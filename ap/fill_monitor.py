@@ -37,6 +37,7 @@ import inspect
 import os
 import re
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -277,6 +278,8 @@ def get_pending_orders(client_id: str) -> list[dict]:
                         position_id IS NULL
                         OR BTRIM(position_id) = ''
                         OR meta->>'canonical_owner_handoff_retry_required' = 'true'
+                        OR last_error LIKE 'FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED%'
+                        OR last_error LIKE 'FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN%'
                       )
                     )
                   )
@@ -1302,6 +1305,36 @@ def _get_existing_position_by_order(pm, local_order_id: str, broker_order_id: Op
     return None
 
 
+_TERMINAL_POSITION_STATUSES = frozenset({
+    "CLOSED",
+    "EXPIRED",
+    "STOPPED",
+    "TAKEN_PROFIT",
+    "ERROR",
+})
+
+
+def _position_value(position, name: str, default=None):
+    if isinstance(position, dict):
+        return position.get(name, default)
+    return getattr(position, name, default)
+
+
+def _existing_position_is_terminal(position) -> bool:
+    status = str(_position_value(position, "status", "") or "").strip().upper()
+    if status in _TERMINAL_POSITION_STATUSES:
+        return True
+    if bool(_position_value(position, "closed", False)):
+        return True
+    remaining = _position_value(position, "quantity_remaining", None)
+    if remaining is not None:
+        try:
+            return int(remaining or 0) <= 0
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
 def _open_position_safe(
     pm,
     *,
@@ -1324,7 +1357,18 @@ def _open_position_safe(
     """
     existing = _get_existing_position_by_order(pm, local_id, order.get("broker_order_id"))
     if existing:
-        return existing.get("id") or existing.get("position_id")
+        if _existing_position_is_terminal(existing):
+            log.critical(
+                "[%s] FILLED_ENTRY_CANONICAL_OWNER_RETRY_TERMINAL_POSITION | "
+                "local=%s broker=%s position=%s status=%s",
+                order.get("client_id"),
+                local_id,
+                order.get("broker_order_id"),
+                _position_value(existing, "id", "") or _position_value(existing, "position_id", ""),
+                _position_value(existing, "status", ""),
+            )
+            return None
+        return _position_value(existing, "id") or _position_value(existing, "position_id")
 
     # PR #235: resolve canonical CALL/PUT — never default to CALL.
     _side, _side_source = _resolve_order_option_side(order)
@@ -1966,6 +2010,34 @@ def _canonical_handoff_meta_flag(order: dict, key: str) -> bool:
     return value is True or str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _canonical_owner_handoff_lock(exit_engine):
+    lock = getattr(exit_engine, "_lock", None)
+    return lock if hasattr(lock, "__enter__") and hasattr(lock, "__exit__") else nullcontext()
+
+
+def _canonical_handoff_identity_where(order: dict) -> tuple[list[str], list]:
+    client_id = str(order.get("client_id") or "").strip()
+    local_order_id = str(order.get("local_order_id") or "").strip()
+    clauses = ["client_id=%s", "local_order_id=%s", "kind='ENTRY'"]
+    values = [client_id, local_order_id]
+
+    broker_order_id = str(order.get("broker_order_id") or "").strip()
+    if broker_order_id:
+        clauses.append("broker_order_id=%s")
+        values.append(broker_order_id)
+
+    contract = str(order.get("contract") or order.get("symbol") or "").strip().upper()
+    if contract:
+        clauses.append("contract=%s")
+        values.append(contract)
+
+    execution_mode = _normalize_execution_mode_token(order.get("execution_mode"))
+    if execution_mode:
+        clauses.append("LOWER(BTRIM(COALESCE(execution_mode,'')))=%s")
+        values.append(execution_mode)
+    return clauses, values
+
+
 def _update_canonical_handoff_order(
     order: dict,
     *,
@@ -1973,11 +2045,13 @@ def _update_canonical_handoff_order(
     last_error: str | None = None,
     clear_handoff_error: bool = False,
     operation: str,
-) -> None:
+) -> bool:
     client_id = str(order.get("client_id") or "").strip()
     local_order_id = str(order.get("local_order_id") or "").strip()
     if not client_id or not local_order_id:
-        return
+        return False
+
+    where_clauses, where_params = _canonical_handoff_identity_where(order)
 
     def _fn():
         with conn() as c:
@@ -1997,25 +2071,58 @@ def _update_canonical_handoff_order(
                 "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb",
                 "updated_ts=NOW()",
             ])
-            params.extend([
-                json_dumps(meta_patch),
-                client_id,
-                local_order_id,
-            ])
-            c.execute(
+            params.append(json_dumps(meta_patch))
+            params.extend(where_params)
+            updated = c.execute(
                 "UPDATE orders SET " + ", ".join(assignments) + " "
-                "WHERE client_id=%s AND local_order_id=%s AND kind='ENTRY'",
+                "WHERE " + " AND ".join(where_clauses),
                 params,
+            )
+            return int(
+                getattr(updated, "rowcount", getattr(c, "rowcount", 0)) or 0
             )
 
     try:
-        run_with_retry(_fn)
+        rowcount = run_with_retry(_fn)
+        if int(rowcount or 0) <= 0:
+            log.critical(
+                "[%s] canonical owner handoff %s persistence matched no exact order row | local=%s",
+                client_id,
+                operation,
+                local_order_id,
+            )
+            return False
+        return True
     except Exception as exc:
         log.critical(
             "[%s] canonical owner handoff %s persistence failed | local=%s error=%s",
             client_id,
             operation,
             local_order_id,
+            exc,
+        )
+        return False
+
+
+def _persist_canonical_handoff_last_error_fallback(order: dict, reason_code: str) -> None:
+    """Keep a retry-visible error when the JSONB marker write cannot commit."""
+    where_clauses, where_params = _canonical_handoff_identity_where(order)
+
+    def _fn():
+        with conn() as c:
+            c.execute(
+                "UPDATE orders SET last_error=%s, updated_ts=NOW() "
+                "WHERE " + " AND ".join(where_clauses),
+                [reason_code, *where_params],
+            )
+
+    try:
+        run_with_retry(_fn)
+    except Exception as exc:
+        log.critical(
+            "[%s] canonical owner handoff fallback persistence failed | local=%s error=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
             exc,
         )
 
@@ -2029,7 +2136,7 @@ def _persist_canonical_owner_handoff_retry(
         handoff_result.get("reason_code")
         or "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN"
     )
-    _update_canonical_handoff_order(
+    persisted = _update_canonical_handoff_order(
         order,
         last_error=reason_code,
         operation="retry marker",
@@ -2045,6 +2152,8 @@ def _persist_canonical_owner_handoff_retry(
             "canonical_owner_handoff_failed_at": now_utc_iso(),
         },
     )
+    if not persisted:
+        _persist_canonical_handoff_last_error_fallback(order, reason_code)
 
 
 def _mark_canonical_owner_handoff_stop_attempted(order: dict) -> None:
@@ -2436,24 +2545,6 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             "ADOPTION_BLOCKED",
             f"canonical_adoption_mode_{_mode_disp.lower()}",
         )
-
-    _clear_quarantine_fn = getattr(
-        exit_engine, "clear_canonical_owner_handoff_quarantine", None
-    )
-    if callable(_clear_quarantine_fn) and _contract_for_adopt and position_id:
-        try:
-            _clear_quarantine_fn(
-                canonical_position_id=position_id,
-                contract=_contract_for_adopt,
-                client_id=str(order.get("client_id") or ""),
-                execution_mode=_resolved_mode,
-            )
-        except Exception as _clear_quarantine_err:
-            log.warning(
-                "[%s] canonical owner quarantine clear failed before retry: %s",
-                order.get("client_id"),
-                _clear_quarantine_err,
-            )
 
     _adopt_fn = getattr(exit_engine, "adopt_canonical_position_identity", None)
     if callable(_adopt_fn) and _contract_for_adopt and position_id:
@@ -3053,53 +3144,81 @@ def process_pending_order(
                             if standing_stop_attempted:
                                 _mark_canonical_owner_handoff_stop_attempted(order)
 
-                        seed_result = _seed_exit_engine(
-                            exit_engine, position_id, order, result, signal_id
-                        )
-                        if not isinstance(seed_result, dict) or not seed_result.get("ok"):
-                            seed_failure = (
-                                dict(seed_result)
-                                if isinstance(seed_result, dict)
-                                else {
-                                    "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
-                                    "detail_reason": "seed_result_missing_or_invalid",
-                                }
+                        seed_failure = None
+                        owner_failure = None
+                        with _canonical_owner_handoff_lock(exit_engine):
+                            clear_fn = getattr(
+                                exit_engine,
+                                "clear_canonical_owner_handoff_quarantine",
+                                None,
                             )
-                            seed_failure.setdefault(
-                                "standing_stop_attempted", standing_stop_attempted
+                            if callable(clear_fn):
+                                try:
+                                    clear_fn(
+                                        canonical_position_id=position_id,
+                                        contract=str(
+                                            order.get("contract") or order.get("symbol") or ""
+                                        ).strip().upper(),
+                                        client_id=str(order.get("client_id") or "").strip(),
+                                        execution_mode=_normalize_execution_mode_token(
+                                            order.get("execution_mode")
+                                        ),
+                                    )
+                                except Exception as clear_err:
+                                    log.warning(
+                                        "[%s] canonical owner quarantine clear failed before retry: %s",
+                                        order.get("client_id"),
+                                        clear_err,
+                                    )
+
+                            seed_result = _seed_exit_engine(
+                                exit_engine, position_id, order, result, signal_id
                             )
-                            _quarantine_canonical_owner_handoff(
-                                exit_engine=exit_engine,
-                                order=order,
-                                canonical_position_id=position_id,
-                                failure=seed_failure,
-                            )
-                            _emit_canonical_owner_handoff_failure(
-                                order,
-                                position_id,
-                                seed_failure,
-                            )
-                        else:
-                            owner_result = _verify_canonical_entry_owner(
-                                exit_engine, order, position_id
-                            )
-                            if not owner_result.get("ok"):
-                                owner_failure = dict(owner_result)
-                                owner_failure.setdefault(
+                            if not isinstance(seed_result, dict) or not seed_result.get("ok"):
+                                seed_failure = (
+                                    dict(seed_result)
+                                    if isinstance(seed_result, dict)
+                                    else {
+                                        "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                                        "detail_reason": "seed_result_missing_or_invalid",
+                                    }
+                                )
+                                seed_failure.setdefault(
                                     "standing_stop_attempted", standing_stop_attempted
                                 )
                                 _quarantine_canonical_owner_handoff(
                                     exit_engine=exit_engine,
                                     order=order,
                                     canonical_position_id=position_id,
-                                    failure=owner_failure,
-                                )
-                                _emit_canonical_owner_handoff_failure(
-                                    order, position_id, owner_failure
+                                    failure=seed_failure,
                                 )
                             else:
-                                _clear_canonical_owner_handoff_retry(order)
-                                entry_handoff_proven = True
+                                owner_result = _verify_canonical_entry_owner(
+                                    exit_engine, order, position_id
+                                )
+                                if not owner_result.get("ok"):
+                                    owner_failure = dict(owner_result)
+                                    owner_failure.setdefault(
+                                        "standing_stop_attempted", standing_stop_attempted
+                                    )
+                                    _quarantine_canonical_owner_handoff(
+                                        exit_engine=exit_engine,
+                                        order=order,
+                                        canonical_position_id=position_id,
+                                        failure=owner_failure,
+                                    )
+
+                        if seed_failure is not None:
+                            _emit_canonical_owner_handoff_failure(
+                                order, position_id, seed_failure
+                            )
+                        elif owner_failure is not None:
+                            _emit_canonical_owner_handoff_failure(
+                                order, position_id, owner_failure
+                            )
+                        else:
+                            _clear_canonical_owner_handoff_retry(order)
+                            entry_handoff_proven = True
 
                 if not position_id:
                     log.critical(

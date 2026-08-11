@@ -114,7 +114,7 @@ class _Connection:
             if self.update_error:
                 raise self.update_error
             if "last_error=CASE" in normalized:
-                meta_payload, client_id, local_id = params
+                meta_payload, client_id, local_id = params[:3]
                 if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
                     self.row["meta"] = {
                         **(self.row.get("meta") or {}),
@@ -122,15 +122,21 @@ class _Connection:
                     }
                 return _Result(rowcount=1 if self.row else 0)
             if "last_error=%s" in normalized:
-                last_error, meta_payload, client_id, local_id = params
+                last_error = params[0]
+                if "meta=" in normalized:
+                    meta_payload, client_id, local_id = params[1:4]
+                else:
+                    meta_payload = None
+                    client_id, local_id = params[1:3]
                 if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
                     self.row["last_error"] = last_error
-                    self.row["meta"] = {
-                        **(self.row.get("meta") or {}),
-                        **json.loads(meta_payload),
-                    }
+                    if meta_payload is not None:
+                        self.row["meta"] = {
+                            **(self.row.get("meta") or {}),
+                            **json.loads(meta_payload),
+                        }
                 return _Result(rowcount=1 if self.row else 0)
-            meta_payload, client_id, local_id = params
+            meta_payload, client_id, local_id = params[:3]
             if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
                 self.row["meta"] = {
                     **(self.row.get("meta") or {}),
@@ -171,6 +177,52 @@ def _owner(position_id, *, client_id="jason@example.com", mode="live", contract=
         option_symbol=contract or "INTC260810P00098000",
         closed=closed,
     )
+
+
+def test_handoff_marker_update_fences_broker_contract_and_mode(monkeypatch):
+    from ap import fill_monitor as fm
+
+    db = _Connection({
+        "client_id": "jason@example.com",
+        "local_order_id": "entry-local-1",
+        "broker_order_id": "entry-broker-1",
+        "contract": "INTC260810P00098000",
+        "kind": "ENTRY",
+        "execution_mode": "live",
+        "position_id": None,
+    })
+    _install_db(monkeypatch, db)
+
+    assert fm._update_canonical_handoff_order(
+        _order(),
+        meta_patch={"canonical_owner_handoff_retry_required": True},
+        last_error="FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+        operation="test",
+    ) is True
+    sql, _params = db.calls[-1]
+    assert "broker_order_id=%s" in sql
+    assert "contract=%s" in sql
+    assert "LOWER(BTRIM(COALESCE(execution_mode,'')))=%s" in sql
+
+
+def test_open_position_safe_does_not_replay_terminal_position():
+    from ap import fill_monitor as fm
+
+    class _PM:
+        def get_position_by_local_order(self, _local_id):
+            return {"id": "closed-position", "status": "CLOSED"}
+
+        def open_position(self, **_kwargs):
+            raise AssertionError("terminal replay must not open or reseed")
+
+    assert fm._open_position_safe(
+        _PM(),
+        order=_order(),
+        result={"filled_qty": 1, "avg_fill": 1.46},
+        plan_id="plan-1",
+        signal_id="signal-1",
+        local_id="entry-local-1",
+    ) is None
 
 
 def test_filled_entry_binds_null_position_id_and_reads_back(monkeypatch):
@@ -716,15 +768,38 @@ def test_filled_handoff_retry_replays_without_terminal_osm_transition(monkeypatc
         "_place_standing_stop_best_effort",
         lambda *a, **k: events.append("standing_stop") or True,
     )
+
+    class _HandoffLock:
+        active = False
+
+        def __enter__(self):
+            self.active = True
+            return self
+
+        def __exit__(self, *_args):
+            self.active = False
+
+    handoff_lock = _HandoffLock()
+
+    def _seed(*args, **kwargs):
+        assert handoff_lock.active
+        events.append("seed")
+        return {"ok": True, "disposition": "SEEDED"}
+
+    def _verify(*args, **kwargs):
+        assert handoff_lock.active
+        events.append("verify")
+        return {"ok": True}
+
     monkeypatch.setattr(
         fm,
         "_seed_exit_engine",
-        lambda *a, **k: events.append("seed") or {"ok": True, "disposition": "SEEDED"},
+        _seed,
     )
     monkeypatch.setattr(
         fm,
         "_verify_canonical_entry_owner",
-        lambda *a, **k: events.append("verify") or {"ok": True},
+        _verify,
     )
 
     class _OSM:
@@ -736,7 +811,7 @@ def test_filled_handoff_retry_replays_without_terminal_osm_transition(monkeypatc
         order,
         osm=_OSM(),
         pm=object(),
-        exit_engine=SimpleNamespace(),
+        exit_engine=SimpleNamespace(_lock=handoff_lock),
     )
 
     assert db.row["position_id"] == "canonical-position-1"
@@ -764,6 +839,24 @@ def test_exit_engine_quarantines_and_releases_same_contract_on_retry():
     position.quantity_remaining = 1
     engine.add_position(position)
 
+    foreign = ManagedPosition(
+        ticker="INTC",
+        option_symbol="INTC260810P00098000",
+        side="PUT",
+        quantity=1,
+        entry_price=1.46,
+        underlying_entry=98.0,
+        underlying_target=100.0,
+        underlying_stop=96.0,
+    )
+    foreign.position_id = "broker-repair-foreign"
+    foreign.client_id = "other@example.com"
+    foreign.execution_mode = "paper"
+    foreign.quantity_remaining = 1
+    with engine._lock:
+        engine._positions.append(foreign)
+        engine._positions_by_id[foreign.position_id] = foreign
+
     quarantined = engine.quarantine_canonical_owner_handoff(
         canonical_position_id="canonical-position-1",
         contract="INTC260810P00098000",
@@ -771,7 +864,10 @@ def test_exit_engine_quarantines_and_releases_same_contract_on_retry():
         execution_mode="live",
         reason="owner_cardinality_or_identity_unproven",
     )
-    assert quarantined["quarantined_ids"] == ["canonical-position-1"]
+    assert quarantined["quarantined_ids"] == [
+        "canonical-position-1",
+        "broker-repair-foreign",
+    ]
     assert engine.active_positions() == []
 
     cleared = engine.clear_canonical_owner_handoff_quarantine(

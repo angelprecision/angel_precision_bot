@@ -4142,7 +4142,8 @@ class APExitEngine:
     ) -> dict:
         """Allow a durable retry to re-run adoption and prove one owner."""
         target_contract = str(contract or "").strip().upper()
-        if not target_contract:
+        canonical_id = str(canonical_position_id or "").strip()
+        if not target_contract or not canonical_id:
             return {"ok": False, "cleared_ids": []}
 
         cleared_ids = []
@@ -4154,6 +4155,8 @@ class APExitEngine:
                     or ""
                 ).strip().upper()
                 if pos_contract != target_contract or getattr(pos, "closed", False):
+                    continue
+                if str(getattr(pos, "position_id", "") or "").strip() != canonical_id:
                     continue
                 if _is_adoption_identity_quarantined(pos):
                     _clear_adoption_identity_quarantine(pos)
