@@ -222,6 +222,153 @@ def _norm_contract(value: Any) -> str:
     return _norm(value).upper().replace(" ", "")
 
 
+_BROKER_STATUS_KEYS = ("status", "Status", "state", "order_status")
+_BROKER_ORDER_ID_KEYS = ("broker_order_id", "order_id", "id", "orderId")
+_BROKER_CONTRACT_KEYS = ("contract", "symbol", "option_symbol", "instrument")
+_BROKER_ORDER_QTY_KEYS = ("qty", "quantity", "order_qty")
+_BROKER_REMAINING_QTY_KEYS = ("remaining_qty", "remaining_quantity")
+_BROKER_FILLED_QTY_KEYS = ("filled_qty", "filled_quantity", "exec_quantity")
+
+
+def _strict_nonnegative_quantity(value: Any) -> Optional[int]:
+    """Parse broker quantities without bool, sign, fraction, or whitespace coercion."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if type(value) is int:
+        return value if value >= 0 else None
+    if type(value) is float:
+        if not math.isfinite(value) or not value.is_integer() or value < 0:
+            return None
+        return int(value)
+    if isinstance(value, str):
+        if value != value.strip() or not value or not value.isdigit():
+            return None
+        return int(value)
+    return None
+
+
+def _strict_consistent_text(
+    raw: dict,
+    keys: tuple[str, ...],
+    *,
+    field_name: str,
+    normalize,
+) -> str:
+    values = []
+    for key in keys:
+        if key not in raw or raw.get(key) is None:
+            continue
+        value = raw.get(key)
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"malformed broker {field_name} field: {key}")
+        values.append(normalize(value))
+    if values and any(value != values[0] for value in values[1:]):
+        raise ValueError(f"conflicting broker {field_name} fields")
+    return values[0] if values else ""
+
+
+def _strict_quantity_group(
+    raw: dict,
+    keys: tuple[str, ...],
+    *,
+    field_name: str,
+) -> Optional[int]:
+    values = []
+    for key in keys:
+        if key not in raw or raw.get(key) is None:
+            continue
+        parsed = _strict_nonnegative_quantity(raw.get(key))
+        if parsed is None:
+            raise ValueError(f"malformed broker {field_name} field: {key}")
+        values.append(parsed)
+    if values and any(value != values[0] for value in values[1:]):
+        raise ValueError(f"conflicting broker {field_name} fields")
+    return values[0] if values else None
+
+
+def _validate_broker_order_payload(
+    raw: Any,
+    *,
+    expected_broker_order_id: str = "",
+    expected_contract: str = "",
+) -> dict:
+    """Validate broker authority before any recovery mutation is permitted."""
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("broker order payload is empty or not an object")
+
+    status = _strict_consistent_text(
+        raw,
+        _BROKER_STATUS_KEYS,
+        field_name="status",
+        normalize=lambda value: value.lower(),
+    )
+    if not status:
+        raise ValueError("broker order status is missing")
+
+    broker_order_id = _strict_consistent_text(
+        raw,
+        _BROKER_ORDER_ID_KEYS,
+        field_name="order identity",
+        normalize=lambda value: value,
+    )
+    expected_id = _norm(expected_broker_order_id)
+    if broker_order_id and expected_id and broker_order_id != expected_id:
+        raise ValueError("broker order identity does not match requested order")
+
+    contract = _strict_consistent_text(
+        raw,
+        _BROKER_CONTRACT_KEYS,
+        field_name="contract",
+        normalize=lambda value: _norm_contract(value),
+    )
+    expected_contract_norm = _norm_contract(expected_contract)
+    if contract and expected_contract_norm and contract != expected_contract_norm:
+        raise ValueError("broker order contract does not match durable position")
+
+    order_qty = _strict_quantity_group(
+        raw, _BROKER_ORDER_QTY_KEYS, field_name="order quantity"
+    )
+    remaining_qty = _strict_quantity_group(
+        raw, _BROKER_REMAINING_QTY_KEYS, field_name="remaining quantity"
+    )
+    filled_qty = _strict_quantity_group(
+        raw, _BROKER_FILLED_QTY_KEYS, field_name="filled quantity"
+    )
+
+    if status == "filled":
+        if order_qty is not None and filled_qty is not None and order_qty != filled_qty:
+            raise ValueError("filled broker order quantity authorities disagree")
+        authoritative_filled_qty = filled_qty if filled_qty is not None else order_qty
+        if authoritative_filled_qty is None or authoritative_filled_qty <= 0:
+            raise ValueError("filled broker order quantity is missing or non-positive")
+        if remaining_qty is not None and remaining_qty != 0:
+            raise ValueError("filled broker order has non-zero remaining quantity")
+
+    return dict(raw)
+
+
+def _strict_filled_order_quantity(raw: dict) -> Optional[int]:
+    """Return a proven positive filled quantity, never a local fallback."""
+    try:
+        order_qty = _strict_quantity_group(
+            raw, _BROKER_ORDER_QTY_KEYS, field_name="order quantity"
+        )
+        filled_qty = _strict_quantity_group(
+            raw, _BROKER_FILLED_QTY_KEYS, field_name="filled quantity"
+        )
+        remaining_qty = _strict_quantity_group(
+            raw, _BROKER_REMAINING_QTY_KEYS, field_name="remaining quantity"
+        )
+    except ValueError:
+        return None
+    if order_qty is not None and filled_qty is not None and order_qty != filled_qty:
+        return None
+    quantity = filled_qty if filled_qty is not None else order_qty
+    if quantity is None or quantity <= 0 or (remaining_qty is not None and remaining_qty != 0):
+        return None
+    return quantity
+
+
 def _status(raw: dict) -> str:
     return _norm(raw.get("status") or raw.get("Status") or raw.get("state") or raw.get("order_status")).lower()
 
@@ -235,13 +382,17 @@ def _contract(raw: dict) -> str:
 
 
 def _qty(raw: dict) -> int:
-    for key in ("qty", "quantity", "order_qty", "remaining_qty", "remaining_quantity", "filled_qty", "filled_quantity", "exec_quantity"):
+    for keys in (
+        _BROKER_ORDER_QTY_KEYS,
+        _BROKER_REMAINING_QTY_KEYS,
+        _BROKER_FILLED_QTY_KEYS,
+    ):
         try:
-            val = raw.get(key)
-            if val not in (None, ""):
-                return abs(int(float(val)))
-        except Exception:
-            pass
+            quantity = _strict_quantity_group(raw, keys, field_name="quantity")
+        except ValueError:
+            return 0
+        if quantity is not None:
+            return quantity
     return 0
 
 
@@ -326,6 +477,15 @@ def _list_open_orders(broker: Any) -> tuple[bool, list[dict]]:
             if rows is None:
                 log.warning("broker.%s returned malformed data during autonomous recovery", method_name)
                 continue
+            try:
+                rows = [_validate_broker_order_payload(row) for row in rows]
+            except ValueError as exc:
+                log.warning(
+                    "broker.%s returned contradictory or malformed order authority: %s",
+                    method_name,
+                    exc,
+                )
+                continue
             if not all(
                 _broker_order_id(row) and _contract(row) and _status(row)
                 for row in rows
@@ -340,7 +500,12 @@ def _list_open_orders(broker: Any) -> tuple[bool, list[dict]]:
     return False, []
 
 
-def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
+def _get_order(
+    broker: Any,
+    broker_order_id: str,
+    *,
+    expected_contract: str = "",
+) -> Optional[dict]:
     if not broker_order_id:
         raise _BrokerSnapshotUnavailable("missing broker order id")
     method = getattr(broker, "get_order", None)
@@ -354,16 +519,37 @@ def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
         raise _BrokerSnapshotUnavailable(
             f"broker.get_order failed for {broker_order_id}"
         ) from exc
-    if not isinstance(raw, dict) or not raw or not _status(raw):
+    try:
+        return _validate_broker_order_payload(
+            raw,
+            expected_broker_order_id=broker_order_id,
+            expected_contract=expected_contract,
+        )
+    except ValueError as exc:
         log.warning(
-            "broker.get_order(%s) returned unavailable payload: %r",
+            "broker.get_order(%s) returned unavailable or contradictory payload: %r (%s)",
             broker_order_id,
             raw,
+            exc,
         )
         raise _BrokerSnapshotUnavailable(
             f"broker.get_order returned malformed payload for {broker_order_id}"
         )
-    return dict(raw)
+
+
+def _get_order_for_contract(
+    broker: Any,
+    broker_order_id: str,
+    contract: str,
+) -> Optional[dict]:
+    """Keep the legacy two-argument GET seam while fencing contract identity."""
+    raw = _get_order(broker, broker_order_id)
+    try:
+        return _validate_broker_order_payload(raw, expected_contract=contract)
+    except ValueError as exc:
+        raise _BrokerSnapshotUnavailable(
+            f"broker.get_order contract authority unavailable for {broker_order_id}"
+        ) from exc
 
 
 def _matching_open_exit_orders(
@@ -403,23 +589,27 @@ def _list_broker_positions(broker: Any) -> tuple[bool, list[dict]]:
             log.warning("broker.list_positions returned malformed data during autonomous recovery")
             return False, []
         for row in rows:
-            if not _contract(row):
-                log.warning("broker.list_positions returned position without a contract during autonomous recovery")
-                return False, []
-            quantity_present = any(
-                key in row for key in ("quantity", "qty", "position_qty", "long_quantity")
-            )
-            if not quantity_present:
-                log.warning("broker.list_positions returned position without quantity during autonomous recovery")
-                return False, []
             try:
-                quantity = float(
-                    row.get("quantity", row.get("qty", row.get("position_qty", row.get("long_quantity"))))
+                _strict_consistent_text(
+                    row,
+                    _BROKER_CONTRACT_KEYS,
+                    field_name="contract",
+                    normalize=lambda value: _norm_contract(value),
                 )
-                if not math.isfinite(quantity):
-                    raise ValueError("non-finite quantity")
-            except (TypeError, ValueError, OverflowError):
-                log.warning("broker.list_positions returned non-numeric quantity during autonomous recovery")
+                if not _contract(row):
+                    raise ValueError("missing broker position contract")
+                quantity = _strict_quantity_group(
+                    row,
+                    ("quantity", "qty", "position_qty", "long_quantity"),
+                    field_name="position quantity",
+                )
+                if quantity is None:
+                    raise ValueError("missing broker position quantity")
+            except (TypeError, ValueError, OverflowError) as exc:
+                log.warning(
+                    "broker.list_positions returned contradictory or malformed quantity/contract: %s",
+                    exc,
+                )
                 return False, []
         return True, rows
     except Exception as exc:
@@ -802,7 +992,9 @@ def _recover_known_open_exit_when_monitor_unavailable(
         # the retry interval has elapsed, require another fresh recognized
         # live proof before consuming the next durable cancel attempt.
         try:
-            fresh_raw = _get_order(broker, broker_id)
+            fresh_raw = _get_order_for_contract(
+                broker, broker_id, _position_contract(pos)
+            )
         except _BrokerSnapshotUnavailable:
             fresh_raw = None
         fresh_status = _status(fresh_raw or {})
@@ -1072,7 +1264,7 @@ def _recover_durable_replacement_pending(
         )
 
     try:
-        old_raw = _get_order(broker, old_broker)
+        old_raw = _get_order_for_contract(broker, old_broker, contract)
     except _BrokerSnapshotUnavailable as exc:
         return RecoveryAction(
             "NOOP",
@@ -1172,7 +1364,7 @@ def _recover_durable_replacement_pending(
                     },
                 )
             try:
-                new_raw = _get_order(broker, row_broker)
+                new_raw = _get_order_for_contract(broker, row_broker, contract)
             except _BrokerSnapshotUnavailable as exc:
                 return RecoveryAction(
                     "NOOP",
@@ -1524,7 +1716,7 @@ def recover_exit_position(
         # still take the bounded autonomous handoff.
         pre_reconciliation_age_seconds = _exit_age_seconds(pos, osm, local_id)
         try:
-            raw = _get_order(broker, pending_broker_id)
+            raw = _get_order_for_contract(broker, pending_broker_id, contract)
         except _BrokerSnapshotUnavailable as exc:
             return RecoveryAction(
                 "NOOP",
@@ -1577,13 +1769,37 @@ def recover_exit_position(
                     age_seconds=pre_reconciliation_age_seconds,
                 )
             if st == "filled":
-                filled_qty = _qty(raw) or int(getattr(pos, "pending_exit_qty", 0) or 0)
+                filled_qty = _strict_filled_order_quantity(raw)
+                if filled_qty is None:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_filled_quantity_unproven",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "quote_health": qh,
+                            "broker_truth_unavailable": False,
+                            "broker_authority_malformed": True,
+                            "broker_mutation_blocked": True,
+                            "replacement_blocked": True,
+                        },
+                    )
                 fill_price = None
                 for key in ("avg_fill_price", "average_fill_price", "fill_price", "filled_avg_price", "price"):
                     try:
-                        if raw.get(key) not in (None, ""):
-                            fill_price = float(raw.get(key))
-                            break
+                        value = raw.get(key)
+                        if value in (None, "") or isinstance(value, bool):
+                            continue
+                        if isinstance(value, str) and value != value.strip():
+                            continue
+                        parsed = float(value)
+                        if math.isfinite(parsed) and parsed > 0:
+                            if fill_price is not None and parsed != fill_price:
+                                fill_price = None
+                                break
+                            fill_price = parsed
                     except Exception:
                         pass
                 if exit_engine and hasattr(exit_engine, "mark_position_closed"):
@@ -1597,6 +1813,7 @@ def recover_exit_position(
                             broker_order_id=pending_broker_id,
                             cumulative_filled=filled_qty,
                             reconciled=True,
+                            economic_pending=fill_price is None,
                         )
                     except Exception as _close_exc:
                         log.warning(
@@ -1925,7 +2142,7 @@ def recover_exit_position(
 
 
 def recover_exit_engine(
-    exit_engine: Any, *, broker: Any, osm: Any = None, max_positions: int = 10,
+    exit_engine: Any, *, broker: Any, osm: Any = None, max_positions: Optional[int] = None,
     order_monitor: Any = None,
 ) -> list[RecoveryAction]:
     if exit_engine is None or broker is None:
@@ -1939,7 +2156,18 @@ def recover_exit_engine(
         positions = []
 
     actions: list[RecoveryAction] = []
-    for pos in positions[:max_positions]:
+    if max_positions is None:
+        selected_positions = positions
+        deferred_positions = []
+    else:
+        try:
+            recovery_limit = max(0, int(max_positions))
+        except (TypeError, ValueError, OverflowError):
+            recovery_limit = 0
+        selected_positions = positions[:recovery_limit]
+        deferred_positions = positions[recovery_limit:]
+
+    for pos in selected_positions:
         lifecycle, lifecycle_reason = _durable_replacement_lifecycle(pos)
         has_durable_replacement = lifecycle is not None
         if lifecycle_reason not in {"absent", "inactive", "ok"} and getattr(
@@ -1985,6 +2213,20 @@ def recover_exit_engine(
         except Exception as exc:
             log.exception("autonomous recovery failed for pos=%s: %s", _position_id(pos), exc)
             actions.append(RecoveryAction("ERROR", str(exc), _position_id(pos)))
+    for pos in deferred_positions:
+        actions.append(
+            RecoveryAction(
+                "DEFERRED",
+                "autonomous_recovery_capacity_deferred",
+                _position_id(pos),
+                details={
+                    "capacity_limit": recovery_limit,
+                    "deferred": True,
+                    "broker_mutation_blocked": True,
+                    "replacement_blocked": True,
+                },
+            )
+        )
     return actions
 
 

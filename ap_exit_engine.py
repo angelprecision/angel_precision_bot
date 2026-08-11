@@ -9949,6 +9949,18 @@ class APExitEngine:
                 "positions":                       positions,
             }
 
+    def _release_pending_replacement_submit_claim(self, pos: ManagedPosition) -> None:
+        """Release only an unaccepted PENDING callback claim.
+
+        An accepted callback that loses the post-submit race must retain its
+        claim for reconciliation; a rejected/raised/missing callback must not
+        strand the durable replacement forever.
+        """
+        with self._lock:
+            lifecycle, lifecycle_valid, _ = self._replacement_lifecycle_for_position(pos)
+            if lifecycle_valid and lifecycle.get("state") == EXIT_REPLACEMENT_STATE_PENDING:
+                pos.pending_exit_replace_submit_claimed = False
+
     def _submit_exit_decision(
         self,
         pos: ManagedPosition,
@@ -10356,11 +10368,13 @@ class APExitEngine:
             if decision.action == "SCALE_OUT":
                 if not self.on_scale:
                     log.warning("[%s] Scale-out decision generated but no on_scale callback installed", ticker)
+                    self._release_pending_replacement_submit_claim(pos)
                     return False
                 callback_result = self.on_scale(pos, decision)
             else:
                 if not self.on_exit:
                     log.warning("[%s] Exit decision generated but no on_exit callback installed", ticker)
+                    self._release_pending_replacement_submit_claim(pos)
                     return False
                 callback_result = self.on_exit(pos, decision)
 
@@ -10373,6 +10387,7 @@ class APExitEngine:
                     stage="exit_submission",
                     extra_inputs={"decision_action": decision.action, "decision_qty": decision.quantity},
                 )
+                self._release_pending_replacement_submit_claim(pos)
                 return False
         except Exception as exc:
             log.error("[%s] Exit submit failed; position remains tracked: %s", ticker, exc)
@@ -10381,6 +10396,7 @@ class APExitEngine:
                 explanation=str(exc), stage="exit_submission",
                 extra_inputs={"decision_action": decision.action, "decision_qty": decision.quantity},
             )
+            self._release_pending_replacement_submit_claim(pos)
             return False
 
         # FIX-1 + P4: Discord runner alert fires in a daemon thread so even a

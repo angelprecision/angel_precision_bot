@@ -68,6 +68,73 @@ def _add(eng: APExitEngine, pos: ManagedPosition) -> None:
     eng._positions_by_id[pos.position_id] = pos
 
 
+def _pending_callback_position(eng: APExitEngine, callback) -> ManagedPosition:
+    now = datetime.now(timezone.utc)
+    pos = ManagedPosition(
+        ticker="AVGO",
+        option_symbol="AVGO260814C00350000",
+        side="CALL",
+        quantity=5,
+        entry_price=2.0,
+        underlying_entry=350.0,
+        underlying_target=360.0,
+        underlying_stop=340.0,
+        position_id="pos-callback-claim",
+        client_id="client-1",
+        execution_mode="paper",
+        quantity_remaining=5,
+        current_bid=1.0,
+        current_ask=1.1,
+        current_option_price=1.05,
+        current_underlying=350.0,
+        last_option_quote_update_ts=now,
+        last_underlying_quote_update_ts=now,
+    )
+    pos.exit_retry_liveness = {
+        "state": "REPLACEMENT_PENDING",
+        "replace_attempt": 1,
+        "replacement_generation": 1,
+        "replace_quantity": 1,
+        "position_id": pos.position_id,
+        "client_id": pos.client_id,
+        "execution_mode": pos.execution_mode,
+        "old_local_order_id": "loc-old-claim",
+        "old_broker_order_id": "bro-old-claim",
+        "last_ack_identity": "bro-old-claim",
+    }
+    eng.order_state_machine = None
+    eng.on_exit = callback
+    eng._sync_replacement_runtime_from_lifecycle(pos, revalidated=True)
+    pos.pending_exit_replace_allowed = True
+    pos.pending_exit_replace_revalidated = True
+    _add(eng, pos)
+    return pos
+
+
+@pytest.mark.parametrize(
+    "callback",
+    [
+        lambda _pos, _decision: {"accepted": False, "status": "REJECTED"},
+        lambda _pos, _decision: (_ for _ in ()).throw(RuntimeError("transport")),
+    ],
+    ids=["callback_rejected", "callback_raised"],
+)
+def test_pending_replacement_claim_is_released_after_callback_failure(callback):
+    eng = _engine()
+    pos = _pending_callback_position(eng, callback)
+
+    result = eng._submit_exit_decision(
+        pos,
+        ExitDecision(
+            "CLOSE_ALL", 1, "HARD_STOP", "IMMEDIATE", suggested_limit=1.0,
+        ),
+        kill_active=True,
+    )
+
+    assert result is False
+    assert pos.pending_exit_replace_submit_claimed is False
+
+
 # ── Attempt starts at zero, dedicated field exists and is separate ─────────
 
 def test_exit_replace_attempt_field_exists_separate_from_exit_stuck_count():

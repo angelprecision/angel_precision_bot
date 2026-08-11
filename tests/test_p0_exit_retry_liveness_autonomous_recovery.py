@@ -26,7 +26,9 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 sys.path.insert(0, str(REPO_ROOT))
 
 from ap.exit_autonomous_recovery import (  # noqa: E402
+    RecoveryAction,
     recover_exit_position,
+    recover_exit_engine,
     _order_monitor_alive,
 )
 from ap.self_healing import APSelfHealingSystem, ComponentHealth  # noqa: E402
@@ -683,9 +685,103 @@ def test_exact_filled_order_is_not_claimed_closed_without_engine_confirmation():
     assert action.action == "NOOP"
     assert action.reason == "autonomous_recovery_broker_filled_close_unconfirmed"
     exit_engine.mark_position_closed.assert_called_once()
+    assert exit_engine.mark_position_closed.call_args.kwargs["economic_pending"] is True
     assert position.closed is False
     assert position.quantity_remaining == 2
     assert position.exit_in_flight is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"id": "bro-filled", "status": "filled", "quantity": False},
+        {"id": "bro-filled", "status": "filled", "quantity": True},
+        {"id": "bro-filled", "status": "filled", "quantity": 0},
+        {"id": "bro-filled", "status": "filled", "quantity": -1},
+        {"id": "bro-filled", "status": "filled", "quantity": 1.5},
+        {"id": "bro-filled", "status": "filled", "quantity": " 2 "},
+    ],
+    ids=["boolean_false", "boolean_true", "zero", "negative", "fraction", "whitespace"],
+)
+def test_malformed_filled_quantity_is_zero_mutation(payload):
+    broker = MagicMock()
+    broker.get_order.return_value = payload
+    position = _recovery_position(pending_exit_broker_order_id="bro-filled")
+    exit_engine = MagicMock()
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=_DurableOSM(broker_id="bro-filled"),
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_exact_order_query_unavailable"
+    assert action.details["broker_mutation_blocked"] is True
+    exit_engine.mark_position_closed.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+
+
+def test_conflicting_broker_order_authorities_are_zero_mutation():
+    broker = MagicMock()
+    broker.get_order.return_value = {
+        "id": "bro-filled",
+        "status": "filled",
+        "state": "working",
+        "quantity": 2,
+    }
+    position = _recovery_position(pending_exit_broker_order_id="bro-filled")
+    exit_engine = MagicMock()
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=_DurableOSM(broker_id="bro-filled"),
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_exact_order_query_unavailable"
+    assert action.details["broker_mutation_blocked"] is True
+    exit_engine.mark_position_closed.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+
+
+def test_recovery_processes_all_positions_by_default_and_reports_explicit_capacity():
+    import ap.exit_autonomous_recovery as recovery_module
+
+    positions = [
+        SimpleNamespace(position_id=f"pos-{index}", exit_in_flight=True)
+        for index in range(11)
+    ]
+    engine = MagicMock()
+    engine.active_positions.return_value = positions
+    calls = []
+
+    def _recover(position, **_kwargs):
+        calls.append(position.position_id)
+        return RecoveryAction("NOOP", "test", position.position_id)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(recovery_module, "recover_exit_position", _recover)
+    try:
+        actions = recover_exit_engine(engine, broker=object())
+        assert len(actions) == 11
+        assert calls == [f"pos-{index}" for index in range(11)]
+
+        calls.clear()
+        capped = recover_exit_engine(engine, broker=object(), max_positions=10)
+    finally:
+        monkeypatch.undo()
+
+    assert calls == [f"pos-{index}" for index in range(10)]
+    assert capped[-1].action == "DEFERRED"
+    assert capped[-1].reason == "autonomous_recovery_capacity_deferred"
+    assert capped[-1].position_id == "pos-10"
+    assert capped[-1].details["broker_mutation_blocked"] is True
 
 
 def test_authoritative_zero_orders_and_flat_position_uses_real_close_contract_and_verifies_state():
