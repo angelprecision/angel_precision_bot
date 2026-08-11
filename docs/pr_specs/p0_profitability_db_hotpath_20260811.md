@@ -2,9 +2,9 @@
 
 ## Status
 
-**DRAFT / HARD HOLD. IMPLEMENTATION CONTRACT ONLY. DO NOT MERGE OR DEPLOY THIS DOCS-ONLY PR AS A FIX.**
+**DRAFT / HARD HOLD. IMPLEMENTATION AMENDMENT IN PROGRESS. DO NOT MERGE OR DEPLOY UNTIL PRODUCTION EXPLAIN EVIDENCE IS ATTACHED.**
 
-Base: `main@5284edbdc7af845a634314dc3348cb50f3f846e0`.
+Base: `main@3f9f4c65b79c80c6d3442a9144a0018d70624fb6`.
 
 This PR is infrastructure, not strategy. It exists because profitable entry intelligence is useless if the order/watcher/retry path routinely waits 10-15 seconds on PostgreSQL or times out.
 
@@ -43,6 +43,30 @@ Make the active ENTRY/retry/watcher ownership queries predictably fast and make 
 This PR must **not** change strategy semantics, retry limits, order ownership, broker behavior, or eligibility.
 
 ## Required implementation workflow
+
+### Current-main inventory completed
+
+The exact runtime callers are:
+
+- `APOrderMonitor._check_armed_retries` — canceled `ENTRY` rows with
+  `meta->>'retry_status' = 'ARMED'`, ordered by `updated_ts`, `LIMIT 64`;
+- `APOrderMonitor._recover_stale_inflight_retries` — canceled `ENTRY` rows
+  with `meta->>'retry_status' IN ('IN_FLIGHT','SUBMITTING')`, ordered by
+  `updated_ts`, `LIMIT 16`;
+- `ap.morning_handoff._has_unowned_pending_trigger_orders` — watcher-held
+  `ENTRY` rows with no broker/submitted/fill identity, ordered by `created_ts`.
+
+The retry callers already parse `retry_ready_at` and attempt counters in
+Python. The implementation therefore adds only the three narrow partial
+indexes in `migrations/20260811_orders_retry_hotpath_indexes.sql`; it does not
+cast JSON metadata or rewrite client/mode ownership predicates.
+
+Focused contract coverage is in
+`tests/test_p0_profitability_db_hotpath.py` and runs through
+`.github/workflows/p0_db_hotpath.yml`. It includes exact result-set comparison
+before/after indexes, clean PostgreSQL idempotency, fixture EXPLAIN/index
+eligibility, scaled bounded scans, malformed-metadata guards, and the two
+known production schema-shape checks.
 
 ### 1. Inventory slow queries from production logs
 
@@ -206,6 +230,9 @@ The active ENTRY lifecycle no longer spends 10-15 seconds scanning thousands of 
 
 ## Release verdict
 
-Current state: **HARD HOLD — docs only.**
+Current state: **HARD HOLD — implementation is covered locally/fixture-level;
+production `EXPLAIN (ANALYZE, BUFFERS)` evidence and deployment proof remain
+required.**
 
-Implementation requires production-safe EXPLAIN evidence, migration review, exact-head P0 CI, and independent money-path review.
+Implementation requires production-safe EXPLAIN evidence, migration review,
+exact-head P0 CI, and independent money-path review.
