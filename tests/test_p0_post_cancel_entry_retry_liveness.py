@@ -18,7 +18,6 @@ os.environ.setdefault(
     "DATABASE_URL",
     "postgresql://test:test@127.0.0.1:5432/test_p0_post_cancel_retry",
 )
-os.environ.setdefault("SCHEMA_ATTESTATION_ENABLED", "0")
 
 import ap.order_monitor as order_monitor_module
 import ap.post_cancel_retry as retry_module
