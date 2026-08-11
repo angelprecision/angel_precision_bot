@@ -854,6 +854,86 @@ def test_authoritative_zero_orders_and_held_position_allows_recovery():
     assert len(osm.transitions) == 1
 
 
+def test_replacement_quantity_must_not_exceed_exact_broker_open_quantity():
+    broker = _BrokerSnapshots(
+        orders=[],
+        positions=[{"symbol": "AVGO260814C00350000", "quantity": 1}],
+    )
+    exit_engine = MagicMock()
+    osm = _DurableOSM(
+        local_id="loc-snapshot",
+        broker_id="",
+        position_id="pos-snapshot",
+    )
+
+    action = recover_exit_position(
+        _recovery_position(pending_exit_qty=3, contracts=3, quantity_remaining=3),
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == (
+        "autonomous_recovery_replacement_quantity_exceeds_broker_open_quantity"
+    )
+    assert action.details["broker_quantity_class"] == "AVAILABLE_EXACT_QTY"
+    assert action.details["broker_open_qty"] == 1
+    assert action.details["replacement_qty"] == 3
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    assert osm.transitions == []
+    assert broker.cancel_calls == 0
+
+
+def test_malformed_broker_quantity_holds_without_replacement_mutation():
+    broker = _BrokerSnapshots(
+        orders=[],
+        positions=[{"symbol": "AVGO260814C00350000", "quantity": True}],
+    )
+    exit_engine = MagicMock()
+    osm = _DurableOSM(local_id="loc-snapshot", broker_id="")
+
+    action = recover_exit_position(
+        _recovery_position(),
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_position_query_unavailable"
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    assert osm.transitions == []
+
+
+def test_duplicate_exact_broker_contract_rows_are_ambiguous_and_hold():
+    broker = _BrokerSnapshots(
+        orders=[],
+        positions=[
+            {"symbol": "AVGO260814C00350000", "quantity": 1},
+            {"symbol": "AVGO260814C00350000", "quantity": 1},
+        ],
+    )
+    exit_engine = MagicMock()
+    osm = _DurableOSM(local_id="loc-snapshot", broker_id="")
+
+    action = recover_exit_position(
+        _recovery_position(),
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_broker_position_quantity_ambiguous"
+    assert action.details["broker_quantity_class"] == "AMBIGUOUS"
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    assert osm.transitions == []
+
+
 def test_position_query_failure_after_authoritative_zero_orders_is_noop():
     broker = _BrokerSnapshots(
         orders=[],

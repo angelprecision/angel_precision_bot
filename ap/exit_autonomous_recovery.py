@@ -692,6 +692,43 @@ def _list_broker_positions(broker: Any) -> tuple[bool, list[dict]]:
         return False, []
 
 
+_BROKER_POSITION_QTY_KEYS = ("quantity", "qty", "position_qty", "long_quantity")
+
+
+def _classify_broker_open_quantity(
+    rows: list[dict], expected_contract: str,
+) -> tuple[str, Optional[int]]:
+    """Classify exact broker-held quantity for one OCC contract.
+
+    A position snapshot is economic authority only when one well-formed row
+    identifies the contract.  Multiple matching rows are ambiguous even when
+    their quantities happen to agree; summing or selecting one would invent
+    ownership.  The caller must treat every non-exact result as HOLD.
+    """
+    contract = _norm_contract(expected_contract)
+    matches: list[int] = []
+    for row in rows:
+        if _contract(row) != contract:
+            continue
+        try:
+            quantity = _strict_quantity_group(
+                row,
+                _BROKER_POSITION_QTY_KEYS,
+                field_name="position quantity",
+            )
+        except (TypeError, ValueError, OverflowError):
+            return "UNAVAILABLE_OR_MALFORMED", None
+        if quantity is None:
+            return "UNAVAILABLE_OR_MALFORMED", None
+        matches.append(quantity)
+
+    if len(matches) > 1:
+        return "AMBIGUOUS", None
+    if not matches or matches[0] == 0:
+        return "AVAILABLE_FLAT", 0
+    return "AVAILABLE_EXACT_QTY", matches[0]
+
+
 def _cancel_order_with_proof(
     broker: Any,
     broker_order_id: str,
@@ -2330,8 +2367,28 @@ def _recover_durable_replacement_pending(
             old_broker,
             {"replacement_blocked": True, "quote_health": qh},
         )
-    held = any(_contract(row) == contract and _qty(row) > 0 for row in broker_positions)
-    if not held:
+    broker_quantity_class, broker_open_qty = _classify_broker_open_quantity(
+        broker_positions, contract,
+    )
+    if broker_quantity_class == "AMBIGUOUS":
+        return RecoveryAction(
+            "NOOP",
+            "replacement_pending_broker_contract_quantity_ambiguous",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_blocked": True, "broker_quantity_class": broker_quantity_class, "quote_health": qh},
+        )
+    if broker_quantity_class == "UNAVAILABLE_OR_MALFORMED":
+        return RecoveryAction(
+            "NOOP",
+            "replacement_pending_broker_contract_quantity_unavailable",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_blocked": True, "broker_quantity_class": broker_quantity_class, "quote_health": qh},
+        )
+    if broker_quantity_class == "AVAILABLE_FLAT":
         return RecoveryAction(
             "NOOP",
             "replacement_pending_broker_contract_not_held",
@@ -2339,6 +2396,21 @@ def _recover_durable_replacement_pending(
             old_local,
             old_broker,
             {"replacement_blocked": True, "quote_health": qh},
+        )
+    if broker_open_qty is None or replacement_qty > broker_open_qty:
+        return RecoveryAction(
+            "NOOP",
+            "replacement_pending_quantity_exceeds_broker_open_quantity",
+            pid,
+            old_local,
+            old_broker,
+            {
+                "replacement_blocked": True,
+                "replacement_qty": replacement_qty,
+                "broker_open_qty": broker_open_qty,
+                "broker_quantity_class": broker_quantity_class,
+                "quote_health": qh,
+            },
         )
     revalidate = getattr(exit_engine, "revalidate_durable_replacement_pending", None)
     if not callable(revalidate) or not revalidate(
@@ -2853,19 +2925,41 @@ def recover_exit_position(
             },
         )
 
-    def _broker_position_quantity(row: dict) -> float:
-        for key in ("quantity", "qty", "position_qty", "long_quantity"):
-            if key in row:
-                try:
-                    return float(row.get(key) or 0)
-                except (TypeError, ValueError, OverflowError):
-                    return 0.0
-        return 0.0
-
-    _contract_held = any(
-        _contract(p) == contract and _broker_position_quantity(p) != 0
-        for p in broker_positions
+    broker_quantity_class, broker_open_qty = _classify_broker_open_quantity(
+        broker_positions, contract,
     )
+    if broker_quantity_class == "AMBIGUOUS":
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_broker_position_quantity_ambiguous",
+            pid,
+            local_id,
+            pending_broker_id,
+            {
+                "contract": contract,
+                "broker_quantity_class": broker_quantity_class,
+                "quote_health": qh,
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            },
+        )
+    if broker_quantity_class == "UNAVAILABLE_OR_MALFORMED":
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_broker_position_quantity_unavailable",
+            pid,
+            local_id,
+            pending_broker_id,
+            {
+                "contract": contract,
+                "broker_quantity_class": broker_quantity_class,
+                "quote_health": qh,
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            },
+        )
+
+    _contract_held = broker_quantity_class == "AVAILABLE_EXACT_QTY"
 
     if terminal_exact_broker_id:
         terminal_row, terminal_requested_qty, terminal_osm_reason = _exact_osm_exit_generation(
@@ -2975,6 +3069,55 @@ def recover_exit_position(
                     "replacement_blocked": True,
                 },
             )
+
+    calculated_replacement_qty = terminal_replacement_qty
+    if calculated_replacement_qty is None:
+        raw_requested = getattr(pos, "pending_exit_qty", None)
+        raw_filled = getattr(pos, "pending_exit_filled_qty", 0)
+        if type(raw_requested) is int and raw_requested > 0 and type(raw_filled) is int and raw_filled >= 0:
+            calculated_replacement_qty = max(0, raw_requested - raw_filled)
+    if (
+        broker_quantity_class == "AVAILABLE_EXACT_QTY"
+        and (type(calculated_replacement_qty) is not int or calculated_replacement_qty <= 0)
+    ):
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_replacement_quantity_unproven",
+            pid,
+            local_id,
+            terminal_exact_broker_id or pending_broker_id,
+            {
+                "contract": contract,
+                "replacement_qty": calculated_replacement_qty,
+                "broker_open_qty": broker_open_qty,
+                "broker_quantity_class": broker_quantity_class,
+                "quote_health": qh,
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            },
+        )
+    if (
+        broker_quantity_class == "AVAILABLE_EXACT_QTY"
+        and calculated_replacement_qty is not None
+        and calculated_replacement_qty > int(broker_open_qty or 0)
+    ):
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_replacement_quantity_exceeds_broker_open_quantity",
+            pid,
+            local_id,
+            terminal_exact_broker_id or pending_broker_id,
+            {
+                "contract": contract,
+                "replacement_qty": calculated_replacement_qty,
+                "broker_open_qty": broker_open_qty,
+                "broker_quantity_class": broker_quantity_class,
+                "terminal_filled_qty": terminal_filled_qty if terminal_exact_broker_id else None,
+                "quote_health": qh,
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            },
+        )
 
     if not _contract_held and contract:
         # Position is flat at broker — exit filled but callback was dropped.
@@ -3112,6 +3255,8 @@ def recover_exit_position(
             "quote_health": qh,
             "open_order_query_available": True,
             "position_query_available": True,
+            "broker_quantity_class": broker_quantity_class,
+            "broker_open_qty": broker_open_qty,
             "terminal_filled_qty": (
                 terminal_filled_qty if terminal_exact_broker_id else None
             ),
@@ -3121,8 +3266,8 @@ def recover_exit_position(
             **terminal_late_fill_details,
         },
         replacement_qty=(
-            terminal_replacement_qty
-            if terminal_replacement_qty is not None
+            calculated_replacement_qty
+            if calculated_replacement_qty is not None
             else 0
         ),
     )

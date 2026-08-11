@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -42,7 +43,9 @@ def test_replacement_lifecycle_jsonb_merge_and_generation_fence(monkeypatch):
             sql.SQL(
                 "CREATE TABLE {}.positions ("
                 "id text PRIMARY KEY, client_id text NOT NULL, execution_mode text NOT NULL, "
-                "meta jsonb NOT NULL DEFAULT '{{}}'::jsonb, updated_at timestamptz NOT NULL DEFAULT NOW()"
+                "contract text NOT NULL, status text NOT NULL, qty integer NOT NULL, "
+                "quantity_remaining integer NOT NULL, "
+                "updated_at timestamptz NOT NULL DEFAULT NOW()"
                 ")"
             ).format(sql.Identifier(schema))
         )
@@ -51,18 +54,64 @@ def test_replacement_lifecycle_jsonb_merge_and_generation_fence(monkeypatch):
         mode = "paper"
         old_local = "loc-old-pr423"
         old_broker = "bro-old-pr423"
-        initial_lifecycle = {
-            "state": "NONE",
-            "replace_attempt": 0,
-            "replacement_generation": 0,
-            "replace_quantity": 0,
-            "last_ack_identity": "",
-        }
         setup_cur.execute(
-            sql.SQL("INSERT INTO {}.positions (id, client_id, execution_mode, meta) VALUES (%s, %s, %s, %s::jsonb)")
+            sql.SQL(
+                "INSERT INTO {}.positions ("
+                "id, client_id, execution_mode, contract, status, qty, quantity_remaining"
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            )
             .format(sql.Identifier(schema)),
-            (position_id, client_id, mode, json.dumps({"unrelated": {"keep": True}, "exit_retry_liveness": initial_lifecycle})),
+            (
+                position_id,
+                client_id,
+                mode,
+                "AVGO260814C00350000",
+                "OPEN",
+                5,
+                5,
+            ),
         )
+        # This is deliberately a production-shaped pre-migration table.  The
+        # test must fail before lifecycle/fill persistence if the amendment's
+        # migration is missing or does not actually add the authority column.
+        setup_cur.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema=%s AND table_name='positions' AND column_name='meta'",
+            (schema,),
+        )
+        assert setup_cur.fetchone() is None
+
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "migrations/20260811_positions_exit_retry_liveness_authority.sql"
+        )
+        migration_sql = migration_path.read_text(encoding="utf-8")
+        qualified_positions = (
+            sql.Identifier(schema).as_string(setup_conn) + ".positions"
+        )
+        setup_cur.execute(migration_sql.replace("public.positions", qualified_positions))
+        setup_cur.execute(
+            "SELECT data_type, is_nullable, column_default "
+            "FROM information_schema.columns "
+            "WHERE table_schema=%s AND table_name='positions' AND column_name='meta'",
+            (schema,),
+        )
+        meta_column = setup_cur.fetchone()
+        assert meta_column is not None
+        assert meta_column[0] == "jsonb"
+        assert meta_column[1] == "NO"
+        assert meta_column[2] and "{}" in meta_column[2]
+        setup_cur.execute(
+            "SELECT qty, quantity_remaining, status FROM "
+            f"{qualified_positions} WHERE id=%s",
+            (position_id,),
+        )
+        assert setup_cur.fetchone() == (5, 5, "OPEN")
+        setup_cur.execute(
+            f"SELECT meta FROM {qualified_positions} WHERE id=%s",
+            (position_id,),
+        )
+        assert setup_cur.fetchone()[0] == {}
     finally:
         setup_cur.close()
         setup_conn.close()
@@ -257,6 +306,131 @@ def test_replacement_lifecycle_jsonb_merge_and_generation_fence(monkeypatch):
         assert final_meta["unrelated"] == {"keep": True}
         assert final_meta["exit_retry_liveness"]["state"] == "NONE"
         assert final_meta["exit_retry_liveness"]["replacement_generation"] == 1
+
+        # The same migrated row now proves the position-side fill bridge.  A
+        # cumulative replay is idempotent, while a later cumulative fill
+        # consumes only the exact delta.
+        fill_position = copy.copy(position)
+        fill_position.quantity_remaining = 5
+        fill_position.exit_retry_liveness = dict(final_meta["exit_retry_liveness"])
+        fill_engine = APExitEngine(broker=object(), email=client_id)
+        fill_engine._positions.append(fill_position)
+        fill_engine._positions_by_id[position_id] = fill_position
+
+        first_fill = fill_engine.reconcile_exit_fill_consumption(
+            position_id,
+            local_order_id=old_local,
+            broker_order_id=old_broker,
+            cumulative_filled_qty=1,
+            prior_cumulative_filled=0,
+        )
+        assert first_fill["ok"] is True
+        assert first_fill["applied_delta"] == 1
+        assert first_fill["quantity_remaining"] == 4
+
+        replay_fill = fill_engine.reconcile_exit_fill_consumption(
+            position_id,
+            local_order_id=old_local,
+            broker_order_id=old_broker,
+            cumulative_filled_qty=1,
+            prior_cumulative_filled=1,
+        )
+        assert replay_fill["ok"] is True
+        assert replay_fill["applied_delta"] == 0
+        assert replay_fill["quantity_remaining"] == 4
+
+        second_fill = fill_engine.reconcile_exit_fill_consumption(
+            position_id,
+            local_order_id=old_local,
+            broker_order_id=old_broker,
+            cumulative_filled_qty=2,
+            prior_cumulative_filled=1,
+        )
+        assert second_fill["ok"] is True
+        assert second_fill["applied_delta"] == 1
+        assert second_fill["quantity_remaining"] == 3
+
+        with _real_pg_conn() as cursor:
+            cursor.execute(
+                "SELECT quantity_remaining, meta FROM positions WHERE id=%s",
+                (position_id,),
+            )
+            consumed_remaining, consumed_meta = cursor.fetchone()
+        assert consumed_remaining == 3
+        assert consumed_meta["exit_fill_consumption"]["applied_cumulative_qty"] == 2
+
+        # A fresh process hydrates the exact marker and replays cumulative=2
+        # without consuming the position a second time.
+        from ap_exit_engine import _restore_exit_fill_consumption_from_meta
+
+        restored_marker, marker_valid, marker_reason = _restore_exit_fill_consumption_from_meta(
+            consumed_meta
+        )
+        assert marker_valid, marker_reason
+        assert restored_marker["applied_cumulative_qty"] == 2
+        restart_position = copy.copy(position)
+        restart_position.quantity_remaining = 3
+        restart_position.exit_retry_liveness = dict(
+            consumed_meta["exit_retry_liveness"]
+        )
+        restart_position.exit_fill_consumption = dict(restored_marker)
+        restart_engine = APExitEngine(broker=object(), email=client_id)
+        restart_engine._positions.append(restart_position)
+        restart_engine._positions_by_id[position_id] = restart_position
+        restart_replay = restart_engine.reconcile_exit_fill_consumption(
+            position_id,
+            local_order_id=old_local,
+            broker_order_id=old_broker,
+            cumulative_filled_qty=2,
+            prior_cumulative_filled=2,
+        )
+        assert restart_replay["ok"] is True
+        assert restart_replay["applied_delta"] == 0
+        assert restart_replay["quantity_remaining"] == 3
+
+        # Migration-boundary proof: an old active partial exit with a nonzero
+        # OSM watermark but no exact position watermark is HOLD, never an
+        # inferred zero/nonzero fill.
+        legacy_position_id = f"legacy-{uuid.uuid4().hex}"
+        with _real_pg_conn() as cursor:
+            cursor.execute(
+                "INSERT INTO positions ("
+                "id, client_id, execution_mode, contract, status, qty, quantity_remaining, meta"
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, '{}'::jsonb)",
+                (
+                    legacy_position_id,
+                    client_id,
+                    mode,
+                    "AVGO260814C00350000",
+                    "CLOSING",
+                    5,
+                    5,
+                ),
+            )
+        legacy_position = copy.copy(position)
+        legacy_position.position_id = legacy_position_id
+        legacy_position.quantity_remaining = 5
+        legacy_position.exit_retry_liveness = dict(final_meta["exit_retry_liveness"])
+        legacy_engine = APExitEngine(broker=object(), email=client_id)
+        legacy_engine._positions.append(legacy_position)
+        legacy_engine._positions_by_id[legacy_position_id] = legacy_position
+        legacy_result = legacy_engine.reconcile_exit_fill_consumption(
+            legacy_position_id,
+            local_order_id=old_local,
+            broker_order_id=old_broker,
+            cumulative_filled_qty=1,
+            prior_cumulative_filled=1,
+        )
+        assert legacy_result["ok"] is False
+        assert legacy_result["reason"] == "position_applied_cumulative_unavailable"
+        with _real_pg_conn() as cursor:
+            cursor.execute(
+                "SELECT quantity_remaining, meta FROM positions WHERE id=%s",
+                (legacy_position_id,),
+            )
+            legacy_remaining, legacy_meta = cursor.fetchone()
+        assert legacy_remaining == 5
+        assert legacy_meta == {}
     finally:
         cleanup_conn = psycopg2.connect(database_url)
         cleanup_conn.autocommit = True
