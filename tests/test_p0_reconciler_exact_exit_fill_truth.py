@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import os
+import threading
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -153,6 +155,7 @@ def _position(*, mode: str = MODE_LIVE) -> dict:
         "execution_mode": mode,
         "entry_ts": "2026-08-10T18:00:00+00:00",
         "opened_at": "2026-08-10T18:00:00+00:00",
+        "local_order_id": "entry-local-1",
         "pending_exit_local_order_id": "exit-local-1",
         "pending_exit_broker_order_id": "TR-195",
     }
@@ -744,6 +747,7 @@ def test_missing_id_exit_generation_mismatch_cannot_promote_current_order(
     [
         (None, "2026-08-10T18:00:00+00:00"),
         ("not-a-timestamp", "2026-08-10T18:00:00+00:00"),
+        ("2026-08-10T19:00:00", "2026-08-10T18:00:00+00:00"),
         ("2026-08-10T17:59:59+00:00", "2026-08-10T18:00:00+00:00"),
     ],
 )
@@ -1001,7 +1005,8 @@ def test_exact_exit_evidence_identity_reaches_position_engine_and_proof(monkeypa
     assert len(proof_calls) == 1
     proof = proof_calls[0]
     assert proof["position_id"] == POSITION_ID
-    assert proof["local_order_id"] == "exit-local-1"
+    assert proof["local_order_id"] == "entry-local-1"
+    assert proof["exit_local_order_id"] == "exit-local-1"
     assert proof["broker_exit_order_id"] == "TR-195"
     assert proof["broker_exit_fill_ts"].isoformat() == evidence["filled_ts"]
     assert proof["broker_exit_filled_qty"] == 2
@@ -1009,6 +1014,177 @@ def test_exact_exit_evidence_identity_reaches_position_engine_and_proof(monkeypa
     mark_kwargs = rec.exit_engine.mark_position_closed.call_args.kwargs
     assert mark_kwargs["local_order_id"] == "exit-local-1"
     assert mark_kwargs["broker_order_id"] == "TR-195"
+    assert mark_kwargs["broker_exit_order_id"] == "TR-195"
+    assert mark_kwargs["broker_exit_fill_ts"].isoformat() == evidence["filled_ts"]
+    assert mark_kwargs["broker_exit_filled_qty"] == 2
+
+
+def test_reconciler_skips_fallback_proof_after_canonical_callback_persists(monkeypatch):
+    evidence = _exit_row(filled_qty=2, fill_price=4.79)
+    updates: list[tuple] = []
+    fallback_calls: list[tuple] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if "FROM ORDERS" in compact:
+                self._row = dict(evidence)
+            elif "FOR UPDATE" in compact:
+                self._row = {
+                    "quantity_remaining": 2,
+                    "qty": 2,
+                    "pending_exit_local_order_id": "exit-local-1",
+                    "pending_exit_broker_order_id": "TR-195",
+                }
+            elif compact.startswith("UPDATE POSITIONS"):
+                updates.append((sql, params))
+
+        def fetchone(self):
+            return getattr(self, "_row", None)
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(db_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+
+    class _Supabase:
+        def table(self, *args):
+            fallback_calls.append(args)
+            raise AssertionError("fallback proof writer must not run")
+
+    rec = _reconciler()
+    rec.supabase_client = _Supabase()
+    rec.exit_engine = MagicMock()
+    rec.exit_engine.mark_position_closed.return_value = True
+    summary = _empty_summary(CLIENT)
+
+    rec._execute_reconciler_close(
+        pos=_position(),
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=2,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+        summary=summary,
+        exact_exit_fill_qty=2,
+        exact_exit_evidence=evidence,
+    )
+
+    assert updates
+    assert fallback_calls == []
+    assert summary.get("proof_write_failures", 0) == 0
+
+
+def test_real_exit_engine_callback_carries_exit_provenance_without_overwriting_entry_id():
+    """Exercise the production ExitEngine -> ExecutionCore callback seam."""
+    from ap_execution_core import APExecutionCore
+    from ap_exit_engine import APExitEngine
+
+    core = APExecutionCore.__new__(APExecutionCore)
+    core.proof = MagicMock()
+    core.proof.log_trade.return_value = {"_proof_persisted": True}
+    core.feedback = MagicMock()
+    core.store = MagicMock()
+    core.shadow = MagicMock()
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._lock = threading.RLock()
+    engine._positions = []
+    engine._positions_by_id = {}
+    engine._email = CLIENT
+    engine._emit_exit_event = MagicMock()
+    engine.on_exit_fill_confirmed = core._finalize_proof
+
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        ticker="C",
+        current_underlying=100.0,
+        closed=False,
+        close_reason="",
+        quantity_remaining=2,
+        _submit_generation=0,
+        current_option_price=2.33,
+        exit_in_flight=True,
+        pending_exit_reason="",
+        pending_exit_action="",
+        pending_exit_qty=2,
+        pending_exit_filled_qty=2,
+        pending_scale_counted=False,
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+        last_applied_exit_local_order_id="",
+        last_applied_exit_broker_order_id="",
+        last_exit_signal_ts=None,
+        last_callback_identity_missing=False,
+        last_callback_identity_missing_ts=None,
+        exit_identity_quarantine=False,
+        pending_exit_replace_allowed=False,
+        pending_exit_replace_reason="",
+        pending_exit_replace_allowed_ts=None,
+        _proof_staged={
+            "ticker": "C",
+            "pattern": "",
+            "side": "CALL",
+            "timeframe": "1d",
+            "score": 0,
+            "tier": "A",
+            "context_score": 0,
+            "setup_status": "reconciler_auto_close",
+            "entry_option_price": 2.33,
+            "exit_option_price": 4.00,
+            "underlying_entry": 100.0,
+            "underlying_exit": 100.0,
+            "contracts": 2,
+            "exit_reason": "RECONCILER_AUTO_CLOSE",
+            "opt_pnl": 0.0,
+            "spread_pct": 0.0,
+            "chain_grade": "",
+            "opened_at": "2026-08-10T18:00:00+00:00",
+            "synthetic_entry": False,
+            "position_id": POSITION_ID,
+            "local_order_id": "entry-local-1",
+            "signal": {},
+            "paper": False,
+        },
+        _proof_finalized=False,
+    )
+    engine._positions_by_id[POSITION_ID] = pos
+
+    fill_ts = datetime(2026, 8, 10, 19, 0, tzinfo=timezone.utc)
+    result = engine.mark_position_closed(
+        POSITION_ID,
+        reason="reconciler_auto_close",
+        qty_filled=2,
+        fill_price=4.79,
+        local_order_id="exit-local-1",
+        broker_order_id="TR-195",
+        broker_exit_order_id="TR-195",
+        broker_exit_fill_ts=fill_ts,
+        broker_exit_filled_qty=2,
+        reconciled=True,
+    )
+
+    assert result is True
+    proof = core.proof.log_trade.call_args.kwargs
+    assert proof["local_order_id"] == "entry-local-1"
+    assert proof["exit_local_order_id"] == "exit-local-1"
+    assert proof["broker_exit_order_id"] == "TR-195"
+    assert proof["broker_exit_fill_ts"] == fill_ts
+    assert proof["broker_exit_filled_qty"] == 2
 
 
 def _run_unproven_three_passes(rec: APBrokerReconciler, pos: dict, mark: float):

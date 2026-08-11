@@ -478,6 +478,7 @@ class APProofLogger:
         broker_exit_order_id: str = "",
         broker_exit_fill_ts:  Optional[datetime] = None,
         broker_exit_filled_qty: Optional[int] = None,
+        exit_local_order_id: str = "",
     ) -> dict:
         now = datetime.now(timezone.utc)
         # execution_mode is COPIED from the originating entry order (source of
@@ -557,6 +558,8 @@ class APProofLogger:
             )
         if broker_exit_filled_qty:
             row["broker_exit_filled_qty"] = int(broker_exit_filled_qty)
+        if exit_local_order_id:
+            row["exit_local_order_id"] = str(exit_local_order_id)
 
         # Cache for convenience — not source of truth
         with self._lock:
@@ -587,6 +590,7 @@ class APProofLogger:
             "entry_option_price", "exit_option_price", "contracts",
             "exit_reason", "option_pnl_pct", "underlying_pnl_pct", "win",
             "synthetic_entry", "position_id", "local_order_id",
+            "exit_local_order_id",
         }
         # ── Persistence-status tracking ──────────────────────────────────────
         # _persisted is set True only after a confirmed Supabase insert.

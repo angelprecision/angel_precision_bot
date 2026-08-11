@@ -106,6 +106,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
         "position_id", "client_email", "closed_at", "execution_mode",
         "official_live_performance_eligible", "performance_taxonomy",
         "training_eligible", "taxonomy_reason", "quote_domain_consistent",
+        "exit_local_order_id",
     }),
     # PR #360 — durable EXIT ownership on positions (pending_exit_action /
     # pending_exit_reason are intentionally NOT required: the fill-truth

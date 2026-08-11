@@ -278,6 +278,36 @@ The proof row should preserve `broker_exit_order_id`, `broker_exit_fill_ts`, and
 `broker_exit_filled_qty` when those columns are available. Do not fall back to
 the position's `local_order_id`, which identifies the entry generation.
 
+#### Amendment — canonical callback provenance and proof identity
+
+The exact-fill reconciler must pass the evidence bundle through the real
+`APExitEngine.mark_position_closed()` callback before any reconciler fallback
+proof path runs:
+
+```text
+mark_position_closed
+  -> on_exit_fill_confirmed
+  -> APExecutionCore._finalize_proof
+  -> APProofLogger.log_trade
+```
+
+The callback carries `exit_local_order_id`, `broker_exit_order_id`,
+`broker_exit_fill_ts`, and `broker_exit_filled_qty`. The callback reports
+confirmed durable proof persistence; only when it does not report persistence
+may the reconciler's manual/recovery fallback writer run. This closes the
+callback-versus-idempotency race without allowing the fallback writer to
+overwrite canonical proof.
+
+`proof_trades.local_order_id` remains the originating ENTRY local-order bridge.
+The EXIT local-order identity is persisted separately as
+`proof_trades.exit_local_order_id`; it must never replace the entry bridge.
+The additive migration is:
+`migrations/20260810_proof_exit_local_identity.sql`.
+
+Broker fill timestamps are exact generation evidence. Missing, malformed,
+pre-entry, or naive timestamps are invalid and hold; naive values are not
+silently assigned UTC.
+
 ### File 2 — focused regression tests
 
 Create:
@@ -312,6 +342,9 @@ Required cases:
 22. Missing, malformed, and pre-entry `filled_ts` values hold.
 23. Exact broker EXIT identity/timestamp/quantity reaches the position callback and proof writer.
 24. Broker-flat observation before external/manual fill adoption causes no position/proof mutation.
+25. The real exit-engine callback persists exact EXIT provenance before reconciler fallback/idempotency handling.
+26. Proof preserves the ENTRY local-order bridge and stores EXIT local identity separately.
+27. Naive broker fill timestamps cannot authorize close.
 
 ## Explicit non-goals
 
@@ -325,8 +358,8 @@ Do not change:
 - sizing/risk;
 - broker submit/cancel behavior;
 - manual-close broker discovery rules except tests if needed;
-- proof taxonomy architecture;
-- migrations/schema.
+- proof taxonomy architecture beyond the explicit EXIT-local identity field;
+- unrelated migrations/schema changes.
 
 Do not repair today's historical C row automatically inside runtime code. Historical correction/audit is a separate controlled data operation after this faucet is closed.
 
@@ -336,10 +369,13 @@ Expected:
 
 1. `ap_reconciler.py`
 2. `tests/test_p0_reconciler_exact_exit_fill_truth.py`
-3. `ap_proof_logger.py` only to persist the existing `broker_exit_order_id`,
-   `broker_exit_fill_ts`, and `broker_exit_filled_qty` columns from the exact
-   evidence bundle
-4. `.github/workflows/p0_regression.yml` only if the focused test is not already picked up by an existing pattern
+3. `ap_proof_logger.py` only to persist the exact evidence bundle into the
+   existing broker EXIT columns plus the explicit `exit_local_order_id` field
+4. `ap_exit_engine.py` to carry the exact callback evidence and report canonical persistence
+5. `ap_execution_core.py` to make the callback the provenance-rich proof writer
+6. `migrations/20260810_proof_exit_local_identity.sql` for the separate EXIT local identity
+7. `ap/schema_attestation.py` to require the new proof identity column before LIVE startup
+8. `.github/workflows/p0_regression.yml` only if the focused test is not already picked up by an existing pattern
 
 No other production files are changed.
 

@@ -5403,6 +5403,9 @@ class APExitEngine:
         fill_price: Optional[float] = None,
         local_order_id: str = "",
         broker_order_id: str = "",
+        broker_exit_order_id: str = "",
+        broker_exit_fill_ts: Optional[datetime] = None,
+        broker_exit_filled_qty: Optional[int] = None,
         cumulative_filled: Optional[int] = None,
         cumulative_filled_qty: Optional[int] = None,
         force: bool = False,
@@ -5450,11 +5453,33 @@ class APExitEngine:
                 # only knew the limit price. on_exit_fill_confirmed calls
                 # APExecutionCore._finalize_proof() which writes proof/P&L/feedback
                 # using actual fill_price, not the estimated bid/mid at submit.
+                _proof_callback_result = None
                 try:
                     _fill_cb = getattr(self, "on_exit_fill_confirmed", None)
                     if _fill_cb is not None and callable(_fill_cb):
-                        _fill_cb(pos, float(fill_price) if fill_price is not None else 0.0)
+                        _proof_callback_result = _fill_cb(
+                            pos,
+                            float(fill_price) if fill_price is not None else 0.0,
+                            exit_local_order_id=(
+                                local_order_id
+                                or getattr(pos, "pending_exit_local_order_id", "")
+                                or ""
+                            ),
+                            broker_exit_order_id=(
+                                broker_exit_order_id
+                                or broker_order_id
+                                or getattr(pos, "pending_exit_broker_order_id", "")
+                                or ""
+                            ),
+                            broker_exit_fill_ts=broker_exit_fill_ts,
+                            broker_exit_filled_qty=(
+                                broker_exit_filled_qty
+                                if broker_exit_filled_qty is not None
+                                else qty_filled
+                            ),
+                        )
                 except Exception as _cb_err:
+                    _proof_callback_result = False
                     log.error("on_exit_fill_confirmed callback failed (non-fatal): %s", _cb_err)
                 pos.exit_in_flight   = False
                 pos.pending_exit_reason = ""
@@ -5490,6 +5515,11 @@ class APExitEngine:
                 # and get_position() returning closed positions to callers.
                 if pos.position_id and pos.position_id in self._positions_by_id:
                     del self._positions_by_id[pos.position_id]
+                log.info(
+                    "[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s",
+                    position_id, reason,
+                )
+                return _proof_callback_result
         log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
 
     def clear_exit_in_flight(

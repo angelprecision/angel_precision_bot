@@ -9946,7 +9946,16 @@ class APExecutionCore:
         except Exception:
             return None
 
-    def _finalize_proof(self, pos: "ManagedPosition", actual_fill_price: float = 0.0) -> None:
+    def _finalize_proof(
+        self,
+        pos: "ManagedPosition",
+        actual_fill_price: float = 0.0,
+        *,
+        exit_local_order_id: str = "",
+        broker_exit_order_id: str = "",
+        broker_exit_fill_ts: Optional[datetime] = None,
+        broker_exit_filled_qty: Optional[int] = None,
+    ) -> bool:
         """Write proof/P&L/feedback using the ACTUAL broker fill price.
 
         Called from mark_position_closed via the exit engine's
@@ -9959,14 +9968,14 @@ class APExecutionCore:
         """
         staged = getattr(pos, "_proof_staged", None)
         if not staged:
-            return
+            return False
         if getattr(pos, "_proof_finalized", False):
             log.info(
                 "[EXIT_PROOF_FINALIZE_SKIPPED_ALREADY_LOGGED] %s | "
                 "position already finalized — skipping duplicate",
                 getattr(pos, "ticker", "?"),
             )
-            return
+            return bool(getattr(pos, "_proof_persisted", False))
         pos._proof_finalized = True  # type: ignore[attr-defined]
 
         # Use actual fill price; fall back to estimated if broker returns 0/None
@@ -10019,9 +10028,9 @@ class APExecutionCore:
         # Dropping them when proof errors creates silent data loss exactly
         # in degraded DB conditions (when intel matters most for diagnosis).
         # Track proof outcome with a flag; do NOT early-return.
-        proof_ok = True
+        proof_ok = False
         try:
-            self.proof.log_trade(
+            _proof_result = self.proof.log_trade(
                 ticker             = staged["ticker"],
                 pattern            = staged.get("pattern", ""),
                 side               = staged.get("side", ""),
@@ -10046,13 +10055,20 @@ class APExecutionCore:
                 synthetic_entry    = staged.get("synthetic_entry", False),
                 position_id        = staged.get("position_id", ""),
                 local_order_id     = staged.get("local_order_id", ""),
+                exit_local_order_id = str(exit_local_order_id or "").strip(),
+                broker_exit_order_id = str(broker_exit_order_id or "").strip(),
+                broker_exit_fill_ts  = broker_exit_fill_ts,
+                broker_exit_filled_qty = broker_exit_filled_qty,
                 # Slippage vs staged estimate
                 exit_fill_price    = fill if fill > 0 else None,
                 exit_limit_placed  = est if est > 0 else None,
                 slippage_vs_bid    = slippage_vs_est,
             )
+            proof_ok = bool(
+                isinstance(_proof_result, dict)
+                and _proof_result.get("_proof_persisted") is True
+            )
         except Exception as proof_err:
-            proof_ok = False
             log.error(
                 "[%s] _finalize_proof: proof.log_trade failed: %s — "
                 "continuing to feedback/shadow/intel (proof-independent)",
@@ -10101,6 +10117,9 @@ class APExecutionCore:
                 )
             except Exception as _alpha_err:
                 log.warning("Alpha tracker update failed: %s", _alpha_err)
+
+        pos._proof_persisted = proof_ok  # type: ignore[attr-defined]
+        return proof_ok
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
         log.info(

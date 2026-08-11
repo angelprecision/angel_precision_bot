@@ -78,7 +78,7 @@ class TestExitFillCallbackWiring:
 
     def test_finalize_proof_method_exists(self):
         m = re.search(
-            r"def _finalize_proof\(self,\s*pos[^)]*,\s*actual_fill_price[^)]*\)",
+            r"def _finalize_proof\(\s*self\s*,\s*pos[\s\S]*?actual_fill_price[\s\S]*?\)",
             EX_CORE,
         )
         assert m, (
@@ -144,7 +144,7 @@ class TestFinalizeProofIsTheOnlyWriter:
     @pytest.fixture
     def finalize_body(self):
         m = re.search(
-            r"^    def _finalize_proof\(self.*?(?=^    def )",
+            r"^    def _finalize_proof\(.*?(?=^    def )",
             EX_CORE, re.DOTALL | re.MULTILINE,
         )
         assert m, "_finalize_proof not found"
@@ -192,7 +192,7 @@ class TestFinalizeProofIsTheOnlyWriter:
         leak proof writes back to the submit-time path."""
         # Strip the body of _finalize_proof, then search what remains.
         m = re.search(
-            r"^    def _finalize_proof\(self.*?(?=^    def )",
+            r"^    def _finalize_proof\(.*?(?=^    def )",
             EX_CORE, re.DOTALL | re.MULTILINE,
         )
         without_finalize = EX_CORE.replace(m.group(0), "")
@@ -212,7 +212,7 @@ class TestFinalizeProofIsTheOnlyWriter:
         """Mark-as-closed against the signal store must happen only from
         _finalize_proof, after broker-confirmed fill."""
         m = re.search(
-            r"^    def _finalize_proof\(self.*?(?=^    def )",
+            r"^    def _finalize_proof\(.*?(?=^    def )",
             EX_CORE, re.DOTALL | re.MULTILINE,
         )
         without_finalize = EX_CORE.replace(m.group(0), "")
@@ -240,7 +240,7 @@ class TestActualFillPriceUsed:
     @pytest.fixture
     def finalize_body(self):
         m = re.search(
-            r"^    def _finalize_proof\(self.*?(?=^    def )",
+            r"^    def _finalize_proof\(.*?(?=^    def )",
             EX_CORE, re.DOTALL | re.MULTILINE,
         )
         assert m
@@ -292,7 +292,7 @@ class TestActualFillPriceUsed:
 @pytest.fixture(scope="module")
 def finalize_proof_callable():
     body_match = re.search(
-        r"^    def _finalize_proof\(self.*?(?=^    def )",
+        r"^    def _finalize_proof\(.*?(?=^    def )",
         EX_CORE, re.DOTALL | re.MULTILINE,
     )
     assert body_match, "could not locate _finalize_proof"

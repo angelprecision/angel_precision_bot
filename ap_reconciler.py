@@ -272,7 +272,7 @@ def _parse_reconciler_timestamp(value: object) -> Optional[datetime]:
         else:
             parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            return None
         return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError, OverflowError):
         return None
@@ -3738,16 +3738,22 @@ class APBrokerReconciler:
 
         # Only notify exit engine if position is truly fully closed
         _ee = getattr(self, "exit_engine", None)
+        _canonical_proof_persisted = False
         if _ee and final_status == "CLOSED":
             try:
-                _ee.mark_position_closed(
-                    str(pos_id),
-                    reason="reconciler_auto_close",
-                    qty_filled=exact_exit_fill_qty,
-                    fill_price=exit_px,
-                    local_order_id=evidence_local_order_id,
-                    broker_order_id=evidence_broker_order_id,
-                    reconciled=True,
+                _canonical_proof_persisted = (
+                    _ee.mark_position_closed(
+                        str(pos_id),
+                        reason="reconciler_auto_close",
+                        qty_filled=exact_exit_fill_qty,
+                        fill_price=exit_px,
+                        local_order_id=evidence_local_order_id,
+                        broker_order_id=evidence_broker_order_id,
+                        broker_exit_order_id=evidence_broker_order_id,
+                        broker_exit_fill_ts=evidence_filled_ts,
+                        broker_exit_filled_qty=exact_exit_fill_qty,
+                        reconciled=True,
+                    ) is True
                 )
             except Exception as _e:
                 log.warning("reconciler_mark_position_closed_failed: %s", _e)
@@ -3773,6 +3779,25 @@ class APBrokerReconciler:
             )
             return
 
+        if _canonical_proof_persisted:
+            log.info(
+                "[%s] RECONCILER_PROOF_CANONICAL_CALLBACK_PERSISTED contract=%s "
+                "position_id=%s entry_local_order_id=%s exit_local_order_id=%s "
+                "broker_exit_order_id=%s — fallback proof write skipped",
+                self.client_id,
+                contract,
+                pos_id,
+                str(pos.get("local_order_id") or pos.get("entry_local_order_id") or "").strip(),
+                evidence_local_order_id,
+                evidence_broker_order_id,
+            )
+            try:
+                from ap_proof_logger import funnel as _funnel_r
+                _funnel_r.inc("reconciler_corrections")
+            except Exception:
+                pass
+            return
+
         # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
         # Without this, any position closed outside the exit engine (manual broker
         # close, overnight expiry, emergency flatten) is invisible in the trade ledger.
@@ -3789,8 +3814,15 @@ class APBrokerReconciler:
                 )
                 _proof_write_failed = True
             else:
-                _local_order_id = evidence_local_order_id
-                _pos_id_str     = str(pos_id or "")
+                _entry_local_order_id = str(
+                    pos.get("local_order_id")
+                    or pos.get("entry_local_order_id")
+                    or ""
+                ).strip()
+                _exit_local_order_id  = evidence_local_order_id
+                _pos_id_str            = str(pos_id or "")
+                if not _entry_local_order_id:
+                    raise RuntimeError("missing_entry_local_order_id")
 
                 # ── Idempotency: three-state lookup ───────────────────────────
                 # IDEMPOTENCY_EXISTS  — existing row confirmed → skip, no failure
@@ -3812,12 +3844,12 @@ class APBrokerReconciler:
                         .execute()
                     )
                     _existing_rows = (_existing.data or []) if _existing else []
-                    if not _existing_rows and _local_order_id:
+                    if not _existing_rows and _entry_local_order_id:
                         _existing2 = (
                             self.supabase_client
                             .table("proof_trades")
                             .select("id")
-                            .eq("local_order_id", _local_order_id)
+                            .eq("local_order_id", _entry_local_order_id)
                             .limit(1)
                             .execute()
                         )
@@ -3831,7 +3863,7 @@ class APBrokerReconciler:
                     log.info(
                         "[%s] RECONCILER_PROOF_ALREADY_EXISTS contract=%s position_id=%s "
                         "local_order_id=%s — skipping duplicate insert",
-                        self.client_id, contract, _pos_id_str, _local_order_id,
+                        self.client_id, contract, _pos_id_str, _entry_local_order_id,
                     )
                     # safe no-op — not a write failure
 
@@ -3841,7 +3873,7 @@ class APBrokerReconciler:
                         "[%s] RECONCILER_PROOF_IDEMPOTENCY_UNVERIFIED contract=%s "
                         "position_id=%s local_order_id=%s client=%s "
                         "error=%s — insert blocked to prevent duplicates",
-                        self.client_id, contract, _pos_id_str, _local_order_id,
+                        self.client_id, contract, _pos_id_str, _entry_local_order_id,
                         self.client_id, _idem_err_str,
                     )
                     _proof_write_failed = True
@@ -3876,7 +3908,8 @@ class APBrokerReconciler:
                         chain_grade        = "",
                         synthetic_entry    = False,
                         position_id        = _pos_id_str,
-                        local_order_id     = _local_order_id,
+                        local_order_id     = _entry_local_order_id,
+                        exit_local_order_id = _exit_local_order_id,
                         execution_mode     = self.execution_mode or "",
                         broker_exit_order_id = evidence_broker_order_id,
                         broker_exit_fill_ts  = evidence_filled_ts,
