@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,14 +88,26 @@ def _migration_checksum() -> str:
 
 
 def _index_is_active_exit_unique(row: dict[str, Any]) -> bool:
-    definition = str(row.get("indexdef") or "").lower()
+    definition = re.sub(r"\s+", " ", str(row.get("indexdef") or "").lower()).strip()
     if "create unique index" not in definition:
         return False
-    if "position_id" not in definition or "kind" not in definition:
+    if not re.search(r"\(\s*client_id\s*,\s*position_id\s*\)", definition):
         return False
-    if "exit" not in definition:
+    if not re.search(r"\bkind\s*=\s*'exit'(?:\s*::\s*[a-z0-9_]+)?", definition):
         return False
-    return any(status.lower() in definition for status in _ACTIVE_EXIT_STATUSES)
+    status_predicates = re.findall(r"\bstatus\s+in\s*\(([^)]*)\)", definition)
+    status_predicates.extend(
+        re.findall(
+            r"\bstatus\s*=\s*any\s*\(\s*array\s*\[([^\]]*)\]",
+            definition,
+        )
+    )
+    if not status_predicates:
+        return False
+    status_literals = set()
+    for predicate in status_predicates:
+        status_literals.update(re.findall(r"'(exit_[a-z_]+)'", predicate))
+    return status_literals == {status.lower() for status in _ACTIVE_EXIT_STATUSES}
 
 
 def _read_snapshot() -> dict[str, Any]:
@@ -241,6 +254,10 @@ def _classify_partial_fill(row: dict[str, Any]) -> dict[str, Any]:
             findings.append("PARTIAL_FILL_BROKER_ORDER_ID_MISMATCH")
         if marker.get("execution_mode") != str(row.get("execution_mode") or "").strip().lower():
             findings.append("PARTIAL_FILL_EXECUTION_MODE_MISMATCH")
+        position_mode = str(row.get("execution_mode") or "").strip().lower()
+        order_mode = str(row.get("order_execution_mode") or "").strip().lower()
+        if not order_mode or order_mode != position_mode:
+            findings.append("PARTIAL_FILL_ORDER_EXECUTION_MODE_MISMATCH")
         if _positive_int(filled_qty) and marker.get("applied_cumulative_qty") != filled_qty:
             findings.append("PARTIAL_FILL_WATERMARK_QTY_MISMATCH")
     return {

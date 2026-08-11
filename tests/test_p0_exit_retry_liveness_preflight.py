@@ -144,3 +144,49 @@ def test_preflight_holds_missing_proof_and_ambiguous_partial_fill(monkeypatch):
     assert "MULTIPLE_ACTIVE_EXITS_PER_POSITION" in result["findings"]
     assert result["broker_calls"] == 0
     assert result["writes"] == 0
+
+
+def test_active_exit_index_proof_requires_complete_status_predicate():
+    complete = {
+        "indexdef": (
+            "CREATE UNIQUE INDEX orders_active_exit_unique ON public.orders "
+            "(client_id, position_id) WHERE kind='EXIT' AND status IN "
+            "('EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL')"
+        )
+    }
+    subset = {
+        "indexdef": complete["indexdef"].replace(
+            ",'EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'", ""
+        )
+    }
+
+    assert preflight._index_is_active_exit_unique(complete) is True
+    assert preflight._index_is_active_exit_unique(subset) is False
+
+
+def test_partial_fill_preflight_requires_order_mode_to_match_position_mode():
+    row = {
+        "position_id": "pos-1",
+        "client_id": "client-1",
+        "execution_mode": "paper",
+        "order_execution_mode": "live",
+        "local_order_id": "loc-1",
+        "broker_order_id": "bro-1",
+        "filled_qty": 1,
+        "meta": {
+            "exit_fill_consumption": {
+                "position_id": "pos-1",
+                "client_id": "client-1",
+                "execution_mode": "paper",
+                "local_order_id": "loc-1",
+                "broker_order_id": "bro-1",
+                "replacement_generation": 0,
+                "applied_cumulative_qty": 1,
+            }
+        },
+    }
+
+    result = preflight._classify_partial_fill(row)
+
+    assert result["safe"] is False
+    assert "PARTIAL_FILL_ORDER_EXECUTION_MODE_MISMATCH" in result["findings"]

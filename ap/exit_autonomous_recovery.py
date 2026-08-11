@@ -1598,6 +1598,42 @@ def _recover_known_open_exit_when_monitor_unavailable(
         )
     replacement_qty = terminal_requested_qty - terminal_filled_qty
     if replacement_qty <= 0:
+        terminal_status = _osm_terminal_status_for_broker_status(
+            proof.get("confirmed_status")
+            or _status(confirmed_payload if isinstance(confirmed_payload, dict) else {})
+        )
+        terminalized, terminalize_reason, terminalize_details = (
+            _terminalize_fully_consumed_exit_generation(
+                pos=pos,
+                exit_engine=exit_engine,
+                osm=osm,
+                local_id=local_id,
+                broker_id=broker_id,
+                position_id=_position_id(pos),
+                client_id=_norm(getattr(pos, "client_id", "")),
+                execution_mode=str(getattr(pos, "execution_mode", "") or ""),
+                terminal_status=terminal_status,
+                filled_qty=terminal_filled_qty,
+                reason="autonomous_recovery_terminal_cancel_fill_exhausts_osm_qty",
+            )
+        )
+        details.update(terminalize_details)
+        if not terminalized:
+            details.update(
+                {
+                    "error": terminalize_reason,
+                    "broker_mutation_blocked": True,
+                    "replacement_blocked": True,
+                }
+            )
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_terminal_cancel_fill_exhaustion_terminalization_failed",
+                _position_id(pos),
+                local_id,
+                broker_id,
+                details,
+            )
         details.update(
             {
                 "broker_mutation_blocked": True,
@@ -1706,6 +1742,137 @@ def _replacement_row_is_exact(
         and _norm(row.get("kind")).upper() == "EXIT"
         and valid_status
     )
+
+
+def _osm_terminal_status_for_broker_status(status: Any) -> Optional[str]:
+    return {
+        "canceled": "CANCELED",
+        "cancelled": "CANCELED",
+        "expired": "EXPIRED",
+        "rejected": "REJECTED",
+    }.get(_norm(status).lower())
+
+
+def _runtime_exit_identity_is_clear(pos: Any) -> bool:
+    return bool(
+        not getattr(pos, "exit_in_flight", False)
+        and not getattr(pos, "pending_exit_local_order_id", "")
+        and not getattr(pos, "pending_exit_broker_order_id", "")
+    )
+
+
+def _terminalize_fully_consumed_exit_generation(
+    *,
+    pos: Any,
+    exit_engine: Any,
+    osm: Any,
+    local_id: str,
+    broker_id: str,
+    position_id: str,
+    client_id: str,
+    execution_mode: str,
+    terminal_status: Optional[str],
+    filled_qty: int,
+    reason: str,
+) -> tuple[bool, str, dict]:
+    """Terminalize an exact old EXIT after its requested tranche is consumed."""
+    if terminal_status not in {"CANCELED", "EXPIRED", "REJECTED"}:
+        return False, "broker_terminal_status_unrecognized", {}
+    if type(filled_qty) is not int or filled_qty <= 0:
+        return False, "terminal_filled_quantity_invalid", {}
+
+    row = _order_row(osm, local_id)
+    row_qty, row_present = _strict_durable_cumulative_fill_authority(row)
+    exact_active = (
+        _replacement_row_is_exact(
+            row,
+            local_id=local_id,
+            broker_id=broker_id,
+            position_id=position_id,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            active=True,
+        )
+        and row_present
+        and row_qty == filled_qty
+    )
+    exact_terminal = (
+        _replacement_row_is_exact(
+            row,
+            local_id=local_id,
+            broker_id=broker_id,
+            position_id=position_id,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            active=False,
+        )
+        and _norm(row.get("status")).upper() == terminal_status
+        and row_present
+        and row_qty == filled_qty
+    )
+    if not exact_active and not exact_terminal:
+        return False, "fully_consumed_exit_generation_identity_or_fill_unconfirmed", {}
+
+    transition_ok = exact_terminal
+    transition = getattr(osm, "transition", None)
+    if not transition_ok:
+        if not callable(transition):
+            return False, "fully_consumed_exit_terminal_transition_unavailable", {}
+        try:
+            transition_ok = bool(
+                transition(
+                    local_id,
+                    terminal_status,
+                    broker_order_id=broker_id,
+                    filled_qty=filled_qty,
+                    position_id=position_id,
+                    last_error=reason,
+                )
+            )
+        except Exception as exc:
+            return False, f"fully_consumed_exit_terminal_transition_failed:{type(exc).__name__}", {}
+
+    refreshed = _order_row(osm, local_id)
+    refreshed_qty, refreshed_present = _strict_durable_cumulative_fill_authority(refreshed)
+    if not (
+        transition_ok
+        and _replacement_row_is_exact(
+            refreshed,
+            local_id=local_id,
+            broker_id=broker_id,
+            position_id=position_id,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            active=False,
+        )
+        and _norm(refreshed.get("status")).upper() == terminal_status
+        and refreshed_present
+        and refreshed_qty == filled_qty
+    ):
+        return False, "fully_consumed_exit_terminal_transition_unconfirmed", {}
+
+    if not _runtime_exit_identity_is_clear(pos):
+        clear = getattr(exit_engine, "clear_exit_in_flight", None)
+        if not callable(clear):
+            return False, "fully_consumed_exit_identity_clear_unavailable", {}
+        try:
+            clear(
+                position_id,
+                reason=reason,
+                local_order_id=local_id,
+                broker_order_id=broker_id,
+                reconciled=False,
+            )
+        except Exception as exc:
+            return False, f"fully_consumed_exit_identity_clear_failed:{type(exc).__name__}", {}
+        if not _runtime_exit_identity_is_clear(pos):
+            return False, "fully_consumed_exit_identity_clear_unconfirmed", {}
+
+    return True, "fully_consumed_exit_generation_terminalized", {
+        "durable_osm_transition": terminal_status,
+        "terminalized_fully_consumed_old_exit": True,
+        "old_exit_identity_cleared": True,
+    }
 
 
 def _strict_replacement_row_qty(row: dict) -> Optional[int]:
@@ -3054,6 +3221,41 @@ def recover_exit_position(
             )
         terminal_replacement_qty = terminal_requested_qty - terminal_filled_qty
         if _contract_held and terminal_replacement_qty <= 0:
+            terminal_status = _osm_terminal_status_for_broker_status(
+                _status(terminal_broker_snapshot or {})
+            )
+            terminalized, terminalize_reason, terminalize_details = (
+                _terminalize_fully_consumed_exit_generation(
+                    pos=pos,
+                    exit_engine=exit_engine,
+                    osm=osm,
+                    local_id=local_id,
+                    broker_id=terminal_exact_broker_id,
+                    position_id=pid,
+                    client_id=_norm(getattr(pos, "client_id", "")),
+                    execution_mode=str(getattr(pos, "execution_mode", "") or ""),
+                    terminal_status=terminal_status,
+                    filled_qty=terminal_filled_qty,
+                    reason="autonomous_recovery_terminal_cancel_fill_exhausts_osm_qty_position_held",
+                )
+            )
+            terminal_late_fill_details.update(terminalize_details)
+            if not terminalized:
+                return RecoveryAction(
+                    "NOOP",
+                    "autonomous_recovery_terminal_cancel_fill_exhaustion_terminalization_failed",
+                    pid,
+                    local_id,
+                    terminal_exact_broker_id,
+                    {
+                        "contract": contract,
+                        "quote_health": qh,
+                        "error": terminalize_reason,
+                        **terminal_late_fill_details,
+                        "broker_mutation_blocked": True,
+                        "replacement_blocked": True,
+                    },
+                )
             return RecoveryAction(
                 "NOOP",
                 "autonomous_recovery_terminal_cancel_fill_exhausts_osm_qty_position_held",

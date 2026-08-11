@@ -177,6 +177,29 @@ class _DurableOSM:
             )
         return True
 
+    def create_exit_order(self, **kwargs):
+        if self.row["status"] in {
+            "EXIT_REQUESTED",
+            "EXIT_SUBMITTED",
+            "EXIT_ACKNOWLEDGED",
+            "EXIT_PARTIAL_FILL",
+        }:
+            return self.row["local_order_id"]
+        local_id = kwargs.get("local_order_id") or "loc-new-pr423"
+        self.row = {
+            "local_order_id": local_id,
+            "position_id": kwargs["position_id"],
+            "broker_order_id": "",
+            "client_id": self.row["client_id"],
+            "execution_mode": kwargs["execution_mode"],
+            "kind": "EXIT",
+            "status": "EXIT_REQUESTED",
+            "qty": int(kwargs["qty"]),
+            "filled_qty": 0,
+            "meta": {},
+        }
+        return local_id
+
 
 class _PositionDurabilityStore:
     """Small row-locked positions-table double for restart crash tests."""
@@ -1108,6 +1131,163 @@ def test_terminal_cancel_uses_proven_partial_fill_for_replacement_qty():
     _, mark_kwargs = exit_engine.mark_exit_replacement_safe.call_args
     assert mark_kwargs["replacement_qty"] == 1
     assert position.quantity_remaining == 7
+
+
+def _fully_consumed_cancel_fixture(monkeypatch):
+    class _FullyConsumedCancelBroker:
+        def __init__(self):
+            self.get_order_calls = 0
+            self.cancel_calls = 0
+
+        def get_order(self, broker_order_id):
+            self.get_order_calls += 1
+            if self.get_order_calls == 1:
+                status = "working"
+                payload = {}
+            else:
+                status = "canceled"
+                payload = {"exec_quantity": 3}
+            return {
+                "id": broker_order_id,
+                "contract": "AVGO260814C00350000",
+                "status": status,
+                **payload,
+            }
+
+        def list_open_orders(self):
+            return []
+
+        def list_positions(self):
+            return [{"symbol": "AVGO260814C00350000", "quantity": 4}]
+
+        def cancel_order(self, broker_order_id):
+            self.cancel_calls += 1
+            return {"status": "canceled", "broker_order_id": broker_order_id}
+
+    broker = _FullyConsumedCancelBroker()
+    position = _production_callsite_position()
+    position.quantity = 7
+    position.contracts = 7
+    position.quantity_remaining = 5
+    position.pending_exit_local_order_id = "loc-fully-consumed-pr423"
+    position.pending_exit_broker_order_id = "bro-fully-consumed-pr423"
+    position.pending_exit_qty = 3
+    position.pending_exit_filled_qty = 2
+    marker = _fill_consumption_marker(
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+        local_id=position.pending_exit_local_order_id,
+        broker_id=position.pending_exit_broker_order_id,
+        applied=2,
+    )
+    position.exit_fill_consumption = dict(marker)
+    _patch_position_durability(
+        monkeypatch,
+        _PositionDurabilityStore(
+            quantity_remaining=5,
+            qty=7,
+            meta={"exit_fill_consumption": marker},
+        ),
+    )
+
+    exit_engine = APExitEngine(broker=broker, email=position.client_id)
+    exit_engine._emit_exit_event = MagicMock()
+    exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    exit_engine._persist_exit_fill_consumption_to_db = MagicMock(
+        side_effect=_fake_runtime_exit_fill_consumption
+    )
+    exit_engine.add_position(position)
+    exit_engine.mark_exit_replacement_safe = MagicMock(
+        wraps=exit_engine.mark_exit_replacement_safe
+    )
+    osm = _DurableOSM(
+        local_id=position.pending_exit_local_order_id,
+        broker_id=position.pending_exit_broker_order_id,
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+        qty=3,
+        filled_qty=2,
+        exit_engine=exit_engine,
+    )
+    return broker, position, exit_engine, osm
+
+
+def test_fully_consumed_canceled_exit_terminalizes_old_generation_before_noop(monkeypatch):
+    broker, position, exit_engine, osm = _fully_consumed_cancel_fixture(monkeypatch)
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_terminal_cancel_fill_exhausts_osm_qty"
+    assert action.details["durable_osm_transition"] == "CANCELED"
+    assert action.details["terminalized_fully_consumed_old_exit"] is True
+    assert action.details["old_exit_identity_cleared"] is True
+    assert position.quantity_remaining == 4
+    assert position.closed is False
+    assert position.exit_in_flight is False
+    assert position.pending_exit_local_order_id == ""
+    assert position.pending_exit_broker_order_id == ""
+    assert osm.row["status"] == "CANCELED"
+    assert osm.row["filled_qty"] == 3
+    assert exit_engine.mark_exit_replacement_safe.call_count == 0
+
+    new_local_id = osm.create_exit_order(
+        position_id=position.position_id,
+        contract=position.option_symbol,
+        symbol=position.ticker,
+        direction="CALL",
+        qty=1,
+        local_order_id="loc-new-pr423",
+        execution_mode=position.execution_mode,
+    )
+    assert new_local_id == "loc-new-pr423"
+    assert new_local_id != "loc-fully-consumed-pr423"
+    assert osm.row["status"] == "EXIT_REQUESTED"
+
+
+def test_restart_replay_of_terminalized_canceled_exit_does_not_reconsume(monkeypatch):
+    broker, position, exit_engine, osm = _fully_consumed_cancel_fixture(monkeypatch)
+
+    first = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+    assert first.reason == "autonomous_recovery_terminal_cancel_fill_exhausts_osm_qty"
+    assert position.quantity_remaining == 4
+
+    replayed_position = copy.copy(position)
+    replayed_engine = APExitEngine(broker=broker, email=position.client_id)
+    replayed_engine._emit_exit_event = MagicMock()
+    replayed_engine.mark_exit_replacement_safe = MagicMock(
+        wraps=replayed_engine.mark_exit_replacement_safe
+    )
+    replayed_engine.add_position(replayed_position)
+
+    replay = recover_exit_position(
+        replayed_position,
+        broker=broker,
+        exit_engine=replayed_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert replay.action == "NOOP"
+    assert replayed_position.quantity_remaining == 4
+    assert position.quantity_remaining == 4
+    assert osm.row["status"] == "CANCELED"
+    assert osm.row["filled_qty"] == 3
+    assert replayed_engine.mark_exit_replacement_safe.call_count == 0
 
 
 def test_terminal_cancel_monotonic_late_fill_is_applied_before_replacement(monkeypatch):
