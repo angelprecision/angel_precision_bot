@@ -81,12 +81,16 @@ def test_exit_replace_attempt_field_exists_separate_from_exit_stuck_count():
 
 def test_partial_replacement_cap_limits_next_submit_to_unfilled_remainder():
     eng = _engine()
-    pos = _pos(
-        pending_exit_replace_allowed=True,
-        pending_exit_replace_qty=1,
-        last_exit_signal_ts=None,
-    )
+    pos = _pos(last_exit_signal_ts=None)
     _add(eng, pos)
+    assert eng.mark_exit_replacement_safe(
+        pos.position_id,
+        reason="durable partial remainder",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+        replacement_qty=1,
+    ) is True
+    pos.exit_in_flight = False
     eng._can_submit_exit = MagicMock(return_value=False)
 
     decision = ExitDecision(
@@ -154,7 +158,9 @@ def test_staged_replacement_finalize_blocks_when_generation_persist_fails():
         local_order_id="loc-old-1",
         broker_order_id="bro-old-1",
         defer_attempt=True,
-    ) is True
+    ) is False
+    assert pos.pending_exit_replace_allowed is False
+    assert pos.pending_exit_replace_durable_pending is False
     assert eng.finalize_exit_replacement_safe(
         "pos-avgo-1",
         reason="OSM CANCELED durable",
@@ -162,7 +168,7 @@ def test_staged_replacement_finalize_blocks_when_generation_persist_fails():
         broker_order_id="bro-old-1",
     ) is False
     assert pos.exit_replace_attempt == 0
-    assert pos.pending_exit_replace_durable_pending is True
+    assert pos.pending_exit_replace_durable_pending is False
 
 
 def test_staged_replacement_can_be_revoked_without_clearing_old_owner():
@@ -225,11 +231,27 @@ def test_new_generation_after_consumed_grant_increments_again():
     )
     assert pos.exit_replace_attempt == 1
 
-    # Simulate the replacement submit consuming the grant (this is what
-    # _mark_exit_submitted does to pending_exit_replace_allowed).
-    pos.pending_exit_replace_allowed = False
-    pos.pending_exit_local_order_id = "loc-new-1"
-    pos.pending_exit_broker_order_id = "bro-new-1"
+    class _OSM:
+        def get_order(self, local_order_id):
+            return {
+                "local_order_id": local_order_id,
+                "broker_order_id": "bro-new-1",
+                "kind": "EXIT",
+                "position_id": pos.position_id,
+                "client_id": pos.client_id,
+                "execution_mode": pos.execution_mode,
+                "status": "EXIT_REQUESTED",
+                "qty": 2,
+            }
+
+    eng.order_state_machine = _OSM()
+    eng.osm = eng.order_state_machine
+    assert eng._mark_replacement_owned_by_new_generation(
+        pos,
+        local_order_id="loc-new-1",
+        broker_order_id="bro-new-1",
+        qty=2,
+    ) is True
 
     # That replacement itself later goes stale and gets proven-canceled.
     eng.mark_exit_replacement_safe(
@@ -260,6 +282,13 @@ def test_exit_replace_attempt_is_bounded_and_persisted_at_configured_max(monkeyp
             pos.pending_exit_replace_allowed = False
             pos.pending_exit_local_order_id = f"loc-old-{generation}"
             pos.pending_exit_broker_order_id = f"bro-old-{generation}"
+            pos.exit_retry_liveness = {
+                "state": "NONE",
+                "replace_attempt": pos.exit_replace_attempt,
+                "replacement_generation": pos.exit_replace_attempt,
+                "replace_quantity": 0,
+                "last_ack_identity": "",
+            }
         eng.mark_exit_replacement_safe(
             pos.position_id,
             reason=f"broker-confirmed-cancel-{generation}",

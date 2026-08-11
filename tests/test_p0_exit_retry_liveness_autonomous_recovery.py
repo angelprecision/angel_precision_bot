@@ -185,6 +185,7 @@ def _production_callsite_position():
         underlying_stop=340.0,
         position_id="pos-self-healing-callsite",
         client_id="client-self-healing",
+        execution_mode="paper",
         quantity_remaining=2,
     )
     position.exit_in_flight = True
@@ -317,7 +318,7 @@ def test_self_healing_callsite_dead_monitor_completes_durable_exact_replacement_
     assert position.exit_replace_attempt == 1
     mark_spy.assert_called_once()
     finalize_spy.assert_called_once()
-    assert engine._persist_exit_replace_attempt_to_db.call_count == 1
+    assert engine._persist_exit_replace_attempt_to_db.call_count == 2
 
 
 def test_ambiguous_multi_match_never_cancels_without_exact_identity(monkeypatch):

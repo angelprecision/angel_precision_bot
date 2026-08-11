@@ -347,7 +347,8 @@ def _submit_component_replacement(monkeypatch, broker, osm, engine, position, *,
     }
     assert position.exit_in_flight is True
     assert position.pending_exit_replace_allowed is False
-    assert position.pending_exit_replace_qty == 0
+    assert position.pending_exit_replace_qty == expected_qty
+    assert position.exit_retry_liveness["state"] == "REPLACEMENT_OWNED_BY_NEW_GENERATION"
     assert position.pending_exit_broker_order_id == "bro-avgo-replacement-1"
 
 

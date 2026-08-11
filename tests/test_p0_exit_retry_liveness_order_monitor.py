@@ -668,6 +668,122 @@ def test_canceled_after_already_durable_partial_fill_preserves_remainder(monkeyp
     )
 
 
+@pytest.mark.parametrize(
+    ("previous_filled", "cumulative", "expected_remainder", "expected_transition"),
+    [
+        (1, 0, None, None),
+        (1, -1, None, None),
+        (1, "bad", None, None),
+        (1, 3, None, None),
+        (1, 1, 1, None),
+        (0, 1, 1, "EXIT_PARTIAL_FILL"),
+        (1, 2, 0, "EXIT_FILLED"),
+    ],
+)
+def test_terminal_cumulative_fill_matrix_is_strict_and_cumulative(
+    previous_filled, cumulative, expected_remainder, expected_transition,
+):
+    """CANCELED/EXPIRED/REJECTED share one strict cumulative-fill path."""
+
+    class _TerminalOSM:
+        def __init__(self):
+            self.row = {
+                "local_order_id": "loc-terminal-matrix",
+                "kind": "EXIT",
+                "position_id": "pos-terminal-matrix",
+                "broker_order_id": "bro-terminal-matrix",
+                "status": "EXIT_PARTIAL_FILL" if previous_filled else "EXIT_ACKNOWLEDGED",
+                "qty": 2,
+                "filled_qty": previous_filled,
+            }
+            self.transitions = []
+
+        def get_order(self, local_order_id):
+            return dict(self.row) if local_order_id == self.row["local_order_id"] else None
+
+        def transition(self, local_order_id, status, **kwargs):
+            self.transitions.append((status, dict(kwargs)))
+            self.row["status"] = status
+            if "filled_qty" in kwargs:
+                self.row["filled_qty"] = kwargs["filled_qty"]
+            return True
+
+    for terminal_status in ("canceled", "expired", "rejected"):
+        osm = _TerminalOSM()
+        mon = _monitor(osm=osm)
+        mon._emit_order_event = MagicMock()
+        remainder = mon._apply_broker_partial_exit_fill(
+            "loc-terminal-matrix",
+            "bro-terminal-matrix",
+            "AAPL260814C00200000",
+            raw_payload={
+                "status": terminal_status,
+                "exec_quantity": cumulative,
+                "avg_fill_price": 1.25,
+            },
+        )
+        assert remainder == expected_remainder
+        if expected_transition is None:
+            assert osm.transitions == []
+        else:
+            assert osm.transitions[-1][0] == expected_transition
+
+
+def test_terminal_explicit_zero_against_durable_partial_holds_and_grants_zero(monkeypatch):
+    """A terminal exec_quantity=0 contradicting durable fill=1 must hold."""
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+
+    class _OSM:
+        def __init__(self):
+            self.row = {
+                "local_order_id": "loc-zero-contradiction",
+                "kind": "EXIT",
+                "position_id": "pos-zero-contradiction",
+                "broker_order_id": "bro-zero-contradiction",
+                "status": "EXIT_PARTIAL_FILL",
+                "qty": 2,
+                "filled_qty": 1,
+                "meta": {},
+            }
+            self.transitions = []
+
+        def get_order(self, local_order_id):
+            return dict(self.row) if local_order_id == self.row["local_order_id"] else None
+
+        def persist_stale_exit_cancel_attempt(self, local_order_id, broker_order_id, attempt):
+            return True
+
+        def transition(self, local_order_id, status, **kwargs):
+            self.transitions.append((status, dict(kwargs)))
+            return True
+
+    broker = MagicMock()
+    broker.get_order.side_effect = [
+        {"status": "working"},
+        {"status": "canceled", "exec_quantity": 0},
+    ]
+    broker.cancel_order.return_value = {"status": "canceled"}
+    osm = _OSM()
+    exit_engine = MagicMock()
+    mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+    mon._get_newer_active_exit_order = MagicMock(return_value=None)
+
+    mon._handle_stale_exit(
+        local_order_id="loc-zero-contradiction",
+        status="EXIT_PARTIAL_FILL",
+        contract="AAPL260814C00200000",
+        age_secs=120.0,
+        position_id="pos-zero-contradiction",
+        reason="terminal zero contradicts durable partial",
+    )
+
+    assert osm.transitions == []
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.finalize_exit_replacement_safe.assert_not_called()
+
+
 def test_rejected_is_terminal_stale_exit_cancel_proof():
     mon = _monitor()
 
@@ -901,7 +1017,7 @@ def test_late_fill_wins_over_bounded_recancel(monkeypatch):
     assert mon._stale_exit_cancel_attempts == {}
 
 
-def test_failed_osm_cancel_transition_revokes_staged_grant_and_keeps_owner(monkeypatch):
+def test_failed_osm_cancel_transition_retracts_staged_grant_and_keeps_owner(monkeypatch):
     """Broker cancel proof alone must not clear or authorize replacement."""
     from ap_exit_engine import APExitEngine, ManagedPosition
 
@@ -963,7 +1079,10 @@ def test_failed_osm_cancel_transition_revokes_staged_grant_and_keeps_owner(monke
     assert position.pending_exit_replace_durable_pending is False
     assert position.exit_replace_attempt == 0
     assert "bro-osm-fail" in mon._stale_exit_cancel_inflight
-    engine._persist_exit_replace_attempt_to_db.assert_not_called()
+    # STAGED is durably written before the OSM CAS, then safely retracted when
+    # that CAS is proven unsuccessful; neither write grants a replacement.
+    assert engine._persist_exit_replace_attempt_to_db.call_count == 2
+    assert position.exit_retry_liveness["state"] == "NONE"
 
 
 def test_osm_transition_miss_accepts_exact_terminal_reread(monkeypatch):
@@ -1043,7 +1162,15 @@ def test_paper_and_live_identity_preserved_through_handoff(monkeypatch):
     ]
     broker.cancel_order.return_value = {"status": "pending"}
     osm = MagicMock()
-    osm.get_order.return_value = {"kind": "EXIT", "position_id": "pos-live-1", "broker_order_id": "bro-live-1"}
+    osm.get_order.return_value = {
+        "local_order_id": "loc-live-1",
+        "kind": "EXIT",
+        "position_id": "pos-live-1",
+        "broker_order_id": "bro-live-1",
+        "status": "EXIT_ACKNOWLEDGED",
+        "qty": 2,
+        "filled_qty": 0,
+    }
     exit_engine = MagicMock()
 
     mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)

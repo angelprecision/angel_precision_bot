@@ -8734,7 +8734,9 @@ class APExecutionCore:
             _replacement_qty = 0
             _remaining_before_close = 0
         _is_partial_replacement = bool(
-            getattr(pos, "pending_exit_replace_allowed", False)
+            isinstance(getattr(pos, "exit_retry_liveness", {}), dict)
+            and getattr(pos, "exit_retry_liveness", {}).get("state") == "REPLACEMENT_PENDING"
+            and getattr(pos, "pending_exit_replace_allowed", False)
             and 0 < _replacement_qty < _remaining_before_close
         )
 

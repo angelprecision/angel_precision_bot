@@ -36,6 +36,7 @@ import ap.exit_safety as exit_safety  # noqa: E402
 import ap.order_monitor as monitor_module  # noqa: E402
 import ap.order_state_machine as osm_module  # noqa: E402
 from ap_execution_core import APExecutionCore  # noqa: E402
+from ap.exit_autonomous_recovery import recover_exit_engine  # noqa: E402
 from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition  # noqa: E402
 from ap.broker_submit_identity import canonical_broker_submit_key  # noqa: E402
 from ap.order_monitor import APOrderMonitor  # noqa: E402
@@ -242,6 +243,24 @@ class _ProductionShapeBroker:
         self.session.post.side_effect = _post
 
 
+class _RestartReplayBroker(_ProductionShapeBroker):
+    """Read boundary for a fresh-process replacement replay."""
+
+    def __init__(self):
+        super().__init__()
+        self.get_calls = []
+
+    def get_order(self, broker_order_id):
+        self.get_calls.append(broker_order_id)
+        return {"status": "canceled"}
+
+    def list_open_orders(self):
+        return []
+
+    def list_positions(self):
+        return [{"contract": "AVGO260814C00350000", "quantity": 5}]
+
+
 def _position() -> ManagedPosition:
     now = datetime.now(timezone.utc)
     position = ManagedPosition(
@@ -283,6 +302,13 @@ def test_avgo_replacement_crosses_real_production_submit_shape(monkeypatch):
     db = _MemoryOrderDB()
     broker = _ProductionShapeBroker()
     import ap.authorization as authorization_module
+    import ap.db as db_module
+
+    # Keep this production-shape test independent of pytest file import order;
+    # the real wrapper is the submit boundary under test.
+    idempotency_guard.install_exit_decision_idempotency_guard()
+    monkeypatch.setattr(db_module, "conn", db.conn)
+    monkeypatch.setattr(db_module, "run_with_retry", db.run_with_retry)
 
     # The broad P0 suite contains legacy tests that replace
     # ``ap.authorization`` in sys.modules.  Pin this declared PAPER broker at
@@ -485,6 +511,229 @@ def test_avgo_replacement_crosses_real_production_submit_shape(monkeypatch):
     assert not hasattr(broker, "submit_order")
     assert position.exit_in_flight is True
     assert position.pending_exit_broker_order_id == "broker-replacement-1"
+
+
+def test_fresh_process_replays_durable_pending_replacement_once(monkeypatch):
+    """A cleared old owner still produces exactly one capped replacement POST."""
+    db = _MemoryOrderDB()
+    broker = _RestartReplayBroker()
+    import ap.authorization as authorization_module
+    import ap.db as db_module
+
+    monkeypatch.setattr(
+        authorization_module,
+        "execution_mode_for_broker",
+        lambda _broker: "paper",
+        raising=False,
+    )
+    monkeypatch.setitem(sys.modules, "ap.authorization", authorization_module)
+    monkeypatch.setattr(db_module, "conn", db.conn)
+    monkeypatch.setattr(db_module, "run_with_retry", db.run_with_retry)
+    monkeypatch.setattr(osm_module, "conn", db.conn)
+    monkeypatch.setattr(osm_module, "run_with_retry", db.run_with_retry)
+    monkeypatch.setattr(osm_module, "resolve_exit_broker_truth", lambda **kwargs: {
+        "is_fresh_exact": False,
+        "broker_truth_open_qty": None,
+        "audit": {"source": "restart_replay"},
+    })
+    monkeypatch.setattr(osm_module, "evaluate_exit_submission_safety", lambda **kwargs: {
+        "blocked": False,
+    })
+    monkeypatch.setattr(exit_safety, "resolve_exit_broker_truth", lambda **kwargs: {
+        "is_fresh_exact": False,
+        "broker_truth_open_qty": None,
+        "audit": {"source": "restart_replay"},
+    })
+    monkeypatch.setattr(exit_safety, "evaluate_exit_submission_safety", lambda **kwargs: {
+        "blocked": False,
+    })
+
+    old_local_id = "loc-replay-old"
+    old_broker_id = "broker-replay-old"
+    position_id = "pos-replay"
+    client_id = "client-replay"
+    contract = "AVGO260814C00350000"
+    db.rows[old_local_id] = {
+        "local_order_id": old_local_id,
+        "client_id": client_id,
+        "position_id": position_id,
+        "kind": "EXIT",
+        "status": "CANCELED",
+        "symbol": "AVGO",
+        "contract": contract,
+        "direction": "CALL",
+        "execution_mode": "paper",
+        "qty": 2,
+        "limit_price": 2.49,
+        "reserved_cost": 498.0,
+        "filled_qty": 1,
+        "broker_order_id": old_broker_id,
+        "submitted_ts": None,
+        "last_error": None,
+        "meta": {},
+    }
+    osm = APOrderStateMachine(client_id)
+    osm.get_order = lambda local_order_id: (
+        dict(db.rows[local_order_id]) if local_order_id in db.rows else None
+    )
+    osm._get_order = osm.get_order
+    osm._get_active_exit_order = lambda pid: next(
+        (
+            dict(row)
+            for row in db.rows.values()
+            if row.get("position_id") == pid
+            and row.get("kind") == "EXIT"
+            and row.get("status") in {
+                "EXIT_REQUESTED", "EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL",
+            }
+        ),
+        None,
+    )
+    osm._notify_opportunity_ledger = lambda **kwargs: None
+    osm.submit_exit = MagicMock(wraps=osm.submit_exit)
+
+    lifecycle = {
+        "state": "REPLACEMENT_PENDING",
+        "replace_attempt": 1,
+        "replacement_generation": 1,
+        "replace_quantity": 1,
+        "position_id": position_id,
+        "client_id": client_id,
+        "execution_mode": "paper",
+        "old_local_order_id": old_local_id,
+        "old_broker_order_id": old_broker_id,
+        "last_ack_identity": old_broker_id,
+    }
+    durable_meta = {"unrelated": {"keep": True}, "exit_retry_liveness": dict(lifecycle)}
+
+    def _position_row():
+        return {
+            "id": position_id,
+            "underlying": "AVGO",
+            "contract": contract,
+            "direction": "CALL",
+            "qty": 5,
+            "avg_fill": 2.49,
+            "underlying_entry": 350.0,
+            "target_underlying": 360.0,
+            "stop_underlying": 340.0,
+            "client_id": client_id,
+            "execution_mode": "paper",
+            "quantity_remaining": 5,
+            "meta": json.loads(json.dumps(durable_meta)),
+        }
+
+    class _PositionManager:
+        def get_active_positions(self):
+            return [_position_row()]
+
+    def _persist_lifecycle(pos, *, expected_state=None, expected_generation=None):
+        current = durable_meta.get("exit_retry_liveness") or {}
+        if current.get("state", "NONE") != (expected_state or current.get("state", "NONE")):
+            return False
+        if int(current.get("replacement_generation", 0) or 0) != int(expected_generation or 0):
+            return False
+        durable_meta["exit_retry_liveness"] = json.loads(json.dumps(pos.exit_retry_liveness))
+        return True
+
+    # This is a fresh APExitEngine, hydrated only from the durable row.
+    engine = APExitEngine(broker=broker, email=client_id)
+    engine._emit_exit_event = MagicMock()
+    engine._persist_exit_replace_attempt_to_db = _persist_lifecycle
+    engine.order_state_machine = osm
+    engine.osm = osm
+    engine.seed_from_db(_PositionManager())
+    position = engine.get_position(position_id)
+    assert position is not None
+    assert position.exit_retry_liveness["state"] == "REPLACEMENT_PENDING"
+    assert position.pending_exit_replace_qty == 1
+    assert position.pending_exit_replace_allowed is True
+    assert position.exit_in_flight is False
+
+    # Recovery is proof-only and restores one-shot authority without changing
+    # position economics or creating proof-trade state.
+    actions = recover_exit_engine(engine, broker=broker, osm=osm, order_monitor=None)
+    assert [action.action for action in actions] == ["REPLACEMENT_PENDING"]
+    assert position.pending_exit_replace_revalidated is True
+    assert position.quantity_remaining == 5
+    assert position.proof_logged is False
+    assert db.created_reservations == 0
+    assert broker.post_payloads == []
+
+    monkeypatch.setattr(
+        idempotency_guard,
+        "_durable_exit_generation",
+        lambda pos, client_id: (f"{client_id}|{pos.position_id}|1|1", 1),
+    )
+    monkeypatch.setattr(
+        idempotency_guard,
+        "_claim_durable_decision_generation",
+        lambda **kwargs: {"claimed": True},
+    )
+    monkeypatch.setattr(idempotency_guard, "_update_durable_decision_generation", lambda *args, **kwargs: None)
+
+    now = datetime.now(timezone.utc)
+    position.signal = {"correlation_bucket": "OTHER", "pattern": "3-1-2", "score": 1.0, "tier": "A+"}
+    position.current_bid = 2.00
+    position.current_ask = 2.40
+    position.current_option_price = 2.20
+    position.current_underlying = 350.0
+    position.option_bid_valid = True
+    position.last_quote_update_ts = now
+    position.last_option_quote_update_ts = now
+    position.last_underlying_quote_update_ts = now
+
+    core = APExecutionCore.__new__(APExecutionCore)
+    core._pos_lock = threading.RLock()
+    core._sector_lock = threading.RLock()
+    core._position_count = 1
+    core._sector_counts = {"OTHER": 1}
+    core.master_control = SimpleNamespace(mode="paper", _trade_cooldowns={})
+    core.paper = True
+    core.email = client_id
+    core.client_id = client_id
+    core.broker = broker
+    core.order_state_machine = osm
+    core.feedback = MagicMock()
+    core.feedback.get_setup_status.return_value = "READY"
+    core._edge_logger = None
+    engine.on_exit = core._on_position_close
+
+    decision = ExitDecision(
+        action="CLOSE_ALL",
+        quantity=5,
+        reason="DURABLE_REPLACEMENT_PENDING",
+        urgency="HIGH",
+        pnl_pct=-0.10,
+    )
+    assert engine._submit_exit_decision(position, decision) is True
+    assert decision.quantity == 1
+    assert db.created_reservations == 1
+    assert osm.submit_exit.call_count == 1
+    assert len(broker.post_payloads) == 1
+    assert broker.post_payloads[0]["data"]["quantity"] == 1
+    replacement = next(row for local_id, row in db.rows.items() if local_id != old_local_id)
+    assert replacement["client_id"] == client_id
+    assert replacement["execution_mode"] == "paper"
+    assert replacement["qty"] == 1
+    assert position.quantity_remaining == 5
+    assert position.proof_logged is False
+    assert durable_meta["exit_retry_liveness"]["state"] == "REPLACEMENT_OWNED_BY_NEW_GENERATION"
+
+    # A second fresh object sees durable ownership and must not POST again.
+    engine2 = APExitEngine(broker=broker, email=client_id)
+    engine2._emit_exit_event = MagicMock()
+    engine2.order_state_machine = osm
+    engine2.osm = osm
+    engine2.seed_from_db(_PositionManager())
+    position2 = engine2.get_position(position_id)
+    assert position2.exit_retry_liveness["state"] == "REPLACEMENT_OWNED_BY_NEW_GENERATION"
+    actions2 = recover_exit_engine(engine2, broker=broker, osm=osm, order_monitor=None)
+    assert [action.action for action in actions2] == ["REPLACEMENT_OWNED"]
+    assert db.created_reservations == 1
+    assert len(broker.post_payloads) == 1
+    assert position2.quantity_remaining == 5
+    assert position2.proof_logged is False
 
 
 if __name__ == "__main__":

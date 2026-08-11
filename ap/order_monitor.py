@@ -47,6 +47,17 @@ log = logging.getLogger("ap.order_monitor")
 
 _OCC_SIDE_RE = re.compile(r"\d{6}([CP])")
 
+
+def _strict_cumulative_quantity(value) -> Optional[int]:
+    """Parse broker cumulative quantity without coercing malformed truth."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if type(value) is int:
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
 # ── Shared broker order-status cache ─────────────────────────────────────────
 # fill_monitor and order_monitor both call broker.get_order(broker_order_id)
 # independently. With 10 clients and active orders both components fire
@@ -5288,10 +5299,7 @@ class APOrderMonitor:
                     ),
                     None,
                 )
-                try:
-                    cumulative_filled = int(cumulative_raw)
-                except (TypeError, ValueError, OverflowError):
-                    cumulative_filled = None
+                cumulative_filled = _strict_cumulative_quantity(cumulative_raw)
                 if cumulative_filled is None or cumulative_filled < 0:
                     self._hold_on_unknown_broker_status(
                         local_order_id,
@@ -5302,27 +5310,26 @@ class APOrderMonitor:
                         reason="terminal cancel payload cumulative fill was invalid",
                     )
                     return True
-                if cumulative_filled > 0:
-                    _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                    local_order_id,
+                    broker_oid,
+                    contract,
+                    raw_payload=confirmed_payload,
+                )
+                if _partial_remainder_qty is None:
+                    self._hold_on_unknown_broker_status(
                         local_order_id,
-                        broker_oid,
+                        status,
                         contract,
-                        raw_payload=confirmed_payload,
+                        position_id=position_id,
+                        broker_order_id=broker_oid,
+                        reason="terminal cancel cumulative fill could not be durably applied",
                     )
-                    if _partial_remainder_qty is None:
-                        self._hold_on_unknown_broker_status(
-                            local_order_id,
-                            status,
-                            contract,
-                            position_id=position_id,
-                            broker_order_id=broker_oid,
-                            reason="terminal cancel cumulative fill could not be durably applied",
-                        )
-                        return True
-                    if _partial_remainder_qty <= 0:
-                        self._clear_stale_exit_cancel_state(broker_oid)
-                        return True
-                    return False
+                    return True
+                if _partial_remainder_qty <= 0:
+                    self._clear_stale_exit_cancel_state(broker_oid)
+                    return True
+                return False
 
             if not self._is_executed_status(confirmed):
                 return False
@@ -5791,19 +5798,13 @@ class APOrderMonitor:
                 )
                 _replacement_finalized = False
             if not _replacement_finalized:
-                try:
-                    self.exit_engine.revoke_exit_replacement_safe(
-                        position_id,
-                        reason="replacement_generation_commit_failed",
-                        local_order_id=local_order_id,
-                        broker_order_id=broker_oid,
-                        force=True,
-                    )
-                except Exception as _revoke_error:
-                    log.error(
-                        "[%s] replacement grant revoke after finalize failure failed for pos=%s: %s",
-                        self.client_id, position_id, _revoke_error,
-                    )
+                # The exact OSM terminal row is already durable.  Keep the
+                # STAGED lifecycle for restart/recovery; revoking it here
+                # would recreate the forgotten-replacement crash hole.
+                log.critical(
+                    "[%s] replacement lifecycle remains STAGED after finalize persistence miss | pos=%s",
+                    self.client_id, position_id,
+                )
                 self._stale_exit_cancel_inflight.setdefault(broker_oid, _now)
                 return
 
@@ -6383,14 +6384,17 @@ class APOrderMonitor:
                         ),
                         None,
                     )
-                    if cumulative_raw is not None:
-                        try:
-                            cumulative_filled = int(cumulative_raw)
-                            requested_qty = int(
-                                order.get("qty") or order.get("quantity") or 0
-                            )
-                            previous_filled = int(order.get("filled_qty") or 0)
-                        except (TypeError, ValueError, OverflowError):
+                    if any(key in raw for key in ("exec_quantity", "filled_quantity", "filled_qty")):
+                        cumulative_filled = _strict_cumulative_quantity(cumulative_raw)
+                        requested_qty = _strict_cumulative_quantity(
+                            order.get("qty") if order.get("qty") is not None else order.get("quantity")
+                        )
+                        previous_raw = order.get("filled_qty")
+                        previous_filled = (
+                            0 if previous_raw in (None, "")
+                            else _strict_cumulative_quantity(previous_raw)
+                        )
+                        if cumulative_filled is None or requested_qty is None or previous_filled is None:
                             log.warning(
                                 "[%s] terminal cancel payload has invalid cumulative fill "
                                 "| local=%s cumulative=%s",
@@ -6499,11 +6503,13 @@ class APOrderMonitor:
             if key in raw and raw.get(key) is not None:
                 cumulative_raw = raw.get(key)
                 break
-        try:
-            cumulative_filled = int(cumulative_raw)
-            requested_qty = int(order.get("qty") or order.get("quantity") or 0)
-            previous_filled = int(order.get("filled_qty") or 0)
-        except (TypeError, ValueError):
+        cumulative_filled = _strict_cumulative_quantity(cumulative_raw)
+        requested_qty = _strict_cumulative_quantity(
+            order.get("qty") if order.get("qty") is not None else order.get("quantity")
+        )
+        previous_raw = order.get("filled_qty")
+        previous_filled = 0 if previous_raw in (None, "") else _strict_cumulative_quantity(previous_raw)
+        if cumulative_filled is None or requested_qty is None or previous_filled is None:
             cumulative_filled = 0
             requested_qty = 0
             previous_filled = 0

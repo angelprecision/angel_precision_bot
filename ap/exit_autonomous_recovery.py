@@ -650,18 +650,12 @@ def _mark_replacement_safe(
         log.error("autonomous replacement finalize failed for pos=%s: %s", pid, exc)
         finalized = False
     if not finalized:
-        try:
-            revoke(
-                pid,
-                reason="autonomous_replacement_generation_commit_failed",
-                local_order_id=local_id,
-                broker_order_id=broker_id,
-                force=True,
-            )
-        except Exception as exc:
-            log.error("autonomous replacement revoke after finalize failure failed for pos=%s: %s", pid, exc)
+        # The durable STAGED record is intentionally retained.  Revoking here
+        # would reopen the process-death seam between exact OSM terminality and
+        # replacement lifecycle persistence; restart recovery can safely retry
+        # the same old generation without exposing a replacement submit.
         return RecoveryAction(
-            "NOOP", "replacement_generation_commit_failed", pid, local_id, broker_id, details,
+            "NOOP", "replacement_generation_commit_failed_staged_retained", pid, local_id, broker_id, details,
         )
 
     try:
@@ -844,6 +838,482 @@ def _recover_known_open_exit_when_monitor_unavailable(
         broker_id=broker_id,
         details=details,
         replacement_qty=max(0, int(getattr(pos, "pending_exit_qty", 0) or 0)),
+    )
+
+
+def _durable_replacement_lifecycle(pos: Any) -> tuple[Optional[dict], str]:
+    """Read the canonical replacement lifecycle without inventing authority."""
+    raw = getattr(pos, "exit_retry_liveness", None)
+    if not isinstance(raw, dict) or "state" not in raw:
+        return None, "absent"
+    try:
+        from ap_exit_engine import _parse_exit_retry_liveness_namespace
+
+        lifecycle, error = _parse_exit_retry_liveness_namespace(raw)
+    except Exception as exc:
+        return None, f"parser_unavailable:{exc}"
+    if lifecycle is None:
+        return None, error
+    if lifecycle.get("state") not in {
+        "STAGED",
+        "REPLACEMENT_PENDING",
+        "REPLACEMENT_OWNED_BY_NEW_GENERATION",
+    }:
+        return None, "inactive"
+    if (
+        lifecycle.get("position_id") != _position_id(pos)
+        or lifecycle.get("client_id") != _norm(getattr(pos, "client_id", ""))
+        or lifecycle.get("execution_mode") != str(getattr(pos, "execution_mode", "") or "")
+    ):
+        return None, "position_client_mode_fence_mismatch"
+    if not _norm(getattr(pos, "client_id", "")):
+        return None, "missing_client_id"
+    if str(getattr(pos, "execution_mode", "") or "") not in {"live", "paper"}:
+        return None, "invalid_execution_mode"
+    return lifecycle, "ok"
+
+
+def _active_osm_exit_row(osm: Any, position_id: str) -> dict:
+    """Find the exact newer active OSM EXIT generation, if one is durable."""
+    if not osm or not position_id:
+        return {}
+    for method_name in ("_get_active_exit_order", "get_active_exit_order"):
+        method = getattr(osm, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            row = method(position_id)
+            return dict(row) if row else {}
+        except Exception:
+            continue
+    return {}
+
+
+def _replacement_row_is_exact(
+    row: dict,
+    *,
+    local_id: str,
+    broker_id: str,
+    position_id: str,
+    client_id: str,
+    execution_mode: str,
+    active: bool = False,
+) -> bool:
+    if not isinstance(row, dict):
+        return False
+    status = _norm(row.get("status")).upper()
+    if active:
+        valid_status = status in {
+            "EXIT_REQUESTED",
+            "EXIT_SUBMITTED",
+            "EXIT_ACKNOWLEDGED",
+            "EXIT_PARTIAL_FILL",
+        }
+    else:
+        valid_status = status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+    return bool(
+        _norm(row.get("local_order_id")) == _norm(local_id)
+        and _norm(row.get("broker_order_id")) == _norm(broker_id)
+        and _norm(row.get("position_id")) == _norm(position_id)
+        and _norm(row.get("client_id")) == _norm(client_id)
+        and str(row.get("execution_mode") or "") == str(execution_mode or "")
+        and _norm(row.get("kind")).upper() == "EXIT"
+        and valid_status
+    )
+
+
+def _strict_replacement_row_qty(row: dict) -> Optional[int]:
+    value = row.get("qty") if row.get("qty") is not None else row.get("quantity")
+    if isinstance(value, bool) or value is None:
+        return None
+    if type(value) is int:
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _recover_durable_replacement_pending(
+    pos: Any,
+    *,
+    broker: Any,
+    exit_engine: Any,
+    osm: Any,
+    order_monitor: Any = None,
+) -> Optional[RecoveryAction]:
+    """Recover a durable replacement obligation after process restart.
+
+    This path is deliberately proof-only: it performs GET/list reads and
+    restores one in-memory reservation. The broker POST remains owned by the
+    normal exit-engine/OSM submit boundary.
+    """
+    lifecycle, lifecycle_reason = _durable_replacement_lifecycle(pos)
+    if lifecycle is None:
+        if lifecycle_reason not in {"absent", "inactive"}:
+            return RecoveryAction(
+                "NOOP",
+                "replacement_lifecycle_invalid_fail_closed",
+                _position_id(pos),
+                details={"lifecycle_error": lifecycle_reason, "replacement_blocked": True},
+            )
+        return None
+
+    pid = _position_id(pos)
+    client_id = _norm(getattr(pos, "client_id", ""))
+    execution_mode = str(getattr(pos, "execution_mode", "") or "")
+    contract = _position_contract(pos)
+    qh = quote_health(pos)
+    state = lifecycle["state"]
+    replacement_qty = lifecycle["replace_quantity"]
+    old_local = lifecycle["old_local_order_id"]
+    old_broker = lifecycle["old_broker_order_id"]
+    try:
+        quantity_remaining = int(getattr(pos, "quantity_remaining", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        quantity_remaining = 0
+    if replacement_qty > quantity_remaining:
+        return RecoveryAction(
+            "NOOP",
+            "replacement_quantity_exceeds_durable_position_remainder",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_qty": replacement_qty, "quantity_remaining": quantity_remaining},
+        )
+
+    old_row = _order_row(osm, old_local)
+    if not _replacement_row_is_exact(
+        old_row,
+        local_id=old_local,
+        broker_id=old_broker,
+        position_id=pid,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        active=False,
+    ):
+        return RecoveryAction(
+            "NOOP",
+            "replacement_old_generation_not_durably_terminal",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_blocked": True, "lifecycle_state": state, "quote_health": qh},
+        )
+
+    try:
+        old_raw = _get_order(broker, old_broker)
+    except _BrokerSnapshotUnavailable as exc:
+        return RecoveryAction(
+            "NOOP",
+            "replacement_old_generation_broker_proof_unavailable",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_blocked": True, "error": str(exc), "quote_health": qh},
+        )
+    old_status = _status(old_raw)
+    if old_status == "filled":
+        return RecoveryAction(
+            "NOOP",
+            "replacement_old_generation_filled_requires_canonical_fill_reconciliation",
+            pid,
+            old_local,
+            old_broker,
+            {"status": old_status, "replacement_blocked": True, "quote_health": qh},
+        )
+    if old_status in OPEN_BROKER_STATUSES:
+        if state == "REPLACEMENT_OWNED_BY_NEW_GENERATION":
+            return RecoveryAction(
+                "NOOP",
+                "replacement_old_generation_still_open",
+                pid,
+                old_local,
+                old_broker,
+                {"status": old_status, "replacement_blocked": True, "quote_health": qh},
+            )
+        if callable(getattr(exit_engine, "set_pending_exit_order", None)):
+            exit_engine.set_pending_exit_order(
+                pid,
+                local_order_id=old_local,
+                broker_order_id=old_broker,
+                qty=_strict_replacement_row_qty(old_row) or replacement_qty,
+                reason="durable_replacement_old_generation_still_open",
+            )
+        return RecoveryAction(
+            "CONFIRMED_OPEN",
+            "replacement_old_generation_still_open",
+            pid,
+            old_local,
+            old_broker,
+            {"status": old_status, "quote_health": qh, "replacement_blocked": True},
+        )
+    if old_status not in CANCEL_CONFIRMED_STATUSES:
+        return RecoveryAction(
+            "NOOP",
+            "replacement_old_generation_broker_status_unrecognized",
+            pid,
+            old_local,
+            old_broker,
+            {"status": old_status, "replacement_blocked": True, "quote_health": qh},
+        )
+
+    # STAGED means the old broker order is terminal but the exact OSM fence
+    # still needs to be completed. Re-run that handoff before restoring the
+    # one-shot pending authority.
+    if state == "STAGED":
+        return _mark_replacement_safe(
+            exit_engine,
+            pid,
+            osm=osm,
+            reason="restart_recovery_staged_replacement_terminal_proof",
+            local_id=old_local,
+            broker_id=old_broker,
+            details={"status": old_status, "quote_health": qh, "restart_recovery": True},
+            replacement_qty=replacement_qty,
+        )
+
+    if state == "REPLACEMENT_OWNED_BY_NEW_GENERATION":
+        new_local = lifecycle.get("new_local_order_id") or ""
+        new_broker = lifecycle.get("new_broker_order_id") or ""
+        new_row = _order_row(osm, new_local)
+        row_broker = new_broker or _norm(new_row.get("broker_order_id"))
+        if not _replacement_row_is_exact(
+            new_row,
+            local_id=new_local,
+            broker_id=row_broker,
+            position_id=pid,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            active=True,
+        ):
+            return RecoveryAction(
+                "NOOP",
+                "replacement_owned_generation_reconciliation_required",
+                pid,
+                new_local,
+                new_broker,
+                {"old_local_order_id": old_local, "old_broker_order_id": old_broker, "replacement_blocked": True},
+            )
+        if _strict_replacement_row_qty(new_row) != replacement_qty:
+            return RecoveryAction(
+                "NOOP",
+                "replacement_owned_generation_quantity_mismatch",
+                pid,
+                new_local,
+                row_broker,
+                {"replacement_qty": replacement_qty, "row_qty": _strict_replacement_row_qty(new_row), "replacement_blocked": True},
+            )
+        if callable(getattr(exit_engine, "set_pending_exit_order", None)):
+            exit_engine.set_pending_exit_order(
+                pid,
+                local_order_id=new_local,
+                broker_order_id=row_broker,
+                qty=replacement_qty,
+                reason="durable_replacement_owned_generation_restored",
+            )
+        return RecoveryAction(
+            "REPLACEMENT_OWNED",
+            "durable_replacement_new_generation_already_owned",
+            pid,
+            new_local,
+            row_broker,
+            {"replacement_qty": replacement_qty, "quote_health": qh, "duplicate_submit_blocked": True},
+        )
+
+    # A crash can leave a durable OSM reservation before the broker POST (or
+    # before its broker identity is copied back). Treat that exact newer row
+    # as the existing replacement generation; never reserve a second one.
+    reserved_row = _active_osm_exit_row(osm, pid)
+    if reserved_row:
+        reserved_local = _norm(reserved_row.get("local_order_id"))
+        reserved_broker = _norm(reserved_row.get("broker_order_id"))
+        if (
+            not reserved_local
+            or not _replacement_row_is_exact(
+                reserved_row,
+                local_id=reserved_local,
+                broker_id=reserved_broker,
+                position_id=pid,
+                client_id=client_id,
+                execution_mode=execution_mode,
+                active=True,
+            )
+            or _strict_replacement_row_qty(reserved_row) != replacement_qty
+        ):
+            return RecoveryAction(
+                "NOOP",
+                "replacement_reserved_generation_owner_unproven",
+                pid,
+                reserved_local,
+                reserved_broker,
+                {"replacement_blocked": True, "quote_health": qh},
+            )
+        if not callable(getattr(exit_engine, "set_pending_exit_order", None)):
+            return RecoveryAction(
+                "NOOP",
+                "replacement_reserved_generation_restore_unavailable",
+                pid,
+                reserved_local,
+                reserved_broker,
+                {"replacement_blocked": True, "quote_health": qh},
+            )
+        exit_engine.set_pending_exit_order(
+            pid,
+            local_order_id=reserved_local,
+            broker_order_id=reserved_broker,
+            qty=replacement_qty,
+            reason="durable_replacement_reserved_generation_restored",
+        )
+        if reserved_broker:
+            lifecycle_after, _ = _durable_replacement_lifecycle(pos)
+            if not lifecycle_after or lifecycle_after.get("state") != "REPLACEMENT_OWNED_BY_NEW_GENERATION":
+                return RecoveryAction(
+                    "NOOP",
+                    "replacement_reserved_generation_ownership_persist_unconfirmed",
+                    pid,
+                    reserved_local,
+                    reserved_broker,
+                    {"replacement_blocked": True, "quote_health": qh},
+            )
+            return RecoveryAction(
+                "REPLACEMENT_OWNED",
+                "durable_replacement_reserved_generation_reconciled",
+                pid,
+                reserved_local,
+                reserved_broker,
+                {"replacement_qty": replacement_qty, "quote_health": qh, "duplicate_submit_blocked": True},
+            )
+        return RecoveryAction(
+            "REPLACEMENT_RESERVED",
+            "durable_replacement_reserved_before_broker_identity",
+            pid,
+            reserved_local,
+            "",
+            {"replacement_qty": replacement_qty, "quote_health": qh, "duplicate_submit_blocked": True},
+        )
+
+    open_orders_available, matches = _matching_open_exit_orders(
+        broker, contract, exclude_broker_id=old_broker,
+    )
+    if not open_orders_available:
+        return RecoveryAction(
+            "NOOP",
+            "replacement_new_generation_open_order_query_unavailable",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_blocked": True, "quote_health": qh},
+        )
+    if len(matches) > 1:
+        return RecoveryAction(
+            "NOOP",
+            "replacement_new_generation_identity_ambiguous",
+            pid,
+            old_local,
+            old_broker,
+            {"matches": [bid for bid, _ in matches], "replacement_blocked": True, "quote_health": qh},
+        )
+    if len(matches) == 1:
+        new_broker, new_raw = matches[0]
+        broker_qty = _qty(new_raw)
+        if broker_qty not in (0, replacement_qty):
+            return RecoveryAction(
+                "NOOP",
+                "replacement_new_generation_quantity_mismatch",
+                pid,
+                old_local,
+                new_broker,
+                {"replacement_qty": replacement_qty, "broker_qty": broker_qty, "replacement_blocked": True},
+            )
+        new_row = _active_osm_exit_row(osm, pid)
+        new_local = _norm(new_row.get("local_order_id"))
+        if not _replacement_row_is_exact(
+            new_row,
+            local_id=new_local,
+            broker_id=new_broker,
+            position_id=pid,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            active=True,
+        ) or _strict_replacement_row_qty(new_row) != replacement_qty:
+            return RecoveryAction(
+                "NOOP",
+                "replacement_new_generation_osm_owner_unproven",
+                pid,
+                new_local,
+                new_broker,
+                {"replacement_blocked": True, "quote_health": qh},
+            )
+        if callable(getattr(exit_engine, "set_pending_exit_order", None)):
+            exit_engine.set_pending_exit_order(
+                pid,
+                local_order_id=new_local,
+                broker_order_id=new_broker,
+                qty=replacement_qty,
+                reason="durable_replacement_new_generation_found",
+            )
+        lifecycle_after, _ = _durable_replacement_lifecycle(pos)
+        if not lifecycle_after or lifecycle_after.get("state") != "REPLACEMENT_OWNED_BY_NEW_GENERATION":
+            return RecoveryAction(
+                "NOOP",
+                "replacement_new_generation_ownership_persist_unconfirmed",
+                pid,
+                new_local,
+                new_broker,
+                {"replacement_blocked": True, "quote_health": qh},
+            )
+        return RecoveryAction(
+            "REPLACEMENT_OWNED",
+            "durable_replacement_new_generation_reconciled",
+            pid,
+            new_local,
+            new_broker,
+            {"replacement_qty": replacement_qty, "quote_health": qh, "duplicate_submit_blocked": True},
+        )
+
+    positions_available, broker_positions = _list_broker_positions(broker)
+    if not positions_available:
+        return RecoveryAction(
+            "NOOP",
+            "replacement_pending_position_query_unavailable",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_blocked": True, "quote_health": qh},
+        )
+    held = any(_contract(row) == contract and _qty(row) > 0 for row in broker_positions)
+    if not held:
+        return RecoveryAction(
+            "NOOP",
+            "replacement_pending_broker_contract_not_held",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_blocked": True, "quote_health": qh},
+        )
+    revalidate = getattr(exit_engine, "revalidate_durable_replacement_pending", None)
+    if not callable(revalidate) or not revalidate(
+        pid,
+        old_local_order_id=old_local,
+        old_broker_order_id=old_broker,
+        replacement_qty=replacement_qty,
+    ):
+        return RecoveryAction(
+            "NOOP",
+            "replacement_pending_runtime_revalidation_failed",
+            pid,
+            old_local,
+            old_broker,
+            {"replacement_blocked": True, "quote_health": qh},
+        )
+    return RecoveryAction(
+        "REPLACEMENT_PENDING",
+        "durable_replacement_pending_revalidated",
+        pid,
+        old_local,
+        old_broker,
+        {"replacement_qty": replacement_qty, "quote_health": qh, "one_shot_submit": True},
     )
 
 
@@ -1284,10 +1754,48 @@ def recover_exit_engine(
 
     actions: list[RecoveryAction] = []
     for pos in positions[:max_positions]:
-        if not (getattr(pos, "exit_identity_quarantine", False) or getattr(pos, "last_callback_identity_missing", False) or getattr(pos, "exit_in_flight", False)):
+        lifecycle, lifecycle_reason = _durable_replacement_lifecycle(pos)
+        has_durable_replacement = lifecycle is not None
+        if lifecycle_reason not in {"absent", "inactive", "ok"} and getattr(
+            pos, "exit_retry_liveness", None
+        ):
+            actions.append(
+                RecoveryAction(
+                    "NOOP",
+                    "replacement_lifecycle_invalid_fail_closed",
+                    _position_id(pos),
+                    details={"lifecycle_error": lifecycle_reason, "replacement_blocked": True},
+                )
+            )
+            continue
+        if not (
+            getattr(pos, "exit_identity_quarantine", False)
+            or getattr(pos, "last_callback_identity_missing", False)
+            or getattr(pos, "exit_in_flight", False)
+            or has_durable_replacement
+        ):
             continue
         try:
-            actions.append(recover_exit_position(pos, broker=broker, exit_engine=exit_engine, osm=osm, order_monitor=order_monitor))
+            if has_durable_replacement:
+                durable_action = _recover_durable_replacement_pending(
+                    pos,
+                    broker=broker,
+                    exit_engine=exit_engine,
+                    osm=osm,
+                    order_monitor=order_monitor,
+                )
+                if durable_action is not None:
+                    actions.append(durable_action)
+                    continue
+            actions.append(
+                recover_exit_position(
+                    pos,
+                    broker=broker,
+                    exit_engine=exit_engine,
+                    osm=osm,
+                    order_monitor=order_monitor,
+                )
+            )
         except Exception as exc:
             log.exception("autonomous recovery failed for pos=%s: %s", _position_id(pos), exc)
             actions.append(RecoveryAction("ERROR", str(exc), _position_id(pos)))
