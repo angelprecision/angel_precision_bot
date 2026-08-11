@@ -1493,6 +1493,26 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "final_qty":          int(qty),
             "sizing_reason_code": str(sizing_reason_code),
         }
+        # P0 post-cancel retry lineage.  process_signal intentionally builds
+        # order metadata from an explicit allow-list, so a retry claim must be
+        # copied here before the durable insert; otherwise restart recovery
+        # cannot prove whether this exact claim already created a replacement.
+        # Do not persist arbitrary signal-payload keys at this boundary.
+        for _retry_key in (
+            "retry_of_local_oid",
+            "retry_claim_token",
+            "retry_attempts",
+            "retry_attempt",
+            "retry_expected_execution_mode",
+            "retry_cancel_reason",
+        ):
+            if _retry_key in signal_payload:
+                _meta[_retry_key] = signal_payload.get(_retry_key)
+        _retry_execution_mode = str(
+            signal_payload.get("execution_mode") or ""
+        ).strip().lower()
+        if _retry_execution_mode in {"live", "paper"}:
+            _meta["execution_mode"] = _retry_execution_mode
         insert_order(
             client_id=client_id,
             local_order_id=local_order_id,
@@ -1650,4 +1670,11 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         audit(client_id, "ERROR", "EXECUTION_FAILED", {
             "error": str(e), "symbol": symbol, "signal": signal_payload
         })
-        return {"ok": False, "error": "execution_exception", "details": str(e)}
+        return {
+            "ok": False,
+            "error": "execution_exception",
+            "details": str(e),
+            # If the durable row was created before the exception, the retry
+            # monitor can use this exact local identity for reconciliation.
+            "local_order_id": local_order_id,
+        }

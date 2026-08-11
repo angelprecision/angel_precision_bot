@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -260,6 +262,34 @@ ALLOW_ENTRY_CANCEL_IN_WATCHDOG = os.getenv("ALLOW_ENTRY_CANCEL_IN_WATCHDOG", "1"
 # disabled in production via env without a code change. Wire-in itself is
 # additive — disabling it returns the monitor to pre-PR-22 behavior.
 ENTRY_RETRY_ENABLED = os.getenv("ENTRY_RETRY_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+# A stale timer only makes an IN_FLIGHT/SUBMITTING row eligible for durable
+# recovery classification.  It never authorizes a replacement submit by
+# itself; SUBMITTING is quarantined unless replacement truth is found.
+ENTRY_RETRY_IN_FLIGHT_STALE_SECS = int(
+    os.getenv("ENTRY_RETRY_IN_FLIGHT_STALE_SECS", "120")
+)
+
+# Durable ENTRY statuses that prove the replacement is broker-owned or
+# completed.  These are the current OSM/legacy durable spellings, not raw
+# broker response vocabulary; an unknown durable status must never authorize
+# the canceled parent as SUBMITTED.
+_RETRY_REPLACEMENT_ACCEPTED_STATUSES = frozenset({
+    "ACK",
+    "ACKED",
+    "ACKNOWLEDGED",
+    "SUBMITTED",
+    "PARTIAL_FILL",
+    "PARTIALLY_FILLED",
+    "PARTIAL_FILLED",
+    "FILLED",
+})
+_RETRY_REPLACEMENT_TERMINAL_STATUSES = frozenset({
+    "REJECTED",
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+    "ERROR",
+})
 
 
 def _has_proven_broker_order_id(value) -> bool:
@@ -3014,10 +3044,10 @@ class APOrderMonitor:
     #   _check_armed_retries()
     #       Called every EXIT_CHECK_INTERVAL by the main loop. Selects this
     #       client's CANCELED orders whose meta carries retry_status='ARMED'
-    #       AND retry_ready_at <= NOW(). For each, builds the signal payload
-    #       and hands it to ap.execution.process_signal, then transitions the
-    #       meta to retry_status='SUBMITTED' (or 'FAILED' if process_signal
-    #       rejected). Emits ENTRY_RETRY_SUBMITTED on success.
+    #       and whose ready time has passed. Each due intent is claimed with a
+    #       client/mode-fenced CAS, advanced to SUBMITTING before the fresh
+    #       process_signal admission path, and then durably terminalized or
+    #       boundedly re-armed from the exact claim owner.
     #
     # Storage choice: the retry intent is stored in the existing orders.meta
     # JSONB column (added by 20260519_phase2_orders_meta.sql). No new table
@@ -3026,7 +3056,10 @@ class APOrderMonitor:
     #   ARMED      — evaluate_retry returned ARM; submit pending until ready_at
     #   SUBMITTED  — process_signal accepted the retry; a new order exists
     #   ABORTED    — evaluate_retry returned ABORT (or retry was canceled)
-    #   FAILED     — process_signal returned ok=False at retry submit
+    #   IN_FLIGHT — one worker owns the durable retry claim
+    #   SUBMITTING — the owner passed the final submit-phase CAS fence
+    #   FAILED     — legacy direct-call path returned ok=False; production
+    #                claimed failures use ABORTED/HOLD/ARMED/EXHAUSTED
     #
     # Duplicate-position guard: process_signal already calls
     # acquire_symbol_lock and _count_active_entry_orders_today. Those gates
@@ -3133,6 +3166,14 @@ class APOrderMonitor:
             try:
                 if hasattr(self.broker, "get_quote"):
                     q = self._quote_broker().get_quote(underlying) or {}
+                    # Test doubles and partially wired runners may expose a
+                    # truthy ``data_broker`` attribute whose get_quote result
+                    # is not a quote mapping.  Do not coerce arbitrary
+                    # objects to floats and turn an unproven quote into an
+                    # alignment rejection; fail open only to the existing
+                    # ``underlying_spot=None`` behavior of the evaluator.
+                    if not isinstance(q, dict):
+                        q = {}
                     last = q.get("last") or q.get("close") or q.get("price")
                     if last:
                         spot = float(last)
@@ -3177,35 +3218,85 @@ class APOrderMonitor:
                 contract=contract,
                 inputs=evt_inputs,
             )
-            # Best-effort: stamp meta so the dashboard can show the abort
-            # alongside the cancel.
-            try:
-                from ap.db import update_order
-                _meta = dict(meta or {})
-                _meta["retry_status"] = "ABORTED"
-                _meta["retry_abort_reason"] = decision.reason_code
-                _meta["retry_abort_ts"] = now_utc_iso()
-                update_order(local_order_id, meta=_meta)
-            except Exception as e:
-                log.debug(
-                    "[%s] retry: failed to stamp ABORTED meta on %s: %s",
-                    self.client_id, local_order_id, e,
+            runtime_mode = self._retry_runtime_mode()
+            if not runtime_mode:
+                log.error(
+                    "[%s] retry: refusing ABORTED metadata write without "
+                    "explicit execution mode local=%s",
+                    self.client_id, local_order_id,
+                )
+                return
+            abort_patch = {
+                "retry_status": "ABORTED",
+                "retry_abort_reason": decision.reason_code,
+                "retry_abort_ts": now_utc_iso(),
+                "retry_status_ts": now_utc_iso(),
+                "retry_last_transition": "ABORTED",
+                "retry_last_reason": decision.reason_code,
+            }
+            if not self._cas_retry_parent_meta(
+                local_order_id, meta, abort_patch, runtime_mode,
+            ):
+                log.error(
+                    "[%s] retry: fenced ABORTED metadata write missed local=%s",
+                    self.client_id, local_order_id,
                 )
             return
 
         # action == 'ARM'
+        runtime_mode = self._retry_runtime_mode()
+        if not runtime_mode:
+            detail = (
+                "retry execution mode was not explicitly wired; "
+                "retry remains fail-closed"
+            )
+            log.error(
+                "[%s] retry: refusing ARM without explicit execution mode "
+                "local=%s",
+                self.client_id, local_order_id,
+            )
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="post_cancel_retry",
+                decision="ABORT",
+                reason_code="RETRY_EXECUTION_MODE_UNPROVEN",
+                explanation=detail,
+                contract=contract,
+                inputs=evt_inputs,
+            )
+            return
+
         ready_at_epoch = time.time() + float(decision.wait_secs)
         try:
-            from ap.db import update_order
-            _meta = dict(meta or {})
-            _meta["retry_status"]      = "ARMED"
-            _meta["retry_attempt"]     = int(decision.attempt_number)
-            _meta["retry_armed_ts"]    = now_utc_iso()
-            _meta["retry_ready_at"]    = float(ready_at_epoch)
-            _meta["retry_wait_secs"]   = float(decision.wait_secs)
-            _meta["retry_payload"]     = decision.retry_payload
-            _meta["retry_cancel_reason"] = decision.cancel_reason_normalized
-            update_order(local_order_id, meta=_meta)
+            retry_payload = dict(decision.retry_payload or {})
+            # This is an evidence mirror only.  The durable parent row's
+            # execution_mode remains the owner fence; the submit path
+            # overwrites this value with its exact claimed mode.
+            retry_payload["execution_mode"] = runtime_mode
+            retry_payload["retry_expected_execution_mode"] = runtime_mode
+            arm_patch = {
+                "retry_status": "ARMED",
+                # Canonical counter.  The singular mirror remains dashboard-
+                # only compatibility and is never independent retry authority.
+                "retry_attempts": int(decision.attempt_number),
+                "retry_attempt": int(decision.attempt_number),
+                "retry_last_transition": "ARMED",
+                "retry_last_reason": decision.reason_code,
+                "retry_armed_ts": now_utc_iso(),
+                "retry_ready_at": float(ready_at_epoch),
+                "retry_wait_secs": float(decision.wait_secs),
+                "retry_payload": retry_payload,
+                "retry_cancel_reason": decision.cancel_reason_normalized,
+            }
+            if not self._cas_retry_parent_meta(
+                local_order_id, meta, arm_patch, runtime_mode,
+            ):
+                log.error(
+                    "[%s] retry: fenced ARMED metadata write missed local=%s "
+                    "— SKIPPING retry",
+                    self.client_id, local_order_id,
+                )
+                return
         except Exception as e:
             log.error(
                 "[%s] retry: failed to persist ARMED meta on %s: %s — SKIPPING retry",
@@ -3234,57 +3325,1064 @@ class APOrderMonitor:
                     "ready_at_epoch": ready_at_epoch},
         )
 
-    def _check_armed_retries(self) -> None:
-        """Look for this client's ARMED retries whose ready_at has passed,
-        submit each via process_signal, and update meta to SUBMITTED/FAILED.
-        """
-        if not ENTRY_RETRY_ENABLED:
-            return
+    def _retry_runtime_mode(self) -> str:
+        """Return the explicitly wired retry owner mode, never a fallback."""
+        mode = str(getattr(self, "_broker_owned_exit_recovery_mode", "") or "")
+        return mode if mode in {"live", "paper"} else ""
 
-        # Query: this client's CANCELED orders with meta.retry_status='ARMED'
-        # and retry_ready_at <= now. Cap at 16 per tick to avoid burst submits.
-        now_epoch = time.time()
-        rows = []
+    def _retry_client_state_mode(self) -> Optional[str]:
+        """Read the current client mode for the final submit fence.
+
+        ``process_signal`` derives its mode from ``client_state`` rather than
+        from the monitor instance.  A monitor configured for one mode must
+        therefore prove that the durable runtime state still agrees before it
+        calls that admission path.  ``None`` means the read itself was not
+        proven; an empty string means the durable value is invalid.
+        """
+        try:
+            from ap.db import get_client_state
+            state = get_client_state(self.client_id) or {}
+        except Exception as exc:
+            log.error(
+                "[%s] retry client mode read failed: %s",
+                self.client_id, exc, exc_info=True,
+            )
+            return None
+        mode = str(state.get("mode") or "").strip().lower()
+        return mode if mode in {"live", "paper"} else ""
+
+    @staticmethod
+    def _retry_mode_params(mode: str) -> tuple[str, str, str, str, str]:
+        return (mode, mode, mode.upper(), mode, mode.upper())
+
+    def _cas_retry_parent_meta(
+        self,
+        local_order_id: str,
+        prior_meta: dict,
+        patch: dict,
+        mode: str,
+    ) -> bool:
+        """Patch a canceled ENTRY parent only if its exact snapshot is intact."""
+        local_order_id = str(local_order_id or "")
+        mode = str(mode or "").strip().lower()
+        if (
+            not local_order_id
+            or local_order_id != local_order_id.strip()
+            or mode not in {"live", "paper"}
+            or not isinstance(prior_meta, dict)
+            or not isinstance(patch, dict)
+        ):
+            return False
+
+        next_meta = dict(prior_meta)
+        next_meta.update(patch)
         try:
             def _fn():
                 with conn() as c:
                     c.execute(
                         """
-                        SELECT local_order_id, contract, symbol, direction, meta
-                        FROM   orders
-                        WHERE  client_id = %s
-                          AND  kind = 'ENTRY'
-                          AND  status = 'CANCELED'
-                          AND  meta ->> 'retry_status' = 'ARMED'
-                          AND  COALESCE((meta ->> 'retry_ready_at')::float, 0) <= %s
-                        ORDER BY updated_ts ASC
-                        LIMIT 16
+                        UPDATE orders
+                        SET meta = %s::jsonb, updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status = 'CANCELED'
+                          AND meta = %s::jsonb
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        RETURNING local_order_id
                         """,
-                        (self.client_id, now_epoch),
+                        (
+                            json.dumps(next_meta),
+                            local_order_id,
+                            self.client_id,
+                            json.dumps(prior_meta),
+                            *self._retry_mode_params(mode),
+                        ),
                     )
-                    return [dict(r) for r in c.fetchall()]
-            rows = run_with_retry(_fn) or []
-        except Exception as e:
+                    return c.fetchone()
+            return bool(run_with_retry(_fn))
+        except Exception as exc:
             log.error(
-                "[%s] _check_armed_retries: DB select failed: %s",
-                self.client_id, e, exc_info=True,
+                "[%s] retry parent metadata CAS failed local=%s mode=%s: %s",
+                self.client_id, local_order_id, mode, exc, exc_info=True,
+            )
+            return False
+
+    def _read_retry_row(self, local_order_id: str, mode: str) -> Optional[dict]:
+        """Read one retry row through exact client and durable-mode fences."""
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT local_order_id, client_id, contract, symbol,
+                               direction, execution_mode, broker_order_id,
+                               status, last_error, meta, updated_ts
+                        FROM orders
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND kind = 'ENTRY'
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        """,
+                        (
+                            local_order_id,
+                            self.client_id,
+                            *self._retry_mode_params(mode),
+                        ),
+                    )
+                    row = c.fetchone()
+                    return dict(row) if row else None
+            return run_with_retry(_fn)
+        except Exception as exc:
+            log.error(
+                "[%s] retry row reread failed local=%s mode=%s: %s",
+                self.client_id, local_order_id, mode, exc, exc_info=True,
+            )
+            return None
+
+    def _hold_unclaimed_retry(self, row: dict, mode: str, detail: str) -> bool:
+        """Fail closed on malformed ARMED metadata without acquiring submit ownership."""
+        local_order_id = str(row.get("local_order_id") or "")
+        prior_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        held_meta = dict(prior_meta)
+        held_meta.update({
+            "retry_status": "HOLD",
+            "retry_status_ts": now_utc_iso(),
+            "retry_status_detail": detail,
+        })
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE orders
+                        SET meta = %s::jsonb, updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status = 'CANCELED'
+                          AND meta ->> 'retry_status' = 'ARMED'
+                          AND meta = %s::jsonb
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        RETURNING local_order_id
+                        """,
+                        (
+                            json.dumps(held_meta),
+                            local_order_id,
+                            self.client_id,
+                            json.dumps(prior_meta),
+                            *self._retry_mode_params(mode),
+                        ),
+                    )
+                    return c.fetchone()
+            return bool(run_with_retry(_fn))
+        except Exception as exc:
+            log.error(
+                "[%s] retry HOLD persistence failed local=%s detail=%s: %s",
+                self.client_id, local_order_id, detail, exc, exc_info=True,
+            )
+            return False
+
+    def _claim_armed_retry(
+        self,
+        row: dict,
+        *,
+        expected_attempt: int,
+        mode: str,
+    ) -> Optional[dict]:
+        """CAS one exact ARMED intent to IN_FLIGHT and return it to its sole owner."""
+        local_order_id = str(row.get("local_order_id") or "")
+        prior_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        claim_token = str(uuid.uuid4())
+        claimed_meta = dict(prior_meta)
+        claimed_meta.update({
+            "retry_status": "IN_FLIGHT",
+            "retry_attempts": int(expected_attempt),
+            "retry_attempt": int(expected_attempt),
+            "retry_claim_token": claim_token,
+            "retry_claimed_at": now_utc_iso(),
+            "retry_expected_execution_mode": mode,
+            "retry_last_transition": "IN_FLIGHT",
+            "retry_last_reason": "armed_retry_claimed",
+        })
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE orders
+                        SET meta = %s::jsonb, updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status = 'CANCELED'
+                          AND meta ->> 'retry_status' = 'ARMED'
+                          AND meta = %s::jsonb
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        RETURNING local_order_id, client_id, contract, symbol,
+                                  direction, execution_mode, status, meta, updated_ts
+                        """,
+                        (
+                            json.dumps(claimed_meta),
+                            local_order_id,
+                            self.client_id,
+                            json.dumps(prior_meta),
+                            *self._retry_mode_params(mode),
+                        ),
+                    )
+                    claimed = c.fetchone()
+                    return dict(claimed) if claimed else None
+            claimed = run_with_retry(_fn)
+        except Exception as exc:
+            log.error(
+                "[%s] retry claim failed local=%s attempt=%s: %s",
+                self.client_id, local_order_id, expected_attempt, exc,
+                exc_info=True,
+            )
+            return None
+
+        if claimed:
+            return claimed
+
+        # A retry wrapper may observe an ambiguous commit.  Reread and accept
+        # only our exact token; every other zero-row outcome remains no-submit.
+        current = self._read_retry_row(local_order_id, mode)
+        current_meta = (current or {}).get("meta")
+        if (
+            isinstance(current_meta, dict)
+            and current_meta.get("retry_status") == "IN_FLIGHT"
+            and current_meta.get("retry_claim_token") == claim_token
+        ):
+            return current
+
+        log.info(
+            "[%s] retry claim miss local=%s expected_attempt=%s current_status=%s",
+            self.client_id,
+            local_order_id,
+            expected_attempt,
+            (current_meta or {}).get("retry_status")
+                if isinstance(current_meta, dict) else "missing_or_wrong_mode",
+        )
+        return None
+
+    def _transition_claimed_retry(
+        self,
+        local_order_id: str,
+        *,
+        claim_token: str,
+        mode: str,
+        expected_statuses: tuple[str, ...],
+        patch: dict,
+        claim_token_field: str = "retry_claim_token",
+    ) -> bool:
+        """Patch retry metadata only while this exact claim token still owns it."""
+        if not claim_token or mode not in {"live", "paper"}:
+            return False
+        if claim_token_field not in {"retry_claim_token", "retry_recovery_token"}:
+            return False
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        UPDATE orders
+                        SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status = 'CANCELED'
+                          AND meta ->> '{claim_token_field}' = %s
+                          AND meta ->> 'retry_status' = ANY(%s)
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        RETURNING local_order_id
+                        """,
+                        (
+                            json.dumps(patch),
+                            local_order_id,
+                            self.client_id,
+                            claim_token,
+                            list(expected_statuses),
+                            *self._retry_mode_params(mode),
+                        ),
+                    )
+                    return c.fetchone()
+            changed = run_with_retry(_fn)
+        except Exception as exc:
+            log.error(
+                "[%s] claimed retry transition failed local=%s target=%s: %s",
+                self.client_id, local_order_id, patch.get("retry_status"), exc,
+                exc_info=True,
+            )
+            return False
+        if changed:
+            return True
+
+        # Resolve an ambiguous committed write without granting stale ownership.
+        current = self._read_retry_row(local_order_id, mode)
+        current_meta = (current or {}).get("meta")
+        if isinstance(current_meta, dict) and all(
+            current_meta.get(key) == value for key, value in patch.items()
+        ):
+            return True
+        log.error(
+            "[%s] claimed retry transition CAS miss local=%s token=%s target=%s",
+            self.client_id, local_order_id, claim_token,
+            patch.get("retry_status"),
+        )
+        return False
+
+    def _find_retry_replacements(
+        self,
+        local_order_id: str,
+        claim_token: str,
+        mode: str,
+    ) -> Optional[list[dict]]:
+        """Find exact durable replacement rows created from one retry claim."""
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT local_order_id, broker_order_id, status, contract,
+                               symbol, execution_mode, last_error, meta, updated_ts,
+                               (meta ->> 'retry_claim_token' = %s)
+                                   AS retry_lineage_exact
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND local_order_id <> %s
+                          AND (
+                                meta ->> 'retry_of_local_oid' = %s
+                                OR meta ->> 'retry_claim_token' = %s
+                              )
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        ORDER BY created_ts ASC
+                        LIMIT 3
+                        """,
+                        (
+                            claim_token,
+                            self.client_id,
+                            local_order_id,
+                            local_order_id,
+                            claim_token,
+                            *self._retry_mode_params(mode),
+                        ),
+                    )
+                    return [dict(item) for item in (c.fetchall() or [])]
+            return run_with_retry(_fn) or []
+        except Exception as exc:
+            log.error(
+                "[%s] retry replacement proof query failed local=%s: %s",
+                self.client_id, local_order_id, exc, exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _replacement_matches_claim(replacement: dict, claim_token: str) -> bool:
+        """Return true only for a replacement bound to this exact attempt."""
+        if not isinstance(replacement, dict):
+            return False
+        if replacement.get("retry_lineage_exact") is True:
+            return True
+        meta = replacement.get("meta")
+        return (
+            isinstance(meta, dict)
+            and meta.get("retry_claim_token") == claim_token
+        )
+
+    def _classify_retry_replacement(
+        self,
+        replacement: dict,
+        claim_token: str,
+    ) -> tuple[str, str, dict]:
+        """Classify one exact child before mutating its canceled retry parent.
+
+        Returns ``(parent_status, detail, extra)``.  A broker ID is necessary
+        but not sufficient: the durable child status is authoritative.  Known
+        terminal child statuses become truthful parent ABORTED state; accepted
+        statuses require a nonblank broker ID; unknown or unbound children
+        remain HOLD.
+        """
+        if not isinstance(replacement, dict):
+            return "HOLD", "replacement_row_invalid", {}
+        if not self._replacement_matches_claim(replacement, claim_token):
+            return "HOLD", "replacement_lineage_not_exact", {}
+
+        status = str(replacement.get("status") or "").strip().upper()
+        status = {
+            "CANCELLED": "CANCELED",
+            "PARTIALLY_FILLED": "PARTIAL_FILL",
+            "PARTIAL_FILLED": "PARTIAL_FILL",
+        }.get(status, status)
+        extra = {
+            "retry_new_local_order_id": replacement.get("local_order_id"),
+            "retry_new_broker_order_id": replacement.get("broker_order_id"),
+            "retry_replacement_status": status or None,
+        }
+
+        if status in _RETRY_REPLACEMENT_ACCEPTED_STATUSES:
+            broker_id = replacement.get("broker_order_id")
+            if (
+                not isinstance(broker_id, str)
+                or not _has_proven_broker_order_id(broker_id)
+            ):
+                return (
+                    "HOLD",
+                    f"accepted_replacement_missing_exact_broker_identity:{status}",
+                    extra,
+                )
+            return "SUBMITTED", f"replacement_status:{status}", extra
+
+        if status in _RETRY_REPLACEMENT_TERMINAL_STATUSES:
+            return "ABORTED", f"replacement_terminal_status:{status}", extra
+
+        return (
+            "HOLD",
+            f"replacement_unknown_status:{status or 'MISSING'}",
+            extra,
+        )
+
+    def _active_retry_symbol_owner_exists(
+        self,
+        *,
+        symbol: str,
+        local_order_id: str,
+        mode: str,
+    ) -> Optional[bool]:
+        """Prove whether a symbol lock is backed by another durable entry."""
+        exact_symbol = str(symbol or "")
+        if not exact_symbol or exact_symbol != exact_symbol.strip():
+            return None
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT 1
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND local_order_id <> %s
+                          AND symbol = %s
+                          AND status IN (
+                              'NEW','CREATED','PENDING_TRIGGER','SUBMITTED',
+                              'ACK','ACKNOWLEDGED','PARTIAL_FILL','FILLED'
+                          )
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        LIMIT 1
+                        """,
+                        (
+                            self.client_id,
+                            local_order_id,
+                            exact_symbol,
+                            *self._retry_mode_params(mode),
+                        ),
+                    )
+                    return c.fetchone() is not None
+            return bool(run_with_retry(_fn))
+        except Exception as exc:
+            log.error(
+                "[%s] retry symbol-owner proof failed local=%s symbol=%s: %s",
+                self.client_id, local_order_id, exact_symbol, exc,
+                exc_info=True,
+            )
+            return None
+
+    def _classify_retry_submit_failure(
+        self,
+        *,
+        result: dict,
+        local_order_id: str,
+        retry_payload: dict,
+        mode: str,
+    ) -> tuple[str, str]:
+        """Classify only the result vocabulary current process_signal emits."""
+        err = str(result.get("error") or "unknown")
+        if err == "quote_refresh_failed":
+            return "TRANSIENT", err
+        if err == "symbol_locked":
+            symbol = result.get("symbol") or retry_payload.get("symbol")
+            active_owner = self._active_retry_symbol_owner_exists(
+                symbol=str(symbol or ""),
+                local_order_id=local_order_id,
+                mode=mode,
+            )
+            if active_owner is False:
+                return "TRANSIENT", "temporary_self_lock_without_durable_entry_owner"
+            if active_owner is None:
+                return "HOLD", "symbol_lock_owner_unproven"
+            return "TERMINAL", "symbol_lock_has_durable_entry_owner"
+
+        # Risk, policy, account, chase, time, thesis/metadata, broker ambiguity,
+        # and unknown future errors all fail closed.  None are force-through paths.
+        return "TERMINAL", err
+
+    def _rearm_or_exhaust_retry(
+        self,
+        *,
+        local_order_id: str,
+        contract: Optional[str],
+        prior_meta: dict,
+        claim_token: str,
+        mode: str,
+        failure_reason: str,
+        expected_statuses: tuple[str, ...] = ("IN_FLIGHT",),
+        claim_token_field: str = "retry_claim_token",
+    ) -> None:
+        from ap.post_cancel_retry import (
+            ENTRY_RETRY_MAX_ATTEMPTS,
+            RetryAttemptCounterError,
+            _compute_wait_secs,
+            parse_retry_attempt_count,
+        )
+
+        try:
+            attempt = parse_retry_attempt_count(prior_meta)
+        except RetryAttemptCounterError as exc:
+            self._stamp_retry_status(
+                local_order_id,
+                prior_meta,
+                status="HOLD",
+                detail=f"malformed_attempt_count:{exc}",
+                claim_token=claim_token,
+                expected_mode=mode,
+                expected_statuses=expected_statuses,
+                claim_token_field=claim_token_field,
             )
             return
 
-        if not rows:
+        if attempt >= ENTRY_RETRY_MAX_ATTEMPTS:
+            detail = f"attempt={attempt}/{ENTRY_RETRY_MAX_ATTEMPTS}:{failure_reason}"
+            self._stamp_retry_status(
+                local_order_id,
+                prior_meta,
+                status="EXHAUSTED",
+                detail=detail,
+                extra={
+                    "retry_exhausted_reason": failure_reason,
+                    "retry_exhausted_at": now_utc_iso(),
+                    "retry_attempts": attempt,
+                    "retry_attempt": attempt,
+                },
+                claim_token=claim_token,
+                expected_mode=mode,
+                expected_statuses=expected_statuses,
+                claim_token_field=claim_token_field,
+            )
+            log.warning(
+                "[%s] ENTRY_RETRY_EXHAUSTED order=%s %s",
+                self.client_id, local_order_id, detail,
+            )
             return
 
-        log.info(
-            "[%s] _check_armed_retries: processing %d ready retr%s",
-            self.client_id, len(rows), "y" if len(rows) == 1 else "ies",
+        next_attempt = attempt + 1
+        wait_secs = float(_compute_wait_secs())
+        ready_at = time.time() + wait_secs
+        payload = prior_meta.get("retry_payload")
+        payload = dict(payload) if isinstance(payload, dict) else {}
+        payload.update({
+            "retry_attempts": next_attempt,
+            "retry_attempt": next_attempt,
+            "retry_of_local_oid": local_order_id,
+            "retry_expected_execution_mode": mode,
+            "execution_mode": mode,
+        })
+        patch = {
+            "retry_status": "ARMED",
+            "retry_status_ts": now_utc_iso(),
+            "retry_status_detail": f"rearmed_after:{failure_reason}",
+            "retry_attempts": next_attempt,
+            "retry_attempt": next_attempt,
+            "retry_ready_at": ready_at,
+            "retry_wait_secs": wait_secs,
+            "retry_payload": payload,
+            "retry_last_failure": failure_reason,
+            "retry_last_claim_token": claim_token,
+            "retry_claim_token": None,
+            "retry_recovery_token": None,
+        }
+        changed = self._transition_claimed_retry(
+            local_order_id,
+            claim_token=claim_token,
+            mode=mode,
+            expected_statuses=expected_statuses,
+            patch=patch,
+            claim_token_field=claim_token_field,
+        )
+        if not changed:
+            return
+        log.warning(
+            "[%s] ENTRY_RETRY_REARMED order=%s attempt=%s/%s wait=%.1fs reason=%s",
+            self.client_id, local_order_id, next_attempt,
+            ENTRY_RETRY_MAX_ATTEMPTS, wait_secs, failure_reason,
+        )
+        self._emit_order_event(
+            local_order_id=local_order_id,
+            stage="post_cancel_retry",
+            decision="REARM",
+            reason_code="TRANSIENT_RETRY_REARMED",
+            explanation=failure_reason,
+            contract=contract,
+            inputs={
+                "attempt_number": next_attempt,
+                "max_attempts": ENTRY_RETRY_MAX_ATTEMPTS,
+                "ready_at_epoch": ready_at,
+            },
         )
 
+    def _claim_stale_inflight_for_recovery(
+        self,
+        row: dict,
+        *,
+        mode: str,
+    ) -> Optional[dict]:
+        """Fence an abandoned retry owner before replacement-proof reads."""
+        local_order_id = str(row.get("local_order_id") or "")
+        prior_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        recovery_token = str(uuid.uuid4())
+        recovering_meta = dict(prior_meta)
+        recovering_meta.update({
+            "retry_status": "RECOVERING",
+            "retry_recovery_token": recovery_token,
+            "retry_recovery_claimed_at": now_utc_iso(),
+            "retry_last_transition": "RECOVERING",
+            "retry_last_reason": "stale_inflight_recovery_claimed",
+        })
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE orders
+                        SET meta = %s::jsonb, updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status = 'CANCELED'
+                          AND meta ->> 'retry_status' IN ('IN_FLIGHT', 'SUBMITTING')
+                          AND meta = %s::jsonb
+                          AND updated_ts <= NOW() - (%s * INTERVAL '1 second')
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        RETURNING local_order_id, client_id, contract, symbol,
+                                  direction, execution_mode, status, meta, updated_ts
+                        """,
+                        (
+                            json.dumps(recovering_meta),
+                            local_order_id,
+                            self.client_id,
+                            json.dumps(prior_meta),
+                            ENTRY_RETRY_IN_FLIGHT_STALE_SECS,
+                            *self._retry_mode_params(mode),
+                        ),
+                    )
+                    claimed = c.fetchone()
+                    return dict(claimed) if claimed else None
+            claimed = run_with_retry(_fn)
+        except Exception as exc:
+            log.error(
+                "[%s] stale retry recovery claim failed local=%s: %s",
+                self.client_id, local_order_id, exc, exc_info=True,
+            )
+            return None
+        if claimed:
+            return claimed
+        current = self._read_retry_row(local_order_id, mode)
+        current_meta = (current or {}).get("meta")
+        if (
+            isinstance(current_meta, dict)
+            and current_meta.get("retry_status") == "RECOVERING"
+            and current_meta.get("retry_recovery_token") == recovery_token
+        ):
+            return current
+        return None
+
+    def _recover_stale_inflight_retries(self, mode: str) -> None:
+        """Recover only after fencing the old worker and proving replacement truth."""
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT local_order_id, client_id, contract, symbol,
+                               direction, execution_mode, status, meta, updated_ts
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status = 'CANCELED'
+                          AND meta ->> 'retry_status' IN ('IN_FLIGHT', 'SUBMITTING')
+                          AND updated_ts <= NOW() - (%s * INTERVAL '1 second')
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        ORDER BY updated_ts ASC
+                        LIMIT 16
+                        """,
+                        (
+                            self.client_id,
+                            ENTRY_RETRY_IN_FLIGHT_STALE_SECS,
+                            *self._retry_mode_params(mode),
+                        ),
+                    )
+                    return [dict(item) for item in (c.fetchall() or [])]
+            rows = run_with_retry(_fn) or []
+        except Exception as exc:
+            log.error(
+                "[%s] stale retry recovery scan failed: %s",
+                self.client_id, exc, exc_info=True,
+            )
+            return
+
+        for stale in rows:
+            stale_meta = stale.get("meta") if isinstance(stale.get("meta"), dict) else {}
+            stale_status = str(stale_meta.get("retry_status") or "").strip().upper()
+            claimed = self._claim_stale_inflight_for_recovery(stale, mode=mode)
+            if not claimed:
+                continue
+            meta = claimed.get("meta") if isinstance(claimed.get("meta"), dict) else {}
+            claim_token = str(meta.get("retry_claim_token") or "")
+            recovery_token = str(meta.get("retry_recovery_token") or "")
+            local_order_id = str(claimed.get("local_order_id") or "")
+            if not recovery_token or recovery_token != recovery_token.strip():
+                log.critical(
+                    "[%s] stale retry recovery lost its exact recovery token local=%s",
+                    self.client_id, local_order_id,
+                )
+                continue
+            if not claim_token or claim_token != claim_token.strip():
+                self._stamp_retry_status(
+                    local_order_id,
+                    meta,
+                    status="HOLD",
+                    detail="stale_inflight_missing_exact_claim_token",
+                    claim_token=recovery_token,
+                    expected_mode=mode,
+                    expected_statuses=("RECOVERING",),
+                    claim_token_field="retry_recovery_token",
+                )
+                continue
+
+            replacements = self._find_retry_replacements(
+                local_order_id, claim_token, mode,
+            )
+            if replacements is None:
+                self._stamp_retry_status(
+                    local_order_id,
+                    meta,
+                    status="HOLD",
+                    detail="replacement_truth_query_failed",
+                    claim_token=recovery_token,
+                    expected_mode=mode,
+                    expected_statuses=("RECOVERING",),
+                    claim_token_field="retry_recovery_token",
+                )
+                continue
+            if replacements:
+                if len(replacements) > 1:
+                    parent_status = "HOLD"
+                    replacement_detail = "multiple_correlated_replacements"
+                    replacement_extra = {}
+                else:
+                    (
+                        parent_status,
+                        replacement_detail,
+                        replacement_extra,
+                    ) = self._classify_retry_replacement(
+                        replacements[0], claim_token,
+                    )
+                    if parent_status == "SUBMITTED":
+                        replacement_detail = "recovered_existing_replacement"
+                        replacement_extra["retry_recovered_at"] = now_utc_iso()
+                    elif parent_status == "ABORTED":
+                        replacement_detail = (
+                            f"recovered_terminal_replacement:{replacement_detail}"
+                        )
+                self._stamp_retry_status(
+                    local_order_id,
+                    meta,
+                    status=parent_status,
+                    detail=replacement_detail,
+                    extra=replacement_extra or None,
+                    claim_token=recovery_token,
+                    expected_mode=mode,
+                    expected_statuses=("RECOVERING",),
+                    claim_token_field="retry_recovery_token",
+                )
+                continue
+
+            # RECOVERING won the CAS, so execution's final retry-submit fence
+            # can no longer advance this claim to SUBMITTING.  An IN_FLIGHT row
+            # has not crossed that fence; insert-before-broker ordering therefore
+            # proves no broker bytes left for this attempt and permits one bounded
+            # re-arm.  A stale SUBMITTING row may still have a live worker whose
+            # lease expired before the broker call completed, so it is quarantined
+            # HOLD rather than timer-rearmed and potentially double-submitted.
+            if stale_status == "IN_FLIGHT":
+                self._rearm_or_exhaust_retry(
+                    local_order_id=local_order_id,
+                    contract=claimed.get("contract"),
+                    prior_meta=meta,
+                    claim_token=recovery_token,
+                    mode=mode,
+                    failure_reason="stale_inflight_no_replacement_proven",
+                    expected_statuses=("RECOVERING",),
+                    claim_token_field="retry_recovery_token",
+                )
+            elif stale_status == "SUBMITTING":
+                self._stamp_retry_status(
+                    local_order_id,
+                    meta,
+                    status="HOLD",
+                    detail="stale_submitting_without_replacement_proof",
+                    claim_token=recovery_token,
+                    expected_mode=mode,
+                    expected_statuses=("RECOVERING",),
+                    claim_token_field="retry_recovery_token",
+                )
+            else:
+                self._stamp_retry_status(
+                    local_order_id,
+                    meta,
+                    status="HOLD",
+                    detail="stale_retry_unknown_status",
+                    claim_token=recovery_token,
+                    expected_mode=mode,
+                    expected_statuses=("RECOVERING",),
+                    claim_token_field="retry_recovery_token",
+                )
+
+    def _check_armed_retries(self) -> None:
+        """Claim and submit due retries under exact client/mode ownership."""
+        if not ENTRY_RETRY_ENABLED:
+            return
+        mode = self._retry_runtime_mode()
+        if not mode:
+            log.error(
+                "[%s] retry submit disabled: explicit PAPER/LIVE monitor mode missing",
+                self.client_id,
+            )
+            return
+
+        self._recover_stale_inflight_retries(mode)
+
+        # Fetch a small bounded ARMED cohort and parse ready_at in Python.  A
+        # malformed JSON value must not make PostgreSQL cast fail and silence
+        # every other client's valid retry row.
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT local_order_id, client_id, contract, symbol,
+                               direction, execution_mode, status, meta, updated_ts
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status = 'CANCELED'
+                          AND meta ->> 'retry_status' = 'ARMED'
+                          AND (
+                                execution_mode = %s
+                                OR (
+                                    execution_mode IS NULL
+                                    AND (
+                                        meta ->> 'execution_mode' = %s
+                                        OR meta ->> 'mode' = %s
+                                    )
+                                )
+                              )
+                          AND (meta ->> 'execution_mode' IS NULL
+                               OR meta ->> 'execution_mode' = %s)
+                          AND (meta ->> 'mode' IS NULL
+                               OR meta ->> 'mode' = %s)
+                        ORDER BY updated_ts ASC
+                        LIMIT 64
+                        """,
+                        (self.client_id, *self._retry_mode_params(mode)),
+                    )
+                    return [dict(item) for item in (c.fetchall() or [])]
+            rows = run_with_retry(_fn) or []
+        except Exception as exc:
+            log.error(
+                "[%s] _check_armed_retries DB select failed: %s",
+                self.client_id, exc, exc_info=True,
+            )
+            return
+
+        now_epoch = time.time()
+        ready_rows: list[tuple[dict, int]] = []
+        from ap.post_cancel_retry import (
+            RetryAttemptCounterError,
+            parse_retry_attempt_count,
+        )
         for row in rows:
-            local_oid = row.get("local_order_id")
-            contract  = row.get("contract")
-            meta      = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-            payload   = (meta or {}).get("retry_payload") or {}
-            self._submit_armed_retry(local_oid, contract, payload, meta)
+            meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+            try:
+                ready_at = float(meta.get("retry_ready_at"))
+                if isinstance(meta.get("retry_ready_at"), bool):
+                    raise ValueError("retry_ready_at must not be boolean")
+                if not math.isfinite(ready_at):
+                    raise ValueError("retry_ready_at must be finite")
+            except (TypeError, ValueError) as exc:
+                self._hold_unclaimed_retry(
+                    row, mode, f"malformed_retry_ready_at:{exc}",
+                )
+                continue
+            if ready_at > now_epoch:
+                continue
+            try:
+                attempt = parse_retry_attempt_count(meta)
+            except RetryAttemptCounterError as exc:
+                self._hold_unclaimed_retry(
+                    row, mode, f"malformed_attempt_count:{exc}",
+                )
+                continue
+            if attempt <= 0:
+                self._hold_unclaimed_retry(
+                    row, mode, "armed_retry_has_non_positive_attempt",
+                )
+                continue
+            ready_rows.append((row, attempt))
+            if len(ready_rows) >= 16:
+                break
+
+        if ready_rows:
+            log.info(
+                "[%s] _check_armed_retries: claiming %d ready retr%s",
+                self.client_id, len(ready_rows),
+                "y" if len(ready_rows) == 1 else "ies",
+            )
+
+        for row, attempt in ready_rows:
+            claimed = self._claim_armed_retry(
+                row, expected_attempt=attempt, mode=mode,
+            )
+            if not claimed:
+                continue
+            meta = claimed.get("meta") if isinstance(claimed.get("meta"), dict) else {}
+            payload = meta.get("retry_payload") or {}
+            self._submit_armed_retry(
+                str(claimed.get("local_order_id") or ""),
+                claimed.get("contract"),
+                payload,
+                meta,
+                claim_token=str(meta.get("retry_claim_token") or ""),
+                expected_mode=mode,
+            )
 
     def _submit_armed_retry(
         self,
@@ -3292,16 +4390,109 @@ class APOrderMonitor:
         contract: Optional[str],
         retry_payload: dict,
         prior_meta: dict,
+        *,
+        claim_token: Optional[str] = None,
+        expected_mode: Optional[str] = None,
     ) -> None:
+        strict_claim = bool(
+            claim_token
+            and expected_mode in {"live", "paper"}
+            and claim_token == str(claim_token).strip()
+        )
+        attempt = 0
+        try:
+            from ap.post_cancel_retry import parse_retry_attempt_count
+            attempt = parse_retry_attempt_count(prior_meta)
+        except Exception as exc:
+            self._stamp_retry_status(
+                local_order_id,
+                prior_meta,
+                status="HOLD" if strict_claim else "FAILED",
+                detail=f"malformed_attempt_count:{exc}",
+                claim_token=claim_token,
+                expected_mode=expected_mode,
+            )
+            return
+
         # Defensive: refuse to submit if the payload is empty or malformed.
-        if not isinstance(retry_payload, dict) or not retry_payload.get("ticker"):
+        # ``symbol`` is the canonical process_signal field; ``ticker`` is a
+        # legacy alias retained for older armed rows.
+        if not isinstance(retry_payload, dict) or not (
+            retry_payload.get("symbol") or retry_payload.get("ticker")
+        ):
             log.warning(
                 "[%s] _submit_armed_retry: malformed payload for %s — marking FAILED",
                 self.client_id, local_order_id,
             )
-            self._stamp_retry_status(local_order_id, prior_meta,
-                                     status="FAILED", detail="malformed_payload")
+            detail = (
+                "malformed_payload"
+                if attempt <= 0 else f"malformed_payload:attempt={attempt}"
+            )
+            self._stamp_retry_status(
+                local_order_id,
+                prior_meta,
+                status="FAILED",
+                detail=detail,
+                extra={"retry_attempts": attempt, "retry_attempt": attempt},
+                claim_token=claim_token,
+                expected_mode=expected_mode,
+            )
             return
+
+        retry_payload = dict(retry_payload)
+        retry_symbol = retry_payload.get("symbol") or retry_payload.get("ticker")
+        retry_payload.setdefault("symbol", retry_symbol)
+        retry_payload.setdefault("ticker", retry_symbol)
+        if strict_claim:
+            retry_payload.update({
+                "retry_of_local_oid": local_order_id,
+                "retry_claim_token": claim_token,
+                "retry_attempts": attempt,
+                "retry_attempt": attempt,
+                "retry_expected_execution_mode": expected_mode,
+                "execution_mode": expected_mode,
+            })
+
+            # process_signal reads client_state itself.  Prove that its
+            # authoritative mode still matches this monitor's explicit owner
+            # before entering the admission path.
+            current_mode = self._retry_client_state_mode()
+            if current_mode != expected_mode:
+                detail = (
+                    "runtime_execution_mode_mismatch:"
+                    f"expected={expected_mode}:actual={current_mode or 'unproven'}"
+                )
+                self._stamp_retry_status(
+                    local_order_id,
+                    prior_meta,
+                    status="HOLD",
+                    detail=detail,
+                    claim_token=claim_token,
+                    expected_mode=expected_mode,
+                )
+                return
+
+            # Fence the final submit phase separately from the broad claim.
+            # Stale recovery only considers IN_FLIGHT/SUBMITTING rows; if this
+            # CAS loses to recovery, this worker must not enter process_signal.
+            submit_claimed = self._transition_claimed_retry(
+                local_order_id,
+                claim_token=str(claim_token),
+                mode=str(expected_mode),
+                expected_statuses=("IN_FLIGHT",),
+                patch={
+                    "retry_status": "SUBMITTING",
+                    "retry_submit_started_at": now_utc_iso(),
+                    "retry_last_transition": "SUBMITTING",
+                    "retry_last_reason": "retry_submit_claimed",
+                },
+            )
+            if not submit_claimed:
+                log.warning(
+                    "[%s] retry submit fence lost local=%s; no broker admission",
+                    self.client_id, local_order_id,
+                )
+                return
 
         # Hand to the same admission path a fresh signal uses. process_signal
         # enforces symbol lock, equity reserve, daily cap, kill-switch, trend
@@ -3313,8 +4504,14 @@ class APOrderMonitor:
                 "[%s] _submit_armed_retry: cannot import process_signal: %s",
                 self.client_id, e,
             )
-            self._stamp_retry_status(local_order_id, prior_meta,
-                                     status="FAILED", detail=f"import_error:{e}")
+            self._stamp_retry_status(
+                local_order_id,
+                prior_meta,
+                status="HOLD" if strict_claim else "FAILED",
+                detail=f"import_error:attempt={attempt}:{e}",
+                claim_token=claim_token,
+                expected_mode=expected_mode,
+            )
             return
 
         try:
@@ -3324,8 +4521,53 @@ class APOrderMonitor:
                 "[%s] _submit_armed_retry: process_signal raised for retry of %s: %s",
                 self.client_id, local_order_id, e, exc_info=True,
             )
-            self._stamp_retry_status(local_order_id, prior_meta,
-                                     status="FAILED", detail=f"exception:{e}")
+            replacements = (
+                self._find_retry_replacements(
+                    local_order_id, str(claim_token), str(expected_mode),
+                )
+                if strict_claim else []
+            )
+            exact_replacement = (
+                replacements[0]
+                if replacements and len(replacements) == 1
+                else None
+            )
+            if exact_replacement is not None:
+                status, replacement_detail, extra = (
+                    self._classify_retry_replacement(
+                        exact_replacement, str(claim_token),
+                    )
+                )
+                if status == "SUBMITTED":
+                    detail = "exception_after_exact_replacement_persisted"
+                elif status == "ABORTED":
+                    detail = (
+                        f"exception_after_terminal_replacement:"
+                        f"{replacement_detail}:attempt={attempt}:{e}"
+                    )
+                else:
+                    detail = (
+                        f"exception_replacement_{replacement_detail}:"
+                        f"attempt={attempt}:{e}"
+                    )
+            elif replacements is None or replacements:
+                status = "HOLD"
+                detail = f"exception_replacement_truth_ambiguous:attempt={attempt}:{e}"
+                extra = {}
+            else:
+                status = "HOLD"
+                detail = f"exception_without_correlated_replacement:attempt={attempt}:{e}"
+                extra = {}
+            self._stamp_retry_status(
+                local_order_id,
+                prior_meta,
+                status=status,
+                detail=detail,
+                extra=extra,
+                claim_token=claim_token,
+                expected_mode=expected_mode,
+                expected_statuses=("IN_FLIGHT", "SUBMITTING"),
+            )
             self._emit_order_event(
                 local_order_id=local_order_id,
                 stage="post_cancel_retry",
@@ -3337,7 +4579,18 @@ class APOrderMonitor:
             return
 
         if not isinstance(result, dict) or not result.get("ok"):
-            err = (result or {}).get("error", "unknown")
+            if not isinstance(result, dict):
+                self._stamp_retry_status(
+                    local_order_id,
+                    prior_meta,
+                    status="HOLD" if strict_claim else "FAILED",
+                    detail=f"malformed_submit_result:attempt={attempt}",
+                    claim_token=claim_token,
+                    expected_mode=expected_mode,
+                )
+                return
+
+            err = result.get("error", "unknown")
             # PR fix/entry-retry-context-and-submit-refresh:
             # Classify quote-related submit rejects with explicit codes so
             # the audit trail distinguishes runaway-quote (price moved out of
@@ -3370,21 +4623,116 @@ class APOrderMonitor:
                 "[%s] ENTRY_RETRY_ABORTED order=%s submit-time reject: %s",
                 self.client_id, local_order_id, err,
             )
-            self._stamp_retry_status(
-                local_order_id, prior_meta,
-                status="FAILED",
-                detail=_detail,
-                extra={
-                    "retry_submit_err":        err,
-                    "retry_selector_ask":      _r.get("selector_ask"),
-                    "retry_submit_ask":        _r.get("submit_ask"),
-                    "retry_submit_limit":      _r.get("submit_limit"),
-                    "retry_quote_age_ms":      _r.get("quote_age_ms"),
-                    "retry_gap_pct":           _r.get("gap_pct"),
-                    "retry_refresh_ok":        _r.get("refresh_ok"),
-                    "retry_refresh_reason":    _r.get("refresh_reason"),
-                },
-            )
+            diagnostics = {
+                "retry_submit_err":        err,
+                "retry_selector_ask":      _r.get("selector_ask"),
+                "retry_submit_ask":        _r.get("submit_ask"),
+                "retry_submit_limit":      _r.get("submit_limit"),
+                "retry_quote_age_ms":      _r.get("quote_age_ms"),
+                "retry_gap_pct":           _r.get("gap_pct"),
+                "retry_refresh_ok":        _r.get("refresh_ok"),
+                "retry_refresh_reason":    _r.get("refresh_reason"),
+                "retry_attempts":          attempt,
+                "retry_attempt":           attempt,
+            }
+
+            if not strict_claim:
+                # Preserve the legacy direct-call behavior used by older unit
+                # harnesses.  Production polling always supplies a durable claim.
+                self._stamp_retry_status(
+                    local_order_id, prior_meta,
+                    status="FAILED", detail=_detail, extra=diagnostics,
+                )
+            else:
+                replacements = self._find_retry_replacements(
+                    local_order_id, str(claim_token), str(expected_mode),
+                )
+                if replacements is None or replacements:
+                    if replacements and len(replacements) == 1:
+                        (
+                            replacement_status,
+                            replacement_detail,
+                            replacement_extra,
+                        ) = self._classify_retry_replacement(
+                            replacements[0], str(claim_token),
+                        )
+                    else:
+                        replacement_status = "HOLD"
+                        replacement_detail = "submit_failure_replacement_truth_ambiguous"
+                        replacement_extra = {}
+
+                    if replacement_status in {"SUBMITTED", "ABORTED"}:
+                        parent_detail = (
+                            "failure_result_with_exact_broker_replacement"
+                            if replacement_status == "SUBMITTED"
+                            else f"failure_result_after_terminal_replacement:{replacement_detail}"
+                        )
+                        self._stamp_retry_status(
+                            local_order_id,
+                            prior_meta,
+                            status=replacement_status,
+                            detail=parent_detail,
+                            extra={
+                                **diagnostics,
+                                **replacement_extra,
+                            },
+                            claim_token=claim_token,
+                            expected_mode=expected_mode,
+                            expected_statuses=("IN_FLIGHT", "SUBMITTING"),
+                        )
+                    else:
+                        self._stamp_retry_status(
+                            local_order_id,
+                            prior_meta,
+                            status="HOLD",
+                            detail=(
+                                replacement_detail
+                                if replacements and len(replacements) == 1
+                                else "submit_failure_replacement_truth_ambiguous"
+                            ),
+                            extra={**diagnostics, **replacement_extra},
+                            claim_token=claim_token,
+                            expected_mode=expected_mode,
+                            expected_statuses=("IN_FLIGHT", "SUBMITTING"),
+                        )
+                else:
+                    classification, class_detail = self._classify_retry_submit_failure(
+                        result=result,
+                        local_order_id=local_order_id,
+                        retry_payload=retry_payload,
+                        mode=str(expected_mode),
+                    )
+                    if classification == "TRANSIENT":
+                        self._rearm_or_exhaust_retry(
+                            local_order_id=local_order_id,
+                            contract=contract,
+                            prior_meta=prior_meta,
+                            claim_token=str(claim_token),
+                            mode=str(expected_mode),
+                            failure_reason=class_detail,
+                            expected_statuses=("SUBMITTING",),
+                        )
+                    elif classification == "HOLD":
+                        self._stamp_retry_status(
+                            local_order_id,
+                            prior_meta,
+                            status="HOLD",
+                            detail=class_detail,
+                            extra=diagnostics,
+                            claim_token=claim_token,
+                            expected_mode=expected_mode,
+                        )
+                    else:
+                        self._stamp_retry_status(
+                            local_order_id,
+                            prior_meta,
+                            status="ABORTED",
+                            detail=f"terminal_submit_reject:{class_detail}",
+                            extra=diagnostics,
+                            claim_token=claim_token,
+                            expected_mode=expected_mode,
+                            expected_statuses=("IN_FLIGHT", "SUBMITTING"),
+                        )
             # Also emit a post-cancel-retry abort event so the dashboard
             # records the full lifecycle (ARM → submit-time reject).
             self._emit_order_event(
@@ -3402,6 +4750,32 @@ class APOrderMonitor:
         # exists for the retry order; reference it back to the canceled one.
         new_local_oid = result.get("local_order_id")
         new_broker_oid = result.get("broker_order_id")
+        identities_exact = (
+            isinstance(new_local_oid, str)
+            and bool(new_local_oid)
+            and new_local_oid == new_local_oid.strip()
+            and new_local_oid != local_order_id
+            and isinstance(new_broker_oid, str)
+            and bool(new_broker_oid)
+            and new_broker_oid == new_broker_oid.strip()
+        )
+        if not identities_exact:
+            self._stamp_retry_status(
+                local_order_id,
+                prior_meta,
+                status="HOLD",
+                detail="accepted_retry_missing_exact_replacement_identity",
+                extra={
+                    "retry_new_local_order_id": new_local_oid,
+                    "retry_new_broker_order_id": new_broker_oid,
+                    "retry_attempts": attempt,
+                    "retry_attempt": attempt,
+                },
+                claim_token=claim_token,
+                expected_mode=expected_mode,
+                expected_statuses=("IN_FLIGHT", "SUBMITTING"),
+            )
+            return
         log.info(
             "[%s] ENTRY_RETRY_SUBMITTED prev=%s new=%s broker=%s contract=%s",
             self.client_id, local_order_id, new_local_oid, new_broker_oid,
@@ -3415,6 +4789,8 @@ class APOrderMonitor:
                 "retry_new_local_order_id":  new_local_oid,
                 "retry_new_broker_order_id": new_broker_oid,
                 "retry_submitted_ts":        now_utc_iso(),
+                "retry_attempts":            attempt,
+                "retry_attempt":             attempt,
                 # PR fix/entry-retry-context-and-submit-refresh:
                 # Persist the full submit-time quote evidence on success too
                 # so success and failure rows have a consistent shape.
@@ -3425,6 +4801,9 @@ class APOrderMonitor:
                 "retry_refresh_ok":          True if result.get("submit_ask") is not None else None,
                 "retry_submit_refresh_ok":   True if result.get("submit_ask") is not None else None,
             },
+            claim_token=claim_token,
+            expected_mode=expected_mode,
+            expected_statuses=("IN_FLIGHT", "SUBMITTING"),
         )
         self._emit_order_event(
             local_order_id=local_order_id,
@@ -3452,22 +4831,44 @@ class APOrderMonitor:
         status: str,
         detail: str = "",
         extra: Optional[dict] = None,
-    ) -> None:
+        claim_token: Optional[str] = None,
+        expected_mode: Optional[str] = None,
+        expected_statuses: tuple[str, ...] = ("IN_FLIGHT", "SUBMITTING", "RECOVERING"),
+        claim_token_field: str = "retry_claim_token",
+    ) -> bool:
+        patch = {
+            "retry_status": status,
+            "retry_status_ts": now_utc_iso(),
+            "retry_last_transition": status,
+        }
+        if detail:
+            patch["retry_status_detail"] = detail
+            patch["retry_last_reason"] = detail
+        if extra:
+            patch.update(extra)
+
+        if claim_token and expected_mode in {"live", "paper"}:
+            return self._transition_claimed_retry(
+                local_order_id,
+                claim_token=str(claim_token),
+                mode=str(expected_mode),
+                expected_statuses=expected_statuses,
+                patch=patch,
+                claim_token_field=claim_token_field,
+            )
+
         try:
             from ap.db import update_order
             _meta = dict(prior_meta or {})
-            _meta["retry_status"]    = status
-            _meta["retry_status_ts"] = now_utc_iso()
-            if detail:
-                _meta["retry_status_detail"] = detail
-            if extra:
-                _meta.update(extra)
+            _meta.update(patch)
             update_order(local_order_id, meta=_meta)
+            return True
         except Exception as e:
             log.error(
                 "[%s] _stamp_retry_status failed for %s status=%s: %s",
                 self.client_id, local_order_id, status, e,
             )
+            return False
 
     def _handle_stale_entry(
         self,

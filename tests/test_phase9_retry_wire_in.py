@@ -284,6 +284,8 @@ def monitor_with_mocks():
         broker=broker,
         order_state_machine=osm,
         position_manager=pm,
+        client_mode="PAPER",
+        data_broker=broker,
     )
 
     m._emitted = []
@@ -317,10 +319,13 @@ class TestArmPathBehavior:
         broker.get_quote.return_value = {"last": 185.05}
 
         captured = {}
-        def fake_update_order(local_oid, **kwargs):
+        def fake_parent_cas(local_oid, prior_meta, patch, mode):
             captured["local_oid"] = local_oid
-            captured.update(kwargs)
-        monkeypatch.setattr("ap.db.update_order", fake_update_order)
+            captured["mode"] = mode
+            captured["meta"] = dict(prior_meta)
+            captured["meta"].update(patch)
+            return True
+        monkeypatch.setattr(m, "_cas_retry_parent_meta", fake_parent_cas)
 
         m._maybe_arm_post_cancel_retry(
             local_order_id="loc-1",
@@ -356,10 +361,13 @@ class TestArmPathBehavior:
         broker.get_quote.return_value = {"last": 185.0}
 
         captured = {}
-        def fake_update_order(local_oid, **kwargs):
+        def fake_parent_cas(local_oid, prior_meta, patch, mode):
             captured["local_oid"] = local_oid
-            captured.update(kwargs)
-        monkeypatch.setattr("ap.db.update_order", fake_update_order)
+            captured["mode"] = mode
+            captured["meta"] = dict(prior_meta)
+            captured["meta"].update(patch)
+            return True
+        monkeypatch.setattr(m, "_cas_retry_parent_meta", fake_parent_cas)
 
         m._maybe_arm_post_cancel_retry(
             local_order_id="loc-2",
