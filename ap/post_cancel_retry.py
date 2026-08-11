@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -331,6 +332,47 @@ def _compute_wait_secs(rng: random.Random | None = None) -> float:
     return r.uniform(lo, hi)
 
 
+class RetryAttemptCounterError(ValueError):
+    """Raised when durable post-cancel retry accounting is not trustworthy."""
+
+
+def parse_retry_attempt_count(meta: dict | None) -> int:
+    """Return the monotonic durable retry count across old and new keys.
+
+    ``retry_attempts`` is the canonical producer/consumer contract.  The
+    singular ``retry_attempt`` key was written by the original monitor and is
+    accepted only as a legacy source.  When both are present, the larger value
+    wins so a stale compatibility mirror can never move the counter backward.
+
+    Values must be JSON integers or canonical unsigned decimal strings.  Booleans,
+    floats, whitespace-padded strings, negative values, and other malformed
+    shapes fail closed instead of silently resetting the retry budget to zero.
+    """
+    if meta is None:
+        return 0
+    if not isinstance(meta, dict):
+        raise RetryAttemptCounterError("retry metadata is not an object")
+
+    parsed: list[int] = []
+    for key in ("retry_attempts", "retry_attempt"):
+        if key not in meta or meta.get(key) is None:
+            continue
+        raw = meta.get(key)
+        if isinstance(raw, bool):
+            raise RetryAttemptCounterError(f"{key} must be a non-negative integer")
+        if isinstance(raw, int):
+            value = raw
+        elif isinstance(raw, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", raw):
+            value = int(raw)
+        else:
+            raise RetryAttemptCounterError(f"{key} must be a canonical non-negative integer")
+        if value < 0:
+            raise RetryAttemptCounterError(f"{key} must not be negative")
+        parsed.append(value)
+
+    return max(parsed, default=0)
+
+
 # ----------------------------------------------------------------------
 # Main decision entry point
 # ----------------------------------------------------------------------
@@ -364,8 +406,22 @@ def evaluate_retry(
         )
 
     reason_norm = _normalize_reason(cancel_reason)
-    meta = (canceled_order.get("meta") or {}) if canceled_order else {}
+    canceled_order = canceled_order or {}
     direction = str(canceled_order.get("direction") or "").upper()
+    raw_meta = canceled_order.get("meta")
+    if raw_meta is None:
+        meta = {}
+    elif isinstance(raw_meta, dict):
+        meta = raw_meta
+    else:
+        return RetryDecision(
+            action="ABORT",
+            reason_code="MALFORMED_RETRY_METADATA",
+            explanation="retry metadata is not an object",
+            cancel_reason_normalized=reason_norm,
+            direction=direction,
+            max_attempts=ENTRY_RETRY_MAX_ATTEMPTS,
+        )
     signal_entry = meta.get("signal_entry_price")
     if signal_entry in (0, "0", "", None):
         signal_entry = None
@@ -373,7 +429,20 @@ def evaluate_retry(
         signal_entry = float(signal_entry) if signal_entry is not None else None
     except (TypeError, ValueError):
         signal_entry = None
-    prior_retries = int(meta.get("retry_attempts") or 0)
+    try:
+        prior_retries = parse_retry_attempt_count(meta)
+    except RetryAttemptCounterError as exc:
+        return RetryDecision(
+            action="ABORT",
+            reason_code="MALFORMED_RETRY_ATTEMPT_COUNT",
+            explanation=str(exc),
+            cancel_reason_normalized=reason_norm,
+            underlying_spot=underlying_spot,
+            signal_entry_price=signal_entry,
+            direction=direction,
+            attempt_number=0,
+            max_attempts=ENTRY_RETRY_MAX_ATTEMPTS,
+        )
     next_attempt = prior_retries + 1
 
     base = dict(
@@ -626,6 +695,7 @@ def evaluate_retry(
             "underlying_price":  underlying_price_for_payload,
         },
         # Retry-specific bookkeeping the caller will persist into meta:
+        "retry_attempts":       next_attempt,
         "retry_attempt":        next_attempt,
         "retry_of_local_oid":   canceled_order.get("local_order_id"),
         "retry_cancel_reason":  reason_norm,
