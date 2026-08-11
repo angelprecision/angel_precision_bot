@@ -4309,6 +4309,11 @@ class APExitEngine:
             client_id = identity["client_id"]
             execution_mode = identity["execution_mode"]
 
+            def _row_mapping(row, columns):
+                if hasattr(row, "keys"):
+                    return dict(row)
+                return dict(zip(columns, row))
+
             def _do_update():
                 with conn() as c:
                     c.execute(
@@ -4325,7 +4330,7 @@ class APExitEngine:
                     row = c.fetchone()
                     if not row:
                         return {"ok": False, "reason": "position_row_unavailable"}
-                    row = dict(row)
+                    row = _row_mapping(row, ("quantity_remaining", "qty", "meta"))
                     stored, stored_valid, stored_reason = _restore_exit_fill_consumption_from_meta(
                         row.get("meta")
                     )
@@ -4416,7 +4421,7 @@ class APExitEngine:
                     updated = c.fetchone()
                     if not updated:
                         return {"ok": False, "reason": "position_consumption_update_unconfirmed"}
-                    updated = dict(updated)
+                    updated = _row_mapping(updated, ("quantity_remaining", "meta"))
                     stored_after, valid_after, reason_after = _restore_exit_fill_consumption_from_meta(
                         updated.get("meta")
                     )
