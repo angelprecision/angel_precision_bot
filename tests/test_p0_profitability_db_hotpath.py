@@ -224,7 +224,8 @@ def test_armed_retry_query_returns_byte_equivalent_rows_before_after_indexes(hot
         after = _fetch(cur, sql, params)
     assert after == before
     assert [row["local_order_id"] for row in after] == [
-        "armed-paper", "armed-paper-null-column", "armed-conflicting-meta", "armed-future"
+        "stale-armed", "armed-paper", "armed-paper-null-column",
+        "armed-conflicting-meta", "armed-future"
     ]
 
 
@@ -247,12 +248,12 @@ def test_pending_trigger_query_returns_byte_equivalent_rows_before_after_indexes
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=48)
     with db.cursor() as cur:
-        _insert_order(cur, local_id="pending-paper", created=now - timedelta(hours=1), updated=now)
-        _insert_order(cur, local_id="pending-live", mode="live", created=now - timedelta(hours=2), updated=now)
-        _insert_order(cur, local_id="pending-broker", broker_id="broker-1", created=now - timedelta(hours=3), updated=now)
-        _insert_order(cur, local_id="pending-submitted", submitted=now, created=now - timedelta(hours=4), updated=now)
-        _insert_order(cur, local_id="pending-filled", filled=now, created=now - timedelta(hours=5), updated=now)
-        _insert_order(cur, local_id="pending-old", created=now - timedelta(hours=49), updated=now)
+        _insert_order(cur, local_id="pending-paper", status="PENDING_TRIGGER", created=now - timedelta(hours=1), updated=now)
+        _insert_order(cur, local_id="pending-live", status="PENDING_TRIGGER", mode="live", created=now - timedelta(hours=2), updated=now)
+        _insert_order(cur, local_id="pending-broker", status="PENDING_TRIGGER", broker_id="broker-1", created=now - timedelta(hours=3), updated=now)
+        _insert_order(cur, local_id="pending-submitted", status="PENDING_TRIGGER", submitted=now, created=now - timedelta(hours=4), updated=now)
+        _insert_order(cur, local_id="pending-filled", status="PENDING_TRIGGER", filled=now, created=now - timedelta(hours=5), updated=now)
+        _insert_order(cur, local_id="pending-old", status="PENDING_TRIGGER", created=now - timedelta(hours=49), updated=now)
         sql = _pending_sql()
         params = ("client-A", cutoff)
         before = _fetch(cur, sql, params)
