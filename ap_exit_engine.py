@@ -4085,6 +4085,97 @@ class APExitEngine:
         with self._lock:
             return [p for p in self._positions if _is_behavior_active_position(p)]
 
+    def quarantine_canonical_owner_handoff(
+        self,
+        *,
+        canonical_position_id: str,
+        contract: str,
+        client_id: str = "",
+        execution_mode: str = "",
+        reason: str = "canonical_owner_handoff_failed",
+    ) -> dict:
+        """Fail closed for every nonclosed owner of an unproven contract."""
+        target_contract = str(contract or "").strip().upper()
+        if not target_contract:
+            return {"ok": False, "quarantined_ids": []}
+
+        quarantined_ids = []
+        with self._lock:
+            for pos in self._positions:
+                pos_contract = str(
+                    getattr(pos, "option_symbol", "")
+                    or getattr(pos, "contract", "")
+                    or ""
+                ).strip().upper()
+                if pos_contract != target_contract or getattr(pos, "closed", False):
+                    continue
+                position_id = str(getattr(pos, "position_id", "") or "").strip()
+                _mark_adoption_identity_quarantined(
+                    pos,
+                    reason or "canonical_owner_handoff_failed",
+                )
+                quarantined_ids.append(position_id)
+
+        log.critical(
+            "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINED | "
+            "contract=%s canonical=%s client=%s mode=%s quarantined=%s reason=%s",
+            target_contract,
+            str(canonical_position_id or ""),
+            str(client_id or ""),
+            str(execution_mode or ""),
+            quarantined_ids,
+            reason,
+        )
+        return {
+            "ok": bool(quarantined_ids),
+            "quarantined_ids": quarantined_ids,
+            "contract": target_contract,
+        }
+
+    def clear_canonical_owner_handoff_quarantine(
+        self,
+        *,
+        canonical_position_id: str,
+        contract: str,
+        client_id: str = "",
+        execution_mode: str = "",
+    ) -> dict:
+        """Allow a durable retry to re-run adoption and prove one owner."""
+        target_contract = str(contract or "").strip().upper()
+        if not target_contract:
+            return {"ok": False, "cleared_ids": []}
+
+        cleared_ids = []
+        with self._lock:
+            for pos in self._positions:
+                pos_contract = str(
+                    getattr(pos, "option_symbol", "")
+                    or getattr(pos, "contract", "")
+                    or ""
+                ).strip().upper()
+                if pos_contract != target_contract or getattr(pos, "closed", False):
+                    continue
+                if _is_adoption_identity_quarantined(pos):
+                    _clear_adoption_identity_quarantine(pos)
+                    cleared_ids.append(
+                        str(getattr(pos, "position_id", "") or "").strip()
+                    )
+
+        log.info(
+            "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINE_CLEARED | "
+            "contract=%s canonical=%s client=%s mode=%s cleared=%s",
+            target_contract,
+            str(canonical_position_id or ""),
+            str(client_id or ""),
+            str(execution_mode or ""),
+            cleared_ids,
+        )
+        return {
+            "ok": True,
+            "cleared_ids": cleared_ids,
+            "contract": target_contract,
+        }
+
     def attach_quote_monitor(self, monitor) -> None:
         """Wire the PositionQuoteMonitor for observability and wake-driven exits."""
         self.quote_monitor = monitor

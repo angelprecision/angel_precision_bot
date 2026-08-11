@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -43,25 +44,64 @@ class _Result:
 
 
 class _Connection:
-    def __init__(self, row=None, *, update_rowcount=1, update_error=None):
+    def __init__(
+        self,
+        row=None,
+        *,
+        update_rowcount=1,
+        update_error=None,
+        position_row=None,
+    ):
         self.row = dict(row) if row is not None else None
+        if self.row is not None:
+            self.row.setdefault("broker_order_id", "entry-broker-1")
+            self.row.setdefault("contract", "INTC260810P00098000")
         self.update_rowcount = update_rowcount
         self.update_error = update_error
+        self.position_row = (
+            dict(position_row)
+            if position_row is not None
+            else {
+                "id": "canonical-position-1",
+                "client_id": "jason@example.com",
+                "contract": "INTC260810P00098000",
+                "execution_mode": "live",
+            }
+        )
         self.calls = []
 
     def execute(self, sql, params=()):
         self.calls.append((sql, params))
         normalized = " ".join(sql.split())
-        if normalized.startswith("UPDATE orders"):
+        if normalized.startswith("SELECT id, client_id"):
+            position_id, client_id = params
+            if (
+                self.position_row is None
+                or self.position_row.get("id") != position_id
+                or self.position_row.get("client_id") != client_id
+            ):
+                return _Result(row=None)
+            return _Result(row=dict(self.position_row))
+        if normalized.startswith("UPDATE orders") and "SET position_id=%s" in normalized:
             if self.update_error:
                 raise self.update_error
-            requested_position, client_id, local_id, mode, same_position = params
+            (
+                requested_position,
+                client_id,
+                local_id,
+                broker_id,
+                contract,
+                mode,
+                same_position,
+            ) = params
             eligible = bool(
                 self.row
                 and self.row.get("client_id") == client_id
                 and self.row.get("local_order_id") == local_id
+                and self.row.get("broker_order_id") == broker_id
+                and self.row.get("contract") == contract
                 and self.row.get("kind") == "ENTRY"
-                and self.row.get("execution_mode") == mode
+                and str(self.row.get("execution_mode") or "").strip().lower() == mode
                 and (
                     self.row.get("position_id") in (None, "")
                     or self.row.get("position_id") == same_position
@@ -70,8 +110,45 @@ class _Connection:
             if eligible and self.update_rowcount:
                 self.row["position_id"] = requested_position
             return _Result(rowcount=self.update_rowcount if eligible else 0)
+        if normalized.startswith("UPDATE orders"):
+            if self.update_error:
+                raise self.update_error
+            if "last_error=CASE" in normalized:
+                meta_payload, client_id, local_id = params
+                if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
+                    self.row["meta"] = {
+                        **(self.row.get("meta") or {}),
+                        **json.loads(meta_payload),
+                    }
+                return _Result(rowcount=1 if self.row else 0)
+            if "last_error=%s" in normalized:
+                last_error, meta_payload, client_id, local_id = params
+                if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
+                    self.row["last_error"] = last_error
+                    self.row["meta"] = {
+                        **(self.row.get("meta") or {}),
+                        **json.loads(meta_payload),
+                    }
+                return _Result(rowcount=1 if self.row else 0)
+            meta_payload, client_id, local_id = params
+            if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
+                self.row["meta"] = {
+                    **(self.row.get("meta") or {}),
+                    **json.loads(meta_payload),
+                }
+            return _Result(rowcount=1 if self.row else 0)
         if normalized.startswith("SELECT client_id"):
-            return _Result(row=dict(self.row) if self.row is not None else None)
+            if self.row is None:
+                return _Result(row=None)
+            client_id, local_id, broker_id, contract = params
+            if (
+                self.row.get("client_id") != client_id
+                or self.row.get("local_order_id") != local_id
+                or self.row.get("broker_order_id") != broker_id
+                or self.row.get("contract") != contract
+            ):
+                return _Result(row=None)
+            return _Result(row=dict(self.row))
         raise AssertionError(f"unexpected SQL: {sql}")
 
 
@@ -113,13 +190,19 @@ def test_filled_entry_binds_null_position_id_and_reads_back(monkeypatch):
     assert result["ok"] is True
     assert result["disposition"] == "BOUND"
     assert db.row["position_id"] == "canonical-position-1"
-    update_sql, update_params = db.calls[0]
+    update_sql, update_params = next(
+        (sql, params)
+        for sql, params in db.calls
+        if "SET position_id=%s" in sql
+    )
     assert "kind='ENTRY'" in update_sql
-    assert "execution_mode=%s" in update_sql
+    assert "LOWER(BTRIM(COALESCE(execution_mode,'')))=%s" in update_sql
     assert update_params == (
         "canonical-position-1",
         "jason@example.com",
         "entry-local-1",
+        "entry-broker-1",
+        "INTC260810P00098000",
         "live",
         "canonical-position-1",
     )
@@ -164,11 +247,60 @@ def test_different_existing_position_id_is_conflict_without_overwrite(monkeypatc
     assert db.row["position_id"] == "other-position"
 
 
+def test_bind_fences_exact_broker_and_contract_identity(monkeypatch):
+    from ap import fill_monitor as fm
+
+    db = _Connection({
+        "client_id": "jason@example.com",
+        "local_order_id": "entry-local-1",
+        "broker_order_id": "a-different-broker-order",
+        "kind": "ENTRY",
+        "execution_mode": "live",
+        "position_id": None,
+    })
+    _install_db(monkeypatch, db)
+
+    result = fm._bind_filled_entry_position_id(_order(), "canonical-position-1")
+
+    assert result["ok"] is False
+    assert result["detail_reason"] == "order_row_missing_after_bind"
+    assert db.row["position_id"] is None
+
+
+def test_bind_fails_closed_on_position_identity_mismatch(monkeypatch):
+    from ap import fill_monitor as fm
+
+    db = _Connection(
+        {
+            "client_id": "jason@example.com",
+            "local_order_id": "entry-local-1",
+            "kind": "ENTRY",
+            "execution_mode": "live",
+            "position_id": None,
+        },
+        position_row={
+            "id": "canonical-position-1",
+            "client_id": "jason@example.com",
+            "contract": "INTC260810C00098000",
+            "execution_mode": "live",
+        },
+    )
+    _install_db(monkeypatch, db)
+
+    result = fm._bind_filled_entry_position_id(_order(), "canonical-position-1")
+
+    assert result["ok"] is False
+    assert result["detail_reason"] == "canonical_position_identity_mismatch"
+    assert db.row["position_id"] is None
+
+
 @pytest.mark.parametrize(
     ("overrides", "detail"),
     [
         ({"client_id": ""}, "client_id_missing"),
         ({"local_order_id": ""}, "local_order_id_missing"),
+        ({"broker_order_id": ""}, "broker_order_id_missing_or_invalid"),
+        ({"contract": "", "symbol": ""}, "contract_missing"),
         ({"kind": "EXIT"}, "kind_not_ENTRY"),
         ({"execution_mode": "sandbox"}, "execution_mode_missing_or_invalid"),
     ],
@@ -495,6 +627,7 @@ def test_process_owner_ambiguity_is_visible_after_seed(monkeypatch):
 
     events = []
     failures = []
+    quarantines = []
     _patch_process_side_effects(monkeypatch, events)
     db = _Connection({
         "client_id": "jason@example.com",
@@ -530,6 +663,10 @@ def test_process_owner_ambiguity_is_visible_after_seed(monkeypatch):
         },
     )
 
+    engine = SimpleNamespace(
+        quarantine_canonical_owner_handoff=lambda **kwargs: quarantines.append(kwargs),
+    )
+
     class _OSM:
         def transition(self, *args, **kwargs):
             return True
@@ -539,8 +676,109 @@ def test_process_owner_ambiguity_is_visible_after_seed(monkeypatch):
         _order(),
         osm=_OSM(),
         pm=object(),
-        exit_engine=SimpleNamespace(),
+        exit_engine=engine,
     )
 
     assert failures
     assert failures[0]["reason_code"] == "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN"
+    assert quarantines
+
+
+def test_filled_handoff_retry_replays_without_terminal_osm_transition(monkeypatch):
+    from ap import fill_monitor as fm
+
+    events = []
+    _patch_process_side_effects(monkeypatch, events)
+    order = _order(
+        status="FILLED",
+        position_id=None,
+        meta={
+            "canonical_owner_handoff_retry_required": True,
+            "canonical_owner_handoff_standing_stop_attempted": False,
+        },
+    )
+    db = _Connection({
+        "client_id": "jason@example.com",
+        "local_order_id": "entry-local-1",
+        "kind": "ENTRY",
+        "execution_mode": "live",
+        "position_id": None,
+        "meta": dict(order["meta"]),
+    })
+    _install_db(monkeypatch, db)
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *a, **k: events.append("open") or "canonical-position-1",
+    )
+    monkeypatch.setattr(
+        fm,
+        "_place_standing_stop_best_effort",
+        lambda *a, **k: events.append("standing_stop") or True,
+    )
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *a, **k: events.append("seed") or {"ok": True, "disposition": "SEEDED"},
+    )
+    monkeypatch.setattr(
+        fm,
+        "_verify_canonical_entry_owner",
+        lambda *a, **k: events.append("verify") or {"ok": True},
+    )
+
+    class _OSM:
+        def transition(self, *args, **kwargs):
+            raise AssertionError("terminal FILLED row must not transition again")
+
+    fm.process_pending_order(
+        object(),
+        order,
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(),
+    )
+
+    assert db.row["position_id"] == "canonical-position-1"
+    assert db.row["meta"]["canonical_owner_handoff_retry_required"] is False
+    assert events.index("open") < events.index("standing_stop") < events.index("seed") < events.index("verify")
+
+
+def test_exit_engine_quarantines_and_releases_same_contract_on_retry():
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    engine = APExitEngine(None, email="jason@example.com")
+    position = ManagedPosition(
+        ticker="INTC",
+        option_symbol="INTC260810P00098000",
+        side="PUT",
+        quantity=1,
+        entry_price=1.46,
+        underlying_entry=98.0,
+        underlying_target=100.0,
+        underlying_stop=96.0,
+    )
+    position.position_id = "canonical-position-1"
+    position.client_id = "jason@example.com"
+    position.execution_mode = "live"
+    position.quantity_remaining = 1
+    engine.add_position(position)
+
+    quarantined = engine.quarantine_canonical_owner_handoff(
+        canonical_position_id="canonical-position-1",
+        contract="INTC260810P00098000",
+        client_id="jason@example.com",
+        execution_mode="live",
+        reason="owner_cardinality_or_identity_unproven",
+    )
+    assert quarantined["quarantined_ids"] == ["canonical-position-1"]
+    assert engine.active_positions() == []
+
+    cleared = engine.clear_canonical_owner_handoff_quarantine(
+        canonical_position_id="canonical-position-1",
+        contract="INTC260810P00098000",
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+    assert cleared["cleared_ids"] == ["canonical-position-1"]
+    assert engine.active_positions() == [position]
