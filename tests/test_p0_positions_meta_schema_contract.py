@@ -63,6 +63,23 @@ def test_live_attestation_fails_closed_when_positions_meta_is_missing(monkeypatc
         schema_attestation.attest_schema(required=required)
 
 
+def test_live_attestation_succeeds_when_positions_meta_is_present(monkeypatch):
+    required = {"positions": frozenset({"id", "client_id", "meta"})}
+    monkeypatch.setenv("BOT_MODE", "LIVE")
+    monkeypatch.delenv("SCHEMA_ATTESTATION_STRICT", raising=False)
+    monkeypatch.setattr(
+        schema_attestation,
+        "_fetch_actual_schema",
+        lambda _required: {"positions": {"id", "client_id", "meta"}},
+    )
+
+    report = schema_attestation.attest_schema(required=required)
+
+    assert report["ok"] is True
+    assert report["strict"] is True
+    assert report["missing_columns"] == {}
+
+
 def test_migration_is_idempotent_jsonb_contract():
     sql = MIGRATION_PATH.read_text(encoding="utf-8")
     normalized = " ".join(sql.split()).lower()
@@ -116,17 +133,25 @@ def test_migration_closes_exact_production_qpm_sql_gap():
                 cur.execute(runtime_sql, params)
 
             cur.execute(migration_sql)
-            # Idempotency: applying the same migration twice must remain safe.
+            cur.execute(
+                "UPDATE positions SET meta = %s::jsonb WHERE id='pos-1'",
+                ('{"existing":{"keep":true}}',),
+            )
+            # Idempotency: applying the same migration twice must remain safe
+            # and preserve existing non-null metadata.
             cur.execute(migration_sql)
+            cur.execute("SELECT meta->'existing' FROM positions WHERE id='pos-1'")
+            assert cur.fetchone() == ({"keep": True},)
 
             cur.execute(runtime_sql, params)
             assert cur.rowcount == 1
             cur.execute(
-                "SELECT meta->'hard_exit_reference'->>'source', "
+                "SELECT meta->'existing', "
+                "       meta->'hard_exit_reference'->>'source', "
                 "       meta->'hard_exit_reference'->>'validity' "
                 "FROM positions WHERE id='pos-1'"
             )
-            assert cur.fetchone() == ("bid", "proven")
+            assert cur.fetchone() == ({"keep": True}, "bid", "proven")
 
             cur.execute(
                 """
