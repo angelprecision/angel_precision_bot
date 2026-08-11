@@ -28,6 +28,7 @@ from ap.order_monitor import (  # noqa: E402
     APOrderMonitor,
     NewerExitLookup,
     NewerExitLookupState,
+    _strict_cumulative_quantity,
 )
 
 
@@ -57,6 +58,19 @@ def _actor_mode(monkeypatch):
     import ap.order_monitor as om_mod
     monkeypatch.setattr(om_mod, "ORDER_MONITOR_MODE", "actor")
     monkeypatch.setattr(om_mod, "ORDER_MONITOR_CAN_ACT", True)
+
+
+@pytest.mark.parametrize("value, expected", [(0.0, 0), (1.0, 1), (2.0, 2)])
+def test_strict_cumulative_quantity_accepts_finite_integral_float(value, expected):
+    assert _strict_cumulative_quantity(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, -1.0, 1.5, float("nan"), float("inf"), " 1 "],
+)
+def test_strict_cumulative_quantity_rejects_ambiguous_values(value):
+    assert _strict_cumulative_quantity(value) is None
 
 
 class _DurableCancelOSM:
@@ -714,7 +728,7 @@ def test_cancel_post_cancel_get_failure_blocks_replacement(monkeypatch):
 
 
 def test_cancel_to_canceled_with_cumulative_partial_fill_caps_replacement_to_remainder(monkeypatch):
-    """A fill earned during DELETE must be durable before CANCELED handoff."""
+    """Decimal Tradier quantities still prove the partial-fill handoff."""
     _watchdog_mode(monkeypatch, stale_exit_recovery=True)
 
     class _PartialFillOSM:
@@ -763,7 +777,13 @@ def test_cancel_to_canceled_with_cumulative_partial_fill_caps_replacement_to_rem
     broker = MagicMock()
     broker.get_order.side_effect = [
         {"status": "working"},
-        {"status": "canceled", "exec_quantity": 1, "avg_fill_price": 1.25},
+        {
+            "status": "canceled",
+            "quantity": 2.0,
+            "exec_quantity": 1.0,
+            "remaining_quantity": 1.0,
+            "avg_fill_price": 1.25,
+        },
     ]
     broker.cancel_order.return_value = {"status": "canceled"}
     osm = _PartialFillOSM()

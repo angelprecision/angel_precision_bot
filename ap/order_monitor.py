@@ -56,6 +56,10 @@ def _strict_cumulative_quantity(value) -> Optional[int]:
         return None
     if type(value) is int:
         return value if value >= 0 else None
+    if type(value) is float:
+        if math.isfinite(value) and value.is_integer() and value >= 0:
+            return int(value)
+        return None
     if isinstance(value, str) and value.isdigit():
         return int(value)
     return None
