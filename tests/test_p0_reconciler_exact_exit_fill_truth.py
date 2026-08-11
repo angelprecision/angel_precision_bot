@@ -16,6 +16,7 @@ os.environ.setdefault(
 
 import ap.db as db_mod
 from ap import manual_close_reconciliation as manual_close
+import ap.position_manager as position_manager_mod
 from ap_reconciler import APBrokerReconciler, _empty_summary
 
 
@@ -155,6 +156,125 @@ def _position(*, mode: str = MODE_LIVE) -> dict:
         "pending_exit_local_order_id": "exit-local-1",
         "pending_exit_broker_order_id": "TR-195",
     }
+
+
+class _HealerCursor:
+    """Cursor double that exposes the old OR versus the exact-pair SQL fence."""
+
+    def __init__(
+        self,
+        rows: list[dict],
+        *,
+        current_local: str = "exit-B",
+        current_broker: str = "222",
+    ):
+        self.rows = list(rows)
+        self.current_local = current_local
+        self.current_broker = current_broker
+        self.sql: list[str] = []
+        self._selected: list[dict] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=()):
+        compact = " ".join(str(sql).split())
+        self.sql.append(compact)
+        upper_sql = compact.upper()
+        if "FROM ORDERS O" not in upper_sql:
+            return
+
+        exact_pair_predicate = (
+            "NULLIF(TRIM(COALESCE(P.PENDING_EXIT_LOCAL_ORDER_ID, '')), '') IS NULL"
+            in upper_sql
+            and "NULLIF(TRIM(COALESCE(P.PENDING_EXIT_BROKER_ORDER_ID, '')), '') IS NULL"
+            in upper_sql
+        )
+
+        def _matches(row: dict) -> bool:
+            local_matches = (
+                str(row.get("local_order_id") or "").strip() == self.current_local
+            )
+            broker_matches = (
+                str(row.get("broker_order_id") or "").strip() == self.current_broker
+            )
+            return (
+                local_matches and broker_matches
+                if exact_pair_predicate
+                else local_matches or broker_matches
+            )
+
+        self._selected = [dict(row) for row in self.rows if _matches(row)]
+
+    def fetchall(self):
+        return list(self._selected)
+
+
+def _install_healer_rows(monkeypatch, rows: list[dict]) -> _HealerCursor:
+    cursor = _HealerCursor(rows)
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(db_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+    return cursor
+
+
+def _healer_row(*, local_order_id: str, broker_order_id: str) -> dict:
+    return {
+        "local_order_id": local_order_id,
+        "position_id": POSITION_ID,
+        "fill_price": 4.79,
+        "filled_qty": 2,
+        "filled_ts": "2026-08-10T19:00:00+00:00",
+        "broker_order_id": broker_order_id,
+    }
+
+
+@pytest.mark.parametrize(
+    ("row_local", "row_broker", "expected_heals"),
+    [
+        pytest.param("exit-B", "111", 0, id="local-only-match-holds"),
+        pytest.param("exit-A", "222", 0, id="broker-only-match-holds"),
+        pytest.param("exit-B", "222", 1, id="exact-pair-heals"),
+    ],
+)
+def test_backup_healer_requires_exact_current_exit_generation_pair(
+    monkeypatch,
+    row_local: str,
+    row_broker: str,
+    expected_heals: int,
+):
+    cursor = _install_healer_rows(
+        monkeypatch,
+        [_healer_row(local_order_id=row_local, broker_order_id=row_broker)],
+    )
+    fake_pm = MagicMock()
+    fake_pm.close_position_from_exit_fill.return_value = True
+    monkeypatch.setattr(
+        position_manager_mod,
+        "APPositionManager",
+        lambda _client_id: fake_pm,
+    )
+
+    rec = _reconciler()
+    summary = _empty_summary(CLIENT)
+    rec._heal_exit_filled_positions_from_orders(summary)
+
+    assert cursor.sql
+    healer_sql = cursor.sql[0].upper()
+    assert "PENDING_EXIT_LOCAL_ORDER_ID" in healer_sql
+    assert "PENDING_EXIT_BROKER_ORDER_ID" in healer_sql
+    assert fake_pm.close_position_from_exit_fill.call_count == expected_heals
+    assert summary["positions_corrected"] == expected_heals
 
 
 def test_exact_c_incident_old_same_ticker_fill_is_not_evidence(monkeypatch):

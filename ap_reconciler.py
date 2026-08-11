@@ -1040,10 +1040,17 @@ class APBrokerReconciler:
                           AND UPPER(TRIM(COALESCE(o.contract, ''))) =
                               UPPER(TRIM(COALESCE(p.contract, '')))
                           AND (
-                              NULLIF(TRIM(COALESCE(p.pending_exit_local_order_id, '')), '')
-                                  = o.local_order_id
-                              OR NULLIF(TRIM(COALESCE(p.pending_exit_broker_order_id, '')), '')
-                                  = o.broker_order_id
+                              NULLIF(TRIM(COALESCE(p.pending_exit_local_order_id, '')), '') IS NOT NULL
+                              OR
+                              NULLIF(TRIM(COALESCE(p.pending_exit_broker_order_id, '')), '') IS NOT NULL
+                          )
+                          AND (
+                              NULLIF(TRIM(COALESCE(p.pending_exit_local_order_id, '')), '') IS NULL
+                              OR p.pending_exit_local_order_id = o.local_order_id
+                          )
+                          AND (
+                              NULLIF(TRIM(COALESCE(p.pending_exit_broker_order_id, '')), '') IS NULL
+                              OR p.pending_exit_broker_order_id = o.broker_order_id
                           )
                           AND p.avg_fill IS NOT NULL
                           AND p.avg_fill > 0
