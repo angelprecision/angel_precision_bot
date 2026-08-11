@@ -591,6 +591,7 @@ class APProofLogger:
             "exit_reason", "option_pnl_pct", "underlying_pnl_pct", "win",
             "synthetic_entry", "position_id", "local_order_id",
             "exit_local_order_id",
+            "broker_exit_order_id", "broker_exit_fill_ts", "broker_exit_filled_qty",
         }
         # ── Persistence-status tracking ──────────────────────────────────────
         # _persisted is set True only after a confirmed Supabase insert.

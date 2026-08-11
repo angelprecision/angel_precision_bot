@@ -1187,6 +1187,121 @@ def test_real_exit_engine_callback_carries_exit_provenance_without_overwriting_e
     assert proof["broker_exit_filled_qty"] == 2
 
 
+class _ProofSchemaFallbackSupabase:
+    def __init__(self, *, missing_field: str | None = None):
+        self.attempts: list[dict] = []
+        self.missing_field = missing_field
+
+    def table(self, name):
+        assert name == "proof_trades"
+        return self
+
+    def insert(self, payload):
+        self.attempts.append(dict(payload))
+        return self
+
+    def execute(self):
+        attempt = len(self.attempts)
+        if attempt <= 3:
+            raise RuntimeError("column schema drift")
+        if self.missing_field and self.missing_field in self.attempts[-1]:
+            raise RuntimeError(f'column "{self.missing_field}" does not exist')
+        return SimpleNamespace(data=[])
+
+
+def _proof_log_kwargs(*, fill_ts: datetime) -> dict:
+    return {
+        "ticker": "C",
+        "pattern": "test",
+        "side": "CALL",
+        "timeframe": "1d",
+        "score": 80,
+        "tier": "A",
+        "context_score": 70,
+        "setup_status": "broker_exit_fill",
+        "entry_trigger": 400.0,
+        "entry_option_price": 2.33,
+        "exit_option_price": 4.79,
+        "underlying_entry": 400.0,
+        "underlying_exit": 405.0,
+        "contracts": 2,
+        "exit_reason": "RECONCILED_CLOSE",
+        "option_pnl_pct": 105.58,
+        "underlying_pnl_pct": 1.25,
+        "win": True,
+        "position_id": POSITION_ID,
+        "local_order_id": "ENTRY",
+        "exit_local_order_id": "EXIT",
+        "broker_exit_order_id": "BROKER-EXIT",
+        "broker_exit_fill_ts": fill_ts,
+        "broker_exit_filled_qty": 2,
+    }
+
+
+def _stub_proof_taxonomy_guard(monkeypatch):
+    monkeypatch.setattr(
+        "ap.proof_taxonomy_guard.resolve_originating_entry_identity",
+        lambda **_kwargs: SimpleNamespace(
+            local_order_id="ENTRY",
+            position_id=POSITION_ID,
+            execution_mode=MODE_LIVE,
+            synthetic_entry=False,
+        ),
+    )
+    monkeypatch.setattr("ap.proof_taxonomy_guard._lifecycle_proof_stamp", lambda _identity: {})
+    monkeypatch.setattr("ap.proof_taxonomy_guard._persist_stamp", lambda *_args: None)
+
+
+def test_stage4_fallback_preserves_broker_exit_provenance(monkeypatch):
+    from ap_proof_logger import APProofLogger
+
+    fill_ts = datetime(2026, 8, 10, 19, 0, tzinfo=timezone.utc)
+    supabase = _ProofSchemaFallbackSupabase()
+    _stub_proof_taxonomy_guard(monkeypatch)
+    monkeypatch.setattr("ap_proof_logger._resolve_entry_execution_mode", lambda *_args: MODE_LIVE)
+
+    result = APProofLogger(
+        supabase_client=supabase,
+        client_email=CLIENT,
+        mode=MODE_LIVE,
+    ).log_trade(**_proof_log_kwargs(fill_ts=fill_ts))
+
+    assert result["_proof_persisted"] is True
+    assert len(supabase.attempts) == 4
+    payload = supabase.attempts[-1]
+    assert payload["local_order_id"] == "ENTRY"
+    assert payload["exit_local_order_id"] == "EXIT"
+    assert payload["broker_exit_order_id"] == "BROKER-EXIT"
+    assert payload["broker_exit_fill_ts"] == fill_ts.isoformat()
+    assert payload["broker_exit_filled_qty"] == 2
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ("broker_exit_order_id", "broker_exit_fill_ts", "broker_exit_filled_qty"),
+)
+def test_stage4_missing_required_broker_provenance_does_not_claim_persistence(
+    monkeypatch,
+    missing_field,
+):
+    from ap_proof_logger import APProofLogger
+
+    supabase = _ProofSchemaFallbackSupabase(missing_field=missing_field)
+    _stub_proof_taxonomy_guard(monkeypatch)
+    monkeypatch.setattr("ap_proof_logger._resolve_entry_execution_mode", lambda *_args: MODE_LIVE)
+
+    result = APProofLogger(
+        supabase_client=supabase,
+        client_email=CLIENT,
+        mode=MODE_LIVE,
+    ).log_trade(
+        **_proof_log_kwargs(fill_ts=datetime(2026, 8, 10, 19, 0, tzinfo=timezone.utc))
+    )
+
+    assert len(supabase.attempts) == 4
+    assert result["_proof_persisted"] is False
+
+
 def _run_unproven_three_passes(rec: APBrokerReconciler, pos: dict, mark: float):
     summary = _empty_summary(CLIENT)
     rec._alert = MagicMock()
