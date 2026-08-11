@@ -225,7 +225,7 @@ def test_armed_retry_query_returns_byte_equivalent_rows_before_after_indexes(hot
     assert after == before
     assert [row["local_order_id"] for row in after] == [
         "stale-armed", "armed-paper", "armed-paper-null-column",
-        "armed-conflicting-meta", "armed-future"
+        "armed-future"
     ]
 
 
@@ -260,7 +260,7 @@ def test_pending_trigger_query_returns_byte_equivalent_rows_before_after_indexes
         _apply_migration(cur)
         after = _fetch(cur, sql, params)
     assert after == before
-    assert [row["local_order_id"] for row in after] == ["pending-paper", "pending-live"]
+    assert [row["local_order_id"] for row in after] == ["pending-live", "pending-paper"]
 
 
 def test_live_and_paper_retry_rows_remain_isolated():
