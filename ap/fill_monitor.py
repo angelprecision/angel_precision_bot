@@ -1393,6 +1393,122 @@ def _open_position_safe(
     return position_id
 
 
+def _bind_filled_entry_position_id(order: dict, canonical_position_id: str) -> dict:
+    """Bind and prove the canonical position id on one filled ENTRY row.
+
+    The fill monitor must prove this durable link before the exit engine is
+    allowed to treat the in-memory owner as canonical.  The UPDATE is fenced
+    by exact client/local/kind/mode identity and never overwrites a different
+    existing position id.  A readback is mandatory because a zero-row update
+    can mean either an idempotent already-bound row or an identity conflict.
+    """
+    client_id = str(order.get("client_id") or "").strip()
+    local_order_id = str(order.get("local_order_id") or "").strip()
+    position_id = str(canonical_position_id or "").strip()
+    kind = str(order.get("kind") or "").strip().upper()
+    execution_mode = _normalize_execution_mode_token(order.get("execution_mode"))
+
+    def _failure(detail_reason: str, **extra) -> dict:
+        return {
+            "ok": False,
+            "disposition": "BIND_FAILED",
+            "reason_code": "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED",
+            "detail_reason": detail_reason,
+            "client_id": client_id,
+            "local_order_id": local_order_id,
+            "position_id": position_id,
+            "execution_mode": execution_mode,
+            **extra,
+        }
+
+    if not client_id:
+        return _failure("client_id_missing")
+    if not local_order_id:
+        return _failure("local_order_id_missing")
+    if not position_id:
+        return _failure("canonical_position_id_missing")
+    if kind != "ENTRY":
+        return _failure("kind_not_ENTRY", kind=kind)
+    if not execution_mode:
+        return _failure("execution_mode_missing_or_invalid")
+
+    def _read_row():
+        with conn() as c:
+            return c.execute(
+                "SELECT client_id, local_order_id, kind, execution_mode, position_id "
+                "FROM orders WHERE client_id=%s AND local_order_id=%s LIMIT 1",
+                (client_id, local_order_id),
+            ).fetchone()
+
+    def _bind_row():
+        with conn() as c:
+            result = c.execute(
+                "UPDATE orders SET position_id=%s, updated_ts=NOW() "
+                "WHERE client_id=%s AND local_order_id=%s "
+                "AND kind='ENTRY' AND execution_mode=%s "
+                "AND (position_id IS NULL OR BTRIM(position_id)='' "
+                "OR position_id=%s)",
+                (position_id, client_id, local_order_id, execution_mode, position_id),
+            )
+            return int(
+                getattr(result, "rowcount", getattr(c, "rowcount", 0)) or 0
+            )
+
+    try:
+        rowcount = run_with_retry(_bind_row)
+        row = run_with_retry(_read_row)
+    except Exception as exc:
+        return _failure(
+            "database_error",
+            exception_type=type(exc).__name__,
+            exception=str(exc),
+        )
+
+    if not row:
+        return _failure("order_row_missing_after_bind", rowcount=rowcount)
+
+    row_client = str(row.get("client_id") or "").strip()
+    row_local = str(row.get("local_order_id") or "").strip()
+    row_kind = str(row.get("kind") or "").strip()
+    row_mode = str(row.get("execution_mode") or "").strip()
+    row_position = str(row.get("position_id") or "").strip()
+
+    if (
+        row_client != client_id
+        or row_local != local_order_id
+        or row_kind != "ENTRY"
+        or row_mode != execution_mode
+    ):
+        return _failure(
+            "stored_order_identity_mismatch",
+            row_client_id=row_client,
+            row_local_order_id=row_local,
+            row_kind=row_kind,
+            row_execution_mode=row_mode,
+            rowcount=rowcount,
+        )
+
+    if row_position == position_id:
+        return {
+            "ok": True,
+            "disposition": "BOUND" if rowcount else "ALREADY_BOUND",
+            "reason_code": "FILLED_ENTRY_POSITION_IDENTITY_BOUND",
+            "client_id": client_id,
+            "local_order_id": local_order_id,
+            "position_id": position_id,
+            "execution_mode": execution_mode,
+            "rowcount": rowcount,
+        }
+
+    if row_position:
+        return _failure(
+            "POSITION_IDENTITY_CONFLICT",
+            existing_position_id=row_position,
+            rowcount=rowcount,
+        )
+    return _failure("position_id_not_proven_after_readback", rowcount=rowcount)
+
+
 def _place_standing_stop_best_effort(
     *,
     broker: BrokerAdapter,
@@ -1737,6 +1853,142 @@ def _classify_existing_protective_owner(
     return "NO_OWNER", 0, 0
 
 
+def _owner_value(owner, name: str, default=None):
+    if isinstance(owner, dict):
+        return owner.get(name, default)
+    return getattr(owner, name, default)
+
+
+def _verify_canonical_entry_owner(
+    exit_engine,
+    order: dict,
+    canonical_position_id: str,
+) -> dict:
+    """Prove one exact behavior-active canonical owner after ENTRY handoff."""
+    client_id = str(order.get("client_id") or "").strip().lower()
+    contract = str(order.get("contract") or order.get("symbol") or "").strip().upper()
+    execution_mode = _normalize_execution_mode_token(order.get("execution_mode"))
+    position_id = str(canonical_position_id or "").strip()
+
+    def _failure(detail_reason: str, **extra) -> dict:
+        return {
+            "ok": False,
+            "disposition": "OWNER_UNPROVEN",
+            "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+            "detail_reason": detail_reason,
+            "client_id": client_id,
+            "contract": contract,
+            "execution_mode": execution_mode,
+            "position_id": position_id,
+            **extra,
+        }
+
+    if not client_id or not contract or not execution_mode or not position_id:
+        return _failure("canonical_owner_identity_missing")
+
+    active_fn = getattr(exit_engine, "active_positions", None)
+    if not callable(active_fn):
+        return _failure("active_owner_lookup_unavailable")
+
+    try:
+        active_positions = list(active_fn() or [])
+    except Exception as exc:
+        return _failure(
+            "active_owner_lookup_failed",
+            exception_type=type(exc).__name__,
+            exception=str(exc),
+        )
+
+    identity_matches = []
+    repair_matches = []
+    for owner in active_positions:
+        if bool(_owner_value(owner, "closed", False)):
+            continue
+        owner_contract = str(
+            _owner_value(owner, "option_symbol", _owner_value(owner, "contract", ""))
+            or ""
+        ).strip().upper()
+        owner_client = str(_owner_value(owner, "client_id", "") or "").strip().lower()
+        owner_mode = _normalize_execution_mode_token(
+            _owner_value(owner, "execution_mode", "")
+        )
+        owner_id = str(_owner_value(owner, "position_id", "") or "").strip()
+        if (
+            owner_contract != contract
+            or owner_client != client_id
+            or owner_mode != execution_mode
+        ):
+            continue
+        identity_matches.append(owner_id)
+        if owner_id.startswith("broker-repair-"):
+            repair_matches.append(owner_id)
+
+    if (
+        len(identity_matches) == 1
+        and identity_matches[0] == position_id
+        and not repair_matches
+    ):
+        return {
+            "ok": True,
+            "disposition": "CANONICAL_OWNER_PROVEN",
+            "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_PROVEN",
+            "client_id": client_id,
+            "contract": contract,
+            "execution_mode": execution_mode,
+            "position_id": position_id,
+            "owner_ids": identity_matches,
+        }
+
+    return _failure(
+        "owner_cardinality_or_identity_unproven",
+        owner_ids=identity_matches,
+        repair_ids=repair_matches,
+    )
+
+
+def _emit_canonical_owner_handoff_failure(
+    order: dict,
+    canonical_position_id: str,
+    handoff_result: dict,
+) -> None:
+    """Make an ENTRY identity failure durable and visible without broker mutation."""
+    client_id = str(order.get("client_id") or "default")
+    reason_code = str(
+        handoff_result.get("reason_code")
+        or "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN"
+    )
+    payload = {
+        "client_id": client_id,
+        "local_order_id": order.get("local_order_id"),
+        "broker_order_id": order.get("broker_order_id"),
+        "contract": order.get("contract") or order.get("symbol"),
+        "execution_mode": order.get("execution_mode"),
+        "position_id": str(canonical_position_id or ""),
+        **handoff_result,
+    }
+    log.critical(
+        "[%s] %s | local=%s contract=%s position_id=%s detail=%s",
+        client_id,
+        reason_code,
+        order.get("local_order_id"),
+        order.get("contract") or order.get("symbol"),
+        canonical_position_id,
+        handoff_result.get("detail_reason") or "unspecified",
+    )
+    audit(client_id, "ERROR", reason_code, payload)
+    emit_fill_event(
+        order,
+        decision="ERROR",
+        reason_code=reason_code,
+        explanation=(
+            "Canonical ENTRY ownership was not proven; no ambiguous exit "
+            "owner may be declared active."
+        ),
+        result=handoff_result,
+        extra_context=payload,
+    )
+
+
 def _emit_seed_failure_diagnostic(
     *,
     order: dict,
@@ -1844,8 +2096,21 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     the broker-repair position held synthetic ID and unknown execution_mode;
     exits and proof rows were never attributed to the canonical fill.
     """
+    def _seed_result(ok: bool, disposition: str, detail_reason: str = "", **extra) -> dict:
+        return {
+            "ok": bool(ok),
+            "disposition": disposition,
+            "reason_code": (
+                "EXIT_ENGINE_HANDOFF_SUCCEEDED"
+                if ok
+                else "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN"
+            ),
+            "detail_reason": detail_reason,
+            **extra,
+        }
+
     if not exit_engine or not position_id:
-        return
+        return _seed_result(False, "SEED_SKIPPED", "missing_exit_engine_or_position")
 
     # Resolve canonical side up front — used by both the ManagedPosition
     # constructor and the mp.signal dict below.  Emit critical + skip if
@@ -1853,7 +2118,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     _side, _side_source = _resolve_order_option_side(order)
     if not _side:
         _emit_side_unresolved(order, reason_code="EXIT_ENGINE_SEED_SIDE_UNRESOLVED")
-        return
+        return _seed_result(False, "SEED_SKIPPED", "side_unresolved")
 
     # ── Repair 4: canonical adoption of broker-repair position ───────────────
     # Before creating a new position, check whether the exit engine is already
@@ -1911,7 +2176,11 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 "Canonical adoption execution mode could not be proven"
             ),
         )
-        return
+        return _seed_result(
+            False,
+            "ADOPTION_BLOCKED",
+            f"canonical_adoption_mode_{_mode_disp.lower()}",
+        )
 
     _adopt_fn = getattr(exit_engine, "adopt_canonical_position_identity", None)
     if callable(_adopt_fn) and _contract_for_adopt and position_id:
@@ -1969,7 +2238,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                     "[%s] _seed_exit_engine: %s contract=%s position_id=%s",
                     order.get("client_id"), _disposition, _contract_for_adopt, position_id,
                 )
-                return
+                return _seed_result(True, _disposition)
             elif _disposition == "NO_REPAIR_FOUND":
                 pass  # fall through to normal seed
             elif _disposition and _disposition.startswith("RETRY_"):
@@ -2005,9 +2274,14 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                     ),
                     extra_payload={"adoption_disposition": _disposition},
                 )
-                return
+                return _seed_result(
+                    False,
+                    "ADOPTION_BLOCKED",
+                    f"adoption_{_disposition.lower()}",
+                    adoption_disposition=_disposition,
+                )
             elif _adopted is True:  # legacy bool path
-                return
+                return _seed_result(True, "ADOPTED_LEGACY")
             elif _adopted is False:  # legacy bool — no repair found, seed normally
                 pass
         except Exception as _adopt_err:
@@ -2043,12 +2317,17 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                     "exception_type": type(_adopt_err).__name__,
                 },
             )
-            return
+            return _seed_result(
+                False,
+                "ADOPTION_ERROR",
+                "canonical_adoption_exception",
+                exception_type=type(_adopt_err).__name__,
+            )
 
     try:
         getter = getattr(exit_engine, "get_position", None)
         if callable(getter) and getter(position_id):
-            return
+            return _seed_result(True, "ALREADY_SEEDED")
     except Exception as _ee_err:
         log.warning("Exit engine position check failed for %s: %s", position_id, _ee_err)
 
@@ -2070,7 +2349,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     try:
         if hasattr(exit_engine, "seed_position"):
             exit_engine.seed_position(position_id, _seed_order, result)
-            return
+            return _seed_result(True, "SEEDED")
     except Exception as exc:
         log.debug("exit_engine.seed_position failed; trying add_position path: %s", exc)
 
@@ -2152,8 +2431,15 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             ticker,
             getattr(mp, "current_underlying", None),
         )
+        return _seed_result(True, "SEEDED")
     except Exception as exc:
         log.error("[%s] exit_engine.add_position failed: %s", order.get("client_id"), exc)
+        return _seed_result(
+            False,
+            "SEED_FAILED",
+            "exit_engine_add_position_failed",
+            exception_type=type(exc).__name__,
+        )
 
 
 # =============================================================================
@@ -2411,53 +2697,62 @@ def process_pending_order(
                     quote_broker=data_broker,
                 )
 
-                # Secondary broker-side stop is best-effort only.
-                _place_standing_stop_best_effort(
-                    broker=broker,
-                    order=order,
-                    qty=qty,
-                    entry_price=price,
-                )
-
-                _seed_exit_engine(exit_engine, position_id, order, result, signal_id)
-
-                # Write position_id back to orders row.
-                # osm.transition above was called without position_id because the
-                # position didn't exist yet — _open_position_safe created it after.
-                # Without this write the orders row has position_id=null forever.
                 log.info(
                     "[%s] order_filled_detected order=%s contract=%s qty=%d "
                     "position_link_result=%s",
                     client_id, local_id,
                     order.get("contract") or order.get("symbol"),
                     int(new_filled or 0),
-                    "success" if position_id else "MISSING",
+                    "position_opened" if position_id else "MISSING",
                 )
                 if position_id:
-                    try:
-                        from ap.db import conn as _fm_conn, run_with_retry as _fm_retry
-                        def _link_back():
-                            with _fm_conn() as c:
-                                c.execute(
-                                    "UPDATE orders "
-                                    "SET position_id=%s, updated_ts=NOW() "
-                                    "WHERE client_id=%s AND local_order_id=%s "
-                                    "AND (position_id IS NULL OR position_id='')",
-                                    (position_id, client_id, local_id),
-                                )
-                        _fm_retry(_link_back)
+                    # Durable canonical identity must be proven before any
+                    # exit-engine adoption/seed decision is treated as live.
+                    bind_result = _bind_filled_entry_position_id(order, position_id)
+                    if not bind_result.get("ok"):
+                        _emit_canonical_owner_handoff_failure(
+                            order, position_id, bind_result
+                        )
+                    else:
                         log.info(
                             "[%s] order_position_link_success order=%s position=%s "
-                            "contract=%s",
+                            "disposition=%s contract=%s",
                             client_id, local_id, position_id,
+                            bind_result.get("disposition"),
                             order.get("contract") or order.get("symbol"),
                         )
-                    except Exception as _link_err:
-                        log.error(
-                            "[%s] order_position_link_failed order=%s position=%s "
-                            "err=%s",
-                            client_id, local_id, position_id, _link_err,
+
+                        # Secondary broker-side stop is best-effort protection,
+                        # but only after the durable ENTRY identity is bound.
+                        _place_standing_stop_best_effort(
+                            broker=broker,
+                            order=order,
+                            qty=qty,
+                            entry_price=price,
                         )
+
+                        seed_result = _seed_exit_engine(
+                            exit_engine, position_id, order, result, signal_id
+                        )
+                        if not isinstance(seed_result, dict) or not seed_result.get("ok"):
+                            _emit_canonical_owner_handoff_failure(
+                                order,
+                                position_id,
+                                seed_result
+                                if isinstance(seed_result, dict)
+                                else {
+                                    "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                                    "detail_reason": "seed_result_missing_or_invalid",
+                                },
+                            )
+                        else:
+                            owner_result = _verify_canonical_entry_owner(
+                                exit_engine, order, position_id
+                            )
+                            if not owner_result.get("ok"):
+                                _emit_canonical_owner_handoff_failure(
+                                    order, position_id, owner_result
+                                )
 
                 if not position_id:
                     log.critical(
@@ -2466,6 +2761,14 @@ def process_pending_order(
                         "exit engine BLIND to this position)",
                         client_id, local_id,
                         order.get("contract") or order.get("symbol"),
+                    )
+                    _emit_canonical_owner_handoff_failure(
+                        order,
+                        "",
+                        {
+                            "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                            "detail_reason": "canonical_position_create_failed",
+                        },
                     )
 
             except Exception as exc:
