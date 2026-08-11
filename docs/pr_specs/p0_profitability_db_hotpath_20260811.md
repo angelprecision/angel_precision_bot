@@ -53,8 +53,11 @@ The exact runtime callers are:
 - `APOrderMonitor._recover_stale_inflight_retries` — canceled `ENTRY` rows
   with `meta->>'retry_status' IN ('IN_FLIGHT','SUBMITTING')`, ordered by
   `updated_ts`, `LIMIT 16`;
-- `ap.morning_handoff._has_unowned_pending_trigger_orders` — watcher-held
-  `ENTRY` rows with no broker/submitted/fill identity, ordered by `created_ts`.
+- `ap.preopen_readiness._query_client_state` — active startup-readiness
+  `PENDING_TRIGGER` `ENTRY` rows with no broker/submitted/fill identity,
+  ordered by `created_ts`;
+- `ap.morning_handoff._has_unowned_pending_trigger_orders` — watcher reseed
+  guard using the same exact `PENDING_TRIGGER` identity predicates.
 
 The retry callers already parse `retry_ready_at` and attempt counters in
 Python. The implementation therefore adds only the three narrow partial
@@ -64,9 +67,11 @@ cast JSON metadata or rewrite client/mode ownership predicates.
 Focused contract coverage is in
 `tests/test_p0_profitability_db_hotpath.py` and runs through
 `.github/workflows/p0_db_hotpath.yml`. It includes exact result-set comparison
-before/after indexes, clean PostgreSQL idempotency, fixture EXPLAIN/index
-eligibility, scaled bounded scans, malformed-metadata guards, and the two
-known production schema-shape checks.
+before/after indexes, clean PostgreSQL idempotency with actual index-definition
+attestation, direct fixture EXPLAIN/index eligibility for all three paths,
+recursive scan-work bounds including the PENDING_TRIGGER residual
+`filled_ts IS NULL` filter, malformed-metadata guards, and the two known
+production schema-shape checks.
 
 ### 1. Inventory slow queries from production logs
 

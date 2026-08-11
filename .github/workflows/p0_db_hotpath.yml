@@ -7,6 +7,7 @@ on:
     paths:
       - "ap/order_monitor.py"
       - "ap/morning_handoff.py"
+      - "ap/preopen_readiness.py"
       - "ap/schema_attestation.py"
       - "migrations/20260811_orders_retry_hotpath_indexes.sql"
       - "tests/test_p0_profitability_db_hotpath.py"

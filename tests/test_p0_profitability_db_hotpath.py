@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = REPO_ROOT / "migrations" / "20260811_orders_retry_hotpath_indexes.sql"
 ORDER_MONITOR_PATH = REPO_ROOT / "ap" / "order_monitor.py"
 MORNING_HANDOFF_PATH = REPO_ROOT / "ap" / "morning_handoff.py"
+PREOPEN_READINESS_PATH = REPO_ROOT / "ap" / "preopen_readiness.py"
 SCHEMA_ATTESTATION_PATH = REPO_ROOT / "ap" / "schema_attestation.py"
 
 ARMED_INDEX = "idx_orders_entry_canceled_retry_armed_updated"
@@ -75,6 +76,13 @@ def _pending_sql() -> str:
     )
 
 
+def _active_pending_sql() -> str:
+    return _literal_sql(
+        _function_source(PREOPEN_READINESS_PATH, "_query_client_state"),
+        "AND filled_ts IS NULL",
+    )
+
+
 def _pg_dsn() -> str:
     return (
         os.getenv("P0_DB_HOTPATH_TEST_DATABASE_URL")
@@ -105,6 +113,7 @@ def hotpath_db():
                 """
                 CREATE TABLE orders (
                     local_order_id TEXT,
+                    signal_id TEXT,
                     client_id TEXT NOT NULL,
                     kind TEXT,
                     status TEXT,
@@ -165,6 +174,68 @@ def _mode_params(mode: str) -> tuple[str, str, str, str, str]:
     return (mode, mode, mode.upper(), mode, mode.upper())
 
 
+def _plan_nodes(node: dict):
+    yield node
+    for child in node.get("Plans") or ():
+        yield from _plan_nodes(child)
+
+
+def _explain_json(cur, sql: str, params: tuple) -> dict:
+    cur.execute("SET enable_seqscan = off")
+    cur.execute("SET enable_bitmapscan = off")
+    cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql, params)
+    explain_row = cur.fetchone()
+    assert explain_row and explain_row["QUERY PLAN"]
+    return explain_row["QUERY PLAN"][0]["Plan"]
+
+
+def _assert_index_scan(
+    plan: dict,
+    *,
+    index_name: str,
+    limit_rows: int | None = None,
+    expected_rows: int | None = None,
+    expected_removed: int | None = None,
+) -> dict:
+    nodes = list(_plan_nodes(plan))
+    scans = [node for node in nodes if node.get("Index Name") == index_name]
+    assert len(scans) == 1, f"expected one scan using {index_name}: {nodes}"
+    scan = scans[0]
+    assert scan.get("Node Type") in {"Index Scan", "Index Only Scan"}
+    assert scan is not plan or limit_rows is None
+    assert int(scan.get("Actual Loops", 0)) == 1
+    actual_rows = int(scan.get("Actual Rows", 0))
+    removed_rows = int(scan.get("Rows Removed by Filter", 0))
+    assert "Shared Hit Blocks" in scan
+    assert "Shared Read Blocks" in scan
+    assert not any(node.get("Node Type") == "Sort" for node in nodes)
+
+    if limit_rows is not None:
+        limits = [node for node in nodes if node.get("Node Type") == "Limit"]
+        assert len(limits) == 1, f"expected a Limit node: {nodes}"
+        assert limits[0] is plan
+        assert int(limits[0].get("Actual Rows", 0)) <= limit_rows
+        assert actual_rows <= limit_rows
+        assert actual_rows + removed_rows <= limit_rows * 2
+    if expected_rows is not None:
+        assert actual_rows == expected_rows
+    if expected_removed is not None:
+        assert removed_rows == expected_removed
+    return scan
+
+
+def _canonical_index_predicate(predicate: str) -> str:
+    normalized = predicate.lower()
+    normalized = re.sub(r"::text\b", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = normalized.replace("(", "").replace(")", "")
+    return normalized.strip()
+
+
+def _predicate_terms(predicate: str) -> set[str]:
+    return {term.strip() for term in _canonical_index_predicate(predicate).split(" and ")}
+
+
 def _seed_retry_rows(cur, now: datetime) -> None:
     _insert_order(
         cur, local_id="armed-paper", updated=now - timedelta(seconds=40),
@@ -210,6 +281,34 @@ def _seed_retry_rows(cur, now: datetime) -> None:
         cur, local_id="stale-armed", updated=now - timedelta(minutes=8),
         meta={"retry_status": "ARMED", "execution_mode": "paper", "mode": "PAPER"},
     )
+
+
+def _seed_explain_rows(cur, now: datetime) -> None:
+    for i in range(500):
+        mode = "paper" if i % 2 == 0 else "live"
+        _insert_order(
+            cur,
+            local_id=f"explain-armed-{i}",
+            mode=mode,
+            updated=now - timedelta(seconds=i),
+            meta={"retry_status": "ARMED", "execution_mode": mode, "mode": mode.upper()},
+        )
+        stale_status = "IN_FLIGHT" if i % 2 == 0 else "SUBMITTING"
+        _insert_order(
+            cur,
+            local_id=f"explain-stale-{i}",
+            mode=mode,
+            updated=now - timedelta(minutes=10, seconds=i),
+            meta={"retry_status": stale_status, "execution_mode": mode, "mode": mode.upper()},
+        )
+        _insert_order(
+            cur,
+            local_id=f"explain-pending-{i}",
+            status="PENDING_TRIGGER",
+            filled=now if i % 50 == 0 else None,
+            created=now - timedelta(seconds=i),
+            updated=now,
+        )
 
 
 def test_armed_retry_query_returns_byte_equivalent_rows_before_after_indexes(hotpath_db):
@@ -359,24 +458,79 @@ def test_clean_postgres_can_apply_migration_twice(hotpath_db):
         assert [row["indexname"] for row in cur.fetchall()] == sorted(
             [ARMED_INDEX, PENDING_INDEX, STALE_INDEX]
         )
+        cur.execute(
+            """
+            SELECT c.relname AS indexname,
+                   pg_get_indexdef(c.oid) AS indexdef,
+                   pg_get_expr(i.indpred, i.indrelid) AS predicate
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_class t ON t.oid = i.indrelid
+            WHERE t.relnamespace = current_schema()::regnamespace
+              AND t.relname = 'orders'
+              AND c.relname = ANY(%s)
+            """,
+            ([ARMED_INDEX, STALE_INDEX, PENDING_INDEX],),
+        )
+        definitions = {row["indexname"]: row for row in cur.fetchall()}
+        expected = {
+            ARMED_INDEX: {
+                "keys": "using btree (client_id, updated_ts) where",
+                "terms": {
+                    "kind = 'entry'",
+                    "status = 'canceled'",
+                    "meta ->> 'retry_status' = 'armed'",
+                },
+            },
+            STALE_INDEX: {
+                "keys": "using btree (client_id, updated_ts) where",
+                "terms": {
+                    "kind = 'entry'",
+                    "status = 'canceled'",
+                    "meta ->> 'retry_status' = any array['in_flight', 'submitting']",
+                },
+            },
+            PENDING_INDEX: {
+                "keys": "using btree (client_id, created_ts) where",
+                "terms": {
+                    "kind = 'entry'",
+                    "status = 'pending_trigger'",
+                    "broker_order_id is null",
+                    "submitted_ts is null",
+                },
+            },
+        }
+        assert set(definitions) == set(expected)
+        for name, shape in expected.items():
+            actual = definitions[name]
+            indexdef = " ".join(actual["indexdef"].lower().split())
+            assert shape["keys"] in indexdef, actual["indexdef"]
+            assert _predicate_terms(actual["predicate"]) == shape["terms"], actual["predicate"]
+        assert "filled_ts" not in definitions[PENDING_INDEX]["indexdef"].lower()
 
 
-def test_explain_proves_armed_index_is_eligible_and_used(hotpath_db):
+def test_explain_proves_all_three_indexes_are_eligible_and_used(hotpath_db):
     db, _ = hotpath_db
     now = datetime.now(timezone.utc)
     with db.cursor() as cur:
-        for i in range(500):
-            _insert_order(
-                cur, local_id=f"explain-{i}", updated=now - timedelta(seconds=i),
-                meta={"retry_status": "ARMED", "execution_mode": "paper", "mode": "PAPER"},
-            )
+        _seed_explain_rows(cur, now)
         _apply_migration(cur)
         cur.execute("ANALYZE orders")
-        cur.execute("SET enable_seqscan = off")
-        cur.execute("SET enable_bitmapscan = off")
-        cur.execute("EXPLAIN (COSTS OFF) " + _armed_sql(), ("client-A", *_mode_params("paper")))
-        plan = "\n".join(row["QUERY PLAN"] for row in cur.fetchall())
-    assert ARMED_INDEX in plan
+        armed_plan = _explain_json(cur, _armed_sql(), ("client-A", *_mode_params("paper")))
+        _assert_index_scan(armed_plan, index_name=ARMED_INDEX, limit_rows=64)
+        stale_plan = _explain_json(cur, _stale_sql(), ("client-A", 60, *_mode_params("paper")))
+        _assert_index_scan(stale_plan, index_name=STALE_INDEX, limit_rows=16)
+        pending_plan = _explain_json(
+            cur,
+            _active_pending_sql(),
+            ("client-A", now - timedelta(hours=48)),
+        )
+        _assert_index_scan(
+            pending_plan,
+            index_name=PENDING_INDEX,
+            expected_rows=490,
+            expected_removed=10,
+        )
 
 
 def test_production_shaped_scale_scan_is_bounded_by_existing_limit(hotpath_db):
@@ -384,18 +538,19 @@ def test_production_shaped_scale_scan_is_bounded_by_existing_limit(hotpath_db):
     now = datetime.now(timezone.utc)
     with db.cursor() as cur:
         for i in range(2000):
+            mode = "paper" if i % 2 == 0 else "live"
             _insert_order(
-                cur, local_id=f"scale-{i}", updated=now - timedelta(seconds=i),
-                meta={"retry_status": "ARMED", "execution_mode": "paper", "mode": "PAPER"},
+                cur,
+                local_id=f"scale-{i}",
+                mode=mode,
+                updated=now - timedelta(seconds=i),
+                meta={"retry_status": "ARMED", "execution_mode": mode, "mode": mode.upper()},
             )
         _apply_migration(cur)
         cur.execute("ANALYZE orders")
-        cur.execute("SET enable_seqscan = off")
-        cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + _armed_sql(), ("client-A", *_mode_params("paper")))
-        plan = cur.fetchone()["QUERY PLAN"][0]
-    node = plan["Plan"]
-    assert node.get("Actual Rows", 0) <= 64
-    assert ARMED_INDEX in json.dumps(plan)
+        plan = _explain_json(cur, _armed_sql(), ("client-A", *_mode_params("paper")))
+    scan = _assert_index_scan(plan, index_name=ARMED_INDEX, limit_rows=64)
+    assert int(scan.get("Rows Removed by Filter", 0)) > 0
 
 
 def test_schema_shape_rejects_trade_queue_ticker_assumption():
