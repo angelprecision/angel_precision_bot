@@ -69,9 +69,13 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
     # PR #360 — durable EXIT ownership on positions (pending_exit_action /
     # pending_exit_reason are intentionally NOT required: the fill-truth
     # guard filters them dynamically via _table_columns()).
+    # PR #385 — QPM persists provenance-aware hard_exit_reference into
+    # positions.meta and exit-engine restart hydration reads it back verbatim.
+    # Missing meta therefore breaks durable quote/risk persistence and must
+    # fail LIVE preflight rather than degrade into a runtime error loop.
     "positions": frozenset({
         "id", "client_id", "contract", "status", "qty", "entry_ts",
-        "execution_mode",
+        "execution_mode", "meta",
         "exit_in_flight", "pending_exit_qty",
         "pending_exit_local_order_id", "pending_exit_broker_order_id",
         "quantity_remaining", "contracts_exited",
