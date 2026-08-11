@@ -3794,8 +3794,12 @@ class APBrokerReconciler:
             try:
                 from ap_proof_logger import funnel as _funnel_r
                 _funnel_r.inc("reconciler_corrections")
-            except Exception:
-                pass
+            except Exception as _funnel_err:
+                log.debug(
+                    "[%s] canonical reconciler proof funnel increment failed: %s",
+                    self.client_id,
+                    _funnel_err,
+                )
             return
 
         # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
