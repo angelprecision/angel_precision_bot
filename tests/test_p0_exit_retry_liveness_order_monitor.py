@@ -784,6 +784,50 @@ def test_terminal_explicit_zero_against_durable_partial_holds_and_grants_zero(mo
     exit_engine.finalize_exit_replacement_safe.assert_not_called()
 
 
+@pytest.mark.parametrize("cumulative", [True, 1.5, -1, "bad", 3])
+def test_filled_race_rejects_malformed_or_out_of_bounds_cumulative_quantity(cumulative):
+    """The FILLED race branch must share strict cumulative-fill semantics."""
+
+    class _OSM:
+        def __init__(self):
+            self.row = {
+                "local_order_id": "loc-filled-strict",
+                "kind": "EXIT",
+                "position_id": "pos-filled-strict",
+                "broker_order_id": "bro-filled-strict",
+                "status": "EXIT_ACKNOWLEDGED",
+                "qty": 2,
+                "filled_qty": 0,
+            }
+            self.transitions = []
+
+        def get_order(self, local_order_id):
+            return dict(self.row) if local_order_id == self.row["local_order_id"] else None
+
+        def transition(self, local_order_id, status, **kwargs):
+            self.transitions.append((status, dict(kwargs)))
+            return True
+
+    osm = _OSM()
+    mon = _monitor(osm=osm)
+    mon._emit_order_event = MagicMock()
+
+    result = mon._apply_broker_partial_exit_fill(
+        "loc-filled-strict",
+        "bro-filled-strict",
+        "AAPL260814C00200000",
+        raw_payload={
+            "status": "filled",
+            "exec_quantity": cumulative,
+            "avg_fill_price": 1.25,
+        },
+    )
+
+    assert result is None
+    assert osm.transitions == []
+    assert mon._emit_order_event.call_args.kwargs["reason_code"] == "BROKER_FILLED_QTY_INVALID"
+
+
 def test_rejected_is_terminal_stale_exit_cancel_proof():
     mon = _monitor()
 

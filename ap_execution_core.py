@@ -10011,6 +10011,26 @@ class APExecutionCore:
                 getattr(pos, "ticker", "?"),
             )
             return
+        try:
+            _fill_probe = float(actual_fill_price or 0)
+        except (TypeError, ValueError, OverflowError):
+            _fill_probe = 0.0
+        if _fill_probe != _fill_probe or _fill_probe in (float("inf"), float("-inf")):
+            _fill_probe = 0.0
+        if getattr(pos, "exit_economics_pending", False) and _fill_probe <= 0:
+            # Broker-flat recovery is valid exposure truth, not price truth.
+            # Keep the staged proof open for an exact fill reconciliation and
+            # never substitute the submit-time estimate for realized economics.
+            pos.exit_economics_status = "PENDING_EXIT_ECONOMICS"
+            staged["economic_status"] = "PENDING_EXIT_ECONOMICS"
+            log.critical(
+                "[PENDING_EXIT_ECONOMICS] %s | broker-flat close has no authoritative exit fill price; proof/P&L held",
+                staged.get("ticker", getattr(pos, "ticker", "?")),
+            )
+            return
+        if _fill_probe > 0 and getattr(pos, "exit_economics_pending", False):
+            pos.exit_economics_pending = False
+            pos.exit_economics_status = ""
         pos._proof_finalized = True  # type: ignore[attr-defined]
 
         # Use actual fill price; fall back to estimated if broker returns 0/None

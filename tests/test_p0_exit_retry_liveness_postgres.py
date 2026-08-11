@@ -195,12 +195,42 @@ def test_replacement_lifecycle_jsonb_merge_and_generation_fence(monkeypatch):
         assert hydrated._persist_replacement_lifecycle(
             copy.copy(position), expected_state="REPLACEMENT_PENDING", expected_generation=1,
         ) is False
+
+        wrong_identity = copy.copy(position)
+        wrong_identity.exit_retry_liveness = dict(position.exit_retry_liveness)
+        assert hydrated._persist_replacement_lifecycle(
+            wrong_identity,
+            expected_state="REPLACEMENT_OWNED_BY_NEW_GENERATION",
+            expected_generation=1,
+            expected_new_local_order_id="loc-stale-pr423",
+            expected_new_broker_order_id="bro-new-pr423",
+            expected_filled_qty=1,
+        ) is False
+
+        # The filled replacement may release liveness only with the exact
+        # owned generation, both broker identities, and the filled tranche.
+        consumed = copy.copy(position)
+        consumed.exit_retry_liveness = dict(position.exit_retry_liveness)
+        consumed.exit_retry_liveness.update({
+            "state": "NONE",
+            "replace_attempt": 0,
+            "replace_quantity": 0,
+            "last_ack_identity": "",
+        })
+        assert hydrated._persist_replacement_lifecycle(
+            consumed,
+            expected_state="REPLACEMENT_OWNED_BY_NEW_GENERATION",
+            expected_generation=1,
+            expected_new_local_order_id="loc-new-pr423",
+            expected_new_broker_order_id="bro-new-pr423",
+            expected_filled_qty=1,
+        ) is True
         with _real_pg_conn() as cursor:
             cursor.execute("SELECT meta FROM positions WHERE id=%s", (position_id,))
             final_meta = cursor.fetchone()[0]
         assert final_meta["unrelated"] == {"keep": True}
-        assert final_meta["exit_retry_liveness"]["state"] == "REPLACEMENT_OWNED_BY_NEW_GENERATION"
-        assert final_meta["exit_retry_liveness"]["new_broker_order_id"] == "bro-new-pr423"
+        assert final_meta["exit_retry_liveness"]["state"] == "NONE"
+        assert final_meta["exit_retry_liveness"]["replacement_generation"] == 1
     finally:
         cleanup_conn = psycopg2.connect(database_url)
         cleanup_conn.autocommit = True

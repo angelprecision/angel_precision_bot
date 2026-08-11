@@ -373,6 +373,72 @@ def test_completed_scale_out_resets_and_persists_replacement_generation():
     eng._persist_exit_replace_attempt_to_db.assert_called_once_with(pos)
 
 
+def test_fully_filled_owned_replacement_consumes_lifecycle_and_reopens_exit_liveness():
+    """A filled replacement tranche must release OWNED for the next exit."""
+    eng = _engine()
+    pos = _pos(
+        quantity=5,
+        quantity_remaining=5,
+        pending_exit_action="CLOSE_ALL",
+        pending_exit_local_order_id="loc-new-1",
+        pending_exit_broker_order_id="bro-new-1",
+        pending_exit_qty=1,
+        pending_exit_filled_qty=0,
+        exit_replace_attempt=1,
+    )
+    pos.exit_retry_liveness = {
+        "state": "REPLACEMENT_OWNED_BY_NEW_GENERATION",
+        "replace_attempt": 1,
+        "replacement_generation": 1,
+        "replace_quantity": 1,
+        "position_id": pos.position_id,
+        "client_id": pos.client_id,
+        "execution_mode": pos.execution_mode,
+        "old_local_order_id": "loc-old-1",
+        "old_broker_order_id": "bro-old-1",
+        "new_local_order_id": "loc-new-1",
+        "new_broker_order_id": "bro-new-1",
+        "last_ack_identity": "bro-old-1",
+    }
+    _add(eng, pos)
+    captured = {}
+
+    def _persist(current_pos, *, expected_state=None, expected_generation=None,
+                 expected_new_local_order_id=None, expected_new_broker_order_id=None,
+                 expected_filled_qty=None):
+        captured.update(
+            expected_state=expected_state,
+            expected_generation=expected_generation,
+            expected_new_local_order_id=expected_new_local_order_id,
+            expected_new_broker_order_id=expected_new_broker_order_id,
+            expected_filled_qty=expected_filled_qty,
+        )
+        return True
+
+    eng._persist_exit_replace_attempt_to_db = _persist
+    eng.note_partial_exit_fill(
+        pos.position_id,
+        qty_filled=1,
+        fill_price=2.10,
+        local_order_id="loc-new-1",
+        broker_order_id="bro-new-1",
+        cumulative_filled=1,
+    )
+
+    assert pos.quantity_remaining == 4
+    assert pos.exit_in_flight is False
+    assert pos.exit_retry_liveness["state"] == "NONE"
+    assert pos.exit_replace_attempt == 0
+    assert captured == {
+        "expected_state": "REPLACEMENT_OWNED_BY_NEW_GENERATION",
+        "expected_generation": 1,
+        "expected_new_local_order_id": "loc-new-1",
+        "expected_new_broker_order_id": "bro-new-1",
+        "expected_filled_qty": 1,
+    }
+    assert eng._can_submit_exit(pos, datetime.now(timezone.utc)) is True
+
+
 # ── Pricing ladder reads exit_replace_attempt, not _exit_stuck_count ───────
 
 def test_pricing_ladder_attempt_source_is_exit_replace_attempt():

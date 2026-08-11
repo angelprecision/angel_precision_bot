@@ -1438,6 +1438,13 @@ class ManagedPosition:
     _proof_staged:      Optional[dict]         = None
     _proof_finalized:   bool                   = False
     proof_logged:       bool                   = False
+    # Broker-flat recovery proves exposure ownership/flatness, but not the
+    # economic exit fill price. Keep that distinction explicit so proof/P&L
+    # cannot silently substitute the staged submit estimate for a realized
+    # fill. A later exact-fill reconciliation may clear this flag and call
+    # the same finalization seam with the authoritative price.
+    exit_economics_pending: bool               = False
+    exit_economics_status: str                 = ""
 
     # PR-C (baseline repair): protective-monitoring ghost field. Previously
     # assigned dynamically in _apply_retry_intent_to_position() and read
@@ -4004,7 +4011,16 @@ class APExitEngine:
         pos.exit_retry_liveness = payload
         return True, prior_state, "ok", prior_generation
 
-    def _persist_exit_replace_attempt_to_db(self, pos, *, expected_state: Optional[str] = None, expected_generation: Optional[int] = None) -> bool:
+    def _persist_exit_replace_attempt_to_db(
+        self,
+        pos,
+        *,
+        expected_state: Optional[str] = None,
+        expected_generation: Optional[int] = None,
+        expected_new_local_order_id: Optional[str] = None,
+        expected_new_broker_order_id: Optional[str] = None,
+        expected_filled_qty: Optional[int] = None,
+    ) -> bool:
         """
         PR #423 Patch 2 (restart requirement): persist exit_replace_attempt
         under a dedicated nested metadata namespace so the replacement-
@@ -4055,22 +4071,45 @@ class APExitEngine:
                 "exit_retry_liveness": lifecycle_payload,
             }
 
+            where_extra = ""
+            where_params = []
+            if expected_new_local_order_id is not None:
+                if not expected_new_local_order_id or expected_new_local_order_id != expected_new_local_order_id.strip():
+                    return False
+                where_extra += " AND meta->'exit_retry_liveness'->>'new_local_order_id' = %s"
+                where_params.append(expected_new_local_order_id)
+            if expected_new_broker_order_id is not None:
+                if not expected_new_broker_order_id or expected_new_broker_order_id != expected_new_broker_order_id.strip():
+                    return False
+                where_extra += " AND meta->'exit_retry_liveness'->>'new_broker_order_id' = %s"
+                where_params.append(expected_new_broker_order_id)
+            if expected_filled_qty is not None:
+                if type(expected_filled_qty) is not int or expected_filled_qty <= 0:
+                    return False
+                # The replacement tranche is the exact filled quantity being
+                # consumed.  Binding it to the durable replace_quantity keeps
+                # a retry from consuming a different generation or quantity.
+                where_extra += " AND COALESCE((meta->'exit_retry_liveness'->>'replace_quantity')::integer, 0) = %s"
+                where_params.append(expected_filled_qty)
+
             def _do_update():
                 with conn() as c:
                     c.execute(
-                        """
+                        f"""
                         UPDATE positions
-                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                             updated_at = NOW()
                         WHERE id = %s
                           AND client_id = %s
                           AND execution_mode = %s
                           AND COALESCE(meta->'exit_retry_liveness'->>'state', 'NONE') = %s
                           AND COALESCE((meta->'exit_retry_liveness'->>'replacement_generation')::integer, 0) = %s
+                        {where_extra}
                         """,
                         (
                             json.dumps(patch, default=str), pid, client_id, execution_mode,
                             expected_state, int(expected_generation or 0),
+                            *where_params,
                         ),
                     )
                     return c.rowcount
@@ -4091,6 +4130,9 @@ class APExitEngine:
         *,
         expected_state: Optional[str] = None,
         expected_generation: Optional[int] = None,
+        expected_new_local_order_id: Optional[str] = None,
+        expected_new_broker_order_id: Optional[str] = None,
+        expected_filled_qty: Optional[int] = None,
     ) -> bool:
         """Persist the lifecycle with its generation fence.
 
@@ -4107,7 +4149,11 @@ class APExitEngine:
             parameters = inspect.signature(persist).parameters.values()
             supports_cas = any(
                 parameter.kind == inspect.Parameter.VAR_KEYWORD
-                or parameter.name in {"expected_state", "expected_generation"}
+                or parameter.name in {
+                    "expected_state", "expected_generation",
+                    "expected_new_local_order_id", "expected_new_broker_order_id",
+                    "expected_filled_qty",
+                }
                 for parameter in parameters
             )
             if isinstance(persist, Mock):
@@ -4116,13 +4162,31 @@ class APExitEngine:
             supports_cas = True
         if not supports_cas:
             return bool(persist(pos))
-        return bool(
-            persist(
-                pos,
-                expected_state=expected_state,
-                expected_generation=expected_generation,
+        persist_kwargs = {
+            "expected_state": expected_state,
+            "expected_generation": expected_generation,
+        }
+        try:
+            parameter_names = {
+                parameter.name
+                for parameter in parameters
+                if parameter.kind
+                not in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+            }
+            has_var_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
             )
-        )
+        except Exception:
+            parameter_names = set()
+            has_var_kwargs = True
+        if has_var_kwargs or "expected_new_local_order_id" in parameter_names:
+            persist_kwargs["expected_new_local_order_id"] = expected_new_local_order_id
+        if has_var_kwargs or "expected_new_broker_order_id" in parameter_names:
+            persist_kwargs["expected_new_broker_order_id"] = expected_new_broker_order_id
+        if has_var_kwargs or "expected_filled_qty" in parameter_names:
+            persist_kwargs["expected_filled_qty"] = expected_filled_qty
+        return bool(persist(pos, **persist_kwargs))
 
 
     def adopt_canonical_position_identity(
@@ -4829,6 +4893,8 @@ class APExitEngine:
                 },
             )
             return BrokerFlatCloseResult(False, 0, False, "broker_flat_truth_unproven", None)
+        pos.exit_economics_pending = True
+        pos.exit_economics_status = "PENDING_EXIT_ECONOMICS"
         try:
             import json
             from ap.db import conn, run_with_retry
@@ -4840,6 +4906,8 @@ class APExitEngine:
                 "exit_circuit_breaker_broker_truth": broker_truth,
                 "stale_source": "protective_monitoring_degraded",
                 "protective_monitoring_state": PROTECTIVE_STATE_RESOLVED,
+                "exit_economics_status": "PENDING_EXIT_ECONOMICS",
+                "exit_economics_source": "broker_flat_without_authoritative_fill",
             }
 
             def _update():
@@ -5828,6 +5896,10 @@ class APExitEngine:
         local_order_id  = str(local_order_id or "")
         broker_order_id = str(broker_order_id or "")
         force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
+        economic_pending = bool(
+            kwargs.get("economic_pending")
+            or kwargs.get("fill_price_unproven")
+        ) and not _positive_or_none(fill_price)
         if "RECONCILER" in reason_s.upper():
             force = True
 
@@ -5867,6 +5939,12 @@ class APExitEngine:
                         pos.current_option_price = float(fill_price)
                 except Exception as _fp_err:
                     log.error("Failed to set fill_price on position: %s", _fp_err)
+                if economic_pending:
+                    pos.exit_economics_pending = True
+                    pos.exit_economics_status = "PENDING_EXIT_ECONOMICS"
+                elif _positive_or_none(fill_price):
+                    pos.exit_economics_pending = False
+                    pos.exit_economics_status = ""
                 # FIX 2: fire proof finalization with broker-confirmed fill price.
                 # This is the ONLY point where we have the real fill — submit_exit
                 # only knew the limit price. on_exit_fill_confirmed calls
@@ -6092,6 +6170,7 @@ class APExitEngine:
 
         applied_delta = 0
         _reset_exit_replace_attempt_pos = None
+        _replacement_fill_completion = None
         # PR-A / BUG-3: O(1) lookup via self._positions_by_id (was O(n) scan).
         with self._lock:
             _matched = self._positions_by_id.get(str(position_id or ""))
@@ -6183,6 +6262,23 @@ class APExitEngine:
                     pos.pending_exit_qty > 0
                     and pos.pending_exit_filled_qty >= pos.pending_exit_qty
                 )
+                if fully_filled_pending and pos.quantity_remaining > 0:
+                    _replacement_lifecycle, _replacement_valid, _ = self._replacement_lifecycle_for_position(pos)
+                    if (
+                        _replacement_valid
+                        and _replacement_lifecycle.get("state") == EXIT_REPLACEMENT_STATE_OWNED
+                        and pos.pending_exit_filled_qty == int(_replacement_lifecycle.get("replace_quantity") or 0)
+                        and (local_order_id or pos.pending_exit_local_order_id)
+                            == str(_replacement_lifecycle.get("new_local_order_id") or "")
+                        and (broker_order_id or pos.pending_exit_broker_order_id)
+                            == str(_replacement_lifecycle.get("new_broker_order_id") or "")
+                    ):
+                        _replacement_fill_completion = (
+                            pos,
+                            local_order_id or pos.pending_exit_local_order_id,
+                            broker_order_id or pos.pending_exit_broker_order_id,
+                            int(pos.pending_exit_filled_qty),
+                        )
                 if pos.quantity_remaining <= 0:
                     pos.closed       = True
                     pos.close_reason = pos.pending_exit_reason or "exit_fill_closed"
@@ -6215,9 +6311,10 @@ class APExitEngine:
                     # old exit generation even when the position remains
                     # open.  The next exit must start at ladder rung zero;
                     # retain the reset for the out-of-lock durability write.
-                    pos.exit_replace_attempt = 0
-                    pos._exit_replace_attempt_last_ack_identity = ""
-                    _reset_exit_replace_attempt_pos = pos
+                    if _replacement_fill_completion is None:
+                        pos.exit_replace_attempt = 0
+                        pos._exit_replace_attempt_last_ack_identity = ""
+                        _reset_exit_replace_attempt_pos = pos
 
                 self._assert_position_invariants(pos, "note_partial_exit_fill")
                 self._emit_exit_event(
@@ -6252,6 +6349,22 @@ class APExitEngine:
                 _rwr_s(_save_scale)
             except Exception as _se:
                 log.debug("[exit_eng] scale/qty persist failed (non-critical): %s", _se)
+        if _replacement_fill_completion is not None:
+            _replacement_pos, _replacement_local, _replacement_broker, _replacement_filled = _replacement_fill_completion
+            with self._lock:
+                if not self._consume_replacement_lifecycle_after_fill_locked(
+                    _replacement_pos,
+                    local_order_id=_replacement_local,
+                    broker_order_id=_replacement_broker,
+                    filled_qty=_replacement_filled,
+                ):
+                    log.critical(
+                        "[exit_eng] filled replacement remains OWNED after lifecycle CAS miss | pos=%s local=%s broker=%s qty=%s",
+                        getattr(_replacement_pos, "position_id", ""),
+                        _replacement_local,
+                        _replacement_broker,
+                        _replacement_filled,
+                    )
         if _reset_exit_replace_attempt_pos is not None:
             try:
                 if not self._persist_exit_replace_attempt_to_db(
@@ -6448,6 +6561,153 @@ class APExitEngine:
                 extra_inputs={"exit_replace_attempt": pos.exit_replace_attempt, "reason": reason},
             )
         return True
+
+    def _consume_replacement_lifecycle_after_fill_locked(
+        self,
+        pos: ManagedPosition,
+        *,
+        local_order_id: str,
+        broker_order_id: str,
+        filled_qty: int,
+    ) -> bool:
+        """Consume one fully filled replacement generation with an exact CAS.
+
+        The caller owns ``self._lock``.  ``REPLACEMENT_OWNED_BY_NEW_GENERATION``
+        is deliberately retained until the replacement tranche is durably
+        confirmed filled.  This transition is the only path that releases
+        that ownership while the position remains open; every identity and
+        quantity is bound in the database predicate so a stale fill cannot
+        release a newer generation.
+        """
+        lifecycle, valid, _ = self._replacement_lifecycle_for_position(pos)
+        if not valid or lifecycle.get("state") != EXIT_REPLACEMENT_STATE_OWNED:
+            return False
+        try:
+            expected_qty = int(lifecycle.get("replace_quantity") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if type(filled_qty) is not int or filled_qty <= 0 or filled_qty != expected_qty:
+            return False
+        if int(getattr(pos, "quantity_remaining", 0) or 0) <= 0:
+            return False
+        expected_local = str(lifecycle.get("new_local_order_id") or "")
+        expected_broker = str(lifecycle.get("new_broker_order_id") or "")
+        if (
+            not expected_local
+            or not expected_broker
+            or str(local_order_id or "") != expected_local
+            or str(broker_order_id or "") != expected_broker
+        ):
+            return False
+
+        prior_runtime = {
+            "lifecycle": dict(getattr(pos, "exit_retry_liveness", {}) or {}),
+            "attempt": int(getattr(pos, "exit_replace_attempt", 0) or 0),
+            "ack": str(getattr(pos, "_exit_replace_attempt_last_ack_identity", "") or ""),
+            "exit_in_flight": bool(getattr(pos, "exit_in_flight", False)),
+            "pending_reason": getattr(pos, "pending_exit_reason", ""),
+            "pending_action": getattr(pos, "pending_exit_action", ""),
+            "pending_qty": int(getattr(pos, "pending_exit_qty", 0) or 0),
+            "pending_filled": int(getattr(pos, "pending_exit_filled_qty", 0) or 0),
+            "pending_local": getattr(pos, "pending_exit_local_order_id", ""),
+            "pending_broker": getattr(pos, "pending_exit_broker_order_id", ""),
+            "pending_scale": bool(getattr(pos, "pending_scale_counted", False)),
+            "replace_allowed": bool(getattr(pos, "pending_exit_replace_allowed", False)),
+            "replace_reason": getattr(pos, "pending_exit_replace_reason", ""),
+            "replace_allowed_ts": getattr(pos, "pending_exit_replace_allowed_ts", None),
+            "replace_qty": int(getattr(pos, "pending_exit_replace_qty", 0) or 0),
+            "replace_durable_pending": bool(getattr(pos, "pending_exit_replace_durable_pending", False)),
+            "replace_revalidated": bool(getattr(pos, "pending_exit_replace_revalidated", False)),
+            "replace_claimed": bool(getattr(pos, "pending_exit_replace_submit_claimed", False)),
+        }
+        generation = int(lifecycle.get("replacement_generation") or 0)
+        pos.exit_retry_liveness = {
+            "state": EXIT_REPLACEMENT_STATE_NONE,
+            "replace_attempt": 0,
+            "replacement_generation": generation,
+            "replace_quantity": 0,
+            "last_ack_identity": "",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        pos.exit_replace_attempt = 0
+        pos._exit_replace_attempt_last_ack_identity = ""
+        pos.exit_in_flight = False
+        pos.pending_exit_reason = ""
+        pos.pending_exit_action = ""
+        pos.pending_exit_qty = 0
+        pos.pending_exit_filled_qty = 0
+        pos.pending_scale_counted = False
+        pos.pending_exit_local_order_id = ""
+        pos.pending_exit_broker_order_id = ""
+        pos.pending_exit_replace_allowed = False
+        pos.pending_exit_replace_reason = ""
+        pos.pending_exit_replace_allowed_ts = None
+        pos.pending_exit_replace_qty = 0
+        pos.pending_exit_replace_durable_pending = False
+        pos.pending_exit_replace_revalidated = False
+        pos.pending_exit_replace_submit_claimed = False
+        try:
+            persisted = self._persist_replacement_lifecycle(
+                pos,
+                expected_state=EXIT_REPLACEMENT_STATE_OWNED,
+                expected_generation=generation,
+                expected_new_local_order_id=expected_local,
+                expected_new_broker_order_id=expected_broker,
+                expected_filled_qty=filled_qty,
+            )
+        except Exception as exc:
+            log.error(
+                "[exit_eng] replacement lifecycle consumption failed | pos=%s error=%s",
+                getattr(pos, "position_id", ""), exc,
+            )
+            persisted = False
+        if persisted:
+            return True
+
+        # A failed CAS must leave the owned generation as the in-memory fence;
+        # a restart can then replay the exact terminal fill and retry this
+        # consumption without permitting another POST in the meantime.
+        pos.exit_retry_liveness = prior_runtime["lifecycle"]
+        pos.exit_replace_attempt = prior_runtime["attempt"]
+        pos._exit_replace_attempt_last_ack_identity = prior_runtime["ack"]
+        pos.exit_in_flight = prior_runtime["exit_in_flight"]
+        pos.pending_exit_reason = prior_runtime["pending_reason"]
+        pos.pending_exit_action = prior_runtime["pending_action"]
+        pos.pending_exit_qty = prior_runtime["pending_qty"]
+        pos.pending_exit_filled_qty = prior_runtime["pending_filled"]
+        pos.pending_exit_local_order_id = prior_runtime["pending_local"]
+        pos.pending_exit_broker_order_id = prior_runtime["pending_broker"]
+        pos.pending_scale_counted = prior_runtime["pending_scale"]
+        pos.pending_exit_replace_allowed = prior_runtime["replace_allowed"]
+        pos.pending_exit_replace_reason = prior_runtime["replace_reason"]
+        pos.pending_exit_replace_allowed_ts = prior_runtime["replace_allowed_ts"]
+        pos.pending_exit_replace_qty = prior_runtime["replace_qty"]
+        pos.pending_exit_replace_durable_pending = prior_runtime["replace_durable_pending"]
+        pos.pending_exit_replace_revalidated = prior_runtime["replace_revalidated"]
+        pos.pending_exit_replace_submit_claimed = prior_runtime["replace_claimed"]
+        return False
+
+    def consume_replacement_lifecycle_after_fill(
+        self,
+        position_id: str,
+        *,
+        local_order_id: str,
+        broker_order_id: str,
+        filled_qty: int,
+    ) -> bool:
+        """Public restart/reconciler seam for consuming a filled replacement."""
+        if not position_id:
+            return False
+        with self._lock:
+            pos = self._positions_by_id.get(str(position_id or ""))
+            if pos is None or pos.closed:
+                return False
+            return self._consume_replacement_lifecycle_after_fill_locked(
+                pos,
+                local_order_id=str(local_order_id or ""),
+                broker_order_id=str(broker_order_id or ""),
+                filled_qty=filled_qty,
+            )
 
     def _mark_exit_replacement_lifecycle(
         self,

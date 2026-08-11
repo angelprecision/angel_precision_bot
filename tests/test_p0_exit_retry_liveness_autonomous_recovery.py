@@ -173,6 +173,40 @@ def test_stale_exit_cancel_attempt_persistence_is_monotonic_and_fail_closed():
     assert _persist_stale_exit_cancel_attempt(osm, "loc-1", "bro-known", 3) is False
 
 
+def test_stale_exit_cancel_attempt_writer_requires_exact_execution_mode():
+    from ap.exit_autonomous_recovery import _persist_stale_exit_cancel_attempt
+
+    class _ModeOSM:
+        def __init__(self):
+            self.row = {
+                "local_order_id": "loc-mode",
+                "broker_order_id": "bro-mode",
+                "execution_mode": "paper",
+                "meta": {},
+            }
+
+        def persist_stale_exit_cancel_attempt(self, local_id, broker_id, attempt, execution_mode):
+            if (
+                local_id != self.row["local_order_id"]
+                or broker_id != self.row["broker_order_id"]
+                or execution_mode != self.row["execution_mode"]
+            ):
+                return False
+            self.row["meta"]["attempt"] = attempt
+            return True
+
+    osm = _ModeOSM()
+    assert _persist_stale_exit_cancel_attempt(
+        osm, "loc-mode", "bro-mode", 1, execution_mode="paper"
+    ) is True
+    assert _persist_stale_exit_cancel_attempt(
+        osm, "loc-mode", "bro-mode", 2, execution_mode="live"
+    ) is False
+    assert _persist_stale_exit_cancel_attempt(
+        osm, "loc-mode", "bro-mode", 2, execution_mode=""
+    ) is False
+
+
 def _production_callsite_position():
     position = ManagedPosition(
         ticker="AVGO",
@@ -667,6 +701,7 @@ def test_authoritative_zero_orders_and_flat_position_uses_real_close_contract_an
         assert kwargs["local_order_id"] == "loc-snapshot"
         assert kwargs["broker_order_id"] == ""
         assert kwargs["reconciled"] is True
+        assert kwargs["economic_pending"] is True
         position.closed = True
         position.quantity_remaining = 0
         position.exit_in_flight = False

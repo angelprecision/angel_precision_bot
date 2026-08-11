@@ -147,7 +147,11 @@ def _read_stale_exit_cancel_liveness(
 
 
 def _persist_stale_exit_cancel_attempt(
-    osm: Any, local_order_id: str, broker_order_id: str, attempt: int,
+    osm: Any,
+    local_order_id: str,
+    broker_order_id: str,
+    attempt: int,
+    execution_mode: str = "",
 ) -> bool:
     """Persist one exact-order cancel attempt before issuing the broker DELETE.
 
@@ -164,6 +168,29 @@ def _persist_stale_exit_cancel_attempt(
         attempt_i = int(attempt)
         if attempt_i <= 0:
             return False
+        mode = str(execution_mode or "").strip().lower()
+        # Production APOrderStateMachine requires the exact mode fence.  Keep
+        # old three-argument test doubles compatible without weakening that
+        # production contract; a real four-argument writer with no mode fails
+        # closed above rather than guessing LIVE/PAPER.
+        import inspect
+
+        try:
+            parameters = inspect.signature(persister).parameters.values()
+            supports_mode = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                or parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                or parameter.name == "execution_mode"
+                for parameter in parameters
+            )
+        except Exception:
+            supports_mode = True
+        if supports_mode:
+            if mode not in {"live", "paper"}:
+                return False
+            return bool(
+                persister(local_order_id, _norm(broker_order_id), attempt_i, mode)
+            )
         return bool(persister(local_order_id, _norm(broker_order_id), attempt_i))
     except Exception as exc:
         log.error(
@@ -809,7 +836,13 @@ def _recover_known_open_exit_when_monitor_unavailable(
             )
         status = fresh_status
     next_attempt = prior_attempt + 1
-    if not _persist_stale_exit_cancel_attempt(osm, local_id, broker_id, next_attempt):
+    if not _persist_stale_exit_cancel_attempt(
+        osm,
+        local_id,
+        broker_id,
+        next_attempt,
+        execution_mode=str(getattr(pos, "execution_mode", "") or ""),
+    ):
         return RecoveryAction(
             "NOOP",
             "autonomous_cancel_attempt_durability_unconfirmed",
@@ -898,6 +931,7 @@ def _replacement_row_is_exact(
     client_id: str,
     execution_mode: str,
     active: bool = False,
+    filled: bool = False,
 ) -> bool:
     if not isinstance(row, dict):
         return False
@@ -909,6 +943,8 @@ def _replacement_row_is_exact(
             "EXIT_ACKNOWLEDGED",
             "EXIT_PARTIAL_FILL",
         }
+    elif filled:
+        valid_status = status == "EXIT_FILLED"
     else:
         valid_status = status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
     return bool(
@@ -931,6 +967,27 @@ def _strict_replacement_row_qty(row: dict) -> Optional[int]:
     if isinstance(value, str) and value.isdigit():
         parsed = int(value)
         return parsed if parsed > 0 else None
+    return None
+
+
+def _strict_replacement_filled_qty(payload: dict) -> Optional[int]:
+    """Read broker/OSM cumulative fill quantity without numeric coercion."""
+    if not isinstance(payload, dict):
+        return None
+    value = next(
+        (
+            payload.get(key)
+            for key in ("filled_qty", "filled_quantity", "exec_quantity")
+            if key in payload and payload.get(key) is not None
+        ),
+        None,
+    )
+    if isinstance(value, bool) or value is None:
+        return None
+    if type(value) is int:
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
     return None
 
 
@@ -983,7 +1040,7 @@ def _recover_durable_replacement_pending(
         )
 
     old_row = _order_row(osm, old_local)
-    if not _replacement_row_is_exact(
+    old_row_terminal = _replacement_row_is_exact(
         old_row,
         local_id=old_local,
         broker_id=old_broker,
@@ -991,7 +1048,20 @@ def _recover_durable_replacement_pending(
         client_id=client_id,
         execution_mode=execution_mode,
         active=False,
-    ):
+    )
+    old_row_staged_active = (
+        state == "STAGED"
+        and _replacement_row_is_exact(
+            old_row,
+            local_id=old_local,
+            broker_id=old_broker,
+            position_id=pid,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            active=True,
+        )
+    )
+    if not old_row_terminal and not old_row_staged_active:
         return RecoveryAction(
             "NOOP",
             "replacement_old_generation_not_durably_terminal",
@@ -1078,6 +1148,121 @@ def _recover_durable_replacement_pending(
         new_broker = lifecycle.get("new_broker_order_id") or ""
         new_row = _order_row(osm, new_local)
         row_broker = new_broker or _norm(new_row.get("broker_order_id"))
+        if _replacement_row_is_exact(
+            new_row,
+            local_id=new_local,
+            broker_id=row_broker,
+            position_id=pid,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            filled=True,
+        ):
+            row_filled = _strict_replacement_filled_qty(new_row)
+            if row_filled != replacement_qty:
+                return RecoveryAction(
+                    "NOOP",
+                    "replacement_owned_generation_filled_quantity_mismatch",
+                    pid,
+                    new_local,
+                    row_broker,
+                    {
+                        "replacement_qty": replacement_qty,
+                        "row_filled_qty": row_filled,
+                        "replacement_blocked": True,
+                    },
+                )
+            try:
+                new_raw = _get_order(broker, row_broker)
+            except _BrokerSnapshotUnavailable as exc:
+                return RecoveryAction(
+                    "NOOP",
+                    "replacement_owned_generation_fill_proof_unavailable",
+                    pid,
+                    new_local,
+                    row_broker,
+                    {"error": str(exc), "replacement_blocked": True, "quote_health": qh},
+                )
+            if _status(new_raw) != "filled":
+                return RecoveryAction(
+                    "NOOP",
+                    "replacement_owned_generation_fill_status_unrecognized",
+                    pid,
+                    new_local,
+                    row_broker,
+                    {"status": _status(new_raw), "replacement_blocked": True, "quote_health": qh},
+                )
+            broker_filled_raw = _strict_replacement_filled_qty(new_raw)
+            broker_fill_keys_present = any(
+                key in new_raw and new_raw.get(key) is not None
+                for key in ("filled_qty", "filled_quantity", "exec_quantity")
+            )
+            if broker_fill_keys_present and broker_filled_raw is None:
+                return RecoveryAction(
+                    "NOOP",
+                    "replacement_owned_generation_broker_fill_quantity_invalid",
+                    pid,
+                    new_local,
+                    row_broker,
+                    {"replacement_blocked": True, "quote_health": qh},
+                )
+            broker_filled = row_filled if broker_filled_raw is None else broker_filled_raw
+            if broker_filled != replacement_qty:
+                return RecoveryAction(
+                    "NOOP",
+                    "replacement_owned_generation_broker_fill_quantity_mismatch",
+                    pid,
+                    new_local,
+                    row_broker,
+                    {
+                        "replacement_qty": replacement_qty,
+                        "broker_filled_qty": broker_filled,
+                        "replacement_blocked": True,
+                    },
+                )
+            consume = getattr(exit_engine, "consume_replacement_lifecycle_after_fill", None)
+            if not callable(consume):
+                return RecoveryAction(
+                    "NOOP",
+                    "replacement_fill_lifecycle_consumer_unavailable",
+                    pid,
+                    new_local,
+                    row_broker,
+                    {"replacement_blocked": True, "quote_health": qh},
+                )
+            try:
+                consumed = bool(
+                    consume(
+                        pid,
+                        local_order_id=new_local,
+                        broker_order_id=row_broker,
+                        filled_qty=broker_filled,
+                    )
+                )
+            except Exception as exc:
+                log.error("replacement fill lifecycle consumption failed for pos=%s: %s", pid, exc)
+                consumed = False
+            if not consumed:
+                return RecoveryAction(
+                    "NOOP",
+                    "replacement_fill_lifecycle_consumption_unconfirmed",
+                    pid,
+                    new_local,
+                    row_broker,
+                    {"replacement_blocked": True, "quote_health": qh},
+                )
+            return RecoveryAction(
+                "REPLACEMENT_FILL_CONSUMED",
+                "durable_replacement_fill_released_liveness",
+                pid,
+                new_local,
+                row_broker,
+                {
+                    "replacement_qty": replacement_qty,
+                    "filled_qty": broker_filled,
+                    "quote_health": qh,
+                    "duplicate_submit_blocked": False,
+                },
+            )
         if not _replacement_row_is_exact(
             new_row,
             local_id=new_local,
@@ -1671,6 +1856,7 @@ def recover_exit_position(
                 broker_order_id="",
                 cumulative_filled=close_qty,
                 reconciled=True,
+                economic_pending=True,
             )
         except Exception as _close_exc:
             log.warning("exit_autonomous_recovery: broker-flat close failed: %s", _close_exc)

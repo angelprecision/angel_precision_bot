@@ -96,8 +96,15 @@ class _BrokerReadBoundary:
         raise AssertionError("durable replacement recovery must not DELETE")
 
 
+class _BrokerReplacementFilled(_BrokerReadBoundary):
+    def get_order(self, broker_order_id):
+        if broker_order_id == "bro-restart-new":
+            return {"status": "filled", "exec_quantity": 1}
+        return super().get_order(broker_order_id)
+
+
 class _OSM:
-    def __init__(self, *, reserved_row=None, transition_result=True):
+    def __init__(self, *, reserved_row=None, transition_result=True, old_status="CANCELED"):
         self.old_row = {
             "local_order_id": OLD_LOCAL,
             "broker_order_id": OLD_BROKER,
@@ -105,7 +112,7 @@ class _OSM:
             "client_id": CLIENT_ID,
             "execution_mode": "paper",
             "kind": "EXIT",
-            "status": "CANCELED",
+            "status": old_status,
             "qty": 2,
             "filled_qty": 1,
         }
@@ -150,7 +157,7 @@ def test_restart_after_fresh_terminal_proof_replays_staged_fence_without_delete(
     """Crash A: terminal proof before OSM CAS is recoverable from STAGED."""
     position = _position("STAGED")
     position.exit_in_flight = True
-    osm = _OSM()
+    osm = _OSM(old_status="EXIT_ACKNOWLEDGED")
     broker = _BrokerReadBoundary()
     engine = _engine(position, osm)
 
@@ -228,6 +235,40 @@ def test_repeated_restart_with_pending_authority_revalidates_once_without_osm_or
     assert broker.cancel_calls == 0
     assert broker.open_order_calls == 2
     assert broker.position_calls == 2
+
+
+def test_restart_after_replacement_fill_consumes_owned_lifecycle_without_delete():
+    """A crash between fill persistence and lifecycle consumption is replay-safe."""
+    position = _position("REPLACEMENT_OWNED_BY_NEW_GENERATION")
+    position.quantity_remaining = 4
+    position.pending_exit_local_order_id = "loc-restart-new"
+    position.pending_exit_broker_order_id = "bro-restart-new"
+    position.pending_exit_qty = 1
+    position.pending_exit_filled_qty = 1
+    position.exit_in_flight = True
+    osm = _OSM(
+        reserved_row={
+            "local_order_id": "loc-restart-new",
+            "broker_order_id": "bro-restart-new",
+            "position_id": POSITION_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "kind": "EXIT",
+            "status": "EXIT_FILLED",
+            "qty": 1,
+            "filled_qty": 1,
+        }
+    )
+    broker = _BrokerReplacementFilled()
+    engine = _engine(position, osm)
+
+    actions = recover_exit_engine(engine, broker=broker, osm=osm, order_monitor=None)
+
+    assert [action.action for action in actions] == ["REPLACEMENT_FILL_CONSUMED"]
+    assert position.exit_retry_liveness["state"] == "NONE"
+    assert position.exit_replace_attempt == 0
+    assert position.exit_in_flight is False
+    assert broker.cancel_calls == 0
 
 
 def test_reserved_generation_without_broker_ack_is_not_consumed_or_re_reserved():

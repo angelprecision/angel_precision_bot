@@ -2144,6 +2144,7 @@ class APOrderStateMachine:
         local_order_id: str,
         broker_order_id: str,
         attempt: int,
+        execution_mode: str = "",
     ) -> bool:
         """Atomically advance the exact stale-exit cancel-attempt fence.
 
@@ -2155,9 +2156,14 @@ class APOrderStateMachine:
         proposed attempt is strictly greater than the durable one.
 
         ``False`` is fail-closed: the caller must not issue a broker cancel.
+        The caller must supply the runner's exact LIVE/PAPER mode; both the
+        row lock and the conditional update fence that mode.
         """
         local_id = str(local_order_id or "").strip()
         broker_id = str(broker_order_id or "").strip()
+        mode = str(execution_mode or "").strip().lower()
+        if mode not in {"live", "paper"}:
+            return False
         if isinstance(attempt, bool):
             return False
         if isinstance(attempt, int):
@@ -2186,13 +2192,16 @@ class APOrderStateMachine:
         def _fn():
             with conn() as c:
                 row = c.execute(
-                    "SELECT broker_order_id, meta FROM orders "
-                    "WHERE local_order_id=%s AND client_id=%s FOR UPDATE",
-                    (local_id, self.client_id),
+                    "SELECT broker_order_id, execution_mode, meta FROM orders "
+                    "WHERE local_order_id=%s AND client_id=%s "
+                    "  AND LOWER(COALESCE(execution_mode, ''))=%s FOR UPDATE",
+                    (local_id, self.client_id, mode),
                 ).fetchone()
                 if not row:
                     return 0
                 if str(row.get("broker_order_id") or "").strip() != broker_id:
+                    return 0
+                if str(row.get("execution_mode") or "").strip().lower() != mode:
                     return 0
 
                 raw_meta = row.get("meta") or {}
@@ -2227,8 +2236,9 @@ class APOrderStateMachine:
                     "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
                     "    updated_ts = NOW() "
                     "WHERE local_order_id=%s AND client_id=%s "
-                    "  AND broker_order_id=%s",
-                    (patch_json, local_id, self.client_id, broker_id),
+                    "  AND broker_order_id=%s "
+                    "  AND LOWER(COALESCE(execution_mode, ''))=%s",
+                    (patch_json, local_id, self.client_id, broker_id, mode),
                 )
                 return getattr(cur, "rowcount", getattr(c, "rowcount", None))
 

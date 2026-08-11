@@ -5225,6 +5225,10 @@ class APOrderMonitor:
         broker_status = self._query_broker_order(broker_oid, bypass_cache=True)
         _partial_remainder_qty = 0
         _stale_order_row = self.osm.get_order(local_order_id) or {}
+        _expected_execution_mode = str(
+            _stale_order_row.get("execution_mode")
+            or getattr(self, "_broker_owned_exit_recovery_mode", "")
+        ).strip().lower()
 
         # ── Broker fill truth wins before cancel ────────────────────────────
         # A full fill still wins immediately.  A partial fill is first routed
@@ -5430,7 +5434,11 @@ class APOrderMonitor:
 
                 persisted = bool(
                     _persist_stale_exit_cancel_attempt(
-                        self.osm, local_order_id, broker_oid, attempt,
+                        self.osm,
+                        local_order_id,
+                        broker_oid,
+                        attempt,
+                        execution_mode=_expected_execution_mode,
                     )
                 )
             except Exception as _persist_error:
@@ -6434,16 +6442,48 @@ class APOrderMonitor:
                         if key in raw and raw.get(key) is not None:
                             cumulative_raw = raw.get(key)
                             break
-                    try:
-                        cumulative_filled = int(cumulative_raw)
-                        requested_qty = int(
-                            order.get("qty") or order.get("quantity") or 0
+                    cumulative_filled = _strict_cumulative_quantity(cumulative_raw)
+                    requested_raw = (
+                        order.get("qty")
+                        if order.get("qty") is not None
+                        else order.get("quantity")
+                    )
+                    requested_qty = _strict_cumulative_quantity(requested_raw)
+                    previous_raw = order.get("filled_qty")
+                    previous_filled = (
+                        0
+                        if previous_raw in (None, "")
+                        else _strict_cumulative_quantity(previous_raw)
+                    )
+
+                    if (
+                        cumulative_filled is None
+                        or requested_qty is None
+                        or previous_filled is None
+                        or requested_qty <= 0
+                        or cumulative_filled < previous_filled
+                        or cumulative_filled > requested_qty
+                    ):
+                        self._emit_order_event(
+                            local_order_id=local_order_id,
+                            stage="order_monitor",
+                            decision="HOLD",
+                            reason_code="BROKER_FILLED_QTY_INVALID",
+                            explanation=(
+                                "Broker FILLED status carried malformed, regressed, "
+                                "or out-of-bounds cumulative quantity; no terminal "
+                                "economic transition was applied."
+                            ),
+                            contract=contract,
+                            position_id=order.get("position_id"),
+                            inputs={
+                                "broker_order_id": broker_order_id,
+                                "cumulative_filled": cumulative_raw,
+                                "previous_filled": previous_raw,
+                                "requested_qty": requested_raw,
+                            },
                         )
-                        previous_filled = int(order.get("filled_qty") or 0)
-                    except (TypeError, ValueError):
-                        cumulative_filled = 0
-                        requested_qty = 0
-                        previous_filled = 0
+                        return None
 
                     fill_price = raw.get("avg_fill_price")
                     if fill_price is None:
@@ -6451,11 +6491,7 @@ class APOrderMonitor:
                     if fill_price is None:
                         fill_price = raw.get("price")
 
-                    if (
-                        cumulative_filled > 0
-                        and requested_qty > 0
-                        and previous_filled <= cumulative_filled <= requested_qty
-                    ):
+                    if cumulative_filled == requested_qty:
                         try:
                             ok = self.osm.transition(
                                 local_order_id,
@@ -6474,15 +6510,16 @@ class APOrderMonitor:
                             return None
                         return 0
 
-                    log.warning(
-                        "[%s] broker filled payload lacks valid cumulative quantity; "
-                        "deferring to fill monitor | local=%s cumulative=%s requested=%s previous=%s",
-                        self.client_id,
-                        local_order_id,
-                        cumulative_raw,
-                        order.get("qty") or order.get("quantity"),
-                        order.get("filled_qty"),
-                    )
+                    if cumulative_filled > previous_filled:
+                        # A terminal broker status can race a partial-fill
+                        # payload. Reuse the strict cumulative parser and the
+                        # canonical partial path; never terminalize a request
+                        # whose broker cumulative fill is still below qty.
+                        raw_status = "partially_filled"
+                    else:
+                        # The durable order already contains this cumulative
+                        # truth. Preserve only its exact unfilled remainder.
+                        return max(0, requested_qty - previous_filled)
 
                 if raw_status != "partially_filled":
                     self._advance_from_broker_status(local_order_id, raw_status, contract)

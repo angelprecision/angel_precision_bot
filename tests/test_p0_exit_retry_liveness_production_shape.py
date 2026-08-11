@@ -55,14 +55,19 @@ class _MemoryCursor:
         self.rowcount = 1
         self._result = None
 
-        if normalized.startswith("SELECT BROKER_ORDER_ID, META FROM ORDERS"):
-            local_id, client_id = str(params[0]), str(params[1])
+        if normalized.startswith("SELECT BROKER_ORDER_ID, EXECUTION_MODE, META FROM ORDERS"):
+            local_id, client_id, execution_mode = str(params[0]), str(params[1]), str(params[2]).lower()
             row = self.db.rows.get(local_id)
-            if row is None or str(row.get("client_id") or "") != client_id:
+            if (
+                row is None
+                or str(row.get("client_id") or "") != client_id
+                or str(row.get("execution_mode") or "").lower() != execution_mode
+            ):
                 self._result = None
             else:
                 self._result = {
                     "broker_order_id": row.get("broker_order_id"),
+                    "execution_mode": row.get("execution_mode"),
                     "meta": dict(row.get("meta") or {}),
                 }
             return self
@@ -73,11 +78,13 @@ class _MemoryCursor:
         ):
             patch = json.loads(str(params[0]))
             local_id, client_id, broker_id = str(params[1]), str(params[2]), str(params[3])
+            expected_mode = str(params[4]).lower() if len(params) > 4 else ""
             row = self.db.rows.get(local_id)
             if (
                 row is None
                 or str(row.get("client_id") or "") != client_id
                 or str(row.get("broker_order_id") or "") != broker_id
+                or (expected_mode and str(row.get("execution_mode") or "").lower() != expected_mode)
             ):
                 self.rowcount = 0
                 return self
@@ -472,7 +479,9 @@ def test_avgo_replacement_crosses_real_production_submit_shape(monkeypatch):
         assert position.pending_exit_replace_qty == 2
         assert position.exit_replace_attempt == 1
         assert rows[old_local_id]["meta"]["stale_exit_cancel_liveness"]["attempt"] == 1
-        assert osm.persist_stale_exit_cancel_attempt(old_local_id, old_broker_id, 1) is False
+        assert osm.persist_stale_exit_cancel_attempt(
+            old_local_id, old_broker_id, 1, execution_mode="paper"
+        ) is False
 
         decision = ExitDecision(
             action="STOP",

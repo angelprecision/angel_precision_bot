@@ -445,6 +445,25 @@ class TestFinalizeProofBehavior:
         # exit_fill_price is None because the broker didn't give us one.
         assert lt_kwargs["exit_fill_price"] is None
 
+    @pytest.mark.parametrize("actual_fill_price", [0.0, None, float("nan"), float("inf")])
+    def test_broker_flat_without_fill_holds_proof_as_pending_economics(
+        self, finalize_proof_callable, actual_fill_price
+    ):
+        """Broker-flat ownership must not turn the staged estimate into P&L."""
+        h = _build_harness(finalize_proof_callable)
+        pos = _build_pos(_make_staged())
+        pos.exit_economics_pending = True
+
+        h._finalize_proof(pos, actual_fill_price=actual_fill_price)
+
+        assert h.proof.log_trade.call_count == 0
+        assert h.feedback.record_outcome.call_count == 0
+        assert h.store.update_status.call_count == 0
+        assert h.shadow.record_live_outcome.call_count == 0
+        assert pos._proof_finalized is False
+        assert pos.exit_economics_status == "PENDING_EXIT_ECONOMICS"
+        assert pos._proof_staged["economic_status"] == "PENDING_EXIT_ECONOMICS"
+
     def test_no_staged_dict_is_noop(self, finalize_proof_callable):
         """Position with no _proof_staged dict: finalize must be a no-op
         (defensive). Happens when on_exit_fill_confirmed fires for a
