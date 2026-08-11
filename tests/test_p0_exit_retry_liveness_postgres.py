@@ -41,7 +41,7 @@ def test_replacement_lifecycle_jsonb_merge_and_generation_fence(monkeypatch):
             sql.SQL(
                 "CREATE TABLE {}.positions ("
                 "id text PRIMARY KEY, client_id text NOT NULL, execution_mode text NOT NULL, "
-                "meta jsonb NOT NULL DEFAULT '{}'::jsonb, updated_at timestamptz NOT NULL DEFAULT NOW()"
+                "meta jsonb NOT NULL DEFAULT '{{}}'::jsonb, updated_at timestamptz NOT NULL DEFAULT NOW()"
                 ")"
             ).format(sql.Identifier(schema))
         )
