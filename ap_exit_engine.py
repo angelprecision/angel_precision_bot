@@ -6181,6 +6181,7 @@ class APExitEngine:
         broker_order_id: str = "",
         cumulative_filled: Optional[int] = None,
         cumulative_filled_qty: Optional[int] = None,
+        prior_cumulative_filled: Optional[int] = None,
         **kwargs,
     ):
         if not position_id:
@@ -6272,6 +6273,22 @@ class APExitEngine:
                 if cumulative_filled_qty is not None:
                     cum   = max(0, int(cumulative_filled_qty or 0))
                     prev  = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
+                    if prior_cumulative_filled is not None:
+                        if (
+                            type(prior_cumulative_filled) is not int
+                            or prior_cumulative_filled < 0
+                        ):
+                            log.error(
+                                "[exit_eng] Invalid prior cumulative fill authority | "
+                                "pos_id=%s order=%s prior=%r",
+                                position_id, order_key, prior_cumulative_filled,
+                            )
+                            return
+                        # Durable OSM may know about a fill that the in-memory
+                        # watermark missed.  Apply only the monotonic delta
+                        # beyond that durable baseline and advance the local
+                        # watermark to the broker cumulative value.
+                        prev = max(prev, prior_cumulative_filled)
                     delta = max(0, cum - prev)
                     pos.last_applied_exit_cum_fill_by_order[order_key] = max(prev, cum)
                     pos.last_applied_exit_cum_fill = max(int(pos.last_applied_exit_cum_fill or 0), cum)

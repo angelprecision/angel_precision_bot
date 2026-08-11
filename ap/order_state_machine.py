@@ -1882,6 +1882,7 @@ class APOrderStateMachine:
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         cumulative_filled=_cum_filled,
+                        prior_cumulative_filled=_prev_filled,
                     )
                 return
 

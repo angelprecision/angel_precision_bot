@@ -24,7 +24,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 sys.path.insert(0, str(REPO_ROOT))
 
-from ap.order_monitor import APOrderMonitor  # noqa: E402
+from ap.order_monitor import (  # noqa: E402
+    APOrderMonitor,
+    NewerExitLookup,
+    NewerExitLookupState,
+)
 
 
 def _monitor(**kwargs):
@@ -112,6 +116,229 @@ class _DurableCancelOSM:
             return False
         self.row["status"] = status
         return True
+
+
+def _install_replacement_lookup_db(monkeypatch, outcomes):
+    """Run the production SQL seam against deterministic cursor outcomes."""
+    import ap.order_monitor as om_mod
+
+    pending = list(outcomes)
+    current_rows = []
+    captured = []
+
+    class _Cursor:
+        def execute(self, sql, params):
+            captured.append((sql, params))
+
+        def fetchall(self):
+            return list(current_rows)
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params):
+            cursor = _Cursor()
+            cursor.execute(sql, params)
+            return cursor
+
+        def fetchall(self):
+            return list(current_rows)
+
+    def _conn():
+        return _Connection()
+
+    def _retry(fn):
+        if not pending:
+            raise AssertionError("replacement lookup outcome queue exhausted")
+        outcome = pending.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        current_rows[:] = outcome
+        return fn()
+
+    monkeypatch.setattr(om_mod, "conn", _conn)
+    monkeypatch.setattr(om_mod, "run_with_retry", _retry)
+    return captured
+
+
+def _reopen_gate_monitor(monkeypatch, *, pm):
+    import ap.order_monitor as om_mod
+
+    _actor_mode(monkeypatch)
+    monkeypatch.setattr(om_mod, "ALLOW_ORDER_MONITOR_POSITION_REOPEN", True)
+    mon = _monitor(pm=pm)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+    return mon
+
+
+def _reopen_gate_kwargs(mon):
+    return {
+        "position_id": "pos-reopen",
+        "canceled_exit_order_id": "loc-old",
+        "contract": "AAPL260814C00200000",
+        "reason": "broker-confirmed cancel",
+    }
+
+
+def _replacement_row(local_id="loc-new", broker_id="bro-new", status="EXIT_SUBMITTED"):
+    return {
+        "local_order_id": local_id,
+        "broker_order_id": broker_id,
+        "status": status,
+        "created_ts": "2026-08-11T12:00:01+00:00",
+        "submitted_ts": "2026-08-11T12:00:02+00:00",
+    }
+
+
+def test_position_reopen_db_failure_is_unavailable_and_holds(monkeypatch):
+    _install_replacement_lookup_db(monkeypatch, [RuntimeError("postgres unavailable")])
+    pm = MagicMock(spec=[
+        "revert_position_to_open",
+        "revertpositiontoopen",
+        "revert_to_open_after_exit_cancel",
+        "update_position",
+    ])
+    mon = _reopen_gate_monitor(monkeypatch, pm=pm)
+
+    lookup = mon._get_newer_active_exit_order(
+        position_id="pos-reopen", canceled_exit_order_id="loc-old"
+    )
+    assert lookup.state is NewerExitLookupState.UNAVAILABLE
+    mon._get_newer_active_exit_order = MagicMock(return_value=lookup)
+
+    assert mon._guarded_revert_position_open_after_exit_cancel(**_reopen_gate_kwargs(mon)) is False
+    pm.revert_position_to_open.assert_not_called()
+    pm.revertpositiontoopen.assert_not_called()
+    pm.revert_to_open_after_exit_cancel.assert_not_called()
+    pm.update_position.assert_not_called()
+    hold = mon._emit_order_event.call_args
+    assert hold.kwargs["decision"] == "HOLD"
+    assert hold.kwargs["reason_code"] == "POSITION_REOPEN_HOLD_REPLACEMENT_LOOKUP_UNAVAILABLE"
+    assert hold.kwargs["inputs"]["lookup_state"] == "UNAVAILABLE"
+
+
+def test_position_reopen_authoritative_zero_rows_is_permitted(monkeypatch):
+    captured = _install_replacement_lookup_db(monkeypatch, [[]])
+    pm = MagicMock(spec=[
+        "revert_position_to_open",
+        "revertpositiontoopen",
+        "revert_to_open_after_exit_cancel",
+        "update_position",
+    ])
+    pm.revert_position_to_open.return_value = True
+    mon = _reopen_gate_monitor(monkeypatch, pm=pm)
+
+    lookup = mon._get_newer_active_exit_order(
+        position_id="pos-reopen", canceled_exit_order_id="loc-old"
+    )
+    assert lookup.state is NewerExitLookupState.AUTHORITATIVE_NONE
+    assert lookup.count == 0
+    mon._get_newer_active_exit_order = MagicMock(return_value=lookup)
+
+    assert mon._guarded_revert_position_open_after_exit_cancel(**_reopen_gate_kwargs(mon)) is True
+    pm.revert_position_to_open.assert_called_once()
+    assert captured
+    assert "LIMIT 1" not in captured[0][0].upper()
+
+
+def test_position_reopen_single_newer_exit_is_found_and_blocked(monkeypatch):
+    row = _replacement_row()
+    _install_replacement_lookup_db(monkeypatch, [[row]])
+    pm = MagicMock(spec=[
+        "revert_position_to_open",
+        "revertpositiontoopen",
+        "revert_to_open_after_exit_cancel",
+        "update_position",
+    ])
+    mon = _reopen_gate_monitor(monkeypatch, pm=pm)
+
+    lookup = mon._get_newer_active_exit_order(
+        position_id="pos-reopen", canceled_exit_order_id="loc-old"
+    )
+    assert lookup.state is NewerExitLookupState.FOUND
+    assert lookup.row["local_order_id"] == "loc-new"
+    mon._get_newer_active_exit_order = MagicMock(return_value=lookup)
+
+    assert mon._guarded_revert_position_open_after_exit_cancel(**_reopen_gate_kwargs(mon)) is False
+    pm.revert_position_to_open.assert_not_called()
+    pm.update_position.assert_not_called()
+
+
+def test_position_reopen_multiple_newer_exits_is_ambiguous_and_holds(monkeypatch):
+    rows = [_replacement_row("loc-new-a", "bro-new-a"), _replacement_row("loc-new-b", "bro-new-b")]
+    _install_replacement_lookup_db(monkeypatch, [rows])
+    pm = MagicMock(spec=[
+        "revert_position_to_open",
+        "revertpositiontoopen",
+        "revert_to_open_after_exit_cancel",
+        "update_position",
+    ])
+    mon = _reopen_gate_monitor(monkeypatch, pm=pm)
+
+    lookup = mon._get_newer_active_exit_order(
+        position_id="pos-reopen", canceled_exit_order_id="loc-old"
+    )
+    assert lookup.state is NewerExitLookupState.AMBIGUOUS
+    assert lookup.count == 2
+    assert [item["local_order_id"] for item in lookup.diagnostic()["replacement_identities"]] == [
+        "loc-new-a", "loc-new-b"
+    ]
+    mon._get_newer_active_exit_order = MagicMock(return_value=lookup)
+
+    assert mon._guarded_revert_position_open_after_exit_cancel(**_reopen_gate_kwargs(mon)) is False
+    pm.revert_position_to_open.assert_not_called()
+    pm.revertpositiontoopen.assert_not_called()
+    pm.revert_to_open_after_exit_cancel.assert_not_called()
+    pm.update_position.assert_not_called()
+    hold = mon._emit_order_event.call_args
+    assert hold.kwargs["decision"] == "HOLD"
+    assert hold.kwargs["reason_code"] == "POSITION_REOPEN_HOLD_REPLACEMENT_LOOKUP_AMBIGUOUS"
+    assert hold.kwargs["inputs"]["replacement_count"] == 2
+    assert hold.kwargs["inputs"]["replacement_identities"][1]["broker_order_id"] == "bro-new-b"
+
+
+def test_position_reopen_db_failure_then_authoritative_none_recovers(monkeypatch):
+    _install_replacement_lookup_db(monkeypatch, [RuntimeError("temporary postgres failure"), []])
+    pm = MagicMock(spec=[
+        "revert_position_to_open",
+        "revertpositiontoopen",
+        "revert_to_open_after_exit_cancel",
+        "update_position",
+    ])
+    pm.revert_position_to_open.return_value = True
+    mon = _reopen_gate_monitor(monkeypatch, pm=pm)
+
+    assert mon._guarded_revert_position_open_after_exit_cancel(**_reopen_gate_kwargs(mon)) is False
+    pm.revert_position_to_open.assert_not_called()
+    assert mon._guarded_revert_position_open_after_exit_cancel(**_reopen_gate_kwargs(mon)) is True
+    pm.revert_position_to_open.assert_called_once()
+    assert any(call.kwargs["decision"] == "HOLD" for call in mon._emit_order_event.call_args_list)
+
+
+def test_position_reopen_db_failure_then_replacement_discovery_stays_blocked(monkeypatch):
+    _install_replacement_lookup_db(
+        monkeypatch,
+        [RuntimeError("temporary postgres failure"), [_replacement_row()]],
+    )
+    pm = MagicMock(spec=[
+        "revert_position_to_open",
+        "revertpositiontoopen",
+        "revert_to_open_after_exit_cancel",
+        "update_position",
+    ])
+    mon = _reopen_gate_monitor(monkeypatch, pm=pm)
+
+    assert mon._guarded_revert_position_open_after_exit_cancel(**_reopen_gate_kwargs(mon)) is False
+    assert mon._guarded_revert_position_open_after_exit_cancel(**_reopen_gate_kwargs(mon)) is False
+    pm.revert_position_to_open.assert_not_called()
+    pm.revertpositiontoopen.assert_not_called()
+    pm.revert_to_open_after_exit_cancel.assert_not_called()
+    pm.update_position.assert_not_called()
 
 
 # ── 1. Watchdog stale-EXIT recovery allowed by default ──────────────────────

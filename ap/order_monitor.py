@@ -35,7 +35,9 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from enum import Enum
 from typing import Optional
 
 from ap.broker_submit_identity import canonical_broker_submit_key
@@ -85,6 +87,64 @@ def _strict_broker_status(raw_status) -> Optional[str]:
         "partial_filled": "partially_filled",
     }
     return aliases.get(status, status)
+
+
+class NewerExitLookupState(str, Enum):
+    """Authority states for the position-reopen replacement lookup."""
+
+    FOUND = "FOUND"
+    AUTHORITATIVE_NONE = "AUTHORITATIVE_NONE"
+    UNAVAILABLE = "UNAVAILABLE"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+@dataclass(frozen=True)
+class NewerExitLookup:
+    """Tri/four-state result; absence is authoritative only when proven."""
+
+    state: NewerExitLookupState
+    rows: tuple[dict, ...] = ()
+    error: str = ""
+    count: Optional[int] = None
+
+    @classmethod
+    def found(cls, row: dict) -> "NewerExitLookup":
+        return cls(NewerExitLookupState.FOUND, (dict(row),), count=1)
+
+    @classmethod
+    def authoritative_none(cls) -> "NewerExitLookup":
+        return cls(NewerExitLookupState.AUTHORITATIVE_NONE, (), count=0)
+
+    @classmethod
+    def unavailable(cls, error: str) -> "NewerExitLookup":
+        return cls(NewerExitLookupState.UNAVAILABLE, (), error=str(error or ""), count=None)
+
+    @classmethod
+    def ambiguous(cls, rows: list[dict]) -> "NewerExitLookup":
+        normalized = tuple(dict(row) for row in rows)
+        return cls(NewerExitLookupState.AMBIGUOUS, normalized, count=len(normalized))
+
+    @property
+    def row(self) -> Optional[dict]:
+        return self.rows[0] if self.state is NewerExitLookupState.FOUND else None
+
+    def diagnostic(self) -> dict:
+        identities = [
+            {
+                "local_order_id": str(row.get("local_order_id") or ""),
+                "broker_order_id": str(row.get("broker_order_id") or ""),
+                "status": str(row.get("status") or ""),
+            }
+            for row in self.rows
+        ]
+        result = {
+            "lookup_state": self.state.value,
+            "replacement_count": self.count,
+            "replacement_identities": identities,
+        }
+        if self.error:
+            result["error"] = self.error
+        return result
 
 # ── Shared broker order-status cache ─────────────────────────────────────────
 # fill_monitor and order_monitor both call broker.get_order(broker_order_id)
@@ -5908,11 +5968,18 @@ class APOrderMonitor:
             return False
 
         try:
-            replacement = self._get_newer_active_exit_order(
+            lookup = self._get_newer_active_exit_order(
                 position_id=position_id,
                 canceled_exit_order_id=canceled_exit_order_id,
             )
-            if replacement:
+            # A test double or legacy override that returns None is not an
+            # authoritative empty result.  Treat every non-typed result as
+            # unavailable so it cannot authorize a money-path mutation.
+            if not isinstance(lookup, NewerExitLookup):
+                lookup = NewerExitLookup.unavailable("invalid_lookup_result")
+
+            if lookup.state is NewerExitLookupState.FOUND:
+                replacement = lookup.row or {}
                 repl_id = replacement.get("local_order_id")
                 repl_status = replacement.get("status")
                 log.warning(
@@ -5936,6 +6003,40 @@ class APOrderMonitor:
                         "replacement_exit_order_id": repl_id,
                         "replacement_status": repl_status,
                     },
+                )
+                return False
+
+            if lookup.state is not NewerExitLookupState.AUTHORITATIVE_NONE:
+                diagnostic = lookup.diagnostic()
+                reason_code = (
+                    "POSITION_REOPEN_HOLD_REPLACEMENT_LOOKUP_AMBIGUOUS"
+                    if lookup.state is NewerExitLookupState.AMBIGUOUS
+                    else "POSITION_REOPEN_HOLD_REPLACEMENT_LOOKUP_UNAVAILABLE"
+                )
+                log.error(
+                    "[%s] Position reopen HOLD after stale exit cancel — replacement "
+                    "ownership is not authoritative | pos=%s old_exit=%s diagnostic=%s",
+                    self.client_id, position_id, canceled_exit_order_id, diagnostic,
+                )
+                self._emit_order_event(
+                    local_order_id=canceled_exit_order_id,
+                    stage="order_monitor",
+                    decision="HOLD",
+                    reason_code=reason_code,
+                    explanation=(
+                        "Position reopen held because newer EXIT replacement ownership "
+                        "is unavailable or ambiguous; no position mutation is authorized"
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "canceled_exit_order_id": canceled_exit_order_id,
+                        **diagnostic,
+                    },
+                )
+                self._alert(
+                    f"POSITION REOPEN HOLD — replacement ownership {lookup.state.value.lower()} | "
+                    f"{self.client_id} | {contract} | pos={position_id}"
                 )
                 return False
 
@@ -5998,10 +6099,10 @@ class APOrderMonitor:
         *,
         position_id: str,
         canceled_exit_order_id: str,
-    ) -> Optional[dict]:
-        """Return a newer active replacement EXIT order for this position, if any."""
+    ) -> NewerExitLookup:
+        """Resolve replacement ownership without collapsing query failure to none."""
         if not position_id or not canceled_exit_order_id:
-            return None
+            return NewerExitLookup.unavailable("missing_position_or_canceled_exit_identity")
 
         def _fn():
             with conn() as c:
@@ -6013,7 +6114,6 @@ class APOrderMonitor:
                         WHERE client_id=%s
                           AND local_order_id=%s
                           AND kind='EXIT'
-                        LIMIT 1
                     )
                     SELECT local_order_id, broker_order_id, status, created_ts, submitted_ts
                     FROM orders
@@ -6029,26 +6129,32 @@ class APOrderMonitor:
                           (SELECT created_ts FROM canceled) IS NULL
                           OR created_ts >= (SELECT created_ts FROM canceled)
                       )
-                    ORDER BY created_ts DESC
-                    LIMIT 1
+                    ORDER BY created_ts DESC, local_order_id ASC
                     """,
                     (
                         self.client_id, canceled_exit_order_id,
                         self.client_id, position_id, canceled_exit_order_id,
                     ),
                 )
-                return c.fetchone()
+                return c.fetchall()
 
         try:
-            row = run_with_retry(_fn)
-            return dict(row) if row else None
+            rows = run_with_retry(_fn)
+            if rows is None:
+                return NewerExitLookup.unavailable("query_returned_no_row_set")
+            normalized_rows = [dict(row) for row in rows]
+            if not normalized_rows:
+                return NewerExitLookup.authoritative_none()
+            if len(normalized_rows) == 1:
+                return NewerExitLookup.found(normalized_rows[0])
+            return NewerExitLookup.ambiguous(normalized_rows)
         except Exception as e:
             log.error(
                 "[%s] Failed checking newer replacement exit | pos=%s old_exit=%s: %s — "
-                "assuming no replacement; proceeding with position reopen",
+                "replacement ownership unavailable; holding position reopen",
                 self.client_id, position_id, canceled_exit_order_id, e,
             )
-            return None  # safe: caller proceeds with position reopen on None
+            return NewerExitLookup.unavailable(type(e).__name__)
 
     def _query_broker_order(
         self, broker_order_id: Optional[str], *, bypass_cache: bool = False,

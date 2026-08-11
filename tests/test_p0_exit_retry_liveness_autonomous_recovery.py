@@ -164,6 +164,8 @@ class _DurableOSM:
         self.row["status"] = status
         self.row["broker_order_id"] = kwargs.get("broker_order_id") or self.row["broker_order_id"]
         self.row["position_id"] = kwargs.get("position_id") or self.row["position_id"]
+        if kwargs.get("filled_qty") is not None:
+            self.row["filled_qty"] = kwargs["filled_qty"]
         if self.exit_engine is not None and status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
             self.exit_engine.clear_exit_in_flight(
                 self.row["position_id"],
@@ -900,6 +902,69 @@ def test_terminal_cancel_uses_proven_partial_fill_for_replacement_qty():
     _, mark_kwargs = exit_engine.mark_exit_replacement_safe.call_args
     assert mark_kwargs["replacement_qty"] == 1
     assert position.quantity_remaining == 7
+
+
+def test_terminal_cancel_monotonic_late_fill_is_applied_before_replacement():
+    """Broker cumulative 2 advances durable OSM cumulative 1 by one contract."""
+    class _TerminalLateFillBroker:
+        def get_order(self, broker_order_id):
+            return {
+                "id": broker_order_id,
+                "contract": "AVGO260814C00350000",
+                "status": "canceled",
+                "exec_quantity": 2,
+            }
+
+        def list_open_orders(self):
+            return []
+
+        def list_positions(self):
+            return [{"symbol": "AVGO260814C00350000", "quantity": 5}]
+
+    broker = _TerminalLateFillBroker()
+    position = _production_callsite_position()
+    position.quantity = 7
+    position.quantity_remaining = 6  # durable/in-memory cumulative fill already includes 1
+    position.pending_exit_broker_order_id = "bro-canceled"
+    position.pending_exit_action = "SCALE_OUT"
+    position.pending_exit_qty = 3
+    position.pending_exit_filled_qty = 1
+
+    exit_engine = APExitEngine(broker=broker, email="client-self-healing")
+    exit_engine._emit_exit_event = MagicMock()
+    exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    exit_engine.add_position(position)
+    mark_spy = MagicMock(wraps=exit_engine.mark_exit_replacement_safe)
+    exit_engine.mark_exit_replacement_safe = mark_spy
+
+    osm = _DurableOSM(
+        local_id=position.pending_exit_local_order_id,
+        broker_id="bro-canceled",
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+        qty=3,
+        filled_qty=1,
+    )
+    osm.exit_engine = exit_engine
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "REPLACEMENT_SAFE"
+    assert action.details["terminal_filled_qty"] == 2
+    assert action.details["terminal_fill_source"] == "broker_snapshot_late_fill_reconciled"
+    assert action.details["late_fill_delta"] == 1
+    assert mark_spy.call_args.kwargs["replacement_qty"] == 1
+    assert osm.row["filled_qty"] == 2
+    assert position.quantity_remaining == 5
+    assert position.closed is False
+    assert position.exit_in_flight is False
 
 
 def test_exact_filled_order_is_not_claimed_closed_without_engine_confirmation():

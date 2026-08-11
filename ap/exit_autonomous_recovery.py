@@ -893,7 +893,13 @@ def _terminal_cumulative_fill_authority(
     broker_payload: dict,
     osm_row: dict,
 ) -> tuple[Optional[int], str]:
-    """Resolve terminal fill quantity from broker or durable OSM evidence."""
+    """Resolve terminal fill quantity from broker or durable OSM evidence.
+
+    A broker cumulative value greater than the durable OSM watermark is a
+    monotonic late fill during the cancel window, not automatically a
+    contradiction.  Callers must reconcile that delta through canonical exit
+    accounting before granting a replacement.
+    """
     broker_qty, broker_present = _strict_cumulative_fill_authority(broker_payload)
     osm_qty, osm_present = _strict_durable_cumulative_fill_authority(osm_row)
     if broker_present and broker_qty is None:
@@ -903,10 +909,147 @@ def _terminal_cumulative_fill_authority(
     if not broker_present and not osm_present:
         return None, "terminal_cumulative_fill_missing"
     if broker_present and osm_present and broker_qty != osm_qty:
+        if broker_qty > osm_qty:
+            return broker_qty, "broker_snapshot_late_fill"
         return None, "terminal_cumulative_fill_conflict"
     if broker_present:
         return broker_qty, "broker_snapshot"
     return osm_qty, "durable_osm"
+
+
+def _reconcile_terminal_late_fill(
+    *,
+    pos: Any,
+    exit_engine: Any,
+    osm: Any,
+    local_id: str,
+    broker_id: str,
+    position_id: str,
+    terminal_row: dict,
+    requested_qty: int,
+    broker_qty: int,
+) -> tuple[bool, str, dict]:
+    """Apply broker-minus-OSM terminal fill before replacement authorization."""
+    durable_qty, durable_present = _strict_durable_cumulative_fill_authority(terminal_row)
+    if not durable_present or durable_qty is None:
+        return False, "durable_osm_cumulative_fill_unavailable", {}
+    if broker_qty <= durable_qty:
+        return False, "terminal_late_fill_delta_not_positive", {
+            "broker_cumulative_filled": broker_qty,
+            "durable_osm_cumulative_filled": durable_qty,
+        }
+    if broker_qty > requested_qty:
+        return False, "terminal_late_fill_exceeds_requested_quantity", {
+            "broker_cumulative_filled": broker_qty,
+            "durable_osm_cumulative_filled": durable_qty,
+            "osm_requested_qty": requested_qty,
+        }
+
+    delta = broker_qty - durable_qty
+    before_remaining = _strict_managed_quantity_remaining(pos)
+    transition = getattr(osm, "transition", None)
+    partial_fill_hook = getattr(exit_engine, "note_partial_exit_fill", None)
+    if not callable(transition) or not callable(partial_fill_hook):
+        return False, "canonical_late_fill_owner_unavailable", {
+            "late_fill_delta": delta,
+            "broker_cumulative_filled": broker_qty,
+            "durable_osm_cumulative_filled": durable_qty,
+        }
+
+    try:
+        transition_ok = bool(
+            transition(
+                local_id,
+                "EXIT_PARTIAL_FILL",
+                broker_order_id=broker_id,
+                filled_qty=broker_qty,
+                position_id=position_id,
+            )
+        )
+    except Exception as exc:
+        return False, "canonical_late_fill_osm_transition_failed", {
+            "late_fill_delta": delta,
+            "broker_cumulative_filled": broker_qty,
+            "durable_osm_cumulative_filled": durable_qty,
+            "error": type(exc).__name__,
+        }
+
+    if not transition_ok:
+        refreshed_row = _order_row(osm, local_id)
+        refreshed_qty, refreshed_present = _strict_durable_cumulative_fill_authority(
+            refreshed_row
+        )
+        transition_ok = bool(
+            _norm(refreshed_row.get("local_order_id")) == _norm(local_id)
+            and _norm(refreshed_row.get("broker_order_id")) == _norm(broker_id)
+            and _norm(refreshed_row.get("position_id")) == _norm(position_id)
+            and _norm(refreshed_row.get("status")).upper() == "EXIT_PARTIAL_FILL"
+            and refreshed_present
+            and refreshed_qty == broker_qty
+        )
+    if not transition_ok:
+        return False, "canonical_late_fill_osm_transition_unconfirmed", {
+            "late_fill_delta": delta,
+            "broker_cumulative_filled": broker_qty,
+            "durable_osm_cumulative_filled": durable_qty,
+        }
+
+    try:
+        # The durable OSM transition normally invokes this hook itself.  The
+        # explicit call is idempotent and covers recovery doubles/registries
+        # that do not wire the OSM hook; prior_cumulative_filled prevents a
+        # missed in-memory watermark from applying the whole broker total.
+        partial_fill_hook(
+            position_id,
+            qty_filled=delta,
+            local_order_id=local_id,
+            broker_order_id=broker_id,
+            cumulative_filled=broker_qty,
+            prior_cumulative_filled=durable_qty,
+        )
+    except Exception as exc:
+        return False, "canonical_late_fill_accounting_failed", {
+            "late_fill_delta": delta,
+            "broker_cumulative_filled": broker_qty,
+            "durable_osm_cumulative_filled": durable_qty,
+            "error": type(exc).__name__,
+        }
+
+    refreshed_row = _order_row(osm, local_id)
+    refreshed_qty, refreshed_present = _strict_durable_cumulative_fill_authority(
+        refreshed_row
+    )
+    if not refreshed_present or refreshed_qty != broker_qty:
+        return False, "canonical_late_fill_durable_quantity_unconfirmed", {
+            "late_fill_delta": delta,
+            "broker_cumulative_filled": broker_qty,
+            "durable_osm_cumulative_filled": refreshed_qty,
+        }
+    if bool(getattr(pos, "closed", False)):
+        return False, "canonical_late_fill_closed_position_unexpected", {
+            "late_fill_delta": delta,
+            "broker_cumulative_filled": broker_qty,
+            "durable_osm_cumulative_filled": durable_qty,
+        }
+    if before_remaining is not None:
+        after_remaining = _strict_managed_quantity_remaining(pos)
+        if after_remaining != before_remaining - delta:
+            return False, "canonical_late_fill_position_delta_unconfirmed", {
+                "late_fill_delta": delta,
+                "quantity_remaining_before": before_remaining,
+                "quantity_remaining_after": after_remaining,
+            }
+
+    return True, "broker_snapshot_late_fill_reconciled", {
+        "late_fill_delta": delta,
+        "broker_cumulative_filled": broker_qty,
+        "durable_osm_cumulative_filled": durable_qty,
+        "quantity_remaining_before": before_remaining,
+        "quantity_remaining_after": (
+            _strict_managed_quantity_remaining(pos)
+            if before_remaining is not None else None
+        ),
+    }
 
 
 def quote_health(pos: Any, *, stale_sec: int = QUOTE_STALE_WARN_SEC) -> dict:
@@ -1309,6 +1452,36 @@ def _recover_known_open_exit_when_monitor_unavailable(
             "osm_requested_qty": terminal_requested_qty,
         }
     )
+    if terminal_fill_source == "broker_snapshot_late_fill":
+        late_fill_ok, late_fill_reason, late_fill_details = _reconcile_terminal_late_fill(
+            pos=pos,
+            exit_engine=exit_engine,
+            osm=osm,
+            local_id=local_id,
+            broker_id=broker_id,
+            position_id=_position_id(pos),
+            terminal_row=terminal_row,
+            requested_qty=terminal_requested_qty,
+            broker_qty=terminal_filled_qty,
+        )
+        details.update(late_fill_details)
+        if not late_fill_ok:
+            details.update(
+                {
+                    "error": late_fill_reason,
+                    "broker_mutation_blocked": True,
+                    "replacement_blocked": True,
+                }
+            )
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_terminal_late_fill_reconciliation_failed",
+                _position_id(pos),
+                local_id,
+                broker_id,
+                details,
+            )
+        details["terminal_fill_source"] = late_fill_reason
     if terminal_filled_qty is None:
         details.update(
             {
@@ -2074,6 +2247,7 @@ def recover_exit_position(
     terminal_exact_broker_id = ""
     terminal_broker_snapshot: Optional[dict] = None
     terminal_replacement_qty: Optional[int] = None
+    terminal_late_fill_details: dict = {}
 
     # Exact broker identity path.
     if pending_broker_id:
@@ -2588,6 +2762,35 @@ def recover_exit_position(
             terminal_broker_snapshot or {},
             terminal_row,
         )
+        if terminal_fill_source == "broker_snapshot_late_fill":
+            late_fill_ok, late_fill_reason, terminal_late_fill_details = _reconcile_terminal_late_fill(
+                pos=pos,
+                exit_engine=exit_engine,
+                osm=osm,
+                local_id=local_id,
+                broker_id=terminal_exact_broker_id,
+                position_id=pid,
+                terminal_row=terminal_row,
+                requested_qty=terminal_requested_qty,
+                broker_qty=terminal_filled_qty,
+            )
+            if not late_fill_ok:
+                return RecoveryAction(
+                    "NOOP",
+                    "autonomous_recovery_terminal_late_fill_reconciliation_failed",
+                    pid,
+                    local_id,
+                    terminal_exact_broker_id,
+                    {
+                        "contract": contract,
+                        "quote_health": qh,
+                        "error": late_fill_reason,
+                        **terminal_late_fill_details,
+                        "broker_mutation_blocked": True,
+                        "replacement_blocked": True,
+                    },
+                )
+            terminal_fill_source = late_fill_reason
         if terminal_filled_qty is None:
             return RecoveryAction(
                 "NOOP",
@@ -2780,6 +2983,7 @@ def recover_exit_position(
             "terminal_fill_source": (
                 terminal_fill_source if terminal_exact_broker_id else ""
             ),
+            **terminal_late_fill_details,
         },
         replacement_qty=(
             terminal_replacement_qty
