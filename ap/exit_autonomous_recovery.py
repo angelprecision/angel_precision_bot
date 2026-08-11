@@ -312,6 +312,8 @@ def _validate_broker_order_payload(
         normalize=lambda value: value,
     )
     expected_id = _norm(expected_broker_order_id)
+    if expected_id and not broker_order_id:
+        raise ValueError("broker order identity is missing")
     if broker_order_id and expected_id and broker_order_id != expected_id:
         raise ValueError("broker order identity does not match requested order")
 
@@ -322,6 +324,8 @@ def _validate_broker_order_payload(
         normalize=lambda value: _norm_contract(value),
     )
     expected_contract_norm = _norm_contract(expected_contract)
+    if expected_contract_norm and not contract:
+        raise ValueError("broker order contract is missing")
     if contract and expected_contract_norm and contract != expected_contract_norm:
         raise ValueError("broker order contract does not match durable position")
 
@@ -543,12 +547,19 @@ def _get_order_for_contract(
     contract: str,
 ) -> Optional[dict]:
     """Keep the legacy two-argument GET seam while fencing contract identity."""
-    raw = _get_order(broker, broker_order_id)
+    expected_contract = _norm_contract(contract)
+    if not expected_contract:
+        raise _BrokerSnapshotUnavailable("missing expected broker contract")
     try:
-        return _validate_broker_order_payload(raw, expected_contract=contract)
-    except ValueError as exc:
+        raw = _get_order(broker, broker_order_id)
+        return _validate_broker_order_payload(
+            raw,
+            expected_broker_order_id=broker_order_id,
+            expected_contract=expected_contract,
+        )
+    except (_BrokerSnapshotUnavailable, ValueError) as exc:
         raise _BrokerSnapshotUnavailable(
-            f"broker.get_order contract authority unavailable for {broker_order_id}"
+            f"broker.get_order exact identity authority unavailable for {broker_order_id}"
         ) from exc
 
 
@@ -621,6 +632,7 @@ def _cancel_order_with_proof(
     broker: Any,
     broker_order_id: str,
     *,
+    expected_contract: str = "",
     max_retries: int = CANCEL_PROOF_RETRIES,
     retry_delay: float = CANCEL_PROOF_DELAY_SEC,
 ) -> tuple[bool, dict]:
@@ -643,7 +655,11 @@ def _cancel_order_with_proof(
 
     for attempt in range(max(1, int(max_retries))):
         try:
-            confirmed = _get_order(broker, broker_order_id)
+            confirmed = (
+                _get_order_for_contract(broker, broker_order_id, expected_contract)
+                if expected_contract
+                else _get_order(broker, broker_order_id)
+            )
         except _BrokerSnapshotUnavailable:
             confirmed = None
         confirmed_payload = confirmed
@@ -1049,7 +1065,11 @@ def _recover_known_open_exit_when_monitor_unavailable(
             _position_id(pos), local_id, broker_id,
             {"status": status, "cancel_attempt": next_attempt, "quote_health": quote_health_payload},
         )
-    ok, proof = _cancel_order_with_proof(broker, broker_id)
+    ok, proof = _cancel_order_with_proof(
+        broker,
+        broker_id,
+        expected_contract=_position_contract(pos),
+    )
     details = {
         "status": status,
         "cancel_attempt": next_attempt,

@@ -259,7 +259,11 @@ class _RestartReplayBroker(_ProductionShapeBroker):
 
     def get_order(self, broker_order_id):
         self.get_calls.append(broker_order_id)
-        return {"status": "canceled"}
+        return {
+            "id": broker_order_id,
+            "contract": "AVGO260814C00350000",
+            "status": "canceled",
+        }
 
     def list_open_orders(self):
         return []

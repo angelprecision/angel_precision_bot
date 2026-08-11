@@ -3622,23 +3622,21 @@ def _restore_exit_replace_attempt_from_meta(raw_meta) -> dict[str, object]:
     # Rows without a declared state are legacy compatibility rows. They do
     # not carry canonical replacement authority, but retain the historical
     # best-effort pricing-counter restoration contract.
-    try:
-        attempt = int(namespace.get("replace_attempt", 0) or 0)
-        if attempt < 0:
-            attempt = 0
-    except Exception:
-        attempt = 0
+    raw_attempt = namespace.get("replace_attempt", 0)
+    # Legacy rows are untrusted JSON.  Do not let bools or numeric-looking
+    # strings change the restart pricing rung through int() coercion.
+    attempt = raw_attempt if type(raw_attempt) is int and raw_attempt >= 0 else 0
     # Restart metadata is untrusted input.  Runtime increments already clamp
     # this counter; hydration must preserve the same invariant after a
     # corrupted or legacy row is loaded.
     attempt = min(attempt, EXIT_REPLACE_MAX_ATTEMPTS)
 
-    try:
-        replace_qty = int(namespace.get("replace_quantity", 0) or 0)
-        if replace_qty < 0:
-            replace_qty = 0
-    except Exception:
-        replace_qty = 0
+    raw_replace_qty = namespace.get("replace_quantity", 0)
+    replace_qty = (
+        raw_replace_qty
+        if type(raw_replace_qty) is int and raw_replace_qty >= 0
+        else 0
+    )
 
     restored = {
         "replace_attempt": attempt,
@@ -6215,6 +6213,54 @@ class APExitEngine:
                     )
                     return
 
+                # A cancellation/replacement handoff clears the compatibility
+                # pending identity, but the old generation is still a durable
+                # authority boundary.  A late callback for that cleared
+                # identity must never become a new fill watermark or mutate
+                # the position while replacement ownership is pending.
+                cleared_local = str(getattr(pos, "last_exit_clear_local_order_id", "") or "")
+                cleared_broker = str(getattr(pos, "last_exit_clear_broker_order_id", "") or "")
+                if (
+                    (local_order_id and local_order_id == cleared_local)
+                    or (broker_order_id and broker_order_id == cleared_broker)
+                ):
+                    self._reject_stale_exit_hook(
+                        pos,
+                        hook_name="note_partial_exit_fill",
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_order_id,
+                        reason="callback belongs to the cleared exit generation",
+                    )
+                    return
+
+                _replacement_lifecycle, _replacement_valid, _replacement_error = (
+                    self._replacement_lifecycle_for_position(pos)
+                )
+                _replacement_state = _replacement_lifecycle.get(
+                    "state", EXIT_REPLACEMENT_STATE_NONE
+                )
+                if (
+                    not pos.pending_exit_local_order_id
+                    and not pos.pending_exit_broker_order_id
+                    and _replacement_valid
+                    and _replacement_state in {
+                        EXIT_REPLACEMENT_STATE_STAGED,
+                        EXIT_REPLACEMENT_STATE_PENDING,
+                        EXIT_REPLACEMENT_STATE_OWNED,
+                    }
+                ):
+                    self._reject_stale_exit_hook(
+                        pos,
+                        hook_name="note_partial_exit_fill",
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_order_id,
+                        reason=(
+                            "replacement generation has no active callback owner"
+                            f" ({_replacement_error})"
+                        ),
+                    )
+                    return
+
                 order_key = (
                     broker_order_id
                     or local_order_id
@@ -7683,6 +7729,7 @@ class APExitEngine:
         allow_inflight_override: bool = False,
     ) -> bool:
         """Centralized gate for every path that can submit an exit order."""
+        replacement_override_authorized = False
         if pos.closed or int(pos.quantity_remaining or 0) <= 0:
             return False
         if _is_adoption_identity_quarantined(pos):
@@ -7820,12 +7867,6 @@ class APExitEngine:
                 )
                 return False
 
-            # Consume one-shot replacement authorization.
-            pos.pending_exit_replace_allowed    = False
-            pos.pending_exit_replace_reason     = ""
-            pos.pending_exit_replace_allowed_ts = None
-            pos.pending_exit_replace_qty        = 0
-
             stale_enough = flight_sec >= 20.0
             new_code     = _classify_exit_decision(ExitDecision("CLOSE_ALL", 0, reason or "", "IMMEDIATE"))
             pending_code = _classify_exit_decision(ExitDecision(pos.pending_exit_action or "CLOSE_ALL", 0, pos.pending_exit_reason or "", "IMMEDIATE"))
@@ -7915,6 +7956,7 @@ class APExitEngine:
                 "[%s] EXIT IN-FLIGHT OVERRIDE allowed | flight=%.1fs new=%s pending=%s",
                 pos.ticker, flight_sec, reason, pos.pending_exit_reason,
             )
+            replacement_override_authorized = True
 
         if pos.last_rejection_ts is not None:
             # FIX-8: last_rejection_ts is now Optional[datetime]; compute elapsed with datetime arithmetic.
@@ -7931,6 +7973,15 @@ class APExitEngine:
                 return False
             pos.last_rejection_ts  = None
             pos.last_exit_rejected = False
+
+        if replacement_override_authorized:
+            # Consume the one-shot grant only after every override and
+            # rejection-cooldown guard has passed.  A denied override must
+            # leave the validated replacement tranche available for retry.
+            pos.pending_exit_replace_allowed    = False
+            pos.pending_exit_replace_reason     = ""
+            pos.pending_exit_replace_allowed_ts = None
+            pos.pending_exit_replace_qty        = 0
 
         return True
 

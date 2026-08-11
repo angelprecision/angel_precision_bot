@@ -445,6 +445,76 @@ def test_completed_scale_out_resets_and_persists_replacement_generation():
     eng._persist_exit_replace_attempt_to_db.assert_called_once_with(pos)
 
 
+def test_late_old_generation_fill_is_rejected_after_replacement_handoff():
+    eng = _engine()
+    pos = _pos(
+        quantity=7,
+        quantity_remaining=7,
+        pending_exit_action="SCALE_OUT",
+        pending_exit_qty=2,
+    )
+    _add(eng, pos)
+
+    assert eng.mark_exit_replacement_safe(
+        pos.position_id,
+        reason="old generation canceled",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+        replacement_qty=2,
+    ) is True
+    eng.clear_exit_in_flight(
+        pos.position_id,
+        reason="old generation canceled",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+    )
+
+    assert pos.pending_exit_local_order_id == ""
+    assert pos.pending_exit_broker_order_id == ""
+    assert pos.pending_exit_replace_allowed is True
+    assert pos.pending_exit_replace_qty == 2
+    assert pos.exit_retry_liveness["state"] == "REPLACEMENT_PENDING"
+
+    eng.note_partial_exit_fill(
+        pos.position_id,
+        qty_filled=2,
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+        cumulative_filled=2,
+    )
+
+    assert pos.quantity_remaining == 7
+    assert pos.scale_outs_done == 0
+    assert pos.pending_exit_replace_allowed is True
+    assert pos.pending_exit_replace_qty == 2
+    assert pos.exit_retry_liveness["state"] == "REPLACEMENT_PENDING"
+
+
+def test_inflight_override_guard_failure_preserves_replacement_authority():
+    eng = _engine()
+    pos = _pos()
+    _add(eng, pos)
+
+    assert eng.mark_exit_replacement_safe(
+        pos.position_id,
+        reason="old generation canceled",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+        replacement_qty=2,
+    ) is True
+
+    assert eng._can_submit_exit(
+        pos,
+        datetime.now(timezone.utc),
+        reason="same priority override",
+        allow_inflight_override=True,
+    ) is False
+    assert pos.exit_retry_liveness["state"] == "REPLACEMENT_PENDING"
+    assert pos.pending_exit_replace_revalidated is True
+    assert pos.pending_exit_replace_allowed is True
+    assert pos.pending_exit_replace_qty == 2
+
+
 def test_fully_filled_owned_replacement_consumes_lifecycle_and_reopens_exit_liveness():
     """A filled replacement tranche must release OWNED for the next exit."""
     eng = _engine()
@@ -611,6 +681,12 @@ def test_persist_exit_replace_attempt_failure_blocks_replacement(monkeypatch):
     [
         ({}, {"replace_attempt": 0, "last_ack_identity": "", "replace_quantity": 0}),
         ({"exit_retry_liveness": {"replace_attempt": "bad", "replace_quantity": -3}},
+         {"replace_attempt": 0, "last_ack_identity": "", "replace_quantity": 0}),
+        ({"exit_retry_liveness": {"replace_attempt": True}},
+         {"replace_attempt": 0, "last_ack_identity": "", "replace_quantity": 0}),
+        ({"exit_retry_liveness": {"replace_attempt": " 2 "}},
+         {"replace_attempt": 0, "last_ack_identity": "", "replace_quantity": 0}),
+        ({"exit_retry_liveness": {"replace_quantity": " 2 "}},
          {"replace_attempt": 0, "last_ack_identity": "", "replace_quantity": 0}),
         ({"exit_retry_liveness": {"replace_attempt": 2, "last_ack_identity": "bro-old", "replace_quantity": 1}},
          {"replace_attempt": 2, "last_ack_identity": "bro-old", "replace_quantity": 1}),

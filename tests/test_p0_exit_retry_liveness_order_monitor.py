@@ -390,6 +390,22 @@ def test_missing_broker_id_blocks_with_named_diagnostic(monkeypatch):
     assert kwargs["reason_code"] == "STALE_EXIT_BROKER_ID_UNPROVEN"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "filled", "order_status": "working"},
+        {"status": "working", "order_status": "filled"},
+    ],
+    ids=["status_first", "order_status_first"],
+)
+def test_conflicting_duplicate_broker_status_authorities_hold(payload):
+    broker = MagicMock()
+    broker.get_order.return_value = payload
+    mon = _monitor(broker=broker)
+
+    assert mon._query_broker_order(f"bro-conflict-{payload['status']}") is None
+
+
 def test_broker_already_filled_applies_fill_no_cancel_no_replacement(monkeypatch):
     _watchdog_mode(monkeypatch, stale_exit_recovery=True)
     broker = MagicMock()

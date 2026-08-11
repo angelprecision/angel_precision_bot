@@ -58,6 +58,34 @@ def _strict_cumulative_quantity(value) -> Optional[int]:
         return int(value)
     return None
 
+
+def _strict_broker_status(raw_status) -> Optional[str]:
+    """Normalize broker status only when duplicate authorities agree."""
+    if isinstance(raw_status, dict):
+        values = []
+        for key in ("status", "order_status"):
+            if key not in raw_status:
+                continue
+            value = raw_status.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return None
+            values.append(value.strip().lower())
+        if not values or len(values) == 2 and values[0] != values[1]:
+            return None
+        raw_status = values[0]
+
+    if raw_status is None:
+        return None
+    status = str(raw_status).strip().lower()
+    if not status:
+        return None
+    aliases = {
+        "cancelled": "canceled",
+        "partial_fill": "partially_filled",
+        "partial_filled": "partially_filled",
+    }
+    return aliases.get(status, status)
+
 # ── Shared broker order-status cache ─────────────────────────────────────────
 # fill_monitor and order_monitor both call broker.get_order(broker_order_id)
 # independently. With 10 clients and active orders both components fire
@@ -6032,9 +6060,14 @@ class APOrderMonitor:
                 if hasattr(self.broker, "get_order"):
                     result = self.broker.get_order(broker_order_id)
                     if isinstance(result, dict):
-                        return str(
-                            result.get("status") or result.get("order_status") or ""
-                        ).lower()
+                        status = _strict_broker_status(result)
+                        if status is None:
+                            log.warning(
+                                "[%s] Broker order %s returned conflicting or missing status authority",
+                                self.client_id,
+                                broker_order_id,
+                            )
+                        return status
                 if hasattr(self.broker, "order_status"):
                     result = self.broker.order_status(broker_order_id)
                     return str(result).lower() if result else None
@@ -6078,7 +6111,7 @@ class APOrderMonitor:
                 log.info(f"[{self.client_id}] Broker cancel requested: {broker_order_id} → {result}")
 
             if isinstance(result, dict):
-                status = str(result.get("status") or result.get("order_status") or "").strip().lower()
+                status = _strict_broker_status(result)
                 if status:
                     return result
 
@@ -6121,19 +6154,7 @@ class APOrderMonitor:
         )
 
     def _normalize_broker_status(self, raw_status) -> str:
-        if raw_status is None:
-            return ""
-        if isinstance(raw_status, dict):
-            raw_status = raw_status.get("status") or raw_status.get("order_status") or ""
-        s = str(raw_status).strip().lower()
-        if not s:
-            return ""
-        aliases = {
-            "cancelled": "canceled",
-            "partial_fill": "partially_filled",
-            "partial_filled": "partially_filled",
-        }
-        return aliases.get(s, s)
+        return _strict_broker_status(raw_status) or ""
 
     def _is_terminal_cancel_status(self, raw_status) -> bool:
         return self._normalize_broker_status(raw_status) in {

@@ -253,7 +253,11 @@ def _production_callsite_runner(*, broker, position, osm, order_monitor):
 def test_self_healing_callsite_live_monitor_keeps_cancel_owner(monkeypatch):
     """The real self-healing caller must pass the live monitor and issue zero cancels."""
     broker = MagicMock()
-    broker.get_order.return_value = {"status": "working"}
+    broker.get_order.return_value = {
+        "id": "bro-self-healing",
+        "contract": "AVGO260814C00350000",
+        "status": "working",
+    }
     position = _production_callsite_position()
     osm = _DurableOSM(
         local_id="loc-self-healing",
@@ -316,8 +320,16 @@ def test_self_healing_callsite_dead_monitor_completes_durable_exact_replacement_
     monkeypatch.setattr(rec_mod, "STALE_EXIT_RECOVERY_AGE_SECONDS", 45)
     broker = MagicMock()
     broker.get_order.side_effect = [
-        {"status": "working"},
-        {"status": "canceled"},
+        {
+            "id": "bro-self-healing",
+            "contract": "AVGO260814C00350000",
+            "status": "working",
+        },
+        {
+            "id": "bro-self-healing",
+            "contract": "AVGO260814C00350000",
+            "status": "canceled",
+        },
     ]
     broker.cancel_order.return_value = {"ok": False, "status": "unknown"}
     position = _production_callsite_position()
@@ -628,7 +640,11 @@ def test_terminal_exact_order_requires_position_proof_and_closes_authoritative_f
             self.list_positions_calls = 0
 
         def get_order(self, broker_order_id):
-            return {"id": broker_order_id, "status": "canceled"}
+            return {
+                "id": broker_order_id,
+                "contract": "AVGO260814C00350000",
+                "status": "canceled",
+            }
 
         def list_orders(self):
             return []
@@ -668,6 +684,7 @@ def test_exact_filled_order_is_not_claimed_closed_without_engine_confirmation():
     broker = MagicMock()
     broker.get_order.return_value = {
         "id": "bro-filled",
+        "contract": "AVGO260814C00350000",
         "status": "filled",
         "quantity": 2,
     }
@@ -742,6 +759,43 @@ def test_exact_filled_scale_out_uses_real_engine_partial_fill_accounting():
     assert position.exit_in_flight is False
     assert exit_engine.active_positions() == [position]
     assert exit_engine._can_submit_exit(position, datetime.now(timezone.utc)) is True
+
+
+def test_exact_filled_order_requires_broker_id_and_contract_authority():
+    broker = MagicMock()
+    broker.get_order.return_value = {
+        "status": "filled",
+        "quantity": 1,
+    }
+    position = _production_callsite_position()
+    position.quantity = 1
+    position.quantity_remaining = 1
+    position.pending_exit_broker_order_id = "bro-missing-fields"
+    position.pending_exit_qty = 1
+
+    exit_engine = APExitEngine(broker=broker, email="client-self-healing")
+    exit_engine._emit_exit_event = MagicMock()
+    exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    exit_engine.add_position(position)
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=_DurableOSM(
+            local_id=position.pending_exit_local_order_id,
+            broker_id="bro-missing-fields",
+            position_id=position.position_id,
+        ),
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_exact_order_query_unavailable"
+    assert position.closed is False
+    assert position.quantity_remaining == 1
+    assert position.exit_in_flight is True
+    assert exit_engine.get_position(position.position_id) is position
 
 
 @pytest.mark.parametrize(
@@ -1174,7 +1228,11 @@ def test_exact_broker_cancel_blocked_when_osm_broker_identity_mismatches(monkeyp
     osm = _DurableOSM(broker_id="bro-osm")
 
     broker = MagicMock()
-    broker.get_order.return_value = {"status": "working"}
+    broker.get_order.return_value = {
+        "id": "bro-position",
+        "contract": "AVGO260814C00350000",
+        "status": "working",
+    }
 
     cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
     monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
@@ -1207,7 +1265,13 @@ def test_single_open_order_path_defers_to_live_monitor(monkeypatch):
     import ap.exit_autonomous_recovery as rec_mod
 
     monkeypatch.setattr(
-        rec_mod, "_get_order", lambda broker, bid: {"status": "working"},
+        rec_mod,
+        "_get_order",
+        lambda broker, bid: {
+            "id": bid,
+            "contract": "AVGO260814C00350000",
+            "status": "working",
+        },
     )
     pos = _pos(pending_exit_broker_order_id="bro-known")
 
@@ -1224,7 +1288,15 @@ def test_single_open_order_dead_monitor_uses_bounded_exact_cancel_and_durable_ha
 
     monkeypatch.setattr(rec_mod, "STALE_EXIT_RECOVERY_AGE_SECONDS", 45)
     monkeypatch.setattr(rec_mod, "STALE_EXIT_CANCEL_MAX_ATTEMPTS", 2)
-    monkeypatch.setattr(rec_mod, "_get_order", lambda broker, bid: {"status": "working"})
+    monkeypatch.setattr(
+        rec_mod,
+        "_get_order",
+        lambda broker, bid: {
+            "id": bid,
+            "contract": "AVGO260814C00350000",
+            "status": "working",
+        },
+    )
     cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
     monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
 
@@ -1284,7 +1356,11 @@ def test_autonomous_retry_waits_for_fresh_marker_interval_and_working_proof(monk
     osm.row["meta"][rec_mod.STALE_EXIT_CANCEL_LIVENESS_META_KEY]["updated_at"] = base.isoformat()
 
     broker = MagicMock()
-    broker.get_order.return_value = {"status": "working"}
+    broker.get_order.return_value = {
+        "id": "bro-known",
+        "contract": "AVGO260814C00350000",
+        "status": "working",
+    }
     cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
     monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
 
@@ -1332,7 +1408,15 @@ def test_autonomous_retry_missing_marker_timestamp_fails_closed(monkeypatch):
     monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
     action = recover_exit_position(
         pos,
-        broker=MagicMock(get_order=MagicMock(return_value={"status": "working"})),
+        broker=MagicMock(
+            get_order=MagicMock(
+                return_value={
+                    "id": "bro-known",
+                    "contract": "AVGO260814C00350000",
+                    "status": "working",
+                }
+            )
+        ),
         exit_engine=MagicMock(),
         osm=osm,
         order_monitor=_dead_monitor(),
@@ -1354,7 +1438,15 @@ def test_terminal_autonomous_path_uses_durable_osm_handoff(monkeypatch):
     ]
     pos = _pos(pending_exit_broker_order_id="bro-terminal")
 
-    monkeypatch.setattr(rec_mod, "_get_order", lambda broker, bid: {"status": "canceled"})
+    monkeypatch.setattr(
+        rec_mod,
+        "_get_order",
+        lambda broker, bid: {
+            "id": bid,
+            "contract": "AVGO260814C00350000",
+            "status": "canceled",
+        },
+    )
     monkeypatch.setattr(rec_mod, "_matching_open_exit_orders", lambda *args, **kwargs: (True, []))
     terminal_osm = _DurableOSM(broker_id="bro-terminal")
     terminal_action = recover_exit_position(
@@ -1385,7 +1477,15 @@ def test_terminal_autonomous_path_rejects_changed_osm_broker_generation(monkeypa
     ]
     pos = _pos(pending_exit_broker_order_id="bro-old")
 
-    monkeypatch.setattr(rec_mod, "_get_order", lambda broker, bid: {"status": "canceled"})
+    monkeypatch.setattr(
+        rec_mod,
+        "_get_order",
+        lambda broker, bid: {
+            "id": bid,
+            "contract": "AVGO260814C00350000",
+            "status": "canceled",
+        },
+    )
     monkeypatch.setattr(rec_mod, "_matching_open_exit_orders", lambda *args, **kwargs: (True, []))
     terminal_osm = _DurableOSM(broker_id="bro-old")
 

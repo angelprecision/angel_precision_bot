@@ -81,7 +81,11 @@ class _BrokerReadBoundary:
 
     def get_order(self, broker_order_id):
         assert broker_order_id == OLD_BROKER
-        return {"status": "canceled"}
+        return {
+            "id": broker_order_id,
+            "contract": CONTRACT,
+            "status": "canceled",
+        }
 
     def list_open_orders(self):
         self.open_order_calls += 1
@@ -99,7 +103,12 @@ class _BrokerReadBoundary:
 class _BrokerReplacementFilled(_BrokerReadBoundary):
     def get_order(self, broker_order_id):
         if broker_order_id == "bro-restart-new":
-            return {"status": "filled", "exec_quantity": 1}
+            return {
+                "id": broker_order_id,
+                "contract": CONTRACT,
+                "status": "filled",
+                "exec_quantity": 1,
+            }
         return super().get_order(broker_order_id)
 
 
