@@ -269,6 +269,28 @@ ENTRY_RETRY_IN_FLIGHT_STALE_SECS = int(
     os.getenv("ENTRY_RETRY_IN_FLIGHT_STALE_SECS", "120")
 )
 
+# Durable ENTRY statuses that prove the replacement is broker-owned or
+# completed.  These are the current OSM/legacy durable spellings, not raw
+# broker response vocabulary; an unknown durable status must never authorize
+# the canceled parent as SUBMITTED.
+_RETRY_REPLACEMENT_ACCEPTED_STATUSES = frozenset({
+    "ACK",
+    "ACKED",
+    "ACKNOWLEDGED",
+    "SUBMITTED",
+    "PARTIAL_FILL",
+    "PARTIALLY_FILLED",
+    "PARTIAL_FILLED",
+    "FILLED",
+})
+_RETRY_REPLACEMENT_TERMINAL_STATUSES = frozenset({
+    "REJECTED",
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+    "ERROR",
+})
+
 
 def _has_proven_broker_order_id(value) -> bool:
     broker_id = str(value or "").strip()
@@ -3747,6 +3769,58 @@ class APOrderMonitor:
             and meta.get("retry_claim_token") == claim_token
         )
 
+    def _classify_retry_replacement(
+        self,
+        replacement: dict,
+        claim_token: str,
+    ) -> tuple[str, str, dict]:
+        """Classify one exact child before mutating its canceled retry parent.
+
+        Returns ``(parent_status, detail, extra)``.  A broker ID is necessary
+        but not sufficient: the durable child status is authoritative.  Known
+        terminal child statuses become truthful parent ABORTED state; accepted
+        statuses require a nonblank broker ID; unknown or unbound children
+        remain HOLD.
+        """
+        if not isinstance(replacement, dict):
+            return "HOLD", "replacement_row_invalid", {}
+        if not self._replacement_matches_claim(replacement, claim_token):
+            return "HOLD", "replacement_lineage_not_exact", {}
+
+        status = str(replacement.get("status") or "").strip().upper()
+        status = {
+            "CANCELLED": "CANCELED",
+            "PARTIALLY_FILLED": "PARTIAL_FILL",
+            "PARTIAL_FILLED": "PARTIAL_FILL",
+        }.get(status, status)
+        extra = {
+            "retry_new_local_order_id": replacement.get("local_order_id"),
+            "retry_new_broker_order_id": replacement.get("broker_order_id"),
+            "retry_replacement_status": status or None,
+        }
+
+        if status in _RETRY_REPLACEMENT_ACCEPTED_STATUSES:
+            broker_id = replacement.get("broker_order_id")
+            if (
+                not isinstance(broker_id, str)
+                or not _has_proven_broker_order_id(broker_id)
+            ):
+                return (
+                    "HOLD",
+                    f"accepted_replacement_missing_exact_broker_identity:{status}",
+                    extra,
+                )
+            return "SUBMITTED", f"replacement_status:{status}", extra
+
+        if status in _RETRY_REPLACEMENT_TERMINAL_STATUSES:
+            return "ABORTED", f"replacement_terminal_status:{status}", extra
+
+        return (
+            "HOLD",
+            f"replacement_unknown_status:{status or 'MISSING'}",
+            extra,
+        )
+
     def _active_retry_symbol_owner_exists(
         self,
         *,
@@ -4119,45 +4193,36 @@ class APOrderMonitor:
                 )
                 continue
             if replacements:
-                replacement = replacements[0] if len(replacements) == 1 else None
-                broker_id = (replacement or {}).get("broker_order_id")
-                if (
-                    replacement is not None
-                    and self._replacement_matches_claim(replacement, claim_token)
-                    and isinstance(broker_id, str)
-                    and broker_id
-                    and broker_id == broker_id.strip()
-                ):
-                    self._stamp_retry_status(
-                        local_order_id,
-                        meta,
-                        status="SUBMITTED",
-                        detail="recovered_existing_replacement",
-                        extra={
-                            "retry_new_local_order_id": replacement.get("local_order_id"),
-                            "retry_new_broker_order_id": broker_id,
-                            "retry_recovered_at": now_utc_iso(),
-                        },
-                        claim_token=recovery_token,
-                        expected_mode=mode,
-                        expected_statuses=("RECOVERING",),
-                        claim_token_field="retry_recovery_token",
-                    )
+                if len(replacements) > 1:
+                    parent_status = "HOLD"
+                    replacement_detail = "multiple_correlated_replacements"
+                    replacement_extra = {}
                 else:
-                    self._stamp_retry_status(
-                        local_order_id,
-                        meta,
-                        status="HOLD",
-                        detail=(
-                            "multiple_correlated_replacements"
-                            if len(replacements) > 1
-                            else "replacement_without_exact_broker_identity"
-                        ),
-                        claim_token=recovery_token,
-                        expected_mode=mode,
-                        expected_statuses=("RECOVERING",),
-                        claim_token_field="retry_recovery_token",
+                    (
+                        parent_status,
+                        replacement_detail,
+                        replacement_extra,
+                    ) = self._classify_retry_replacement(
+                        replacements[0], claim_token,
                     )
+                    if parent_status == "SUBMITTED":
+                        replacement_detail = "recovered_existing_replacement"
+                        replacement_extra["retry_recovered_at"] = now_utc_iso()
+                    elif parent_status == "ABORTED":
+                        replacement_detail = (
+                            f"recovered_terminal_replacement:{replacement_detail}"
+                        )
+                self._stamp_retry_status(
+                    local_order_id,
+                    meta,
+                    status=parent_status,
+                    detail=replacement_detail,
+                    extra=replacement_extra or None,
+                    claim_token=recovery_token,
+                    expected_mode=mode,
+                    expected_statuses=("RECOVERING",),
+                    claim_token_field="retry_recovery_token",
+                )
                 continue
 
             # RECOVERING won the CAS, so execution's final retry-submit fence
@@ -4464,28 +4529,27 @@ class APOrderMonitor:
             )
             exact_replacement = (
                 replacements[0]
-                if (
-                    replacements
-                    and len(replacements) == 1
-                    and self._replacement_matches_claim(
-                        replacements[0], str(claim_token),
-                    )
-                )
+                if replacements and len(replacements) == 1
                 else None
             )
-            broker_id = (exact_replacement or {}).get("broker_order_id")
-            if (
-                exact_replacement
-                and isinstance(broker_id, str)
-                and broker_id
-                and broker_id == broker_id.strip()
-            ):
-                status = "SUBMITTED"
-                detail = "exception_after_exact_replacement_persisted"
-                extra = {
-                    "retry_new_local_order_id": exact_replacement.get("local_order_id"),
-                    "retry_new_broker_order_id": broker_id,
-                }
+            if exact_replacement is not None:
+                status, replacement_detail, extra = (
+                    self._classify_retry_replacement(
+                        exact_replacement, str(claim_token),
+                    )
+                )
+                if status == "SUBMITTED":
+                    detail = "exception_after_exact_replacement_persisted"
+                elif status == "ABORTED":
+                    detail = (
+                        f"exception_after_terminal_replacement:"
+                        f"{replacement_detail}:attempt={attempt}:{e}"
+                    )
+                else:
+                    detail = (
+                        f"exception_replacement_{replacement_detail}:"
+                        f"attempt={attempt}:{e}"
+                    )
             elif replacements is None or replacements:
                 status = "HOLD"
                 detail = f"exception_replacement_truth_ambiguous:attempt={attempt}:{e}"
@@ -4584,36 +4648,33 @@ class APOrderMonitor:
                     local_order_id, str(claim_token), str(expected_mode),
                 )
                 if replacements is None or replacements:
-                    replacement = (
-                        replacements[0]
-                        if (
-                            replacements
-                            and len(replacements) == 1
-                            and self._replacement_matches_claim(
-                                replacements[0], str(claim_token),
-                            )
+                    if replacements and len(replacements) == 1:
+                        (
+                            replacement_status,
+                            replacement_detail,
+                            replacement_extra,
+                        ) = self._classify_retry_replacement(
+                            replacements[0], str(claim_token),
                         )
-                        else None
-                    )
-                    broker_id = (replacement or {}).get("broker_order_id")
-                    if (
-                        replacement
-                        and self._replacement_matches_claim(
-                            replacement, str(claim_token),
+                    else:
+                        replacement_status = "HOLD"
+                        replacement_detail = "submit_failure_replacement_truth_ambiguous"
+                        replacement_extra = {}
+
+                    if replacement_status in {"SUBMITTED", "ABORTED"}:
+                        parent_detail = (
+                            "failure_result_with_exact_broker_replacement"
+                            if replacement_status == "SUBMITTED"
+                            else f"failure_result_after_terminal_replacement:{replacement_detail}"
                         )
-                        and isinstance(broker_id, str)
-                        and broker_id
-                        and broker_id == broker_id.strip()
-                    ):
                         self._stamp_retry_status(
                             local_order_id,
                             prior_meta,
-                            status="SUBMITTED",
-                            detail="failure_result_with_exact_broker_replacement",
+                            status=replacement_status,
+                            detail=parent_detail,
                             extra={
                                 **diagnostics,
-                                "retry_new_local_order_id": replacement.get("local_order_id"),
-                                "retry_new_broker_order_id": broker_id,
+                                **replacement_extra,
                             },
                             claim_token=claim_token,
                             expected_mode=expected_mode,
@@ -4624,8 +4685,12 @@ class APOrderMonitor:
                             local_order_id,
                             prior_meta,
                             status="HOLD",
-                            detail="submit_failure_replacement_truth_ambiguous",
-                            extra=diagnostics,
+                            detail=(
+                                replacement_detail
+                                if replacements and len(replacements) == 1
+                                else "submit_failure_replacement_truth_ambiguous"
+                            ),
+                            extra={**diagnostics, **replacement_extra},
                             claim_token=claim_token,
                             expected_mode=expected_mode,
                             expected_statuses=("IN_FLIGHT", "SUBMITTING"),

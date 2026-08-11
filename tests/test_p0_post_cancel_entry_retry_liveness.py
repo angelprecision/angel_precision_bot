@@ -815,7 +815,94 @@ def test_wrong_claim_replacement_is_not_accepted_as_submitted(monitor, monkeypat
 
     kwargs = monitor._stamp_retry_status.call_args.kwargs
     assert kwargs["status"] == "HOLD"
-    assert "replacement_truth_ambiguous" in kwargs["detail"]
+    assert "replacement_lineage_not_exact" in kwargs["detail"]
+
+
+@pytest.mark.parametrize(
+    "child_status, broker_order_id, expected_parent_status",
+    [
+        ("REJECTED", "broker-rejected", "ABORTED"),
+        ("CANCELED", None, "ABORTED"),
+        ("ACK", "broker-ack", "SUBMITTED"),
+        ("FILLED", "broker-filled", "SUBMITTED"),
+        ("UNKNOWN_CHILD_STATUS", "broker-unknown", "HOLD"),
+    ],
+)
+def test_failed_submit_reconciles_from_exact_child_status(
+    monitor,
+    monkeypatch,
+    child_status,
+    broker_order_id,
+    expected_parent_status,
+):
+    order = _retry_order()
+    monitor._retry_client_state_mode = lambda: "paper"
+    monitor._find_retry_replacements = lambda *args: [{
+        "local_order_id": "replacement-1",
+        "broker_order_id": broker_order_id,
+        "status": child_status,
+        "retry_lineage_exact": True,
+    }]
+    monitor._stamp_retry_status = MagicMock()
+    monkeypatch.setattr(
+        "ap.execution.process_signal",
+        lambda broker, client_id, payload: {
+            "ok": False,
+            "error": "broker_rejected",
+        },
+    )
+
+    monitor._submit_armed_retry(
+        *_strict_submit_args(order),
+        claim_token="claim-token",
+        expected_mode="paper",
+    )
+
+    kwargs = monitor._stamp_retry_status.call_args.kwargs
+    assert kwargs["status"] == expected_parent_status
+    if child_status == "REJECTED":
+        assert "failure_result_after_terminal_replacement" in kwargs["detail"]
+        assert "REJECTED" in kwargs["detail"]
+    elif child_status == "UNKNOWN_CHILD_STATUS":
+        assert kwargs["status"] != "SUBMITTED"
+        assert "replacement_unknown_status:UNKNOWN_CHILD_STATUS" in kwargs["detail"]
+    if child_status in {"ACK", "FILLED"}:
+        assert kwargs["status"] == "SUBMITTED"
+        assert kwargs["extra"]["retry_replacement_status"] == child_status
+
+
+def test_exception_rejected_child_with_broker_id_is_not_submitted(
+    monitor,
+    monkeypatch,
+):
+    order = _retry_order()
+    monitor._retry_client_state_mode = lambda: "paper"
+    monitor._find_retry_replacements = lambda *args: [{
+        "local_order_id": "replacement-rejected",
+        "broker_order_id": "broker-rejected",
+        "status": "REJECTED",
+        "retry_lineage_exact": True,
+    }]
+    monitor._stamp_retry_status = MagicMock()
+    monitor._emit_order_event = MagicMock()
+    monkeypatch.setattr(
+        "ap.execution.process_signal",
+        lambda broker, client_id, payload: (_ for _ in ()).throw(
+            RuntimeError("broker response persisted as rejected")
+        ),
+    )
+
+    monitor._submit_armed_retry(
+        *_strict_submit_args(order),
+        claim_token="claim-token",
+        expected_mode="paper",
+    )
+
+    kwargs = monitor._stamp_retry_status.call_args.kwargs
+    assert kwargs["status"] == "ABORTED"
+    assert kwargs["status"] != "SUBMITTED"
+    assert "exception_after_terminal_replacement" in kwargs["detail"]
+    assert kwargs["extra"]["retry_replacement_status"] == "REJECTED"
 
 
 @pytest.mark.parametrize(
@@ -825,6 +912,7 @@ def test_wrong_claim_replacement_is_not_accepted_as_submitted(monitor, monkeypat
             [{
                 "local_order_id": "replacement-1",
                 "broker_order_id": "broker-1",
+                "status": "ACK",
                 "retry_lineage_exact": True,
             }],
             "SUBMITTED",
@@ -835,11 +923,13 @@ def test_wrong_claim_replacement_is_not_accepted_as_submitted(monitor, monkeypat
                 {
                     "local_order_id": "replacement-1",
                     "broker_order_id": "broker-1",
+                    "status": "ACK",
                     "retry_lineage_exact": True,
                 },
                 {
                     "local_order_id": "replacement-2",
                     "broker_order_id": "broker-2",
+                    "status": "ACK",
                     "retry_lineage_exact": True,
                 },
             ],
@@ -873,6 +963,31 @@ def test_stale_recovery_never_resubmits_known_replacement(
     assert expected_detail in kwargs["detail"]
     assert kwargs["claim_token"] == "recovery-token"
     assert kwargs["claim_token_field"] == "retry_recovery_token"
+
+
+def test_stale_rejected_child_with_broker_id_is_not_submitted(
+    monitor,
+    monkeypatch,
+):
+    stale = _retry_order(status="IN_FLIGHT")
+    claimed = copy.deepcopy(stale)
+    _patch_scan(monkeypatch, stale)
+    monitor._claim_stale_inflight_for_recovery = lambda row, mode: claimed
+    monitor._find_retry_replacements = MagicMock(return_value=[{
+        "local_order_id": "replacement-rejected",
+        "broker_order_id": "broker-rejected",
+        "status": "REJECTED",
+        "retry_lineage_exact": True,
+    }])
+    monitor._stamp_retry_status = MagicMock()
+
+    monitor._recover_stale_inflight_retries("paper")
+
+    kwargs = monitor._stamp_retry_status.call_args.kwargs
+    assert kwargs["status"] == "ABORTED"
+    assert kwargs["status"] != "SUBMITTED"
+    assert "recovered_terminal_replacement" in kwargs["detail"]
+    assert kwargs["extra"]["retry_replacement_status"] == "REJECTED"
 
 
 def test_stale_recovery_without_replacement_rearms_once_with_recovery_fence(
