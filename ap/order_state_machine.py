@@ -370,6 +370,19 @@ class APOrderStateMachine:
             return default
 
     @staticmethod
+    def _strict_exit_quantity(value, *, missing_default=None):
+        """Parse exit fill quantities without accepting coercible garbage."""
+        if value is None or value == "":
+            return missing_default
+        if isinstance(value, bool):
+            return None
+        if type(value) is int:
+            return value if value >= 0 else None
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    @staticmethod
     def _call_exit_engine(exit_engine, method_name: str, *args, **kwargs):
         """
         Call an exit engine hook method with graceful signature fallback.
@@ -1828,9 +1841,17 @@ class APOrderStateMachine:
 
             _local_id    = local_order_id or current.get("local_order_id")
             _broker_id   = broker_order_id or current.get("broker_order_id")
-            _order_qty   = self._safe_int(current.get("qty"), 0)
-            _prev_filled = self._safe_int(current.get("filled_qty"), 0)
-            _cum_filled  = self._safe_int(filled_qty, None)  # FIX-E: None means "not provided"
+            _order_qty   = self._strict_exit_quantity(current.get("qty"), missing_default=0)
+            _prev_filled = self._strict_exit_quantity(current.get("filled_qty"), missing_default=0)
+            _cum_filled  = self._strict_exit_quantity(filled_qty, missing_default=None)
+
+            if _order_qty is None or _prev_filled is None:
+                log.critical(
+                    "[%s] INVALID EXIT QUANTITY AUTHORITY | order=%s pos=%s qty=%r filled=%r",
+                    self.client_id, _local_id, _pos_id,
+                    current.get("qty"), current.get("filled_qty"),
+                )
+                return
 
             if _cum_filled is not None and _cum_filled < _prev_filled:
                 log.critical(
@@ -1868,10 +1889,11 @@ class APOrderStateMachine:
 
             # ── EXIT_PARTIAL_FILL ───────────────────────────────────────────
             if new_status == OrderStatus.EXIT_PARTIAL_FILL:
-                if _cum_filled is None:
+                if _cum_filled is None or _order_qty <= 0 or _cum_filled > _order_qty:
                     log.warning(
-                        "[%s] EXIT_PARTIAL_FILL missing filled_qty | order=%s pos=%s -- not applying",
-                        self.client_id, _local_id, _pos_id,
+                        "[%s] EXIT_PARTIAL_FILL quantity authority invalid | order=%s pos=%s "
+                        "qty=%s cumulative=%s -- not applying",
+                        self.client_id, _local_id, _pos_id, _order_qty, _cum_filled,
                     )
                     return
                 _delta = max(0, _cum_filled - _prev_filled)
@@ -1888,22 +1910,22 @@ class APOrderStateMachine:
 
             # ── EXIT_FILLED ─────────────────────────────────────────────────
             if new_status == OrderStatus.EXIT_FILLED:
-                if _cum_filled is None or _cum_filled <= 0:
-                    _cum_filled = _order_qty
-
-                # FIX-H: zero qty → quarantine, not clear
-                if _cum_filled <= 0:
+                if _cum_filled is None or _cum_filled <= 0 or _cum_filled > _order_qty:
                     log.critical(
-                        "[%s] EXIT_FILLED with zero/unknown quantity -- QUARANTINING | "
-                        "order=%s pos=%s | broker fill data unreliable",
-                        self.client_id, _local_id, _pos_id,
+                        "[%s] EXIT_FILLED with invalid quantity -- QUARANTINING | "
+                        "order=%s pos=%s qty=%s cumulative=%s | broker fill data unreliable",
+                        self.client_id, _local_id, _pos_id, _order_qty, _cum_filled,
                     )
                     self._call_exit_engine(
                         _ee, "set_pending_exit_order", _pos_id,
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         qty=0,
-                        reason="EXIT_FILLED_ZERO_QTY_QUARANTINE",
+                        reason=(
+                            "EXIT_FILLED_ZERO_QTY_QUARANTINE"
+                            if _cum_filled in (None, 0)
+                            else "EXIT_FILLED_QTY_OUT_OF_BOUNDS_QUARANTINE"
+                        ),
                         identity_quarantine=True,
                     )
                     return
@@ -7067,17 +7089,12 @@ class APOrderStateMachine:
                 return None
             if row.get("quantity_remaining") is not None:
                 return int(row.get("quantity_remaining") or 0)
-            # Fallback: quantity_remaining is NULL in DB.
-            # This is correct on first fill (before any scale-out), but if it fires
-            # after a scale-out it means DB is not being updated — partial close will
-            # be silently treated as full close on the next fill.
             log.critical(
-                "[%s] _get_position_remaining_from_db: quantity_remaining is NULL for pos=%s "
-                "falling back to qty=%s — if this fires after a scale-out, "
-                "quantity_remaining is not being updated in DB",
-                self.client_id, position_id, row.get("qty"),
+                "[%s] _get_position_remaining_from_db: quantity_remaining is missing or malformed "
+                "for pos=%s; refusing qty fallback",
+                self.client_id, position_id,
             )
-            return int(row.get("qty") or 0)
+            return None
         except Exception:
             return None
 

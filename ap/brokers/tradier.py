@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -49,6 +50,21 @@ def _to_float(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def _strict_position_quantity(value: Any) -> Optional[int]:
+    """Parse an option position quantity without whitespace/coercion loss."""
+    if value is None or isinstance(value, bool):
+        return None
+    if type(value) is int:
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        if value != value.strip() or not value.isdigit():
+            return None
+        return int(value)
+    if type(value) is float and math.isfinite(value) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
 
 
 class TradierBroker(BrokerAdapter):
@@ -514,12 +530,14 @@ class TradierBroker(BrokerAdapter):
                     or "quantity" not in p
                     or quantity is None
                     or isinstance(quantity, bool)
-                    or (isinstance(quantity, str) and not quantity.strip())
                 ):
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+                parsed_quantity = _strict_position_quantity(quantity)
+                if parsed_quantity is None:
                     raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
                 result.append({
                     "symbol":     symbol,
-                    "quantity":   float(quantity),
+                    "quantity":   float(parsed_quantity),
                     "cost_basis": float(p.get("cost_basis", 0)),
                     "side":       (lambda sym: (
                         "CALL" if (len(sym) >= 15 and sym[-9] == "C") else

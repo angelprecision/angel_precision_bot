@@ -1006,6 +1006,37 @@ def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_positio
     osm._finalize_position_from_exit_order.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "filled_qty",
+    [None, True, 1.5, " 1 ", 0, 5],
+    ids=["missing", "boolean", "fractional", "whitespace", "zero", "over_order_qty"],
+)
+def test_osm_exit_filled_malformed_quantity_quarantines_without_position_mutation(
+    fake_osm_db, monkeypatch, filled_qty
+):
+    """EXIT_FILLED must not infer quantity or mutate the position from bad data."""
+    _, osm = fake_osm_db
+    engine = _CanonicalExitEngine(quantity_remaining=4)
+    monkeypatch.setitem(osm_module._exit_engine_registry, "tradefluence", engine)
+    osm._handle_exit_engine_hooks = APOrderStateMachine._handle_exit_engine_hooks.__get__(
+        osm, APOrderStateMachine
+    )
+
+    osm._handle_exit_engine_hooks(
+        current=_row(status="EXIT_FILLED", broker_order_id="36661364"),
+        new_status=OrderStatus.EXIT_FILLED,
+        position_id="position-orcl-1",
+        filled_qty=filled_qty,
+        fill_price=1.25,
+        broker_order_id="36661364",
+        local_order_id="exit-orcl-1",
+    )
+
+    assert engine.closed_calls == []
+    assert engine.partial_calls == []
+    assert engine.position.quantity_remaining == 4
+
+
 def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypatch):
     """Two full reducers race one recovered EXIT; Postgres permits one economy."""
     from contextlib import contextmanager

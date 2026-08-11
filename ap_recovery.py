@@ -1053,7 +1053,7 @@ class APStartupRecovery:
             broker_id=broker_id,
             position_id=position_id,
             client_id=position_client,
-            execution_mode=position_mode_raw,
+            execution_mode=recovery_mode.lower(),
         )
         if osm_row is None or requested_qty is None:
             return False, "startup_terminal_exit_osm_generation_unavailable", {

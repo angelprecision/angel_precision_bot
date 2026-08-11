@@ -872,7 +872,7 @@ def _exact_osm_exit_generation(
         return None, None, "durable_osm_exit_position_identity_mismatch"
     if _norm(row.get("client_id")) != _norm(client_id):
         return None, None, "durable_osm_exit_client_identity_mismatch"
-    if str(row.get("execution_mode") or "") != str(execution_mode or ""):
+    if str(row.get("execution_mode") or "").strip().lower() != str(execution_mode or "").strip().lower():
         return None, None, "durable_osm_exit_execution_mode_mismatch"
     if _norm(row.get("kind")).upper() != "EXIT":
         return None, None, "durable_osm_exit_kind_mismatch"
@@ -1738,7 +1738,8 @@ def _replacement_row_is_exact(
         and _norm(row.get("broker_order_id")) == _norm(broker_id)
         and _norm(row.get("position_id")) == _norm(position_id)
         and _norm(row.get("client_id")) == _norm(client_id)
-        and str(row.get("execution_mode") or "") == str(execution_mode or "")
+        and str(row.get("execution_mode") or "").strip().lower()
+        == str(execution_mode or "").strip().lower()
         and _norm(row.get("kind")).upper() == "EXIT"
         and valid_status
     )
@@ -2879,15 +2880,89 @@ def recover_exit_position(
                                 "replacement_blocked": True,
                             },
                         )
-                    try:
-                        partial_fill_hook(
+
+                    # A broker FILLED result is not complete recovery proof
+                    # until the exact durable OSM generation is terminal too.
+                    # Transition first so a real OSM can run its canonical
+                    # accounting hook; the explicit hook below remains for
+                    # narrow restart doubles and is idempotent through the
+                    # position-side cumulative watermark.
+                    osm_transition = getattr(osm, "transition", None) if osm else None
+                    if not callable(osm_transition):
+                        return RecoveryAction(
+                            "NOOP",
+                            "autonomous_recovery_broker_filled_osm_terminalization_unavailable",
                             pid,
-                            qty_filled=filled_qty,
-                            fill_price=fill_price,
-                            local_order_id=local_id,
-                            broker_order_id=pending_broker_id,
-                            cumulative_filled=filled_qty,
+                            local_id,
+                            pending_broker_id,
+                            {
+                                "status": st,
+                                "filled_qty": filled_qty,
+                                "quantity_remaining": managed_remaining,
+                                "quote_health": qh,
+                                "position_mutation_blocked": True,
+                                "replacement_blocked": True,
+                            },
                         )
+                    try:
+                        transition_ok = osm_transition(
+                            local_id,
+                            "EXIT_FILLED",
+                            filled_qty=filled_qty,
+                            fill_price=fill_price,
+                            broker_order_id=pending_broker_id,
+                            position_id=pid,
+                        )
+                    except Exception as _osm_exc:
+                        log.warning(
+                            "exit_autonomous_recovery: durable OSM FILLED transition failed: %s",
+                            _osm_exc,
+                        )
+                        transition_ok = False
+                    updated_osm_row = _order_row(osm, local_id)
+                    updated_osm_fill = _strict_durable_quantity(
+                        updated_osm_row,
+                        ("filled_qty", "filled_quantity"),
+                        positive=True,
+                    ) if updated_osm_row else None
+                    if (
+                        transition_ok is not True
+                        or not _replacement_row_is_exact(
+                            updated_osm_row,
+                            local_id=local_id,
+                            broker_id=pending_broker_id,
+                            position_id=pid,
+                            client_id=_norm(getattr(pos, "client_id", "")),
+                            execution_mode=str(getattr(pos, "execution_mode", "") or ""),
+                            filled=True,
+                        )
+                        or updated_osm_fill != filled_qty
+                    ):
+                        return RecoveryAction(
+                            "NOOP",
+                            "autonomous_recovery_broker_filled_osm_terminalization_unconfirmed",
+                            pid,
+                            local_id,
+                            pending_broker_id,
+                            {
+                                "status": st,
+                                "filled_qty": filled_qty,
+                                "quantity_remaining": managed_remaining,
+                                "quote_health": qh,
+                                "position_mutation_blocked": True,
+                                "replacement_blocked": True,
+                            },
+                        )
+                    try:
+                        if _strict_managed_quantity_remaining(pos) != managed_remaining - filled_qty:
+                            partial_fill_hook(
+                                pid,
+                                qty_filled=filled_qty,
+                                fill_price=fill_price,
+                                local_order_id=local_id,
+                                broker_order_id=pending_broker_id,
+                                cumulative_filled=filled_qty,
+                            )
                     except Exception as _partial_exc:
                         log.warning(
                             "exit_autonomous_recovery: broker-filled partial accounting failed: %s",

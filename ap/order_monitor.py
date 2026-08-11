@@ -6474,6 +6474,79 @@ class APOrderMonitor:
             )
         return None
 
+    def _reconcile_replayed_exit_fill(
+        self,
+        *,
+        order: dict,
+        local_order_id: str,
+        broker_order_id: str,
+        contract: str,
+        cumulative_filled: int,
+        previous_filled: int,
+    ) -> bool:
+        """Prove the position-side watermark before accepting a fill replay.
+
+        A durable OSM watermark is not proof that the position quantity was
+        consumed before a process died. Equal cumulative broker truth is
+        therefore routed through the row-locked exit-fill bridge before the
+        monitor can hand off a replacement or clear the old generation.
+        """
+        if cumulative_filled <= 0:
+            return True
+
+        position_id = str(order.get("position_id") or "").strip()
+        reconciler = getattr(self.exit_engine, "reconcile_exit_fill_consumption", None)
+        result = None
+        if not position_id or not callable(reconciler):
+            reason = "position identity or durable fill bridge unavailable"
+        else:
+            try:
+                result = reconciler(
+                    position_id,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    cumulative_filled_qty=cumulative_filled,
+                    prior_cumulative_filled=previous_filled,
+                )
+                reason = "durable position fill replay was not confirmed"
+            except Exception as exc:
+                reason = f"durable position fill replay raised {type(exc).__name__}"
+                log.error(
+                    "[%s] replayed exit fill durability bridge failed | local=%s broker=%s: %s",
+                    self.client_id, local_order_id, broker_order_id, exc,
+                )
+
+        if (
+            not isinstance(result, dict)
+            or result.get("ok") is not True
+            or type(result.get("applied_cumulative_qty")) is not int
+            or result.get("applied_cumulative_qty") != cumulative_filled
+            or type(result.get("quantity_remaining")) is not int
+            or result.get("quantity_remaining") < 0
+        ):
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="HOLD",
+                reason_code="EXIT_FILL_POSITION_DURABILITY_UNCONFIRMED",
+                explanation=(
+                    "A replayed broker cumulative fill matched the durable OSM watermark, "
+                    "but the position-side fill watermark was not independently confirmed; "
+                    "replacement and terminal cleanup remain blocked."
+                ),
+                contract=contract,
+                position_id=position_id or order.get("position_id"),
+                inputs={
+                    "broker_order_id": broker_order_id,
+                    "cumulative_filled": cumulative_filled,
+                    "previous_filled": previous_filled,
+                    "bridge_reason": reason,
+                    "durability_result": result,
+                },
+            )
+            return False
+        return True
+
     def _apply_broker_partial_exit_fill(
         self,
         local_order_id: str,
@@ -6559,8 +6632,18 @@ class APOrderMonitor:
                             raw_status = "partially_filled"
                         else:
                             # The durable partial fill already accounts for this
-                            # cumulative broker truth. Preserve its remainder
-                            # for the staged replacement handoff.
+                            # cumulative broker truth. Prove the position-side
+                            # watermark before preserving its remainder for the
+                            # staged replacement handoff.
+                            if not self._reconcile_replayed_exit_fill(
+                                order=order,
+                                local_order_id=local_order_id,
+                                broker_order_id=broker_order_id,
+                                contract=contract,
+                                cumulative_filled=cumulative_filled,
+                                previous_filled=previous_filled,
+                            ):
+                                return None
                             return max(0, requested_qty - previous_filled)
 
                 if raw_status == "filled":
@@ -6588,6 +6671,7 @@ class APOrderMonitor:
                         or requested_qty is None
                         or previous_filled is None
                         or requested_qty <= 0
+                        or cumulative_filled <= 0
                         or cumulative_filled < previous_filled
                         or cumulative_filled > requested_qty
                     ):
@@ -6619,6 +6703,15 @@ class APOrderMonitor:
                         fill_price = raw.get("price")
 
                     if cumulative_filled == requested_qty:
+                        if cumulative_filled == previous_filled and not self._reconcile_replayed_exit_fill(
+                            order=order,
+                            local_order_id=local_order_id,
+                            broker_order_id=broker_order_id,
+                            contract=contract,
+                            cumulative_filled=cumulative_filled,
+                            previous_filled=previous_filled,
+                        ):
+                            return None
                         try:
                             ok = self.osm.transition(
                                 local_order_id,
@@ -6645,7 +6738,17 @@ class APOrderMonitor:
                         raw_status = "partially_filled"
                     else:
                         # The durable order already contains this cumulative
-                        # truth. Preserve only its exact unfilled remainder.
+                        # truth. Prove the position-side watermark before
+                        # preserving only its exact unfilled remainder.
+                        if not self._reconcile_replayed_exit_fill(
+                            order=order,
+                            local_order_id=local_order_id,
+                            broker_order_id=broker_order_id,
+                            contract=contract,
+                            cumulative_filled=cumulative_filled,
+                            previous_filled=previous_filled,
+                        ):
+                            return None
                         return max(0, requested_qty - previous_filled)
 
                 if raw_status != "partially_filled":
@@ -6748,9 +6851,23 @@ class APOrderMonitor:
             return None
 
         updated = dict(self.osm.get_order(local_order_id) or {})
-        durable_filled = int(updated.get("filled_qty") or cumulative_filled or 0)
-        durable_qty = int(updated.get("qty") or requested_qty or 0)
-        if durable_filled < cumulative_filled or durable_qty <= 0:
+        durable_filled = _strict_cumulative_quantity(updated.get("filled_qty"))
+        durable_qty = _strict_cumulative_quantity(updated.get("qty"))
+        if (
+            durable_filled is None
+            or durable_qty is None
+            or durable_filled < cumulative_filled
+            or durable_qty <= 0
+        ):
+            return None
+        if cumulative_filled == previous_filled and not self._reconcile_replayed_exit_fill(
+            order=order,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            contract=contract,
+            cumulative_filled=cumulative_filled,
+            previous_filled=previous_filled,
+        ):
             return None
         return max(0, durable_qty - durable_filled)
 

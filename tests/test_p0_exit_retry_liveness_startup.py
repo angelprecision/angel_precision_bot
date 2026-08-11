@@ -143,11 +143,11 @@ def _recovery(monkeypatch, *, broker_payload, osm, engine, position):
     return recovery, broker, cursor
 
 
-def _position():
+def _position(*, execution_mode="paper"):
     return {
         "id": POSITION_ID,
         "client_id": CLIENT_ID,
-        "execution_mode": "paper",
+        "execution_mode": execution_mode,
         "contract": CONTRACT,
         "status": "CLOSING",
     }
@@ -217,6 +217,33 @@ def test_startup_terminal_exit_zero_fill_is_proven_and_reopened(monkeypatch):
     assert engine.partial_fill_calls == []
     assert engine.bridge_calls[0][1]["cumulative_filled_qty"] == 0
     assert any("UPDATE positions SET status='OPEN'" in sql for sql, _ in cursor.statements)
+    assert broker.cancel_calls == 0
+
+
+def test_startup_terminal_exit_normalizes_position_mode_before_osm_lookup(monkeypatch):
+    """PAPER/LIVE case is identity-normalized consistently at restart."""
+    osm = _OSM(filled_qty=0)
+    engine = _Engine(quantity_remaining=5)
+    recovery, broker, cursor = _recovery(
+        monkeypatch,
+        broker_payload={
+            "id": BROKER_ID,
+            "contract": CONTRACT,
+            "status": "expired",
+            "quantity": 3,
+            "exec_quantity": 0,
+        },
+        osm=osm,
+        engine=engine,
+        position=_position(execution_mode="PAPER"),
+    )
+    result = {"errors": [], "exits_reattached": 0}
+
+    recovery._recover_exit_fills_that_occurred_during_downtime(result)
+
+    assert result["errors"] == []
+    assert result["exits_reattached"] == 1
+    assert [status for _, status, _ in osm.transitions] == ["EXPIRED"]
     assert broker.cancel_calls == 0
 
 

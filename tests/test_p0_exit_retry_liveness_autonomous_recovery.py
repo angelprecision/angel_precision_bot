@@ -1644,18 +1644,19 @@ def test_exact_filled_scale_out_uses_real_engine_partial_fill_accounting():
     exit_engine.note_partial_exit_fill = partial_fill_spy
     exit_engine.mark_position_closed = close_spy
     exit_engine.add_position(position)
+    osm = _DurableOSM(
+        local_id=position.pending_exit_local_order_id,
+        broker_id="bro-filled",
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+    )
 
     action = recover_exit_position(
         position,
         broker=broker,
         exit_engine=exit_engine,
-        osm=_DurableOSM(
-            local_id=position.pending_exit_local_order_id,
-            broker_id="bro-filled",
-            position_id=position.position_id,
-            client_id=position.client_id,
-            execution_mode=position.execution_mode,
-        ),
+        osm=osm,
         order_monitor=_dead_monitor(),
     )
 
@@ -1663,6 +1664,9 @@ def test_exact_filled_scale_out_uses_real_engine_partial_fill_accounting():
     assert action.reason == "broker_order_filled_partial_position"
     partial_fill_spy.assert_called_once()
     assert partial_fill_spy.call_args.kwargs["cumulative_filled"] == 2
+    assert [status for _, status, _ in osm.transitions] == ["EXIT_FILLED"]
+    assert osm.row["status"] == "EXIT_FILLED"
+    assert osm.row["filled_qty"] == 2
     close_spy.assert_not_called()
     assert position.quantity_remaining == 5
     assert position.closed is False
@@ -2022,8 +2026,10 @@ def test_tradier_list_positions_malformed_top_level_payload_raises(payload):
         {"symbol": "AVGO260814C00350000", "cost_basis": 1.0},
         {"quantity": 2, "cost_basis": 1.0},
         {"symbol": "AVGO260814C00350000", "quantity": False, "cost_basis": 1.0},
+        {"symbol": "AVGO260814C00350000", "quantity": " 2 ", "cost_basis": 1.0},
+        {"symbol": "AVGO260814C00350000", "quantity": -1, "cost_basis": 1.0},
     ],
-    ids=["missing_quantity", "missing_symbol", "boolean_quantity"],
+    ids=["missing_quantity", "missing_symbol", "boolean_quantity", "whitespace_quantity", "negative_quantity"],
 )
 def test_tradier_list_positions_malformed_row_field_raises(row):
     from ap.brokers.tradier import TradierBroker, TradierConfig
@@ -2122,8 +2128,10 @@ def test_recovery_with_malformed_real_tradier_order_snapshot_is_noop():
         {"symbol": "AVGO260814C00350000", "cost_basis": 1.0},
         {"quantity": 2, "cost_basis": 1.0},
         {"symbol": "AVGO260814C00350000", "quantity": False, "cost_basis": 1.0},
+        {"symbol": "AVGO260814C00350000", "quantity": " 2 ", "cost_basis": 1.0},
+        {"symbol": "AVGO260814C00350000", "quantity": -1, "cost_basis": 1.0},
     ],
-    ids=["missing_quantity", "missing_symbol", "boolean_quantity"],
+    ids=["missing_quantity", "missing_symbol", "boolean_quantity", "whitespace_quantity", "negative_quantity"],
 )
 def test_recovery_with_malformed_tradier_position_field_blocks_all_mutation(row):
     from ap.brokers.tradier import TradierBroker, TradierConfig

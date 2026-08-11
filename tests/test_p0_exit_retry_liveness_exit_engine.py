@@ -192,6 +192,79 @@ def test_partial_replacement_cap_limits_next_submit_to_unfilled_remainder():
     eng._can_submit_exit.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "quantity",
+    [True, 1.5, " 1 ", -1],
+    ids=["boolean", "fractional", "whitespace", "negative"],
+)
+def test_partial_exit_fill_rejects_malformed_quantity_authority(quantity):
+    """The direct accounting hook must not coerce malformed fill quantities."""
+    eng = _engine()
+    pos = _pos()
+    _add(eng, pos)
+
+    eng.note_partial_exit_fill(
+        pos.position_id,
+        qty_filled=quantity,
+        fill_price=1.25,
+        local_order_id=pos.pending_exit_local_order_id,
+        broker_order_id=pos.pending_exit_broker_order_id,
+        cumulative_filled=quantity,
+    )
+
+    assert pos.quantity_remaining == 7
+    eng._persist_exit_fill_consumption_to_db.assert_not_called()
+
+
+def test_position_fill_bridge_does_not_fallback_to_total_qty_when_remaining_missing(monkeypatch):
+    """Missing quantity_remaining must hold instead of consuming total qty."""
+    import ap.db as db_module
+
+    class _Cursor:
+        rowcount = 0
+        updates = 0
+
+        def execute(self, statement, params=()):
+            if "SELECT quantity_remaining, qty, meta" in str(statement):
+                self.row = {"quantity_remaining": None, "qty": 7, "meta": {}}
+            elif "UPDATE positions" in str(statement):
+                self.updates += 1
+                raise AssertionError("missing quantity_remaining must not reach UPDATE")
+            else:
+                raise AssertionError(f"unexpected SQL: {statement}")
+
+        def fetchone(self):
+            return getattr(self, "row", None)
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(db_module, "conn", lambda: _Connection())
+    monkeypatch.setattr(db_module, "run_with_retry", lambda fn, *args, **kwargs: fn())
+
+    eng = APExitEngine(broker=MagicMock())
+    pos = _pos()
+    _add(eng, pos)
+
+    result = eng.reconcile_exit_fill_consumption(
+        pos.position_id,
+        local_order_id=pos.pending_exit_local_order_id,
+        broker_order_id=pos.pending_exit_broker_order_id,
+        cumulative_filled_qty=1,
+        prior_cumulative_filled=0,
+    )
+
+    assert result == {"ok": False, "reason": "position_quantity_remaining_unavailable"}
+    assert pos.quantity_remaining == 7
+    assert cursor.updates == 0
+
+
 # ── mark_exit_replacement_safe increments exactly once per proven cancel ───
 
 def test_mark_exit_replacement_safe_increments_attempt_once():

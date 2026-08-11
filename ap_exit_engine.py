@@ -4378,9 +4378,7 @@ class APExitEngine:
                         }
 
                     raw_remaining = row.get("quantity_remaining")
-                    if raw_remaining is None:
-                        raw_remaining = row.get("qty")
-                    if type(raw_remaining) is not int or raw_remaining < 0:
+                    if type(raw_remaining) is not int or isinstance(raw_remaining, bool) or raw_remaining < 0:
                         return {
                             "ok": False,
                             "reason": "position_quantity_remaining_unavailable",
@@ -6537,6 +6535,28 @@ class APExitEngine:
             return
         if cumulative_filled_qty is None and cumulative_filled is not None:
             cumulative_filled_qty = cumulative_filled
+        if type(qty_filled) is not int or qty_filled < 0:
+            log.critical(
+                "[exit_eng] Invalid exit fill quantity authority | pos_id=%s qty=%r",
+                position_id, qty_filled,
+            )
+            return
+        if cumulative_filled_qty is not None and (
+            type(cumulative_filled_qty) is not int or cumulative_filled_qty < 0
+        ):
+            log.critical(
+                "[exit_eng] Invalid cumulative exit fill authority | pos_id=%s cumulative=%r",
+                position_id, cumulative_filled_qty,
+            )
+            return
+        if prior_cumulative_filled is not None and (
+            type(prior_cumulative_filled) is not int or prior_cumulative_filled < 0
+        ):
+            log.critical(
+                "[exit_eng] Invalid prior cumulative exit fill authority | pos_id=%s prior=%r",
+                position_id, prior_cumulative_filled,
+            )
+            return
         try:
             if fill_price is not None:
                 fill_price = float(fill_price)
@@ -6620,19 +6640,9 @@ class APExitEngine:
                 )
 
                 if cumulative_filled_qty is not None:
-                    cum   = max(0, int(cumulative_filled_qty or 0))
+                    cum   = cumulative_filled_qty
                     prev  = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
                     if prior_cumulative_filled is not None:
-                        if (
-                            type(prior_cumulative_filled) is not int
-                            or prior_cumulative_filled < 0
-                        ):
-                            log.error(
-                                "[exit_eng] Invalid prior cumulative fill authority | "
-                                "pos_id=%s order=%s prior=%r",
-                                position_id, order_key, prior_cumulative_filled,
-                            )
-                            return
                         # Durable OSM may know about a fill that the in-memory
                         # watermark missed.  Apply only the monotonic delta
                         # beyond that durable baseline and advance the local
@@ -6677,7 +6687,7 @@ class APExitEngine:
                         durable_consumption["quantity_remaining"]
                     )
                 else:
-                    delta = max(0, int(qty_filled or 0))
+                    delta = qty_filled
                     prev  = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
                     pos.last_applied_exit_cum_fill_by_order[order_key] = prev + delta
                     pos.last_applied_exit_cum_fill += delta

@@ -866,6 +866,11 @@ def test_canceled_after_already_durable_partial_fill_preserves_remainder(monkeyp
     exit_engine.finalize_exit_replacement_safe.side_effect = (
         lambda *args, **kwargs: events.append("finalize_replacement_safe") or True
     )
+    exit_engine.reconcile_exit_fill_consumption.return_value = {
+        "ok": True,
+        "applied_cumulative_qty": 1,
+        "quantity_remaining": 1,
+    }
     exit_engine.clear_exit_in_flight.side_effect = (
         lambda *args, **kwargs: events.append("clear_exit_in_flight")
     )
@@ -908,6 +913,60 @@ def test_canceled_after_already_durable_partial_fill_preserves_remainder(monkeyp
         reason="durable partial truth repeated at cancel",
         local_order_id="loc-durable-partial",
         broker_order_id="bro-durable-partial",
+    )
+    assert exit_engine.reconcile_exit_fill_consumption.call_count == 2
+    exit_engine.reconcile_exit_fill_consumption.assert_any_call(
+        "pos-durable-partial",
+        local_order_id="loc-durable-partial",
+        broker_order_id="bro-durable-partial",
+        cumulative_filled_qty=1,
+        prior_cumulative_filled=1,
+    )
+
+
+def test_replayed_partial_fill_without_position_bridge_holds_before_cancel():
+    """An OSM replay alone cannot authorize a replacement handoff."""
+
+    class _OSM:
+        def __init__(self):
+            self.row = {
+                "local_order_id": "loc-replay-hold",
+                "kind": "EXIT",
+                "position_id": "pos-replay-hold",
+                "broker_order_id": "bro-replay-hold",
+                "status": "EXIT_PARTIAL_FILL",
+                "qty": 2,
+                "filled_qty": 1,
+            }
+            self.transitions = []
+
+        def get_order(self, local_order_id):
+            return dict(self.row) if local_order_id == self.row["local_order_id"] else None
+
+        def transition(self, local_order_id, status, **kwargs):
+            self.transitions.append((local_order_id, status, dict(kwargs)))
+            return True
+
+    osm = _OSM()
+    exit_engine = MagicMock()
+    mon = _monitor(osm=osm, exit_engine=exit_engine)
+    mon._emit_order_event = MagicMock()
+
+    result = mon._apply_broker_partial_exit_fill(
+        "loc-replay-hold",
+        "bro-replay-hold",
+        "AAPL260814C00200000",
+        raw_payload={
+            "status": "canceled",
+            "exec_quantity": 1,
+            "avg_fill_price": 1.25,
+        },
+    )
+
+    assert result is None
+    assert osm.transitions == []
+    assert mon._emit_order_event.call_args.kwargs["reason_code"] == (
+        "EXIT_FILL_POSITION_DURABILITY_UNCONFIRMED"
     )
 
 
@@ -953,7 +1012,13 @@ def test_terminal_cumulative_fill_matrix_is_strict_and_cumulative(
 
     for terminal_status in ("canceled", "expired", "rejected"):
         osm = _TerminalOSM()
-        mon = _monitor(osm=osm)
+        exit_engine = MagicMock()
+        exit_engine.reconcile_exit_fill_consumption.return_value = {
+            "ok": True,
+            "applied_cumulative_qty": 1,
+            "quantity_remaining": 1,
+        }
+        mon = _monitor(osm=osm, exit_engine=exit_engine)
         mon._emit_order_event = MagicMock()
         remainder = mon._apply_broker_partial_exit_fill(
             "loc-terminal-matrix",
@@ -1027,7 +1092,7 @@ def test_terminal_explicit_zero_against_durable_partial_holds_and_grants_zero(mo
     exit_engine.finalize_exit_replacement_safe.assert_not_called()
 
 
-@pytest.mark.parametrize("cumulative", [True, 1.5, -1, "bad", 3])
+@pytest.mark.parametrize("cumulative", [True, 1.5, -1, "bad", " 1 ", 0, 3])
 def test_filled_race_rejects_malformed_or_out_of_bounds_cumulative_quantity(cumulative):
     """The FILLED race branch must share strict cumulative-fill semantics."""
 
