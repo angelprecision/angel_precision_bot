@@ -7668,7 +7668,7 @@ class APExitEngine:
                     c.execute(
                         """
                         SELECT local_order_id, broker_order_id, status, client_id,
-                               qty, filled_qty, created_ts, submitted_ts, updated_ts
+                               execution_mode, qty, filled_qty, created_ts, submitted_ts, updated_ts
                         FROM orders
                         WHERE client_id = %s
                           AND position_id = %s
@@ -7698,10 +7698,18 @@ class APExitEngine:
                 old_local = str(lifecycle.get("old_local_order_id") or "")
                 expected_qty = int(lifecycle.get("replace_quantity") or 0)
                 if local_id != old_local:
+                    row_client_id = row.get("client_id")
+                    row_execution_mode = row.get("execution_mode")
+                    row_qty = row.get("qty")
                     if (
-                        str(row.get("client_id") or pos.client_id) != str(pos.client_id or "")
-                        or str(row.get("execution_mode") or pos.execution_mode) != str(pos.execution_mode or "")
-                        or int(row.get("qty") or 0) != expected_qty
+                        type(row_client_id) is not str
+                        or not row_client_id
+                        or row_client_id != str(pos.client_id or "")
+                        or type(row_execution_mode) is not str
+                        or not row_execution_mode
+                        or row_execution_mode != str(pos.execution_mode or "")
+                        or type(row_qty) is not int
+                        or row_qty != expected_qty
                     ):
                         return False
 

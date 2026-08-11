@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from unittest.mock import MagicMock
 
+import pytest
+
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 os.environ.setdefault("ENCRYPTION_KEY", "ap-pr423-restart-boundary-test")
 
@@ -275,3 +277,42 @@ def test_malformed_replacement_metadata_grants_no_restart_authority():
     assert broker.open_order_calls == 0
     assert broker.position_calls == 0
     assert broker.cancel_calls == 0
+
+
+@pytest.mark.parametrize("row_updates", [{}, {"execution_mode": "live"}])
+def test_restart_hydration_never_defaults_replacement_row_mode(row_updates, monkeypatch):
+    """A newer replacement row must carry exact client and mode identity."""
+    position = _position("REPLACEMENT_PENDING")
+    engine = _engine(position, _OSM())
+    row = {
+        "local_order_id": "loc-restart-new",
+        "broker_order_id": "",
+        "status": "EXIT_REQUESTED",
+        "client_id": CLIENT_ID,
+        "qty": 1,
+        "filled_qty": 0,
+    }
+    row.update(row_updates)
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args):
+            return self
+
+        def fetchone(self):
+            return row
+
+    import ap.db as db_module
+
+    monkeypatch.setattr(db_module, "conn", lambda: _Connection())
+    monkeypatch.setattr(db_module, "run_with_retry", lambda fn, *args, **kwargs: fn(*args, **kwargs))
+
+    assert engine.hydrate_pending_exit_identity_from_db(position) is False
+    assert position.exit_in_flight is False
+    assert position.pending_exit_local_order_id == OLD_LOCAL
+    assert position.pending_exit_broker_order_id == OLD_BROKER
