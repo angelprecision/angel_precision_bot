@@ -2167,6 +2167,67 @@ def _recover_durable_replacement_pending(
             },
         )
     expected_replacement_qty = old_requested_qty - old_filled_qty
+    if state == "REPLACEMENT_PENDING" and expected_replacement_qty == 0:
+        # The old exact EXIT consumed its entire tranche after the replacement
+        # grant was durably committed.  The old OSM row is already terminal;
+        # revoke the exact grant through the canonical mirror-clearing CAS.
+        details = {
+            "status": old_status,
+            "filled_qty": old_filled_qty,
+            "osm_requested_qty": old_requested_qty,
+            "replacement_qty": replacement_qty,
+            "expected_replacement_qty": expected_replacement_qty,
+            "replacement_blocked": True,
+            "broker_mutation_blocked": True,
+            "replacement_post_blocked": True,
+            "quote_health": qh,
+        }
+        revoke = getattr(exit_engine, "revoke_exit_replacement_safe", None)
+        if not callable(revoke):
+            details["error"] = "replacement_lifecycle_revoke_owner_unavailable"
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_terminal_cancel_replacement_lifecycle_revoke_unavailable",
+                pid,
+                old_local,
+                old_broker,
+                details,
+            )
+        try:
+            lifecycle_cleared = bool(
+                revoke(
+                    pid,
+                    reason="autonomous_recovery_terminal_cancel_replacement_fully_consumed",
+                    local_order_id=old_local,
+                    broker_order_id=old_broker,
+                    force=True,
+                    reconciled=True,
+                    fully_consumed=True,
+                )
+            )
+        except Exception as exc:
+            lifecycle_cleared = False
+            details["error"] = f"replacement_lifecycle_revoke_failed:{type(exc).__name__}"
+        if not lifecycle_cleared:
+            details.setdefault("error", "replacement_lifecycle_persistence_unconfirmed")
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_terminal_cancel_replacement_lifecycle_revoke_failed",
+                pid,
+                old_local,
+                old_broker,
+                details,
+            )
+        details["replacement_lifecycle_state"] = "NONE"
+        details["replacement_lifecycle_consumed"] = True
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_terminal_cancel_replacement_fully_consumed_no_replacement",
+            pid,
+            old_local,
+            old_broker,
+            details,
+        )
     if expected_replacement_qty != replacement_qty:
         return RecoveryAction(
             "NOOP",

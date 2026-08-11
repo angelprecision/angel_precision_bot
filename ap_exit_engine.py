@@ -7433,13 +7433,14 @@ class APExitEngine:
         reconciled: bool = False,
         **kwargs,
     ) -> bool:
-        """Revoke a staged grant when durable OSM cancellation is unproven."""
+        """Revoke a staged grant or an exact fully-consumed pending grant."""
         if not position_id:
             return False
         reason_s = str(reason or "")
         local_order_id = str(local_order_id or "")
         broker_order_id = str(broker_order_id or "")
         force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
+        fully_consumed = bool(kwargs.get("fully_consumed"))
         with self._lock:
             pos = self._positions_by_id.get(str(position_id or ""))
             if pos is None or pos.closed:
@@ -7448,7 +7449,11 @@ class APExitEngine:
             if not lifecycle_valid:
                 return False
             lifecycle_state = lifecycle.get("state", EXIT_REPLACEMENT_STATE_NONE)
-            if lifecycle_state in {EXIT_REPLACEMENT_STATE_PENDING, EXIT_REPLACEMENT_STATE_OWNED}:
+            if lifecycle_state in {EXIT_REPLACEMENT_STATE_PENDING, EXIT_REPLACEMENT_STATE_OWNED} and not (
+                lifecycle_state == EXIT_REPLACEMENT_STATE_PENDING
+                and fully_consumed
+                and force
+            ):
                 return False
             if lifecycle_state == EXIT_REPLACEMENT_STATE_STAGED:
                 local_order_id = str(lifecycle.get("old_local_order_id") or local_order_id or "")

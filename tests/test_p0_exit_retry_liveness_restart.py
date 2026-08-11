@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import os
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -75,11 +77,14 @@ def _position(state: str = "REPLACEMENT_PENDING") -> ManagedPosition:
 
 class _BrokerReadBoundary:
     def __init__(self):
+        self.get_order_calls = 0
         self.open_order_calls = 0
         self.position_calls = 0
         self.cancel_calls = 0
+        self.post_calls = 0
 
     def get_order(self, broker_order_id):
+        self.get_order_calls += 1
         assert broker_order_id == OLD_BROKER
         return {
             "id": broker_order_id,
@@ -100,6 +105,17 @@ class _BrokerReadBoundary:
         raise AssertionError("durable replacement recovery must not DELETE")
 
 
+class _BrokerTerminalLateFill(_BrokerReadBoundary):
+    def __init__(self, final_filled_qty):
+        super().__init__()
+        self.final_filled_qty = final_filled_qty
+
+    def get_order(self, broker_order_id):
+        payload = super().get_order(broker_order_id)
+        payload["exec_quantity"] = self.final_filled_qty
+        return payload
+
+
 class _BrokerReplacementFilled(_BrokerReadBoundary):
     def get_order(self, broker_order_id):
         if broker_order_id == "bro-restart-new":
@@ -113,7 +129,15 @@ class _BrokerReplacementFilled(_BrokerReadBoundary):
 
 
 class _OSM:
-    def __init__(self, *, reserved_row=None, transition_result=True, old_status="CANCELED"):
+    def __init__(
+        self,
+        *,
+        reserved_row=None,
+        transition_result=True,
+        old_status="CANCELED",
+        old_qty=2,
+        old_filled=1,
+    ):
         self.old_row = {
             "local_order_id": OLD_LOCAL,
             "broker_order_id": OLD_BROKER,
@@ -122,8 +146,8 @@ class _OSM:
             "execution_mode": "paper",
             "kind": "EXIT",
             "status": old_status,
-            "qty": 2,
-            "filled_qty": 1,
+            "qty": old_qty,
+            "filled_qty": old_filled,
         }
         self.reserved_row = reserved_row
         self.transition_result = transition_result
@@ -200,6 +224,30 @@ def _engine(position, osm, *, persist=True):
     engine._persist_exit_fill_consumption_to_db = _persist_fill_consumption
     engine._sync_replacement_runtime_from_lifecycle(position, revalidated=False)
     return engine
+
+
+def _late_fill_pending_replacement_setup():
+    position = _position("REPLACEMENT_PENDING")
+    position.quantity_remaining = 5
+    position.pending_exit_local_order_id = ""
+    position.pending_exit_broker_order_id = ""
+    position.pending_exit_qty = 3
+    position.pending_exit_filled_qty = 2
+    position.exit_fill_consumption = {
+        "position_id": POSITION_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "local_order_id": OLD_LOCAL,
+        "broker_order_id": OLD_BROKER,
+        "replacement_generation": 1,
+        "applied_cumulative_qty": 2,
+    }
+    osm = _OSM(old_qty=3, old_filled=2)
+    broker = _BrokerTerminalLateFill(3)
+    engine = _engine(position, osm)
+    position.pending_exit_replace_revalidated = True
+    position.pending_exit_replace_submit_claimed = True
+    return position, osm, broker, engine
 
 
 def test_restart_after_fresh_terminal_proof_replays_staged_fence_without_delete():
@@ -284,6 +332,78 @@ def test_repeated_restart_with_pending_authority_revalidates_once_without_osm_or
     assert broker.cancel_calls == 0
     assert broker.open_order_calls == 2
     assert broker.position_calls == 2
+
+
+def test_late_fill_consumes_obsolete_pending_replacement_and_reopens_exit():
+    """A final old-generation fill clears a now-zero replacement obligation."""
+    position, osm, broker, engine = _late_fill_pending_replacement_setup()
+
+    actions = recover_exit_engine(engine, broker=broker, osm=osm, order_monitor=None)
+
+    assert [action.action for action in actions] == ["NOOP"]
+    assert actions[0].reason == (
+        "autonomous_recovery_terminal_cancel_replacement_fully_consumed_no_replacement"
+    )
+    assert position.quantity_remaining == 4
+    assert position.exit_fill_consumption["applied_cumulative_qty"] == 3
+    assert position.exit_retry_liveness["state"] == "NONE"
+    assert position.exit_retry_liveness["replace_quantity"] == 0
+    assert position.pending_exit_replace_qty == 0
+    assert position.pending_exit_replace_allowed is False
+    assert position.pending_exit_replace_revalidated is False
+    assert position.pending_exit_replace_submit_claimed is False
+    assert position.pending_exit_replace_durable_pending is False
+    assert position.exit_in_flight is False
+    assert position.pending_exit_local_order_id == ""
+    assert position.pending_exit_broker_order_id == ""
+    assert osm.old_row["status"] == "CANCELED"
+    assert osm.old_row["filled_qty"] == 2
+    assert broker.post_calls == 0
+    assert engine._can_submit_exit(
+        position,
+        datetime.now(timezone.utc),
+        reason="next normal exit",
+    ) is True
+
+
+def test_restart_after_obsolete_pending_replacement_clear_does_not_resurrect_or_double_consume():
+    """The durable NONE state skips old-fill replay after a fresh restart."""
+    position, osm, broker, engine = _late_fill_pending_replacement_setup()
+    first = recover_exit_engine(engine, broker=broker, osm=osm, order_monitor=None)
+    assert [action.action for action in first] == ["NOOP"]
+
+    restarted_position = copy.copy(position)
+    restarted_position.exit_retry_liveness = dict(position.exit_retry_liveness)
+    restarted_position.exit_fill_consumption = dict(position.exit_fill_consumption)
+    restarted_position.last_applied_exit_cum_fill_by_order = dict(
+        position.last_applied_exit_cum_fill_by_order
+    )
+    restarted_osm = _OSM(old_qty=3, old_filled=3)
+    restarted_broker = _BrokerTerminalLateFill(3)
+    restarted_engine = _engine(restarted_position, restarted_osm)
+    durable_consume = restarted_engine._persist_exit_fill_consumption_to_db
+    restarted_engine._persist_exit_fill_consumption_to_db = MagicMock(
+        side_effect=durable_consume
+    )
+
+    second = recover_exit_engine(
+        restarted_engine,
+        broker=restarted_broker,
+        osm=restarted_osm,
+        order_monitor=None,
+    )
+
+    assert second == []
+    assert restarted_position.quantity_remaining == 4
+    assert restarted_position.exit_fill_consumption["applied_cumulative_qty"] == 3
+    assert restarted_position.exit_retry_liveness["state"] == "NONE"
+    assert restarted_position.pending_exit_replace_qty == 0
+    assert restarted_position.pending_exit_replace_allowed is False
+    assert restarted_position.pending_exit_replace_revalidated is False
+    assert restarted_position.pending_exit_replace_submit_claimed is False
+    assert restarted_engine._persist_exit_fill_consumption_to_db.call_count == 0
+    assert restarted_broker.get_order_calls == 0
+    assert restarted_broker.post_calls == 0
 
 
 def test_restart_after_replacement_fill_consumes_owned_lifecycle_without_delete():
