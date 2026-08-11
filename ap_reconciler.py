@@ -2967,7 +2967,7 @@ class APBrokerReconciler:
                         WHERE  client_id = %s
                           AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                           AND  kind = 'EXIT'
-                          AND  status IN ('FILLED', 'EXIT_FILLED', 'EXIT_PARTIAL_FILL')
+                          AND  status IN ('FILLED', 'EXIT_FILLED')
                           AND  UPPER(TRIM(COALESCE(contract, ''))) = %s
                           AND  position_id::text = %s
                         ORDER  BY COALESCE(filled_ts, updated_ts) DESC

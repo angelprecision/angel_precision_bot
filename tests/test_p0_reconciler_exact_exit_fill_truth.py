@@ -48,7 +48,7 @@ class _ExitCursor:
         self.sql.append(compact)
         self.params.append(tuple(params))
         client_id, mode, contract, position_id = params
-        statuses = {"FILLED", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}
+        statuses = {"FILLED", "EXIT_FILLED"}
         self._selected = [
             row
             for row in self.rows
@@ -173,6 +173,7 @@ def test_exact_target_stc_fill_is_accepted_with_full_identity(monkeypatch):
     assert result["fill_price"] == 1.95
     assert cursor.params[0] == (CLIENT, MODE_LIVE, TARGET_CONTRACT, POSITION_ID)
     assert "LIMIT 2" in cursor.sql[0]
+    assert "EXIT_PARTIAL_FILL" not in cursor.sql[0]
 
 
 def test_exact_contract_with_wrong_position_id_is_rejected(monkeypatch):
@@ -247,6 +248,124 @@ def test_multiple_exact_candidates_hold_without_newest_wins(monkeypatch):
     ) is None
     assert any(
         "RECONCILER_EXIT_FILL_IDENTITY_AMBIGUOUS" in call.args[0]
+        for call in rec._alert.call_args_list
+    )
+
+
+@pytest.mark.parametrize("quantity_remaining", [4, 2])
+def test_exit_partial_fill_is_not_terminal_evidence_or_reconciler_authority(
+    monkeypatch, quantity_remaining: int
+):
+    """A partial EXIT row is not terminal evidence, even at full quantity coverage."""
+    cursor = _install_exit_rows(
+        monkeypatch,
+        [_exit_row(status="EXIT_PARTIAL_FILL", filled_qty=2, fill_price=4.79)],
+    )
+    rec = _reconciler()
+    rec._alert = MagicMock()
+    rec._active_exit_order_exists = MagicMock(return_value=None)
+    rec._broker_open_exit_exists_for_contract = MagicMock(return_value=False)
+    rec._get_current_option_price = MagicMock(return_value=1.95)
+    rec._execute_reconciler_close = MagicMock()
+    rec._record_reconciler_rejection = MagicMock()
+    pos = _position()
+    pos["quantity_remaining"] = quantity_remaining
+    pos["qty"] = quantity_remaining
+    summary = _empty_summary(CLIENT)
+
+    rec._handle_db_position_missing_at_broker(
+        pos=pos,
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=quantity_remaining,
+        entry_px=2.33,
+        summary=summary,
+    )
+
+    assert cursor.sql and "EXIT_PARTIAL_FILL" not in cursor.sql[0]
+    rec._execute_reconciler_close.assert_not_called()
+    rec._record_reconciler_rejection.assert_not_called()
+    rec._get_current_option_price.assert_not_called()
+    assert summary["positions_alerted"] == 1
+    assert any(
+        "BROKER_POSITION_MISSING_EXIT_FILL_UNPROVEN" in call.args[0]
+        for call in rec._alert.call_args_list
+    )
+
+
+@pytest.mark.parametrize("status", ["EXIT_FILLED", "FILLED"])
+def test_terminal_exact_exit_status_can_authorize_full_close(monkeypatch, status: str):
+    cursor = _install_exit_rows(
+        monkeypatch,
+        [_exit_row(status=status, filled_qty=2, fill_price=4.79)],
+    )
+    rec = _reconciler()
+    rec._execute_reconciler_close = MagicMock()
+    rec._record_reconciler_rejection = MagicMock()
+    pos = _position()
+    pos["quantity_remaining"] = 2
+    pos["qty"] = 2
+    summary = _empty_summary(CLIENT)
+
+    rec._handle_db_position_missing_at_broker(
+        pos=pos,
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=2,
+        entry_px=2.33,
+        summary=summary,
+    )
+
+    assert cursor.sql and "EXIT_PARTIAL_FILL" not in cursor.sql[0]
+    rec._execute_reconciler_close.assert_called_once()
+    close_kwargs = rec._execute_reconciler_close.call_args.kwargs
+    assert close_kwargs["exact_exit_fill_qty"] == 2
+    assert close_kwargs["exit_px"] == 4.79
+    rec._record_reconciler_rejection.assert_called_once()
+    assert summary["positions_alerted"] == 0
+
+
+def test_missing_id_exit_with_only_partial_fill_does_not_promote_to_exit_filled(
+    monkeypatch,
+):
+    cursor = _install_exit_rows(
+        monkeypatch,
+        [_exit_row(status="EXIT_PARTIAL_FILL", filled_qty=2, fill_price=4.79)],
+    )
+    rec = _reconciler()
+    rec._alert = MagicMock()
+    rec._recover_missing_broker_id_exit = MagicMock(return_value=False)
+    rec.osm.transition = MagicMock(return_value=True)
+    summary = _empty_summary(CLIENT)
+    order = {
+        "local_order_id": "exit-missing-broker-id",
+        "kind": "EXIT",
+        "status": "EXIT_PARTIAL_FILL",
+        "position_id": POSITION_ID,
+        "contract": TARGET_CONTRACT,
+        "underlying": "C",
+        "execution_mode": MODE_LIVE,
+        "qty": 2,
+        "filled_qty": 2,
+        "broker_order_id": None,
+    }
+
+    assert rec._resolve_missing_id_exit_truth(
+        order,
+        summary,
+        reason="partial-only evidence",
+    ) is True
+
+    assert cursor.sql and "EXIT_PARTIAL_FILL" not in cursor.sql[0]
+    assert rec.osm.transition.call_count == 1
+    assert rec.osm.transition.call_args.args[1] == "CANCELED"
+    assert all(
+        call.args[1] != "EXIT_FILLED"
+        for call in rec.osm.transition.call_args_list
+    )
+    assert summary["orders_corrected"] == 1
+    assert not any(
+        "MISSING_ID_EXIT_RESOLVED_BY_RECENT_FILL" in call.args[0]
         for call in rec._alert.call_args_list
     )
 
