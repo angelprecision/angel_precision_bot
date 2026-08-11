@@ -224,7 +224,11 @@ def _norm_contract(value: Any) -> str:
 
 _BROKER_STATUS_KEYS = ("status", "Status", "state", "order_status")
 _BROKER_ORDER_ID_KEYS = ("broker_order_id", "order_id", "id", "orderId")
-_BROKER_CONTRACT_KEYS = ("contract", "symbol", "option_symbol", "instrument")
+# Tradier's ``symbol`` is the underlying root (for example ``SPY``), while
+# ``option_symbol`` is the OCC contract identity.  They are deliberately not
+# aliases and must never be compared as if they represented the same field.
+_BROKER_CONTRACT_KEYS = ("contract", "option_symbol", "instrument")
+_BROKER_UNDERLYING_KEYS = ("symbol",)
 _BROKER_ORDER_QTY_KEYS = ("qty", "quantity", "order_qty")
 _BROKER_REMAINING_QTY_KEYS = ("remaining_qty", "remaining_quantity")
 _BROKER_FILLED_QTY_KEYS = ("filled_qty", "filled_quantity", "exec_quantity")
@@ -262,6 +266,43 @@ def _strict_consistent_text(
         if not isinstance(value, str) or not value or value != value.strip():
             raise ValueError(f"malformed broker {field_name} field: {key}")
         values.append(normalize(value))
+    if values and any(value != values[0] for value in values[1:]):
+        raise ValueError(f"conflicting broker {field_name} fields")
+    return values[0] if values else ""
+
+
+def _strict_provider_order_id(value: Any, *, field_name: str = "order identity") -> str:
+    """Normalize provider IDs without bool/fraction/malformed coercion."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"malformed broker {field_name} field")
+    if type(value) is int:
+        if value < 0:
+            raise ValueError(f"malformed broker {field_name} field")
+        return str(value)
+    if type(value) is float:
+        if not math.isfinite(value) or not value.is_integer() or value < 0:
+            raise ValueError(f"malformed broker {field_name} field")
+        return str(int(value))
+    if isinstance(value, str):
+        if not value or value != value.strip():
+            raise ValueError(f"malformed broker {field_name} field")
+        return value
+    raise ValueError(f"malformed broker {field_name} field")
+
+
+def _strict_consistent_provider_id(
+    raw: dict,
+    keys: tuple[str, ...],
+    *,
+    field_name: str,
+) -> str:
+    values = []
+    for key in keys:
+        if key not in raw or raw.get(key) is None:
+            continue
+        values.append(
+            _strict_provider_order_id(raw.get(key), field_name=field_name)
+        )
     if values and any(value != values[0] for value in values[1:]):
         raise ValueError(f"conflicting broker {field_name} fields")
     return values[0] if values else ""
@@ -305,13 +346,17 @@ def _validate_broker_order_payload(
     if not status:
         raise ValueError("broker order status is missing")
 
-    broker_order_id = _strict_consistent_text(
+    broker_order_id = _strict_consistent_provider_id(
         raw,
         _BROKER_ORDER_ID_KEYS,
         field_name="order identity",
-        normalize=lambda value: value,
     )
-    expected_id = _norm(expected_broker_order_id)
+    expected_id = ""
+    if expected_broker_order_id not in (None, ""):
+        expected_id = _strict_provider_order_id(
+            expected_broker_order_id,
+            field_name="expected order identity",
+        )
     if expected_id and not broker_order_id:
         raise ValueError("broker order identity is missing")
     if broker_order_id and expected_id and broker_order_id != expected_id:
@@ -321,6 +366,12 @@ def _validate_broker_order_payload(
         raw,
         _BROKER_CONTRACT_KEYS,
         field_name="contract",
+        normalize=lambda value: _norm_contract(value),
+    )
+    _strict_consistent_text(
+        raw,
+        _BROKER_UNDERLYING_KEYS,
+        field_name="underlying symbol",
         normalize=lambda value: _norm_contract(value),
     )
     expected_contract_norm = _norm_contract(expected_contract)
@@ -378,11 +429,24 @@ def _status(raw: dict) -> str:
 
 
 def _broker_order_id(raw: dict) -> str:
-    return _norm(raw.get("broker_order_id") or raw.get("order_id") or raw.get("id") or raw.get("orderId"))
+    try:
+        return _strict_consistent_provider_id(
+            raw,
+            _BROKER_ORDER_ID_KEYS,
+            field_name="order identity",
+        )
+    except ValueError:
+        return ""
 
 
 def _contract(raw: dict) -> str:
-    return _norm_contract(raw.get("contract") or raw.get("symbol") or raw.get("option_symbol") or raw.get("instrument"))
+    for key in _BROKER_CONTRACT_KEYS:
+        value = raw.get(key)
+        if value not in (None, ""):
+            return _norm_contract(value)
+    # Keep legacy non-option/equity discovery usable, but never treat this
+    # fallback as satisfying an expected OCC option contract in validation.
+    return _norm_contract(raw.get("symbol"))
 
 
 def _qty(raw: dict) -> int:
@@ -670,6 +734,7 @@ def _cancel_order_with_proof(
         if confirmed_status in CANCEL_CONFIRMED_STATUSES:
             raw["confirmed_status"] = confirmed_status
             raw["confirmation_attempts"] = attempt + 1
+            raw["confirmed_payload"] = dict(confirmed) if isinstance(confirmed, dict) else confirmed
             return True, raw
         if attempt < max_retries - 1:
             time.sleep(max(0.0, float(retry_delay)))
@@ -716,6 +781,132 @@ def _strict_managed_quantity_remaining(pos: Any) -> Optional[int]:
     if type(value) is not int or value <= 0:
         return None
     return value
+
+
+_OSM_EXIT_ACTIVE_STATUSES = {
+    "EXIT_REQUESTED",
+    "EXIT_SUBMITTED",
+    "EXIT_ACKNOWLEDGED",
+    "EXIT_PARTIAL_FILL",
+}
+_CUMULATIVE_FILL_KEYS = ("filled_qty", "filled_quantity", "exec_quantity")
+
+
+def _strict_durable_quantity(
+    row: dict,
+    keys: tuple[str, ...],
+    *,
+    positive: bool,
+) -> Optional[int]:
+    """Read a durable integer quantity without compatibility coercion."""
+    values = []
+    for key in keys:
+        if key not in row:
+            continue
+        value = row.get(key)
+        if type(value) is not int or isinstance(value, bool):
+            return None
+        if value < 0 or (positive and value <= 0):
+            return None
+        values.append(value)
+    if not values or any(value != values[0] for value in values[1:]):
+        return None
+    return values[0]
+
+
+def _exact_osm_exit_generation(
+    osm: Any,
+    *,
+    local_id: str,
+    broker_id: str,
+    position_id: str,
+    client_id: str,
+    execution_mode: str,
+) -> tuple[Optional[dict], Optional[int], str]:
+    """Return the exact active durable EXIT row and its requested quantity."""
+    row = _order_row(osm, local_id)
+    if not row:
+        return None, None, "durable_osm_exit_row_unavailable"
+    if _norm(row.get("local_order_id")) != _norm(local_id):
+        return None, None, "durable_osm_exit_local_identity_mismatch"
+    if _norm(row.get("broker_order_id")) != _norm(broker_id):
+        return None, None, "durable_osm_exit_broker_identity_mismatch"
+    if _norm(row.get("position_id")) != _norm(position_id):
+        return None, None, "durable_osm_exit_position_identity_mismatch"
+    if _norm(row.get("client_id")) != _norm(client_id):
+        return None, None, "durable_osm_exit_client_identity_mismatch"
+    if str(row.get("execution_mode") or "") != str(execution_mode or ""):
+        return None, None, "durable_osm_exit_execution_mode_mismatch"
+    if _norm(row.get("kind")).upper() != "EXIT":
+        return None, None, "durable_osm_exit_kind_mismatch"
+    if _norm(row.get("status")).upper() not in _OSM_EXIT_ACTIVE_STATUSES:
+        return None, None, "durable_osm_exit_generation_not_active"
+    requested_qty = _strict_durable_quantity(
+        row,
+        ("qty", "quantity"),
+        positive=True,
+    )
+    if requested_qty is None:
+        return None, None, "durable_osm_exit_requested_quantity_unavailable"
+    return row, requested_qty, "ok"
+
+
+def _strict_cumulative_fill_authority(
+    payload: dict,
+) -> tuple[Optional[int], bool]:
+    """Return (cumulative fill, present) from a broker snapshot."""
+    values = []
+    present = False
+    for key in _CUMULATIVE_FILL_KEYS:
+        if key not in payload:
+            continue
+        present = True
+        parsed = _strict_nonnegative_quantity(payload.get(key))
+        if parsed is None:
+            return None, True
+        values.append(parsed)
+    if not present or any(value != values[0] for value in values[1:]):
+        return None, present
+    return values[0], True
+
+
+def _strict_durable_cumulative_fill_authority(
+    row: dict,
+) -> tuple[Optional[int], bool]:
+    """Return (durable cumulative fill, present) from an OSM row."""
+    values = []
+    present = False
+    for key in _CUMULATIVE_FILL_KEYS:
+        if key not in row:
+            continue
+        present = True
+        value = row.get(key)
+        if type(value) is not int or isinstance(value, bool) or value < 0:
+            return None, True
+        values.append(value)
+    if not present or any(value != values[0] for value in values[1:]):
+        return None, present
+    return values[0], True
+
+
+def _terminal_cumulative_fill_authority(
+    broker_payload: dict,
+    osm_row: dict,
+) -> tuple[Optional[int], str]:
+    """Resolve terminal fill quantity from broker or durable OSM evidence."""
+    broker_qty, broker_present = _strict_cumulative_fill_authority(broker_payload)
+    osm_qty, osm_present = _strict_durable_cumulative_fill_authority(osm_row)
+    if broker_present and broker_qty is None:
+        return None, "broker_cumulative_fill_malformed"
+    if osm_present and osm_qty is None:
+        return None, "durable_osm_cumulative_fill_malformed"
+    if not broker_present and not osm_present:
+        return None, "terminal_cumulative_fill_missing"
+    if broker_present and osm_present and broker_qty != osm_qty:
+        return None, "terminal_cumulative_fill_conflict"
+    if broker_present:
+        return broker_qty, "broker_snapshot"
+    return osm_qty, "durable_osm"
 
 
 def quote_health(pos: Any, *, stale_sec: int = QUOTE_STALE_WARN_SEC) -> dict:
@@ -1082,6 +1273,89 @@ def _recover_known_open_exit_when_monitor_unavailable(
         return RecoveryAction(
             "NOOP", "autonomous_cancel_not_proven", _position_id(pos), local_id, broker_id, details,
         )
+    terminal_row, terminal_requested_qty, terminal_osm_reason = _exact_osm_exit_generation(
+        osm,
+        local_id=local_id,
+        broker_id=broker_id,
+        position_id=_position_id(pos),
+        client_id=_norm(getattr(pos, "client_id", "")),
+        execution_mode=str(getattr(pos, "execution_mode", "") or ""),
+    )
+    if terminal_row is None or terminal_requested_qty is None:
+        details.update(
+            {
+                "error": terminal_osm_reason,
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            }
+        )
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_terminal_cancel_osm_generation_unavailable",
+            _position_id(pos),
+            local_id,
+            broker_id,
+            details,
+        )
+    confirmed_payload = proof.get("confirmed_payload") if isinstance(proof, dict) else None
+    terminal_filled_qty, terminal_fill_source = _terminal_cumulative_fill_authority(
+        confirmed_payload if isinstance(confirmed_payload, dict) else {},
+        terminal_row,
+    )
+    details.update(
+        {
+            "terminal_filled_qty": terminal_filled_qty,
+            "terminal_fill_source": terminal_fill_source,
+            "osm_requested_qty": terminal_requested_qty,
+        }
+    )
+    if terminal_filled_qty is None:
+        details.update(
+            {
+                "error": terminal_fill_source,
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            }
+        )
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_terminal_cancel_fill_quantity_unproven",
+            _position_id(pos),
+            local_id,
+            broker_id,
+            details,
+        )
+    if terminal_filled_qty > terminal_requested_qty:
+        details.update(
+            {
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            }
+        )
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_terminal_cancel_fill_exceeds_osm_qty",
+            _position_id(pos),
+            local_id,
+            broker_id,
+            details,
+        )
+    replacement_qty = terminal_requested_qty - terminal_filled_qty
+    if replacement_qty <= 0:
+        details.update(
+            {
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            }
+        )
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_terminal_cancel_fill_exhausts_osm_qty",
+            _position_id(pos),
+            local_id,
+            broker_id,
+            details,
+        )
     return _mark_replacement_safe(
         exit_engine,
         _position_id(pos),
@@ -1090,7 +1364,7 @@ def _recover_known_open_exit_when_monitor_unavailable(
         local_id=local_id,
         broker_id=broker_id,
         details=details,
-        replacement_qty=max(0, int(getattr(pos, "pending_exit_qty", 0) or 0)),
+        replacement_qty=replacement_qty,
     )
 
 
@@ -1348,6 +1622,63 @@ def _recover_durable_replacement_pending(
             {"status": old_status, "replacement_blocked": True, "quote_health": qh},
         )
 
+    old_requested_qty = _strict_replacement_row_qty(old_row)
+    old_filled_qty, old_fill_source = _terminal_cumulative_fill_authority(
+        old_raw,
+        old_row,
+    )
+    if old_requested_qty is None or old_filled_qty is None:
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_terminal_cancel_fill_quantity_unproven",
+            pid,
+            old_local,
+            old_broker,
+            {
+                "status": old_status,
+                "error": (
+                    "replacement_requested_quantity_unavailable"
+                    if old_requested_qty is None
+                    else old_fill_source
+                ),
+                "replacement_blocked": True,
+                "quote_health": qh,
+            },
+        )
+    if old_filled_qty > old_requested_qty:
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_terminal_cancel_fill_exceeds_osm_qty",
+            pid,
+            old_local,
+            old_broker,
+            {
+                "status": old_status,
+                "filled_qty": old_filled_qty,
+                "osm_requested_qty": old_requested_qty,
+                "replacement_blocked": True,
+                "quote_health": qh,
+            },
+        )
+    expected_replacement_qty = old_requested_qty - old_filled_qty
+    if expected_replacement_qty != replacement_qty:
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_terminal_cancel_replacement_qty_mismatch",
+            pid,
+            old_local,
+            old_broker,
+            {
+                "status": old_status,
+                "filled_qty": old_filled_qty,
+                "osm_requested_qty": old_requested_qty,
+                "replacement_qty": replacement_qty,
+                "expected_replacement_qty": expected_replacement_qty,
+                "replacement_blocked": True,
+                "quote_health": qh,
+            },
+        )
+
     # STAGED means the old broker order is terminal but the exact OSM fence
     # still needs to be completed. Re-run that handoff before restoring the
     # one-shot pending authority.
@@ -1359,7 +1690,13 @@ def _recover_durable_replacement_pending(
             reason="restart_recovery_staged_replacement_terminal_proof",
             local_id=old_local,
             broker_id=old_broker,
-            details={"status": old_status, "quote_health": qh, "restart_recovery": True},
+            details={
+                "status": old_status,
+                "quote_health": qh,
+                "restart_recovery": True,
+                "terminal_filled_qty": old_filled_qty,
+                "terminal_fill_source": old_fill_source,
+            },
             replacement_qty=replacement_qty,
         )
 
@@ -1735,6 +2072,8 @@ def recover_exit_position(
         return RecoveryAction("NOOP", "missing_broker_or_position_id", pid, local_id, pending_broker_id, {"quote_health": qh})
 
     terminal_exact_broker_id = ""
+    terminal_broker_snapshot: Optional[dict] = None
+    terminal_replacement_qty: Optional[int] = None
 
     # Exact broker identity path.
     if pending_broker_id:
@@ -1844,6 +2183,51 @@ def recover_exit_position(
                             "filled_qty": filled_qty,
                             "quote_health": qh,
                             "broker_mutation_blocked": True,
+                            "replacement_blocked": True,
+                        },
+                    )
+
+                osm_row, requested_qty, osm_reason = _exact_osm_exit_generation(
+                    osm,
+                    local_id=local_id,
+                    broker_id=pending_broker_id,
+                    position_id=pid,
+                    client_id=_norm(getattr(pos, "client_id", "")),
+                    execution_mode=str(getattr(pos, "execution_mode", "") or ""),
+                )
+                if osm_row is None or requested_qty is None:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_exact_osm_exit_generation_unavailable",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "quantity_remaining": managed_remaining,
+                            "quote_health": qh,
+                            "error": osm_reason,
+                            "broker_mutation_blocked": True,
+                            "position_mutation_blocked": True,
+                            "replacement_blocked": True,
+                        },
+                    )
+                if filled_qty != requested_qty:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_qty_osm_requested_qty_mismatch",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "osm_requested_qty": requested_qty,
+                            "quantity_remaining": managed_remaining,
+                            "quote_health": qh,
+                            "broker_mutation_blocked": True,
+                            "position_mutation_blocked": True,
                             "replacement_blocked": True,
                         },
                     )
@@ -2056,6 +2440,7 @@ def recover_exit_position(
                 if len(other_matches) > 1:
                     return RecoveryAction("NOOP", "multiple_different_open_exits_block_replacement", pid, local_id, pending_broker_id, {"old_status": st, "matches": [m[0] for m in other_matches], "quote_health": qh})
                 terminal_exact_broker_id = pending_broker_id
+                terminal_broker_snapshot = dict(raw)
                 # Do not authorize replacement from terminal status plus zero
                 # other orders alone.  Fall through to the shared negative-
                 # proof path so an authoritative flat position closes and an
@@ -2174,14 +2559,97 @@ def recover_exit_position(
         _contract(p) == contract and _broker_position_quantity(p) != 0
         for p in broker_positions
     )
+
+    if terminal_exact_broker_id:
+        terminal_row, terminal_requested_qty, terminal_osm_reason = _exact_osm_exit_generation(
+            osm,
+            local_id=local_id,
+            broker_id=terminal_exact_broker_id,
+            position_id=pid,
+            client_id=_norm(getattr(pos, "client_id", "")),
+            execution_mode=str(getattr(pos, "execution_mode", "") or ""),
+        )
+        if terminal_row is None or terminal_requested_qty is None:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_terminal_cancel_osm_generation_unavailable",
+                pid,
+                local_id,
+                terminal_exact_broker_id,
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "error": terminal_osm_reason,
+                    "broker_mutation_blocked": True,
+                    "replacement_blocked": True,
+                },
+            )
+        terminal_filled_qty, terminal_fill_source = _terminal_cumulative_fill_authority(
+            terminal_broker_snapshot or {},
+            terminal_row,
+        )
+        if terminal_filled_qty is None:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_terminal_cancel_fill_quantity_unproven",
+                pid,
+                local_id,
+                terminal_exact_broker_id,
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "error": terminal_fill_source,
+                    "osm_requested_qty": terminal_requested_qty,
+                    "broker_mutation_blocked": True,
+                    "replacement_blocked": True,
+                },
+            )
+        if terminal_filled_qty > terminal_requested_qty:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_terminal_cancel_fill_exceeds_osm_qty",
+                pid,
+                local_id,
+                terminal_exact_broker_id,
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "filled_qty": terminal_filled_qty,
+                    "osm_requested_qty": terminal_requested_qty,
+                    "broker_mutation_blocked": True,
+                    "replacement_blocked": True,
+                },
+            )
+        terminal_replacement_qty = terminal_requested_qty - terminal_filled_qty
+        if _contract_held and terminal_replacement_qty <= 0:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_terminal_cancel_fill_exhausts_osm_qty_position_held",
+                pid,
+                local_id,
+                terminal_exact_broker_id,
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "filled_qty": terminal_filled_qty,
+                    "osm_requested_qty": terminal_requested_qty,
+                    "broker_mutation_blocked": True,
+                    "replacement_blocked": True,
+                },
+            )
+
     if not _contract_held and contract:
         # Position is flat at broker — exit filled but callback was dropped.
         # Use the actual mark_position_closed contract and verify the engine
         # performed the close before claiming economic completion.
         close_qty = (
-            getattr(pos, "pending_exit_qty", 0)
-            or getattr(pos, "contracts", 0)
-            or getattr(pos, "quantity_remaining", 0)
+            terminal_filled_qty
+            if terminal_exact_broker_id
+            else (
+                getattr(pos, "pending_exit_qty", 0)
+                or getattr(pos, "contracts", 0)
+                or getattr(pos, "quantity_remaining", 0)
+            )
         )
         try:
             close_qty = int(float(close_qty or 0))
@@ -2196,6 +2664,9 @@ def recover_exit_position(
                     "contract": contract,
                     "quote_health": qh,
                     "source": "negative_proof_position_check",
+                    "terminal_fill_source": (
+                        terminal_fill_source if terminal_exact_broker_id else ""
+                    ),
                     "broker_truth_unavailable": False,
                     "open_order_query_available": True,
                     "position_query_available": True,
@@ -2214,6 +2685,9 @@ def recover_exit_position(
                     "contract": contract,
                     "quote_health": qh,
                     "source": "negative_proof_position_check",
+                    "terminal_fill_source": (
+                        terminal_fill_source if terminal_exact_broker_id else ""
+                    ),
                     "broker_truth_unavailable": False,
                     "open_order_query_available": True,
                     "position_query_available": True,
@@ -2244,6 +2718,9 @@ def recover_exit_position(
                     "contract": contract,
                     "quote_health": qh,
                     "source": "negative_proof_position_check",
+                    "terminal_fill_source": (
+                        terminal_fill_source if terminal_exact_broker_id else ""
+                    ),
                     "broker_truth_unavailable": False,
                     "open_order_query_available": True,
                     "position_query_available": True,
@@ -2276,6 +2753,9 @@ def recover_exit_position(
                 "contract": contract,
                 "quote_health": qh,
                 "source": "negative_proof_position_check",
+                "terminal_fill_source": (
+                    terminal_fill_source if terminal_exact_broker_id else ""
+                ),
                 "broker_truth_unavailable": False,
                 "open_order_query_available": True,
                 "position_query_available": True,
@@ -2294,7 +2774,18 @@ def recover_exit_position(
             "quote_health": qh,
             "open_order_query_available": True,
             "position_query_available": True,
+            "terminal_filled_qty": (
+                terminal_filled_qty if terminal_exact_broker_id else None
+            ),
+            "terminal_fill_source": (
+                terminal_fill_source if terminal_exact_broker_id else ""
+            ),
         },
+        replacement_qty=(
+            terminal_replacement_qty
+            if terminal_replacement_qty is not None
+            else 0
+        ),
     )
 
 

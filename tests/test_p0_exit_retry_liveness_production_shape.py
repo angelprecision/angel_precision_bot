@@ -259,10 +259,13 @@ class _RestartReplayBroker(_ProductionShapeBroker):
 
     def get_order(self, broker_order_id):
         self.get_calls.append(broker_order_id)
+        provider_id = int(broker_order_id) if str(broker_order_id).isdigit() else broker_order_id
         return {
-            "id": broker_order_id,
-            "contract": "AVGO260814C00350000",
+            "id": provider_id,
+            "symbol": "AVGO",
+            "option_symbol": "AVGO260814C00350000",
             "status": "canceled",
+            "exec_quantity": 1,
         }
 
     def list_open_orders(self):
@@ -562,7 +565,7 @@ def test_fresh_process_replays_durable_pending_replacement_once(monkeypatch):
     })
 
     old_local_id = "loc-replay-old"
-    old_broker_id = "broker-replay-old"
+    old_broker_id = "228749"
     position_id = "pos-replay"
     client_id = "client-replay"
     contract = "AVGO260814C00350000"
