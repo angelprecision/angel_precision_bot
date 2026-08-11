@@ -1,7 +1,8 @@
 # tests/test_p0_exit_retry_liveness_exit_engine.py
 # =============================================================================
-# P0 regression: PR #423 Patch 2 — dedicated exit_replace_attempt generation
-# counter on ManagedPosition/APExitEngine, exactly-once increment via
+# P0 regression: PR #423 Patch 2 — dedicated exit_replace_attempt pricing
+# counter on ManagedPosition/APExitEngine, separate from the durable
+# replacement_generation identity. It increments exactly once via
 # mark_exit_replacement_safe(), submission does not reset it, only proven
 # economic completion resets it, and the adaptive pricing ladder reads it
 # instead of the diagnostic _exit_stuck_count counter.
@@ -260,47 +261,49 @@ def test_new_generation_after_consumed_grant_increments_again():
     assert pos.exit_replace_attempt == 2
 
 
-def test_exit_replace_attempt_is_bounded_and_persisted_at_configured_max(monkeypatch):
-    """Repeated independently proven generations never create attempt five."""
+def test_pricing_attempt_is_capped_but_replacement_generation_is_monotonic(monkeypatch):
+    """Six replacement cycles separate pricing pressure from identity."""
     import ap_exit_engine as exit_engine_module
 
     monkeypatch.setattr(exit_engine_module, "EXIT_REPLACE_MAX_ATTEMPTS", 4)
     eng = _engine()
     pos = _pos()
     _add(eng, pos)
-    persisted_attempts = []
+    persisted_cycles = []
     eng._persist_exit_replace_attempt_to_db = MagicMock(
-        side_effect=lambda current_pos: persisted_attempts.append(
-            current_pos.exit_replace_attempt
-        ) or True
+        side_effect=lambda current_pos: persisted_cycles.append((
+            current_pos.exit_replace_attempt,
+            current_pos.exit_retry_liveness["replacement_generation"],
+        )) or True
     )
 
-    for generation in range(6):
-        if generation:
+    for cycle in range(6):
+        if cycle:
             # The prior one-shot grant was consumed by a replacement submit;
             # these are new, independently identified old generations.
             pos.pending_exit_replace_allowed = False
-            pos.pending_exit_local_order_id = f"loc-old-{generation}"
-            pos.pending_exit_broker_order_id = f"bro-old-{generation}"
+            pos.pending_exit_local_order_id = f"loc-old-{cycle}"
+            pos.pending_exit_broker_order_id = f"bro-old-{cycle}"
             pos.exit_retry_liveness = {
                 "state": "NONE",
                 "replace_attempt": pos.exit_replace_attempt,
-                "replacement_generation": pos.exit_replace_attempt,
+                "replacement_generation": cycle,
                 "replace_quantity": 0,
                 "last_ack_identity": "",
             }
         eng.mark_exit_replacement_safe(
             pos.position_id,
-            reason=f"broker-confirmed-cancel-{generation}",
+            reason=f"broker-confirmed-cancel-{cycle}",
             local_order_id=pos.pending_exit_local_order_id,
             broker_order_id=pos.pending_exit_broker_order_id,
         )
-        assert pos.exit_replace_attempt == min(generation + 1, 4)
+        assert pos.exit_replace_attempt == min(cycle + 1, 4)
+        assert pos.exit_retry_liveness["replacement_generation"] == cycle + 1
 
     assert exit_engine_module.EXIT_REPLACE_MAX_ATTEMPTS == 4
     assert pos.exit_replace_attempt == 4
-    assert persisted_attempts == [1, 2, 3, 4, 4, 4]
-    assert 5 not in persisted_attempts
+    assert persisted_cycles == [(1, 1), (2, 2), (3, 3), (4, 4), (4, 5), (4, 6)]
+    assert [generation for _, generation in persisted_cycles] == [1, 2, 3, 4, 5, 6]
 
 
 # ── Submission must NOT reset the attempt counter ───────────────────────────
@@ -503,6 +506,7 @@ def test_persist_exit_replace_attempt_uses_nondestructive_meta_merge(monkeypatch
 
     assert ok is True
     assert "COALESCE(meta, '{}'::jsonb) || %s::jsonb" in captured["sql"]
+    assert "replacement_generation')::bigint" in captured["sql"]
     import json
     patch = json.loads(captured["params"][0])
     assert patch["exit_retry_liveness"]["replace_attempt"] == 2
@@ -551,6 +555,23 @@ def test_restore_exit_replace_attempt_helper_is_fail_safe(raw_meta, expected):
     assert _restore_exit_replace_attempt_from_meta(raw_meta) == expected
 
 
+def test_declared_invalid_lifecycle_clears_legacy_pricing_mirrors():
+    restored = _restore_exit_replace_attempt_from_meta({
+        "exit_retry_liveness": {
+            "state": "REPLACEMENT_PENDING",
+            "replace_attempt": 4,
+            "replacement_generation": "bad",
+            "replace_quantity": 1,
+        },
+    })
+
+    assert restored["replace_attempt"] == 0
+    assert restored["last_ack_identity"] == ""
+    assert restored["replace_quantity"] == 0
+    assert restored["lifecycle"] is None
+    assert restored["lifecycle_valid"] is False
+
+
 def test_seed_from_db_restores_retry_generation_and_replacement_cap(monkeypatch):
     eng = _engine()
     eng.hydrate_pending_exit_identity_from_db = MagicMock(return_value=False)
@@ -585,6 +606,85 @@ def test_seed_from_db_restores_retry_generation_and_replacement_cap(monkeypatch)
     assert restored.exit_replace_attempt == 2
     assert restored._exit_replace_attempt_last_ack_identity == "bro-old"
     assert restored.pending_exit_replace_qty == 1
+
+
+def test_invalid_declared_lifecycle_cannot_change_adaptive_pricing_after_seed(monkeypatch):
+    eng = _engine()
+    eng.hydrate_pending_exit_identity_from_db = MagicMock(return_value=False)
+
+    class _PositionManager:
+        def get_active_positions(self):
+            return [{
+                "id": "pos-invalid-lifecycle",
+                "client_id": "client-1",
+                "underlying": "AVGO",
+                "contract": "AVGO260814C00350000",
+                "direction": "CALL",
+                "qty": 7,
+                "quantity_remaining": 7,
+                "avg_fill": 2.49,
+                "underlying_entry": 350.0,
+                "target_underlying": 360.0,
+                "stop_underlying": 340.0,
+                "execution_mode": "paper",
+                "meta": {
+                    "exit_retry_liveness": {
+                        "state": "REPLACEMENT_PENDING",
+                        "replace_attempt": 4,
+                        "replacement_generation": "bad",
+                        "replace_quantity": 1,
+                    },
+                },
+            }]
+
+    eng.seed_from_db(_PositionManager())
+    pos = eng.get_position("pos-invalid-lifecycle")
+    assert pos is not None
+    assert pos.exit_replace_attempt == 0
+    assert pos.pending_exit_replace_qty == 0
+    assert pos.pending_exit_replace_allowed is False
+    assert pos.pending_exit_replace_revalidated is False
+    assert pos.pending_exit_replace_submit_claimed is False
+    assert pos.exit_retry_liveness == {}
+
+    now = datetime.now(timezone.utc)
+    pos.exit_in_flight = False
+    pos.current_bid = 2.00
+    pos.current_ask = 2.40
+    pos.current_option_price = 2.20
+    pos.option_bid_valid = True
+    pos.option_quote_fresh = True
+    pos.last_quote_update_ts = now
+    pos.last_option_quote_update_ts = now
+    eng._can_submit_exit = MagicMock(return_value=True)
+    eng.on_exit = lambda _pos, _decision: {
+        "local_order_id": "loc-invalid-lifecycle-new",
+        "broker_order_id": "bro-invalid-lifecycle-new",
+    }
+    import ap.exit_safety as exit_safety
+    monkeypatch.setattr(
+        exit_safety,
+        "resolve_exit_broker_truth",
+        lambda **_kwargs: {"broker_truth_open_qty": None, "is_fresh_exact": False},
+    )
+    monkeypatch.setattr(
+        exit_safety,
+        "evaluate_exit_submission_safety",
+        lambda **_kwargs: {"blocked": False},
+    )
+
+    decision = ExitDecision(
+        action="CLOSE_ALL",
+        quantity=1,
+        reason="IMMEDIATE TP",
+        reason_code="IMMEDIATE_TP",
+        urgency="NORMAL",
+        pnl_pct=0.20,
+    )
+    assert eng._submit_exit_decision(pos, decision) is True
+    assert decision._pricing_meta["attempt"] == 0
+    assert decision._pricing_meta["tier"] == "PROFIT_MID"
+    assert decision.suggested_limit == 2.20
 
 
 if __name__ == "__main__":

@@ -1387,13 +1387,14 @@ class ManagedPosition:
     last_rejection_ts:    Optional[datetime] = None
     last_exit_rejected:  bool = False
     _exit_stuck_count:   int = 0
-    # PR #423: dedicated replacement-pricing generation. Deliberately
+    # PR #423: dedicated replacement-pricing attempt counter. Deliberately
     # separate from _exit_stuck_count, which has other diagnostic semantics
-    # and is reset on every submit (see _mark_exit_submitted). This field
-    # exists solely to preserve the adaptive-exit-pricing ladder attempt
-    # number across: broker-proven cancel of a stale exit -> replacement
-    # submit -> replacement later becomes stale -> another proven cancel ->
-    # next replacement submit. It must survive submission and must only
+    # and is reset on every submit (see _mark_exit_submitted). The durable
+    # replacement_generation lifecycle field is the distinct economic
+    # identity; this field only preserves the adaptive-pricing ladder rung
+    # across: broker-proven cancel of a stale exit -> replacement submit ->
+    # replacement later becomes stale -> another proven cancel -> next
+    # replacement submit. It must survive submission and must only
     # reset on proven economic completion (see mark_position_closed and
     # completed scale-outs in note_partial_exit_fill / exactly-once increment
     # in mark_exit_replacement_safe).
@@ -2820,6 +2821,11 @@ try:
 except (TypeError, ValueError, OverflowError):
     EXIT_REPLACE_MAX_ATTEMPTS = 4
 
+# replacement_generation is an economic identity, not a pricing rung.
+# It is stored in JSONB and compared with PostgreSQL bigint in the CAS
+# predicate, so keep its accepted range aligned with that durable type.
+EXIT_REPLACEMENT_GENERATION_MAX = (1 << 63) - 1
+
 # PR #423: replacement authority is a lifecycle, not a quantity.  ``STAGED``
 # is intentionally an internal handoff state: it is written before the exact
 # old OSM generation is terminalized and cannot authorize a new submit until
@@ -3492,7 +3498,7 @@ def _parse_exit_retry_liveness_namespace(namespace) -> tuple[Optional[dict], str
         generation = _strict_lifecycle_int(
             namespace.get("replacement_generation", 0),
             minimum=0,
-            maximum=EXIT_REPLACE_MAX_ATTEMPTS,
+            maximum=EXIT_REPLACEMENT_GENERATION_MAX,
         )
         quantity = _strict_lifecycle_int(namespace.get("replace_quantity", 0), minimum=0)
         ack = namespace.get("last_ack_identity", "")
@@ -3512,7 +3518,8 @@ def _parse_exit_retry_liveness_namespace(namespace) -> tuple[Optional[dict], str
         namespace.get("replace_attempt"), minimum=1, maximum=EXIT_REPLACE_MAX_ATTEMPTS,
     )
     generation = _strict_lifecycle_int(
-        namespace.get("replacement_generation"), minimum=1, maximum=EXIT_REPLACE_MAX_ATTEMPTS,
+        namespace.get("replacement_generation"), minimum=1,
+        maximum=EXIT_REPLACEMENT_GENERATION_MAX,
     )
     quantity = _strict_lifecycle_int(namespace.get("replace_quantity"), minimum=1)
     if attempt is None or generation is None or quantity is None:
@@ -3588,6 +3595,33 @@ def _restore_exit_replace_attempt_from_meta(raw_meta) -> dict[str, object]:
     if not isinstance(namespace, dict):
         namespace = {}
 
+    # A declared state is the canonical lifecycle format. Parse it before
+    # restoring any legacy mirror: malformed durable authority must not leave
+    # exit_replace_attempt populated and change the live pricing rung after
+    # the lifecycle itself has been rejected.
+    if "state" in namespace:
+        lifecycle, error = _parse_exit_retry_liveness_namespace(namespace)
+        if lifecycle is None:
+            return {
+                "replace_attempt": 0,
+                "last_ack_identity": "",
+                "replace_quantity": 0,
+                "lifecycle": None,
+                "lifecycle_valid": False,
+                "lifecycle_error": error,
+            }
+        return {
+            "replace_attempt": int(lifecycle.get("replace_attempt") or 0),
+            "last_ack_identity": str(lifecycle.get("last_ack_identity") or ""),
+            "replace_quantity": int(lifecycle.get("replace_quantity") or 0),
+            "lifecycle": lifecycle,
+            "lifecycle_valid": True,
+            "lifecycle_error": "ok",
+        }
+
+    # Rows without a declared state are legacy compatibility rows. They do
+    # not carry canonical replacement authority, but retain the historical
+    # best-effort pricing-counter restoration contract.
     try:
         attempt = int(namespace.get("replace_attempt", 0) or 0)
         if attempt < 0:
@@ -3611,14 +3645,6 @@ def _restore_exit_replace_attempt_from_meta(raw_meta) -> dict[str, object]:
         "last_ack_identity": str(namespace.get("last_ack_identity", "") or ""),
         "replace_quantity": replace_qty,
     }
-    # Keep the legacy return shape for legacy rows.  A declared lifecycle is
-    # exposed only after strict validation; callers must not infer authority
-    # from the legacy quantity field when this block is absent or invalid.
-    if "state" in namespace:
-        lifecycle, error = _parse_exit_retry_liveness_namespace(namespace)
-        restored["lifecycle"] = lifecycle
-        restored["lifecycle_valid"] = lifecycle is not None
-        restored["lifecycle_error"] = error
     return restored
 
 
@@ -3981,10 +4007,11 @@ class APExitEngine:
             prior_attempt = int(getattr(pos, "exit_replace_attempt", 0) or 0)
             attempt = min(max(1, prior_attempt + 1), EXIT_REPLACE_MAX_ATTEMPTS)
         if generation is None:
-            generation = attempt
+            generation = prior_generation + 1
         if (
             type(attempt) is not int or not 1 <= attempt <= EXIT_REPLACE_MAX_ATTEMPTS
-            or type(generation) is not int or not 1 <= generation <= EXIT_REPLACE_MAX_ATTEMPTS
+            or type(generation) is not int
+            or not 1 <= generation <= EXIT_REPLACEMENT_GENERATION_MAX
         ):
             return False, prior_state, "replacement_generation_invalid", prior_generation
         payload = {
@@ -4029,8 +4056,8 @@ class APExitEngine:
         hard_exit_reference and protective-monitoring-state elsewhere in
         this file. Never overwrites unrelated meta keys.
 
-        A replacement-generation increment is not authoritative until this
-        write succeeds.  Callers fail closed when the row cannot be updated;
+        A pricing-attempt/lifecycle-generation increment is not authoritative
+        until this write succeeds. Callers fail closed when the row cannot be updated;
         otherwise a process restart could hydrate the old counter and reuse a
         stale pricing rung for a live replacement.
         """
@@ -4103,7 +4130,7 @@ class APExitEngine:
                           AND client_id = %s
                           AND execution_mode = %s
                           AND COALESCE(meta->'exit_retry_liveness'->>'state', 'NONE') = %s
-                          AND COALESCE((meta->'exit_retry_liveness'->>'replacement_generation')::integer, 0) = %s
+                          AND COALESCE((meta->'exit_retry_liveness'->>'replacement_generation')::bigint, 0) = %s
                         {where_extra}
                         """,
                         (
@@ -6491,6 +6518,7 @@ class APExitEngine:
             prior_attempt + 1,
             EXIT_REPLACE_MAX_ATTEMPTS,
         )
+        target_generation = prior_generation + 1
         pos._exit_replace_attempt_last_ack_identity = proof_identity
         lifecycle_ok, _, lifecycle_error, _ = self._set_replacement_lifecycle_locked(
             pos,
@@ -6500,7 +6528,7 @@ class APExitEngine:
             replacement_qty=replacement_qty or int(getattr(pos, "pending_exit_replace_qty", 0) or 0),
             reason=reason,
             attempt=pos.exit_replace_attempt,
-            generation=pos.exit_replace_attempt,
+            generation=target_generation,
         )
         if not lifecycle_ok:
             pos.exit_replace_attempt = prior_attempt
@@ -6795,6 +6823,7 @@ class APExitEngine:
                 max(1, int(getattr(pos, "exit_replace_attempt", 0) or 0) + 1),
                 EXIT_REPLACE_MAX_ATTEMPTS,
             )
+            target_generation = prior_generation + 1
             target_state = EXIT_REPLACEMENT_STATE_STAGED if defer_attempt else EXIT_REPLACEMENT_STATE_PENDING
             ok, _, _, _ = self._set_replacement_lifecycle_locked(
                 pos,
@@ -6804,7 +6833,7 @@ class APExitEngine:
                 replacement_qty=replacement_qty,
                 reason=reason,
                 attempt=target_attempt,
-                generation=target_attempt,
+                generation=target_generation,
             )
             if not ok:
                 return False
@@ -8113,6 +8142,9 @@ class APExitEngine:
                                 _retry_liveness["lifecycle_valid"] = False
                                 _retry_liveness["lifecycle"] = None
                                 _retry_liveness["lifecycle_error"] = "row_client_or_execution_mode_invalid"
+                                _retry_liveness["replace_attempt"] = 0
+                                _retry_liveness["last_ack_identity"] = ""
+                                _retry_liveness["replace_quantity"] = 0
                     _restored_attempt = int(_retry_liveness["replace_attempt"])
                     mp.exit_replace_attempt = _restored_attempt
                     mp._exit_replace_attempt_last_ack_identity = str(
@@ -8140,10 +8172,13 @@ class APExitEngine:
                                 _retry_liveness.get("lifecycle_error", "invalid"),
                             )
                             mp.exit_retry_liveness = {}
+                            mp.exit_replace_attempt = 0
+                            mp._exit_replace_attempt_last_ack_identity = ""
                             mp.pending_exit_replace_allowed = False
                             mp.pending_exit_replace_qty = 0
                             mp.pending_exit_replace_durable_pending = False
                             mp.pending_exit_replace_revalidated = False
+                            mp.pending_exit_replace_submit_claimed = False
                     if _restored_attempt > 0:
                         log.info(
                             "[exit_eng] SEED_EXIT_REPLACE_ATTEMPT_RESTORED client=%s "
@@ -10064,9 +10099,9 @@ class APExitEngine:
                 _ask  = pos.current_ask if pos.current_ask > _bid else 0.0
                 _mid  = round((_bid + _ask) / 2.0, 2) if _ask > 0 else _bid
                 _spread_pct = ((_ask - _bid) / _bid) if (_ask > 0 and _bid > 0) else 1.0
-                # PR #423: use the dedicated replacement generation counter,
-                # not _exit_stuck_count (separate diagnostic semantics,
-                # reset on every submit). exit_replace_attempt survives
+                # PR #423: use the dedicated replacement-pricing attempt
+                # counter, not _exit_stuck_count (separate diagnostic
+                # semantics, reset on every submit). exit_replace_attempt survives
                 # submission and only advances on a broker-proven cancel of
                 # the prior generation — see mark_exit_replacement_safe().
                 _attempt    = int(getattr(pos, "exit_replace_attempt", 0))

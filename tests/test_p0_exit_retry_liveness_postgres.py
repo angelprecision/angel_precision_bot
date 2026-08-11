@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 from contextlib import contextmanager
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -151,8 +152,8 @@ def test_replacement_lifecycle_jsonb_merge_and_generation_fence(monkeypatch):
         # A newer replacement generation wins the CAS; an old process cannot
         # overwrite it even when position/client/mode still match.
         newer = dict(position.exit_retry_liveness)
-        newer["replacement_generation"] = 2
-        newer["replace_attempt"] = 2
+        newer["replacement_generation"] = 5
+        newer["replace_attempt"] = 4
         with _real_pg_conn() as cursor:
             cursor.execute(
                 "UPDATE positions SET meta=jsonb_set(meta, '{exit_retry_liveness}', %s::jsonb) WHERE id=%s",
@@ -161,6 +162,31 @@ def test_replacement_lifecycle_jsonb_merge_and_generation_fence(monkeypatch):
         assert hydrated._persist_replacement_lifecycle(
             position, expected_state="REPLACEMENT_PENDING", expected_generation=1,
         ) is False
+
+        # Explicit ABA regression: a stale process holding generation 4 must
+        # not overwrite a newer durable generation 5.
+        stale_generation = copy.copy(position)
+        stale_generation.exit_retry_liveness = dict(position.exit_retry_liveness)
+        stale_generation.exit_retry_liveness.update({
+            "replace_attempt": 4,
+            "replacement_generation": 4,
+        })
+        broker = MagicMock()
+        stale_engine = APExitEngine(broker=broker, email=client_id)
+        assert stale_engine._persist_replacement_lifecycle(
+            stale_generation,
+            expected_state="REPLACEMENT_PENDING",
+            expected_generation=4,
+        ) is False
+        assert stale_generation.exit_retry_liveness["replacement_generation"] == 4
+        assert broker.mock_calls == []
+        with _real_pg_conn() as cursor:
+            cursor.execute(
+                "SELECT meta->'exit_retry_liveness'->>'replacement_generation' "
+                "FROM positions WHERE id=%s",
+                (position_id,),
+            )
+            assert cursor.fetchone()[0] == "5"
 
         # Malformed generation metadata fails closed instead of becoming an
         # implicit zero-generation match.
