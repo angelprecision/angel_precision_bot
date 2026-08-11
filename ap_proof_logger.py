@@ -475,6 +475,9 @@ class APProofLogger:
         exit_pricing_tier:   str  = "",
         exit_attempt:        int  = 0,
         seconds_to_fill:     float = 0.0,
+        broker_exit_order_id: str = "",
+        broker_exit_fill_ts:  Optional[datetime] = None,
+        broker_exit_filled_qty: Optional[int] = None,
     ) -> dict:
         now = datetime.now(timezone.utc)
         # execution_mode is COPIED from the originating entry order (source of
@@ -541,6 +544,19 @@ class APProofLogger:
             "exit_attempt":       exit_attempt if exit_attempt else None,
             "seconds_to_fill":    round(seconds_to_fill, 1) if seconds_to_fill else None,
         }
+        # Exact broker EXIT provenance is supplied by reconciler/manual truth
+        # paths when available. Keep these fields optional so older callers and
+        # schemas retain their existing fallback behavior.
+        if broker_exit_order_id:
+            row["broker_exit_order_id"] = str(broker_exit_order_id)
+        if broker_exit_fill_ts is not None:
+            row["broker_exit_fill_ts"] = (
+                broker_exit_fill_ts.isoformat()
+                if isinstance(broker_exit_fill_ts, datetime)
+                else str(broker_exit_fill_ts)
+            )
+        if broker_exit_filled_qty:
+            row["broker_exit_filled_qty"] = int(broker_exit_filled_qty)
 
         # Cache for convenience — not source of truth
         with self._lock:

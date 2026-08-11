@@ -136,6 +136,20 @@ if not contract or not position_id or mode is None:
     return None
 ```
 
+#### Amendment — position identity is not exit-generation identity
+
+The helper must also receive the current EXIT generation's local and/or broker
+order identity. A position can contain several legitimate EXIT rows over its
+lifetime, so a history-wide query by `position_id` is not authorization. With
+neither current identity available, the helper must return `None` and leave
+external/manual-close reconciliation as the authority. When an identity is
+available, SQL and post-fetch validation must bind it exactly to the returned
+row and require a nonblank `local_order_id`, broker order id, terminal status,
+valid `filled_ts`, and `filled_ts >= COALESCE(position.entry_ts,
+position.opened_at)`. The helper carries the exact broker/local IDs, timestamp,
+quantity, price, position, contract, mode, and status forward as one evidence
+bundle.
+
 Required SQL shape:
 
 ```sql
@@ -144,18 +158,23 @@ SELECT broker_order_id,
        position_id,
        contract,
        execution_mode,
+       status,
        fill_price,
        filled_qty,
        filled_ts,
        updated_ts
-FROM orders
-WHERE client_id = %s
-  AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-  AND kind = 'EXIT'
-  AND status IN ('FILLED', 'EXIT_FILLED', 'EXIT_PARTIAL_FILL')
-  AND UPPER(TRIM(COALESCE(contract, ''))) = %s
-  AND position_id::text = %s
-ORDER BY COALESCE(filled_ts, updated_ts) DESC
+FROM orders o
+JOIN positions p ON p.client_id = o.client_id
+                 AND p.id::text = o.position_id::text
+WHERE o.client_id = %s
+  AND LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s
+  AND o.kind = 'EXIT'
+  AND o.status IN ('FILLED', 'EXIT_FILLED')
+  AND UPPER(TRIM(COALESCE(o.contract, ''))) = %s
+  AND o.position_id::text = %s
+  AND o.local_order_id = %s              -- when local identity is known
+  AND o.broker_order_id = %s             -- when broker identity is known
+ORDER BY COALESCE(o.filled_ts, o.updated_ts) DESC
 LIMIT 2
 ```
 
@@ -188,6 +207,8 @@ exit_fill = self._get_recent_exit_fill(
     contract,
     position_id=str(pos_id or ""),
     execution_mode=position_mode or "",
+    local_order_id=pos.get("pending_exit_local_order_id") or "",
+    broker_order_id=pos.get("pending_exit_broker_order_id") or "",
 )
 ```
 
@@ -235,18 +256,27 @@ Include:
 
 Three broker-flat observations prove the position is absent at the broker. They do **not** prove a realized fill price.
 
+The exact-fill path must re-read the matching durable EXIT row under the position
+lock immediately before the `positions` UPDATE. If the current pending EXIT
+identity, durable row identity, timestamp, status, price, or quantity no longer
+matches, the mutation is HOLD/no-op. Any proof write and exit-engine callback
+must use the evidence bundle's EXIT local/broker identity, not the position's
+entry order identity.
+
 #### Change C — do not alter `_execute_reconciler_close()` semantics broadly
 
 Keep `_execute_reconciler_close()` for callers that provide exact proven economics. Do not turn this PR into a position-manager rewrite.
 
-Add a defensive assertion at its entrance if useful:
+Add a defensive exact-evidence assertion at its entrance:
 
 ```python
-if close_confidence == "HIGH" and not exact_exit_fill_proven:
+if close_confidence == "HIGH" and not exact_exit_evidence:
     ... block ...
 ```
 
-Only add the parameter if necessary to prevent future accidental use. Prefer the smallest call-site correction if all other callers are already exact.
+The proof row should preserve `broker_exit_order_id`, `broker_exit_fill_ts`, and
+`broker_exit_filled_qty` when those columns are available. Do not fall back to
+the position's `local_order_id`, which identifies the entry generation.
 
 ### File 2 — focused regression tests
 
@@ -276,6 +306,12 @@ Required cases:
 16. Exact EXIT fill qty 2 vs current remaining 4 -> coverage HOLD, no close/proof mutation.
 17. `EXIT_PARTIAL_FILL` qty 2 vs current remaining 4 -> coverage HOLD.
 18. Exact EXIT fill qty 2 vs current remaining 2 -> existing close path remains functional.
+19. Same-position historical terminal EXIT cannot authorize a current remaining close.
+20. Historical terminal EXIT cannot bypass an active current EXIT guard.
+21. Missing-ID EXIT generation A evidence cannot terminalize generation B.
+22. Missing, malformed, and pre-entry `filled_ts` values hold.
+23. Exact broker EXIT identity/timestamp/quantity reaches the position callback and proof writer.
+24. Broker-flat observation before external/manual fill adoption causes no position/proof mutation.
 
 ## Explicit non-goals
 
@@ -300,9 +336,12 @@ Expected:
 
 1. `ap_reconciler.py`
 2. `tests/test_p0_reconciler_exact_exit_fill_truth.py`
-3. `.github/workflows/p0_regression.yml` only if the focused test is not already picked up by an existing pattern
+3. `ap_proof_logger.py` only to persist the existing `broker_exit_order_id`,
+   `broker_exit_fill_ts`, and `broker_exit_filled_qty` columns from the exact
+   evidence bundle
+4. `.github/workflows/p0_regression.yml` only if the focused test is not already picked up by an existing pattern
 
-If implementation needs more production files, stop and explain why before widening scope.
+No other production files are changed.
 
 ## Money-path audit answers
 

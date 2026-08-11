@@ -262,6 +262,22 @@ def _normalize_execution_mode(value: object) -> str | None:
     return mode if mode in _VALID_EXECUTION_MODES else None
 
 
+def _parse_reconciler_timestamp(value: object) -> Optional[datetime]:
+    """Parse a durable timestamp without accepting malformed/naive truth."""
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 class APBrokerReconciler:
     """
     Continuously reconciles broker truth against DB state.
@@ -1016,6 +1032,19 @@ class APBrokerReconciler:
                           AND o.status = 'EXIT_FILLED'
                           AND o.fill_price IS NOT NULL
                           AND COALESCE(o.filled_qty, 0) > 0
+                          AND o.filled_ts IS NOT NULL
+                          AND COALESCE(p.entry_ts, p.opened_at) IS NOT NULL
+                          AND o.filled_ts >= COALESCE(p.entry_ts, p.opened_at)
+                          AND LOWER(TRIM(COALESCE(o.execution_mode, ''))) =
+                              LOWER(TRIM(COALESCE(p.execution_mode, '')))
+                          AND UPPER(TRIM(COALESCE(o.contract, ''))) =
+                              UPPER(TRIM(COALESCE(p.contract, '')))
+                          AND (
+                              NULLIF(TRIM(COALESCE(p.pending_exit_local_order_id, '')), '')
+                                  = o.local_order_id
+                              OR NULLIF(TRIM(COALESCE(p.pending_exit_broker_order_id, '')), '')
+                                  = o.broker_order_id
+                          )
                           AND p.avg_fill IS NOT NULL
                           AND p.avg_fill > 0
                           AND (
@@ -1292,6 +1321,8 @@ class APBrokerReconciler:
             contract,
             position_id=pos_id,
             execution_mode=order.get("execution_mode") or "",
+            local_order_id=local_id,
+            broker_order_id=str(order.get("broker_order_id") or "").strip(),
         )
         if recent_fill:
             fill_qty = self._safe_int(recent_fill.get("filled_qty"), requested_qty or 0)
@@ -1421,6 +1452,8 @@ class APBrokerReconciler:
                     order.get("position_id") or order.get("positionId") or ""
                 ).strip(),
                 execution_mode=order.get("execution_mode") or "",
+                local_order_id=str(local_id or "").strip(),
+                broker_order_id=str(order.get("broker_order_id") or "").strip(),
             )
             if recent_fill:
                 self._alert(
@@ -2939,12 +2972,31 @@ class APBrokerReconciler:
         *,
         position_id: str,
         execution_mode: str,
+        local_order_id: str = "",
+        broker_order_id: str = "",
     ) -> Optional[dict]:
-        """Return one exact, economically usable broker EXIT fill, if proven."""
+        """Return one exact current-generation broker EXIT fill, if proven.
+
+        Position identity alone is deliberately insufficient here: a position can
+        have multiple EXIT generations over its lifetime.  Callers must provide
+        the current local and/or broker EXIT identity; without one, a historical
+        fill is not safe evidence for a new close or missing-ID recovery.
+        """
         contract = self._norm_contract(contract)
         position_id = str(position_id or "").strip()
         mode = _normalize_execution_mode(execution_mode)
-        if not contract or not position_id or mode is None:
+        local_order_id = str(local_order_id or "").strip()
+        broker_order_id = str(broker_order_id or "").strip()
+        if local_order_id.lower() in {"none", "null"}:
+            local_order_id = ""
+        if broker_order_id.lower() in {"none", "null"}:
+            broker_order_id = ""
+        if (
+            not contract
+            or not position_id
+            or mode is None
+            or not (local_order_id or broker_order_id)
+        ):
             return None
 
         try:
@@ -2952,28 +3004,43 @@ class APBrokerReconciler:
 
             def _fetch():
                 with conn() as c:
+                    identity_predicates = []
+                    identity_params = []
+                    if local_order_id:
+                        identity_predicates.append("o.local_order_id = %s")
+                        identity_params.append(local_order_id)
+                    if broker_order_id:
+                        identity_predicates.append("o.broker_order_id = %s")
+                        identity_params.append(broker_order_id)
+
                     c.execute(
-                        """
-                        SELECT broker_order_id,
-                               local_order_id,
-                               position_id,
-                               contract,
-                               execution_mode,
-                               fill_price,
-                               filled_qty,
-                               filled_ts,
-                               updated_ts
-                        FROM   orders
-                        WHERE  client_id = %s
-                          AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                          AND  kind = 'EXIT'
-                          AND  status IN ('FILLED', 'EXIT_FILLED')
-                          AND  UPPER(TRIM(COALESCE(contract, ''))) = %s
-                          AND  position_id::text = %s
-                        ORDER  BY COALESCE(filled_ts, updated_ts) DESC
+                        f"""
+                        SELECT o.broker_order_id,
+                               o.local_order_id,
+                               o.position_id,
+                               o.contract,
+                               o.execution_mode,
+                               o.status,
+                               o.fill_price,
+                               o.filled_qty,
+                               o.filled_ts,
+                               o.updated_ts,
+                               COALESCE(p.entry_ts, p.opened_at) AS position_entry_ts
+                        FROM   orders o
+                        JOIN   positions p
+                          ON   p.client_id = o.client_id
+                         AND   p.id::text = o.position_id::text
+                        WHERE  o.client_id = %s
+                          AND  LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s
+                          AND  o.kind = 'EXIT'
+                          AND  o.status IN ('FILLED', 'EXIT_FILLED')
+                          AND  UPPER(TRIM(COALESCE(o.contract, ''))) = %s
+                          AND  o.position_id::text = %s
+                          AND  {' AND '.join(identity_predicates)}
+                        ORDER  BY COALESCE(o.filled_ts, o.updated_ts) DESC
                         LIMIT  2
                         """,
-                        (self.client_id, mode, contract, position_id),
+                        (self.client_id, mode, contract, position_id, *identity_params),
                     )
                     rows = c.fetchall() or []
 
@@ -2992,13 +3059,26 @@ class APBrokerReconciler:
                         return None
 
                     row = dict(rows[0])
-                    broker_order_id = str(row.get("broker_order_id") or "").strip()
+                    row_broker_order_id = str(row.get("broker_order_id") or "").strip()
+                    row_local_order_id = str(row.get("local_order_id") or "").strip()
+                    row_status = str(row.get("status") or "").upper().strip()
+                    filled_ts = _parse_reconciler_timestamp(row.get("filled_ts"))
+                    position_entry_ts = _parse_reconciler_timestamp(
+                        row.get("position_entry_ts")
+                    )
                     if (
-                        not broker_order_id
-                        or broker_order_id.lower() in {"none", "null"}
+                        not row_broker_order_id
+                        or row_broker_order_id.lower() in {"none", "null"}
+                        or not row_local_order_id
+                        or row_status not in {"FILLED", "EXIT_FILLED"}
                         or self._norm_contract(row.get("contract")) != contract
                         or str(row.get("position_id") or "").strip() != position_id
                         or _normalize_execution_mode(row.get("execution_mode")) != mode
+                        or (local_order_id and row_local_order_id != local_order_id)
+                        or (broker_order_id and row_broker_order_id != broker_order_id)
+                        or filled_ts is None
+                        or position_entry_ts is None
+                        or filled_ts < position_entry_ts
                     ):
                         return None
 
@@ -3012,6 +3092,7 @@ class APBrokerReconciler:
                         or not math.isfinite(filled_qty)
                         or fill_price <= 0
                         or filled_qty <= 0
+                        or not filled_qty.is_integer()
                     ):
                         return None
                     return row
@@ -3155,10 +3236,18 @@ class APBrokerReconciler:
     ) -> None:
         pos_id    = pos.get("id") or pos.get("position_id")
         position_mode = _normalize_execution_mode(pos.get("execution_mode"))
+        current_exit_local_id = str(
+            pos.get("pending_exit_local_order_id") or ""
+        ).strip()
+        current_exit_broker_id = str(
+            pos.get("pending_exit_broker_order_id") or ""
+        ).strip()
         exit_fill = self._get_recent_exit_fill(
             contract,
             position_id=str(pos_id or "").strip(),
             execution_mode=position_mode or "",
+            local_order_id=current_exit_local_id,
+            broker_order_id=current_exit_broker_id,
         )
 
         if exit_fill and float(exit_fill.get("fill_price") or 0) > 0:
@@ -3200,9 +3289,29 @@ class APBrokerReconciler:
             filled_qty = int(filled_qty_value)
             exit_px          = float(exit_fill["fill_price"])
             close_confidence = "HIGH"
+            exact_exit_evidence = {
+                "broker_order_id": str(exit_fill.get("broker_order_id") or "").strip(),
+                "exit_local_order_id": str(exit_fill.get("local_order_id") or "").strip(),
+                "filled_ts": exit_fill.get("filled_ts"),
+                "filled_qty": filled_qty,
+                "fill_price": exit_px,
+                "position_id": str(exit_fill.get("position_id") or "").strip(),
+                "contract": self._norm_contract(exit_fill.get("contract")),
+                "execution_mode": _normalize_execution_mode(
+                    exit_fill.get("execution_mode")
+                ),
+                "status": str(exit_fill.get("status") or "").upper().strip(),
+            }
             log.info(
-                "[%s] RECONCILE_CLOSE_EVIDENCE | %s | filled exit found @ $%.4f",
-                self.client_id, contract, exit_px,
+                "[%s] RECONCILE_CLOSE_EVIDENCE | %s | local=%s broker=%s "
+                "filled_ts=%s filled_qty=%d @ $%.4f",
+                self.client_id,
+                contract,
+                exact_exit_evidence["exit_local_order_id"] or "?",
+                exact_exit_evidence["broker_order_id"] or "?",
+                exact_exit_evidence["filled_ts"] or "?",
+                filled_qty,
+                exit_px,
             )
         else:
             pos_id_str       = str(pos_id or "")
@@ -3243,14 +3352,21 @@ class APBrokerReconciler:
             ticker=self._norm_underlying(underlying or contract),
             category_name="DATA",
             severity_name="WARNING",
-            reason_code="BROKER_POSITION_MISSING_THREE_PASS_CONFIRM",
-            human_reason="broker position missing after three-pass confirmation; reconciler auto-closing DB position",
+            reason_code="BROKER_POSITION_MISSING_EXACT_EXIT_FILL_CONFIRMED",
+            human_reason=(
+                "broker position missing; exact current-generation broker EXIT fill "
+                "confirmed; reconciler auto-closing DB position"
+            ),
             contract=contract,
             pos_id=pos_id,
             db_qty=db_qty,
             entry_px=entry_px,
             exit_px=exit_px,
             close_confidence=close_confidence,
+            broker_exit_order_id=exact_exit_evidence["broker_order_id"],
+            exit_local_order_id=exact_exit_evidence["exit_local_order_id"],
+            broker_exit_fill_ts=exact_exit_evidence["filled_ts"],
+            broker_exit_filled_qty=exact_exit_evidence["filled_qty"],
             client_id=self.client_id,
         )
 
@@ -3264,6 +3380,7 @@ class APBrokerReconciler:
             close_confidence=close_confidence,
             summary=summary,
             exact_exit_fill_qty=filled_qty,
+            exact_exit_evidence=exact_exit_evidence,
             side=side if "side" in dir() else (pos.get("side") or pos.get("direction") or "CALL"),
         )
 
@@ -3279,6 +3396,7 @@ class APBrokerReconciler:
         close_confidence: str,
         summary: dict,
         exact_exit_fill_qty: int | None = None,
+        exact_exit_evidence: Optional[dict] = None,
         side: str = "CALL",
     ) -> None:
         """
@@ -3290,6 +3408,61 @@ class APBrokerReconciler:
               Otherwise status=PARTIAL (broker is flat but prior scale-outs exist).
         """
         pos_id = pos.get("id") or pos.get("position_id")
+        evidence = dict(exact_exit_evidence or {})
+        evidence_broker_order_id = str(
+            evidence.get("broker_order_id") or ""
+        ).strip()
+        evidence_local_order_id = str(
+            evidence.get("exit_local_order_id") or evidence.get("local_order_id") or ""
+        ).strip()
+        evidence_position_id = str(evidence.get("position_id") or "").strip()
+        evidence_contract = self._norm_contract(evidence.get("contract"))
+        evidence_mode = _normalize_execution_mode(evidence.get("execution_mode"))
+        evidence_status = str(evidence.get("status") or "").upper().strip()
+        evidence_filled_ts = _parse_reconciler_timestamp(evidence.get("filled_ts"))
+        try:
+            evidence_filled_qty_value = float(evidence.get("filled_qty"))
+        except (TypeError, ValueError):
+            evidence_filled_qty_value = 0.0
+        try:
+            evidence_fill_price = float(evidence.get("fill_price"))
+        except (TypeError, ValueError):
+            evidence_fill_price = 0.0
+        expected_mode = _normalize_execution_mode(
+            pos.get("execution_mode") or self.execution_mode
+        )
+        evidence_valid = (
+            bool(evidence)
+            and bool(evidence_broker_order_id)
+            and bool(evidence_local_order_id)
+            and evidence_position_id == str(pos_id or "").strip()
+            and evidence_contract == self._norm_contract(contract)
+            and expected_mode is not None
+            and evidence_mode == expected_mode
+            and evidence_status in {"FILLED", "EXIT_FILLED"}
+            and evidence_filled_ts is not None
+            and math.isfinite(evidence_filled_qty_value)
+            and evidence_filled_qty_value > 0
+            and evidence_filled_qty_value.is_integer()
+            and math.isfinite(evidence_fill_price)
+            and evidence_fill_price > 0
+            and math.isclose(evidence_fill_price, float(exit_px), rel_tol=0.0, abs_tol=1e-9)
+            and (
+                exact_exit_fill_qty is None
+                or int(exact_exit_fill_qty) == int(evidence_filled_qty_value)
+            )
+        )
+        if not evidence_valid:
+            self._alert(
+                "RECONCILER_EXIT_FILL_EVIDENCE_UNPROVEN | "
+                f"client_id={self.client_id} position_id={str(pos_id or '') or '?'} "
+                f"contract={contract or '?'} reason=invalid_or_missing_exact_exit_bundle"
+            )
+            summary["positions_alerted"] += 1
+            return
+
+        exact_exit_fill_qty = int(evidence_filled_qty_value)
+        exit_px = evidence_fill_price
         pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
         pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
 
@@ -3317,7 +3490,9 @@ class APBrokerReconciler:
                 with conn() as c:
                     # Re-fetch the row under lock so we use the freshest remaining qty.
                     c.execute(
-                        "SELECT quantity_remaining, qty FROM positions "
+                        "SELECT quantity_remaining, qty, "
+                        "pending_exit_local_order_id, pending_exit_broker_order_id "
+                        "FROM positions "
                         "WHERE id = %s AND client_id = %s FOR UPDATE",
                         (pos_id, self.client_id),
                     )
@@ -3326,6 +3501,114 @@ class APBrokerReconciler:
                         return None
 
                     _row = dict(row)
+                    locked_local_order_id = str(
+                        _row.get("pending_exit_local_order_id") or ""
+                    ).strip()
+                    locked_broker_order_id = str(
+                        _row.get("pending_exit_broker_order_id") or ""
+                    ).strip()
+                    if (
+                        not (locked_local_order_id or locked_broker_order_id)
+                        or (
+                            locked_local_order_id
+                            and locked_local_order_id != evidence_local_order_id
+                        )
+                        or (
+                            locked_broker_order_id
+                            and locked_broker_order_id != evidence_broker_order_id
+                        )
+                    ):
+                        return {
+                            "blocked_reason": "RECONCILER_EXIT_FILL_EVIDENCE_CHANGED",
+                            "broker_order_id": evidence_broker_order_id,
+                            "local_order_id": evidence_local_order_id,
+                        }
+
+                    # Re-read the exact broker EXIT row in the same transaction
+                    # immediately before the position UPDATE.  Position identity
+                    # alone is not enough: an older EXIT generation for the same
+                    # position must never authorize this mutation.
+                    c.execute(
+                        """
+                        SELECT broker_order_id,
+                               local_order_id,
+                               position_id,
+                               contract,
+                               execution_mode,
+                               status,
+                               fill_price,
+                               filled_qty,
+                               filled_ts
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'EXIT'
+                          AND status IN ('FILLED', 'EXIT_FILLED')
+                          AND position_id::text = %s
+                          AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                          AND local_order_id = %s
+                          AND broker_order_id = %s
+                        FOR SHARE
+                        """,
+                        (
+                            self.client_id,
+                            str(pos_id or "").strip(),
+                            self._norm_contract(contract),
+                            expected_mode,
+                            evidence_local_order_id,
+                            evidence_broker_order_id,
+                        ),
+                    )
+                    durable_evidence_row = c.fetchone()
+                    if not durable_evidence_row:
+                        return {
+                            "blocked_reason": "RECONCILER_EXIT_FILL_EVIDENCE_CHANGED",
+                            "broker_order_id": evidence_broker_order_id,
+                            "local_order_id": evidence_local_order_id,
+                        }
+                    durable_evidence_row = dict(durable_evidence_row)
+                    durable_filled_ts = _parse_reconciler_timestamp(
+                        durable_evidence_row.get("filled_ts")
+                    )
+                    try:
+                        durable_filled_qty = float(durable_evidence_row.get("filled_qty"))
+                        durable_fill_price = float(durable_evidence_row.get("fill_price"))
+                    except (TypeError, ValueError):
+                        durable_filled_qty = 0.0
+                        durable_fill_price = 0.0
+                    if (
+                        str(durable_evidence_row.get("broker_order_id") or "").strip()
+                        != evidence_broker_order_id
+                        or str(durable_evidence_row.get("local_order_id") or "").strip()
+                        != evidence_local_order_id
+                        or str(durable_evidence_row.get("position_id") or "").strip()
+                        != evidence_position_id
+                        or self._norm_contract(durable_evidence_row.get("contract"))
+                        != evidence_contract
+                        or _normalize_execution_mode(
+                            durable_evidence_row.get("execution_mode")
+                        )
+                        != evidence_mode
+                        or str(durable_evidence_row.get("status") or "").upper().strip()
+                        not in {"FILLED", "EXIT_FILLED"}
+                        or durable_filled_ts != evidence_filled_ts
+                        or not math.isfinite(durable_filled_qty)
+                        or not durable_filled_qty.is_integer()
+                        or int(durable_filled_qty) != exact_exit_fill_qty
+                        or not math.isfinite(durable_fill_price)
+                        or not math.isclose(
+                            durable_fill_price,
+                            evidence_fill_price,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                    ):
+                        return {
+                            "blocked_reason": "RECONCILER_EXIT_FILL_EVIDENCE_CHANGED",
+                            "broker_order_id": evidence_broker_order_id,
+                            "local_order_id": evidence_local_order_id,
+                        }
+
                     _stored_remaining = _row.get("quantity_remaining")
                     _stored_qty       = int(_row.get("qty") or db_qty or 0)
 
@@ -3416,12 +3699,18 @@ class APBrokerReconciler:
 
         if _result.get("blocked_reason"):
             self._alert(
-                "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN | "
+                f"{_result.get('blocked_reason')} | "
                 f"client_id={self.client_id} contract={contract or '?'} "
                 f"position_id={str(pos_id or '') or '?'} "
-                f"filled_qty={_result.get('filled_qty')} "
-                f"quantity_remaining={_result.get('quantity_remaining')} "
-                "reason=position_remaining_changed_before_close"
+                f"broker_order_id={_result.get('broker_order_id', evidence_broker_order_id)} "
+                f"local_order_id={_result.get('local_order_id', evidence_local_order_id)} "
+                "reason="
+                + (
+                    "position_remaining_changed_before_close"
+                    if _result.get("blocked_reason")
+                    == "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN"
+                    else "durable_exit_evidence_changed_before_close"
+                )
             )
             summary["positions_alerted"] += 1
             return
@@ -3444,7 +3733,15 @@ class APBrokerReconciler:
         _ee = getattr(self, "exit_engine", None)
         if _ee and final_status == "CLOSED":
             try:
-                _ee.mark_position_closed(str(pos_id), reason="reconciler_auto_close")
+                _ee.mark_position_closed(
+                    str(pos_id),
+                    reason="reconciler_auto_close",
+                    qty_filled=exact_exit_fill_qty,
+                    fill_price=exit_px,
+                    local_order_id=evidence_local_order_id,
+                    broker_order_id=evidence_broker_order_id,
+                    reconciled=True,
+                )
             except Exception as _e:
                 log.warning("reconciler_mark_position_closed_failed: %s", _e)
 
@@ -3485,7 +3782,7 @@ class APBrokerReconciler:
                 )
                 _proof_write_failed = True
             else:
-                _local_order_id = str(pos.get("local_order_id") or "")
+                _local_order_id = evidence_local_order_id
                 _pos_id_str     = str(pos_id or "")
 
                 # ── Idempotency: three-state lookup ───────────────────────────
@@ -3574,6 +3871,9 @@ class APBrokerReconciler:
                         position_id        = _pos_id_str,
                         local_order_id     = _local_order_id,
                         execution_mode     = self.execution_mode or "",
+                        broker_exit_order_id = evidence_broker_order_id,
+                        broker_exit_fill_ts  = evidence_filled_ts,
+                        broker_exit_filled_qty = exact_exit_fill_qty,
                     )
                     # Check confirmed persistence — never emit PROOF_LOGGED on cache-only write.
                     if _proof_result.get("_proof_persisted") is True:
