@@ -112,6 +112,10 @@ def test_replacement_lifecycle_jsonb_merge_and_generation_fence(monkeypatch):
             (position_id,),
         )
         assert setup_cur.fetchone()[0] == {}
+        setup_cur.execute(
+            f"UPDATE {qualified_positions} SET meta=%s::jsonb WHERE id=%s",
+            (json.dumps({"unrelated": {"keep": True}}), position_id),
+        )
     finally:
         setup_cur.close()
         setup_conn.close()
