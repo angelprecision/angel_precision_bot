@@ -296,13 +296,32 @@ Existing success path writes `retry_new_local_order_id` and `retry_new_broker_or
 
 Do not broaden this unless current process_signal return shape proves the current `SUBMITTED` name is inaccurate.
 
-#### Change G — restart-safe stale `IN_FLIGHT`
+#### Change G — restart-safe stale retry recovery
 
-Add a bounded stale-claim recovery only if needed for the new state.
+Add bounded stale-claim recovery for the new state.
 
 Before re-arming a stale `IN_FLIGHT` row, prove no replacement order exists using the durable identity stored in retry metadata / canonical signal lineage. If replacement existence is ambiguous, HOLD. Never resubmit because a timer expired alone.
 
+The stale timer may scan both `IN_FLIGHT` and `SUBMITTING` rows so they can be
+classified under the same exact client/mode fence. Their recovery outcomes are
+different: an abandoned `IN_FLIGHT` row has not crossed the final submit fence
+and may receive one bounded re-arm after no replacement is proven; an abandoned
+`SUBMITTING` row may still belong to a worker whose symbol-lock lease expired
+while it was in the broker/admission path, so it is quarantined to `HOLD` when
+no exact replacement proof exists. A stale `SUBMITTING` timer must never
+re-arm the parent.
+
 No new scheduler. Use order monitor/recovery's existing tick.
+
+#### Change H — fenced parent ARM/ABORT metadata writes
+
+The cancel hook must update the canceled ENTRY parent through one exact
+snapshot CAS. ARM and ABORT writes require the monitor's explicitly wired
+`live|paper` mode and must match `client_id`, `kind='ENTRY'`,
+`status='CANCELED'`, the durable mode predicate, and the complete prior JSONB
+snapshot. A zero-row CAS is a failed/contended write and must not emit a
+durable retry lifecycle transition or schedule a submit. The legacy unscoped
+`ap.db.update_order(..., meta=...)` path is not an authority for these writes.
 
 ### Tests — `tests/test_p0_post_cancel_entry_retry_liveness.py`
 
@@ -328,10 +347,13 @@ Required load-bearing cases:
 18. stale IN_FLIGHT + proven existing replacement -> no resubmit.
 19. stale IN_FLIGHT + broker/order identity ambiguous -> HOLD, no resubmit.
 20. restart stale IN_FLIGHT + proven no replacement -> at most one safe bounded recovery.
-21. no direct broker submit call is introduced in order monitor; submission remains through `ap.execution.process_signal`.
-22. no broker cancel added.
-23. original cancel reason `entry_max_age_normal_reached` remains retryable.
-24. unknown cancel reason remains fail-closed.
+21. stale SUBMITTING + no replacement proof -> HOLD, never timer-rearmed.
+22. ARM/ABORT metadata writes require exact client/status/kind/mode/snapshot CAS.
+23. two real PostgreSQL sessions racing the ARMED CAS yield one claimant.
+24. no direct broker submit call is introduced in order monitor; submission remains through `ap.execution.process_signal`.
+25. no broker cancel added.
+26. original cancel reason `entry_max_age_normal_reached` remains retryable.
+27. unknown cancel reason remains fail-closed.
 
 Use the MO/META/INTC/AVGO shapes as fixture labels where useful, but assertions must test lifecycle truth, not whether the market later went green.
 
@@ -354,16 +376,24 @@ Do not change:
 
 Do not use this PR to force-fill trades that current market/risk truth rejects.
 
-## Production file budget
+## Production file budget and scope reconciliation
 
 Expected maximum:
 
 1. `ap/post_cancel_retry.py`
 2. `ap/order_monitor.py`
-3. `tests/test_p0_post_cancel_entry_retry_liveness.py`
-4. `.github/workflows/p0_regression.yml` only for CI wiring
+3. `ap/execution.py` — the narrowly justified current-main primitive already
+   carried by this branch: its explicit metadata allow-list preserves retry
+   lineage/mode before the durable replacement insert, and its exception result
+   returns the exact `local_order_id` for reconciliation.
+4. `tests/test_p0_post_cancel_entry_retry_liveness.py`
+5. `tests/test_phase9_retry_wire_in.py` — existing wire-in fixtures updated
+   only to pass explicit mode and observe the fenced parent-write seam.
+6. `.github/workflows/p0_regression.yml` only for CI wiring
 
-Do not touch OSM/execution core unless the current-main implementation proves a required durable primitive is missing. If that happens, stop and explain the missing seam before adding a fourth production file.
+The `ap/execution.py` change is the required durable primitive proven missing on
+current `main`; no further execution-core expansion is part of this PR. The
+corrections in this amendment stay within the three production-file budget.
 
 ## Money-path audit answers
 
@@ -387,7 +417,8 @@ Do not touch OSM/execution core unless the current-main implementation proves a 
 ```bash
 python -m pytest -q \
   tests/test_p0_post_cancel_entry_retry_liveness.py \
-  tests/test_phase9_retry_wire_in.py
+  tests/test_phase9_retry_wire_in.py \
+  tests/test_phase5_post_cancel_retry.py
 python -m py_compile ap/post_cancel_retry.py ap/order_monitor.py
 
 git diff --check

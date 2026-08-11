@@ -6,10 +6,13 @@ import copy
 import json
 import os
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import psycopg2
 
 os.environ.setdefault(
     "DATABASE_URL",
@@ -203,6 +206,164 @@ def _patch_scan(monkeypatch, row):
     )
 
 
+def _ensure_retry_orders_table(database_url: str) -> None:
+    with psycopg2.connect(database_url) as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    client_id TEXT,
+                    kind TEXT,
+                    status TEXT,
+                    contract TEXT,
+                    symbol TEXT,
+                    direction TEXT,
+                    execution_mode TEXT,
+                    broker_order_id TEXT,
+                    last_error TEXT,
+                    meta JSONB DEFAULT '{}'::jsonb,
+                    created_ts TIMESTAMPTZ DEFAULT NOW(),
+                    updated_ts TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            for column, column_type in (
+                ("client_id", "TEXT"),
+                ("kind", "TEXT"),
+                ("status", "TEXT"),
+                ("contract", "TEXT"),
+                ("symbol", "TEXT"),
+                ("direction", "TEXT"),
+                ("execution_mode", "TEXT"),
+                ("broker_order_id", "TEXT"),
+                ("last_error", "TEXT"),
+                ("meta", "JSONB DEFAULT '{}'::jsonb"),
+                ("created_ts", "TIMESTAMPTZ DEFAULT NOW()"),
+                ("updated_ts", "TIMESTAMPTZ DEFAULT NOW()"),
+            ):
+                cursor.execute(
+                    f"ALTER TABLE orders ADD COLUMN IF NOT EXISTS "
+                    f"{column} {column_type}"
+                )
+
+
+def test_postgres_two_workers_have_one_durable_claim():
+    """Exercise the ARMED claim fence against two real PostgreSQL sessions."""
+    test_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "").strip()
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not test_url or test_url != database_url:
+        pytest.skip(
+            "requires an explicitly matching disposable PostgreSQL test URL"
+        )
+
+    _ensure_retry_orders_table(test_url)
+    local_order_id = f"pr430-pg-{uuid.uuid4().hex}"
+    retry_meta = {
+        "retry_status": "ARMED",
+        "retry_attempts": 1,
+        "retry_attempt": 1,
+        "retry_ready_at": time.time() - 1,
+        "execution_mode": "paper",
+        "mode": "PAPER",
+        "retry_payload": {"ticker": "QCOM", "direction": "CALL"},
+    }
+    try:
+        with psycopg2.connect(test_url) as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM orders WHERE local_order_id = %s",
+                    (local_order_id,),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO orders
+                        (local_order_id, client_id, kind, status, contract,
+                         symbol, direction, execution_mode, meta)
+                    VALUES (%s, %s, 'ENTRY', 'CANCELED', %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        local_order_id,
+                        "client-A",
+                        CONTRACT,
+                        "QCOM",
+                        "CALL",
+                        "paper",
+                        json.dumps(retry_meta),
+                    ),
+                )
+
+        cas_owner = APOrderMonitor(
+            client_id="client-A",
+            broker=MagicMock(),
+            order_state_machine=MagicMock(),
+            position_manager=MagicMock(),
+            client_mode="PAPER",
+            data_broker=MagicMock(),
+        )
+        assert cas_owner._cas_retry_parent_meta(
+            local_order_id,
+            retry_meta,
+            {"retry_cas_marker": "winner"},
+            "paper",
+        )
+        assert not cas_owner._cas_retry_parent_meta(
+            local_order_id,
+            retry_meta,
+            {"retry_cas_marker": "stale-writer"},
+            "paper",
+        )
+        retry_meta["retry_cas_marker"] = "winner"
+
+        def _worker():
+            instance = APOrderMonitor(
+                client_id="client-A",
+                broker=MagicMock(),
+                order_state_machine=MagicMock(),
+                position_manager=MagicMock(),
+                client_mode="PAPER",
+                data_broker=MagicMock(),
+            )
+            return instance._claim_armed_retry(
+                {
+                    "local_order_id": local_order_id,
+                    "client_id": "client-A",
+                    "kind": "ENTRY",
+                    "status": "CANCELED",
+                    "contract": CONTRACT,
+                    "symbol": "QCOM",
+                    "direction": "CALL",
+                    "execution_mode": "paper",
+                    "meta": retry_meta,
+                },
+                expected_attempt=1,
+                mode="paper",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [executor.submit(_worker) for _ in range(2)]
+            claimed = [future.result() for future in results]
+
+        assert sum(result is not None for result in claimed) == 1
+        with psycopg2.connect(test_url) as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "SELECT meta ->> 'retry_status', meta ->> 'retry_claim_token' "
+                    "FROM orders WHERE local_order_id = %s",
+                    (local_order_id,),
+                )
+                status, claim_token = cursor.fetchone()
+        assert status == "IN_FLIGHT"
+        assert claim_token and claim_token.strip() == claim_token
+    finally:
+        with psycopg2.connect(test_url) as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM orders WHERE local_order_id = %s",
+                    (local_order_id,),
+                )
+
+
 def test_legacy_singular_counter_advances_to_attempt_two():
     order = _retry_order(attempt=0, meta={"retry_attempts": None, "retry_attempt": 1})
     decision = evaluate_retry(
@@ -267,11 +428,14 @@ def test_arm_persists_canonical_counter_and_mode_evidence(monitor, monkeypatch):
     monitor.broker.get_quote.return_value = {"last": 185.05}
     captured = {}
 
-    def fake_update(local_order_id, **kwargs):
+    def fake_parent_cas(local_order_id, prior_meta, patch, mode):
         captured["local_order_id"] = local_order_id
-        captured.update(kwargs)
+        captured["mode"] = mode
+        captured["meta"] = dict(prior_meta)
+        captured["meta"].update(patch)
+        return True
 
-    monkeypatch.setattr("ap.db.update_order", fake_update)
+    monkeypatch.setattr(monitor, "_cas_retry_parent_meta", fake_parent_cas)
     monitor._maybe_arm_post_cancel_retry(
         local_order_id="parent-1",
         contract=CONTRACT,
@@ -285,6 +449,37 @@ def test_arm_persists_canonical_counter_and_mode_evidence(monitor, monkeypatch):
     assert meta["retry_last_transition"] == "ARMED"
     assert meta["retry_payload"]["execution_mode"] == "paper"
     assert meta["retry_payload"]["retry_expected_execution_mode"] == "paper"
+
+
+def test_arm_without_explicit_mode_fails_closed_without_parent_write(monitor):
+    monitor.osm.get_order.return_value = {
+        "local_order_id": "parent-no-mode",
+        "symbol": "QCOM",
+        "contract": CONTRACT,
+        "direction": "CALL",
+        "meta": {
+            "signal_entry_price": 185.0,
+            "retry_attempts": 0,
+            "score": 90.0,
+            "ticker": "QCOM",
+            "signal_id": "sig-no-mode",
+            "source": "scanner",
+        },
+    }
+    monitor.broker.get_quote.return_value = {"last": 185.05}
+    monitor._broker_owned_exit_recovery_mode = ""
+    monitor._cas_retry_parent_meta = MagicMock()
+
+    monitor._maybe_arm_post_cancel_retry(
+        local_order_id="parent-no-mode",
+        contract=CONTRACT,
+        cancel_reason="entry_max_age_normal_reached",
+    )
+
+    monitor._cas_retry_parent_meta.assert_not_called()
+    event = monitor._emit_order_event.call_args.kwargs
+    assert event["decision"] == "ABORT"
+    assert event["reason_code"] == "RETRY_EXECUTION_MODE_UNPROVEN"
 
 
 def test_two_workers_have_one_durable_claim_and_one_submit(monitor, monkeypatch):
@@ -698,6 +893,28 @@ def test_stale_recovery_without_replacement_rearms_once_with_recovery_fence(
     assert kwargs["claim_token"] == "recovery-token"
     assert kwargs["claim_token_field"] == "retry_recovery_token"
     assert kwargs["failure_reason"] == "stale_inflight_no_replacement_proven"
+
+
+def test_stale_submitting_without_replacement_holds_without_rearm(
+    monitor,
+    monkeypatch,
+):
+    stale = _retry_order(status="SUBMITTING")
+    claimed = copy.deepcopy(stale)
+    _patch_scan(monkeypatch, stale)
+    monitor._claim_stale_inflight_for_recovery = lambda row, mode: claimed
+    monitor._find_retry_replacements = MagicMock(return_value=[])
+    monitor._rearm_or_exhaust_retry = MagicMock()
+    monitor._stamp_retry_status = MagicMock()
+
+    monitor._recover_stale_inflight_retries("paper")
+
+    monitor._rearm_or_exhaust_retry.assert_not_called()
+    kwargs = monitor._stamp_retry_status.call_args.kwargs
+    assert kwargs["status"] == "HOLD"
+    assert kwargs["detail"] == "stale_submitting_without_replacement_proof"
+    assert kwargs["claim_token"] == "recovery-token"
+    assert kwargs["claim_token_field"] == "retry_recovery_token"
 
 
 def test_cancel_reason_taxonomy_stays_retryable_and_fail_closed():
