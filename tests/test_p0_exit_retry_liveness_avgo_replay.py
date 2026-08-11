@@ -198,16 +198,25 @@ def _engine(*, partial=False):
     engine = APExitEngine(broker=MagicMock())
     engine._emit_exit_event = MagicMock()
     engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    applied_by_identity = {}
+
     def _persist_fill(
         pos, *, local_order_id, broker_order_id, cumulative_filled_qty,
         prior_cumulative_filled=None,
     ):
-        delta = max(0, int(cumulative_filled_qty) - int(prior_cumulative_filled or 0))
+        order_identity = (local_order_id, broker_order_id)
+        applied = applied_by_identity.get(
+            order_identity,
+            int(prior_cumulative_filled or 0),
+        )
+        cumulative = int(cumulative_filled_qty)
+        delta = max(0, cumulative - applied)
         pos.quantity_remaining = max(0, int(pos.quantity_remaining or 0) - delta)
+        applied_by_identity[order_identity] = max(applied, cumulative)
         return {
             "ok": True,
             "applied_delta": delta,
-            "applied_cumulative_qty": int(cumulative_filled_qty),
+            "applied_cumulative_qty": cumulative,
             "quantity_remaining": pos.quantity_remaining,
             "identity": {
                 "local_order_id": local_order_id,
