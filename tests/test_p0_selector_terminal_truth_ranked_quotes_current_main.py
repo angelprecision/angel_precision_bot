@@ -465,6 +465,49 @@ def test_later_budget_evidence_does_not_override_affordability_root():
     assert reason == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
 
 
+def test_pr439_retryable_quote_evidence_outranks_unrelated_structural_moneyness():
+    reason = resolve_selector_recovery_final_reason(
+        {
+            "structural_skip_results": {
+                "FAR_OTM": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "attempted_results": {
+                "NEAR_ATM": {
+                    "result_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
+                    "transient": True,
+                },
+            },
+            "eligible_unattempted_symbols": [],
+        }
+    )
+    assert reason == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+
+def test_pr439_full_structural_moneyness_set_remains_terminal():
+    reason = resolve_selector_recovery_final_reason(
+        {
+            "structural_skip_results": {
+                "FAR_OTM_1": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                "FAR_OTM_2": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "eligible_unattempted_symbols": [],
+        }
+    )
+    assert reason == "MONEYNESS_OUT_OF_RANGE"
+
+
+def test_pr439_structural_moneyness_waits_for_unattempted_candidate_accounting():
+    reason = resolve_selector_recovery_final_reason(
+        {
+            "structural_skip_results": {
+                "FAR_OTM": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "eligible_unattempted_symbols": ["NEAR_ATM"],
+        }
+    )
+    assert reason == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+
+
 def test_transient_only_budget_exhaustion_remains_retryable():
     reason = resolve_selector_recovery_final_reason(
         {
@@ -1309,6 +1352,98 @@ def test_execution_core_real_selector_failure_retries_or_terminalizes_with_truth
             "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         )
         core.order_state_machine.expire_pending_entry.assert_called_once()
+
+
+@pytest.mark.parametrize("execution_mode", ["LIVE", "PAPER"])
+def test_execution_core_mixed_retryable_quote_and_structural_moneyness_schedules_retry(
+    monkeypatch,
+    execution_mode,
+):
+    """The real deferred selector/owner seam preserves retryable quote truth."""
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "40")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setattr(APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+
+    near_atm = _row("SPY", 101.0)
+    far_otm = _row("SPY", 130.0)
+    broker = _DirectQuoteBroker(
+        [near_atm, far_otm],
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=100.0,
+    )
+    selector = _actual_selector(broker, execution_mode=execution_mode)
+    core = _execution_core(selector, broker, execution_mode=execution_mode)
+    plan = _execution_plan(
+        breach_attempt_count=0,
+        ticker="SPY",
+        underlying=100.0,
+        execution_mode=execution_mode,
+    )
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: plan,
+    )
+    thread_factory = MagicMock()
+    thread_factory.return_value = MagicMock()
+    monkeypatch.setattr(ec_mod.threading, "Thread", thread_factory)
+
+    local_order_id = f"local-pr439-mixed-evidence-{execution_mode.lower()}"
+    result = core._on_entry_trigger(
+        _execution_watched(
+            execution_mode,
+            ticker="SPY",
+            trigger_price=100.0,
+            local_order_id=local_order_id,
+        )
+    )
+
+    assert result["disposition"] == "RETRY_WAIT"
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()
+    selector_failure = (
+        core.order_state_machine.schedule_deferred_materialization_retry.call_args
+        .kwargs["selector_failure"]
+    )
+    assert selector_failure["reason_code"] == "DIRECT_QUOTE_ZERO_BID_ASK"
+    assert selector_failure["canonical_selector_reason"] == (
+        "DIRECT_QUOTE_ZERO_BID_ASK"
+    )
+    assert selector_failure["execution_mode"] == execution_mode
+    assert selector_failure["data_failure"] is True
+    assert selector_failure["quality_failure"] is False
+    assert selector_failure["reason_code"] != "MONEYNESS_OUT_OF_RANGE"
+    assert selector_failure["selection_diagnostics"]["structural_skips"]
+    assert selector_failure["selection_diagnostics"]["direct_quote_attempted_symbols"] == [
+        near_atm["symbol"]
+    ]
+    assert selector_failure["selection_diagnostics"]["direct_quote_unattempted_count"] == 0
+    core.order_state_machine.submit_existing_entry.assert_not_called()
+    core.order_state_machine.expire_pending_entry.assert_not_called()
+    thread_factory.return_value.start.assert_not_called()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+
+    cursor_calls = core.order_state_machine.persist_selector_recovery_cursor.call_args_list
+    assert cursor_calls
+    cursor_call = cursor_calls[-1]
+    assert cursor_call.args[0] == local_order_id
+    assert cursor_call.kwargs["signal_id"] == plan.signal_id
+    assert cursor_call.kwargs["execution_mode"] == plan.execution_mode
+    cursor = cursor_call.kwargs["cursor"]
+    assert cursor["attempted_symbols"][near_atm["symbol"]]["result_reason"] == (
+        "DIRECT_QUOTE_ZERO_BID_ASK"
+    )
+    assert cursor["structurally_skipped_symbols"][far_otm["symbol"]]["skip_reason"] == (
+        "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
+    )
 
 
 def test_execution_core_real_selector_provider_failure_terminalizes_without_fake_failure_payload(

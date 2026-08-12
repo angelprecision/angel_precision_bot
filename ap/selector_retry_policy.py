@@ -1226,21 +1226,7 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     if terminal_policy:
         return terminal_policy
 
-    # ── Step 3: non-affordability terminal structural geometry ───────────────
-    # The affordability structural skips are intentionally EXCLUDED here and
-    # resolved by the full-set affordability accounting below. This preserves
-    # the pre-amendment position of DTE/moneyness/delta/policy geometry.
-    structural_values = set(skipped.values())
-    for structural, canonical in (
-        ("STRUCTURAL_DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
-        ("STRUCTURAL_MONEYNESS_OUT_OF_RANGE", "MONEYNESS_OUT_OF_RANGE"),
-        ("STRUCTURAL_DELTA_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE"),
-        ("STRUCTURAL_TERMINAL_POLICY_REJECT", "TERMINAL_POLICY_REJECT"),
-    ):
-        if structural in structural_values:
-            return canonical
-
-    # ── Step 4: terminal quality veto (excluding affordability) ──────────────
+    # ── Step 3: terminal quality veto (excluding affordability) ──────────────
     terminal_quality = next(
         (
             reason
@@ -1253,7 +1239,7 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     if terminal_quality:
         return terminal_quality
 
-    # ── Step 5: actual request-budget exhaustion with candidates left ────────
+    # ── Step 4: actual request-budget exhaustion with candidates left ────────
     # A single affordability skip may not outrank actual exhaustion while
     # another eligible candidate remains unattempted.
     eligible = list(data.get("eligible_unattempted_symbols") or [])
@@ -1264,7 +1250,7 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     ):
         return "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
 
-    # ── Step 6: retryable attempted-data failure ─────────────────────────────
+    # ── Step 5: retryable attempted-data failure ─────────────────────────────
     transient_counts: dict[str, int] = {}
     for record in attempted.values():
         if isinstance(record, dict):
@@ -1276,7 +1262,7 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     if transient_counts:
         return sorted(transient_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
-    # ── Step 7: retryable quality/data failure ───────────────────────────────
+    # ── Step 6: retryable quality/data failure ───────────────────────────────
     retryable_quality = [
         (str(reason), int(count or 0))
         for reason, count in quality.items()
@@ -1284,6 +1270,25 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     ]
     if retryable_quality:
         return sorted(retryable_quality, key=lambda item: (-item[1], item[0]))[0][0]
+
+    # ── Step 7: non-affordability terminal structural geometry ───────────────
+    # Structural geometry is authoritative only after the relevant candidate
+    # set has been accounted for. In particular, one far-OTM/DTE/delta row
+    # must not terminalize a request while a different candidate is still
+    # unresolved for retryable provider/quote data. The durable eligible list
+    # is the selector's explicit proof that an eligible direct-quote candidate
+    # remains unattempted; an empty list is required before structural truth
+    # can terminalize the request.
+    structural_values = set(skipped.values())
+    if not eligible:
+        for structural, canonical in (
+            ("STRUCTURAL_DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
+            ("STRUCTURAL_MONEYNESS_OUT_OF_RANGE", "MONEYNESS_OUT_OF_RANGE"),
+            ("STRUCTURAL_DELTA_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE"),
+            ("STRUCTURAL_TERMINAL_POLICY_REJECT", "TERMINAL_POLICY_REJECT"),
+        ):
+            if structural in structural_values:
+                return canonical
 
     # ── Step 8: affordability terminal — only when the FULL candidate set is
     # accounted for and every accounted candidate is an affordability reason.
