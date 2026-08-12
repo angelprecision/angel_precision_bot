@@ -93,7 +93,11 @@ class _OSM:
                 "materialization_in_flight": True,
                 "materialization_owner": kwargs["owner"],
                 "materialization_generation": kwargs["new_generation"],
+                "materialization_lease_until": kwargs["lease_until"],
                 "retry_attempt": kwargs["retry_attempt"],
+                "breach_attempt_count": kwargs["retry_attempt"],
+                "materialization_attempts": kwargs["retry_attempt"],
+                "signal_id": row.get("signal_id"),
                 "broker_ready": False,
             }
         )
@@ -106,7 +110,19 @@ class _OSM:
             {
                 "lifecycle_state": "RETRY_WAIT",
                 "materialization_status": "RETRY_PENDING",
+                "materialization_in_flight": False,
+                "materialization_owner": "",
+                "materialization_lease_until": "",
+                "materialization_generation": kwargs["generation"],
+                "retry_attempt": kwargs["attempt"],
+                "breach_attempt_count": kwargs["attempt"],
+                "materialization_attempts": kwargs["attempt"],
                 "materialization_next_retry_at": kwargs["next_retry_at"],
+                "materialization_reason": kwargs["reason_code"],
+                "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+                "materialization_detail": kwargs["reason_code"],
+                "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+                "broker_ready": False,
             }
         )
         return True
@@ -162,6 +178,113 @@ def test_classifier_keeps_legacy_default_and_exposes_proof_gated_label():
         classify_pending_trigger_row(row, prebroker_recovery_proven=True)
         == PendingTriggerClassification.STUCK_TRIGGER_READY_PREBROKER_RECOVERABLE
     )
+
+    row["meta"].update(
+        {
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
+            "materialization_in_flight": True,
+            "materialization_owner": (
+                f"prebroker_recovery:{CLIENT_ID}:{MODE}:{LOCAL_ORDER_ID}"
+            ),
+        }
+    )
+    assert (
+        classify_pending_trigger_row(row)
+        == PendingTriggerClassification.WAITING_RETRYABLE
+    )
+
+
+def _claim_row(osm, *, lease_until: str):
+    owner = f"prebroker_recovery:{CLIENT_ID}:{MODE}:{LOCAL_ORDER_ID}"
+    assert osm.claim_deferred_materialization(
+        LOCAL_ORDER_ID,
+        owner=owner,
+        new_generation=1,
+        lease_until=lease_until,
+        trigger_crossed_at=TRIGGERED_AT,
+        trigger_price=100.0,
+        observed_underlying_price=101.0,
+        signal_id=SIGNAL_ID,
+        execution_mode=MODE,
+        retry_attempt=1,
+    )
+    return owner
+
+
+def test_restart_after_claim_with_active_lease_leaves_worker_alone():
+    row = _row()
+    osm = _OSM(row)
+    owner = _claim_row(osm, lease_until="2099-01-01T00:00:00+00:00")
+    callback = MagicMock()
+    broker = MagicMock()
+    recovery = _recovery(osm.get_order(LOCAL_ORDER_ID), osm, _Watcher(callback), broker)
+
+    assert recovery.recover_one_row(osm.get_order(LOCAL_ORDER_ID)) == _RowOutcome.RETRY_OWNED
+    assert len(osm.claim_calls) == 1
+    assert osm.retry_calls == []
+    assert osm.cancel_calls == []
+    assert osm.transition_calls == []
+    callback.assert_not_called()
+    broker.list_orders.assert_not_called()
+    assert osm.rows[LOCAL_ORDER_ID]["meta"]["materialization_owner"] == owner
+    assert osm.rows[LOCAL_ORDER_ID]["meta"]["materialization_generation"] == 1
+    assert osm.rows[LOCAL_ORDER_ID]["meta"]["retry_attempt"] == 1
+
+
+def test_restart_after_claim_expiry_transfers_same_lineage_to_canonical_retry():
+    row = _row()
+    osm = _OSM(row)
+    owner = _claim_row(osm, lease_until="2020-01-01T00:00:00+00:00")
+    callback = MagicMock()
+    broker = MagicMock()
+    broker.list_orders.return_value = []
+    recovery = _recovery(osm.get_order(LOCAL_ORDER_ID), osm, _Watcher(callback), broker)
+
+    assert recovery.recover_one_row(osm.get_order(LOCAL_ORDER_ID)) == _RowOutcome.RETRY_OWNED
+    assert len(osm.claim_calls) == 1
+    assert len(osm.retry_calls) == 1
+    retry_kwargs = osm.retry_calls[0][1]
+    assert retry_kwargs["owner"] == owner
+    assert retry_kwargs["generation"] == 1
+    assert retry_kwargs["attempt"] == 1
+    assert osm.cancel_calls == []
+    assert osm.transition_calls == []
+    callback.assert_not_called()
+    broker.list_orders.assert_called_once_with()
+    meta = osm.rows[LOCAL_ORDER_ID]["meta"]
+    assert meta["lifecycle_state"] == "RETRY_WAIT"
+    assert meta["materialization_status"] == "RETRY_PENDING"
+    assert meta["materialization_generation"] == 1
+    assert meta["retry_attempt"] == 1
+    assert meta["materialization_in_flight"] is False
+
+    # The pending-trigger classifier keeps this canonical retry visible to
+    # the existing due-retry owner instead of reverting to STUCK terminal
+    # cleanup on the next restart pass.
+    assert (
+        classify_pending_trigger_row(osm.get_order(LOCAL_ORDER_ID))
+        == PendingTriggerClassification.WAITING_RETRYABLE
+    )
+
+
+def test_restart_after_claim_expiry_adopts_exact_broker_order_without_retry():
+    row = _row()
+    osm = _OSM(row)
+    _claim_row(osm, lease_until="2020-01-01T00:00:00+00:00")
+    callback = MagicMock()
+    broker = MagicMock()
+    broker.list_orders.return_value = [_broker_order()]
+    recovery = _recovery(osm.get_order(LOCAL_ORDER_ID), osm, _Watcher(callback), broker)
+
+    assert recovery.recover_one_row(osm.get_order(LOCAL_ORDER_ID)) == _RowOutcome.SKIPPED
+    assert len(osm.claim_calls) == 1
+    assert osm.retry_calls == []
+    assert osm.cancel_calls == []
+    callback.assert_not_called()
+    broker.list_orders.assert_called_once_with()
+    assert osm.rows[LOCAL_ORDER_ID]["status"] == "SUBMITTED"
+    assert osm.rows[LOCAL_ORDER_ID]["broker_order_id"] == "broker-existing"
 
 
 def test_exact_no_broker_claims_once_and_continues_through_callback():
