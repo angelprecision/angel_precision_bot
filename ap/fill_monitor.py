@@ -2136,12 +2136,32 @@ def _classify_existing_protective_owner(
         )
         return "OWNER_LOOKUP_FAILED", 0, 0
 
+    try:
+        from ap_exit_engine import _classify_canonical_repair_owner_domain
+    except Exception:
+        _classify_canonical_repair_owner_domain = None
+
     _proven = 0
     _unproven = 0
     for _p in _actives:
         _sym = str(getattr(_p, "option_symbol", "") or "").upper().strip()
         if _sym != _contract:
             continue
+        _pid = str(getattr(_p, "position_id", "") or "").strip()
+        if _classify_canonical_repair_owner_domain and _pid.startswith(
+            "broker-repair-"
+        ):
+            _repair_domain = _classify_canonical_repair_owner_domain(
+                _p,
+                client_id=_expected_client,
+                execution_mode=_expected_mode,
+                contract=_contract,
+            )
+            if _repair_domain == "IDENTITY_UNPROVEN":
+                _unproven += 1
+                continue
+            if _repair_domain == "PROVEN_FOREIGN_DOMAIN":
+                continue
         _p_client = str(getattr(_p, "client_id", "") or "").strip().lower()
         if not _p_client or _p_client != _expected_client:
             # Blank / different-client contract match is not exact
@@ -2775,7 +2795,24 @@ def _verify_canonical_entry_owner(
             **extra,
         }
 
-    if not client_id or not contract or not execution_mode or not position_id:
+    try:
+        from ap_exit_engine import (
+            _classify_canonical_repair_owner_domain,
+            _is_proven_owner_client_id,
+        )
+    except Exception as exc:
+        return _failure(
+            "owner_domain_classifier_unavailable",
+            exception_type=type(exc).__name__,
+            exception=str(exc),
+        )
+
+    if (
+        not _is_proven_owner_client_id(client_id)
+        or not contract
+        or execution_mode not in {"live", "paper"}
+        or not position_id
+    ):
         return _failure("canonical_owner_identity_missing")
 
     active_fn = getattr(exit_engine, "active_positions", None)
@@ -2793,6 +2830,7 @@ def _verify_canonical_entry_owner(
 
     identity_matches = []
     repair_matches = []
+    ambiguous_repair_matches = []
     for owner in active_positions:
         if bool(_owner_value(owner, "closed", False)):
             continue
@@ -2805,6 +2843,19 @@ def _verify_canonical_entry_owner(
             _owner_value(owner, "execution_mode", "")
         )
         owner_id = str(_owner_value(owner, "position_id", "") or "").strip()
+
+        if owner_id.startswith("broker-repair-"):
+            repair_domain = _classify_canonical_repair_owner_domain(
+                owner,
+                client_id=client_id,
+                execution_mode=execution_mode,
+                contract=contract,
+            )
+            if repair_domain == "IDENTITY_UNPROVEN":
+                ambiguous_repair_matches.append(owner_id)
+                continue
+            if repair_domain == "PROVEN_FOREIGN_DOMAIN":
+                continue
         if (
             owner_contract != contract
             or owner_client != client_id
@@ -2819,6 +2870,7 @@ def _verify_canonical_entry_owner(
         len(identity_matches) == 1
         and identity_matches[0] == position_id
         and not repair_matches
+        and not ambiguous_repair_matches
     ):
         return {
             "ok": True,
@@ -2829,12 +2881,22 @@ def _verify_canonical_entry_owner(
             "execution_mode": execution_mode,
             "position_id": position_id,
             "owner_ids": identity_matches,
+            "behavior_active_canonical_owner_count": 1,
+            "behavior_active_ambiguous_same_contract_repair_count": 0,
+            "ambiguous_repair_ids": [],
         }
 
     return _failure(
         "owner_cardinality_or_identity_unproven",
         owner_ids=identity_matches,
         repair_ids=repair_matches,
+        ambiguous_repair_ids=ambiguous_repair_matches,
+        behavior_active_canonical_owner_count=sum(
+            owner_id == position_id for owner_id in identity_matches
+        ),
+        behavior_active_ambiguous_same_contract_repair_count=(
+            len(ambiguous_repair_matches)
+        ),
     )
 
 

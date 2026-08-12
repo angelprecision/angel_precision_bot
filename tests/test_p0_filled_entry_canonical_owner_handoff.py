@@ -262,6 +262,41 @@ def _adopt_exact(
     )
 
 
+def _handoff_invariant_counts(
+    engine,
+    *,
+    canonical_position_id="jason-live-canonical",
+    client_id="jason@example.com",
+    mode="live",
+    contract="INTC260810P00098000",
+):
+    from ap_exit_engine import _classify_canonical_repair_owner_domain
+
+    active = list(engine.active_positions())
+    canonical_count = sum(
+        str(getattr(position, "position_id", "") or "").strip()
+        == canonical_position_id
+        and str(getattr(position, "client_id", "") or "").strip().lower()
+        == client_id.strip().lower()
+        and str(getattr(position, "execution_mode", "") or "").strip().lower()
+        == mode.strip().lower()
+        and str(getattr(position, "option_symbol", "") or "").strip().upper()
+        == contract.strip().upper()
+        for position in active
+    )
+    ambiguous_count = sum(
+        _classify_canonical_repair_owner_domain(
+            position,
+            client_id=client_id,
+            execution_mode=mode,
+            contract=contract,
+        )
+        == "IDENTITY_UNPROVEN"
+        for position in active
+    )
+    return canonical_count, ambiguous_count
+
+
 def test_handoff_marker_update_fences_broker_contract_and_mode(monkeypatch):
     from ap import fill_monitor as fm
 
@@ -574,6 +609,7 @@ def test_owner_verification_requires_one_exact_canonical_owner(monkeypatch):
     [
         [_owner("canonical-position-1"), _owner("duplicate-position")],
         [_owner("canonical-position-1"), _owner("broker-repair-jason")],
+        [_owner("canonical-position-1"), _owner("broker-repair-ambiguous", mode="")],
         [_owner("wrong-position")],
         [_owner("canonical-position-1", mode="paper")],
         [_owner("canonical-position-1", client_id="other@example.com")],
@@ -1393,14 +1429,16 @@ def test_exit_engine_malformed_quarantine_mode_performs_zero_mutations():
 
 
 @pytest.mark.parametrize(
-    ("foreign_client", "foreign_mode"),
+    ("foreign_client", "foreign_mode", "foreign_contract"),
     [
-        ("jose@example.com", "live"),
-        ("jason@example.com", "paper"),
+        ("jose@example.com", "live", "INTC260810P00098000"),
+        ("jason@example.com", "paper", "INTC260810P00098000"),
+        ("tradefluence", "paper", "INTC260810P00098000"),
+        ("jason@example.com", "live", "INTC260810C00098000"),
     ],
 )
 def test_existing_canonical_adoption_ignores_foreign_same_contract_owner_domain(
-    foreign_client, foreign_mode
+    foreign_client, foreign_mode, foreign_contract
 ):
     from ap_exit_engine import APExitEngine
 
@@ -1410,6 +1448,7 @@ def test_existing_canonical_adoption_ignores_foreign_same_contract_owner_domain(
         "broker-repair-foreign",
         client_id=foreign_client,
         mode=foreign_mode,
+        contract=foreign_contract,
     )
     _install_adoption_positions(engine, [canonical, foreign])
 
@@ -1421,6 +1460,142 @@ def test_existing_canonical_adoption_ignores_foreign_same_contract_owner_domain(
     assert engine._positions_by_id[foreign.position_id] is foreign
     assert getattr(foreign, "adoption_identity_quarantined", False) is False
     assert engine.active_positions() == [canonical, foreign]
+
+
+@pytest.mark.parametrize(
+    "repair_overrides",
+    [
+        {"mode": ""},
+        {"mode": "live-ish"},
+    ],
+)
+def test_ambiguous_same_contract_repair_is_quarantined_before_canonical_seed(
+    repair_overrides,
+):
+    from ap import fill_monitor as fm
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(None, email="jason@example.com")
+    repair = _adoption_position(
+        "broker-repair-jason-ambiguous-mode",
+        **repair_overrides,
+    )
+    _install_adoption_positions(engine, [repair])
+
+    result = _adopt_exact(engine)
+
+    assert result.disposition == "NO_REPAIR_FOUND"
+    assert result.adopted is False
+    assert repair not in engine.active_positions()
+    assert getattr(repair, "adoption_identity_quarantined", False) is True
+
+    canonical = _adoption_position("jason-live-canonical")
+    engine.add_position(canonical)
+    verified = fm._verify_canonical_entry_owner(
+        engine,
+        _order(),
+        "jason-live-canonical",
+    )
+    assert verified["ok"] is True
+    assert _handoff_invariant_counts(engine) == (1, 0)
+
+
+def test_blank_client_same_contract_repair_is_quarantined_without_ownership_guess():
+    from ap import fill_monitor as fm
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(None, email="jason@example.com")
+    repair = _adoption_position(
+        "broker-repair-blank-client",
+        client_id="",
+        mode="live",
+    )
+    _install_adoption_positions(engine, [repair])
+
+    result = _adopt_exact(engine)
+
+    assert result.disposition == "NO_REPAIR_FOUND"
+    assert repair not in engine.active_positions()
+    assert getattr(repair, "client_id", "") == ""
+    assert getattr(repair, "execution_mode", "") == "live"
+    assert getattr(repair, "adoption_identity_quarantined", False) is True
+
+    canonical = _adoption_position("jason-live-canonical")
+    engine.add_position(canonical)
+    verified = fm._verify_canonical_entry_owner(
+        engine,
+        _order(),
+        "jason-live-canonical",
+    )
+    assert verified["ok"] is True
+    assert _handoff_invariant_counts(engine) == (1, 0)
+
+
+def test_existing_canonical_adoption_quarantines_ambiguous_repair_before_success():
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(None, email="jason@example.com")
+    canonical = _adoption_position("jason-live-canonical")
+    repair = _adoption_position(
+        "broker-repair-jason-blank-mode",
+        mode="",
+    )
+    _install_adoption_positions(engine, [canonical, repair])
+
+    assert _handoff_invariant_counts(engine) == (1, 1)
+    result = _adopt_exact(engine)
+
+    assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+    assert result.adopted is True
+    assert repair in engine._positions
+    assert repair not in engine.active_positions()
+    assert getattr(repair, "adoption_identity_quarantined", False) is True
+    assert _handoff_invariant_counts(engine) == (1, 0)
+
+
+def test_restart_replay_cannot_prove_existing_canonical_with_ambiguous_repairs():
+    from ap import fill_monitor as fm
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(None, email="jason@example.com")
+    canonical = _adoption_position("jason-live-canonical")
+    blank_mode = _adoption_position(
+        "broker-repair-jason-replay-blank-mode",
+        mode="",
+    )
+    blank_client = _adoption_position(
+        "broker-repair-jason-replay-blank-client",
+        client_id="",
+        mode="live",
+    )
+    _install_adoption_positions(engine, [canonical, blank_mode, blank_client])
+
+    before_recovery = fm._verify_canonical_entry_owner(
+        engine,
+        _order(status="FILLED", position_id="jason-live-canonical"),
+        "jason-live-canonical",
+    )
+    assert before_recovery["ok"] is False
+    assert before_recovery["behavior_active_canonical_owner_count"] == 1
+    assert before_recovery[
+        "behavior_active_ambiguous_same_contract_repair_count"
+    ] == 2
+
+    result = _adopt_exact(engine)
+    assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+    assert result.adopted is True
+
+    after_recovery = fm._verify_canonical_entry_owner(
+        engine,
+        _order(status="FILLED", position_id="jason-live-canonical"),
+        "jason-live-canonical",
+    )
+    assert after_recovery["ok"] is True
+    assert after_recovery["behavior_active_canonical_owner_count"] == 1
+    assert after_recovery[
+        "behavior_active_ambiguous_same_contract_repair_count"
+    ] == 0
+    assert _handoff_invariant_counts(engine) == (1, 0)
 
 
 def test_exact_repair_is_adopted_while_foreign_same_contract_repair_stays_untouched():

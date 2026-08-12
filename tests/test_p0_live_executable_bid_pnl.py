@@ -789,7 +789,7 @@ class TestAdoptionIdentityFencing:
         assert result.safe_to_seed is True
         assert getattr(engine._positions[0], "adoption_identity_quarantined", False) is False
 
-    def test_unknown_mode_repair_is_ignored_for_this_adoption_domain(self):
+    def test_unknown_mode_repair_is_quarantined_for_this_adoption_domain(self):
         engine = self._base_engine()
         self._add_repair(engine, mode="")  # repair mode unknown
         result = engine.adopt_canonical_position_identity(
@@ -801,7 +801,8 @@ class TestAdoptionIdentityFencing:
         assert result.disposition == "NO_REPAIR_FOUND"
         assert result.adopted is False
         assert result.safe_to_seed is True
-        assert getattr(engine._positions[0], "adoption_identity_quarantined", False) is False
+        assert getattr(engine._positions[0], "adoption_identity_quarantined", False) is True
+        assert engine.active_positions() == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1018,7 +1019,7 @@ class TestCanonicalPlusRepairCollapse:
         assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
         assert result.adopted is True
 
-    def test_blank_mode_repair_does_not_veto_paper_canonical(self):
+    def test_blank_mode_repair_is_quarantined_before_paper_canonical_proof(self):
         engine, canon_id, repair_id = self._make_engine_with_both(
             canonical_mode="paper", repair_mode="", repair_client=_CLIENT,
         )
@@ -1041,11 +1042,11 @@ class TestCanonicalPlusRepairCollapse:
         assert result.retryable is False
         assert repair_id in engine._positions_by_id
         assert repair in engine._positions
-        assert getattr(repair, "adoption_identity_quarantined", False) is False
-        assert engine.active_positions() == [canonical, repair]
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+        assert engine.active_positions() == [canonical]
         assert getattr(canonical, "hard_exit_reference_validity", "") != "proven"
 
-    def test_blank_client_repair_does_not_veto_matching_mode_canonical(self):
+    def test_blank_client_repair_is_quarantined_before_matching_mode_proof(self):
         engine, canon_id, repair_id = self._make_engine_with_both(
             canonical_mode="live", repair_mode="live", repair_client="",
         )
@@ -1064,8 +1065,8 @@ class TestCanonicalPlusRepairCollapse:
         assert result.retryable is False
         assert repair_id in engine._positions_by_id
         assert any(getattr(p, "position_id", "") == repair_id for p in engine._positions)
-        assert getattr(repair, "adoption_identity_quarantined", False) is False
-        assert engine.active_positions() == [canonical, repair]
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+        assert engine.active_positions() == [canonical]
 
     def test_quarantined_repair_can_recover_canonical_owner_via_broker_precheck(self):
         from ap_exit_engine import APExitEngine
