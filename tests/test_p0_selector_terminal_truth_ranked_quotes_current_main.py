@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import copy
 import itertools
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -28,6 +29,7 @@ from ap_execution_core import (
     _build_deferred_retry_schedule_meta,
     _build_deferred_retry_terminal_meta,
 )
+import ap.contract_selector as selector_mod
 from tests.test_p0_selector_direct_quote_budget_authority import (
     _DirectQuoteBroker,
     _NEAR_EXPIRY,
@@ -278,6 +280,123 @@ def _actual_selector(broker, execution_mode: str = "LIVE") -> APContractSelectio
         min_oi=1,
         min_volume=0,
     )
+
+
+class _ReleaseReplayOSM:
+    """Small durable-row harness for the immutable PR #439 replay."""
+
+    def __init__(self, row: dict):
+        self.client_id = str(row["client_id"])
+        self.row = copy.deepcopy(row)
+        self.claim_calls = []
+        self.cursor_calls = []
+        self.schedule_calls = []
+        self.submit_existing_entry = MagicMock()
+        self.expire_pending_entry = MagicMock(return_value=False)
+        self.terminalize_deferred_breach = MagicMock(return_value=False)
+        self.transition = MagicMock(return_value=True)
+
+    def get_order(self, local_order_id):
+        assert local_order_id == self.row["local_order_id"]
+        return copy.deepcopy(self.row)
+
+    def update_order_meta(self, local_order_id, patch):
+        assert local_order_id == self.row["local_order_id"]
+        self.row.setdefault("meta", {}).update(copy.deepcopy(patch or {}))
+        return True
+
+    def claim_deferred_materialization(self, local_order_id, **kwargs):
+        assert local_order_id == self.row["local_order_id"]
+        self.claim_calls.append(copy.deepcopy(kwargs))
+        meta = self.row.setdefault("meta", {})
+        target_generation = int(
+            kwargs.get("new_generation")
+            if kwargs.get("new_generation") is not None
+            else kwargs.get("generation") or 0
+        )
+        expected_previous = target_generation - 1
+        if int(meta.get("materialization_generation") or 0) != expected_previous:
+            return False
+        if str(meta.get("lifecycle_state") or "") not in {"", "RETRY_WAIT"}:
+            return False
+        meta.update({
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
+            "materialization_in_flight": True,
+            "materialization_owner": kwargs["owner"],
+            "watcher_token": kwargs["owner"],
+            "materialization_generation": target_generation,
+            "broker_ready": False,
+        })
+        # Mirror the production claim's aligned durable attempt counters. The
+        # release replay asserts the callback's pre-claim counter fencing.
+        if kwargs.get("retry_attempt") is not None:
+            retry_attempt = int(kwargs["retry_attempt"])
+            meta["retry_attempt"] = retry_attempt
+            meta["breach_attempt_count"] = retry_attempt
+            meta["materialization_attempts"] = retry_attempt
+        return True
+
+    def persist_selector_recovery_cursor(self, local_order_id, **kwargs):
+        assert local_order_id == self.row["local_order_id"]
+        self.cursor_calls.append(copy.deepcopy(kwargs))
+        meta = self.row.setdefault("meta", {})
+        if (
+            meta.get("lifecycle_state") != "MATERIALIZING"
+            or meta.get("materialization_owner") != kwargs["owner"]
+            or int(meta.get("materialization_generation") or 0)
+            != int(kwargs["generation"])
+        ):
+            return False
+        meta["selector_recovery_cursor_v1"] = copy.deepcopy(kwargs["cursor"])
+        return True
+
+    def schedule_deferred_materialization_retry(self, local_order_id, **kwargs):
+        assert local_order_id == self.row["local_order_id"]
+        self.schedule_calls.append(copy.deepcopy(kwargs))
+        meta = self.row.setdefault("meta", {})
+        if (
+            meta.get("lifecycle_state") != "MATERIALIZING"
+            or meta.get("materialization_owner") != kwargs["owner"]
+            or int(meta.get("materialization_generation") or 0)
+            != int(kwargs["generation"])
+        ):
+            return False
+        meta.update({
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "watcher_token": "",
+            "materialization_lease_until": "",
+            "materialization_generation": int(kwargs["generation"]),
+            "retry_reason": kwargs["reason_code"],
+            "materialization_reason": kwargs["reason_code"],
+            "retry_attempt": int(kwargs["attempt"]),
+            "breach_attempt_count": int(kwargs["attempt"]),
+            "materialization_attempts": int(kwargs["attempt"]),
+            "retry_max_attempts": int(kwargs["max_attempts"]),
+            "next_retry_at": kwargs["next_retry_at"],
+            "materialization_next_retry_at": kwargs["next_retry_at"],
+            "retry_owner": kwargs["owner"],
+            "current_owner": kwargs["owner"],
+            "materialization_outcome": kwargs["selector_failure"].get(
+                "materialization_outcome"
+            ),
+            "materialization_detail": kwargs["selector_failure"].get(
+                "materialization_detail"
+            ),
+            "entry_path": kwargs["selector_failure"].get("entry_path"),
+            "materialization_selector_failure": copy.deepcopy(
+                kwargs["selector_failure"]
+            ),
+            "broker_ready": False,
+        })
+        if isinstance(kwargs.get("selector_recovery_cursor"), dict):
+            meta["selector_recovery_cursor_v1"] = copy.deepcopy(
+                kwargs["selector_recovery_cursor"]
+            )
+        return True
 
 
 def test_ibm_affordability_remains_root_after_later_budget_exhaustion(monkeypatch):
@@ -557,6 +676,216 @@ def test_pr439_candidate_scoped_structural_reason_requires_complete_accounting()
         }
     )
     assert reason == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+
+
+def test_pr439_pro_quality_unavailable_recovery_owns_candidate_reason(monkeypatch):
+    """The real PRO-quality reduction keeps a retryable recovery disposition.
+
+    The recovery result is supplied at the direct-quote seam so the test
+    exercises the production branch that chooses between the pre-recovery PRO
+    quality reason and the later recovery reason; it does not mock the
+    candidate accounting or final reducer.
+    """
+    calls = []
+
+    monkeypatch.setattr(
+        selector_mod,
+        "_pro_contract_quality",
+        lambda opt, ticker, dte: ("REJECT", "low_oi_0"),
+    )
+
+    def _unavailable(*args, **kwargs):
+        calls.append(args[1]["symbol"])
+        return {
+            "action": "REJECT_UNAVAILABLE",
+            "reason_code": "DIRECT_QUOTE_UNAVAILABLE",
+            "direct_quote_used": False,
+            "opt_updated": None,
+            "audit": {},
+        }
+
+    monkeypatch.setattr(selector_mod, "_revalidate_direct", _unavailable)
+    candidate = _row("SPY", 101.0, bid=0.0, ask=0.0, oi=0, volume=0)
+    selected, broker, context, failure, diagnostics = _run_selector(
+        monkeypatch,
+        plan=_plan(ticker="SPY", underlying=100.0, budget=2000.0),
+        chain=[candidate],
+        limit=1,
+    )
+
+    assert selected is None
+    assert calls == [candidate["symbol"]]
+    assert failure["reason_code"] == "DIRECT_QUOTE_UNAVAILABLE"
+    assert diagnostics["candidate_outcomes"] == {
+        candidate["symbol"]: "DIRECT_QUOTE_UNAVAILABLE"
+    }
+    assert diagnostics["candidate_accounting"] == {
+        "universe_count": 1,
+        "accounted_count": 1,
+        "complete": True,
+    }
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+
+
+def test_pr439_pro_quality_partial_pass_without_authoritative_quote_fails_closed(
+    monkeypatch,
+):
+    """A partial PASS result cannot restore the earlier terminal quality veto."""
+    monkeypatch.setattr(
+        selector_mod,
+        "_pro_contract_quality",
+        lambda opt, ticker, dte: ("REJECT", "low_oi_0"),
+    )
+    monkeypatch.setattr(
+        selector_mod,
+        "_revalidate_direct",
+        lambda *args, **kwargs: {
+            "action": "PASS",
+            "reason_code": "DIRECT_QUOTE_UNAVAILABLE",
+            "direct_quote_used": False,
+            "opt_updated": None,
+            "audit": {},
+        },
+    )
+    candidate = _row("SPY", 101.0, bid=0.0, ask=0.0, oi=0, volume=0)
+    selected, broker, context, failure, diagnostics = _run_selector(
+        monkeypatch,
+        plan=_plan(ticker="SPY", underlying=100.0, budget=2000.0),
+        chain=[candidate],
+        limit=1,
+    )
+
+    assert selected is None
+    assert failure["reason_code"] == "DIRECT_QUOTE_UNAVAILABLE"
+    assert diagnostics["candidate_outcomes"][candidate["symbol"]] == (
+        "DIRECT_QUOTE_UNAVAILABLE"
+    )
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+
+
+def test_pr439_pro_quality_retryable_peer_beats_terminal_quality_peer(monkeypatch):
+    """A retryable PRO recovery candidate cannot be vetoed by a terminal peer."""
+    pro_calls = {}
+
+    def _pro_quality(opt, ticker, dte):
+        pro_calls[opt["symbol"]] = pro_calls.get(opt["symbol"], 0) + 1
+        return "REJECT", "low_oi_0"
+
+    monkeypatch.setattr(
+        selector_mod,
+        "_pro_contract_quality",
+        _pro_quality,
+    )
+    retryable_symbol = _row("SPY", 101.0, bid=0.0, ask=0.0, oi=0, volume=0)["symbol"]
+    terminal_symbol = _row("SPY", 102.0, bid=0.0, ask=0.0, oi=0, volume=0)["symbol"]
+
+    def _recover(*args, **kwargs):
+        opt = args[1]
+        if opt["symbol"] == retryable_symbol:
+            return {
+                "action": "REJECT_UNAVAILABLE",
+                "reason_code": "DIRECT_QUOTE_UNAVAILABLE",
+                "direct_quote_used": False,
+                "opt_updated": None,
+                "audit": {},
+            }
+        patched = dict(opt)
+        patched.update({"bid": 1.10, "ask": 1.14})
+        return {
+            "action": "PASS",
+            "reason_code": "DIRECT_QUOTE_RECOVERED_CHAIN_ZERO",
+            "direct_quote_used": True,
+            "opt_updated": patched,
+            "audit": {"direct_bid": 1.10, "direct_ask": 1.14},
+        }
+
+    monkeypatch.setattr(selector_mod, "_revalidate_direct", _recover)
+    candidates = [
+        _row("SPY", 101.0, bid=0.0, ask=0.0, oi=0, volume=0),
+        _row("SPY", 102.0, bid=0.0, ask=0.0, oi=0, volume=0),
+    ]
+    selected, broker, context, failure, diagnostics = _run_selector(
+        monkeypatch,
+        plan=_plan(ticker="SPY", underlying=100.0, budget=2000.0),
+        chain=candidates,
+        limit=2,
+    )
+
+    assert selected is None
+    assert failure["reason_code"] == "DIRECT_QUOTE_UNAVAILABLE"
+    assert diagnostics["candidate_outcomes"] == {
+        retryable_symbol: "DIRECT_QUOTE_UNAVAILABLE",
+        terminal_symbol: "OI_TOO_LOW",
+    }
+    assert diagnostics["candidate_accounting"] == {
+        "universe_count": 2,
+        "accounted_count": 2,
+        "complete": True,
+    }
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+
+
+def test_pr439_successful_pro_recovery_then_fresh_terminal_quality_is_terminal(
+    monkeypatch,
+):
+    """Fresh authoritative quote evidence permits a genuine quality terminal."""
+    monkeypatch.setattr(
+        selector_mod,
+        "_pro_contract_quality",
+        lambda opt, ticker, dte: ("REJECT", "low_oi_0"),
+    )
+
+    def _recover(*args, **kwargs):
+        opt = dict(args[1])
+        opt.update({"bid": 1.10, "ask": 1.14})
+        return {
+            "action": "PASS",
+            "reason_code": "DIRECT_QUOTE_RECOVERED_CHAIN_ZERO",
+            "direct_quote_used": True,
+            "opt_updated": opt,
+            "audit": {"direct_bid": 1.10, "direct_ask": 1.14},
+        }
+
+    monkeypatch.setattr(selector_mod, "_revalidate_direct", _recover)
+    candidates = [
+        _row("SPY", 101.0, bid=0.0, ask=0.0, oi=0, volume=0),
+        _row("SPY", 102.0, bid=0.0, ask=0.0, oi=0, volume=0),
+    ]
+    selected, broker, context, failure, diagnostics = _run_selector(
+        monkeypatch,
+        plan=_plan(ticker="SPY", underlying=100.0, budget=2000.0),
+        chain=candidates,
+        limit=2,
+    )
+
+    assert selected is None
+    assert failure["reason_code"] == "OI_TOO_LOW"
+    assert set(diagnostics["candidate_outcomes"].values()) == {"OI_TOO_LOW"}
+    assert diagnostics["candidate_accounting"]["complete"] is True
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("candidate_outcomes", "expected"),
+    [
+        ({"A": "OI_TOO_LOW", "B": "SPREAD_TOO_WIDE"}, "OI_TOO_LOW"),
+        ({"A": "DIRECT_QUOTE_UNAVAILABLE", "B": "OI_TOO_LOW"}, "DIRECT_QUOTE_UNAVAILABLE"),
+        ({"A": "OI_TOO_LOW", "B": "DIRECT_QUOTE_ZERO_BID_ASK"}, "DIRECT_QUOTE_ZERO_BID_ASK"),
+        ({"A": "DIRECT_QUOTE_UNAVAILABLE", "B": "DIRECT_QUOTE_ZERO_BID_ASK"}, "DIRECT_QUOTE_UNAVAILABLE"),
+        ({"A": "OI_TOO_LOW", "B": "OI_TOO_LOW"}, "OI_TOO_LOW"),
+    ],
+)
+def test_pr439_candidate_scoped_authority_matrix(candidate_outcomes, expected):
+    """The reducer applies retryable authority across every candidate ordering."""
+    assert resolve_selector_recovery_final_reason({
+        "candidate_outcomes": candidate_outcomes,
+        "candidate_accounting_complete": True,
+        "eligible_unattempted_symbols": [],
+    }) == expected
 
 
 def test_transient_only_budget_exhaustion_remains_retryable():
@@ -1667,3 +1996,228 @@ def test_retry_terminal_meta_uses_current_equivalent_truth_fields():
     assert terminal["last_breach_selector_audit"]["operational_reason"] == last
     assert terminal["deferred_retry_terminal_reason"] == lifecycle
     assert terminal["deferred_retry_reason_code"] == last
+
+
+def test_pr439_immutable_release_replay_preserves_retry_ownership_and_blocks_broker(
+    monkeypatch,
+):
+    """Replay one incident-shaped request through durable retry and restart."""
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "40")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setenv("SELECTOR_DURABLE_RECOVERY_CURSOR_ENABLED", "1")
+    risk_calls = []
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_breach_risk_check",
+        lambda self, watched: risk_calls.append(watched.signal.get("signal_id")) or True,
+    )
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: watched.signal.get("_approved_plan") or plan,
+    )
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+
+    near_zero = _row("SPY", 101.0)
+    low_oi = _row("SPY", 102.0, bid=1.10, ask=1.14, oi=0, volume=0)
+    far_otm = _row("SPY", 130.0)
+    chain = [near_zero, low_oi, far_otm]
+    broker = _DirectQuoteBroker(
+        chain,
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=100.0,
+    )
+    selector = _actual_selector(broker, execution_mode="LIVE")
+    core = _execution_core(selector, broker, execution_mode="LIVE")
+    plan = _execution_plan(
+        execution_mode="LIVE",
+        breach_attempt_count=0,
+        budget=2000.0,
+        ticker="SPY",
+        underlying=100.0,
+    )
+    plan.signal_id = "sig-pr439-release-replay"
+    local_order_id = "local-pr439-release-replay"
+    watched = _execution_watched(
+        "LIVE",
+        ticker="SPY",
+        trigger_price=100.0,
+        local_order_id=local_order_id,
+    )
+    watched.signal["signal_id"] = plan.signal_id
+    watched.signal["_approved_plan"] = plan
+    now = datetime.now(timezone.utc)
+    row = {
+        "local_order_id": local_order_id,
+        "client_id": "jasoncosby1@gmail.com",
+        "execution_mode": "live",
+        "signal_id": plan.signal_id,
+        "plan_id": "plan-pr439-release-replay",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "symbol": "SPY",
+        "direction": "CALL",
+        "score": 85.0,
+        "tier": "A",
+        "trigger_price": 100.0,
+        "stop_underlying": 98.0,
+        "target_underlying": 103.0,
+        "pattern": "3-1-2",
+        "timeframe": "5m",
+        "contract": "DEFERRED:SPY",
+        "qty": 1,
+        "limit_price": 0.01,
+        "reserved_cost": 1.0,
+        "meta": {
+            "lifecycle_state": "",
+            "materialization_status": "WAITING_FOR_TRIGGER",
+            "materialization_generation": 0,
+            "retry_attempt": 0,
+            "breach_attempt_count": 0,
+            "materialization_attempts": 0,
+            "retry_max_attempts": 5,
+            "broker_ready": False,
+            "trigger_crossed_at": now.isoformat(),
+            "observed_underlying_price": 100.0,
+            "trigger_price": 100.0,
+            "client_id": "jasoncosby1@gmail.com",
+            "execution_mode": "live",
+            "canonical_signal_id": plan.signal_id,
+        },
+    }
+    osm = _ReleaseReplayOSM(row)
+    core.order_state_machine = osm
+
+    first = core._on_entry_trigger(watched)
+    assert first["disposition"] == "RETRY_WAIT"
+    assert first["reason_code"] == "DIRECT_QUOTE_ZERO_BID_ASK"
+    assert len(osm.schedule_calls) == 1
+    schedule = osm.schedule_calls[0]
+    selector_failure = schedule["selector_failure"]
+    diagnostics = selector_failure["selection_diagnostics"]
+    assert selector_failure["reason_code"] == "DIRECT_QUOTE_ZERO_BID_ASK"
+    assert diagnostics["candidate_accounting"] == {
+        "universe_count": 3,
+        "accounted_count": 3,
+        "complete": True,
+    }
+    assert diagnostics["candidate_outcomes"][near_zero["symbol"]] == (
+        "DIRECT_QUOTE_ZERO_BID_ASK"
+    )
+    assert diagnostics["candidate_outcomes"][low_oi["symbol"]] == "OI_TOO_LOW"
+    assert diagnostics["structural_skips"]
+    assert diagnostics["candidate_outcomes"][far_otm["symbol"]] == (
+        "MONEYNESS_OUT_OF_RANGE"
+    )
+    assert any(
+        item.get("symbol") == far_otm["symbol"]
+        and item.get("skip_reason") == "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
+        for item in diagnostics["structural_skips"]
+    )
+    assert schedule["signal_id"] == plan.signal_id
+    assert str(schedule["execution_mode"]).lower() == "live"
+    assert osm.row["client_id"] == "jasoncosby1@gmail.com"
+    assert osm.row["execution_mode"] == "live"
+    assert osm.row["signal_id"] == plan.signal_id
+    assert osm.row["local_order_id"] == local_order_id
+    assert osm.row["meta"]["materialization_generation"] == 1
+    assert osm.row["meta"]["retry_attempt"] == 1
+    assert osm.row["meta"]["lifecycle_state"] == "RETRY_WAIT"
+    assert osm.row["meta"]["materialization_status"] == "RETRY_PENDING"
+    assert osm.row["meta"]["broker_ready"] is False
+    assert osm.row["meta"]["selector_recovery_cursor_v1"]
+    first_cursor = osm.row["meta"]["selector_recovery_cursor_v1"]
+    assert first_cursor["local_order_id"] == local_order_id
+    assert first_cursor["signal_id"] == plan.signal_id
+    assert first_cursor["execution_mode"] == "live"
+    assert first_cursor["materialization_generation"] == 1
+    assert first_cursor["selector_attempt_count"] == 1
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+    osm.submit_existing_entry.assert_not_called()
+
+    # Simulate the immutable row becoming due before a fresh process starts.
+    due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    osm.row["meta"]["next_retry_at"] = due
+    osm.row["meta"]["materialization_next_retry_at"] = due
+
+    restart_broker = _DirectQuoteBroker(
+        chain,
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=100.0,
+    )
+
+    def _restart_quote(symbol):
+        if str(symbol).upper() == "SPY":
+            return {
+                "bid": 99.99,
+                "ask": 100.01,
+                "last": 100.0,
+                "provider_timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        return {"bid": 0.0, "ask": 0.0}
+
+    restart_broker.get_quote.side_effect = _restart_quote
+    restart_selector = _actual_selector(restart_broker, execution_mode="LIVE")
+    restarted = _execution_core(restart_selector, restart_broker, execution_mode="LIVE")
+    restarted.order_state_machine = osm
+    callback_results = []
+    _original_callback = restarted._on_entry_trigger
+
+    def _capture_callback(watched_signal):
+        result = _original_callback(watched_signal)
+        callback_results.append(result)
+        return result
+
+    restarted._on_entry_trigger = _capture_callback
+    second = restarted.resume_deferred_materialization_retry(
+        local_order_id=local_order_id,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="recovery:pr439-release-replay",
+    )
+
+    assert second["disposition"] == "RETRY_WAIT"
+    assert len(callback_results) == 1
+    assert callback_results[0]["disposition"] == "RETRY_WAIT"
+    assert callback_results[0]["reason_code"] == "DIRECT_QUOTE_ZERO_BID_ASK"
+    assert len(risk_calls) >= 2
+    assert len(osm.claim_calls) == 2
+    assert len(osm.schedule_calls) == 2
+    assert osm.claim_calls[-1]["owner"] == "recovery:pr439-release-replay"
+    assert osm.claim_calls[-1]["new_generation"] == 2
+    assert osm.claim_calls[-1]["retry_attempt"] == 2
+    assert osm.schedule_calls[-1]["signal_id"] == plan.signal_id
+    assert str(osm.schedule_calls[-1]["execution_mode"]).lower() == "live"
+    assert osm.row["local_order_id"] == local_order_id
+    assert osm.row["client_id"] == "jasoncosby1@gmail.com"
+    assert osm.row["execution_mode"] == "live"
+    assert osm.row["signal_id"] == plan.signal_id
+    assert osm.row["meta"]["materialization_generation"] == 2
+    assert osm.row["meta"]["lifecycle_state"] == "RETRY_WAIT"
+    assert osm.row["meta"]["broker_ready"] is False
+    second_cursor = osm.row["meta"]["selector_recovery_cursor_v1"]
+    assert second_cursor["local_order_id"] == local_order_id
+    assert second_cursor["signal_id"] == plan.signal_id
+    assert second_cursor["execution_mode"] == "live"
+    assert second_cursor["materialization_generation"] == 2
+    assert second_cursor["selector_attempt_count"] == 2
+    assert len(osm.cursor_calls) >= 2
+    assert all(call["signal_id"] == plan.signal_id for call in osm.cursor_calls)
+    assert all(str(call["execution_mode"]).lower() == "live" for call in osm.cursor_calls)
+    assert all(call["generation"] in {1, 2} for call in osm.cursor_calls)
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+    assert restart_broker.submit_order.call_count == 0
+    assert restart_broker.cancel_order.call_count == 0
+    restarted.order_state_machine.submit_existing_entry.assert_not_called()

@@ -2733,6 +2733,14 @@ class APOrderStateMachine:
                 _ra = int(retry_attempt)
                 _patch["retry_attempt"] = _ra
                 _patch["retry_attempt_in_flight"] = _ra
+                # Keep the three durable selector-attempt counters aligned
+                # during the fenced claim.  A restart callback reads all
+                # three before spending selector/broker capacity; advancing
+                # only retry_attempt would make the row look corrupt
+                # (retry_attempt=N+1 vs the two completed-attempt counters=N)
+                # and fail closed before the normal selector/risk gates run.
+                _patch["breach_attempt_count"] = _ra
+                _patch["materialization_attempts"] = _ra
                 _prev_attempt = max(0, _ra - 1)
             except (TypeError, ValueError):
                 pass

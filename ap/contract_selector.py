@@ -2307,6 +2307,41 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
     return "B", "ok_liquid"
 
 
+def _pro_recovery_candidate_reason(
+    *,
+    quality_reason: str,
+    recovery_action: str | None,
+    recovery_reason: str | None,
+    fresh_quote_recovered: bool,
+) -> str:
+    """Choose candidate authority after the PRO-quality recovery branch.
+
+    A quality reject observed before direct recovery is only provisional.  If
+    recovery did not produce an authoritative fresh quote, its disposition is
+    the candidate's truth; otherwise the post-recovery PRO-quality result is
+    authoritative.  Structural/off-hours/non-revalidatable skips did not
+    attempt a quote and therefore retain the original quality/structural
+    reason.
+    """
+    _action = str(recovery_action or "").strip().upper()
+    _quality = str(quality_reason or "")
+    _recovery = str(recovery_reason or "")
+    _no_quote_attempt = {
+        "SKIP_STRUCTURAL",
+        "SKIP_NOT_MARKET_HOURS",
+        "SKIP_NOT_REVALIDATABLE",
+        "SKIP_ALREADY_REVALIDATED",
+    }
+    if not _action or _action in _no_quote_attempt:
+        return _recovery if _action == "SKIP_STRUCTURAL" and _recovery else _quality
+    if fresh_quote_recovered:
+        return _quality
+    # Any recovery disposition that reached this point without authoritative
+    # quote evidence owns the candidate outcome, including unavailable,
+    # direct-zero, budget, and malformed/partial PASS results.
+    return _recovery or "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+
+
 # =============================================================================
 # OUTPUT DATACLASS
 # =============================================================================
@@ -3582,6 +3617,7 @@ class APContractSelectionEngine:
         for opt in _quality_chain:
             _pro_recovery_action = None
             _pro_recovery_reason = None
+            _pro_fresh_quote_recovered = False
             opt, _duplicate_authority_reason = _apply_duplicate_quote_authority(opt)
             if _duplicate_authority_reason:
                 _rejections[_duplicate_authority_reason] = _rejections.get(
@@ -3652,6 +3688,7 @@ class APContractSelectionEngine:
                     _pro_recovery_reason = _rv_pro.get("reason_code")
                     if _rv_pro.get("action") == "PASS" and _rv_pro.get("opt_updated"):
                         _opt_pro = _rv_pro["opt_updated"]
+                        _pro_fresh_quote_recovered = True
                         # Rerun pro_quality with patched bid/ask
                         pro_tier, pro_reason = _pro_contract_quality(_opt_pro, ticker, _dte)
                         # Extract direct-quote values from the revalidation audit
@@ -3733,13 +3770,11 @@ class APContractSelectionEngine:
                 if pro_tier == "REJECT":
                     _record_recovery_candidate_outcome(
                         opt,
-                        (
-                            _pro_recovery_reason
-                            if _pro_recovery_action in {
-                                "SKIP_STRUCTURAL",
-                                "SKIP_BUDGET_EXHAUSTED",
-                            }
-                            else pro_reason
+                        _pro_recovery_candidate_reason(
+                            quality_reason=pro_reason,
+                            recovery_action=_pro_recovery_action,
+                            recovery_reason=_pro_recovery_reason,
+                            fresh_quote_recovered=_pro_fresh_quote_recovered,
                         ),
                     )
                     _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
