@@ -1126,8 +1126,10 @@ class APBrokerReconciler:
                 row = dict(row) if not isinstance(row, dict) else row
                 ok = pm.close_position_from_exit_fill(
                     position_id=str(row["position_id"]),
-                    exit_price=float(row["fill_price"]),
-                    filled_qty=int(row["filled_qty"]),
+                    # Keep DB scalars raw; the shared finalizer owns strict
+                    # finite-price and whole-quantity validation.
+                    exit_price=row.get("fill_price"),
+                    filled_qty=row.get("filled_qty"),
                     filled_ts=str(row["filled_ts"]) if row.get("filled_ts") else None,
                     local_order_id=str(row.get("local_order_id") or ""),
                     broker_order_id=str(row.get("broker_order_id") or ""),

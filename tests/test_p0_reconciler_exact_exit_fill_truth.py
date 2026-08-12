@@ -303,6 +303,31 @@ def test_backup_healer_requires_exact_current_exit_generation_pair(
         assert close_kwargs["expected_pending_exit_broker_order_id"] == row_broker
 
 
+def test_backup_healer_passes_raw_exit_economics_to_shared_finalizer(monkeypatch):
+    """The healer must not truncate or launder invalid DB economics first."""
+    row = _healer_row(local_order_id="exit-B", broker_order_id="222")
+    row["fill_price"] = "nan"
+    row["filled_qty"] = 1.5
+    _install_healer_rows(monkeypatch, [row])
+
+    fake_pm = MagicMock()
+    fake_pm.close_position_from_exit_fill.return_value = False
+    monkeypatch.setattr(
+        position_manager_mod,
+        "APPositionManager",
+        lambda _client_id: fake_pm,
+    )
+
+    rec = _reconciler()
+    summary = _empty_summary(CLIENT)
+    rec._heal_exit_filled_positions_from_orders(summary)
+
+    close_kwargs = fake_pm.close_position_from_exit_fill.call_args.kwargs
+    assert close_kwargs["exit_price"] == "nan"
+    assert close_kwargs["filled_qty"] == 1.5
+    assert summary["positions_corrected"] == 0
+
+
 @pytest.mark.parametrize(
     ("locked_local", "locked_broker"),
     [
@@ -377,6 +402,58 @@ def test_backup_healer_finalizer_rechecks_both_exit_identities_under_lock(
 
     assert ok is False
     assert updates == []
+
+
+@pytest.mark.parametrize(
+    ("exit_price", "filled_qty"),
+    [
+        pytest.param(float("nan"), 2, id="nan-price"),
+        pytest.param(float("inf"), 2, id="infinite-price"),
+        pytest.param(True, 2, id="boolean-price"),
+        pytest.param(4.79, float("nan"), id="nan-quantity"),
+        pytest.param(4.79, float("inf"), id="infinite-quantity"),
+        pytest.param(4.79, True, id="boolean-quantity"),
+        pytest.param(4.79, 1.5, id="fractional-quantity"),
+    ],
+)
+def test_shared_finalizer_rejects_invalid_exit_economics_before_db_mutation(
+    monkeypatch,
+    exit_price,
+    filled_qty,
+):
+    """Malformed EXIT economics must be a zero-mutation HOLD at the boundary."""
+    conn_calls: list[bool] = []
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def _conn():
+        conn_calls.append(True)
+        return _Connection()
+
+    monkeypatch.setattr(position_manager_mod, "conn", _conn)
+    monkeypatch.setattr(position_manager_mod, "run_with_retry", lambda fn: fn())
+
+    pm = position_manager_mod.APPositionManager(CLIENT)
+    ok = pm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=exit_price,
+        filled_qty=filled_qty,
+        filled_ts="2026-08-10T19:00:00+00:00",
+        local_order_id="exit-B",
+        broker_order_id="222",
+        expected_pending_exit_local_order_id="exit-B",
+        expected_pending_exit_broker_order_id="222",
+        close_source="reconciler_broker_exit_fill",
+        close_confidence="HIGH",
+    )
+
+    assert ok is False
+    assert conn_calls == []
 
 
 def test_exact_c_incident_old_same_ticker_fill_is_not_evidence(monkeypatch):

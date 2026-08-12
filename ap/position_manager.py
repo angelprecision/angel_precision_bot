@@ -34,6 +34,32 @@ log = logging.getLogger("ap.position_manager")
 ET = ZoneInfo("America/New_York")
 
 
+def _strict_positive_finite_float(value: object) -> float | None:
+    """Return a positive finite scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _strict_positive_whole_number(value: object) -> int | None:
+    """Return a positive whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PR #237 — Position Manager fail-closed side normalization.
 #
@@ -2219,20 +2245,13 @@ class APPositionManager:
                 )
                 return False
 
-        try:
-            exit_px  = float(exit_price or 0)
-            fill_qty = int(filled_qty or 0)
-        except Exception:
-            log.error(
-                "[%s] close_position_from_exit_fill invalid inputs | pos=%s exit_price=%r filled_qty=%r",
-                self.client_id, position_id, exit_price, filled_qty,
-            )
-            return False
-
-        if not position_id or exit_px <= 0 or fill_qty <= 0:
+        exit_px = _strict_positive_finite_float(exit_price)
+        fill_qty = _strict_positive_whole_number(filled_qty)
+        if not position_id or exit_px is None or fill_qty is None:
             log.warning(
-                "[%s] close_position_from_exit_fill blocked | pos=%s exit_price=%s filled_qty=%s",
-                self.client_id, position_id, exit_px, fill_qty,
+                "[%s] close_position_from_exit_fill blocked | pos=%s "
+                "invalid finite-positive exit_price=%r or positive-whole filled_qty=%r",
+                self.client_id, position_id, exit_price, filled_qty,
             )
             return False
 
