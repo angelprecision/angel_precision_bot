@@ -249,9 +249,20 @@ def _resolve_direct_proof(
     if not rows:
         return _result(snapshot_id=snapshot_id, disposition="PROOF_NOT_FOUND", reason="no_proof_row_for_local_order_id")
 
-    matching_rows = [row for row in rows if _proof_client_state(row, client_id) == "MATCH"]
-    if not matching_rows:
-        return _result(snapshot_id=snapshot_id, disposition="CLIENT_CONFLICT", reason="local_order_id_exists_for_another_client")
+    # Every row returned for the exact local order is part of the candidate
+    # set.  A conflicting secondary identity cannot be discarded merely
+    # because another row looks valid: that would turn malformed/ambiguous
+    # proof truth into an official binding.
+    conflicting_rows = [row for row in rows if _proof_client_state(row, client_id) != "MATCH"]
+    if conflicting_rows:
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition="CLIENT_CONFLICT",
+            reason="proof_client_identity_conflict_among_local_order_candidates",
+            candidate_count=len(rows),
+        )
+
+    matching_rows = rows
 
     classifications = [
         _classify_proof_row(
@@ -357,6 +368,129 @@ def _already_bound(snapshot_id: str, binding: Mapping[str, Any]) -> dict[str, An
     )
 
 
+def _binding_identity_matches_snapshot(
+    binding: Mapping[str, Any],
+    snapshot_identity: Mapping[str, Any],
+) -> bool:
+    expected_method = (
+        DIRECT_BINDING_METHOD
+        if snapshot_identity.get("local_order_id")
+        else LINEAGE_BINDING_METHOD
+    )
+    if _text(binding.get("snapshot_id")) != _text(snapshot_identity.get("snapshot_id")):
+        return False
+    if normalize_client_id(binding.get("client_id")) != snapshot_identity.get("client_id"):
+        return False
+    if normalize_execution_mode(binding.get("execution_mode")) != snapshot_identity.get("execution_mode"):
+        return False
+    if _text(binding.get("canonical_signal_id")) != snapshot_identity.get("canonical_signal_id"):
+        return False
+    if _text(binding.get("phase")).upper() != snapshot_identity.get("phase"):
+        return False
+    if _text(binding.get("profile_version")) != snapshot_identity.get("profile_version"):
+        return False
+    if _text(binding.get("input_hash")) != snapshot_identity.get("input_hash"):
+        return False
+    if _text(binding.get("config_hash")) != snapshot_identity.get("config_hash"):
+        return False
+    if _text(binding.get("binding_method")) != expected_method:
+        return False
+    if _text(binding.get("binding_version")) != BINDING_VERSION:
+        return False
+    originating_local_order_id = _text(binding.get("originating_local_order_id"))
+    if not originating_local_order_id:
+        return False
+    if (
+        snapshot_identity.get("local_order_id")
+        and originating_local_order_id != snapshot_identity.get("local_order_id")
+    ):
+        return False
+    return True
+
+
+def _validate_existing_binding(
+    c: Any,
+    *,
+    binding: Mapping[str, Any],
+    snapshot_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Re-prove an existing row before treating it as durable authority."""
+    snapshot_id = _text(snapshot_identity.get("snapshot_id"))
+    if not _binding_identity_matches_snapshot(binding, snapshot_identity):
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition="SNAPSHOT_IDENTITY_UNPROVEN",
+            ok=False,
+            reason="existing_binding_identity_does_not_match_snapshot",
+        )
+
+    proof_trade_id = _proof_trade_id(binding.get("proof_trade_id"))
+    if not proof_trade_id:
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition="SNAPSHOT_IDENTITY_UNPROVEN",
+            ok=False,
+            reason="existing_binding_proof_identity_missing",
+        )
+
+    c.execute("SELECT * FROM proof_trades WHERE id=%s", (binding.get("proof_trade_id"),))
+    proof = c.fetchone()
+    if not proof:
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition="PROOF_NOT_FOUND",
+            ok=False,
+            reason="existing_binding_proof_row_missing",
+        )
+    proof_row = _row_dict(proof)
+    if _proof_trade_id(proof_row.get("id")) != proof_trade_id:
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition="SNAPSHOT_IDENTITY_UNPROVEN",
+            ok=False,
+            reason="existing_binding_proof_id_does_not_match_selected_row",
+        )
+
+    proof_local_order_id = _text(proof_row.get("local_order_id"))
+    if not proof_local_order_id:
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition="LOCAL_ORDER_ID_MISSING",
+            ok=False,
+            reason="existing_binding_proof_local_order_id_missing",
+        )
+    if _text(binding.get("originating_local_order_id")) != proof_local_order_id:
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition="SNAPSHOT_IDENTITY_UNPROVEN",
+            ok=False,
+            reason="existing_binding_local_order_id_does_not_match_proof",
+        )
+
+    classification = _classify_proof_row(
+        proof_row,
+        client_id=snapshot_identity["client_id"],
+        execution_mode=snapshot_identity["execution_mode"],
+        # PRETRIGGER lineage has no local order of its own; validate the
+        # proof's nonblank child order while still enforcing client/mode/
+        # taxonomy truth.
+        local_order_id=snapshot_identity["local_order_id"] or proof_local_order_id,
+    )
+    if not classification.get("eligible"):
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition=str(classification.get("disposition") or "SNAPSHOT_IDENTITY_UNPROVEN"),
+            ok=False,
+            reason=classification.get("reason"),
+        )
+    return _result(
+        snapshot_id=snapshot_id,
+        disposition="BOUND",
+        proof_trade_id=proof_trade_id,
+        proof_row=classification.get("proof_row") or proof_row,
+    )
+
+
 def _insert_binding(
     c: Any,
     *,
@@ -423,7 +557,14 @@ def _insert_binding(
 
     existing = _fetch_existing_binding(c, snapshot_id)
     if existing:
-        return _already_bound(snapshot_id, existing)
+        validated = _validate_existing_binding(
+            c,
+            binding=existing,
+            snapshot_identity=snapshot_identity,
+        )
+        if validated.get("ok"):
+            return _already_bound(snapshot_id, existing)
+        return validated
     return _result(
         snapshot_id=snapshot_id,
         disposition="PERSIST_FAILED",
@@ -471,13 +612,17 @@ def _bind_parent_lineage(
         if existing:
             existing_proof_id = _proof_trade_id(existing.get("proof_trade_id"))
             if existing_proof_id:
-                proof_rows_by_id.setdefault(existing_proof_id, {})
-                c.execute("SELECT * FROM proof_trades WHERE id=%s", (existing.get("proof_trade_id"),))
-                proof = c.fetchone()
-                if proof:
-                    proof_rows_by_id[existing_proof_id] = _row_dict(proof)
+                validated = _validate_existing_binding(
+                    c,
+                    binding=existing,
+                    snapshot_identity=child_identity,
+                )
+                if validated.get("ok"):
+                    proof_rows_by_id[existing_proof_id] = validated.get("proof_row") or {}
                 else:
-                    unresolved.append("PROOF_NOT_FOUND")
+                    unresolved.append(
+                        str(validated.get("disposition") or "PARENT_LINEAGE_UNPROVEN")
+                    )
             else:
                 unresolved.append("PARENT_LINEAGE_UNPROVEN")
             continue
@@ -531,10 +676,6 @@ def _bind_parent_lineage(
 
 
 def _bind_snapshot_in_connection(c: Any, snapshot_id: str) -> dict[str, Any]:
-    existing = _fetch_existing_binding(c, snapshot_id)
-    if existing:
-        return _already_bound(snapshot_id, existing)
-
     snapshot = _fetch_snapshot(c, snapshot_id)
     if not snapshot:
         return _result(
@@ -549,6 +690,27 @@ def _bind_snapshot_in_connection(c: Any, snapshot_id: str) -> dict[str, Any]:
             disposition=str(identity.get("disposition") or "SNAPSHOT_IDENTITY_UNPROVEN"),
             reason=identity.get("reason"),
         )
+
+    existing = _fetch_existing_binding(c, snapshot_id)
+    if existing:
+        validated = _validate_existing_binding(
+            c,
+            binding=existing,
+            snapshot_identity=identity,
+        )
+        if not validated.get("ok"):
+            return validated
+        if not identity["local_order_id"]:
+            if identity["phase"] != "PRETRIGGER":
+                return _result(
+                    snapshot_id=snapshot_id,
+                    disposition="LOCAL_ORDER_ID_MISSING",
+                    reason="only_pretrigger_can_use_parent_lineage_without_local_order_id",
+                )
+            # A PRETRIGGER binding is only durable authority when its
+            # descendant lineage remains provable on repeat reconciliation.
+            return _bind_parent_lineage(c, snapshot=snapshot, snapshot_identity=identity)
+        return _already_bound(snapshot_id, existing)
 
     if identity["local_order_id"]:
         proof_rows = _fetch_proofs_for_local_order(c, identity["local_order_id"])
@@ -713,6 +875,7 @@ def intelligence_truth_health(
         "live_official_proofs_available": 0,
         "live_bound_snapshots": 0,
         "paper_bound_snapshots": 0,
+        "unbound_counts_truncated": False,
         "unbound_missing_identity": 0,
         "unbound_ambiguous_proof": 0,
         "mode_conflicts": 0,
@@ -846,6 +1009,7 @@ def intelligence_truth_health(
                 (*params, bounded_limit),
             )
             unbound = [_row_dict(row) for row in (c.fetchall() or [])]
+            unbound_counts_truncated = len(unbound) >= bounded_limit
             ambiguous = 0
             mode_conflicts = 0
             missing_identity = 0
@@ -862,7 +1026,7 @@ def intelligence_truth_health(
                     ambiguous += 1
                 elif disposition == "MODE_CONFLICT":
                     mode_conflicts += 1
-            return snapshot_count, jobs_pending, jobs_failed_terminal, live_official, live_bound, paper_bound, missing_identity, ambiguous, mode_conflicts
+            return snapshot_count, jobs_pending, jobs_failed_terminal, live_official, live_bound, paper_bound, unbound_counts_truncated, missing_identity, ambiguous, mode_conflicts
 
     try:
         (
@@ -872,6 +1036,7 @@ def intelligence_truth_health(
             report["live_official_proofs_available"],
             report["live_bound_snapshots"],
             report["paper_bound_snapshots"],
+            report["unbound_counts_truncated"],
             report["unbound_missing_identity"],
             report["unbound_ambiguous_proof"],
             report["mode_conflicts"],
@@ -887,6 +1052,8 @@ def intelligence_truth_health(
         report["status"] = "DEGRADED_JOBS_FAILED_TERMINAL"
     elif report["jobs_pending"] and not report["snapshot_count"]:
         report["status"] = "DEGRADED_SNAPSHOT_CAPTURE_NOT_PROGRESSING"
+    elif report["unbound_counts_truncated"]:
+        report["status"] = "DEGRADED_UNBOUND_COUNTS_TRUNCATED"
     elif not report["snapshot_count"]:
         report["status"] = "ENABLED_NO_OBSERVATIONS"
     else:

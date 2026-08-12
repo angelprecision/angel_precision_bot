@@ -203,6 +203,41 @@ def _binding_rows(client_id: str):
         return [dict(row) for row in c.fetchall()]
 
 
+def _insert_binding_row(
+    snapshot_id: str,
+    proof_trade_id: int,
+    *,
+    client_id: str,
+    execution_mode: str,
+    originating_local_order_id: str,
+    phase: str,
+    input_hash: str,
+    binding_method: str = binding.DIRECT_BINDING_METHOD,
+) -> None:
+    with _postgres_conn() as c:
+        c.execute(
+            """
+            INSERT INTO ap_intelligence_outcome_bindings (
+                snapshot_id, proof_trade_id, client_id, execution_mode,
+                originating_local_order_id, canonical_signal_id, phase,
+                profile_version, input_hash, config_hash, binding_method,
+                binding_version
+            ) VALUES (%s,%s,%s,%s,%s,'canon-432',%s,'profile-432',%s,
+                      'config-432',%s,'p0-432-v1')
+            """,
+            (
+                snapshot_id,
+                proof_trade_id,
+                client_id,
+                execution_mode,
+                originating_local_order_id,
+                phase,
+                input_hash,
+                binding_method,
+            ),
+        )
+
+
 def test_normalization_and_taxonomy_are_strict_without_database():
     assert binding.normalize_client_id("  USER@EXAMPLE.COM ") == "user@example.com"
     assert binding.normalize_client_id(" Client-A ") == "Client-A"
@@ -221,14 +256,58 @@ def test_normalization_and_taxonomy_are_strict_without_database():
     )["disposition"] == "MODE_CONFLICT"
 
 
+def test_conflicting_secondary_client_candidate_holds_without_binding():
+    rows = [
+        {
+            "id": 1,
+            "client_email": "client@example.com",
+            "client_id": "client@example.com",
+            "local_order_id": "entry-1",
+            "execution_mode": "live",
+            "mode": "live",
+            "performance_taxonomy": "LIVE_OFFICIAL",
+            "training_eligible": True,
+            "official_live_performance_eligible": True,
+        },
+        {
+            "id": 2,
+            "client_email": "client@example.com",
+            "client_id": "other@example.com",
+            "local_order_id": "entry-1",
+            "execution_mode": "live",
+            "mode": "live",
+            "performance_taxonomy": "LIVE_OFFICIAL",
+            "training_eligible": True,
+            "official_live_performance_eligible": True,
+        },
+    ]
+
+    result = binding._resolve_direct_proof(
+        {
+            "snapshot_id": "snapshot-1",
+            "client_id": "client@example.com",
+            "execution_mode": "live",
+            "local_order_id": "entry-1",
+        },
+        rows,
+    )
+
+    assert result["disposition"] == "CLIENT_CONFLICT"
+    assert result["bound"] is False
+
+
 def test_migration_is_new_idempotent_and_has_no_transaction_control():
     migration = (REPO_ROOT / "migrations/20260812_intelligence_truth_binding_repair.sql").read_text()
-    assert "BEGIN" not in migration.upper()
-    assert "COMMIT" not in migration.upper()
+    assert "BEGIN;" not in migration.upper()
+    assert "COMMIT;" not in migration.upper()
     assert "CREATE TABLE IF NOT EXISTS public.blocked_signal_counterfactuals" in migration
     assert "CREATE TABLE IF NOT EXISTS public.ap_intelligence_outcome_bindings" in migration
     assert "UNIQUE (snapshot_id)" in migration
     assert "proof_trade_id BIGINT NOT NULL" in migration
+    assert "ALTER TABLE public.blocked_signal_counterfactuals ENABLE ROW LEVEL SECURITY" in migration
+    assert "ALTER TABLE public.ap_intelligence_outcome_bindings ENABLE ROW LEVEL SECURITY" in migration
+    assert "REVOKE ALL ON public.blocked_signal_counterfactuals, public.ap_intelligence_outcome_bindings FROM anon" in migration
+    assert "REVOKE ALL ON public.blocked_signal_counterfactuals, public.ap_intelligence_outcome_bindings FROM authenticated" in migration
     binding_sql = migration.split(
         "CREATE TABLE IF NOT EXISTS public.ap_intelligence_outcome_bindings", 1
     )[1]
@@ -245,6 +324,11 @@ def test_schema_attestation_declares_the_intelligence_contract():
     } <= set(required)
     assert {"id", "client_id", "input_hash", "config_hash", "payload"} <= required["ap_intelligence_snapshots"]
     assert {"snapshot_id", "proof_trade_id", "originating_local_order_id", "binding_version"} <= required["ap_intelligence_outcome_bindings"]
+    assert {
+        "id", "client_email", "local_order_id", "execution_mode", "mode",
+        "performance_taxonomy", "training_eligible",
+        "official_live_performance_eligible",
+    } <= required["proof_trades"]
     assert {"signal_id", "execution_mode", "meta", "hypothetical_r"} <= required["blocked_signal_counterfactuals"]
     assert "trade_performance" not in schema_attestation.REQUIRED_SCHEMA
     assert "ap_intelligence_snapshots" not in schema_attestation.REQUIRED_SCHEMA
@@ -345,6 +429,82 @@ def test_cross_client_signal_family_stays_unbound(pg_scope):
     assert _binding_rows(client_id) == []
     with _postgres_conn() as c:
         c.execute("DELETE FROM proof_trades WHERE client_email=%s", (other_client,))
+
+
+def test_existing_binding_revalidates_exact_proof_before_already_bound(pg_scope):
+    client_id = pg_scope
+    other_client = f"other-{uuid4().hex[:10]}@example.com"
+    proof_id = _insert_proof(
+        other_client,
+        "entry-existing",
+        execution_mode="paper",
+        mode="paper",
+        taxonomy="PAPER_UNVERIFIED",
+        training_eligible=False,
+        official_live_performance_eligible=False,
+    )
+    snapshot_id = _insert_snapshot(client_id, "live", local_order_id="entry-existing")
+    _insert_binding_row(
+        snapshot_id,
+        proof_id,
+        client_id=client_id,
+        execution_mode="live",
+        originating_local_order_id="entry-existing",
+        phase="PREOPEN",
+        input_hash=f"input-{snapshot_id}",
+    )
+
+    try:
+        result = binding.bind_snapshot_to_proof(snapshot_id)
+        assert result["disposition"] == "CLIENT_CONFLICT"
+        assert result["bound"] is False
+    finally:
+        with _postgres_conn() as c:
+            c.execute("DELETE FROM proof_trades WHERE id=%s", (proof_id,))
+
+
+def test_existing_child_binding_cannot_authorize_parent_lineage(pg_scope):
+    client_id = pg_scope
+    other_client = f"other-{uuid4().hex[:10]}@example.com"
+    proof_id = _insert_proof(
+        other_client,
+        "entry-lineage-existing",
+        execution_mode="paper",
+        mode="paper",
+        taxonomy="PAPER_UNVERIFIED",
+        training_eligible=False,
+        official_live_performance_eligible=False,
+    )
+    parent_id = _insert_snapshot(client_id, "live", phase="PRETRIGGER", local_order_id="")
+    child_id = _insert_snapshot(
+        client_id,
+        "live",
+        phase="PREOPEN",
+        local_order_id="entry-lineage-existing",
+        parent_snapshot_id=parent_id,
+    )
+    _insert_binding_row(
+        child_id,
+        proof_id,
+        client_id=client_id,
+        execution_mode="live",
+        originating_local_order_id="entry-lineage-existing",
+        phase="PREOPEN",
+        input_hash=f"input-{child_id}",
+    )
+
+    try:
+        result = binding.bind_snapshot_to_proof(parent_id)
+        assert result["disposition"] == "PARENT_LINEAGE_UNPROVEN"
+        with _postgres_conn() as c:
+            c.execute(
+                "SELECT 1 FROM ap_intelligence_outcome_bindings WHERE snapshot_id=%s",
+                (parent_id,),
+            )
+            assert c.fetchone() is None
+    finally:
+        with _postgres_conn() as c:
+            c.execute("DELETE FROM proof_trades WHERE id=%s", (proof_id,))
 
 
 def test_missing_or_conflicting_proof_mode_holds(pg_scope):
@@ -602,3 +762,45 @@ def test_worker_does_not_reconcile_when_capture_is_disabled(monkeypatch):
     assert result["completed"] == 1
     assert result["reconciliation"]["disabled"] is True
     assert called == []
+
+
+def test_worker_reconciles_only_when_capture_is_enabled(monkeypatch):
+    monkeypatch.setenv("INTELLIGENCE_CONTEXT_STORE_BACKEND", "memory")
+    monkeypatch.setenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "1")
+    from ap.intelligence_context_materializer import enqueue_pretrigger_context
+    from ap.intelligence_snapshot_store import _reset_memory_store_for_tests
+
+    _reset_memory_store_for_tests()
+    enqueue_pretrigger_context(
+        {
+            "signal_id": "signal-worker-enabled",
+            "canonical_signal_id": "canon-worker-enabled",
+            "ticker": "SPY",
+        },
+        client_id="worker-enabled@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-worker-enabled",
+    )
+    called = []
+    monkeypatch.setattr(
+        worker,
+        "reconcile_intelligence_outcome_bindings",
+        lambda **kwargs: called.append(kwargs) or {"ok": True, "processed": 0},
+    )
+
+    result = worker.process_due_intelligence_jobs_once(
+        client_id="worker-enabled@example.com",
+        execution_mode="PAPER",
+        claim_owner="worker-enabled-test",
+        limit=5,
+    )
+
+    assert result["completed"] == 1
+    assert result["reconciliation"]["ok"] is True
+    assert called == [
+        {
+            "client_id": "worker-enabled@example.com",
+            "execution_mode": "PAPER",
+            "limit": 5,
+        }
+    ]

@@ -62,6 +62,14 @@ INTELLIGENCE_REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
         "status", "attempt_count", "max_attempts", "next_attempt_at",
         "snapshot_id", "created_at", "updated_at",
     }),
+    # The binder reads these proof-truth fields directly.  Keep this in the
+    # intelligence contract rather than broadening broker preflight with an
+    # analytics-only table dependency.
+    "proof_trades": frozenset({
+        "id", "client_email", "local_order_id", "execution_mode", "mode",
+        "performance_taxonomy", "training_eligible",
+        "official_live_performance_eligible",
+    }),
     "blocked_signal_counterfactuals": frozenset({
         "id", "signal_id", "canonical_signal_id", "client_id", "execution_mode",
         "ticker", "direction", "block_stage", "block_reason", "reason_code",

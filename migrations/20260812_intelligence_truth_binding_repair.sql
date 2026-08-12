@@ -61,3 +61,19 @@ CREATE INDEX IF NOT EXISTS idx_ap_intelligence_outcome_bindings_identity
         execution_mode,
         originating_local_order_id
     );
+
+-- These evidence-plane tables contain cross-client identity and outcome
+-- bindings.  Keep the Supabase Data API roles from reading or writing them;
+-- the backend's direct database role remains the sole application writer.
+ALTER TABLE public.blocked_signal_counterfactuals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ap_intelligence_outcome_bindings ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        EXECUTE 'REVOKE ALL ON public.blocked_signal_counterfactuals, public.ap_intelligence_outcome_bindings FROM anon';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        EXECUTE 'REVOKE ALL ON public.blocked_signal_counterfactuals, public.ap_intelligence_outcome_bindings FROM authenticated';
+    END IF;
+END $$;
