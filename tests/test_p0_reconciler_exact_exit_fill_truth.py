@@ -162,7 +162,7 @@ def _position(*, mode: str = MODE_LIVE) -> dict:
 
 
 class _HealerCursor:
-    """Cursor double that exposes the old OR versus the exact-pair SQL fence."""
+    """Cursor double that models the current position's two EXIT identities."""
 
     def __init__(
         self,
@@ -191,11 +191,14 @@ class _HealerCursor:
             return
 
         exact_pair_predicate = (
-            "NULLIF(TRIM(COALESCE(P.PENDING_EXIT_LOCAL_ORDER_ID, '')), '') IS NULL"
+            "NULLIF(TRIM(COALESCE(P.PENDING_EXIT_LOCAL_ORDER_ID, '')), '') IS NOT NULL"
             in upper_sql
-            and "NULLIF(TRIM(COALESCE(P.PENDING_EXIT_BROKER_ORDER_ID, '')), '') IS NULL"
+            and "NULLIF(TRIM(COALESCE(P.PENDING_EXIT_BROKER_ORDER_ID, '')), '') IS NOT NULL"
             in upper_sql
+            and "O.LOCAL_ORDER_ID = P.PENDING_EXIT_LOCAL_ORDER_ID" in upper_sql
+            and "O.BROKER_ORDER_ID = P.PENDING_EXIT_BROKER_ORDER_ID" in upper_sql
         )
+        assert exact_pair_predicate, "backup healer SQL must require the complete EXIT identity pair"
 
         def _matches(row: dict) -> bool:
             local_matches = (
@@ -204,11 +207,7 @@ class _HealerCursor:
             broker_matches = (
                 str(row.get("broker_order_id") or "").strip() == self.current_broker
             )
-            return (
-                local_matches and broker_matches
-                if exact_pair_predicate
-                else local_matches or broker_matches
-            )
+            return bool(self.current_local and self.current_broker) and local_matches and broker_matches
 
         self._selected = [dict(row) for row in self.rows if _matches(row)]
 
@@ -216,8 +215,18 @@ class _HealerCursor:
         return list(self._selected)
 
 
-def _install_healer_rows(monkeypatch, rows: list[dict]) -> _HealerCursor:
-    cursor = _HealerCursor(rows)
+def _install_healer_rows(
+    monkeypatch,
+    rows: list[dict],
+    *,
+    current_local: str = "exit-B",
+    current_broker: str = "222",
+) -> _HealerCursor:
+    cursor = _HealerCursor(
+        rows,
+        current_local=current_local,
+        current_broker=current_broker,
+    )
 
     class _Connection:
         def __enter__(self):
@@ -243,15 +252,19 @@ def _healer_row(*, local_order_id: str, broker_order_id: str) -> dict:
 
 
 @pytest.mark.parametrize(
-    ("row_local", "row_broker", "expected_heals"),
+    ("current_local", "current_broker", "row_local", "row_broker", "expected_heals"),
     [
-        pytest.param("exit-B", "111", 0, id="local-only-match-holds"),
-        pytest.param("exit-A", "222", 0, id="broker-only-match-holds"),
-        pytest.param("exit-B", "222", 1, id="exact-pair-heals"),
+        pytest.param("", "222", "exit-B", "222", 0, id="current-local-missing-holds"),
+        pytest.param("exit-B", "", "exit-B", "222", 0, id="current-broker-missing-holds"),
+        pytest.param("exit-B", "222", "exit-B", "111", 0, id="row-broker-mismatch-holds"),
+        pytest.param("exit-B", "222", "exit-A", "222", 0, id="row-local-mismatch-holds"),
+        pytest.param("exit-B", "222", "exit-B", "222", 1, id="exact-pair-heals"),
     ],
 )
 def test_backup_healer_requires_exact_current_exit_generation_pair(
     monkeypatch,
+    current_local: str,
+    current_broker: str,
     row_local: str,
     row_broker: str,
     expected_heals: int,
@@ -259,6 +272,8 @@ def test_backup_healer_requires_exact_current_exit_generation_pair(
     cursor = _install_healer_rows(
         monkeypatch,
         [_healer_row(local_order_id=row_local, broker_order_id=row_broker)],
+        current_local=current_local,
+        current_broker=current_broker,
     )
     fake_pm = MagicMock()
     fake_pm.close_position_from_exit_fill.return_value = True
@@ -276,6 +291,10 @@ def test_backup_healer_requires_exact_current_exit_generation_pair(
     healer_sql = cursor.sql[0].upper()
     assert "PENDING_EXIT_LOCAL_ORDER_ID" in healer_sql
     assert "PENDING_EXIT_BROKER_ORDER_ID" in healer_sql
+    assert "NULLIF(TRIM(COALESCE(P.PENDING_EXIT_LOCAL_ORDER_ID, '')), '') IS NOT NULL" in healer_sql
+    assert "NULLIF(TRIM(COALESCE(P.PENDING_EXIT_BROKER_ORDER_ID, '')), '') IS NOT NULL" in healer_sql
+    assert "O.LOCAL_ORDER_ID = P.PENDING_EXIT_LOCAL_ORDER_ID" in healer_sql
+    assert "O.BROKER_ORDER_ID = P.PENDING_EXIT_BROKER_ORDER_ID" in healer_sql
     assert fake_pm.close_position_from_exit_fill.call_count == expected_heals
     assert summary["positions_corrected"] == expected_heals
 
@@ -915,6 +934,87 @@ def test_close_rechecks_remaining_quantity_before_mutating_positions(monkeypatch
     assert summary["positions_alerted"] == 1
     assert any(
         "position_remaining_changed_before_close" in call.args[0]
+        for call in rec._alert.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    ("locked_local", "locked_broker"),
+    [
+        pytest.param("", "TR-195", id="locked-local-missing"),
+        pytest.param("exit-local-1", "", id="locked-broker-missing"),
+    ],
+)
+def test_close_requires_both_locked_exit_identities_before_any_mutation(
+    monkeypatch,
+    locked_local: str,
+    locked_broker: str,
+):
+    """A one-sided identity after FOR UPDATE cannot close or write proof."""
+    rec = _reconciler()
+    rec._alert = MagicMock()
+    rec._persist_exact_reconciler_proof = MagicMock()
+    summary = _empty_summary(CLIENT)
+    evidence = _exit_row(filled_qty=2, fill_price=4.79)
+    updates: list[tuple] = []
+    durable_exit_reads: list[tuple] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if "FROM ORDERS" in compact:
+                durable_exit_reads.append((sql, params))
+                self._row = dict(evidence)
+            elif "FOR UPDATE" in compact:
+                self._row = {
+                    "quantity_remaining": 2,
+                    "qty": 2,
+                    "pending_exit_local_order_id": locked_local,
+                    "pending_exit_broker_order_id": locked_broker,
+                }
+            elif compact.startswith("UPDATE POSITIONS"):
+                updates.append((sql, params))
+
+        def fetchone(self):
+            return getattr(self, "_row", None)
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(db_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+
+    rec._execute_reconciler_close(
+        pos=_position(),
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=2,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+        summary=summary,
+        exact_exit_fill_qty=2,
+        exact_exit_evidence=evidence,
+    )
+
+    assert updates == []
+    assert durable_exit_reads == []
+    rec._persist_exact_reconciler_proof.assert_not_called()
+    assert summary["positions_alerted"] == 1
+    assert any(
+        "durable_exit_evidence_changed_before_close" in call.args[0]
         for call in rec._alert.call_args_list
     )
 

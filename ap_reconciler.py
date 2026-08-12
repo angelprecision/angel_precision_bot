@@ -1097,19 +1097,10 @@ class APBrokerReconciler:
                               LOWER(TRIM(COALESCE(p.execution_mode, '')))
                           AND UPPER(TRIM(COALESCE(o.contract, ''))) =
                               UPPER(TRIM(COALESCE(p.contract, '')))
-                          AND (
-                              NULLIF(TRIM(COALESCE(p.pending_exit_local_order_id, '')), '') IS NOT NULL
-                              OR
-                              NULLIF(TRIM(COALESCE(p.pending_exit_broker_order_id, '')), '') IS NOT NULL
-                          )
-                          AND (
-                              NULLIF(TRIM(COALESCE(p.pending_exit_local_order_id, '')), '') IS NULL
-                              OR p.pending_exit_local_order_id = o.local_order_id
-                          )
-                          AND (
-                              NULLIF(TRIM(COALESCE(p.pending_exit_broker_order_id, '')), '') IS NULL
-                              OR p.pending_exit_broker_order_id = o.broker_order_id
-                          )
+                          AND NULLIF(TRIM(COALESCE(p.pending_exit_local_order_id, '')), '') IS NOT NULL
+                          AND NULLIF(TRIM(COALESCE(p.pending_exit_broker_order_id, '')), '') IS NOT NULL
+                          AND o.local_order_id = p.pending_exit_local_order_id
+                          AND o.broker_order_id = p.pending_exit_broker_order_id
                           AND p.avg_fill IS NOT NULL
                           AND p.avg_fill > 0
                           AND (
@@ -3590,15 +3581,10 @@ class APBrokerReconciler:
                         _row.get("pending_exit_broker_order_id") or ""
                     ).strip()
                     if (
-                        not (locked_local_order_id or locked_broker_order_id)
-                        or (
-                            locked_local_order_id
-                            and locked_local_order_id != evidence_local_order_id
-                        )
-                        or (
-                            locked_broker_order_id
-                            and locked_broker_order_id != evidence_broker_order_id
-                        )
+                        not locked_local_order_id
+                        or not locked_broker_order_id
+                        or locked_local_order_id != evidence_local_order_id
+                        or locked_broker_order_id != evidence_broker_order_id
                     ):
                         return {
                             "blocked_reason": "RECONCILER_EXIT_FILL_EVIDENCE_CHANGED",
