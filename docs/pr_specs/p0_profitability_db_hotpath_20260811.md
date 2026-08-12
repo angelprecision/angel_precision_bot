@@ -80,7 +80,9 @@ EXPLAIN/index-eligibility evidence for ARMED, stale retry, both
 PENDING_TRIGGER paths, recursive scan-work bounds beneath `Limit`, the
 PENDING_TRIGGER residual `filled_ts IS NULL` filter, malformed-metadata guards,
 and the two known production schema-shape checks across root and nested
-production files.
+production files. The focused workflow path filters mirror those root and
+nested production globs, so a future schema-shape regression cannot bypass
+this contract by changing an unlisted production module.
 
 ### 1. Inventory slow queries from production logs
 
