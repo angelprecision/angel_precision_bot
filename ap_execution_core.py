@@ -3503,6 +3503,16 @@ class APExecutionCore:
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
         expected_contract = str(row.get("contract") or "")
         expected_qty = _strict_positive_whole_number(row.get("qty"))
+        if not exact_tag:
+            # An empty broker listing is still an unresolved crash-window
+            # observation. Preserve the identity-fence taxonomy even when the
+            # durable row's requested quantity is itself malformed; there is
+            # no candidate on which quantity matching could be performed.
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD",
+            }
         if expected_qty is None:
             return {
                 **_base,
@@ -3520,10 +3530,6 @@ class APExecutionCore:
         if exact_tag and not strong:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH"}
         if not strong:
-            # A broker order listing can be delayed, paginated, or incomplete.
-            # Once submit intent is durable, one empty listing can never prove
-            # that the POST did not land.  Retain the identity fence until exact
-            # broker truth or an explicit operator reconciliation resolves it.
             return {
                 **_base,
                 "disposition": "RECONCILE_PENDING",
@@ -3639,6 +3645,8 @@ class APExecutionCore:
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
         expected_contract = str(row.get("contract") or "")
         expected_qty = _strict_positive_whole_number(row.get("qty"))
+        if not exact_tag:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD"}
         if expected_qty is None:
             return {
                 **_base,
