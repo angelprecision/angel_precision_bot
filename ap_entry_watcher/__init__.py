@@ -28,6 +28,11 @@ for _name in dir(_base):
     if not _name.startswith("__") or _name == "__doc__":
         globals()[_name] = getattr(_base, _name)
 
+from ap_entry_efficiency import (
+    ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE as _ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+    resolve_entry_efficiency_mode as _resolve_entry_efficiency_mode,
+)
+
 _BaseWatchedSignal = _base.WatchedSignal
 _BaseAPEntryWatcher = _base.APEntryWatcher
 WatchState = _base.WatchState
@@ -209,6 +214,19 @@ class WatchedSignal(_BaseWatchedSignal):
         }
 
     def check(self, bid: float, ask: float, quote_age_ms: _Optional[int] = None) -> str:
+        # Persisted WAIT/REARM state is telemetry/history unless the current
+        # explicit rollout and PAPER execution identity authorize behavior.
+        efficiency_mode = _resolve_entry_efficiency_mode()
+        execution_mode = str(
+            (getattr(self, "signal", {}) or {}).get("execution_mode") or ""
+        ).strip().lower()
+        efficiency_behavior_enabled = (
+            efficiency_mode == _ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE
+            and execution_mode == "paper"
+        )
+        if not efficiency_behavior_enabled:
+            return super().check(bid, ask, quote_age_ms=quote_age_ms)
+
         prior_state = str(getattr(self, "entry_efficiency_state", "") or "").upper()
         if prior_state not in _ENTRY_EFFICIENCY_WAIT_STATES:
             return super().check(bid, ask, quote_age_ms=quote_age_ms)

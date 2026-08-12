@@ -15,6 +15,8 @@ os.environ.setdefault(
 os.environ.setdefault("ENCRYPTION_KEY", "ap-entry-efficiency-pr-436-2026")
 
 from ap_entry_efficiency import (
+    ENTRY_EFFICIENCY_OBSERVE_ONLY,
+    ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
     READY_NOW,
     REARM_FOR_REBREACH,
     TERMINAL_INVALID,
@@ -61,10 +63,10 @@ def test_targeted_paper_rollout_requires_explicit_promotion_and_fails_closed(mon
     monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
     monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
 
-    assert resolve_entry_efficiency_mode() == "observe_only"
-    assert resolve_entry_efficiency_mode("not-a-mode") == "observe_only"
-    assert resolve_entry_efficiency_mode("paper") == "observe_only"
-    assert resolve_entry_efficiency_mode("paper_authoritative") == "paper_authoritative"
+    assert resolve_entry_efficiency_mode() == ENTRY_EFFICIENCY_OBSERVE_ONLY
+    assert resolve_entry_efficiency_mode("not-a-mode") == ENTRY_EFFICIENCY_OBSERVE_ONLY
+    assert resolve_entry_efficiency_mode("paper") == ENTRY_EFFICIENCY_OBSERVE_ONLY
+    assert resolve_entry_efficiency_mode("paper_authoritative") == ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE
     result = _decision(mode=None)
     assert result.authoritative is False
     assert result.decision == WAIT_CONFIRMATION
@@ -248,7 +250,8 @@ def _watch_signal(contract_symbol="", **metadata):
     return signal
 
 
-def test_watcher_wait_suppresses_repeated_trigger_until_efficiency_due():
+def test_watcher_wait_suppresses_repeated_trigger_until_efficiency_due(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
     future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
     watched = WatchedSignal(
         _watch_signal(
@@ -269,7 +272,64 @@ def test_watcher_wait_suppresses_repeated_trigger_until_efficiency_due():
     assert watched.check(302.79, 302.81, quote_age_ms=1000) == WatchState.TRIGGERED
 
 
-def test_watcher_pullback_stages_distinct_rearm_cas_request():
+def test_live_stale_efficiency_wait_is_ignored_when_paper_authority_is_enabled(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    signal = _watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    )
+    signal["execution_mode"] = "live"
+    watched = WatchedSignal(signal, overnight=False)
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+def test_paper_stale_efficiency_wait_is_ignored_when_rollout_is_observe_only(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_OBSERVE_ONLY)
+    watched = WatchedSignal(
+        _watch_signal(
+            entry_efficiency_state=WAIT_CONFIRMATION,
+            entry_efficiency_generation=1,
+            entry_efficiency_next_eval_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(),
+        ),
+        overnight=False,
+    )
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+def test_paper_stale_efficiency_wait_remains_active_when_authority_is_enabled(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    watched = WatchedSignal(
+        _watch_signal(
+            entry_efficiency_state=WAIT_CONFIRMATION,
+            entry_efficiency_generation=1,
+            entry_efficiency_next_eval_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(),
+        ),
+        overnight=False,
+    )
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.breach_count == 0
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+def test_watcher_pullback_stages_distinct_rearm_cas_request(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
     watched = WatchedSignal(
         _watch_signal(
             entry_efficiency_state="WAIT_CONFIRMATION",
@@ -424,7 +484,8 @@ def test_aapl_wait_returns_before_runtime_submit_path(monkeypatch):
     osm.cas_entry_efficiency_state.assert_called_once()
 
 
-def test_aapl_replay_wait_rearm_rebreach_ready_has_no_first_entry_post():
+def test_aapl_replay_wait_rearm_rebreach_ready_has_no_first_entry_post(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
     deadline = "2026-08-12T14:21:51+00:00"
     watched = WatchedSignal(
         _watch_signal(
