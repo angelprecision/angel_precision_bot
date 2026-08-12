@@ -4485,8 +4485,58 @@ class APExitEngine:
         """Recovery-facing wrapper for the durable position fill bridge."""
         with self._lock:
             pos = self._positions_by_id.get(str(position_id or ""))
-            if pos is None or pos.closed:
+            if pos is None:
+                pos = next(
+                    (
+                        candidate
+                        for candidate in self._positions
+                        if str(getattr(candidate, "position_id", "") or "")
+                        == str(position_id or "")
+                    ),
+                    None,
+                )
+            if pos is None:
                 return {"ok": False, "reason": "position_runtime_unavailable"}
+            if pos.closed:
+                # The active EXIT_PARTIAL_FILL hook can consume the final
+                # position contract and remove it from _positions_by_id
+                # before OrderMonitor performs its idempotent proof pass.
+                # Accept that boundary only when the exact watermark identity
+                # is already present; never infer success from closed alone.
+                identity, identity_reason = self._exit_fill_consumption_identity(
+                    pos,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                )
+                marker = getattr(pos, "exit_fill_consumption", None)
+                if (
+                    identity is None
+                    or not isinstance(marker, dict)
+                    or type(marker.get("applied_cumulative_qty")) is not int
+                    or marker.get("applied_cumulative_qty") != cumulative_filled_qty
+                    or any(
+                        str(marker.get(field_name) or "")
+                        != str(identity[field_name] or "")
+                        for field_name in (
+                            "position_id", "client_id", "execution_mode",
+                            "local_order_id", "broker_order_id",
+                        )
+                    )
+                    or marker.get("replacement_generation")
+                    != identity["replacement_generation"]
+                ):
+                    return {
+                        "ok": False,
+                        "reason": "closed_position_fill_watermark_unconfirmed",
+                        "identity_reason": identity_reason,
+                    }
+                return {
+                    "ok": True,
+                    "applied_delta": 0,
+                    "applied_cumulative_qty": cumulative_filled_qty,
+                    "quantity_remaining": int(getattr(pos, "quantity_remaining", 0) or 0),
+                    "identity": identity,
+                }
             return self._persist_exit_fill_consumption_to_db(
                 pos,
                 local_order_id=local_order_id,

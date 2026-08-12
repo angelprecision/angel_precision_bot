@@ -136,15 +136,23 @@ class _DurableCancelOSM:
 class _TerminalPartialFillOSM:
     """Durable OSM double whose exit hook is intentionally not invoked."""
 
-    def __init__(self, *, position_id, local_order_id, broker_order_id):
+    def __init__(
+        self,
+        *,
+        position_id,
+        local_order_id,
+        broker_order_id,
+        status="EXIT_ACKNOWLEDGED",
+        filled_qty=0,
+    ):
         self.row = {
             "local_order_id": local_order_id,
             "kind": "EXIT",
             "position_id": position_id,
             "broker_order_id": broker_order_id,
-            "status": "EXIT_ACKNOWLEDGED",
+            "status": status,
             "qty": 2,
-            "filled_qty": 0,
+            "filled_qty": filled_qty,
             "meta": {},
         }
         self.transitions = []
@@ -179,14 +187,38 @@ class _TerminalPartialFillOSM:
         return True
 
 
+class _HookedTerminalPartialFillOSM(_TerminalPartialFillOSM):
+    """OSM double that runs the active-fill hook before terminalization."""
+
+    def __init__(self, *, exit_engine, **kwargs):
+        super().__init__(**kwargs)
+        self.exit_engine = exit_engine
+
+    def transition(self, local_order_id, status, **kwargs):
+        previous_filled = int(self.row.get("filled_qty") or 0)
+        ok = super().transition(local_order_id, status, **kwargs)
+        if ok and status == "EXIT_PARTIAL_FILL":
+            cumulative_filled = int(kwargs.get("filled_qty") or 0)
+            self.exit_engine.note_partial_exit_fill(
+                self.row["position_id"],
+                qty_filled=max(0, cumulative_filled - previous_filled),
+                fill_price=kwargs.get("fill_price"),
+                local_order_id=local_order_id,
+                broker_order_id=self.row["broker_order_id"],
+                cumulative_filled=cumulative_filled,
+                prior_cumulative_filled=previous_filled,
+            )
+        return ok
+
+
 class _PositionFillDB:
     """Small SQL-shaped store for the real APExitEngine fill bridge."""
 
-    def __init__(self, *, quantity_remaining=7, meta=None, row_present=True):
+    def __init__(self, *, quantity_remaining=7, qty=7, meta=None, row_present=True):
         self.row = (
             {
                 "quantity_remaining": quantity_remaining,
-                "qty": 7,
+                "qty": qty,
                 "meta": dict(meta or {}),
             }
             if row_present
@@ -236,7 +268,10 @@ class _PositionFillConnection:
         return self.result
 
 
-def _real_fill_engine(*, position_id, local_order_id, broker_order_id, quantity_remaining):
+def _real_fill_engine(
+    *, position_id, local_order_id, broker_order_id, quantity_remaining,
+    quantity=7, pending_exit_qty=2,
+):
     from ap_exit_engine import APExitEngine, ManagedPosition
 
     engine = APExitEngine(broker=MagicMock(), email="mon@test.local")
@@ -247,7 +282,7 @@ def _real_fill_engine(*, position_id, local_order_id, broker_order_id, quantity_
         ticker="AAPL",
         option_symbol="AAPL260814C00200000",
         side="CALL",
-        quantity=7,
+        quantity=quantity,
         entry_price=1.0,
         underlying_entry=200.0,
         underlying_target=210.0,
@@ -259,7 +294,7 @@ def _real_fill_engine(*, position_id, local_order_id, broker_order_id, quantity_
         exit_in_flight=True,
         pending_exit_local_order_id=local_order_id,
         pending_exit_broker_order_id=broker_order_id,
-        pending_exit_qty=2,
+        pending_exit_qty=pending_exit_qty,
     )
     engine._positions.append(position)
     engine._positions_by_id[position_id] = position
@@ -627,19 +662,42 @@ def test_check_exit_orders_routes_aged_partial_fill_to_remainder_owner(monkeypat
 
 
 def test_partial_to_filled_reread_applies_canonical_full_fill_truth(monkeypatch):
-    """A newer raw FILLED payload must not be converted into a zero remainder."""
+    """A newer raw FILLED payload consumes only its new position-side delta."""
     _watchdog_mode(monkeypatch, stale_exit_recovery=True)
-    osm = MagicMock()
-    osm.get_order.return_value = {
-        "kind": "EXIT",
-        "position_id": "pos-race",
-        "broker_order_id": "bro-race",
-        "status": "EXIT_PARTIAL_FILL",
-        "qty": 2,
-        "filled_qty": 1,
+    from ap_exit_engine import EXIT_FILL_CONSUMPTION_META_KEY
+
+    position_id = "pos-race"
+    local_order_id = "loc-race"
+    broker_order_id = "bro-race"
+    marker = {
+        "position_id": position_id,
+        "client_id": "mon@test.local",
+        "execution_mode": "paper",
+        "local_order_id": local_order_id,
+        "broker_order_id": broker_order_id,
+        "replacement_generation": 0,
+        "applied_cumulative_qty": 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    osm.transition.return_value = True
-    mon = _monitor(osm=osm)
+    store = _PositionFillDB(
+        quantity_remaining=6,
+        meta={EXIT_FILL_CONSUMPTION_META_KEY: marker},
+    )
+    _install_position_fill_db(monkeypatch, store)
+    exit_engine, position = _real_fill_engine(
+        position_id=position_id,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        quantity_remaining=6,
+    )
+    osm = _TerminalPartialFillOSM(
+        position_id=position_id,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        status="EXIT_PARTIAL_FILL",
+        filled_qty=1,
+    )
+    mon = _monitor(osm=osm, exit_engine=exit_engine)
     mon._emit_order_event = MagicMock()
     mon._alert = MagicMock()
     mon._query_broker_order = MagicMock(return_value="partially_filled")
@@ -661,15 +719,191 @@ def test_partial_to_filled_reread_applies_canonical_full_fill_truth(monkeypatch)
         reason="partial to filled race",
     )
 
-    osm.transition.assert_called_once_with(
-        "loc-race",
-        "EXIT_FILLED",
-        filled_qty=2,
-        fill_price=2.55,
-        broker_order_id="bro-race",
-    )
+    assert [status for _, status, _ in osm.transitions] == [
+        "EXIT_PARTIAL_FILL", "EXIT_FILLED",
+    ]
+    assert osm.row["filled_qty"] == 2
+    assert store.row["quantity_remaining"] == 5
+    assert store.applied_deltas == [1]
+    assert store.row["meta"][EXIT_FILL_CONSUMPTION_META_KEY]["applied_cumulative_qty"] == 2
+    assert position.quantity_remaining == 5
+    assert position.closed is False
     mon._advance_from_broker_status.assert_not_called()
     assert mon.broker.cancel_order.called is False
+
+
+def test_terminal_full_scale_out_consumes_position_before_exit_filled(monkeypatch):
+    """A filled scale-out records OSM active truth before terminalizing."""
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    from ap_exit_engine import EXIT_FILL_CONSUMPTION_META_KEY
+
+    position_id = "pos-full-scale-out"
+    local_order_id = "loc-full-scale-out"
+    broker_order_id = "bro-full-scale-out"
+    store = _PositionFillDB(quantity_remaining=7)
+    _install_position_fill_db(monkeypatch, store)
+    exit_engine, position = _real_fill_engine(
+        position_id=position_id,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        quantity_remaining=7,
+    )
+    osm = _HookedTerminalPartialFillOSM(
+        exit_engine=exit_engine,
+        position_id=position_id,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        status="EXIT_ACKNOWLEDGED",
+        filled_qty=0,
+    )
+    mon = _monitor(osm=osm, exit_engine=exit_engine)
+    mon._emit_order_event = MagicMock()
+    mon._query_broker_order = MagicMock(return_value="partially_filled")
+    mon._query_broker_order_payload = MagicMock(
+        return_value={
+            "status": "filled",
+            "exec_quantity": 2,
+            "avg_fill_price": 2.55,
+        }
+    )
+
+    mon._handle_stale_exit(
+        local_order_id=local_order_id,
+        status="EXIT_ACKNOWLEDGED",
+        contract="AAPL260814C00200000",
+        age_secs=120.0,
+        position_id=position_id,
+        reason="terminal scale-out fill",
+    )
+
+    assert [status for _, status, _ in osm.transitions] == [
+        "EXIT_PARTIAL_FILL", "EXIT_FILLED",
+    ]
+    assert store.row["quantity_remaining"] == 5
+    assert store.applied_deltas == [2, 0]
+    assert sum(store.applied_deltas) == 2
+    assert store.row["meta"][EXIT_FILL_CONSUMPTION_META_KEY]["applied_cumulative_qty"] == 2
+    assert position.quantity_remaining == 5
+    assert position.closed is False
+    assert position.exit_in_flight is False
+    assert mon.broker.cancel_order.called is False
+    assert mon.broker.submit_order.called is False
+
+
+def test_terminal_full_position_still_closes_after_order_monitor_ordering_fix(monkeypatch):
+    """A true full-position fill remains a normal close, not a held terminal."""
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    store = _PositionFillDB(quantity_remaining=2, qty=2)
+    _install_position_fill_db(monkeypatch, store)
+    exit_engine, position = _real_fill_engine(
+        position_id="pos-full-close",
+        local_order_id="loc-full-close",
+        broker_order_id="bro-full-close",
+        quantity_remaining=2,
+        quantity=2,
+        pending_exit_qty=2,
+    )
+    osm = _HookedTerminalPartialFillOSM(
+        exit_engine=exit_engine,
+        position_id="pos-full-close",
+        local_order_id="loc-full-close",
+        broker_order_id="bro-full-close",
+        status="EXIT_ACKNOWLEDGED",
+        filled_qty=0,
+    )
+    mon = _monitor(osm=osm, exit_engine=exit_engine)
+    mon._emit_order_event = MagicMock()
+
+    result = mon._apply_broker_partial_exit_fill(
+        "loc-full-close",
+        "bro-full-close",
+        "AAPL260814C00200000",
+        raw_payload={
+            "status": "filled",
+            "exec_quantity": 2,
+            "avg_fill_price": 2.55,
+        },
+    )
+
+    assert result == 0
+    assert [status for _, status, _ in osm.transitions] == [
+        "EXIT_PARTIAL_FILL", "EXIT_FILLED",
+    ]
+    assert store.row["quantity_remaining"] == 0
+    assert store.applied_deltas == [2]
+    assert position.quantity_remaining == 0
+    assert position.closed is True
+
+
+def test_terminal_full_fill_bridge_unavailable_keeps_active_restart_owner(monkeypatch):
+    """A failed bridge leaves EXIT_PARTIAL_FILL repairable and unconsumed."""
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    from ap_exit_engine import EXIT_FILL_CONSUMPTION_META_KEY
+
+    position_id = "pos-bridge-restart"
+    local_order_id = "loc-bridge-restart"
+    broker_order_id = "bro-bridge-restart"
+    marker = {
+        "position_id": position_id,
+        "client_id": "mon@test.local",
+        "execution_mode": "paper",
+        "local_order_id": local_order_id,
+        "broker_order_id": broker_order_id,
+        "replacement_generation": 0,
+        "applied_cumulative_qty": 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    store = _PositionFillDB(
+        quantity_remaining=6,
+        meta={EXIT_FILL_CONSUMPTION_META_KEY: marker},
+    )
+    _install_position_fill_db(monkeypatch, store)
+    unavailable = MagicMock()
+    unavailable.reconcile_exit_fill_consumption.return_value = {
+        "ok": False,
+        "reason": "bridge_unavailable",
+    }
+    osm = _TerminalPartialFillOSM(
+        position_id=position_id,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        status="EXIT_PARTIAL_FILL",
+        filled_qty=1,
+    )
+    mon = _monitor(osm=osm, exit_engine=unavailable)
+    mon._emit_order_event = MagicMock()
+
+    payload = {
+        "status": "filled",
+        "exec_quantity": 2,
+        "avg_fill_price": 2.55,
+    }
+    assert mon._apply_broker_partial_exit_fill(
+        local_order_id, broker_order_id, "AAPL260814C00200000", raw_payload=payload
+    ) is None
+    assert [status for _, status, _ in osm.transitions] == ["EXIT_PARTIAL_FILL"]
+    assert store.row["quantity_remaining"] == 6
+    assert store.applied_deltas == []
+
+    restart_engine, restart_position = _real_fill_engine(
+        position_id=position_id,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        quantity_remaining=6,
+    )
+    restart = _monitor(osm=osm, exit_engine=restart_engine)
+    restart._emit_order_event = MagicMock()
+
+    assert restart._apply_broker_partial_exit_fill(
+        local_order_id, broker_order_id, "AAPL260814C00200000", raw_payload=payload
+    ) == 0
+    assert [status for _, status, _ in osm.transitions] == [
+        "EXIT_PARTIAL_FILL", "EXIT_FILLED",
+    ]
+    assert store.row["quantity_remaining"] == 5
+    assert store.applied_deltas == [1]
+    assert store.update_count == 1
+    assert restart_position.quantity_remaining == 5
 
 
 def test_watchdog_flag_explicitly_disabled_still_suppresses(monkeypatch):
@@ -1307,11 +1541,13 @@ def test_terminal_cumulative_fill_matrix_is_strict_and_cumulative(
     for terminal_status in ("canceled", "expired", "rejected"):
         osm = _TerminalOSM()
         exit_engine = MagicMock()
-        exit_engine.reconcile_exit_fill_consumption.return_value = {
-            "ok": True,
-            "applied_cumulative_qty": 1,
-            "quantity_remaining": 1,
-        }
+        exit_engine.reconcile_exit_fill_consumption.side_effect = (
+            lambda _position_id, *, cumulative_filled_qty, **_kwargs: {
+                "ok": True,
+                "applied_cumulative_qty": cumulative_filled_qty,
+                "quantity_remaining": max(0, 2 - cumulative_filled_qty),
+            }
+        )
         mon = _monitor(osm=osm, exit_engine=exit_engine)
         mon._emit_order_event = MagicMock()
         remainder = mon._apply_broker_partial_exit_fill(

@@ -6708,7 +6708,72 @@ class APOrderMonitor:
                         fill_price = raw.get("price")
 
                     if cumulative_filled == requested_qty:
-                        if cumulative_filled == previous_filled and not self._reconcile_replayed_exit_fill(
+                        # Keep the exit row active while the position-side
+                        # watermark is proven.  EXIT_FILLED is terminal, so a
+                        # direct transition would strand recovery if the
+                        # post-transition exit hook never runs.
+                        current_status = str(order.get("status") or "").strip().upper()
+                        if (
+                            current_status != "EXIT_PARTIAL_FILL"
+                            or cumulative_filled > previous_filled
+                        ):
+                            try:
+                                if (
+                                    current_status == "EXIT_PARTIAL_FILL"
+                                    and callable(getattr(self.osm, "apply_fill_update", None))
+                                ):
+                                    ok = self.osm.apply_fill_update(
+                                        local_order_id=local_order_id,
+                                        cumulative_filled=cumulative_filled,
+                                        fill_price=fill_price,
+                                        broker_order_id=broker_order_id,
+                                    )
+                                else:
+                                    ok = self.osm.transition(
+                                        local_order_id,
+                                        "EXIT_PARTIAL_FILL",
+                                        filled_qty=cumulative_filled,
+                                        fill_price=fill_price,
+                                        broker_order_id=broker_order_id,
+                                    )
+                                if ok is False:
+                                    return None
+                            except Exception as exc:
+                                log.error(
+                                    "[%s] canonical OSM active full-fill apply failed | local=%s: %s",
+                                    self.client_id, local_order_id, exc,
+                                )
+                                return None
+
+                        active_order = dict(self.osm.get_order(local_order_id) or {})
+                        active_status = str(active_order.get("status") or "").strip().upper()
+                        active_filled = _strict_cumulative_quantity(active_order.get("filled_qty"))
+                        if (
+                            active_status != "EXIT_PARTIAL_FILL"
+                            or active_filled is None
+                            or active_filled < cumulative_filled
+                        ):
+                            self._emit_order_event(
+                                local_order_id=local_order_id,
+                                stage="order_monitor",
+                                decision="HOLD",
+                                reason_code="BROKER_FILLED_ACTIVE_OSM_UNCONFIRMED",
+                                explanation=(
+                                    "Broker terminal fill was not durably recorded in the "
+                                    "active EXIT_PARTIAL_FILL state; terminalization remains blocked."
+                                ),
+                                contract=contract,
+                                position_id=order.get("position_id"),
+                                inputs={
+                                    "broker_order_id": broker_order_id,
+                                    "cumulative_filled": cumulative_filled,
+                                    "active_status": active_status,
+                                    "active_filled": active_order.get("filled_qty"),
+                                },
+                            )
+                            return None
+
+                        if not self._reconcile_replayed_exit_fill(
                             order=order,
                             local_order_id=local_order_id,
                             broker_order_id=broker_order_id,
