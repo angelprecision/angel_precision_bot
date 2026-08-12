@@ -841,6 +841,26 @@ def test_stale_vix_cache_is_refetched_before_authority(monkeypatch):
     assert result["observed_at"] != stale_at
 
 
+def test_fresh_legacy_exact_vix_cache_is_discarded_before_authority(monkeypatch):
+    from ap_intelligence.tools import ap_data_tools
+
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.Ticker = lambda _: types.SimpleNamespace(fast_info={"lastPrice": 18.5})
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+    monkeypatch.setattr(ap_data_tools, "_cache_get", lambda _: _fresh_vix(40.0))
+    monkeypatch.setattr(ap_data_tools, "_cache_set", lambda *_: None)
+
+    fetched = ap_data_tools.get_vix()
+    risk_result = _evaluate_vix_payload(fetched)
+
+    assert fetched["vix"] == 18.5
+    assert fetched["classification"] == "ESTIMATED_ADVISORY"
+    assert ap_data_tools.validate_vix_observation(fetched)[0] is False
+    assert risk_result.approved is True
+    assert risk_result.hard_veto is False
+    assert risk_result.reason_code == "VIX_UNAVAILABLE"
+
+
 def test_unavailable_vix_flows_get_vix_to_pipeline_risk_detail_and_bridge(monkeypatch):
     from unittest.mock import MagicMock, patch
     from ap_intelligence.agents.ap_risk_manager import APRiskManager

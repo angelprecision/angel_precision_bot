@@ -481,8 +481,11 @@ def get_vix() -> dict:
     """Pull VIX from yfinance."""
     cache_key = f"vix_{datetime.date.today()}"
     cached = _cache_get(cache_key)
-    # The shared cache may retain a file for one hour, but Gate G accepts only
-    # a fresh, provenance-bound observation from that cache.
+    # yfinance fast_info.lastPrice has no provider/market observation
+    # timestamp.  Any cached PRODUCTION_EXACT record was therefore created by
+    # the pre-correction fetch-time attestation and cannot establish authority.
+    if isinstance(cached, dict) and cached.get("classification") == "PRODUCTION_EXACT":
+        cached = None
     if validate_vix_observation(cached)[0]:
         return cached
 
