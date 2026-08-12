@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import json
 import math
+import re
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -97,6 +98,22 @@ _BROKER_FILLED_TIMESTAMP_FIELDS = (
     "updated_at",
 )
 
+# Broker order listings must carry the actual option contract before a
+# DEFERRED:<ticker> recovery row can become broker-owned.  Keep this parser
+# strict: a ticker-only ``symbol`` or another placeholder is not an OCC
+# contract, and the fill monitor cannot safely derive position identity from
+# either one.
+_BROKER_OCC_CONTRACT_RE = re.compile(
+    r"^(?P<root>[A-Z0-9.]{1,6})(?P<expiration>\d{6})(?P<right>[CP])(?P<strike>\d{8})$"
+)
+_BROKER_CONTRACT_FIELDS = (
+    "option_symbol",
+    "contract",
+    "contract_symbol",
+    "occ_symbol",
+    "symbol",
+)
+
 # Dedicated pre-breach restart rearm retry fields. These are intentionally
 # separate from #323 post-breach materialization retry metadata.
 _RR_STATUS_FIELD     = "restart_rearm_status"
@@ -115,6 +132,82 @@ _RR_CLOSE_REASON     = "restart_rearm_close_reason"
 _RETRY_MATERIALIZATION = "MATERIALIZATION_RETRY"
 _RETRY_RESTART_REARM  = "RESTART_REARM_RETRY"
 _RETRY_WATCHER        = "WATCHER_RETRY"
+
+
+def _broker_order_contract_values(payload: dict):
+    """Yield OCC-looking contract values from normalized or raw broker data."""
+    pending = [payload]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop(0)
+        if not isinstance(node, dict) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        for field_name in _BROKER_CONTRACT_FIELDS:
+            raw = node.get(field_name)
+            if raw is None:
+                continue
+            normalized = "".join(str(raw).upper().split())
+            if normalized:
+                yield normalized
+        for nested_name in ("raw", "order", "details"):
+            nested = node.get(nested_name)
+            if isinstance(nested, dict):
+                pending.append(nested)
+            elif isinstance(nested, list):
+                pending.extend(item for item in nested if isinstance(item, dict))
+
+
+def _validated_broker_occ_contract(
+    row: dict, broker_order: dict
+) -> tuple[Optional[str], str]:
+    """Return the one broker OCC contract proven for this deferred ENTRY."""
+    if not isinstance(broker_order, dict):
+        return None, "broker_contract_missing_or_invalid"
+
+    valid_contracts: list[str] = []
+    for candidate in _broker_order_contract_values(broker_order):
+        match = _BROKER_OCC_CONTRACT_RE.fullmatch(candidate)
+        if not match:
+            continue
+        try:
+            datetime.strptime(match.group("expiration"), "%y%m%d")
+        except (TypeError, ValueError):
+            continue
+        valid_contracts.append(candidate)
+
+    distinct_contracts = set(valid_contracts)
+    if not distinct_contracts:
+        return None, "broker_contract_missing_or_invalid"
+    if len(distinct_contracts) != 1:
+        return None, "broker_contract_ambiguous"
+    contract = valid_contracts[0]
+    match = _BROKER_OCC_CONTRACT_RE.fullmatch(contract)
+    if match is None:  # pragma: no cover - guarded by the loop above
+        return None, "broker_contract_missing_or_invalid"
+
+    row_ticker = "".join(
+        str(
+            row.get("ticker")
+            or row.get("symbol")
+            or row.get("underlying")
+            or (_strict_recovery_meta(row) or {}).get("ticker")
+            or ""
+        ).upper().split()
+    )
+    if not row_ticker or match.group("root") != row_ticker:
+        return None, "broker_contract_underlying_mismatch"
+
+    direction = str(
+        row.get("direction")
+        or row.get("side")
+        or (_strict_recovery_meta(row) or {}).get("side")
+        or ""
+    ).strip().upper()
+    expected_right = {"CALL": "C", "PUT": "P"}.get(direction)
+    if expected_right is None or match.group("right") != expected_right:
+        return None, "broker_contract_direction_mismatch"
+    return contract, "broker_contract_identity_present"
 
 
 # ── Environment-tunable limits ────────────────────────────────────────────────
@@ -642,7 +735,7 @@ class PendingTriggerRestartRecovery:
 
         broker_disposition, broker_order, broker_reason = (
             self._prebroker_inflight_broker_truth(
-                local_oid, quantity=proof["quantity"]
+                current, local_oid, quantity=proof["quantity"]
             )
         )
         if broker_disposition == "HOLD":
@@ -783,7 +876,7 @@ class PendingTriggerRestartRecovery:
         }
 
     def _prebroker_inflight_broker_truth(
-        self, local_oid: str, *, quantity: int
+        self, row: dict, local_oid: str, *, quantity: int
     ) -> tuple[str, Optional[dict], str]:
         """Return MATCH, ZERO, or HOLD for exact broker ENTRY ownership."""
         list_orders = getattr(self.broker, "list_orders", None)
@@ -816,6 +909,9 @@ class PendingTriggerRestartRecovery:
         remote_id = str(remote.get("id") or remote.get("order_id") or "").strip()
         if not remote_id:
             return "HOLD", None, "exact_broker_order_id_missing"
+        _contract, contract_reason = _validated_broker_occ_contract(row, remote)
+        if _contract is None:
+            return "HOLD", None, contract_reason
         return "MATCH", remote, "exact_broker_order_identity_present"
 
     def _prove_stuck_trigger_ready_prebroker(self, row: dict, local_oid: str) -> dict:
@@ -1011,6 +1107,9 @@ class PendingTriggerRestartRecovery:
             remote_id = str(remote.get("id") or remote.get("order_id") or "").strip()
             if not remote_id:
                 return _hold("exact_broker_order_id_missing")
+            _contract, contract_reason = _validated_broker_occ_contract(row, remote)
+            if _contract is None:
+                return _hold(contract_reason)
             return {
                 "disposition": "BROKER_MATCH",
                 "reason_code": "exact_broker_order_identity_present",
@@ -1030,9 +1129,8 @@ class PendingTriggerRestartRecovery:
     def _adopt_existing_broker_order(
         self, local_oid: str, row: dict, broker_order: dict
     ) -> str:
-        """Adopt one exact broker-owned ENTRY without claim or broker POST."""
+        """Adopt exact broker ownership and hand fill authority to the monitor."""
         transition = getattr(self.osm, "transition", None)
-        update_meta = getattr(self.osm, "update_order_meta", None)
         remote_id = str(
             broker_order.get("id") or broker_order.get("order_id") or ""
         ).strip()
@@ -1040,18 +1138,13 @@ class PendingTriggerRestartRecovery:
             self._mark_failure(local_oid, "broker_adoption_unavailable")
             return _RowOutcome.UNRESOLVED
 
+        contract, contract_reason = _validated_broker_occ_contract(row, broker_order)
+        if contract is None:
+            self._mark_failure(local_oid, f"broker_adoption_{contract_reason}")
+            return _RowOutcome.UNRESOLVED
+
         remote_status = str(broker_order.get("status") or "").strip().lower()
         remote_status = remote_status.replace("-", "_")
-        status_map = {
-            "filled": "FILLED",
-            "partially_filled": "PARTIAL_FILL",
-            "partial_filled": "PARTIAL_FILL",
-            "rejected": "REJECTED",
-            "canceled": "CANCELED",
-            "cancelled": "CANCELED",
-            "expired": "EXPIRED",
-        }
-        local_status = status_map.get(remote_status, "SUBMITTED")
 
         # Recovery time is diagnostic only.  It is never a substitute for
         # broker chronology: a stale order must retain its actual submission
@@ -1063,71 +1156,33 @@ class PendingTriggerRestartRecovery:
             )
         )
         if submitted_ts_malformed:
-            self._mark_failure(local_oid, "broker_adoption_submitted_ts_malformed")
-            return _RowOutcome.UNRESOLVED
-        if submitted_ts is None:
-            existing_meta = _strict_recovery_meta(row)
-            if existing_meta is None:
-                self._mark_failure(local_oid, "broker_adoption_row_meta_malformed")
-                return _RowOutcome.UNRESOLVED
-            existing_timestamps = dict(existing_meta)
-            # The canonical column is authoritative when present; metadata is
-            # only the existing persisted fallback used by older rows.
-            if row.get("submitted_ts") is not None:
-                existing_timestamps["submitted_ts"] = row.get("submitted_ts")
-            submitted_ts, submitted_ts_source, existing_ts_malformed = (
-                _first_broker_timestamp(
-                    existing_timestamps,
-                    _EXISTING_SUBMITTED_TIMESTAMP_FIELDS,
-                )
-            )
-            if existing_ts_malformed:
-                self._mark_failure(local_oid, "broker_adoption_existing_ts_malformed")
-                return _RowOutcome.UNRESOLVED
-
-        filled_qty = None
-        for field_name in (
-            "exec_quantity",
-            "filled_quantity",
-            "quantity_filled",
-            "filled_qty",
-        ):
-            if field_name in broker_order:
-                filled_qty = _strict_broker_quantity(broker_order.get(field_name))
-                if filled_qty is None:
-                    self._mark_failure(local_oid, "broker_adoption_filled_qty_malformed")
-                    return _RowOutcome.UNRESOLVED
-                break
-        fill_price = None
-        for field_name in ("avg_fill_price", "average_fill_price", "fill_price"):
-            if field_name in broker_order:
-                fill_price = _strict_positive_float(broker_order.get(field_name))
-                if fill_price is None and local_status in {"FILLED", "PARTIAL_FILL"}:
-                    self._mark_failure(local_oid, "broker_adoption_fill_price_malformed")
-                    return _RowOutcome.UNRESOLVED
-                break
-
+            submitted_ts = None
+            submitted_ts_source = None
         filled_ts, filled_ts_source, filled_ts_malformed = _first_broker_timestamp(
             broker_order,
             _BROKER_FILLED_TIMESTAMP_FIELDS,
         )
         if filled_ts_malformed:
-            self._mark_failure(local_oid, "broker_adoption_filled_ts_malformed")
-            return _RowOutcome.UNRESOLVED
-        if local_status in {"FILLED", "PARTIAL_FILL"} and (
-            filled_qty is None
-            or filled_qty <= 0
-            or fill_price is None
-            or fill_price <= 0
-            or filled_ts is None
-        ):
-            # Never advance a broker-owned order to a fill state without the
-            # exact positive economics and broker fill chronology required by
-            # the position handoff.
-            self._mark_failure(local_oid, "broker_adoption_fill_proof_incomplete")
-            return _RowOutcome.UNRESOLVED
+            filled_ts = None
+            filled_ts_source = None
 
         now = _now_iso()
+        reconciliation_patch = {
+            "reconciled_at": now,
+            "recovery_classification": "BROKER_ORDER_ADOPTED",
+            "broker_reconcile_status": remote_status,
+            "broker_reconcile_response": broker_order,
+            "broker_reconcile_contract": contract,
+            "broker_submitted_ts": submitted_ts,
+            "broker_submitted_ts_source": (
+                submitted_ts_source
+                or ("malformed_unusable" if submitted_ts_malformed else "unavailable")
+            ),
+            "broker_filled_ts": filled_ts,
+            "broker_filled_ts_source": filled_ts_source or "unavailable",
+            "current_owner": "ORDER_MONITOR",
+            "lifecycle_state": "SUBMITTED",
+        }
         try:
             accepted = bool(
                 transition(
@@ -1135,6 +1190,9 @@ class PendingTriggerRestartRecovery:
                     "SUBMITTED",
                     broker_order_id=remote_id,
                     submitted_ts=submitted_ts,
+                    contract=contract,
+                    meta_patch=reconciliation_patch,
+                    expected_contract=str(row.get("contract") or "").strip(),
                 )
             )
         except Exception as exc:
@@ -1144,60 +1202,6 @@ class PendingTriggerRestartRecovery:
             self._mark_failure(local_oid, "broker_adoption_transition_failed")
             return _RowOutcome.UNRESOLVED
 
-        if local_status != "SUBMITTED":
-            try:
-                advanced = bool(
-                    transition(
-                        local_oid,
-                        local_status,
-                        broker_order_id=remote_id,
-                        filled_qty=filled_qty,
-                        fill_price=fill_price,
-                        filled_ts=filled_ts,
-                        last_error=(
-                            str(
-                                broker_order.get("reason")
-                                or broker_order.get("message")
-                                or ""
-                            ).strip()
-                            or None
-                        ),
-                    )
-                )
-            except Exception as exc:
-                self._mark_failure(
-                    local_oid, f"broker_adoption_status_failed:{type(exc).__name__}"
-                )
-                return _RowOutcome.UNRESOLVED
-            if not advanced:
-                self._mark_failure(local_oid, "broker_adoption_status_failed")
-                return _RowOutcome.UNRESOLVED
-
-        if callable(update_meta):
-            try:
-                update_meta(
-                    local_oid,
-                    {
-                        "reconciled_at": now,
-                        "recovery_classification": "BROKER_ORDER_ADOPTED",
-                        "broker_reconcile_status": remote_status,
-                        "broker_reconcile_response": broker_order,
-                        "broker_submitted_ts": submitted_ts,
-                        "broker_submitted_ts_source": (
-                            submitted_ts_source or "unavailable"
-                        ),
-                        "broker_filled_ts": filled_ts,
-                        "broker_filled_ts_source": filled_ts_source or "unavailable",
-                        "current_owner": "ORDER_MONITOR",
-                        "lifecycle_state": local_status,
-                    },
-                )
-            except Exception as exc:
-                self._mark_failure(
-                    local_oid, f"broker_adoption_meta_failed:{type(exc).__name__}"
-                )
-                return _RowOutcome.UNRESOLVED
-
         try:
             after = self.osm.get_order(local_oid)
         except Exception as exc:
@@ -1206,9 +1210,25 @@ class PendingTriggerRestartRecovery:
         if not isinstance(after, dict):
             self._mark_failure(local_oid, "broker_adoption_reread_missing")
             return _RowOutcome.UNRESOLVED
+        after_meta = _strict_recovery_meta(after)
+        raw_evidence = (
+            after_meta.get("broker_reconcile_response")
+            if isinstance(after_meta, dict)
+            else None
+        )
+        try:
+            evidence_matches = (
+                isinstance(raw_evidence, dict)
+                and json.dumps(raw_evidence, sort_keys=True, default=str)
+                == json.dumps(broker_order, sort_keys=True, default=str)
+            )
+        except Exception:
+            evidence_matches = False
         if (
             str(after.get("broker_order_id") or "").strip() != remote_id
-            or str(after.get("status") or "").strip().upper() == "PENDING_TRIGGER"
+            or str(after.get("status") or "").strip().upper() != "SUBMITTED"
+            or str(after.get("contract") or "").strip().upper() != contract
+            or not evidence_matches
         ):
             self._mark_failure(local_oid, "broker_adoption_durable_identity_missing")
             return _RowOutcome.UNRESOLVED

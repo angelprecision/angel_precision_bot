@@ -77,6 +77,7 @@ class _OSM:
         self.cancel_calls = []
         self.retry_calls = []
         self.transition_calls = []
+        self.meta_calls = []
         self.rearm_calls = []
 
     def get_order(self, local_order_id):
@@ -135,6 +136,7 @@ class _OSM:
         return True
 
     def update_order_meta(self, local_order_id, patch):
+        self.meta_calls.append((local_order_id, dict(patch)))
         self.rows[local_order_id].setdefault("meta", {}).update(patch)
         return True
 
@@ -163,6 +165,10 @@ class _OSM:
             row["fill_price"] = kwargs["fill_price"]
         if kwargs.get("filled_ts") is not None:
             row["filled_ts"] = kwargs["filled_ts"]
+        if kwargs.get("contract") is not None:
+            row["contract"] = kwargs["contract"]
+        if kwargs.get("meta_patch") is not None:
+            row.setdefault("meta", {}).update(kwargs["meta_patch"])
         return True
 
     def cancel_pending_entry(self, local_order_id, *, reason=""):
@@ -196,6 +202,7 @@ def _broker_order(**overrides):
         "side": "buy_to_open",
         "quantity": "1",
         "status": "working",
+        "option_symbol": "SPY260821C00500000",
     }
     order.update(overrides)
     return order
@@ -444,6 +451,7 @@ def test_restart_after_claim_expiry_adopts_exact_broker_order_without_retry():
     broker.list_orders.assert_called_once_with()
     assert osm.rows[LOCAL_ORDER_ID]["status"] == "SUBMITTED"
     assert osm.rows[LOCAL_ORDER_ID]["broker_order_id"] == "broker-existing"
+    assert osm.rows[LOCAL_ORDER_ID]["contract"] == "SPY260821C00500000"
 
 
 def test_exact_no_broker_claims_once_and_continues_through_callback():
@@ -504,8 +512,42 @@ def test_exact_broker_match_is_adopted_without_claim_or_callback():
     broker.place_order.assert_not_called()
     assert osm.rows[LOCAL_ORDER_ID]["status"] == "SUBMITTED"
     assert osm.rows[LOCAL_ORDER_ID]["broker_order_id"] == "broker-existing"
+    assert osm.rows[LOCAL_ORDER_ID]["contract"] == "SPY260821C00500000"
     assert osm.rows[LOCAL_ORDER_ID]["submitted_ts"] is None
     assert osm.rows[LOCAL_ORDER_ID]["meta"]["recovery_classification"] == "BROKER_ORDER_ADOPTED"
+    assert osm.rows[LOCAL_ORDER_ID]["meta"]["broker_reconcile_response"] == _broker_order()
+    assert osm.meta_calls == []
+    transition_kwargs = osm.transition_calls[0][2]
+    assert transition_kwargs["contract"] == "SPY260821C00500000"
+    assert transition_kwargs["expected_contract"] == "DEFERRED:SPY"
+    assert transition_kwargs["meta_patch"]["broker_reconcile_response"] == _broker_order()
+
+
+@pytest.mark.parametrize(
+    ("option_symbol", "reason"),
+    [
+        (None, "broker_contract_missing_or_invalid"),
+        ("QQQ260821C00500000", "broker_contract_underlying_mismatch"),
+        ("SPY260821P00500000", "broker_contract_direction_mismatch"),
+    ],
+)
+def test_exact_tag_without_matching_occ_contract_holds_without_mutation(option_symbol, reason):
+    row = _row()
+    osm = _OSM(row)
+    broker = MagicMock()
+    broker.list_orders.return_value = [_broker_order(option_symbol=option_symbol)]
+    recovery = _recovery(row, osm, _Watcher(MagicMock()), broker)
+
+    proof = recovery._prove_stuck_trigger_ready_prebroker(row, LOCAL_ORDER_ID)
+    assert proof == {"disposition": "HOLD", "reason_code": reason}
+    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
+    assert osm.transition_calls == []
+    assert osm.meta_calls == []
+    assert osm.claim_calls == []
+    assert osm.cancel_calls == []
+    assert osm.rows[LOCAL_ORDER_ID]["status"] == "PENDING_TRIGGER"
+    assert osm.rows[LOCAL_ORDER_ID]["contract"] == "DEFERRED:SPY"
+    assert osm.rows[LOCAL_ORDER_ID]["broker_order_id"] is None
 
 
 def test_broker_adoption_preserves_actual_creation_time_and_repeated_pass_is_idempotent():
@@ -519,16 +561,18 @@ def test_broker_adoption_preserves_actual_creation_time_and_repeated_pass_is_ide
 
     assert recovery.recover_one_row(row) == _RowOutcome.SKIPPED
     assert osm.rows[LOCAL_ORDER_ID]["submitted_ts"] == "2026-08-12T15:50:00+00:00"
+    assert osm.rows[LOCAL_ORDER_ID]["contract"] == "SPY260821C00500000"
     first_transition_count = len(osm.transition_calls)
 
     # Callers supply a fresh durable snapshot on every pass. The second pass
     # must see the broker-owned status and perform no adoption transition.
     assert recovery.recover_one_row(osm.get_order(LOCAL_ORDER_ID)) == _RowOutcome.SKIPPED
     assert len(osm.transition_calls) == first_transition_count
+    assert broker.list_orders.call_count == 1
     assert osm.rows[LOCAL_ORDER_ID]["submitted_ts"] == "2026-08-12T15:50:00+00:00"
 
 
-def test_filled_broker_order_without_positive_fill_price_holds_before_mutation():
+def test_filled_broker_order_without_positive_fill_price_adopts_ownership_only():
     row = _row()
     osm = _OSM(row)
     broker = MagicMock()
@@ -541,13 +585,18 @@ def test_filled_broker_order_without_positive_fill_price_holds_before_mutation()
     ]
     recovery = _recovery(row, osm, _Watcher(MagicMock()), broker)
 
-    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
-    assert osm.transition_calls == []
-    assert osm.rows[LOCAL_ORDER_ID]["status"] == "PENDING_TRIGGER"
-    assert osm.rows[LOCAL_ORDER_ID]["broker_order_id"] is None
+    assert recovery.recover_one_row(row) == _RowOutcome.SKIPPED
+    assert len(osm.transition_calls) == 1
+    adopted = osm.rows[LOCAL_ORDER_ID]
+    assert adopted["status"] == "SUBMITTED"
+    assert adopted["contract"] == "SPY260821C00500000"
+    assert adopted["broker_order_id"] == "broker-existing"
+    assert "filled_qty" not in adopted
+    assert "fill_price" not in adopted
+    assert "filled_ts" not in adopted
 
 
-def test_filled_broker_order_without_exact_fill_timestamp_holds_before_mutation():
+def test_filled_broker_order_without_exact_fill_timestamp_adopts_ownership_only():
     row = _row()
     osm = _OSM(row)
     broker = MagicMock()
@@ -560,12 +609,18 @@ def test_filled_broker_order_without_exact_fill_timestamp_holds_before_mutation(
     ]
     recovery = _recovery(row, osm, _Watcher(MagicMock()), broker)
 
-    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
-    assert osm.transition_calls == []
-    assert osm.rows[LOCAL_ORDER_ID]["status"] == "PENDING_TRIGGER"
+    assert recovery.recover_one_row(row) == _RowOutcome.SKIPPED
+    assert len(osm.transition_calls) == 1
+    adopted = osm.rows[LOCAL_ORDER_ID]
+    assert adopted["status"] == "SUBMITTED"
+    assert adopted["contract"] == "SPY260821C00500000"
+    assert adopted["broker_order_id"] == "broker-existing"
+    assert "filled_qty" not in adopted
+    assert "fill_price" not in adopted
+    assert "filled_ts" not in adopted
 
 
-def test_filled_broker_order_adopts_exact_economics_and_fill_time():
+def test_filled_broker_order_stays_submitted_for_canonical_fill_monitor():
     row = _row()
     osm = _OSM(row)
     broker = MagicMock()
@@ -582,11 +637,15 @@ def test_filled_broker_order_adopts_exact_economics_and_fill_time():
 
     assert recovery.recover_one_row(row) == _RowOutcome.SKIPPED
     adopted = osm.rows[LOCAL_ORDER_ID]
-    assert adopted["status"] == "FILLED"
+    assert adopted["status"] == "SUBMITTED"
+    assert adopted["contract"] == "SPY260821C00500000"
+    assert adopted["broker_order_id"] == "broker-existing"
     assert adopted["submitted_ts"] == "2026-08-12T15:50:00+00:00"
-    assert adopted["filled_ts"] == "2026-08-12T15:51:00+00:00"
-    assert adopted["filled_qty"] == 1
-    assert adopted["fill_price"] == 2.5
+    assert "filled_ts" not in adopted
+    assert "filled_qty" not in adopted
+    assert "fill_price" not in adopted
+    assert len(osm.transition_calls) == 1
+    assert osm.transition_calls[0][1] == "SUBMITTED"
 
 
 @pytest.mark.parametrize(
