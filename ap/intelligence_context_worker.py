@@ -17,10 +17,17 @@ from ap.intelligence_snapshot_store import (
     mark_job_retry,
     mark_job_terminal,
 )
+from ap.intelligence_outcome_binding import reconcile_intelligence_outcome_bindings
 
 log = logging.getLogger("ap.intelligence_context_worker")
 
 _THREADS: dict[str, threading.Thread] = {}
+
+
+def _worker_enabled() -> bool:
+    return os.getenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def process_due_intelligence_jobs_once(
@@ -121,6 +128,34 @@ def process_due_intelligence_jobs_once(
                     transition_failures += 1
                     log.critical("intelligence retry transition failed job_id=%s owner=%s result=%s",
                                  job.get("id"), owner, transition)
+    reconciliation: dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "disabled": True,
+        "processed": 0,
+    }
+    if _worker_enabled():
+        try:
+            reconciliation = reconcile_intelligence_outcome_bindings(
+                client_id=client_id,
+                execution_mode=execution_mode,
+                limit=min(max(int(limit or 5), 1), 50),
+            )
+        except Exception as exc:  # noqa: BLE001 - capture completion stays independent
+            log.error(
+                "intelligence outcome reconciliation failed client=%s mode=%s error=%s",
+                client_id,
+                execution_mode,
+                exc,
+            )
+            reconciliation = {
+                "ok": False,
+                "skipped": False,
+                "disabled": False,
+                "processed": 0,
+                "error": str(exc)[:500],
+            }
+
     return {
         "ok": True,
         "claimed": len(claimed.get("jobs") or []),
@@ -129,6 +164,7 @@ def process_due_intelligence_jobs_once(
         "terminal": terminal,
         "errors": errors,
         "transition_failures": transition_failures,
+        "reconciliation": reconciliation,
     }
 
 
@@ -168,7 +204,7 @@ def start_intelligence_context_worker(
                 execution_mode=execution_mode,
                 broker=broker,
             )
-            if result.get("errors"):
+            if result.get("errors") or not (result.get("reconciliation") or {}).get("ok", True):
                 log.warning("[%s] intelligence context worker errors: %s", client_id, result)
             stop_event.wait(interval)
 

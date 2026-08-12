@@ -723,24 +723,26 @@ def _persist_audit(result: dict, gate: dict, signal: dict) -> None:
         log.debug(f"intelligence_bridge: audit write failed ({e})")
 
 
-def record_trade_outcome(ticker: str, signal_id: str, pnl_pct: float) -> None:
+def record_trade_outcome(ticker: str, signal_id: str, pnl_pct: float) -> dict:
+    """Reject the legacy fuzzy outcome interface without mutating training.
+
+    The positional arguments remain for compatibility with older callers, but
+    ticker/time/signal/P&L evidence is not a canonical economic identity.  The
+    only official outcome path is exact proof binding in the background
+    evidence plane.
     """
-    Call when a position closes to log real P&L back to intel audit.
-    Wire into exit engine to build (decision, outcome) learning pairs.
-    """
-    audit = _get_audit_log()
-    if not audit:
-        return
-    try:
-        from datetime import datetime, timezone
-        audit.record_outcome(
-            ticker=ticker,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            pnl_pct=pnl_pct,
-        )
-        log.info(f"[{ticker}] Intel outcome recorded: pnl={pnl_pct:+.2%}")
-    except Exception as e:
-        log.debug(f"intelligence_bridge: outcome record failed ({e})")
+    log.warning(
+        "LEGACY_FUZZY_OUTCOME_BINDING_DISABLED ticker=%s signal_id=%s "
+        "training_mutated=false",
+        ticker,
+        signal_id,
+    )
+    return {
+        "ok": True,
+        "disposition": "LEGACY_FUZZY_OUTCOME_BINDING_DISABLED",
+        "training_mutated": False,
+        "official_binding": False,
+    }
 
 
 def run_intelligence_check(signal: dict, underlying_price: float,
