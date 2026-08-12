@@ -1009,6 +1009,161 @@ def _patch_process_side_effects(monkeypatch, events):
     monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
 
 
+@pytest.mark.parametrize(
+    ("row_mode", "runtime_mode"),
+    [
+        ("paper", "live"),
+        ("live", "paper"),
+        (None, "live"),
+        (" LIVE ", "live"),
+        ("sandbox", "live"),
+        ("live", None),
+    ],
+    ids=[
+        "paper-row-live-runtime",
+        "live-row-paper-runtime",
+        "missing-row-mode",
+        "noncanonical-row-mode",
+        "malformed-row-mode",
+        "missing-runtime-mode",
+    ],
+)
+def test_broker_filled_mode_admission_holds_before_any_side_effect(
+    monkeypatch, row_mode, runtime_mode
+):
+    from ap import fill_monitor as fm
+
+    events = []
+    _patch_process_side_effects(monkeypatch, events)
+    order = _order(execution_mode=row_mode)
+
+    def _unexpected(name):
+        def _call(*_args, **_kwargs):
+            pytest.fail(f"{name} must not run before broker fill mode admission")
+
+        return _call
+
+    for name in (
+        "_open_position_safe",
+        "_establish_canonical_handoff_standing_stop",
+        "_seed_exit_engine",
+        "_verify_canonical_entry_owner",
+    ):
+        monkeypatch.setattr(fm, name, _unexpected(name))
+
+    class _OSM:
+        def transition(self, *_args, **_kwargs):
+            pytest.fail("OSM transition must not run for an unproven fill mode")
+
+        def increment_retry(self, *_args, **_kwargs):
+            pytest.fail("mode admission hold must return before retry handling")
+
+    fm.process_pending_order(
+        object(),
+        order,
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode=runtime_mode,
+    )
+
+    assert events == []
+
+
+@pytest.mark.parametrize("fill_price", [float("nan"), float("inf"), float("-inf")])
+def test_broker_nonfinite_fill_price_holds_before_position_engine_or_broker_mutation(
+    monkeypatch, fill_price
+):
+    from ap import fill_monitor as fm
+
+    events = []
+    broker_mutations = []
+    real_check_order_with_broker = fm.check_order_with_broker
+    _patch_process_side_effects(monkeypatch, events)
+    monkeypatch.setattr(
+        fm, "check_order_with_broker", real_check_order_with_broker
+    )
+
+    class _Broker:
+        def get_order(self, _broker_order_id):
+            return {
+                "status": "FILLED",
+                "exec_quantity": 1,
+                "avg_fill_price": fill_price,
+            }
+
+        def cancel_order(self, *args, **kwargs):
+            broker_mutations.append(("cancel", args, kwargs))
+
+        def place_stop_order(self, *args, **kwargs):
+            broker_mutations.append(("stop", args, kwargs))
+
+    order = _order()
+
+    def _unexpected(name):
+        def _call(*_args, **_kwargs):
+            pytest.fail(f"{name} must not run for a non-finite broker fill price")
+
+        return _call
+
+    for name in (
+        "_open_position_safe",
+        "_establish_canonical_handoff_standing_stop",
+        "_cancel_pair_opposite",
+        "_seed_exit_engine",
+        "_verify_canonical_entry_owner",
+    ):
+        monkeypatch.setattr(fm, name, _unexpected(name))
+
+    class _OSM:
+        def transition(self, *_args, **_kwargs):
+            pytest.fail("OSM transition must not run for a non-finite fill price")
+
+        def increment_retry(self, *_args, **_kwargs):
+            return None
+
+    fm.process_pending_order(
+        _Broker(),
+        order,
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
+    )
+
+    assert events == []
+    assert broker_mutations == []
+
+
+def test_explicit_unproven_runtime_mode_cannot_fall_back_to_engine_mode():
+    from ap import fill_monitor as fm
+
+    engine = SimpleNamespace(execution_mode="live")
+    assert fm._resolve_runtime_execution_mode(
+        runtime_execution_mode="", exit_engine=engine
+    ) == ""
+
+
+@pytest.mark.parametrize("entry_price", [float("nan"), float("inf"), float("-inf")])
+def test_standing_stop_rejects_nonfinite_entry_price_before_broker_call(entry_price):
+    from ap import fill_monitor as fm
+
+    broker_calls = []
+    broker = SimpleNamespace(
+        place_stop_order=lambda **kwargs: broker_calls.append(kwargs),
+    )
+
+    result = fm._place_standing_stop_best_effort(
+        broker=broker,
+        order=_order(),
+        qty=1,
+        entry_price=entry_price,
+    )
+
+    assert result["outcome"] == "FAILED"
+    assert broker_calls == []
+
+
 def test_process_establishes_stop_before_bind_seed_and_owner_verification(monkeypatch):
     from ap import fill_monitor as fm
 
@@ -1065,6 +1220,7 @@ def test_process_establishes_stop_before_bind_seed_and_owner_verification(monkey
         osm=_OSM(),
         pm=object(),
         exit_engine=engine,
+        runtime_execution_mode="live",
     )
 
     assert db.row["position_id"] == "canonical-position-1"
@@ -1119,6 +1275,7 @@ def test_process_bind_failure_keeps_stop_attempt_before_bind_and_skips_seed(monk
         osm=_OSM(),
         pm=object(),
         exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
     )
 
     assert failures
@@ -1183,6 +1340,7 @@ def test_process_owner_ambiguity_is_visible_after_seed(monkeypatch):
         osm=_OSM(),
         pm=object(),
         exit_engine=engine,
+        runtime_execution_mode="live",
     )
 
     assert failures
@@ -1266,6 +1424,7 @@ def test_filled_handoff_retry_replays_without_terminal_osm_transition(monkeypatc
         osm=_OSM(),
         pm=object(),
         exit_engine=SimpleNamespace(_lock=handoff_lock),
+        runtime_execution_mode="live",
     )
 
     assert db.row["position_id"] == "canonical-position-1"
@@ -1374,7 +1533,12 @@ def test_restart_reloads_last_error_fallback_and_repairs_without_terminal_transi
 
     osm = _OSM()
     fm.process_pending_order(
-        object(), _order(), osm=osm, pm=object(), exit_engine=engine
+        object(),
+        _order(),
+        osm=osm,
+        pm=object(),
+        exit_engine=engine,
+        runtime_execution_mode="live",
     )
     assert db.row["last_error"].startswith(last_error.split(":", 1)[0])
 
@@ -1389,7 +1553,12 @@ def test_restart_reloads_last_error_fallback_and_repairs_without_terminal_transi
         db.row["position_id"] = "canonical-position-1"
 
     fm.process_pending_order(
-        object(), restarted_order, osm=osm, pm=object(), exit_engine=engine
+        object(),
+        restarted_order,
+        osm=osm,
+        pm=object(),
+        exit_engine=engine,
+        runtime_execution_mode="live",
     )
 
     assert osm.transition_calls == 1

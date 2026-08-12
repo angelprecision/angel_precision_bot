@@ -429,13 +429,8 @@ def _durable_filled_entry_recovery_result(
         return None
 
     raw_price = order.get("fill_price")
-    if isinstance(raw_price, bool):
-        return None
-    try:
-        avg_fill = float(raw_price)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not math.isfinite(avg_fill) or avg_fill <= 0:
+    avg_fill = _finite_float_or_none(raw_price)
+    if avg_fill is None or avg_fill <= 0:
         return None
 
     return {
@@ -482,6 +477,17 @@ def _mode_source_state(value) -> tuple[str, str]:
     return ("malformed", "")
 
 
+def _finite_float_or_none(value) -> float | None:
+    """Return a finite float, rejecting booleans and non-finite values."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def _resolve_runtime_execution_mode(
     *,
     runtime_execution_mode=None,
@@ -502,6 +508,15 @@ def _resolve_runtime_execution_mode(
     exact-equality gate between this result and the row's own
     ``execution_mode``.
     """
+    # ``fill_monitor_loop`` passes the already-resolved value into each
+    # per-order call. Treat an explicitly supplied but unproven value as a
+    # hard HOLD; do not let a second source launder a prior conflict by
+    # resolving it back to a valid engine mode.
+    if runtime_execution_mode is not None:
+        explicit_state, _ = _mode_source_state(runtime_execution_mode)
+        if explicit_state != "valid":
+            return ""
+
     master_control = getattr(exit_engine, "master_control", None)
     if master_control is not None and hasattr(
         master_control, "runtime_execution_mode"
@@ -1002,7 +1017,14 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         else:
             filled_qty = 0
 
-        avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
+        raw_avg_fill = raw.get("avg_fill_price") or raw.get("price") or 0.0
+        try:
+            avg_fill = float(raw_avg_fill)
+        except (TypeError, ValueError, OverflowError):
+            # Keep the broker response as contradictory evidence instead of
+            # converting it into an empty ERROR that could qualify for the
+            # DB-only unavailable-poll recovery path.
+            avg_fill = None
 
         result = {
             "status": our,
@@ -1011,6 +1033,47 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             "reason": raw.get("reason") or status,
             "raw": raw,
         }
+
+        # A broker fill with a non-finite or otherwise invalid price is not
+        # executable truth. Hold before OSM/PM/exit-engine/broker side effects
+        # and preserve the raw broker response as contradictory evidence.
+        if our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}:
+            finite_avg_fill = _finite_float_or_none(avg_fill)
+            if finite_avg_fill is None or finite_avg_fill <= 0:
+                reason = (
+                    "BROKER_FILL_NONFINITE_PRICE"
+                    if avg_fill is not None and not math.isfinite(avg_fill)
+                    else "BROKER_FILL_INVALID_PRICE"
+                )
+                client_id = str(order.get("client_id") or "default")
+                payload = {
+                    "local_order_id": order.get("local_order_id"),
+                    "broker_order_id": broker_order_id,
+                    "kind": kind,
+                    "mapped_status": our,
+                    "avg_fill": avg_fill,
+                    "broker_reason": raw.get("reason") or status,
+                }
+                log.critical("[%s] %s | %s", client_id, reason, payload)
+                audit(client_id, "CRITICAL", reason, payload)
+                emit_fill_event(
+                    order,
+                    decision="ERROR",
+                    reason_code=reason,
+                    explanation=(
+                        "Broker reported a fill/partial fill without a finite, "
+                        "positive fill price; OSM transition and downstream "
+                        "side effects are blocked pending a new broker poll."
+                    ),
+                    result=result,
+                    extra_context=payload,
+                )
+                return {
+                    **result,
+                    "status": "ERROR",
+                    "filled_qty": 0,
+                    "reason": reason,
+                }
 
         # PR #235 (hardening #3): broker FILLED / EXIT_FILLED with cumulative
         # filled_qty <= 0 is impossible truth for filled or partial-fill states.  Block the OSM transition and
@@ -1520,6 +1583,13 @@ def _open_position_safe(
       - Persist orders.last_error = FILLED_ORDER_POSITION_CREATE_FAILED when
         position creation raises or returns falsy.
     """
+    entry_price = _finite_float_or_none(result.get("avg_fill"))
+    if entry_price is None or entry_price <= 0:
+        # Do not invoke the PM or persist a downstream failure for an
+        # unexecutable broker price. The caller's admission fence normally
+        # catches this first; keep the helper safe for direct callers too.
+        return None
+
     existing = _get_existing_position_by_order(pm, local_id, order.get("broker_order_id"))
     if existing:
         if _existing_position_is_terminal(existing):
@@ -1583,7 +1653,7 @@ def _open_position_safe(
         "contract": contract,
         "side": _side,
         "qty": int(result.get("filled_qty") or order.get("qty") or 0),
-        "entry_price": float(result.get("avg_fill") or 0.0),
+        "entry_price": entry_price,
         "underlying_entry": underlying_entry if underlying_entry > 0 else None,
         "tier": str(order.get("tier") or "B"),
         "score": float(order.get("score") or 0),
@@ -1842,7 +1912,8 @@ def _place_standing_stop_best_effort(
         }
 
     try:
-        if qty <= 0 or entry_price <= 0:
+        entry_price = _finite_float_or_none(entry_price)
+        if qty <= 0 or entry_price is None or entry_price <= 0:
             return _outcome("FAILED", detail_reason="invalid_qty_or_entry_price")
 
         try:
@@ -3752,6 +3823,10 @@ def process_pending_order(
     kind = (order.get("kind") or "ENTRY").upper()
     canonical_owner_handoff_recovery = _is_canonical_owner_handoff_recovery(order)
     entry_handoff_proven = kind != "ENTRY"
+    resolved_runtime_execution_mode = _resolve_runtime_execution_mode(
+        runtime_execution_mode=runtime_execution_mode,
+        exit_engine=exit_engine,
+    )
 
     requested_exit_recovery = (
         kind == "EXIT"
@@ -3774,10 +3849,7 @@ def process_pending_order(
             osm,
             order,
             source="fill_monitor",
-            runtime_execution_mode=_resolve_runtime_execution_mode(
-                runtime_execution_mode=runtime_execution_mode,
-                exit_engine=exit_engine,
-            ),
+            runtime_execution_mode=resolved_runtime_execution_mode,
         )
         if not adopted:
             return
@@ -3795,7 +3867,7 @@ def process_pending_order(
         broker_poll_status = mapped
         durable_result = _durable_filled_entry_recovery_result(
             order,
-            runtime_execution_mode=runtime_execution_mode,
+            runtime_execution_mode=resolved_runtime_execution_mode,
         )
         if durable_result is not None:
             result = durable_result
@@ -3813,6 +3885,70 @@ def process_pending_order(
                     "broker_poll_status": broker_poll_status,
                 },
             )
+
+    # Ordinary broker-confirmed fills must satisfy the same runtime-mode
+    # admission boundary as DB-only recovery.  This check is deliberately
+    # before cumulative-fill handling and before every OSM/PM/pair-cancel/
+    # standing-stop/exit-owner side effect.  A client-scoped pending-order
+    # query is not execution-mode proof.
+    if mapped in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}:
+        row_mode_state, row_mode = _mode_source_state(order.get("execution_mode"))
+        runtime_mode_state, resolved_mode = _mode_source_state(
+            resolved_runtime_execution_mode
+        )
+        mode_hold = (
+            row_mode_state != "valid"
+            or runtime_mode_state != "valid"
+            or row_mode != resolved_mode
+        )
+        finite_avg_fill = _finite_float_or_none(result.get("avg_fill"))
+        price_hold = finite_avg_fill is None or finite_avg_fill <= 0
+        if mode_hold or price_hold:
+            if mode_hold:
+                reason = (
+                    "FILL_EXECUTION_MODE_UNPROVEN"
+                    if row_mode_state != "valid" or runtime_mode_state != "valid"
+                    else "FILL_EXECUTION_MODE_MISMATCH"
+                )
+            else:
+                price_is_nonfinite = False
+                if result.get("avg_fill") is not None:
+                    try:
+                        price_is_nonfinite = not math.isfinite(
+                            float(result.get("avg_fill"))
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        price_is_nonfinite = False
+                reason = (
+                    "BROKER_FILL_NONFINITE_PRICE"
+                    if price_is_nonfinite
+                    else "BROKER_FILL_INVALID_PRICE"
+                )
+            payload = {
+                "local_order_id": local_id,
+                "broker_order_id": broker_id,
+                "kind": kind,
+                "mapped_status": mapped,
+                "row_execution_mode": order.get("execution_mode"),
+                "runtime_execution_mode": resolved_runtime_execution_mode,
+                "avg_fill": result.get("avg_fill"),
+                "mode_hold": mode_hold,
+                "price_hold": price_hold,
+            }
+            log.critical("[%s] %s | %s", client_id, reason, payload)
+            audit(client_id, "CRITICAL", reason, payload)
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code=reason,
+                explanation=(
+                    "Broker fill admission failed before OSM, position, "
+                    "exit-engine, or broker side effects."
+                ),
+                result={**result, "status": "ERROR", "reason": reason},
+                extra_context=payload,
+            )
+            return
 
     prev_filled = int(order.get("filled_qty") or 0)
     new_filled, overfill_clamped = _sanitize_cumulative_filled(order, result)
