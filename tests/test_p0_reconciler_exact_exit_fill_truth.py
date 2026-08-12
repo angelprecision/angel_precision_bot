@@ -1621,6 +1621,7 @@ def test_exact_exit_evidence_identity_reaches_position_engine_and_proof(monkeypa
     assert mark_kwargs["broker_exit_order_id"] == "TR-195"
     assert mark_kwargs["broker_exit_fill_ts"].isoformat() == evidence["filled_ts"]
     assert mark_kwargs["broker_exit_filled_qty"] == 2
+    assert mark_kwargs["proof_contracts_override"] == 2
 
 
 def _complete_durable_reconciler_proof() -> dict:
@@ -1767,8 +1768,8 @@ def test_reconciler_skips_fallback_proof_after_canonical_callback_persists(monke
     assert summary.get("proof_write_failures", 0) == 0
 
 
-def test_real_exit_engine_callback_carries_exit_provenance_without_overwriting_entry_id():
-    """Exercise the production ExitEngine -> ExecutionCore callback seam."""
+def test_reconciler_exact_scale_out_callback_uses_remaining_qty_for_proof():
+    """The reconciler's final 2-lot close must not persist the original 5 lots."""
     from ap_execution_core import APExecutionCore
     from ap_exit_engine import APExitEngine
 
@@ -1793,6 +1794,7 @@ def test_real_exit_engine_callback_carries_exit_provenance_without_overwriting_e
         current_underlying=100.0,
         closed=False,
         close_reason="",
+        quantity=5,
         quantity_remaining=2,
         _submit_generation=0,
         current_option_price=2.33,
@@ -1826,7 +1828,8 @@ def test_real_exit_engine_callback_carries_exit_provenance_without_overwriting_e
             "exit_option_price": 4.00,
             "underlying_entry": 100.0,
             "underlying_exit": 100.0,
-            "contracts": 2,
+            "contracts": 5,
+            "prior_scale_out_qty": 3,
             "exit_reason": "RECONCILER_AUTO_CLOSE",
             "opt_pnl": 0.0,
             "spread_pct": 0.0,
@@ -1853,6 +1856,7 @@ def test_real_exit_engine_callback_carries_exit_provenance_without_overwriting_e
         broker_exit_order_id="TR-195",
         broker_exit_fill_ts=fill_ts,
         broker_exit_filled_qty=2,
+        proof_contracts_override=2,
         reconciled=True,
     )
 
@@ -1862,7 +1866,155 @@ def test_real_exit_engine_callback_carries_exit_provenance_without_overwriting_e
     assert proof["exit_local_order_id"] == "exit-local-1"
     assert proof["broker_exit_order_id"] == "TR-195"
     assert proof["broker_exit_fill_ts"] == fill_ts
+    assert proof["contracts"] == 2
     assert proof["broker_exit_filled_qty"] == 2
+    # The explicit override is proof-row-only; ordinary feedback keeps its
+    # existing staged entry quantity semantics.
+    assert core.feedback.record_outcome.call_args.kwargs["contracts"] == 5
+
+
+def test_reconciler_scale_out_canonical_proof_is_restart_idempotent(monkeypatch):
+    """Canonical exact-close proof survives restart without fallback insertion."""
+    from ap_execution_core import APExecutionCore
+    from ap_exit_engine import APExitEngine
+
+    state = _RestartDbState()
+    state.position.update({"qty": 5, "quantity_remaining": 2})
+    state.entry["filled_qty"] = 5
+    _install_restart_db(monkeypatch, state)
+
+    core = APExecutionCore.__new__(APExecutionCore)
+    core.proof = MagicMock()
+    canonical_calls: list[dict] = []
+
+    def _canonical_log_trade(**kwargs):
+        canonical_calls.append(dict(kwargs))
+        return {"_proof_persisted": True}
+
+    core.proof.log_trade.side_effect = _canonical_log_trade
+    core.feedback = MagicMock()
+    core.store = MagicMock()
+    core.shadow = MagicMock()
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._lock = threading.RLock()
+    engine._positions = []
+    engine._positions_by_id = {}
+    engine._email = CLIENT
+    engine._emit_exit_event = MagicMock()
+    engine.on_exit_fill_confirmed = core._finalize_proof
+
+    managed_pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        ticker="C",
+        current_underlying=100.0,
+        closed=False,
+        close_reason="",
+        quantity=5,
+        quantity_remaining=2,
+        _submit_generation=0,
+        current_option_price=2.33,
+        exit_in_flight=True,
+        pending_exit_reason="",
+        pending_exit_action="",
+        pending_exit_qty=2,
+        pending_exit_filled_qty=2,
+        pending_scale_counted=False,
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+        last_applied_exit_local_order_id="",
+        last_applied_exit_broker_order_id="",
+        last_exit_signal_ts=None,
+        last_callback_identity_missing=False,
+        last_callback_identity_missing_ts=None,
+        exit_identity_quarantine=False,
+        pending_exit_replace_allowed=False,
+        pending_exit_replace_reason="",
+        pending_exit_replace_allowed_ts=None,
+        _proof_staged={
+            "ticker": "C",
+            "pattern": "",
+            "side": "CALL",
+            "timeframe": "1d",
+            "score": 0,
+            "tier": "A",
+            "context_score": 0,
+            "setup_status": "reconciler_auto_close",
+            "entry_option_price": 2.33,
+            "exit_option_price": 4.00,
+            "underlying_entry": 100.0,
+            "underlying_exit": 100.0,
+            "contracts": 5,
+            "prior_scale_out_qty": 3,
+            "exit_reason": "RECONCILER_AUTO_CLOSE",
+            "opt_pnl": 0.0,
+            "spread_pct": 0.0,
+            "chain_grade": "",
+            "opened_at": "2026-08-10T18:00:00+00:00",
+            "synthetic_entry": False,
+            "position_id": POSITION_ID,
+            "local_order_id": "entry-local-1",
+            "signal": {},
+            "paper": False,
+        },
+        _proof_finalized=False,
+    )
+    engine._positions_by_id[POSITION_ID] = managed_pos
+
+    rec = _reconciler()
+    rec.supabase_client = _UnavailableSupabase()
+    rec.exit_engine = engine
+    summary = _empty_summary(CLIENT)
+    rec._execute_reconciler_close(
+        pos=dict(state.position),
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=2,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+        summary=summary,
+        exact_exit_fill_qty=2,
+        exact_exit_evidence=dict(state.exit),
+    )
+
+    assert len(canonical_calls) == 1
+    canonical = canonical_calls[0]
+    assert canonical["contracts"] == 2
+    assert canonical["broker_exit_filled_qty"] == 2
+    assert managed_pos._proof_persisted is True
+    assert summary.get("proof_write_failures", 0) == 0
+
+    # Simulate restart with exactly the canonical row.  The repair pass must
+    # confirm it as already present, not insert a second proof.
+    proof_sink = _RestartSupabase()
+    proof_sink.proof_rows.append(
+        {
+            "id": "canonical-proof",
+            "client_email": CLIENT,
+            "position_id": canonical["position_id"],
+            "local_order_id": canonical["local_order_id"],
+            "execution_mode": MODE_LIVE,
+            "entry_option_price": canonical["entry_option_price"],
+            "exit_option_price": canonical["exit_option_price"],
+            "contracts": canonical["contracts"],
+            "option_pnl_pct": canonical["option_pnl_pct"],
+            "win": canonical["win"],
+            "exit_local_order_id": canonical["exit_local_order_id"],
+            "broker_exit_order_id": canonical["broker_exit_order_id"],
+            "broker_exit_fill_ts": canonical["broker_exit_fill_ts"].isoformat(),
+            "broker_exit_filled_qty": canonical["broker_exit_filled_qty"],
+        }
+    )
+    restarted = _reconciler()
+    restarted.supabase_client = proof_sink
+    restart_summary = _empty_summary(CLIENT)
+    restarted._repair_missing_reconciler_proofs(restart_summary)
+
+    assert restart_summary["reconciler_proof_repair_already_exists"] == 1
+    assert restart_summary["reconciler_proof_repair_persisted"] == 0
+    assert proof_sink.insert_payloads == []
+    assert len(proof_sink.proof_rows) == 1
 
 
 @pytest.mark.parametrize(

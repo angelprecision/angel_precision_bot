@@ -3923,6 +3923,7 @@ class APBrokerReconciler:
                         broker_exit_order_id=evidence_broker_order_id,
                         broker_exit_fill_ts=evidence_filled_ts,
                         broker_exit_filled_qty=exact_exit_fill_qty,
+                        proof_contracts_override=close_qty,
                         reconciled=True,
                     ) is True
                 )

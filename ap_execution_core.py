@@ -9988,6 +9988,7 @@ class APExecutionCore:
         broker_exit_order_id: str = "",
         broker_exit_fill_ts: Optional[datetime] = None,
         broker_exit_filled_qty: Optional[int] = None,
+        proof_contracts_override: Optional[int] = None,
     ) -> bool:
         """Write proof/P&L/feedback using the ACTUAL broker fill price.
 
@@ -10024,6 +10025,16 @@ class APExecutionCore:
             ):
                 return False
             broker_exit_filled_qty = int(_proof_qty)
+
+        # Reconciler exact-close callbacks may be completing only the remaining
+        # tranche after an earlier scale-out.  Keep ordinary proof semantics
+        # based on the staged entry quantity, but let that explicit callback
+        # override the proof row's contracts with the exact final EXIT qty.
+        proof_contracts = staged.get("contracts", 1)
+        if proof_contracts_override is not None:
+            proof_contracts = _strict_positive_whole_number(proof_contracts_override)
+            if proof_contracts is None:
+                return False
 
         # Validate the callback payload before changing the idempotency flag or
         # touching any proof/feedback/status sink. ``0``/``None`` remain the
@@ -10126,7 +10137,7 @@ class APExecutionCore:
                 exit_option_price  = final_exit_price,
                 underlying_entry   = underlying_entry,
                 underlying_exit    = underlying_exit,
-                contracts          = staged.get("contracts", 1),
+                contracts          = proof_contracts,
                 exit_reason        = staged.get("exit_reason", ""),
                 option_pnl_pct     = opt_pnl_pct_for_proof,
                 underlying_pnl_pct = u_pnl_pct,

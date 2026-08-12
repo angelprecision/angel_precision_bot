@@ -5443,6 +5443,7 @@ class APExitEngine:
         broker_exit_order_id: str = "",
         broker_exit_fill_ts: Optional[datetime] = None,
         broker_exit_filled_qty: Optional[int] = None,
+        proof_contracts_override: Optional[int] = None,
         cumulative_filled: Optional[int] = None,
         cumulative_filled_qty: Optional[int] = None,
         force: bool = False,
@@ -5465,6 +5466,7 @@ class APExitEngine:
         )
         _callback_qty = _positive_whole_or_none(_callback_qty_raw)
         _callback_price = _positive_or_none(fill_price)
+        _proof_contracts_override = _positive_whole_or_none(proof_contracts_override)
         if (
             _callback_qty_raw is not None
             or fill_price is not None
@@ -5479,6 +5481,15 @@ class APExitEngine:
                 position_id,
                 _callback_qty_raw,
                 fill_price,
+            )
+            return False
+        if proof_contracts_override is not None and _proof_contracts_override is None:
+            log.critical(
+                "[%s] mark_position_closed blocked | invalid proof contracts override "
+                "pos=%s contracts=%r",
+                getattr(self, "_email", "?"),
+                position_id,
+                proof_contracts_override,
             )
             return False
 
@@ -5554,6 +5565,13 @@ class APExitEngine:
                             broker_exit_fill_ts=broker_exit_fill_ts,
                             broker_exit_filled_qty=(
                                 _callback_qty
+                            ),
+                            **(
+                                {
+                                    "proof_contracts_override": _proof_contracts_override,
+                                }
+                                if _proof_contracts_override is not None
+                                else {}
                             ),
                         )
                 except Exception as _cb_err:
