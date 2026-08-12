@@ -16,6 +16,7 @@ import logging
 import os
 import json
 import time
+import math
 import datetime
 import requests
 import pandas as pd
@@ -393,21 +394,40 @@ def get_vix() -> dict:
     """Pull VIX from yfinance."""
     cache_key = f"vix_{datetime.date.today()}"
     cached = _cache_get(cache_key)
-    if cached:
+    # A cached VIX value is only eligible for the hard market-safety gate when
+    # it carries an observation timestamp.  Older cache records without that
+    # attestation are treated as unavailable rather than as a safe default.
+    if isinstance(cached, dict) and cached.get("observed_at"):
         return cached
 
     try:
         import yfinance as yf
-        vix = yf.Ticker("^VIX").fast_info.get("lastPrice") or 20.0
+        raw_vix = yf.Ticker("^VIX").fast_info.get("lastPrice")
+        vix = float(raw_vix)
+        if not math.isfinite(vix) or vix <= 0:
+            raise ValueError("VIX lastPrice missing or non-finite")
+        observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         result = {
             "vix":       round(float(vix), 2),
             "premium":   vix > 15,
             "elevated":  vix > 20,
             "extreme":   vix > 30,
             "tradeable": 12 <= vix <= 35,
+            "source":     "yfinance:^VIX.fast_info.lastPrice",
+            "observed_at": observed_at,
+            "classification": "PRODUCTION_EXACT",
         }
         _cache_set(cache_key, result)
         return result
     except Exception:
-        # HIGH-012: do not return fake safe data on error
-        return {"vix": None, "premium": False, "elevated": False, "extreme": False, "tradeable": False}
+        # HIGH-012: do not return fake safe data on error.
+        return {
+            "vix": None,
+            "premium": False,
+            "elevated": False,
+            "extreme": False,
+            "tradeable": False,
+            "source": "yfinance:^VIX.fast_info.lastPrice",
+            "observed_at": None,
+            "classification": "UNAVAILABLE",
+        }

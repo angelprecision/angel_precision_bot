@@ -2578,7 +2578,12 @@ class APMasterControl:
         if tier in ("SHADOW", "shadow"):
             tier = "C"
 
-        intel = self._run_intelligence(signal)
+        # Give Gate G the exact runtime client/mode while keeping the original
+        # signal immutable for the downstream admission and queue paths.
+        signal_for_intel = dict(signal or {})
+        signal_for_intel["_gate_client_id"] = str(client_id or "default")
+        signal_for_intel["_gate_execution_mode"] = current_mode
+        intel = self._run_intelligence(signal_for_intel)
 
         # ── Canonical admission gate — MUST run before any raw field access ──
         # adjudicate_intelligence_result() handles every failure mode:
@@ -3476,7 +3481,23 @@ class APMasterControl:
                 or signal.get("current_price")
                 or 100.0
             )
-            result = _run_intel_check(signal, underlying_price=float(price))
+            # Bind Gate G diagnostics to the same runtime identity/mode that
+            # Master Control will use for canonical account and final-gate
+            # decisions.  Keep the bridge callable signature unchanged for
+            # existing integrations and never mutate the caller's payload.
+            signal_for_intel = dict(signal or {})
+            signal_for_intel.setdefault(
+                "_gate_client_id",
+                str(getattr(self, "_client_id", "default") or "default"),
+            )
+            signal_for_intel.setdefault(
+                "_gate_execution_mode",
+                self._current_mode(),
+            )
+            result = _run_intel_check(
+                signal_for_intel,
+                underlying_price=float(price),
+            )
             result["_available"] = True
             return result
         except Exception as e:
