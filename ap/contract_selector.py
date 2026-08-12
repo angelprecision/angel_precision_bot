@@ -232,6 +232,10 @@ class SelectorRequestContext:
     recovery_cursor: dict | None = None
     recovery_cursor_persist: object | None = None
     structural_skips: list[dict] = field(default_factory=list)
+    selector_candidate_universe_count: int = 0
+    selector_candidate_accounted_count: int = 0
+    selector_candidate_accounting_complete: bool = False
+    selector_candidate_outcomes: dict[str, str] = field(default_factory=dict)
     affordability_headroom_pct: float = 0.10
     symbol_refresh_seconds: int = 20
 
@@ -1141,6 +1145,14 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         )[:25],
         "duplicate_quote_authority_failures": dict(
             list(ctx.duplicate_quote_authority_failures.items())[:25]
+        ),
+        "candidate_accounting": {
+            "universe_count": int(ctx.selector_candidate_universe_count or 0),
+            "accounted_count": int(ctx.selector_candidate_accounted_count or 0),
+            "complete": bool(ctx.selector_candidate_accounting_complete),
+        },
+        "candidate_outcomes": dict(
+            list(ctx.selector_candidate_outcomes.items())[-200:]
         ),
         "selector_request_kind": str(ctx.selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY),
         "recovery_attempt_number": int(ctx.recovery_attempt_number or 1),
@@ -3279,6 +3291,7 @@ class APContractSelectionEngine:
 
         survivors  = []
         _rejections: dict = {}
+        _recovery_candidate_outcomes: dict[str, str] = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
         _quality_chain = _order_chain_for_direct_quote_recovery(
             chain,
@@ -3289,6 +3302,31 @@ class APContractSelectionEngine:
             request_context=request_context,
             preferred_strikes=_preferred_strikes_for_quality_order,
         )
+
+        def _recovery_candidate_symbol(_opt: dict) -> str:
+            return "".join(
+                str((_opt or {}).get("symbol") or (_opt or {}).get("contract") or "")
+                .upper()
+                .split()
+            )
+
+        def _record_recovery_candidate_outcome(_opt: dict, _reason: str) -> None:
+            if not _deferred_recovery_request or not _reason:
+                return
+            _symbol = _recovery_candidate_symbol(_opt)
+            if not _symbol:
+                return
+            _recovery_candidate_outcomes[_symbol] = _normalize_reason_code(_reason)
+
+        _recovery_candidate_universe: set[str] = set()
+        _recovery_candidate_universe_has_missing_identity = False
+        for _candidate in _quality_chain:
+            _candidate_symbol = _recovery_candidate_symbol(_candidate)
+            if _candidate_symbol:
+                _recovery_candidate_universe.add(_candidate_symbol)
+            else:
+                _recovery_candidate_universe_has_missing_identity = True
+
         if _preferred_strikes_for_quality_order:
             def _candidate_order_identity(_opt: dict, _index: int) -> str:
                 _symbol = "".join(
@@ -3542,11 +3580,14 @@ class APContractSelectionEngine:
             )
 
         for opt in _quality_chain:
+            _pro_recovery_action = None
+            _pro_recovery_reason = None
             opt, _duplicate_authority_reason = _apply_duplicate_quote_authority(opt)
             if _duplicate_authority_reason:
                 _rejections[_duplicate_authority_reason] = _rejections.get(
                     _duplicate_authority_reason, 0
                 ) + 1
+                _record_recovery_candidate_outcome(opt, _duplicate_authority_reason)
                 log.warning(
                     "[%s] duplicate OCC authority unavailable symbol=%s reason=%s",
                     ticker,
@@ -3607,6 +3648,8 @@ class APContractSelectionEngine:
                             request_context=request_context,
                         )
                     )
+                    _pro_recovery_action = _rv_pro.get("action")
+                    _pro_recovery_reason = _rv_pro.get("reason_code")
                     if _rv_pro.get("action") == "PASS" and _rv_pro.get("opt_updated"):
                         _opt_pro = _rv_pro["opt_updated"]
                         # Rerun pro_quality with patched bid/ask
@@ -3688,6 +3731,17 @@ class APContractSelectionEngine:
                 # ── end P0A/FIX-2 ────────────────────────────────────────────
 
                 if pro_tier == "REJECT":
+                    _record_recovery_candidate_outcome(
+                        opt,
+                        (
+                            _pro_recovery_reason
+                            if _pro_recovery_action in {
+                                "SKIP_STRUCTURAL",
+                                "SKIP_BUDGET_EXHAUSTED",
+                            }
+                            else pro_reason
+                        ),
+                    )
                     _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
                     try:
                         self._emit_selector_event(
@@ -3731,6 +3785,8 @@ class APContractSelectionEngine:
                 min_oi=_eff_min_oi,
                 min_volume=_eff_min_volume,
             )
+            _candidate_result_reason = result
+            _recovery_action = None
 
             # ── P0A: direct quote revalidation ────────────────────────────
             # When the chain row produced a revalidatable reject (zero/missing
@@ -3778,6 +3834,7 @@ class APContractSelectionEngine:
                     )
                 )
                 _rv_action = _rv.get("action")
+                _recovery_action = _rv_action
                 if _rv_action == "PASS" and _rv.get("opt_updated"):
                     # Direct quote was valid.  Re-run quality filter on the
                     # patched opt (bid/ask replaced with direct-quote values).
@@ -3890,6 +3947,7 @@ class APContractSelectionEngine:
                     except Exception:
                         pass
                 elif _rv_action == "SKIP_BUDGET_EXHAUSTED":
+                    _candidate_result_reason = "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
                     try:
                         # Request-level aggregate: OR ``budget_skipped``
                         # in and record the reason. Do NOT overwrite
@@ -3907,6 +3965,13 @@ class APContractSelectionEngine:
                 elif _rv_action == "REJECT_UNAVAILABLE":
                     # P1: quote source unavailable (network/auth failure)
                     result = _rv.get("reason_code") or "QUOTE_FETCH_FAILED"
+                    _candidate_result_reason = result
+                elif _rv_action == "SKIP_STRUCTURAL":
+                    # Keep the aggregate reject bucket for diagnostics, but
+                    # attribute the candidate's actual terminal disposition to
+                    # the structural prefilter. Otherwise an unrelated far row
+                    # is misreported as retryable chain-zero evidence.
+                    _candidate_result_reason = _rv.get("reason_code") or result
                 # SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE:
                 # fall through with original chain reject reason unchanged.
             # ── end P0A ───────────────────────────────────────────────────
@@ -3914,6 +3979,17 @@ class APContractSelectionEngine:
             if result is None:
                 survivors.append(opt)
             else:
+                _record_recovery_candidate_outcome(
+                    opt,
+                    (
+                        _candidate_result_reason
+                        if _recovery_action in {
+                            "SKIP_STRUCTURAL",
+                            "SKIP_BUDGET_EXHAUSTED",
+                        }
+                        else result
+                    ),
+                )
                 _rejections[result] = _rejections.get(result, 0) + 1
                 log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
                 # P0 (PR #299): track the best rejected candidate — the one with
@@ -4075,6 +4151,38 @@ class APContractSelectionEngine:
                         for item in request_context.structural_skips
                         if isinstance(item, dict) and item.get("symbol")
                     }
+                    _unattempted_symbols = set(
+                        getattr(
+                            request_context,
+                            "direct_quote_unattempted_set",
+                            set(),
+                        )
+                        or set()
+                    )
+                    _accounted_symbols = (
+                        set(_recovery_candidate_outcomes)
+                        | set(_structural_reasons)
+                        | _unattempted_symbols
+                    )
+                    _candidate_accounting_complete = bool(
+                        _recovery_candidate_universe
+                        and not _recovery_candidate_universe_has_missing_identity
+                        and _recovery_candidate_universe.issubset(_accounted_symbols)
+                        and not _unattempted_symbols
+                    )
+                    request_context.selector_candidate_universe_count = len(
+                        _recovery_candidate_universe
+                    )
+                    request_context.selector_candidate_accounted_count = len(
+                        _accounted_symbols & _recovery_candidate_universe
+                    )
+                    request_context.selector_candidate_accounting_complete = (
+                        _candidate_accounting_complete
+                    )
+                    request_context.selector_candidate_outcomes = dict(
+                        list(_recovery_candidate_outcomes.items())[-200:]
+                    )
+                    _ctx_refresh_diagnostics(request_context)
                     _final_reason = resolve_selector_recovery_final_reason({
                         "budget_exhausted_stage": request_context.budget_exhausted_stage,
                         "budget_exhausted_detail": request_context.budget_exhausted_detail,
@@ -4087,6 +4195,12 @@ class APContractSelectionEngine:
                         ),
                         "attempted_results": _cursor_attempted,
                         "structural_skip_results": _structural_reasons,
+                        "candidate_outcomes": dict(_recovery_candidate_outcomes),
+                        "candidate_accounting_complete": _candidate_accounting_complete,
+                        "candidate_universe_count": len(_recovery_candidate_universe),
+                        "candidate_accounted_count": len(
+                            _accounted_symbols & _recovery_candidate_universe
+                        ),
                         "quality_rejections": {
                             _normalize_reason_code(key): value
                             for key, value in _rejections.items()

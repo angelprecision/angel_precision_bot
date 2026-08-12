@@ -508,6 +508,57 @@ def test_pr439_structural_moneyness_waits_for_unattempted_candidate_accounting()
     assert reason == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
 
 
+def test_pr439_candidate_scoped_quality_does_not_veto_retryable_candidate():
+    reason = resolve_selector_recovery_final_reason(
+        {
+            "candidate_outcomes": {
+                "NEAR_LOW_OI": "OI_TOO_LOW",
+                "NEAR_ZERO_QUOTE": "DIRECT_QUOTE_ZERO_BID_ASK",
+                "FAR_OTM": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "structural_skip_results": {
+                "FAR_OTM": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "candidate_accounting_complete": True,
+            "eligible_unattempted_symbols": [],
+        }
+    )
+    assert reason == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+
+def test_pr439_candidate_scoped_terminal_quality_requires_complete_accounting():
+    reason = resolve_selector_recovery_final_reason(
+        {
+            "candidate_outcomes": {
+                "NEAR_LOW_OI": "OI_TOO_LOW",
+                "FAR_OTM": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "structural_skip_results": {
+                "FAR_OTM": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "candidate_accounting_complete": True,
+            "eligible_unattempted_symbols": [],
+        }
+    )
+    assert reason == "OI_TOO_LOW"
+
+
+def test_pr439_candidate_scoped_structural_reason_requires_complete_accounting():
+    reason = resolve_selector_recovery_final_reason(
+        {
+            "candidate_outcomes": {
+                "FAR_OTM": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "structural_skip_results": {
+                "FAR_OTM": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            "candidate_accounting_complete": False,
+            "eligible_unattempted_symbols": [],
+        }
+    )
+    assert reason == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+
+
 def test_transient_only_budget_exhaustion_remains_retryable():
     reason = resolve_selector_recovery_final_reason(
         {
@@ -1444,6 +1495,90 @@ def test_execution_core_mixed_retryable_quote_and_structural_moneyness_schedules
     assert cursor["structurally_skipped_symbols"][far_otm["symbol"]]["skip_reason"] == (
         "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
     )
+
+
+@pytest.mark.parametrize("execution_mode", ["LIVE", "PAPER"])
+def test_execution_core_candidate_scoped_quality_does_not_veto_retryable_quote(
+    monkeypatch,
+    execution_mode,
+):
+    """A terminal OI result on one candidate cannot expire a retryable peer."""
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "40")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setattr(APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+
+    near_low_oi = _row(
+        "SPY",
+        101.0,
+        bid=1.10,
+        ask=1.14,
+        oi=0,
+        volume=0,
+    )
+    near_zero_quote = _row("SPY", 102.0)
+    far_otm = _row("SPY", 130.0)
+    broker = _DirectQuoteBroker(
+        [near_low_oi, near_zero_quote, far_otm],
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=100.0,
+    )
+    selector = _actual_selector(broker, execution_mode=execution_mode)
+    core = _execution_core(selector, broker, execution_mode=execution_mode)
+    plan = _execution_plan(
+        breach_attempt_count=0,
+        ticker="SPY",
+        underlying=100.0,
+        execution_mode=execution_mode,
+    )
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: plan,
+    )
+    thread_factory = MagicMock()
+    thread_factory.return_value = MagicMock()
+    monkeypatch.setattr(ec_mod.threading, "Thread", thread_factory)
+
+    local_order_id = f"local-pr439-candidate-scoped-{execution_mode.lower()}"
+    result = core._on_entry_trigger(
+        _execution_watched(
+            execution_mode,
+            ticker="SPY",
+            trigger_price=100.0,
+            local_order_id=local_order_id,
+        )
+    )
+
+    assert result["disposition"] == "RETRY_WAIT"
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()
+    selector_failure = (
+        core.order_state_machine.schedule_deferred_materialization_retry.call_args
+        .kwargs["selector_failure"]
+    )
+    assert selector_failure["reason_code"] == "DIRECT_QUOTE_ZERO_BID_ASK"
+    assert selector_failure["data_failure"] is True
+    assert selector_failure["quality_failure"] is False
+    assert selector_failure["selection_diagnostics"]["candidate_accounting"] == {
+        "universe_count": 3,
+        "accounted_count": 3,
+        "complete": True,
+    }
+    assert selector_failure["top_reject_buckets"]["OI_TOO_LOW"] == 1
+    assert selector_failure["top_reject_buckets"]["DIRECT_QUOTE_ZERO_BID_ASK"] == 1
+    assert selector_failure["selection_diagnostics"]["structural_skips"]
+    core.order_state_machine.expire_pending_entry.assert_not_called()
+    core.order_state_machine.submit_existing_entry.assert_not_called()
+    thread_factory.return_value.start.assert_not_called()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
 
 
 def test_execution_core_real_selector_provider_failure_terminalizes_without_fake_failure_payload(

@@ -1,6 +1,9 @@
-# P0 Work Order — Deferred selector final-reason precedence
+# P0 Implementation Note — Deferred selector final-reason precedence
 
-This branch intentionally contains only the work-order specification. Production code changes are not authorized by this commit. Codex should implement the PR against this branch and preserve the scope below.
+This branch implements the work order below. The production correction is
+limited to deferred selector reason reduction and its candidate-accounting
+evidence; it does not change broker submit/cancel behavior, thresholds, or
+position/proof/reconciliation paths.
 
 ## Incident
 
@@ -94,6 +97,22 @@ Before merge, audit exact head for:
 - PAPER/LIVE taxonomy parity
 - restart ownership/cursor correctness
 - exact-head CI and incident-shaped executable replay
+
+## Amendment corrections
+
+The implementation now carries candidate-scoped outcomes from the selector to
+the deferred resolver. Aggregate reject buckets remain diagnostic only, so a
+terminal OI/spread result on one candidate cannot veto retryable quote/data
+evidence on another candidate. The resolver also requires an explicit complete
+candidate-accounting marker before terminal structural geometry or
+affordability can be selected. Incomplete or ambiguous accounting fails closed
+to the unknown recovery reason, while actual unattempted candidates retain
+the request-budget outcome.
+
+The fleet replay accepts the canonical zero-quote reasons emitted by the
+selector (`CHAIN_ROW_ZERO_BID_ASK` and `DIRECT_QUOTE_ZERO_BID_ASK`) while
+continuing to assert independent budgets, preserved diagnostics, and zero
+broker submit/cancel activity.
 
 ## Merge policy
 
