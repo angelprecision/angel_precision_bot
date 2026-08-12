@@ -423,6 +423,19 @@ Run the focused tests and full exact-head P0 workflow, update the PR with exact 
 
 The repository cannot itself prove what Render injected into every active trading pod. The code change must make each pod self-attest its resolved values; the actual fleet comparison/normalization is an operational deployment step. Do not invent a cross-pod database authority, new environment registry, or mode-specific selector config table for this PR.
 
+## Frozen scope answer
+
+If current main has not materially changed, the expected answer to "what code should #441 touch?" is exactly:
+
+- 3 production files
+- 2 existing test files
+- 0 migrations
+- 0 broker files
+- 0 workflow files
+- 0 selector-threshold changes
+
+Any deviation requires an explicit explanation in the PR before accepting the scope expansion.
+
 ## Merge policy
 
 P1 draft only until exact-head tests, deployment-shape audit, and production environment attestation pass. No merge/deploy without explicit approval.
