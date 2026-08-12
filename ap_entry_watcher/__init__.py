@@ -53,8 +53,10 @@ def _parse_entry_efficiency_at(value: _Any) -> _datetime | None:
             parsed = _datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
         except (TypeError, ValueError):
             return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_timezone.utc)
+    # A durable efficiency schedule without an explicit zone is ambiguous;
+    # never reinterpret it as UTC and release a waiting opportunity early.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
     return parsed.astimezone(_timezone.utc)
 
 

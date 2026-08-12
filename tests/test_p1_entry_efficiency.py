@@ -22,9 +22,14 @@ from ap_entry_efficiency import (
     evaluate_entry_efficiency,
     resolve_entry_efficiency_mode,
 )
-from ap_entry_watcher import APEntryWatcher, WatchedSignal, WatchState
+from ap_entry_watcher import (
+    APEntryWatcher,
+    WatchedSignal,
+    WatchState,
+    _parse_entry_efficiency_at,
+)
 from ap.order_state_machine import APOrderStateMachine
-from ap_execution_core import APExecutionCore
+from ap_execution_core import APExecutionCore, _parse_datetime_for_efficiency
 
 
 FIRST_BREACH = datetime(2026, 8, 12, 13, 51, 51, tzinfo=timezone.utc)
@@ -52,25 +57,26 @@ def _decision(**overrides):
     return evaluate_entry_efficiency(**values)
 
 
-def test_unset_or_malformed_rollout_is_observe_only(monkeypatch):
+def test_targeted_paper_rollout_is_active_by_default_but_fail_closed_on_bad_mode(monkeypatch):
     monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
-    monkeypatch.delenv("AP_ENTRY_EFFICIENCY_LIVE_APPROVED", raising=False)
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
 
-    assert resolve_entry_efficiency_mode() == "observe_only"
+    assert resolve_entry_efficiency_mode() == "paper_authoritative"
     assert resolve_entry_efficiency_mode("not-a-mode") == "observe_only"
     assert resolve_entry_efficiency_mode("paper") == "observe_only"
     result = _decision(mode=None)
-    assert result.authoritative is False
+    assert result.authoritative is True
     assert result.decision == WAIT_CONFIRMATION
-    assert result.should_hold is False
+    assert result.should_hold is True
 
 
-def test_live_authority_requires_explicit_promotion(monkeypatch):
-    monkeypatch.delenv("AP_ENTRY_EFFICIENCY_LIVE_APPROVED", raising=False)
-    monkeypatch.delenv("ENTRY_EFFICIENCY_LIVE_APPROVED", raising=False)
-    assert resolve_entry_efficiency_mode("live_authoritative") == "observe_only"
+def test_live_authority_is_reserved_and_cannot_be_enabled_by_environment(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_LIVE_APPROVED", "1")
-    assert resolve_entry_efficiency_mode("live_authoritative") == "live_authoritative"
+    monkeypatch.setenv("ENTRY_EFFICIENCY_LIVE_APPROVED", "true")
+    assert resolve_entry_efficiency_mode("live_authoritative") == "observe_only"
+    result = _decision(execution_mode="live", mode="live_authoritative")
+    assert result.authoritative is False
+    assert result.should_hold is False
 
 
 def test_aapl_opening_daily_raw_pattern_normalizes_and_holds():
@@ -118,7 +124,7 @@ def test_unproven_rearm_state_cannot_release_on_trigger_relation_alone():
     assert result.reason_code == "ENTRY_EFFICIENCY_REARM_STATE_UNPROVEN"
 
 
-def test_profile_ready_is_explicit_continuation_evidence():
+def test_profile_ready_is_ignored_without_direct_rebreach_evidence():
     result = _decision(
         now=datetime(2026, 8, 12, 14, 0, tzinfo=timezone.utc),
         metadata={
@@ -128,8 +134,11 @@ def test_profile_ready_is_explicit_continuation_evidence():
             }
         },
     )
-    assert result.decision == READY_NOW
-    assert result.reason_code == "ENTRY_EFFICIENCY_FRESH_CONTINUATION"
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.reason_code == "ENTRY_EFFICIENCY_OPENING_BREACH"
+    assert result.should_hold is True
+    assert result.evidence["intelligence_metadata_authority"] == "IGNORED"
+    assert result.evidence["untrusted_intelligence_keys"] == ("breach_profile",)
 
 
 def test_profile_ready_without_fresh_continuation_does_not_release_old_breach():
@@ -141,16 +150,59 @@ def test_profile_ready_without_fresh_continuation_does_not_release_old_breach():
     assert result.reason_code == "ENTRY_EFFICIENCY_OPENING_BREACH"
 
 
-def test_canonical_breach_profile_classes_map_without_broad_regime_veto():
-    assert _decision(
-        metadata={"breach_profile": {"decision_class": "VALID_SETUP_BAD_IMMEDIATE_ENTRY"}},
-    ).decision == WAIT_CONFIRMATION
-    assert _decision(
-        metadata={"breach_profile": {"decision_class": "VALID_SETUP_WAIT_FOR_REBREACH"}},
-    ).decision == REARM_FOR_REBREACH
-    assert _decision(
-        metadata={"breach_profile": {"decision_class": "SETUP_INVALID"}},
-    ).decision == TERMINAL_INVALID
+def test_canonical_breach_profile_classes_never_become_timing_authority():
+    baseline = _decision()
+    for decision_class in (
+        "VALID_SETUP_BAD_IMMEDIATE_ENTRY",
+        "VALID_SETUP_WAIT_FOR_REBREACH",
+        "SETUP_INVALID",
+    ):
+        result = _decision(
+            metadata={"breach_profile": {"decision_class": decision_class}},
+        )
+        assert result.decision == baseline.decision
+        assert result.reason_code == baseline.reason_code
+        assert result.evidence["timing_authority_basis"] == "DIRECT_MARKET_EVIDENCE"
+
+
+def test_naive_first_breach_is_rejected_not_reinterpreted_as_utc():
+    result = _decision(
+        first_breach_at="2026-08-12T13:51:51",
+        metadata={"entry_efficiency_first_breach_at": FIRST_BREACH.isoformat()},
+    )
+    assert result.first_breach_at is None
+    assert result.breach_was_opening is False
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.reason_code == "ENTRY_EFFICIENCY_FIRST_BREACH_UNAVAILABLE"
+    assert result.should_hold is True
+
+
+@pytest.mark.parametrize(
+    "parser",
+    [_parse_entry_efficiency_at, _parse_datetime_for_efficiency],
+)
+def test_entry_efficiency_schedule_parsers_reject_naive_timestamps(parser):
+    assert parser("2026-08-12T13:51:51") is None
+    assert parser("2026-08-12T13:51:51+00:00") == FIRST_BREACH
+
+
+def test_durable_deadline_is_not_extended_when_breach_evidence_is_missing():
+    result = _decision(
+        first_breach_at=None,
+        prior_deadline_at="2026-08-12T13:52:00+00:00",
+        now=datetime(2026, 8, 12, 13, 53, tzinfo=timezone.utc),
+    )
+    assert result.decision == TERMINAL_INVALID
+    assert result.reason_code == "ENTRY_EFFICIENCY_WAIT_DEADLINE_EXPIRED"
+
+
+def test_authoritative_rollout_is_scoped_to_daily_232():
+    result = _decision(pattern="1-2")
+    assert result.canonical_pattern == "1-2"
+    assert result.decision == READY_NOW
+    assert result.reason_code == "PATTERN_NOT_IN_SCOPE"
+    assert result.authoritative is False
+    assert result.should_hold is False
 
 
 @pytest.mark.parametrize(

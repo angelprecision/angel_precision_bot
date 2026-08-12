@@ -2,13 +2,13 @@
 
 ## Status
 
-**DRAFT / HARD HOLD. IMPLEMENTATION CONTRACT ONLY. DO NOT MERGE OR DEPLOY THIS DOCS-ONLY PR AS A FIX.**
+**DRAFT / HARD HOLD. TARGETED PAPER IMPLEMENTATION CONTRACT. DO NOT MERGE OR DEPLOY. LIVE PROMOTION IS OUT OF SCOPE.**
 
-Base: `main@5284edbdc7af845a634314dc3348cb50f3f846e0`.
+Base: `main@9c36ab5845746a253458f2c2eb0520b157e87a4e`.
 
 This is PR 4 in the profitability-intelligence repair stack.
 
-This PR is where intelligence may eventually begin to change entry timing, but the first implementation must be guarded and evidence-driven. It must not simply add another retry loop or delay every trade.
+This PR activates only the explicitly targeted daily 2-3-2 PAPER timing policy. Direct watcher/quote/stop/target evidence is authoritative for that policy; generic or unproven intelligence metadata is telemetry only. LIVE promotion remains out of scope until a separate outcome-evidence gate is satisfied.
 
 ## Problem
 
@@ -112,32 +112,26 @@ Entry-efficiency logic may decide **when to try**. It may not bypass the money-p
 
 ### READY_NOW
 
-Used when the breach profile indicates sufficient immediate continuation quality.
+Used only when the targeted policy has current direct market truth and either:
 
-Possible positive evidence, subject to calibration from PR 3 data:
+- a genuine durable reset/re-breach has been recorded, or
+- the bounded post-opening continuation path has fresh trigger, quote, stop, target, and deadline truth.
 
-- decisive trigger clearance
-- strong completed 5m close through trigger or equivalent immediate-strength evidence
-- supportive 15m structure
-- strong remaining R
-- no near opposing 4h/1h obstacle
-- aligned VWAP/volume context
-- move not already overextended
-
-Do not hardcode final weights/thresholds before outcome analysis. First implementation may use a conservative reviewed ruleset behind a flag.
+Generic classifier/profile fields cannot produce `READY_NOW`.
 
 ### WAIT_CONFIRMATION
 
-Used when the setup is still valid but immediate entry quality is ambiguous.
+Used when the setup is still valid but direct market timing evidence is insufficient.
 
 Examples:
 
 - wick-only breach
 - small marginal breach without follow-through
-- 5m candle still forming and policy requires confirmation
-- price at VWAP/near structural wall but not invalid
-- move temporarily pauses after crossing trigger
-- volume confirmation weak but not adverse enough to kill setup
+- first opening-window breach has not earned a genuine reset/re-breach
+- direct quote, first-breach, or bounded-deadline truth is unavailable
+- price has not re-breached after a pullback
+
+Classifier/profile metadata is not continuation evidence.
 
 This state must retain one durable owner and schedule bounded reevaluation without creating duplicate watcher/order owners.
 
@@ -192,7 +186,9 @@ The final implementation value must be justified by historical replay and curren
 
 ## Data inputs
 
-Consume the canonical BREACH intelligence profile from PR 3 when available.
+Record any BREACH intelligence profile for diagnostics only.  Unless a later
+PR supplies exact producer-bound outcome evidence, it cannot change this
+policy's timing decision.
 
 At every reevaluation refresh only dynamic evidence:
 
@@ -269,17 +265,20 @@ If a previously selected contract becomes stale during a wait, it must be revali
 
 ## Feature flag / rollout
 
-First active implementation must be behind an explicit rollout control.
+The active implementation is behind an explicit rollout control and is scoped
+to the canonical daily 2-3-2 family.
 
-Suggested modes:
+Modes:
 
-- `observe_only`: calculate what decision would have occurred, execution unchanged.
-- `paper_authoritative`: changes PAPER timing only.
-- `live_authoritative`: unavailable until explicit promotion gate is satisfied.
+- `paper_authoritative`: active default; changes PAPER timing only for daily 2-3-2.
+- `observe_only`: explicit opt-out; calculate the decision without changing execution.
 
-Malformed/unset mode should default to `observe_only` initially.
+Malformed/unsupported mode defaults to `observe_only`.  LIVE has no
+authoritative mode in this PR.
 
-Do not make LIVE authoritative merely by setting a generic `INTELLIGENCE_ENABLED=1` flag.
+No environment-variable pair can promote LIVE timing authority here. Do not
+make LIVE authoritative merely by setting a generic intelligence or approval
+flag.
 
 ## Promotion criteria
 
@@ -307,9 +306,9 @@ No promotion from anecdotes such as “three delayed trades looked better.”
 
 Minimum:
 
-1. strong immediate CALL breach -> READY_NOW.
-2. strong immediate PUT breach -> READY_NOW.
-3. wick-only CALL breach -> WAIT; later 5m confirmation -> READY_NOW.
+1. eligible post-opening CALL breach with direct truth -> READY_NOW.
+2. eligible post-opening PUT breach with direct truth -> READY_NOW.
+3. opening-window breach -> WAIT; later direct watcher reset/re-breach -> READY_NOW.
 4. wick-only breach -> falls back below trigger -> REARM, zero submit.
 5. re-breach cleanly -> one new READY transition, one eventual submit maximum.
 6. waits then target completes -> terminal, zero submit.
@@ -324,7 +323,7 @@ Minimum:
 15. 5m data unavailable -> bounded wait/explicit unavailable disposition, no fake confirmation.
 16. DB CAS unavailable -> zero broker submit.
 17. session cutoff reached -> terminal/expire, zero submit.
-18. PAPER and LIVE same market data -> same strategy classification, different rollout authority only.
+18. PAPER and LIVE same market data -> same strategy classification; only targeted PAPER may gate, while LIVE remains observe-only.
 19. PAPER state can never promote a LIVE order.
 20. post-cancel #430 row is not consumed by this pre-submit lifecycle.
 21. selector transient failure after READY -> existing selector retry authority, not a new efficiency retry loop.
@@ -359,8 +358,9 @@ Do not edit:
 
 Final review must answer all:
 
-- Does this change LIVE behavior? Flag dependent; initially observe-only.
-- Is it active by default? **NO** for LIVE.
+- Does this change LIVE behavior? **NO**; LIVE is always observe-only in this PR.
+- Does it change PAPER behavior? **YES**, only for the canonical daily 2-3-2 policy; `paper_authoritative` is the default.
+- Is it active by default? **YES** for targeted PAPER 2-3-2; unrelated setups and LIVE remain observe-only.
 - Does it add broker submit/cancel calls? **NO**.
 - Can it make existing submit seam reachable at a different time? Eventually yes under reviewed rollout; exact transition must be proven.
 - Does it mutate orders? Only existing pending-entry lifecycle metadata/state through exact CAS if implementation requires it.
@@ -377,6 +377,8 @@ We can distinguish “good setup, bad immediate entry” from “bad setup,” p
 
 ## Release verdict
 
-Current state: **HARD HOLD — docs only.**
+Current state: **HARD HOLD — targeted PAPER behavior is implemented; LIVE promotion and release remain blocked pending exact outcome evidence.**
 
-Implement observe-only first. PAPER authority comes only after replay. LIVE authority comes only after exact outcome evidence and explicit approval.
+The targeted PAPER 2-3-2 authority is implemented with direct-market evidence;
+replay and exact CI/runtime proof remain release gates. LIVE authority comes
+only after exact outcome evidence and explicit approval in a later change.

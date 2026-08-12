@@ -100,8 +100,11 @@ def _parse_datetime_for_efficiency(value) -> datetime | None:
             )
         except (TypeError, ValueError):
             return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    # Entry-efficiency deadlines are authority-bearing.  A naive timestamp
+    # cannot establish a session boundary, so reject it instead of guessing
+    # UTC and manufacturing a bounded window.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
     return parsed.astimezone(timezone.utc)
 
 
@@ -4572,18 +4575,28 @@ class APExecutionCore:
             getattr(self, "execution_mode", None),
             getattr(self, "paper", None),
         )
+        _efficiency_watched_state = getattr(watched, "entry_efficiency_state", None)
         _efficiency_prior_state = str(
-            _efficiency_meta.get("entry_efficiency_state")
-            or getattr(watched, "entry_efficiency_state", "")
+            _efficiency_watched_state
+            if _efficiency_watched_state not in (None, "")
+            else _efficiency_meta.get("entry_efficiency_state", "")
             or ""
         ).strip().upper()
+        _efficiency_watched_generation = getattr(
+            watched, "entry_efficiency_generation", None
+        )
+        _efficiency_generation_raw = (
+            _efficiency_watched_generation
+            if _efficiency_watched_generation is not None
+            else _efficiency_meta.get("entry_efficiency_generation")
+        )
         try:
             _efficiency_prior_generation = max(
                 0,
                 int(
-                    _efficiency_meta.get("entry_efficiency_generation")
-                    if _efficiency_meta.get("entry_efficiency_generation") is not None
-                    else getattr(watched, "entry_efficiency_generation", 0)
+                    _efficiency_generation_raw
+                    if _efficiency_generation_raw is not None
+                    else 0
                 ),
             )
         except (TypeError, ValueError, OverflowError):
@@ -4591,8 +4604,9 @@ class APExecutionCore:
         _efficiency_first_breach = (
             getattr(watched, "trigger_crossed_at", None)
             or sig.get("trigger_crossed_at")
-            or _efficiency_meta.get("trigger_crossed_at")
-            or _efficiency_meta.get("entry_efficiency_first_breach_at")
+        )
+        _efficiency_watched_deadline = getattr(
+            watched, "entry_efficiency_deadline_at", None
         )
         _efficiency_mode = resolve_entry_efficiency_mode()
         _efficiency_result = evaluate_entry_efficiency(
@@ -4601,13 +4615,10 @@ class APExecutionCore:
             pattern=(
                 getattr(approved_plan, "pattern", None)
                 or sig.get("pattern")
-                or _efficiency_meta.get("pattern")
             ),
             timeframe=(
                 getattr(approved_plan, "timeframe", None)
                 or sig.get("timeframe")
-                or _efficiency_meta.get("timeframe")
-                or "1d"
             ),
             metadata=_efficiency_meta,
             execution_mode=_efficiency_execution_mode,
@@ -4620,9 +4631,14 @@ class APExecutionCore:
             first_breach_at=_efficiency_first_breach,
             prior_state=_efficiency_prior_state,
             rearm_pending=_efficiency_truthy(
-                _efficiency_meta.get("entry_efficiency_rearm_pending")
-                if _efficiency_meta.get("entry_efficiency_rearm_pending") is not None
-                else getattr(watched, "entry_efficiency_rearm_pending", False)
+                getattr(watched, "entry_efficiency_rearm_pending", None)
+                if getattr(watched, "entry_efficiency_rearm_pending", None) is not None
+                else _efficiency_meta.get("entry_efficiency_rearm_pending")
+            ),
+            prior_deadline_at=(
+                _efficiency_watched_deadline
+                if _efficiency_watched_deadline is not None
+                else _efficiency_meta.get("entry_efficiency_deadline_at")
             ),
             mode=_efficiency_mode,
         )
@@ -4723,8 +4739,12 @@ class APExecutionCore:
                 _efficiency_plan_meta.update(_efficiency_patch)
                 try:
                     approved_plan.metadata = _efficiency_plan_meta
-                except Exception:
-                    pass
+                except Exception as _efficiency_plan_meta_exc:
+                    log.debug(
+                        "[%s] entry-efficiency plan metadata mirror unavailable: %s",
+                        ticker,
+                        _efficiency_plan_meta_exc,
+                    )
                 watched.entry_efficiency_state = next_state
                 watched.entry_efficiency_generation = _efficiency_prior_generation + 1
                 watched.entry_efficiency_rearm_pending = bool(

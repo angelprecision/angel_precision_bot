@@ -5538,16 +5538,25 @@ class APEntryWatcher:
                                 w.state = WatchState.PENDING
                                 w.deferred_retry_not_before = None
                                 if _callback_next_retry:
+                                    # A future efficiency callback must carry
+                                    # an explicit zone; guessing UTC could
+                                    # bypass the bounded timing policy.
                                     try:
                                         w.entry_efficiency_next_eval_at = datetime.fromisoformat(
                                             str(_callback_next_retry)
                                         )
-                                        if w.entry_efficiency_next_eval_at.tzinfo is None:
-                                            w.entry_efficiency_next_eval_at = (
-                                                w.entry_efficiency_next_eval_at.replace(
-                                                    tzinfo=timezone.utc
-                                                )
+                                        if (
+                                            w.entry_efficiency_next_eval_at.tzinfo is None
+                                            or w.entry_efficiency_next_eval_at.utcoffset() is None
+                                        ):
+                                            raise ValueError(
+                                                "naive_entry_efficiency_next_eval_at"
                                             )
+                                        w.entry_efficiency_next_eval_at = (
+                                            w.entry_efficiency_next_eval_at.astimezone(
+                                                timezone.utc
+                                            )
+                                        )
                                     except Exception:
                                         w.entry_efficiency_next_eval_at = (
                                             datetime.now(timezone.utc)

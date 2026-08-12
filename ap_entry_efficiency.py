@@ -19,11 +19,9 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 ENTRY_EFFICIENCY_OBSERVE_ONLY = "observe_only"
 ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE = "paper_authoritative"
-ENTRY_EFFICIENCY_LIVE_AUTHORITATIVE = "live_authoritative"
 ENTRY_EFFICIENCY_MODES = frozenset({
     ENTRY_EFFICIENCY_OBSERVE_ONLY,
     ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
-    ENTRY_EFFICIENCY_LIVE_AUTHORITATIVE,
 })
 
 READY_NOW = "READY_NOW"
@@ -32,25 +30,21 @@ REARM_FOR_REBREACH = "REARM_FOR_REBREACH"
 TERMINAL_INVALID = "TERMINAL_INVALID"
 
 _DAILY_TIMEFRAMES = frozenset({"1d", "d", "day", "daily"})
-_PROFILE_KEYS = (
+_UNTRUSTED_INTELLIGENCE_KEYS = frozenset({
     "breach_profile",
     "breach_intelligence",
     "intelligence_breach_profile",
     "entry_efficiency_profile",
-)
-_DECISION_KEYS = (
     "decision_class",
     "classification",
     "entry_efficiency_class",
     "recommendation",
     "decision",
-)
-
-
-def _truthy(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+    "continuation_confirmed",
+    "fresh_continuation",
+    "genuine_rebreach",
+    "reset_confirmed",
+})
 
 
 def _safe_float(value: Any) -> float | None:
@@ -75,32 +69,31 @@ def _parse_datetime(value: Any) -> datetime | None:
             parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
         except (TypeError, ValueError):
             return None
+    # A naive timestamp cannot establish an exchange-session boundary or a
+    # bounded elapsed-time window.  Reject it; never guess UTC.
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 
 def resolve_entry_efficiency_mode(raw: Any = None) -> str:
     """Resolve the rollout mode fail-closed.
 
-    Unset, malformed, or unsupported configuration is observation-only.  A
-    live-authoritative rollout also requires an explicit approval flag; live
-    mode must never become authoritative merely because a typo resembles the
-    mode name.
+    The targeted PAPER 2-3-2 policy is active by default.  An explicit
+    ``observe_only`` mode disables behavioral gating; malformed or unsupported
+    configuration also fails closed.  LIVE has no authoritative mode in this
+    PR.
     """
-    candidate = (
-        os.getenv("AP_ENTRY_EFFICIENCY_MODE")
-        or os.getenv("ENTRY_EFFICIENCY_MODE", "")
-        if raw is None
-        else raw
-    )
+    if raw is None:
+        candidate = os.getenv("AP_ENTRY_EFFICIENCY_MODE") or os.getenv(
+            "ENTRY_EFFICIENCY_MODE", ""
+        )
+        if not str(candidate or "").strip():
+            return ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE
+    else:
+        candidate = raw
     normalized = str(candidate or "").strip().lower().replace("-", "_")
     if normalized not in ENTRY_EFFICIENCY_MODES:
-        return ENTRY_EFFICIENCY_OBSERVE_ONLY
-    live_approved = os.getenv("AP_ENTRY_EFFICIENCY_LIVE_APPROVED") or os.getenv(
-        "ENTRY_EFFICIENCY_LIVE_APPROVED", ""
-    )
-    if normalized == ENTRY_EFFICIENCY_LIVE_AUTHORITATIVE and not _truthy(live_approved):
         return ENTRY_EFFICIENCY_OBSERVE_ONLY
     return normalized
 
@@ -116,66 +109,9 @@ def normalize_strategy_pattern(pattern: Any, timeframe: Any) -> tuple[str, bool]
     return raw, False
 
 
-def _merged_profile(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    profile: dict[str, Any] = {}
-    for key in _PROFILE_KEYS:
-        value = metadata.get(key)
-        if isinstance(value, Mapping):
-            profile.update(value)
-        elif isinstance(value, str) and value.strip():
-            profile.setdefault("decision", value)
-    # Some queue rows place the classifier fields directly in metadata.
-    for key in _DECISION_KEYS + (
-        "continuation_confirmed",
-        "fresh_continuation",
-        "genuine_rebreach",
-        "reset_confirmed",
-    ):
-        if key in metadata and key not in profile:
-            profile[key] = metadata[key]
-    return profile
-
-
-def _profile_decision(profile: Mapping[str, Any]) -> str | None:
-    raw_values = [profile.get(key) for key in _DECISION_KEYS]
-    text = " ".join(str(value or "").strip().upper() for value in raw_values)
-    if not text:
-        return None
-    compact = re.sub(r"[^A-Z0-9]+", "_", text)
-    # These are the canonical #435 breach-profile classes.  Match them before
-    # broad token rules: VALID_SETUP_BAD_IMMEDIATE_ENTRY contains
-    # VALID_SETUP, but it is explicitly a wait rather than a release.
-    if "SETUP_INVALID" in compact or any(
-        token in compact for token in ("TERMINAL", "STOP_BROKEN", "TARGET_COMPLETE")
-    ):
-        return TERMINAL_INVALID
-    if any(
-        token in compact
-        for token in (
-            "VALID_SETUP_WAIT_FOR_REBREACH",
-            "REBREACH_PREFERRED",
-            "REARM",
-            "RESET",
-            "REBREACH",
-        )
-    ):
-        return REARM_FOR_REBREACH
-    if "VALID_SETUP_BAD_IMMEDIATE_ENTRY" in compact or any(
-        token in compact for token in ("WAIT", "CONFIRM")
-    ):
-        return WAIT_CONFIRMATION
-    if any(token in compact for token in ("READY", "VALID_SETUP", "PROCEED", "CONTINUE")):
-        return READY_NOW
-    return None
-
-
 def _authoritative_for_mode(mode: str, execution_mode: Any) -> bool:
     runtime_mode = str(execution_mode or "").strip().lower()
-    return (
-        mode == ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE and runtime_mode == "paper"
-    ) or (
-        mode == ENTRY_EFFICIENCY_LIVE_AUTHORITATIVE and runtime_mode == "live"
-    )
+    return mode == ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE and runtime_mode == "paper"
 
 
 def _rth_minutes(now: datetime) -> tuple[float | None, bool]:
@@ -256,6 +192,7 @@ def evaluate_entry_efficiency(
     first_breach_at: Any,
     prior_state: Any = "",
     rearm_pending: bool = False,
+    prior_deadline_at: Any = None,
     now: datetime | None = None,
     mode: Any = None,
 ) -> EntryEfficiencyResult:
@@ -268,8 +205,10 @@ def evaluate_entry_efficiency(
     now_utc = _parse_datetime(now) or datetime.now(timezone.utc)
     metadata_map = dict(metadata or {}) if isinstance(metadata, Mapping) else {}
     configured_mode = resolve_entry_efficiency_mode(mode)
-    authoritative = _authoritative_for_mode(configured_mode, execution_mode)
     canonical_pattern, applies = normalize_strategy_pattern(pattern, timeframe)
+    # Authority is deliberately limited to the explicitly targeted policy;
+    # unrelated setups remain telemetry-only even when PAPER rollout is on.
+    authoritative = _authoritative_for_mode(configured_mode, execution_mode) and applies
     pattern_raw = str(pattern or "").strip()
     side_key = str(side or "").strip().upper()
     first_breach = _parse_datetime(first_breach_at)
@@ -278,13 +217,8 @@ def evaluate_entry_efficiency(
     opening_window = bool(same_session and minutes_since_open is not None and 0 <= minutes_since_open < 30)
     breach_was_opening = _opening_breach(first_breach)
     prior = str(prior_state or "").strip().upper()
-    profile = _merged_profile(metadata_map)
-    profile_decision = _profile_decision(profile)
-    continuation_confirmed = _truthy(
-        profile.get("continuation_confirmed")
-        or profile.get("fresh_continuation")
-        or profile.get("genuine_rebreach")
-        or profile.get("reset_confirmed")
+    untrusted_intelligence_keys = tuple(
+        sorted(key for key in metadata_map if key in _UNTRUSTED_INTELLIGENCE_KEYS)
     )
 
     try:
@@ -296,10 +230,11 @@ def evaluate_entry_efficiency(
     except (TypeError, ValueError):
         max_wait_seconds = 1800
 
-    deadline = None
-    if first_breach is not None:
+    durable_deadline = _parse_datetime(prior_deadline_at)
+    deadline = durable_deadline
+    if deadline is None and first_breach is not None:
         deadline = first_breach + timedelta(seconds=max_wait_seconds)
-    else:
+    elif deadline is None:
         # A confirmed watcher breach should normally carry the durable first
         # breach timestamp.  If that evidence is unavailable, fail closed but
         # still keep the continuation bounded from this evaluation rather than
@@ -316,8 +251,9 @@ def evaluate_entry_efficiency(
         "bid": _safe_float(bid),
         "ask": _safe_float(ask),
         "quote_age_ms": quote_age_ms,
-        "profile_decision": profile_decision,
-        "continuation_confirmed": continuation_confirmed,
+        "untrusted_intelligence_keys": untrusted_intelligence_keys,
+        "intelligence_metadata_authority": "IGNORED",
+        "timing_authority_basis": "DIRECT_MARKET_EVIDENCE",
     }
 
     def result(decision: str, reason: str, detail: str) -> EntryEfficiencyResult:
@@ -415,6 +351,8 @@ def evaluate_entry_efficiency(
         return result(TERMINAL_INVALID, "ENTRY_EFFICIENCY_STOP_INVALIDATED", "stop-side truth is already broken")
     if target_complete:
         return result(TERMINAL_INVALID, "ENTRY_EFFICIENCY_TARGET_COMPLETE", "target-side truth leaves no entry opportunity")
+    if deadline is not None and now_utc >= deadline:
+        return result(TERMINAL_INVALID, "ENTRY_EFFICIENCY_WAIT_DEADLINE_EXPIRED", "bounded recheck window expired")
     if first_breach is None:
         return result(
             WAIT_CONFIRMATION,
@@ -429,9 +367,6 @@ def evaluate_entry_efficiency(
             "ENTRY_EFFICIENCY_REARM_STATE_UNPROVEN",
             "re-arm state is not durably paired with a fresh re-breach",
         )
-    if deadline is not None and now_utc >= deadline:
-        return result(TERMINAL_INVALID, "ENTRY_EFFICIENCY_WAIT_DEADLINE_EXPIRED", "bounded recheck window expired")
-
     if prior == READY_NOW:
         # A crash/restart after the durable READY promotion must resume the
         # existing pre-submit handoff rather than downgrade the state merely
@@ -441,33 +376,21 @@ def evaluate_entry_efficiency(
         return result(READY_NOW, "ENTRY_EFFICIENCY_READY_RETRY", "durable READY handoff is being resumed")
 
     # The first opening-window breach is always held.  The later clock tick is
-    # not a release signal; it must be paired with continuation evidence or a
-    # genuine reset/re-breach recorded by the watcher.
+    # not a release signal; only a genuine reset/re-breach recorded by the
+    # durable watcher may release it.  Generic intelligence metadata is never
+    # a timing authority.
     if opening_window or breach_was_opening:
-        if profile_decision == TERMINAL_INVALID:
-            return result(TERMINAL_INVALID, "ENTRY_EFFICIENCY_PROFILE_INVALID", "breach profile is terminally invalid")
-        if profile_decision == REARM_FOR_REBREACH and not rearm_pending:
-            return result(REARM_FOR_REBREACH, "ENTRY_EFFICIENCY_PROFILE_REARM", "profile requires a reset/re-breach")
         if rearm_pending:
             return result(READY_NOW, "ENTRY_EFFICIENCY_GENUINE_REBREACH", "fresh reset/re-breach is proven")
-        if continuation_confirmed:
-            return result(READY_NOW, "ENTRY_EFFICIENCY_FRESH_CONTINUATION", "fresh continuation evidence is proven")
         return result(WAIT_CONFIRMATION, "ENTRY_EFFICIENCY_OPENING_BREACH", "first 30-minute breach requires continuation or reset/re-breach")
 
-    if prior in {WAIT_CONFIRMATION, REARM_FOR_REBREACH} and not (rearm_pending or continuation_confirmed):
-        if profile_decision == TERMINAL_INVALID:
-            return result(TERMINAL_INVALID, "ENTRY_EFFICIENCY_PROFILE_INVALID", "breach profile is terminally invalid")
+    if prior in {WAIT_CONFIRMATION, REARM_FOR_REBREACH} and not rearm_pending:
         return result(WAIT_CONFIRMATION, "ENTRY_EFFICIENCY_CLOCK_NOT_SUFFICIENT", "clock alone cannot release the prior breach")
-    if profile_decision == TERMINAL_INVALID:
-        return result(TERMINAL_INVALID, "ENTRY_EFFICIENCY_PROFILE_INVALID", "breach profile is terminally invalid")
-    if profile_decision == REARM_FOR_REBREACH and not rearm_pending:
-        return result(REARM_FOR_REBREACH, "ENTRY_EFFICIENCY_PROFILE_REARM", "profile requires a reset/re-breach")
     return result(READY_NOW, "ENTRY_EFFICIENCY_READY", "fresh post-window entry truth is proven")
 
 
 __all__ = [
     "EntryEfficiencyResult",
-    "ENTRY_EFFICIENCY_LIVE_AUTHORITATIVE",
     "ENTRY_EFFICIENCY_MODES",
     "ENTRY_EFFICIENCY_OBSERVE_ONLY",
     "ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE",
