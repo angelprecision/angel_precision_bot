@@ -419,6 +419,10 @@ Implement the smallest exact-head change that:
 
 Run the focused tests and full exact-head P0 workflow, update the PR with exact head SHA/test evidence, and do not merge or deploy.
 
+## Codex tripwire: do not over-scope deployment parity
+
+The repository cannot itself prove what Render injected into every active trading pod. The code change must make each pod self-attest its resolved values; the actual fleet comparison/normalization is an operational deployment step. Do not invent a cross-pod database authority, new environment registry, or mode-specific selector config table for this PR.
+
 ## Merge policy
 
 P1 draft only until exact-head tests, deployment-shape audit, and production environment attestation pass. No merge/deploy without explicit approval.
