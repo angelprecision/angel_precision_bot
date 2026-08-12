@@ -57,17 +57,19 @@ def _decision(**overrides):
     return evaluate_entry_efficiency(**values)
 
 
-def test_targeted_paper_rollout_is_active_by_default_but_fail_closed_on_bad_mode(monkeypatch):
+def test_targeted_paper_rollout_requires_explicit_promotion_and_fails_closed(monkeypatch):
     monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
     monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
 
-    assert resolve_entry_efficiency_mode() == "paper_authoritative"
+    assert resolve_entry_efficiency_mode() == "observe_only"
     assert resolve_entry_efficiency_mode("not-a-mode") == "observe_only"
     assert resolve_entry_efficiency_mode("paper") == "observe_only"
+    assert resolve_entry_efficiency_mode("paper_authoritative") == "paper_authoritative"
     result = _decision(mode=None)
-    assert result.authoritative is True
+    assert result.authoritative is False
     assert result.decision == WAIT_CONFIRMATION
-    assert result.should_hold is True
+    assert result.reason_code == "OBSERVE_ONLY"
+    assert result.should_hold is False
 
 
 def test_live_authority_is_reserved_and_cannot_be_enabled_by_environment(monkeypatch):
@@ -85,7 +87,10 @@ def test_aapl_opening_daily_raw_pattern_normalizes_and_holds():
     assert result.authoritative is True
     assert result.decision == WAIT_CONFIRMATION
     assert result.should_hold is True
+    assert result.pattern_raw == "2-3"
     assert result.canonical_pattern == "2-3-2"
+    assert result.to_meta()["entry_efficiency_pattern_raw"] == "2-3"
+    assert result.to_meta()["entry_efficiency_canonical_pattern"] == "2-3-2"
     assert result.breach_was_opening is True
     assert result.opening_window is True
     assert result.reason_code == "ENTRY_EFFICIENCY_OPENING_BREACH"

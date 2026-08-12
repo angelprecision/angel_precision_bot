@@ -270,11 +270,16 @@ to the canonical daily 2-3-2 family.
 
 Modes:
 
-- `paper_authoritative`: active default; changes PAPER timing only for daily 2-3-2.
-- `observe_only`: explicit opt-out; calculate the decision without changing execution.
+- `observe_only`: default when unset; calculate the decision without changing execution.
+- `paper_authoritative`: explicit PAPER promotion; changes PAPER timing only for daily 2-3-2.
 
-Malformed/unsupported mode defaults to `observe_only`.  LIVE has no
-authoritative mode in this PR.
+Unset, malformed, and unsupported mode values all resolve to `observe_only`.
+LIVE has no authoritative mode in this PR.
+
+The raw strategy pattern and canonical pattern are both persisted in the
+efficiency metadata so the PAPER cohort can be inspected before any future
+promotion.  Normalizing daily `2-3` to canonical `2-3-2` is limited to this
+targeted policy; it does not establish LIVE taxonomy authority.
 
 No environment-variable pair can promote LIVE timing authority here. Do not
 make LIVE authoritative merely by setting a generic intelligence or approval
@@ -359,8 +364,8 @@ Do not edit:
 Final review must answer all:
 
 - Does this change LIVE behavior? **NO**; LIVE is always observe-only in this PR.
-- Does it change PAPER behavior? **YES**, only for the canonical daily 2-3-2 policy; `paper_authoritative` is the default.
-- Is it active by default? **YES** for targeted PAPER 2-3-2; unrelated setups and LIVE remain observe-only.
+- Does it change PAPER behavior? **YES**, only after explicit `paper_authoritative` promotion and only for the canonical daily 2-3-2 policy.
+- Is it active by default? **NO**; unset/malformed configuration is observe-only, and unrelated setups and LIVE remain observe-only.
 - Does it add broker submit/cancel calls? **NO**.
 - Can it make existing submit seam reachable at a different time? Eventually yes under reviewed rollout; exact transition must be proven.
 - Does it mutate orders? Only existing pending-entry lifecycle metadata/state through exact CAS if implementation requires it.

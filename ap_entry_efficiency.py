@@ -79,17 +79,17 @@ def _parse_datetime(value: Any) -> datetime | None:
 def resolve_entry_efficiency_mode(raw: Any = None) -> str:
     """Resolve the rollout mode fail-closed.
 
-    The targeted PAPER 2-3-2 policy is active by default.  An explicit
-    ``observe_only`` mode disables behavioral gating; malformed or unsupported
-    configuration also fails closed.  LIVE has no authoritative mode in this
-    PR.
+    The targeted PAPER 2-3-2 policy is opt-in through an explicit
+    ``paper_authoritative`` mode.  Unset, ``observe_only``, malformed, or
+    unsupported configuration fails closed to observation.  LIVE has no
+    authoritative mode in this PR.
     """
     if raw is None:
         candidate = os.getenv("AP_ENTRY_EFFICIENCY_MODE") or os.getenv(
             "ENTRY_EFFICIENCY_MODE", ""
         )
         if not str(candidate or "").strip():
-            return ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE
+            return ENTRY_EFFICIENCY_OBSERVE_ONLY
     else:
         candidate = raw
     normalized = str(candidate or "").strip().lower().replace("-", "_")
