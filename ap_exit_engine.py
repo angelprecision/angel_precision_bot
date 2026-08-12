@@ -3595,6 +3595,17 @@ class APExitEngine:
                 disposition="RETRY_ADOPTION_ERROR", adopted=False,
                 safe_to_seed=False, retryable=True, reason="missing_contract_or_id",
             )
+        if not _client:
+            return CanonicalAdoptionResult(
+                disposition="RETRY_CLIENT_MISMATCH", adopted=False,
+                safe_to_seed=False, retryable=True, reason="missing_client_id",
+            )
+        if _mode not in {"live", "paper"}:
+            return CanonicalAdoptionResult(
+                disposition="RETRY_MODE_MISMATCH", adopted=False,
+                safe_to_seed=False, retryable=True,
+                reason=f"unsupported_execution_mode={_mode!r}",
+            )
 
         with self._lock:
             # ── Final Blocker 1: Canonical + repair collapse ───────────────────
@@ -3993,10 +4004,21 @@ class APExitEngine:
                     and existing.option_symbol == pos.option_symbol
                     and not existing.closed
                 )
-                if same_id or same_sym:
+                _existing_client = str(getattr(existing, "client_id", "") or "").strip().lower()
+                _existing_mode = str(getattr(existing, "execution_mode", "") or "").strip().lower()
+                _incoming_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                same_owner_domain = (
+                    same_sym
+                    and _existing_client
+                    and _incoming_client
+                    and _existing_mode in {"live", "paper"}
+                    and _incoming_mode in {"live", "paper"}
+                    and _existing_client == _incoming_client
+                    and _existing_mode == _incoming_mode
+                )
+                if same_id or same_owner_domain:
                     _incoming_id = str(getattr(pos, "position_id", "") or "")
-                    _incoming_client = str(getattr(pos, "client_id", "") or "").strip().lower()
-                    _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
                     _incoming_is_proven_canonical = (
                         _incoming_id
                         and not _incoming_id.startswith("broker-repair-")

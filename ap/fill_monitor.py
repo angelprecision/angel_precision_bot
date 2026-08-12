@@ -321,8 +321,22 @@ def get_pending_orders(client_id: str) -> list[dict]:
 
 
 def _has_proven_broker_order_id(value) -> bool:
+    if isinstance(value, bool):
+        return False
     broker_id = str(value or "").strip()
-    return bool(broker_id and broker_id.upper() != "N/A")
+    return bool(
+        broker_id
+        and broker_id.upper() not in {"N/A", "NA", "NONE", "NULL", "UNKNOWN", "?"}
+    )
+
+
+def _has_proven_standing_stop_order_id(value) -> bool:
+    """Require a concrete broker identity before calling protection proven."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)) and value <= 0:
+        return False
+    return _has_proven_broker_order_id(value)
 
 
 def _is_canonical_owner_handoff_recovery(order: dict) -> bool:
@@ -1761,7 +1775,7 @@ def _place_standing_stop_best_effort(
                     detail_reason="broker_helper_rejected",
                     broker_stop_status=stop_stat,
                 )
-            if _has_proven_broker_order_id(stop_id):
+            if _has_proven_standing_stop_order_id(stop_id):
                 return _outcome(
                     "SUBMITTED",
                     broker_stop_id=str(stop_id).strip(),
@@ -1875,7 +1889,7 @@ def _place_standing_stop_best_effort(
                     exception_type=type(exc).__name__,
                     exception=str(exc),
                 )
-            if not _has_proven_broker_order_id(stop_id):
+            if not _has_proven_standing_stop_order_id(stop_id):
                 return _outcome(
                     "OUTCOME_UNPROVEN",
                     detail_reason="broker_rest_response_missing_order_id",
@@ -2251,7 +2265,7 @@ def _persist_canonical_handoff_standing_stop_state(
 ) -> bool:
     if state not in _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATES:
         return False
-    if state == "SUBMITTED" and not _has_proven_broker_order_id(broker_stop_id):
+    if state == "SUBMITTED" and not _has_proven_standing_stop_order_id(broker_stop_id):
         log.critical(
             "[%s] refusing SUBMITTED standing-stop marker without broker order id | local=%s",
             order.get("client_id"),
@@ -2329,7 +2343,7 @@ def _claim_canonical_handoff_standing_stop(order: dict) -> dict:
         meta.get(_CANONICAL_OWNER_HANDOFF_STANDING_STOP_ID_KEY) or ""
     ).strip()
     if current_state == "SUBMITTED":
-        if not _has_proven_broker_order_id(broker_stop_id):
+        if not _has_proven_standing_stop_order_id(broker_stop_id):
             persisted = _persist_canonical_handoff_standing_stop_state(
                 order,
                 "OUTCOME_UNPROVEN",
@@ -2452,7 +2466,7 @@ def _normalize_standing_stop_call_result(raw_result) -> dict:
         if outcome in {"SUBMITTED", "FAILED", "OUTCOME_UNPROVEN"}:
             if outcome == "SUBMITTED":
                 broker_stop_id = str(raw_result.get("broker_stop_id") or "").strip()
-                if not _has_proven_broker_order_id(broker_stop_id):
+                if not _has_proven_standing_stop_order_id(broker_stop_id):
                     return dict(
                         raw_result,
                         ok=False,
@@ -2467,7 +2481,7 @@ def _normalize_standing_stop_call_result(raw_result) -> dict:
             return dict(raw_result, outcome=outcome)
         if raw_result.get("ok") is True:
             broker_stop_id = str(raw_result.get("broker_stop_id") or "").strip()
-            if not _has_proven_broker_order_id(broker_stop_id):
+            if not _has_proven_standing_stop_order_id(broker_stop_id):
                 return dict(
                     raw_result,
                     ok=False,
@@ -2519,7 +2533,7 @@ def _establish_canonical_handoff_standing_stop(
         )
     )
     outcome = call_result.get("outcome")
-    if outcome == "SUBMITTED" and not _has_proven_broker_order_id(
+    if outcome == "SUBMITTED" and not _has_proven_standing_stop_order_id(
         call_result.get("broker_stop_id")
     ):
         call_result = {

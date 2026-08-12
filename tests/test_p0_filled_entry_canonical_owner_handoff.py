@@ -1470,3 +1470,26 @@ def test_foreign_repair_before_exact_repair_does_not_veto_adoption():
     assert engine._positions_by_id["jason-live-canonical"] is exact_repair
     assert foreign_repair in engine._positions
     assert getattr(foreign_repair, "adoption_identity_quarantined", False) is False
+
+
+def test_canonical_seed_can_coexist_with_foreign_same_contract_repair():
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(None, email="jason@example.com")
+    foreign_repair = _adoption_position(
+        "broker-repair-jose-live",
+        client_id="jose@example.com",
+        mode="live",
+    )
+    canonical = _adoption_position(
+        "jason-live-canonical",
+        client_id="jason@example.com",
+        mode="live",
+    )
+    _install_adoption_positions(engine, [foreign_repair])
+
+    engine.add_position(canonical)
+
+    assert engine._positions == [foreign_repair, canonical]
+    assert engine._positions_by_id[canonical.position_id] is canonical
+    assert getattr(foreign_repair, "adoption_identity_quarantined", False) is False
