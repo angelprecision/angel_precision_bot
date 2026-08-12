@@ -88,6 +88,49 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
     return None
 
 
+def _resolve_entry_efficiency_execution_mode(
+    approved_plan, signal, runtime_mode, paper_flag
+) -> str | None:
+    """Resolve entry-efficiency authority from one exact execution identity.
+
+    The generic submit resolver intentionally selects the first usable value
+    for legacy submit paths. That is not safe for #436: a stale PAPER plan
+    must never promote a LIVE signal into PAPER timing authority. Require the
+    durable signal mode, every present plan mode, runtime mode, and the runtime
+    paper flag to agree. Missing or conflicting identity returns ``None``;
+    the caller must remain on the existing non-efficiency path.
+    """
+    if not isinstance(signal, dict):
+        return None
+    signal_mode = _normalize_execution_mode(signal.get("execution_mode"))
+    if signal_mode is None:
+        return None
+
+    plan_modes = []
+    for raw_value in (
+        getattr(approved_plan, "execution_mode", None),
+        getattr(approved_plan, "mode", None),
+    ):
+        if not str(raw_value or "").strip():
+            continue
+        normalized = _normalize_execution_mode(raw_value)
+        if normalized is None:
+            return None
+        plan_modes.append(normalized)
+    if not plan_modes or any(mode != signal_mode for mode in plan_modes):
+        return None
+
+    runtime_normalized = _normalize_execution_mode(runtime_mode)
+    if runtime_normalized is None or runtime_normalized != signal_mode:
+        return None
+    if not isinstance(paper_flag, bool):
+        return None
+    flag_mode = "paper" if paper_flag else "live"
+    if flag_mode != signal_mode:
+        return None
+    return signal_mode
+
+
 def _parse_datetime_for_efficiency(value) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
@@ -4569,7 +4612,7 @@ class APExecutionCore:
             _efficiency_signal_meta = {}
         _efficiency_meta = dict(_efficiency_plan_meta)
         _efficiency_meta.update(_efficiency_signal_meta)
-        _efficiency_execution_mode = _resolve_submit_execution_mode(
+        _efficiency_execution_mode = _resolve_entry_efficiency_execution_mode(
             approved_plan,
             sig,
             getattr(self, "execution_mode", None),

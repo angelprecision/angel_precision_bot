@@ -30,6 +30,7 @@ for _name in dir(_base):
 
 from ap_entry_efficiency import (
     ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE as _ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+    normalize_strategy_pattern as _normalize_strategy_pattern,
     resolve_entry_efficiency_mode as _resolve_entry_efficiency_mode,
 )
 
@@ -217,12 +218,17 @@ class WatchedSignal(_BaseWatchedSignal):
         # Persisted WAIT/REARM state is telemetry/history unless the current
         # explicit rollout and PAPER execution identity authorize behavior.
         efficiency_mode = _resolve_entry_efficiency_mode()
+        signal = getattr(self, "signal", {}) or {}
         execution_mode = str(
-            (getattr(self, "signal", {}) or {}).get("execution_mode") or ""
+            signal.get("execution_mode") or ""
         ).strip().lower()
+        _, pattern_applies = _normalize_strategy_pattern(
+            signal.get("pattern"), signal.get("timeframe")
+        )
         efficiency_behavior_enabled = (
             efficiency_mode == _ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE
             and execution_mode == "paper"
+            and pattern_applies
         )
         if not efficiency_behavior_enabled:
             return super().check(bid, ask, quote_age_ms=quote_age_ms)

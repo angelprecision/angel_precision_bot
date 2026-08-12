@@ -14,6 +14,7 @@ os.environ.setdefault(
 )
 os.environ.setdefault("ENCRYPTION_KEY", "ap-entry-efficiency-pr-436-2026")
 
+import ap_execution_core as execution_core_module
 from ap_entry_efficiency import (
     ENTRY_EFFICIENCY_OBSERVE_ONLY,
     ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
@@ -31,7 +32,11 @@ from ap_entry_watcher import (
     _parse_entry_efficiency_at,
 )
 from ap.order_state_machine import APOrderStateMachine
-from ap_execution_core import APExecutionCore, _parse_datetime_for_efficiency
+from ap_execution_core import (
+    APExecutionCore,
+    _parse_datetime_for_efficiency,
+    _resolve_entry_efficiency_execution_mode,
+)
 
 
 FIRST_BREACH = datetime(2026, 8, 12, 13, 51, 51, tzinfo=timezone.utc)
@@ -326,6 +331,151 @@ def test_paper_stale_efficiency_wait_remains_active_when_authority_is_enabled(mo
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
     assert watched.breach_count == 0
     assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+def test_paper_stale_efficiency_wait_is_ignored_for_unrelated_strategy_scope(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    signal = _watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    )
+    signal["pattern"] = "1-2"
+    watched = WatchedSignal(signal, overnight=False)
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+@pytest.mark.parametrize(
+    "plan_modes, signal_mode, runtime_mode, paper_flag",
+    [
+        (("paper",), "live", "live", False),
+        (("live",), "paper", "paper", True),
+        (("paper", "live"), "paper", "paper", True),
+    ],
+)
+def test_entry_efficiency_execution_identity_conflicts_fail_closed(
+    plan_modes, signal_mode, runtime_mode, paper_flag
+):
+    plan = SimpleNamespace(
+        execution_mode=plan_modes[0],
+        mode=plan_modes[1] if len(plan_modes) > 1 else None,
+    )
+    signal = {"execution_mode": signal_mode}
+
+    assert _resolve_entry_efficiency_execution_mode(
+        plan, signal, runtime_mode, paper_flag
+    ) is None
+
+
+def test_entry_efficiency_execution_identity_requires_exact_paper_agreement():
+    plan = SimpleNamespace(execution_mode="paper", mode=None)
+    signal = {"execution_mode": "paper"}
+
+    assert _resolve_entry_efficiency_execution_mode(
+        plan, signal, "paper", True
+    ) == "paper"
+
+
+@pytest.mark.parametrize(
+    "plan_mode, signal_mode, runtime_mode, paper_flag",
+    [
+        ("paper", "live", "live", False),
+        ("live", "paper", "paper", True),
+    ],
+)
+def test_execution_core_conflicting_identity_stays_on_existing_path(
+    monkeypatch, plan_mode, signal_mode, runtime_mode, paper_flag
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    efficiency_metadata = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat(),
+    }
+    signal = _watch_signal(**efficiency_metadata)
+    signal["execution_mode"] = signal_mode
+    watched = WatchedSignal(signal, overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": "canonical-sig-efficiency",
+        },
+        execution_mode=plan_mode,
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+
+    class ExistingPathReached(RuntimeError):
+        pass
+
+    refresh = MagicMock(side_effect=ExistingPathReached)
+    observed_results = []
+    real_evaluate_entry_efficiency = execution_core_module.evaluate_entry_efficiency
+
+    def _observe_efficiency_result(**kwargs):
+        result = real_evaluate_entry_efficiency(**kwargs)
+        observed_results.append(result)
+        return result
+
+    core = SimpleNamespace(
+        mode=runtime_mode.upper(),
+        paper=paper_flag,
+        execution_mode=runtime_mode,
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _refresh_hydrated_prebreach_plan=refresh,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *a, **k: None,
+        )
+        patcher.setattr(
+            execution_core_module,
+            "evaluate_entry_efficiency",
+            _observe_efficiency_result,
+        )
+        with pytest.raises(ExistingPathReached):
+            APExecutionCore._on_entry_trigger(core, watched)
+
+    assert observed_results
+    assert observed_results[0].authoritative is False
+    assert observed_results[0].decision not in {WAIT_CONFIRMATION, TERMINAL_INVALID}
+    assert _resolve_entry_efficiency_execution_mode(
+        plan, signal, runtime_mode, paper_flag
+    ) is None
+    refresh.assert_called_once()
+    osm.cas_entry_efficiency_state.assert_not_called()
+    osm.submit_existing_entry.assert_not_called()
 
 
 def test_watcher_pullback_stages_distinct_rearm_cas_request(monkeypatch):
