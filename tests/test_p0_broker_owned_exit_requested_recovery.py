@@ -1326,6 +1326,7 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                     "exec_quantity": 4,
                     "avg_fill_price": 1.25,
                     "quantity": 4,
+                    "transaction_date": "2026-08-08T13:31:00Z",
                 }
 
             def submit_order(self, *args, **kwargs):
