@@ -129,14 +129,16 @@ _MAX_SELECTED_QUOTE_AGE_SECONDS = _positive_finite_env_float(
     "GATE_G_MAX_SELECTED_QUOTE_AGE_SECONDS", 120.0
 )
 # Gate G does not infer selected-contract authority from a generic broker label,
-# a signal timestamp, or a caller-provided fallback.  This is the closed
-# producer attestation reserved for the selector/revalidator contract.  The
-# current deferred materializer does not emit it, so its metadata remains
-# advisory until the later selected-contract contract is frozen.
+# a signal timestamp, or a caller-provided fallback.  This token is reserved
+# for the future selector/revalidator contract; it is not itself a producer
+# attestation.  The current deferred materializer does not emit a
+# producer-bound Gate G attestation, so selected-contract metadata remains
+# advisory until that later contract is frozen.
 SELECTED_CONTRACT_TRUSTED_SOURCE = "selector_revalidated_production"
-TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES = frozenset({
-    SELECTED_CONTRACT_TRUSTED_SOURCE,
-})
+# Keep this closed set empty until a real selector/revalidator integration
+# supplies producer-bound evidence.  A raw string in a signal or metadata
+# payload must never be sufficient to activate PRODUCTION_EXACT authority.
+TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES = frozenset()
 
 
 def _safe_float(value: Any, *, field: str = "value") -> tuple[Optional[float], str]:
@@ -569,29 +571,24 @@ def _extract_selected_contract_evidence(
         any(len(values) > 1 for values in source_claims)
         or len(claimed_quote_sources) > 1
     )
-    provenance_untrusted = (
-        not source_claims
-        or any(
-            not values
-            or not values.issubset(TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES)
-            for values in source_claims
-        )
-        or len(claimed_quote_sources) != 1
-    )
-    if provenance_conflict or provenance_untrusted:
+    if provenance_conflict:
         return {
             "exists": False,
             "authoritative": False,
             "classification": UNAVAILABLE,
-            "reason": (
-                "selected_contract_quote_source_conflict"
-                if provenance_conflict
-                else "selected_contract_quote_source_untrusted"
-            ),
+            "reason": "selected_contract_quote_source_conflict",
             "claimed_contracts": claimed_contracts,
             "claimed_quote_sources": claimed_quote_sources,
         }
-    quote_source = claimed_quote_sources[0]
+    quote_source = claimed_quote_sources[0] if len(claimed_quote_sources) == 1 else None
+    # Source aliases are still resolved for diagnostics and conflict detection,
+    # but they cannot establish authority.  Only a future producer-bound
+    # attestation may make this true; no current Gate G caller supplies one.
+    source_is_trusted = bool(
+        quote_source
+        and quote_source in TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES
+        and all(values == {quote_source} for values in source_claims)
+    )
 
     last_reason = "selected_contract_unavailable"
     for candidate, source_container, nested_contract in records:
@@ -722,6 +719,10 @@ def _extract_selected_contract_evidence(
                 "selected_contract_quality_field_missing_or_invalid:"
                 f"{delta_status}:{oi_status}:{volume_status}:{dte_status}"
             )
+            continue
+
+        if not source_is_trusted:
+            last_reason = "selected_contract_quote_source_untrusted"
             continue
 
         return {

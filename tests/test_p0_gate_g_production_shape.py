@@ -151,22 +151,25 @@ def test_loose_preselector_quote_fields_are_not_selected_authority(monkeypatch):
     assert gate["gate_diagnostics"]["input_provenance"]["spread_pct"]["authoritative"] is False
 
 
-def test_exact_selected_contract_activates_only_exact_quality_path(monkeypatch):
+def test_payload_trusted_source_token_cannot_activate_exact_quality_path(monkeypatch):
     signal = _selected_signal(
         quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
     )
     gate, pipeline = _run_with_fake_pipeline(monkeypatch, signal)
     name, kwargs = pipeline.calls[0]
-    assert name == "run"
-    assert kwargs["contract_quality_authoritative"] is True
-    assert kwargs["account_state_authoritative"] is False
-    assert kwargs["dte"] == 0
+    assert name == "run_quick"
+    assert kwargs["contract_evidence"]["exists"] is False
+    assert kwargs.get("contract_quality_authoritative") is not True
+    assert kwargs.get("account_state_authoritative") is not True
     evidence = gate["gate_diagnostics"]["selected_contract_evidence"]
-    assert evidence["exists"] is True
-    assert evidence["source"] == ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
+    assert gate["intel_status"] != "RISK_VETO"
 
 
-def test_trusted_quote_source_can_be_attested_by_selected_container():
+def test_payload_quote_source_token_cannot_attest_selected_contract():
     signal = _selected_signal()
     signal["quote_source"] = ib.SELECTED_CONTRACT_TRUSTED_SOURCE
 
@@ -174,9 +177,10 @@ def test_trusted_quote_source_can_be_attested_by_selected_container():
         signal, client_id="client-a", execution_mode="LIVE"
     )
 
-    assert evidence["exists"] is True
-    assert evidence["authoritative"] is True
-    assert evidence["source"] == ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
 
 
 @pytest.mark.parametrize("quote_source", [None, "whatever", "tradier_live"])
@@ -201,7 +205,7 @@ def test_unrecognized_selected_contract_quote_source_cannot_create_authority(
 
 
 @pytest.mark.parametrize("source_field", ["source", "provider"])
-def test_trusted_source_alias_can_attest_selected_contract(source_field):
+def test_payload_trusted_source_alias_cannot_attest_selected_contract(source_field):
     signal = _selected_signal()
     signal["selected_contract"][source_field] = ib.SELECTED_CONTRACT_TRUSTED_SOURCE
 
@@ -209,9 +213,10 @@ def test_trusted_source_alias_can_attest_selected_contract(source_field):
         signal, client_id="client-a", execution_mode="LIVE"
     )
 
-    assert evidence["exists"] is True
-    assert evidence["authoritative"] is True
-    assert evidence["source"] == ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
 
 
 @pytest.mark.parametrize("source_field", ["source", "provider"])
@@ -367,7 +372,7 @@ def test_same_occ_identity_conflict_is_checked_in_every_candidate_container(
     assert evidence["reason"] == "selected_contract_identity_conflict"
 
 
-def test_duplicate_selected_contracts_with_identical_identity_remain_eligible():
+def test_duplicate_selected_contracts_with_identical_identity_remain_advisory():
     signal = _selected_signal(
         quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
     )
@@ -379,10 +384,10 @@ def test_duplicate_selected_contracts_with_identical_identity_remain_eligible():
         signal, client_id="client-a", execution_mode="LIVE"
     )
 
-    assert evidence["exists"] is True
-    assert evidence["authoritative"] is True
-    assert evidence["classification"] == ib.PRODUCTION_EXACT
-    assert evidence["source"] == ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
 
 
 def test_top_level_and_nested_occ_identity_conflict_is_quarantined():
