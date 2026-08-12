@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import math
 import os
 import re
 import time
@@ -390,9 +391,31 @@ def _is_canonical_owner_handoff_recovery(order: dict) -> bool:
     return position_id_missing or retry_marker or retry_error or handoff_pending
 
 
-def _durable_filled_entry_recovery_result(order: dict) -> dict | None:
-    """Return a DB-only FILLED result when durable fill truth is complete."""
+def _durable_filled_entry_recovery_result(
+    order: dict,
+    *,
+    runtime_execution_mode=None,
+) -> dict | None:
+    """Return a DB-only FILLED result only after exact runtime admission.
+
+    ``runtime_execution_mode`` is the already-resolved per-iteration runtime
+    authority from ``run_fill_monitor``.  A direct caller that cannot provide
+    that authority must hold rather than deriving it from the durable row.
+    """
     if not _is_canonical_owner_handoff_recovery(order):
+        return None
+    if _canonical_handoff_identity_where(order) is None:
+        return None
+
+    row_mode_state, row_mode = _mode_source_state(order.get("execution_mode"))
+    runtime_mode_state, resolved_runtime_mode = _mode_source_state(
+        runtime_execution_mode
+    )
+    if (
+        row_mode_state != "valid"
+        or runtime_mode_state != "valid"
+        or row_mode != resolved_runtime_mode
+    ):
         return None
 
     raw_qty = order.get("filled_qty")
@@ -412,7 +435,7 @@ def _durable_filled_entry_recovery_result(order: dict) -> dict | None:
         avg_fill = float(raw_price)
     except (TypeError, ValueError, OverflowError):
         return None
-    if avg_fill <= 0:
+    if not math.isfinite(avg_fill) or avg_fill <= 0:
         return None
 
     return {
@@ -3770,7 +3793,10 @@ def process_pending_order(
         and _broker_poll_unavailable_for_durable_filled_recovery(result)
     ):
         broker_poll_status = mapped
-        durable_result = _durable_filled_entry_recovery_result(order)
+        durable_result = _durable_filled_entry_recovery_result(
+            order,
+            runtime_execution_mode=runtime_execution_mode,
+        )
         if durable_result is not None:
             result = durable_result
             mapped = "FILLED"

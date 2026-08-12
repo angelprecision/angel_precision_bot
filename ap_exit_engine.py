@@ -1068,8 +1068,14 @@ def _classify_canonical_repair_owner_domain(
         not _is_proven_owner_client_id(target_client)
         or target_mode not in {"live", "paper"}
         or not _is_proven_owner_client_id(repair_client)
-        or repair_mode not in {"live", "paper"}
     ):
+        return "IDENTITY_UNPROVEN"
+    # A proven client mismatch is sufficient to prove a foreign owner domain;
+    # a malformed mode on that foreign row must not let this client's adoption
+    # quarantine or disable another client's protective owner.
+    if repair_client != target_client:
+        return "PROVEN_FOREIGN_DOMAIN"
+    if repair_mode not in {"live", "paper"}:
         return "IDENTITY_UNPROVEN"
     if repair_client == target_client and repair_mode == target_mode:
         return "EXACT_OWNER_DOMAIN"

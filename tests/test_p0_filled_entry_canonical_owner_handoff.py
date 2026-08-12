@@ -1399,7 +1399,10 @@ def test_restart_reloads_last_error_fallback_and_repairs_without_terminal_transi
     assert verify_calls == [1]
 
 
-def test_filled_handoff_uses_durable_db_proof_when_broker_poll_unavailable(monkeypatch):
+@pytest.mark.parametrize("execution_mode", ["live", "paper"])
+def test_filled_handoff_uses_durable_db_proof_when_broker_poll_unavailable(
+    monkeypatch, execution_mode
+):
     from ap import fill_monitor as fm
 
     events = []
@@ -1410,6 +1413,7 @@ def test_filled_handoff_uses_durable_db_proof_when_broker_poll_unavailable(monke
         filled_qty=1,
         fill_price=1.46,
         meta={"canonical_owner_handoff_entry_handoff_proven": False},
+        execution_mode=execution_mode,
     )
     db = _Connection(
         {
@@ -1424,7 +1428,14 @@ def test_filled_handoff_uses_durable_db_proof_when_broker_poll_unavailable(monke
             "filled_qty": 1,
             "fill_price": 1.46,
             "meta": {"canonical_owner_handoff_entry_handoff_proven": False},
-        }
+            "execution_mode": execution_mode,
+        },
+        position_row={
+            "id": "canonical-position-1",
+            "client_id": "jason@example.com",
+            "contract": "INTC260810P00098000",
+            "execution_mode": execution_mode,
+        },
     )
     _install_db(monkeypatch, db)
     monkeypatch.setattr(
@@ -1486,11 +1497,183 @@ def test_filled_handoff_uses_durable_db_proof_when_broker_poll_unavailable(monke
         osm=_OSM(),
         pm=object(),
         exit_engine=SimpleNamespace(_lock=_Lock()),
+        runtime_execution_mode=execution_mode,
     )
 
     assert db.row["position_id"] == "canonical-position-1"
     assert db.row["meta"]["canonical_owner_handoff_entry_handoff_proven"] is True
     assert events.index("open") < events.index("seed") < events.index("verify")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "runtime_execution_mode"),
+    [
+        ({"execution_mode": "paper"}, "live"),
+        ({"execution_mode": "live"}, "paper"),
+        ({"execution_mode": None}, "live"),
+        ({"execution_mode": " LIVE "}, "live"),
+        ({"execution_mode": "sandbox"}, "live"),
+        ({"client_id": ""}, "live"),
+        ({"local_order_id": ""}, "live"),
+        ({"contract": ""}, "live"),
+    ],
+    ids=[
+        "paper-row-in-live-runtime",
+        "live-row-in-paper-runtime",
+        "null-mode",
+        "whitespace-mode",
+        "malformed-mode",
+        "missing-client",
+        "missing-local-order",
+        "missing-contract",
+    ],
+)
+def test_durable_db_recovery_holds_without_exact_identity_or_mode(
+    monkeypatch, overrides, runtime_execution_mode
+):
+    from ap import fill_monitor as fm
+
+    events = []
+    _patch_process_side_effects(monkeypatch, events)
+    order = _order(
+        status="FILLED",
+        position_id=None,
+        filled_qty=1,
+        fill_price=1.46,
+        meta={"canonical_owner_handoff_entry_handoff_proven": False},
+        **overrides,
+    )
+    db = _Connection(dict(order))
+    _install_db(monkeypatch, db)
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {
+            "status": "UNKNOWN",
+            "filled_qty": 0,
+            "avg_fill": 0.0,
+            "reason": "broker_timeout",
+            "raw": {},
+        },
+    )
+
+    def _unexpected(name):
+        def _call(*_args, **_kwargs):
+            pytest.fail(f"{name} must not run for an unproven DB-only replay")
+
+        return _call
+
+    for name in (
+        "_open_position_safe",
+        "_establish_canonical_handoff_standing_stop",
+        "_cancel_pair_opposite",
+        "_seed_exit_engine",
+        "_verify_canonical_entry_owner",
+    ):
+        monkeypatch.setattr(fm, name, _unexpected(name))
+
+    class _OSM:
+        def increment_retry(self, *_args, **_kwargs):
+            return None
+
+    class _Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    fm.process_pending_order(
+        object(),
+        order,
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(_lock=_Lock()),
+        runtime_execution_mode=runtime_execution_mode,
+    )
+
+    assert db.row["position_id"] is None
+    assert events == []
+
+
+@pytest.mark.parametrize("fill_price", [float("nan"), float("inf"), float("-inf")])
+def test_durable_db_recovery_rejects_nonfinite_fill_price_without_side_effects(
+    monkeypatch, fill_price
+):
+    from ap import fill_monitor as fm
+
+    events = []
+    _patch_process_side_effects(monkeypatch, events)
+    order = _order(
+        status="FILLED",
+        position_id=None,
+        filled_qty=1,
+        fill_price=fill_price,
+        meta={"canonical_owner_handoff_entry_handoff_proven": False},
+    )
+    db = _Connection(dict(order))
+    _install_db(monkeypatch, db)
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {
+            "status": "UNKNOWN",
+            "filled_qty": 0,
+            "avg_fill": 0.0,
+            "reason": "broker_timeout",
+            "raw": {},
+        },
+    )
+
+    def _unexpected(*_args, **_kwargs):
+        pytest.fail("non-finite DB fill must not reach PM, exit engine, or broker mutation")
+
+    monkeypatch.setattr(fm, "_open_position_safe", _unexpected)
+    monkeypatch.setattr(fm, "_establish_canonical_handoff_standing_stop", _unexpected)
+    monkeypatch.setattr(fm, "_cancel_pair_opposite", _unexpected)
+    monkeypatch.setattr(fm, "_seed_exit_engine", _unexpected)
+    monkeypatch.setattr(fm, "_verify_canonical_entry_owner", _unexpected)
+
+    class _OSM:
+        def increment_retry(self, *_args, **_kwargs):
+            return None
+
+    class _Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    fm.process_pending_order(
+        object(),
+        order,
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(_lock=_Lock()),
+        runtime_execution_mode="live",
+    )
+
+    assert db.row["position_id"] is None
+    assert events == []
+
+
+@pytest.mark.parametrize("entry_price", [float("nan"), float("inf"), float("-inf")])
+def test_position_manager_rejects_nonfinite_entry_price(entry_price):
+    from ap.position_manager import APPositionManager
+
+    manager = APPositionManager("jason@example.com")
+    with pytest.raises(ValueError, match="entry_price"):
+        manager.open_position(
+            plan_id="plan-1",
+            signal_id="signal-1",
+            ticker="INTC",
+            contract="INTC260810P00098000",
+            side="PUT",
+            qty=1,
+            entry_price=entry_price,
+            execution_mode="live",
+        )
 
 
 def test_exit_engine_quarantine_is_exactly_fenced_by_client_mode_and_contract():
@@ -1593,6 +1776,8 @@ def test_exit_engine_malformed_quarantine_mode_performs_zero_mutations():
     ("foreign_client", "foreign_mode", "foreign_contract"),
     [
         ("jose@example.com", "live", "INTC260810P00098000"),
+        ("jose@example.com", "", "INTC260810P00098000"),
+        ("jose@example.com", "sandbox", "INTC260810P00098000"),
         ("jason@example.com", "paper", "INTC260810P00098000"),
         ("tradefluence", "paper", "INTC260810P00098000"),
         ("jason@example.com", "live", "INTC260810C00098000"),
