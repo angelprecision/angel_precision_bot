@@ -463,6 +463,57 @@ def test_existing_binding_revalidates_exact_proof_before_already_bound(pg_scope)
             c.execute("DELETE FROM proof_trades WHERE id=%s", (proof_id,))
 
 
+def test_existing_binding_rechecks_full_current_proof_set(pg_scope):
+    client_id = pg_scope
+    first_proof_id = _insert_proof(client_id, "entry-existing-ambiguous")
+    snapshot_id = _insert_snapshot(client_id, "live", local_order_id="entry-existing-ambiguous")
+
+    first = binding.bind_snapshot_to_proof(snapshot_id)
+    assert first["disposition"] == "BOUND"
+
+    second_proof_id = _insert_proof(client_id, "entry-existing-ambiguous")
+    result = binding.bind_snapshot_to_proof(snapshot_id)
+
+    assert result["disposition"] == "PROOF_AMBIGUOUS"
+    assert result["ok"] is False
+    assert result["bound"] is False
+    assert {int(row["proof_trade_id"]) for row in _binding_rows(client_id)} == {first_proof_id}
+    assert second_proof_id != first_proof_id
+
+
+def test_conflicting_insert_race_holds_without_overwrite(pg_scope):
+    client_id = pg_scope
+    attempted_proof_id = _insert_proof(client_id, "entry-conflicting-race")
+    existing_proof_id = _insert_proof(client_id, "entry-conflicting-race")
+    snapshot_id = _insert_snapshot(client_id, "live", local_order_id="entry-conflicting-race")
+    _insert_binding_row(
+        snapshot_id,
+        existing_proof_id,
+        client_id=client_id,
+        execution_mode="live",
+        originating_local_order_id="entry-conflicting-race",
+        phase="PREOPEN",
+        input_hash=f"input-{snapshot_id}",
+    )
+
+    with _postgres_conn() as c:
+        c.execute("SELECT * FROM ap_intelligence_snapshots WHERE id=%s", (snapshot_id,))
+        snapshot_identity = binding._snapshot_identity(dict(c.fetchone()))
+        c.execute("SELECT * FROM proof_trades WHERE id=%s", (attempted_proof_id,))
+        attempted_proof = dict(c.fetchone())
+        result = binding._insert_binding(
+            c,
+            snapshot_identity=snapshot_identity,
+            proof_row=attempted_proof,
+            binding_method=binding.DIRECT_BINDING_METHOD,
+        )
+
+    assert result["disposition"] == "BINDING_CONFLICT"
+    assert result["ok"] is False
+    assert result["bound"] is False
+    assert {int(row["proof_trade_id"]) for row in _binding_rows(client_id)} == {existing_proof_id}
+
+
 def test_existing_child_binding_cannot_authorize_parent_lineage(pg_scope):
     client_id = pg_scope
     other_client = f"other-{uuid4().hex[:10]}@example.com"
@@ -505,6 +556,39 @@ def test_existing_child_binding_cannot_authorize_parent_lineage(pg_scope):
     finally:
         with _postgres_conn() as c:
             c.execute("DELETE FROM proof_trades WHERE id=%s", (proof_id,))
+
+
+def test_existing_child_binding_rechecks_full_proof_set_for_parent_lineage(pg_scope):
+    client_id = pg_scope
+    first_proof_id = _insert_proof(client_id, "entry-lineage-ambiguous")
+    parent_id = _insert_snapshot(client_id, "live", phase="PRETRIGGER", local_order_id="")
+    child_id = _insert_snapshot(
+        client_id,
+        "live",
+        phase="PREOPEN",
+        local_order_id="entry-lineage-ambiguous",
+        parent_snapshot_id=parent_id,
+    )
+    _insert_binding_row(
+        child_id,
+        first_proof_id,
+        client_id=client_id,
+        execution_mode="live",
+        originating_local_order_id="entry-lineage-ambiguous",
+        phase="PREOPEN",
+        input_hash=f"input-{child_id}",
+    )
+    _insert_proof(client_id, "entry-lineage-ambiguous")
+
+    result = binding.bind_snapshot_to_proof(parent_id)
+
+    assert result["disposition"] == "PARENT_LINEAGE_UNPROVEN"
+    with _postgres_conn() as c:
+        c.execute(
+            "SELECT 1 FROM ap_intelligence_outcome_bindings WHERE snapshot_id=%s",
+            (parent_id,),
+        )
+        assert c.fetchone() is None
 
 
 def test_missing_or_conflicting_proof_mode_holds(pg_scope):

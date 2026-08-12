@@ -408,6 +408,30 @@ def _binding_identity_matches_snapshot(
     return True
 
 
+def _binding_matches_attempt(
+    binding: Mapping[str, Any],
+    *,
+    snapshot_identity: Mapping[str, Any],
+    proof_row: Mapping[str, Any],
+    binding_method: str,
+) -> bool:
+    """Compare every immutable field in a conflicting insert attempt."""
+    return (
+        _text(binding.get("snapshot_id")) == _text(snapshot_identity.get("snapshot_id"))
+        and _proof_trade_id(binding.get("proof_trade_id")) == _proof_trade_id(proof_row.get("id"))
+        and normalize_client_id(binding.get("client_id")) == snapshot_identity.get("client_id")
+        and normalize_execution_mode(binding.get("execution_mode")) == snapshot_identity.get("execution_mode")
+        and _text(binding.get("originating_local_order_id")) == _text(proof_row.get("local_order_id"))
+        and _text(binding.get("canonical_signal_id")) == _text(snapshot_identity.get("canonical_signal_id"))
+        and _text(binding.get("phase")).upper() == _text(snapshot_identity.get("phase")).upper()
+        and _text(binding.get("profile_version")) == _text(snapshot_identity.get("profile_version"))
+        and _text(binding.get("input_hash")) == _text(snapshot_identity.get("input_hash"))
+        and _text(binding.get("config_hash")) == _text(snapshot_identity.get("config_hash"))
+        and _text(binding.get("binding_method")) == _text(binding_method)
+        and _text(binding.get("binding_version")) == BINDING_VERSION
+    )
+
+
 def _validate_existing_binding(
     c: Any,
     *,
@@ -465,6 +489,31 @@ def _validate_existing_binding(
             disposition="SNAPSHOT_IDENTITY_UNPROVEN",
             ok=False,
             reason="existing_binding_local_order_id_does_not_match_proof",
+        )
+
+    if snapshot_identity.get("local_order_id"):
+        current_proof_set = _fetch_proofs_for_local_order(
+            c,
+            snapshot_identity["local_order_id"],
+        )
+        direct = _resolve_direct_proof(snapshot_identity, current_proof_set)
+        if direct.get("disposition") != "BOUND":
+            return {**direct, "ok": False, "bound": False}
+        current_proof_id = _proof_trade_id(direct.get("proof_trade_id"))
+        if current_proof_id != proof_trade_id:
+            return _result(
+                snapshot_id=snapshot_id,
+                disposition="BINDING_CONFLICT",
+                ok=False,
+                reason="existing_binding_proof_does_not_match_current_direct_resolution",
+                existing_proof_trade_id=proof_trade_id,
+                current_proof_trade_id=current_proof_id,
+            )
+        return _result(
+            snapshot_id=snapshot_id,
+            disposition="BOUND",
+            proof_trade_id=proof_trade_id,
+            proof_row=direct.get("proof_row") or proof_row,
         )
 
     classification = _classify_proof_row(
@@ -557,6 +606,20 @@ def _insert_binding(
 
     existing = _fetch_existing_binding(c, snapshot_id)
     if existing:
+        if not _binding_matches_attempt(
+            existing,
+            snapshot_identity=snapshot_identity,
+            proof_row=proof_row,
+            binding_method=binding_method,
+        ):
+            return _result(
+                snapshot_id=snapshot_id,
+                disposition="BINDING_CONFLICT",
+                ok=False,
+                reason="existing_binding_does_not_match_attempted_immutable_tuple",
+                existing_proof_trade_id=existing.get("proof_trade_id"),
+                attempted_proof_trade_id=proof_id,
+            )
         validated = _validate_existing_binding(
             c,
             binding=existing,
