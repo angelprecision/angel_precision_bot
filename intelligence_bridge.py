@@ -214,9 +214,36 @@ def _parse_timestamp(value: Any) -> Optional[_dt.datetime]:
             raw = raw[:-1] + "+00:00"
         parsed = _dt.datetime.fromisoformat(raw)
         if parsed.tzinfo is None:
-            return None
+            parsed = parsed.replace(tzinfo=_dt.timezone.utc)
         return parsed.astimezone(_dt.timezone.utc)
     except ValueError:
+        return None
+
+
+def _parse_authoritative_quote_timestamp(value: Any) -> Optional[_dt.datetime]:
+    """Parse selected-quote time only when its timezone is explicit."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                return None
+            return _dt.datetime.fromtimestamp(numeric, tz=_dt.timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        parsed = _dt.datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(_dt.timezone.utc)
+    except (TypeError, ValueError):
         return None
 
 
@@ -538,20 +565,29 @@ def _extract_selected_contract_evidence(
         for values in source_claims
         for source in values
     })
-    if (
+    provenance_conflict = (
+        any(len(values) > 1 for values in source_claims)
+        or len(claimed_quote_sources) > 1
+    )
+    provenance_untrusted = (
         not source_claims
         or any(
-            len(values) != 1
+            not values
             or not values.issubset(TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES)
             for values in source_claims
         )
         or len(claimed_quote_sources) != 1
-    ):
+    )
+    if provenance_conflict or provenance_untrusted:
         return {
             "exists": False,
             "authoritative": False,
             "classification": UNAVAILABLE,
-            "reason": "selected_contract_quote_source_untrusted",
+            "reason": (
+                "selected_contract_quote_source_conflict"
+                if provenance_conflict
+                else "selected_contract_quote_source_untrusted"
+            ),
             "claimed_contracts": claimed_contracts,
             "claimed_quote_sources": claimed_quote_sources,
         }
@@ -621,7 +657,7 @@ def _extract_selected_contract_evidence(
             timestamp_payload,
             "quote_ts", "quote_timestamp", "quote_observed_at", "observed_at",
         )
-        quote_ts = _parse_timestamp(quote_ts_raw)
+        quote_ts = _parse_authoritative_quote_timestamp(quote_ts_raw)
         if quote_ts is None:
             last_reason = "selected_contract_quote_timestamp_missing_or_invalid"
             continue

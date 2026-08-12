@@ -228,7 +228,7 @@ def test_conflicting_explicit_source_alias_cannot_create_authority(source_field)
     assert evidence["exists"] is False
     assert evidence["authoritative"] is False
     assert evidence["classification"] == ib.UNAVAILABLE
-    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
+    assert evidence["reason"] == "selected_contract_quote_source_conflict"
 
 
 def test_duplicate_identity_with_conflicting_source_provenance_is_quarantined():
@@ -249,7 +249,24 @@ def test_duplicate_identity_with_conflicting_source_provenance_is_quarantined():
     assert evidence["exists"] is False
     assert evidence["authoritative"] is False
     assert evidence["classification"] == ib.UNAVAILABLE
-    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
+    assert evidence["reason"] == "selected_contract_quote_source_conflict"
+
+
+def test_outer_and_nested_source_provenance_conflict_is_quarantined():
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
+    signal["quote_source"] = ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+    signal["selected_contract"]["quote_source"] = "untrusted-provider"
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_source_conflict"
 
 
 def test_malformed_duplicate_identity_alias_cannot_be_ignored():
@@ -430,9 +447,14 @@ def test_stale_selected_contract_is_quarantined():
     assert evidence["reason"] == "selected_contract_quote_stale"
 
 
-@pytest.mark.parametrize("bad_limit", [float("nan"), float("inf"), 0.0, -1.0, None])
-def test_invalid_selected_quote_age_limit_cannot_create_authority(monkeypatch, bad_limit):
-    monkeypatch.setattr(ib, "_MAX_SELECTED_QUOTE_AGE_SECONDS", bad_limit)
+@pytest.mark.parametrize("raw_limit", ["nan", "inf", "-inf", "0", "-1", "garbage"])
+def test_invalid_selected_quote_age_limit_cannot_create_authority(monkeypatch, raw_limit):
+    monkeypatch.setenv("GATE_G_MAX_SELECTED_QUOTE_AGE_SECONDS", raw_limit)
+    configured_limit = ib._positive_finite_env_float(
+        "GATE_G_MAX_SELECTED_QUOTE_AGE_SECONDS", 120.0
+    )
+    assert configured_limit is None
+    monkeypatch.setattr(ib, "_MAX_SELECTED_QUOTE_AGE_SECONDS", configured_limit)
     old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
     evidence = ib._extract_selected_contract_evidence(
         _selected_signal(
@@ -446,6 +468,25 @@ def test_invalid_selected_quote_age_limit_cannot_create_authority(monkeypatch, b
     assert evidence["authoritative"] is False
     assert evidence["classification"] == ib.UNAVAILABLE
     assert evidence["reason"] == "selected_contract_quote_freshness_config_invalid"
+
+
+def test_invalid_selected_quote_age_cannot_activate_contract_quality_authority(monkeypatch):
+    monkeypatch.setattr(ib, "_MAX_SELECTED_QUOTE_AGE_SECONDS", None)
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
+    gate, pipeline = _run_with_fake_pipeline(
+        monkeypatch,
+        _selected_signal(
+            quote_ts=old,
+            quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+        ),
+    )
+
+    assert pipeline.calls[0][0] == "run_quick"
+    evidence = gate["gate_diagnostics"]["selected_contract_evidence"]
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert gate["risk_detail"]["reason_code"] != "CONTRACT_QUALITY_FAILED"
+    assert gate["intel_status"] != "RISK_VETO"
 
 
 def test_timezone_naive_selected_quote_timestamp_cannot_create_authority():
@@ -462,6 +503,15 @@ def test_timezone_naive_selected_quote_timestamp_cannot_create_authority():
     assert evidence["authoritative"] is False
     assert evidence["classification"] == ib.UNAVAILABLE
     assert evidence["reason"] == "selected_contract_quote_timestamp_missing_or_invalid"
+
+
+def test_authoritative_quote_timestamp_accepts_aware_and_numeric_values():
+    aware = dt.datetime.now(dt.timezone.utc)
+    assert ib._parse_authoritative_quote_timestamp(aware.isoformat()) is not None
+    assert ib._parse_authoritative_quote_timestamp(aware.timestamp()) is not None
+    assert ib._parse_authoritative_quote_timestamp(
+        aware.replace(tzinfo=None).isoformat()
+    ) is None
 
 
 def test_selected_contract_client_mismatch_has_no_authority():
