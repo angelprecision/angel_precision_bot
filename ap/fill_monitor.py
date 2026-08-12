@@ -1178,6 +1178,7 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             our = "ACKNOWLEDGED" if status in ACTIVE_BROKER_STATUSES else status_map.get(status, "UNKNOWN")
 
         explicit_filled_qty = None
+        explicit_filled_qty_key = None
         for _qty_key in (
             "exec_quantity",
             "filled_quantity",
@@ -1186,9 +1187,19 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         ):
             if _qty_key in raw:
                 explicit_filled_qty = raw.get(_qty_key)
+                explicit_filled_qty_key = _qty_key
                 break
-        if explicit_filled_qty is not None:
-            filled_qty = _strict_positive_whole_number(explicit_filled_qty) or 0
+        if explicit_filled_qty_key is not None:
+            validated_filled_qty = _validated_broker_quantity(explicit_filled_qty)
+            if validated_filled_qty is None:
+                return _broker_quantity_error_result(
+                    order,
+                    broker_order_id,
+                    raw,
+                    quantity_field=explicit_filled_qty_key,
+                    quantity_value=explicit_filled_qty,
+                )
+            filled_qty = _strict_positive_whole_number(validated_filled_qty) or 0
         elif our in ("FILLED", "EXIT_FILLED"):
             # Requested order quantity is not execution truth. A terminal
             # broker status without an explicit executed quantity remains a

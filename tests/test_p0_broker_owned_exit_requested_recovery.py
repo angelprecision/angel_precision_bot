@@ -1095,6 +1095,7 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                     submitted_ts TIMESTAMPTZ,
                     filled_ts TIMESTAMPTZ,
                     filled_qty INTEGER NOT NULL DEFAULT 0,
+                    retries INTEGER NOT NULL DEFAULT 0,
                     fill_price NUMERIC,
                     execution_mode TEXT NOT NULL,
                     qty INTEGER NOT NULL,
