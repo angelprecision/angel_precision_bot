@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from ap.utils import parse_aware_utc_timestamp
+from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE, parse_aware_utc_timestamp
 
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
@@ -451,6 +451,7 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                     broker_exit_order_id=pending_broker_id,
                     broker_exit_filled_qty=filled_qty,
                     broker_exit_fill_ts=fill_ts,
+                    broker_exit_fill_timestamp_source=BROKER_FILL_TIMESTAMP_SOURCE,
                     reconciled=True,
                 )
                 if mark_result is False:

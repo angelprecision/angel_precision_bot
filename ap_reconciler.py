@@ -86,6 +86,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    has_broker_fill_timestamp_provenance,
+)
+
 log = logging.getLogger("ap.reconciler")
 
 # ── Optional observability hooks ─────────────────────────────────────────────
@@ -743,10 +748,11 @@ class APBrokerReconciler:
             return _strict_positive_finite_float(val)
         return None
 
-    def _extract_broker_fill_timestamp(
+    def _extract_broker_fill_timestamp_with_source(
         self, broker_raw: dict, order: dict | None = None
-    ) -> Optional[datetime]:
-        """Read explicit broker fill time without substituting recovery time."""
+    ) -> tuple[Optional[datetime], Optional[str]]:
+        """Read explicit broker fill time and its producer token only."""
+        del order  # Durable ``orders.filled_ts`` is not broker provenance.
         for key in (
             "filled_ts",
             "filled_at",
@@ -755,10 +761,18 @@ class APBrokerReconciler:
             "transaction_date",
         ):
             if key in broker_raw:
-                return _parse_reconciler_timestamp(broker_raw.get(key))
-        if order and order.get("filled_ts") not in (None, ""):
-            return _parse_reconciler_timestamp(order.get("filled_ts"))
-        return None
+                parsed = _parse_reconciler_timestamp(broker_raw.get(key))
+                return (
+                    parsed,
+                    BROKER_FILL_TIMESTAMP_SOURCE if parsed is not None else None,
+                )
+        return None, None
+
+    def _extract_broker_fill_timestamp(
+        self, broker_raw: dict, order: dict | None = None
+    ) -> Optional[datetime]:
+        """Read explicit broker fill time without substituting durable time."""
+        return self._extract_broker_fill_timestamp_with_source(broker_raw, order)[0]
 
     def _db_order_filled_qty(self, order: dict) -> int:
         for key in ("filled_qty", "filled_quantity", "exec_quantity", "quantity_filled"):
@@ -821,6 +835,7 @@ class APBrokerReconciler:
         fill_price: float,
         broker_order_id: str | None = None,
         filled_ts=None,
+        filled_ts_source: str | None = None,
     ) -> bool:
         """Compatibility bridge for OSM v3 apply_fill_update()."""
         status_u = str(status or "").upper()
@@ -846,6 +861,7 @@ class APBrokerReconciler:
                     fill_price=validated_price,
                     broker_order_id=broker_order_id,
                     filled_ts=filled_ts,
+                    filled_ts_source=filled_ts_source,
                 ))
             except TypeError as te:
                 log.warning(
@@ -858,6 +874,7 @@ class APBrokerReconciler:
             filled_qty=validated_qty,
             fill_price=validated_price,
             filled_ts=filled_ts,
+            filled_ts_source=filled_ts_source,
         ))
 
     def _handle_stale_acknowledged_exits(self, summary: dict) -> None:
@@ -935,12 +952,17 @@ class APBrokerReconciler:
 
                 fill_qty = self._extract_explicit_cumulative_fill_qty(broker_raw)
                 fill_px  = self._extract_avg_fill_price(broker_raw)
-                fill_ts  = self._extract_broker_fill_timestamp(broker_raw, row)
+                fill_ts, fill_ts_source = self._extract_broker_fill_timestamp_with_source(
+                    broker_raw, row
+                )
 
                 if broker_status in BROKER_FILLED and fill_qty and fill_px:
                     family     = self._order_family_from_kind_and_status(row, db_status)
                     new_status = "EXIT_FILLED" if family == "EXIT" else "FILLED"
-                    if family == "EXIT" and fill_ts is None:
+                    if family == "EXIT" and (
+                        fill_ts is None
+                        or fill_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+                    ):
                         self._alert(
                             f"BROKER_EXIT_FILL_TIMESTAMP_UNPROVEN | {contract} | {local_id} | "
                             "stale ACK recovery lacks an explicit aware fill timestamp; holding"
@@ -954,6 +976,9 @@ class APBrokerReconciler:
                             filled_qty=int(fill_qty),
                             fill_price=float(fill_px),
                             filled_ts=fill_ts.isoformat() if fill_ts else None,
+                            filled_ts_source=(
+                                fill_ts_source if family == "EXIT" else None
+                            ),
                             last_error="stale_ack_exit_broker_filled",
                         )
                         summary["orders_corrected"] = int(summary.get("orders_corrected", 0)) + 1
@@ -1127,6 +1152,7 @@ class APBrokerReconciler:
                             o.fill_price,
                             o.filled_qty,
                             o.filled_ts,
+                            o.meta,
                             o.broker_order_id
                         FROM orders o
                         JOIN positions p ON p.id = o.position_id AND p.client_id = o.client_id
@@ -1138,6 +1164,7 @@ class APBrokerReconciler:
                           AND o.filled_ts IS NOT NULL
                           AND COALESCE(p.entry_ts, p.opened_at) IS NOT NULL
                           AND o.filled_ts >= COALESCE(p.entry_ts, p.opened_at)
+                          AND COALESCE(o.meta->>'exit_fill_timestamp_source', '') = %s
                           AND LOWER(TRIM(COALESCE(o.execution_mode, ''))) =
                               LOWER(TRIM(COALESCE(p.execution_mode, '')))
                           AND UPPER(TRIM(COALESCE(o.contract, ''))) =
@@ -1157,7 +1184,7 @@ class APBrokerReconciler:
                         ORDER BY o.filled_ts DESC
                         LIMIT 50
                         """,
-                        (self.client_id,),
+                        (self.client_id, BROKER_FILL_TIMESTAMP_SOURCE),
                     )
                     return c.fetchall()
 
@@ -1169,6 +1196,15 @@ class APBrokerReconciler:
             healed = 0
             for row in rows:
                 row = dict(row) if not isinstance(row, dict) else row
+                if not has_broker_fill_timestamp_provenance(row.get("meta")):
+                    log.critical(
+                        "[%s] EXIT_FILLED healer blocked without broker timestamp provenance "
+                        "local=%s broker=%s",
+                        self.client_id,
+                        row.get("local_order_id"),
+                        row.get("broker_order_id"),
+                    )
+                    continue
                 ok = pm.close_position_from_exit_fill(
                     position_id=str(row["position_id"]),
                     # Keep DB scalars raw; the shared finalizer owns strict
@@ -1994,7 +2030,9 @@ class APBrokerReconciler:
 
         filled_qty = self._extract_explicit_cumulative_fill_qty(broker_raw)
         avg_fill   = self._extract_avg_fill_price(broker_raw)
-        filled_ts  = self._extract_broker_fill_timestamp(broker_raw, order)
+        filled_ts, filled_ts_source = self._extract_broker_fill_timestamp_with_source(
+            broker_raw, order
+        )
         if filled_qty is None:
             self._alert(
                 f"BROKER_FILL_QTY_NOT_NORMALIZED | {contract} | {local_id} | "
@@ -2011,7 +2049,10 @@ class APBrokerReconciler:
             )
             summary["orders_alerted"] += 1
             return
-        if family == "EXIT" and filled_ts is None:
+        if family == "EXIT" and (
+            filled_ts is None
+            or filled_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+        ):
             self._alert(
                 f"BROKER_EXIT_FILL_TIMESTAMP_UNPROVEN | {contract} | {local_id} | "
                 "broker returned EXIT fill status without an explicit aware fill timestamp; "
@@ -2036,6 +2077,9 @@ class APBrokerReconciler:
                     db_filled_before,
                     avg_fill,
                     filled_ts=filled_ts,
+                    filled_ts_source=(
+                        filled_ts_source if family == "EXIT" else None
+                    ),
                 )
                 log.warning(
                     "[%s] RECONCILE_INTERMEDIATE_FILL_UPDATE | %s | %s | qty=%s before terminal qty=%s",
@@ -2057,6 +2101,9 @@ class APBrokerReconciler:
                 filled_qty=filled_qty,
                 fill_price=avg_fill,
                 filled_ts=filled_ts,
+                filled_ts_source=(
+                    filled_ts_source if family == "EXIT" else None
+                ),
                 broker_order_id=str(
                     broker_raw.get("id")
                     or broker_raw.get("order_id")
@@ -3166,6 +3213,7 @@ class APBrokerReconciler:
                                o.fill_price,
                                o.filled_qty,
                                o.filled_ts,
+                               o.meta,
                                o.updated_ts,
                                COALESCE(p.entry_ts, p.opened_at) AS position_entry_ts
                         FROM   orders o
@@ -3179,10 +3227,18 @@ class APBrokerReconciler:
                           AND  UPPER(TRIM(COALESCE(o.contract, ''))) = %s
                           AND  o.position_id::text = %s
                           AND  {' AND '.join(identity_predicates)}
+                          AND  COALESCE(o.meta->>'exit_fill_timestamp_source', '') = %s
                         ORDER  BY COALESCE(o.filled_ts, o.updated_ts) DESC
                         LIMIT  2
                         """,
-                        (self.client_id, mode, contract, position_id, *identity_params),
+                        (
+                            self.client_id,
+                            mode,
+                            contract,
+                            position_id,
+                            *identity_params,
+                            BROKER_FILL_TIMESTAMP_SOURCE,
+                        ),
                     )
                     rows = c.fetchall() or []
 
@@ -3218,6 +3274,7 @@ class APBrokerReconciler:
                         or _normalize_execution_mode(row.get("execution_mode")) != mode
                         or (local_order_id and row_local_order_id != local_order_id)
                         or (broker_order_id and row_broker_order_id != broker_order_id)
+                        or not has_broker_fill_timestamp_provenance(row.get("meta"))
                         or filled_ts is None
                         or position_entry_ts is None
                         or filled_ts < position_entry_ts
@@ -3228,6 +3285,7 @@ class APBrokerReconciler:
                     filled_qty = _strict_positive_whole_number(row.get("filled_qty"))
                     if fill_price is None or filled_qty is None:
                         return None
+                    row["filled_ts_source"] = BROKER_FILL_TIMESTAMP_SOURCE
                     return row
 
             return run_with_retry(_fetch)
@@ -3492,6 +3550,8 @@ class APBrokerReconciler:
                 "broker_order_id": str(exit_fill.get("broker_order_id") or "").strip(),
                 "exit_local_order_id": str(exit_fill.get("local_order_id") or "").strip(),
                 "filled_ts": exit_fill.get("filled_ts"),
+                "filled_ts_source": BROKER_FILL_TIMESTAMP_SOURCE,
+                "meta": exit_fill.get("meta"),
                 "filled_qty": filled_qty,
                 "fill_price": exit_px,
                 "position_id": str(exit_fill.get("position_id") or "").strip(),
@@ -3566,6 +3626,9 @@ class APBrokerReconciler:
             exit_local_order_id=exact_exit_evidence["exit_local_order_id"],
             broker_exit_fill_ts=exact_exit_evidence["filled_ts"],
             broker_exit_filled_qty=exact_exit_evidence["filled_qty"],
+            broker_exit_fill_timestamp_source=exact_exit_evidence[
+                "filled_ts_source"
+            ],
             client_id=self.client_id,
         )
 
@@ -3618,6 +3681,16 @@ class APBrokerReconciler:
         evidence_contract = self._norm_contract(evidence.get("contract"))
         evidence_mode = _normalize_execution_mode(evidence.get("execution_mode"))
         evidence_status = str(evidence.get("status") or "").upper().strip()
+        evidence_fill_timestamp_source = str(
+            evidence.get("filled_ts_source")
+            or evidence.get("exit_fill_timestamp_source")
+            or (
+                BROKER_FILL_TIMESTAMP_SOURCE
+                if has_broker_fill_timestamp_provenance(evidence.get("meta"))
+                else ""
+            )
+            or ""
+        ).strip()
         evidence_filled_ts = _parse_reconciler_timestamp(evidence.get("filled_ts"))
         evidence_filled_qty_value = _strict_positive_whole_number(
             evidence.get("filled_qty")
@@ -3648,6 +3721,7 @@ class APBrokerReconciler:
             and expected_mode is not None
             and evidence_mode == expected_mode
             and evidence_status in {"FILLED", "EXIT_FILLED"}
+            and evidence_fill_timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
             and evidence_filled_ts is not None
             and position_entry_ts is not None
             and evidence_filled_ts >= position_entry_ts
@@ -3750,7 +3824,8 @@ class APBrokerReconciler:
                                status,
                                fill_price,
                                filled_qty,
-                               filled_ts
+                               filled_ts,
+                               meta
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'EXIT'
@@ -3803,6 +3878,9 @@ class APBrokerReconciler:
                         != evidence_mode
                         or str(durable_evidence_row.get("status") or "").upper().strip()
                         not in {"FILLED", "EXIT_FILLED"}
+                        or not has_broker_fill_timestamp_provenance(
+                            durable_evidence_row.get("meta")
+                        )
                         or durable_filled_ts != evidence_filled_ts
                         or durable_filled_qty is None
                         or durable_filled_qty != exact_exit_fill_qty
@@ -3968,6 +4046,9 @@ class APBrokerReconciler:
                         broker_exit_order_id=evidence_broker_order_id,
                         broker_exit_fill_ts=evidence_filled_ts,
                         broker_exit_filled_qty=exact_exit_fill_qty,
+                        broker_exit_fill_timestamp_source=(
+                            BROKER_FILL_TIMESTAMP_SOURCE
+                        ),
                         proof_contracts_override=close_qty,
                         reconciled=True,
                     ) is True
@@ -4133,6 +4214,16 @@ class APBrokerReconciler:
             evidence.get("broker_order_id") or evidence.get("broker_exit_order_id") or ""
         ).strip()
         evidence_status = str(evidence.get("status") or "").upper().strip()
+        evidence_fill_timestamp_source = str(
+            evidence.get("filled_ts_source")
+            or evidence.get("exit_fill_timestamp_source")
+            or (
+                BROKER_FILL_TIMESTAMP_SOURCE
+                if has_broker_fill_timestamp_provenance(evidence.get("meta"))
+                else ""
+            )
+            or ""
+        ).strip()
         evidence_filled_ts = _parse_reconciler_timestamp(
             evidence.get("filled_ts") or evidence.get("broker_exit_fill_ts")
         )
@@ -4162,6 +4253,7 @@ class APBrokerReconciler:
             or evidence_local != pending_local
             or evidence_broker != pending_broker
             or evidence_status not in {"FILLED", "EXIT_FILLED"}
+            or evidence_fill_timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
             or evidence_filled_ts is None
             or entry_ts is None
             or evidence_filled_ts < entry_ts

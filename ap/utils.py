@@ -4,6 +4,9 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 
+BROKER_FILL_TIMESTAMP_SOURCE = "broker_response"
+BROKER_FILL_TIMESTAMP_SOURCE_KEY = "exit_fill_timestamp_source"
+
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -37,6 +40,23 @@ def parse_aware_utc_timestamp(value):
         return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError, OverflowError, OSError):
         return None
+
+
+def broker_fill_timestamp_source(meta):
+    """Return the durable EXIT fill timestamp producer token, if present."""
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(meta, dict):
+        return None
+    source = meta.get(BROKER_FILL_TIMESTAMP_SOURCE_KEY)
+    return str(source).strip() if isinstance(source, str) else None
+
+
+def has_broker_fill_timestamp_provenance(meta) -> bool:
+    return broker_fill_timestamp_source(meta) == BROKER_FILL_TIMESTAMP_SOURCE
 
 def now_et():
     return datetime.now(ET)

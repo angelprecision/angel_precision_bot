@@ -99,6 +99,7 @@ def _exact_close_bundle(pos: dict, *, contract: str, filled_qty: int, fill_price
         "fill_price": fill_price,
         "filled_qty": filled_qty,
         "filled_ts": "2026-08-10T19:00:00+00:00",
+        "meta": {"exit_fill_timestamp_source": "broker_response"},
     }
 
 

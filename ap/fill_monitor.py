@@ -45,7 +45,13 @@ from typing import Optional
 
 from ap.trace import trace_gate
 from ap.db import conn, run_with_retry
-from ap.utils import now_utc_iso, json_dumps, json_loads, parse_aware_utc_timestamp
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    now_utc_iso,
+    json_dumps,
+    json_loads,
+    parse_aware_utc_timestamp,
+)
 from ap.logger import get_logger
 from ap.config import Config
 from ap.state import release_equity, release_symbol_lock
@@ -128,16 +134,21 @@ _BROKER_FILL_TIMESTAMP_KEYS = (
 )
 
 
-def _broker_fill_timestamp(raw: dict, order: dict) -> str | None:
-    """Return explicit aware broker fill time; never substitute local time."""
+def _broker_fill_timestamp_with_source(raw: dict) -> tuple[str | None, str | None]:
+    """Return only an explicit aware broker fill time and its producer token."""
     for key in _BROKER_FILL_TIMESTAMP_KEYS:
         if key in raw:
             parsed = parse_aware_utc_timestamp(raw.get(key))
-            return parsed.isoformat() if parsed is not None else None
-    if order.get("filled_ts") not in (None, ""):
-        parsed = parse_aware_utc_timestamp(order.get("filled_ts"))
-        return parsed.isoformat() if parsed is not None else None
-    return None
+            if parsed is None:
+                return None, None
+            return parsed.isoformat(), BROKER_FILL_TIMESTAMP_SOURCE
+    return None, None
+
+
+def _broker_fill_timestamp(raw: dict, order: dict) -> str | None:
+    """Return explicit aware broker fill time; never substitute durable time."""
+    del order  # Retained in the signature for existing callers.
+    return _broker_fill_timestamp_with_source(raw)[0]
 
 ALLOW_LEGACY_FILL_MONITOR = (
     os.getenv("ALLOW_LEGACY_FILL_MONITOR", "0").strip().lower()
@@ -1197,13 +1208,14 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 raw_fill_price = raw.get(_price_key)
                 break
         avg_fill = _strict_positive_finite_float(raw_fill_price) or 0.0
-        filled_ts = _broker_fill_timestamp(raw, order)
+        filled_ts, filled_ts_source = _broker_fill_timestamp_with_source(raw)
 
         result = {
             "status": our,
             "filled_qty": filled_qty,
             "avg_fill": avg_fill,
             "filled_ts": filled_ts,
+            "filled_ts_source": filled_ts_source,
             "reason": raw.get("reason") or status,
             "raw": raw,
         }
@@ -4283,6 +4295,9 @@ def process_pending_order(
                         filled_qty=new_filled,
                         fill_price=result.get("avg_fill"),
                         filled_ts=result.get("filled_ts"),
+                        filled_ts_source=(
+                            result.get("filled_ts_source") if kind == "EXIT" else None
+                        ),
                         broker_order_id=broker_id,
                     )
             except Exception as exc:
@@ -4634,6 +4649,9 @@ def process_pending_order(
                         cumulative_filled=new_filled,
                         fill_price=result.get("avg_fill"),
                         filled_ts=result.get("filled_ts"),
+                        filled_ts_source=(
+                            result.get("filled_ts_source") if kind == "EXIT" else None
+                        ),
                         broker_order_id=broker_id,
                     )
                 else:
@@ -4643,6 +4661,9 @@ def process_pending_order(
                         filled_qty=new_filled,
                         fill_price=result.get("avg_fill"),
                         filled_ts=result.get("filled_ts"),
+                        filled_ts_source=(
+                            result.get("filled_ts_source") if kind == "EXIT" else None
+                        ),
                         broker_order_id=broker_id,
                     )
                 partial_applied = True

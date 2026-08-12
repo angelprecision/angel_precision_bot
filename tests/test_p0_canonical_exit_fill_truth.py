@@ -30,6 +30,7 @@ from ap.exit_fill_truth_guard import (
     retry_exit_fill_reconciliation,
     retry_pending_exit_fill_reconciliations,
 )
+from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE_KEY
 
 
 def _position(*, qty: int, entry: float) -> dict:
@@ -311,7 +312,7 @@ def _exit_order(**overrides) -> dict:
         "filled_qty": 1,
         "fill_price": 1.35,
         "filled_ts": "2026-07-16T18:40:51Z",
-        "meta": {},
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
     }
     row.update(overrides)
     return row
@@ -458,6 +459,7 @@ def test_zero_row_position_update_stops_before_order_or_proof_mutation(monkeypat
     monkeypatch.setattr(guard, "_load_exit_fills", lambda *_: [{
         "local_order_id": "exit-local-1", "broker_order_id": "broker-exit-1",
         "filled_qty": 1, "fill_price": 1.35, "filled_ts": "2026-07-16T18:40:51Z",
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
     }])
     monkeypatch.setattr(guard, "_load_entry_order", lambda *_: {})
     monkeypatch.setattr(guard, "_table_columns", lambda *_: {
@@ -508,6 +510,7 @@ def test_partial_fill_projects_exact_durable_exit_ownership(monkeypatch) -> None
         "filled_qty": 2,
         "fill_price": 1.50,
         "filled_ts": "2026-07-17T16:00:00Z",
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
     }])
     monkeypatch.setattr(guard, "_load_entry_order", lambda *_: {})
     monkeypatch.setattr(guard, "_table_columns", lambda *_: {

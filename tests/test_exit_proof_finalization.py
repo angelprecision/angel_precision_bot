@@ -320,7 +320,7 @@ def finalize_proof_callable():
     #     method's `if _record_intel_outcome:` guard handles None.)
     src = (
         "import os\nimport math\nimport logging\n"
-        "from ap.utils import parse_aware_utc_timestamp\n"
+        "from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE, parse_aware_utc_timestamp\n"
         "log = logging.getLogger('test_finalize')\n"
     )
     src += f'BREAKEVEN_BAND_PCT = float(os.getenv("BREAKEVEN_BAND_PCT", "{_be_default}"))\n'

@@ -124,6 +124,9 @@ class _FakeCursor:
                 if f"{column}=%s" in set_clause:
                     updates[column] = params[index]
                     index += 1
+            if "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb" in set_clause:
+                updates["meta"] = json.loads(params[index])
+                index += 1
             local_id = str(params[index])
             client_id = str(params[index + 1])
             expected_status = params[index + 2]

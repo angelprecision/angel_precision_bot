@@ -20,6 +20,7 @@ import ap.db as db_mod
 from ap import manual_close_reconciliation as manual_close
 import ap.position_manager as position_manager_mod
 from ap_reconciler import APBrokerReconciler, _empty_summary
+from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE_KEY
 
 
 CLIENT = "jason@example.com"
@@ -122,6 +123,7 @@ def _exit_row(
     local_order_id: str = "exit-local-1",
     filled_ts: str | None = "2026-08-10T19:00:00+00:00",
     position_entry_ts: str | None = "2026-08-10T18:00:00+00:00",
+    meta: dict | None = None,
 ) -> dict:
     return {
         "client_id": CLIENT,
@@ -135,6 +137,11 @@ def _exit_row(
         "fill_price": fill_price,
         "filled_qty": filled_qty,
         "filled_ts": filled_ts,
+        "meta": (
+            {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"}
+            if meta is None
+            else meta
+        ),
         "updated_ts": "2026-08-10T19:00:01+00:00",
         "position_entry_ts": position_entry_ts,
     }
@@ -247,6 +254,7 @@ def _healer_row(*, local_order_id: str, broker_order_id: str) -> dict:
         "fill_price": 4.79,
         "filled_qty": 2,
         "filled_ts": "2026-08-10T19:00:00+00:00",
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
         "broker_order_id": broker_order_id,
     }
 
@@ -722,6 +730,39 @@ def test_osm_exit_fill_requires_aware_timestamp_before_db_write(
     )
 
 
+def test_osm_exit_fill_requires_broker_timestamp_provenance_before_db_write(monkeypatch):
+    from ap.order_state_machine import APOrderStateMachine
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT
+    osm._get_order = lambda _local_id: {
+        "local_order_id": "exit-local-1",
+        "client_id": CLIENT,
+        "kind": "EXIT",
+        "status": "EXIT_SUBMITTED",
+        "filled_qty": 0,
+    }
+    osm._record_error = MagicMock()
+    osm._emit_transition_event = MagicMock()
+    monkeypatch.setattr(
+        "ap.order_state_machine.run_with_retry",
+        lambda _fn: pytest.fail("unproven EXIT timestamp reached DB mutation"),
+    )
+
+    assert osm.transition(
+        "exit-local-1",
+        "EXIT_FILLED",
+        broker_order_id="TR-195",
+        filled_qty=2,
+        fill_price=4.79,
+        filled_ts="2026-08-10T19:00:00+00:00",
+        filled_ts_source=None,
+    ) is False
+    assert osm._emit_transition_event.call_args.kwargs["reason_code"] == (
+        "EXIT_FILL_TIMESTAMP_UNPROVEN"
+    )
+
+
 def test_osm_exit_filled_overcoverage_quarantines_without_close(monkeypatch):
     from ap.order_state_machine import APOrderStateMachine
     import ap.order_state_machine as osm_module
@@ -763,6 +804,7 @@ def test_osm_exit_filled_overcoverage_quarantines_without_close(monkeypatch):
         filled_qty=3,
         fill_price=4.79,
         filled_ts="2026-08-10T19:00:00+00:00",
+        filled_ts_source="broker_response",
         broker_order_id="TR-195",
         local_order_id="exit-local-1",
     )
@@ -1079,7 +1121,7 @@ def test_exact_target_stc_fill_is_accepted_with_full_identity(monkeypatch):
     assert result is not None
     assert result["broker_order_id"] == "TR-195"
     assert result["fill_price"] == 1.95
-    assert cursor.params[0] == (
+    assert cursor.params[0][:6] == (
         CLIENT,
         MODE_LIVE,
         TARGET_CONTRACT,
@@ -1087,6 +1129,7 @@ def test_exact_target_stc_fill_is_accepted_with_full_identity(monkeypatch):
         "exit-local-1",
         "TR-195",
     )
+    assert cursor.params[0][-1] == "broker_response"
     assert "LIMIT 2" in cursor.sql[0]
     assert "EXIT_PARTIAL_FILL" not in cursor.sql[0]
 
@@ -1346,7 +1389,7 @@ def test_historical_same_position_exit_cannot_authorize_current_remaining_close(
         summary=summary,
     )
 
-    assert cursor.params[0][-2:] == ("exit-current", "222")
+    assert cursor.params[0][-3:-1] == ("exit-current", "222")
     assert pos == before
     rec._execute_reconciler_close.assert_not_called()
     rec._record_reconciler_rejection.assert_not_called()
@@ -1519,6 +1562,41 @@ def test_invalid_or_pre_entry_exit_timestamp_cannot_authorize_close(
             _exit_row(
                 filled_ts=filled_ts,
                 position_entry_ts=position_entry_ts,
+            )
+        ],
+    )
+    rec = _reconciler()
+    rec._alert = MagicMock()
+    rec._active_exit_order_exists = MagicMock(return_value=None)
+    rec._broker_open_exit_exists_for_contract = MagicMock(return_value=False)
+    rec._execute_reconciler_close = MagicMock()
+    rec._record_reconciler_rejection = MagicMock()
+    summary = _empty_summary(CLIENT)
+
+    rec._handle_db_position_missing_at_broker(
+        pos=_position(),
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=9,
+        entry_px=2.33,
+        summary=summary,
+    )
+
+    rec._execute_reconciler_close.assert_not_called()
+    rec._record_reconciler_rejection.assert_not_called()
+    assert summary["positions_alerted"] == 1
+
+
+def test_valid_legacy_exit_timestamp_without_provenance_holds_without_mutation(
+    monkeypatch,
+):
+    """A structurally valid legacy local timestamp is not broker fill truth."""
+    _install_exit_rows(
+        monkeypatch,
+        [
+            _exit_row(
+                filled_ts="2026-08-12T18:19:27.123456+00:00",
+                meta={},
             )
         ],
     )
@@ -1895,6 +1973,7 @@ def test_exact_exit_evidence_identity_reaches_position_engine_and_proof(monkeypa
     assert mark_kwargs["broker_order_id"] == "TR-195"
     assert mark_kwargs["broker_exit_order_id"] == "TR-195"
     assert mark_kwargs["broker_exit_fill_ts"].isoformat() == evidence["filled_ts"]
+    assert mark_kwargs["broker_exit_fill_timestamp_source"] == "broker_response"
     assert mark_kwargs["broker_exit_filled_qty"] == 2
     assert mark_kwargs["proof_contracts_override"] == 2
 
@@ -2131,6 +2210,7 @@ def test_reconciler_exact_scale_out_callback_uses_remaining_qty_for_proof():
         broker_order_id="TR-195",
         broker_exit_order_id="TR-195",
         broker_exit_fill_ts=fill_ts,
+        broker_exit_fill_timestamp_source="broker_response",
         broker_exit_filled_qty=2,
         proof_contracts_override=2,
         reconciled=True,

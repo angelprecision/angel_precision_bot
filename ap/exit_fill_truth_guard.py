@@ -19,7 +19,11 @@ from ap.operator.live_execution_journal import (
     PRICE_SOURCE_TRADIER_EXIT,
     classify_official,
 )
-from ap.utils import parse_aware_utc_timestamp
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    has_broker_fill_timestamp_provenance,
+    parse_aware_utc_timestamp,
+)
 
 log = get_logger("ap.exit_fill_truth_guard")
 
@@ -245,7 +249,7 @@ def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
     current_local_order_id = str(order.get("local_order_id") or "").strip()
     entry_ts = position.get("entry_ts") or position.get("created_at")
     rows = c.execute(
-        "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status "
+        "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status, meta "
         "FROM orders WHERE client_id=%s AND kind='EXIT' AND UPPER(contract)=UPPER(%s) "
         "AND status IN %s AND COALESCE(filled_qty,0)>0 AND fill_price IS NOT NULL "
         "AND (%s IS NULL OR filled_ts >= %s OR (%s <> '' AND local_order_id=%s)) "
@@ -481,6 +485,14 @@ def _diagnostic_context(order: dict, result: dict) -> dict[str, Any]:
         "filled_qty": _int(result.get("filled_qty"), _int(order.get("filled_qty"))),
         "fill_price": _float(result.get("fill_price"), _float(order.get("fill_price"))),
         "filled_ts": str(result.get("filled_ts") or order.get("filled_ts") or ""),
+        "filled_ts_source": (
+            str(result.get("filled_ts_source") or "").strip()
+            or (
+                BROKER_FILL_TIMESTAMP_SOURCE
+                if has_broker_fill_timestamp_provenance(order.get("meta"))
+                else ""
+            )
+        ),
         "recorded_by": "canonical_exit_fill_reconciler",
     }
 
@@ -707,6 +719,8 @@ def _run_reconciliation_attempt(
     attempt_count: int,
 ) -> dict:
     client_id = str(order.get("client_id") or "").strip()
+    if not has_broker_fill_timestamp_provenance(order.get("meta")):
+        raise LifecycleProjectionError("EXIT_FILL_TIMESTAMP_UNPROVEN")
     fill_ts = _parse_reconciler_timestamp(
         result.get("filled_ts") or order.get("filled_ts")
     )
@@ -723,6 +737,10 @@ def _run_reconciliation_attempt(
                 raise LifecycleProjectionError("canonical_position_id_missing")
 
             fills = _load_exit_fills(c, position, order)
+            for fill in fills:
+                if _int(fill.get("filled_qty")) > 0 and _float(fill.get("fill_price")) > 0:
+                    if not has_broker_fill_timestamp_provenance(fill.get("meta")):
+                        raise LifecycleProjectionError("EXIT_FILL_TIMESTAMP_UNPROVEN")
             projection = project_position_from_exit_fills(position, fills)
             entry_order = _load_entry_order(c, position, order)
             entry_broker_id = str(entry_order.get("broker_order_id") or position.get("broker_order_id") or "").strip()
@@ -966,6 +984,11 @@ def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> di
         "filled_qty": order.get("filled_qty"),
         "fill_price": order.get("fill_price"),
         "filled_ts": order.get("filled_ts"),
+        "filled_ts_source": (
+            BROKER_FILL_TIMESTAMP_SOURCE
+            if has_broker_fill_timestamp_provenance(order.get("meta"))
+            else None
+        ),
     }
     attempt_count = _claim_reconciliation_retry(order, result)
     if attempt_count is None:

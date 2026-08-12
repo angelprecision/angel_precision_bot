@@ -65,7 +65,13 @@ try:
     from psycopg2 import errors as pg_errors
 except ImportError:
     pg_errors = None
-from ap.utils import now_utc_iso, parse_aware_utc_timestamp
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    BROKER_FILL_TIMESTAMP_SOURCE_KEY,
+    has_broker_fill_timestamp_provenance,
+    now_utc_iso,
+    parse_aware_utc_timestamp,
+)
 
 
 def _normalize_broker_submitted_ts(value) -> str | None:
@@ -1039,6 +1045,7 @@ class APOrderStateMachine:
         last_error=None,
         submitted_ts=None,
         filled_ts=None,
+        filled_ts_source=None,
         position_id=None,
         allow_submit_owner_terminalization: bool = False,
     ) -> bool:
@@ -1060,14 +1067,28 @@ class APOrderStateMachine:
         kind        = str(current.get("kind") or "")
 
         normalized_exit_fill_ts = None
+        normalized_exit_fill_source = None
         if new_status in (OrderStatus.EXIT_FILLED, OrderStatus.EXIT_PARTIAL_FILL):
             normalized_exit_fill_ts = parse_aware_utc_timestamp(filled_ts)
-            if normalized_exit_fill_ts is None:
+            normalized_exit_fill_source = (
+                str(filled_ts_source).strip()
+                if isinstance(filled_ts_source, str)
+                else None
+            )
+            if (
+                normalized_exit_fill_ts is None
+                or normalized_exit_fill_source != BROKER_FILL_TIMESTAMP_SOURCE
+            ):
                 reason = "exit_fill_timestamp_unproven"
                 log.critical(
                     "[%s] EXIT transition blocked | order=%s status=%s "
-                    "filled_ts=%r is missing, malformed, or naive",
-                    self.client_id, local_order_id, new_status, filled_ts,
+                    "filled_ts=%r source=%r is missing, malformed, naive, or "
+                    "not explicitly broker-sourced",
+                    self.client_id,
+                    local_order_id,
+                    new_status,
+                    filled_ts,
+                    filled_ts_source,
                 )
                 self._emit_transition_event(
                     local_order_id=local_order_id,
@@ -1235,6 +1256,15 @@ class APOrderStateMachine:
         elif new_status == OrderStatus.EXIT_PARTIAL_FILL:
             updates.append("filled_ts=%s")
             params.append(normalized_exit_fill_ts.isoformat())
+        if new_status in (OrderStatus.EXIT_FILLED, OrderStatus.EXIT_PARTIAL_FILL):
+            updates.append(
+                "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb"
+            )
+            params.append(
+                json.dumps(
+                    {BROKER_FILL_TIMESTAMP_SOURCE_KEY: normalized_exit_fill_source}
+                )
+            )
         if kind.upper() == "ENTRY" and OrderStatus.is_terminal(new_status):
             updates.append(
                 "meta=COALESCE(meta, '{}'::jsonb) "
@@ -1417,6 +1447,7 @@ class APOrderStateMachine:
                 if normalized_exit_fill_ts is not None
                 else filled_ts
             ),
+            filled_ts_source=normalized_exit_fill_source,
             broker_order_id=broker_order_id or current.get("broker_order_id"),
             local_order_id=local_order_id,
         )
@@ -1937,6 +1968,7 @@ class APOrderStateMachine:
         filled_qty=None,
         fill_price=None,
         filled_ts=None,
+        filled_ts_source=None,
         broker_order_id=None,
         local_order_id=None,
     ) -> None:
@@ -1970,7 +2002,15 @@ class APOrderStateMachine:
                 OrderStatus.EXIT_PARTIAL_FILL,
             ):
                 _normalized_fill_ts = parse_aware_utc_timestamp(filled_ts)
-                if _normalized_fill_ts is None:
+                _normalized_fill_ts_source = (
+                    str(filled_ts_source).strip()
+                    if isinstance(filled_ts_source, str)
+                    else None
+                )
+                if (
+                    _normalized_fill_ts is None
+                    or _normalized_fill_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+                ):
                     log.critical(
                         "[%s] EXIT hook blocked | order=%s pos=%s "
                         "broker fill timestamp unproven=%r",
@@ -2204,6 +2244,7 @@ class APOrderStateMachine:
                     local_order_id=str(_local_id or ""),
                     broker_order_id=str(_broker_id or ""),
                     broker_exit_fill_ts=_normalized_fill_ts,
+                    broker_exit_fill_timestamp_source=_normalized_fill_ts_source,
                     cumulative_filled=_cum_filled,
                 )
                 # Finalize position row from confirmed broker fill truth.
@@ -2276,6 +2317,7 @@ class APOrderStateMachine:
         fill_price=None,
         broker_order_id=None,
         filled_ts=None,
+        filled_ts_source=None,
     ) -> bool:
         order = self._get_order(local_order_id)
         if not order:
@@ -2299,6 +2341,7 @@ class APOrderStateMachine:
             filled_qty=cumulative_filled,
             fill_price=fill_price,
             filled_ts=filled_ts,
+            filled_ts_source=filled_ts_source,
         )
 
     def increment_retry(self, local_order_id: str):
@@ -7276,6 +7319,7 @@ class APOrderStateMachine:
                 or validated_price is None
                 or validated_qty is None
                 or normalized_filled_ts is None
+                or not has_broker_fill_timestamp_provenance(order.get("meta"))
             ):
                 log.warning(
                     "[%s] _finalize_position_from_exit_order skipped — incomplete fill data | "

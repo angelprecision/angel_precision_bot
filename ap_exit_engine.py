@@ -71,7 +71,10 @@ from ap.exit_thresholds import (
     effective_thresholds as _shared_effective_thresholds,
     option_profile as _shared_option_profile,
 )
-from ap.utils import parse_aware_utc_timestamp
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    parse_aware_utc_timestamp,
+)
 
 
 try:
@@ -5443,6 +5446,7 @@ class APExitEngine:
         broker_order_id: str = "",
         broker_exit_order_id: str = "",
         broker_exit_fill_ts: Optional[datetime] = None,
+        broker_exit_fill_timestamp_source: Optional[str] = None,
         broker_exit_filled_qty: Optional[int] = None,
         proof_contracts_override: Optional[int] = None,
         cumulative_filled: Optional[int] = None,
@@ -5468,6 +5472,11 @@ class APExitEngine:
         _callback_qty = _positive_whole_or_none(_callback_qty_raw)
         _callback_price = _positive_or_none(fill_price)
         _callback_fill_ts = parse_aware_utc_timestamp(broker_exit_fill_ts)
+        _callback_fill_ts_source = (
+            str(broker_exit_fill_timestamp_source).strip()
+            if isinstance(broker_exit_fill_timestamp_source, str)
+            else None
+        )
         _proof_contracts_override = _positive_whole_or_none(proof_contracts_override)
         if (
             _callback_qty_raw is not None
@@ -5485,7 +5494,10 @@ class APExitEngine:
                 fill_price,
             )
             return False
-        if _callback_qty_raw is not None and _callback_fill_ts is None:
+        if _callback_qty_raw is not None and (
+            _callback_fill_ts is None
+            or _callback_fill_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+        ):
             log.critical(
                 "[%s] mark_position_closed blocked | unproven broker EXIT fill timestamp "
                 "pos=%s fill_ts=%r",
@@ -5619,6 +5631,9 @@ class APExitEngine:
                                 or ""
                             ),
                             broker_exit_fill_ts=_callback_fill_ts,
+                            broker_exit_fill_timestamp_source=(
+                                _callback_fill_ts_source
+                            ),
                             broker_exit_filled_qty=(
                                 _callback_qty
                             ),
@@ -6598,6 +6613,7 @@ class APExitEngine:
                 broker_exit_order_id=broker_oid,
                 broker_exit_filled_qty=_filled_qty,
                 broker_exit_fill_ts=_fill_ts,
+                broker_exit_fill_timestamp_source=BROKER_FILL_TIMESTAMP_SOURCE,
                 force=True,
             )
 
