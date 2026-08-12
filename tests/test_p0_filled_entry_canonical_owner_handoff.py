@@ -998,7 +998,22 @@ def _patch_process_side_effects(monkeypatch, events):
             "avg_fill": 1.46,
         },
     )
-    monkeypatch.setattr(fm, "trace_gate", lambda *a, **k: events.append("trace"))
+    def _trace_gate(
+        signal_id,
+        ticker,
+        gate,
+        status,
+        reason="",
+        score=None,
+        iv_rank=None,
+        spread_pct=None,
+        trigger_price=None,
+        contracts=None,
+        pnl_pct=None,
+    ):
+        events.append("trace")
+
+    monkeypatch.setattr(fm, "trace_gate", _trace_gate)
     monkeypatch.setattr(
         fm,
         "_cancel_pair_opposite",
@@ -1195,6 +1210,83 @@ def test_broker_boolean_fill_price_is_rejected_before_side_effects(
     )
 
     assert events == []
+    assert broker_mutations == []
+
+
+@pytest.mark.parametrize(
+    "raw_response",
+    [None, {}, {"filled_quantity": 1}],
+    ids=["none", "empty-dict", "missing-status"],
+)
+def test_malformed_broker_response_cannot_authorize_db_only_recovery(
+    monkeypatch, raw_response
+):
+    from ap import fill_monitor as fm
+
+    events = []
+    broker_mutations = []
+    real_check_order_with_broker = fm.check_order_with_broker
+    _patch_process_side_effects(monkeypatch, events)
+    monkeypatch.setattr(
+        fm, "check_order_with_broker", real_check_order_with_broker
+    )
+
+    class _Broker:
+        def get_order(self, _broker_order_id):
+            return raw_response
+
+        def cancel_order(self, *args, **kwargs):
+            broker_mutations.append(("cancel", args, kwargs))
+
+        def place_stop_order(self, *args, **kwargs):
+            broker_mutations.append(("stop", args, kwargs))
+
+    order = _order(
+        status="FILLED",
+        position_id=None,
+        filled_qty=1,
+        fill_price=1.46,
+        meta={"canonical_owner_handoff_entry_handoff_proven": False},
+    )
+    result = fm.check_order_with_broker(_Broker(), order)
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_RESPONSE_MALFORMED"
+    assert result["raw"]["_malformed_broker_response"] is True
+    assert not fm._broker_poll_unavailable_for_durable_filled_recovery(result)
+
+    def _unexpected(name):
+        def _call(*_args, **_kwargs):
+            pytest.fail(f"{name} must not run for a malformed broker response")
+
+        return _call
+
+    for name in (
+        "_open_position_safe",
+        "_establish_canonical_handoff_standing_stop",
+        "_cancel_pair_opposite",
+        "_seed_exit_engine",
+        "_verify_canonical_entry_owner",
+    ):
+        monkeypatch.setattr(fm, name, _unexpected(name))
+
+    class _OSM:
+        def transition(self, *_args, **_kwargs):
+            pytest.fail("malformed broker truth must not transition OSM")
+
+        def increment_retry(self, *_args, **_kwargs):
+            events.append("retry")
+
+    fm.process_pending_order(
+        _Broker(),
+        order,
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
+    )
+
+    assert events in ([], ["retry"])
     assert broker_mutations == []
 
 

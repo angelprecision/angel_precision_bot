@@ -984,7 +984,41 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 
     try:
         raw = broker.get_order(broker_order_id)
-        status = (raw.get("status") or "").upper()
+        raw_status = raw.get("status") if isinstance(raw, dict) else None
+        if (
+            not isinstance(raw, dict)
+            or not raw
+            or not isinstance(raw_status, str)
+            or not raw_status.strip()
+        ):
+            reason = "BROKER_RESPONSE_MALFORMED"
+            response_evidence = (
+                dict(raw) if isinstance(raw, dict) else {}
+            )
+            response_evidence.update(
+                {
+                    "_malformed_broker_response": True,
+                    "response_type": type(raw).__name__,
+                }
+            )
+            audit(
+                str(order.get("client_id") or "default"),
+                "ERROR",
+                reason,
+                {
+                    "broker_order_id": broker_order_id,
+                    "local_order_id": order.get("local_order_id"),
+                    "response_type": type(raw).__name__,
+                },
+            )
+            return {
+                "status": "ERROR",
+                "filled_qty": 0,
+                "avg_fill": 0.0,
+                "reason": reason,
+                "raw": response_evidence,
+            }
+        status = raw_status.upper()
 
         if kind == "EXIT":
             status_map = {
@@ -4062,10 +4096,6 @@ def process_pending_order(
                     reason="entry_filled",
                     trigger_price=price,
                     contracts=qty,
-                    side=(order.get("direction") or "CALL").upper(),
-                    kind="ENTRY",
-                    tier=str(order.get("tier") or "B"),
-                    plan_id=str(plan_id or ""),
                 )
 
                 # Pair cancel is broker-first/local-second.  A DB-only
