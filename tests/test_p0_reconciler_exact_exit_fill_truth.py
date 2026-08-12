@@ -368,6 +368,8 @@ def test_wrong_client_or_unusable_economics_are_rejected(monkeypatch):
         _exit_row(broker_order_id=" ", fill_price=1.95),
         _exit_row(broker_order_id="TR-ZERO-QTY", filled_qty=0),
         _exit_row(broker_order_id="TR-ZERO-PRICE", fill_price=0),
+        _exit_row(broker_order_id="TR-BOOL-QTY", filled_qty=True),
+        _exit_row(broker_order_id="TR-BOOL-PRICE", fill_price=True),
     ):
         _install_exit_rows(monkeypatch, [invalid_row])
         assert rec._get_recent_exit_fill(
@@ -1441,6 +1443,38 @@ def test_existing_exact_bot_exit_fill_still_reaches_existing_close_path(monkeypa
     rec._record_reconciler_rejection.assert_called_once()
 
 
+@pytest.mark.parametrize("missing_identity", [
+    "pending_exit_local_order_id",
+    "pending_exit_broker_order_id",
+])
+def test_reconciler_close_requires_current_exit_identity_pair(
+    monkeypatch, missing_identity: str
+):
+    _install_exit_rows(monkeypatch, [_exit_row()])
+    rec = _reconciler()
+    rec._alert = MagicMock()
+    rec._execute_reconciler_close = MagicMock()
+    pos = _position()
+    pos[missing_identity] = ""
+    summary = _empty_summary(CLIENT)
+
+    rec._handle_db_position_missing_at_broker(
+        pos=pos,
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=9,
+        entry_px=2.33,
+        summary=summary,
+    )
+
+    rec._execute_reconciler_close.assert_not_called()
+    assert summary["positions_alerted"] == 1
+    assert any(
+        "current_exit_local_and_broker_identity_pair_missing" in call.args[0]
+        for call in rec._alert.call_args_list
+    )
+
+
 def test_strict_manual_close_selector_keeps_exact_target_stc_fill():
     detected_at = datetime(2026, 8, 10, 20, 0, tzinfo=timezone.utc)
     evidence, reason = manual_close.select_external_close_fills(
@@ -1701,6 +1735,44 @@ def _restart_fixture(monkeypatch):
     rec = _reconciler()
     rec.supabase_client = _RestartSupabase()
     return state, rec
+
+
+@pytest.mark.parametrize(
+    "mutate_evidence",
+    [
+        pytest.param(lambda evidence: evidence.update(filled_qty=True), id="bool-quantity"),
+        pytest.param(lambda evidence: evidence.update(fill_price=True), id="bool-price"),
+        pytest.param(
+            lambda evidence: evidence.update(filled_ts="2026-08-10T17:00:00+00:00"),
+            id="pre-entry-timestamp",
+        ),
+    ],
+)
+def test_close_mutation_fence_holds_on_coercion_or_timestamp_truth(
+    monkeypatch, mutate_evidence
+):
+    state, rec = _restart_fixture(monkeypatch)
+    rec._alert = MagicMock()
+    evidence = dict(state.exit)
+    mutate_evidence(evidence)
+    summary = _empty_summary(CLIENT)
+
+    rec._execute_reconciler_close(
+        pos=dict(state.position),
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=2,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+        summary=summary,
+        exact_exit_fill_qty=2,
+        exact_exit_evidence=evidence,
+    )
+
+    assert state.position["status"] == "OPEN"
+    assert state.order_updates == []
+    assert summary["positions_alerted"] == 1
 
 
 def test_reconciler_close_then_restart_repairs_exact_proof_once(monkeypatch):

@@ -3134,18 +3134,9 @@ class APBrokerReconciler:
                     ):
                         return None
 
-                    try:
-                        fill_price = float(row.get("fill_price"))
-                        filled_qty = float(row.get("filled_qty"))
-                    except (TypeError, ValueError):
-                        return None
-                    if (
-                        not math.isfinite(fill_price)
-                        or not math.isfinite(filled_qty)
-                        or fill_price <= 0
-                        or filled_qty <= 0
-                        or not filled_qty.is_integer()
-                    ):
+                    fill_price = _strict_positive_finite_float(row.get("fill_price"))
+                    filled_qty = _strict_positive_whole_number(row.get("filled_qty"))
+                    if fill_price is None or filled_qty is None:
                         return None
                     return row
 
@@ -3294,6 +3285,16 @@ class APBrokerReconciler:
         current_exit_broker_id = str(
             pos.get("pending_exit_broker_order_id") or ""
         ).strip()
+        if not current_exit_local_id or not current_exit_broker_id:
+            self._alert(
+                "RECONCILER_EXIT_FILL_IDENTITY_UNPROVEN | "
+                f"client_id={self.client_id} "
+                f"position_id={str(pos_id or '') or '?'} "
+                f"contract={contract or '?'} "
+                "reason=current_exit_local_and_broker_identity_pair_missing"
+            )
+            summary["positions_alerted"] += 1
+            return
         exit_fill = self._get_recent_exit_fill(
             contract,
             position_id=str(pos_id or "").strip(),
@@ -3342,6 +3343,7 @@ class APBrokerReconciler:
             exit_px          = float(exit_fill["fill_price"])
             close_confidence = "HIGH"
             exact_exit_evidence = {
+                "client_id": self.client_id,
                 "broker_order_id": str(exit_fill.get("broker_order_id") or "").strip(),
                 "exit_local_order_id": str(exit_fill.get("local_order_id") or "").strip(),
                 "filled_ts": exit_fill.get("filled_ts"),
@@ -3472,16 +3474,24 @@ class APBrokerReconciler:
         evidence_mode = _normalize_execution_mode(evidence.get("execution_mode"))
         evidence_status = str(evidence.get("status") or "").upper().strip()
         evidence_filled_ts = _parse_reconciler_timestamp(evidence.get("filled_ts"))
-        try:
-            evidence_filled_qty_value = float(evidence.get("filled_qty"))
-        except (TypeError, ValueError):
-            evidence_filled_qty_value = 0.0
-        try:
-            evidence_fill_price = float(evidence.get("fill_price"))
-        except (TypeError, ValueError):
-            evidence_fill_price = 0.0
+        evidence_filled_qty_value = _strict_positive_whole_number(
+            evidence.get("filled_qty")
+        )
+        evidence_fill_price = _strict_positive_finite_float(evidence.get("fill_price"))
+        expected_exit_price = _strict_positive_finite_float(exit_px)
+        expected_entry_price = _strict_positive_finite_float(entry_px)
         expected_mode = _normalize_execution_mode(
             pos.get("execution_mode") or self.execution_mode
+        )
+        position_entry_ts = _parse_reconciler_timestamp(
+            pos.get("entry_ts")
+            or pos.get("opened_at")
+            or evidence.get("position_entry_ts")
+        )
+        provided_exact_qty = (
+            _strict_positive_whole_number(exact_exit_fill_qty)
+            if exact_exit_fill_qty is not None
+            else None
         )
         evidence_valid = (
             bool(evidence)
@@ -3493,15 +3503,21 @@ class APBrokerReconciler:
             and evidence_mode == expected_mode
             and evidence_status in {"FILLED", "EXIT_FILLED"}
             and evidence_filled_ts is not None
-            and math.isfinite(evidence_filled_qty_value)
-            and evidence_filled_qty_value > 0
-            and evidence_filled_qty_value.is_integer()
-            and math.isfinite(evidence_fill_price)
-            and evidence_fill_price > 0
-            and math.isclose(evidence_fill_price, float(exit_px), rel_tol=0.0, abs_tol=1e-9)
+            and position_entry_ts is not None
+            and evidence_filled_ts >= position_entry_ts
+            and evidence_filled_qty_value is not None
+            and evidence_fill_price is not None
+            and expected_exit_price is not None
+            and expected_entry_price is not None
+            and math.isclose(
+                evidence_fill_price,
+                expected_exit_price,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
             and (
                 exact_exit_fill_qty is None
-                or int(exact_exit_fill_qty) == int(evidence_filled_qty_value)
+                or provided_exact_qty == evidence_filled_qty_value
             )
         )
         if not evidence_valid:
@@ -3513,8 +3529,9 @@ class APBrokerReconciler:
             summary["positions_alerted"] += 1
             return
 
-        exact_exit_fill_qty = int(evidence_filled_qty_value)
+        exact_exit_fill_qty = evidence_filled_qty_value
         exit_px = evidence_fill_price
+        entry_px = expected_entry_price
         pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
         pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
 
