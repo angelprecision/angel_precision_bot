@@ -777,6 +777,30 @@ def classify_pending_trigger_row(
         restart_rearm_status = str(meta.get("restart_rearm_status") or "").strip().upper()
         restart_rearm_next_at = meta.get("restart_rearm_next_at")
 
+        # An in-flight canonical materialization claim is a durable ownership
+        # state, not a stale watcher diagnosis.  This must take precedence
+        # over ``watcher_audit.reason_code=trigger_ready`` so a crash after
+        # claim can converge through the existing retry owner.
+        # The restart engine still proves the exact owner/client/mode/lease
+        # before it permits any mutation; this label is routing only.
+        _materialization_lifecycle = str(
+            meta.get("lifecycle_state") or ""
+        ).strip().upper()
+        if (
+            retry_status == "RUNNING"
+            and (
+                meta.get("materialization_in_flight") is True
+                or _materialization_lifecycle == "MATERIALIZING"
+            )
+        ) or (
+            retry_status == "RETRY_PENDING"
+            and (
+                retry_next_at
+                or _materialization_lifecycle in {"RETRY_WAIT", "MATERIALIZING"}
+            )
+        ):
+            return PendingTriggerClassification.WAITING_RETRYABLE
+
         # ── Priority 1: trigger_ready without broker_order_id ────────────────
         # A watcher decided the row should submit, but broker never accepted.
         # The historical terminal class remains the default; only the
