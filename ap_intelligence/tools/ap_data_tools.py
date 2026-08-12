@@ -492,6 +492,9 @@ def get_vix() -> dict:
         vix = float(raw_vix)
         if not math.isfinite(vix) or vix <= 0:
             raise ValueError("VIX lastPrice missing or non-finite")
+        # yfinance fast_info.lastPrice has no provider/market observation
+        # timestamp.  This local fetch time is diagnostic only and cannot
+        # establish production freshness or hard-risk authority.
         observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         result = {
             "vix":       round(float(vix), 2),
@@ -501,10 +504,8 @@ def get_vix() -> dict:
             "tradeable": 12 <= vix <= 35,
             "source":     VIX_TRUSTED_SOURCE,
             "observed_at": observed_at,
-            "classification": "PRODUCTION_EXACT",
+            "classification": "ESTIMATED_ADVISORY",
         }
-        if not validate_vix_observation(result)[0]:
-            raise ValueError("VIX observation failed authority validation")
         _cache_set(cache_key, result)
         return result
     except Exception:

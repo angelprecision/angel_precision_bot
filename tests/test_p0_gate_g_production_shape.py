@@ -697,6 +697,28 @@ def test_vix_observation_has_provenance(monkeypatch):
     assert result["tradeable"] is True
     assert result["source"] == "yfinance:^VIX.fast_info.lastPrice"
     assert result["observed_at"]
+    assert result["classification"] == "ESTIMATED_ADVISORY"
+    assert ap_data_tools.validate_vix_observation(result)[0] is False
+
+
+def test_fetched_vix_last_price_cannot_trigger_hard_cap(monkeypatch):
+    from ap_intelligence.tools import ap_data_tools
+
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.Ticker = lambda _: types.SimpleNamespace(fast_info={"lastPrice": 40.0})
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+    monkeypatch.setattr(ap_data_tools, "_cache_get", lambda _: None)
+    monkeypatch.setattr(ap_data_tools, "_cache_set", lambda *_: None)
+
+    payload = ap_data_tools.get_vix()
+    result = _evaluate_vix_payload(payload)
+
+    assert payload["classification"] == "ESTIMATED_ADVISORY"
+    assert result.approved is True
+    assert result.hard_veto is False
+    assert result.reason_code == "VIX_UNAVAILABLE"
+    assert result.authority_diagnostics["vix"]["authoritative"] is False
+    assert result.authority_diagnostics["vix"]["policy_outcome"] == "VIX_ADVISORY"
 
 
 def _evaluate_vix_payload(payload):
@@ -815,7 +837,7 @@ def test_stale_vix_cache_is_refetched_before_authority(monkeypatch):
     result = ap_data_tools.get_vix()
 
     assert result["vix"] == 18.5
-    assert result["classification"] == "PRODUCTION_EXACT"
+    assert result["classification"] == "ESTIMATED_ADVISORY"
     assert result["observed_at"] != stale_at
 
 
