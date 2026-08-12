@@ -362,15 +362,18 @@ def test_efficiency_gate_is_before_hydration_selector_and_submit():
 
 def test_aapl_wait_returns_before_runtime_submit_path(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     efficiency_metadata = {
         "entry_efficiency_state": "WAIT_CONFIRMATION",
         "entry_efficiency_generation": 1,
         "entry_efficiency_next_eval_at": (
             datetime.now(timezone.utc) - timedelta(seconds=1)
         ).isoformat(),
+        "entry_efficiency_deadline_at": deadline,
     }
     watched = WatchedSignal(_watch_signal(**efficiency_metadata), overnight=False)
-    watched.trigger_crossed_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    # AAPL incident shape: 09:51:51 ET, inside the first 30-minute window.
+    watched.trigger_crossed_at = FIRST_BREACH
     watched.last_quote_bid = 302.79
     watched.last_quote_ask = 302.81
     watched.last_quote_age_ms = 1_000
@@ -410,10 +413,67 @@ def test_aapl_wait_returns_before_runtime_submit_path(monkeypatch):
         result = APExecutionCore._on_entry_trigger(core, watched)
 
     assert result["disposition"] == "ENTRY_EFFICIENCY_WAIT"
-    assert result["reason_code"] == "ENTRY_EFFICIENCY_CLOCK_NOT_SUFFICIENT"
+    assert result["reason_code"] == "ENTRY_EFFICIENCY_OPENING_BREACH"
     osm.submit_existing_entry.assert_not_called()
     core.contract_selector.select.assert_not_called()
     osm.cas_entry_efficiency_state.assert_called_once()
+
+
+def test_aapl_replay_wait_rearm_rebreach_ready_has_no_first_entry_post():
+    deadline = "2026-08-12T14:21:51+00:00"
+    watched = WatchedSignal(
+        _watch_signal(
+            entry_efficiency_state=WAIT_CONFIRMATION,
+            entry_efficiency_generation=1,
+            entry_efficiency_next_eval_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+            entry_efficiency_deadline_at=deadline,
+        ),
+        overnight=False,
+    )
+    watched.trigger_crossed_at = FIRST_BREACH
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = True
+    watcher = APEntryWatcher(None, order_state_machine=osm, mode="PAPER")
+
+    # Direct market pullback stages the durable WAIT -> REARM CAS; no callback
+    # or broker submit path is entered for the original poor breach.
+    assert watched.check(303.10, 303.20, quote_age_ms=1_000) == WatchState.PENDING
+    request = watched._entry_efficiency_persist_request
+    assert request["expected_state"] == WAIT_CONFIRMATION
+    assert request["next_state"] == REARM_FOR_REBREACH
+    assert watcher._persist_entry_efficiency_transition(watched, request) is True
+    assert watched.entry_efficiency_state == REARM_FOR_REBREACH
+    assert watched.entry_efficiency_rearm_pending is True
+    cas_call = osm.cas_entry_efficiency_state.call_args
+    assert cas_call.args[0] == "order-efficiency"
+    cas_kwargs = cas_call.kwargs
+    assert cas_kwargs["signal_id"] == "sig-efficiency"
+    assert cas_kwargs["canonical_signal_id"] == "canonical-sig-efficiency"
+    assert cas_kwargs["client_id"] == "jason@example.com"
+    assert cas_kwargs["execution_mode"] == "paper"
+    assert cas_kwargs["expected_state"] == WAIT_CONFIRMATION
+    assert cas_kwargs["expected_generation"] == 1
+    assert cas_kwargs["next_state"] == REARM_FOR_REBREACH
+    assert cas_kwargs["next_generation"] == 2
+    assert osm.submit_existing_entry.call_count == 0
+
+    # A fresh direct-market re-breach earns one trigger observation, while the
+    # policy evaluator still owns the authoritative READY decision.
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.entry_efficiency_rebreach_at is not None
+    ready = _decision(
+        prior_state=REARM_FOR_REBREACH,
+        rearm_pending=True,
+        prior_deadline_at=deadline,
+        now=datetime(2026, 8, 12, 14, 1, tzinfo=timezone.utc),
+    )
+    assert ready.decision == READY_NOW
+    assert ready.reason_code == "ENTRY_EFFICIENCY_GENUINE_REBREACH"
+    assert ready.evidence["timing_authority_basis"] == "DIRECT_MARKET_EVIDENCE"
+    assert osm.submit_existing_entry.call_count == 0
 
 
 def test_osm_efficiency_cas_has_exact_entry_identity_and_no_broker_evidence():
