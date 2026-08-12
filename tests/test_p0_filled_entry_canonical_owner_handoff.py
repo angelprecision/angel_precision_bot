@@ -50,6 +50,7 @@ class _Connection:
         *,
         update_rowcount=1,
         claim_rowcount=None,
+        metadata_update_rowcount=1,
         update_error=None,
         position_row=None,
     ):
@@ -58,8 +59,10 @@ class _Connection:
             self.row.setdefault("broker_order_id", "entry-broker-1")
             self.row.setdefault("contract", "INTC260810P00098000")
             self.row.setdefault("last_error", None)
+            self.row.setdefault("meta", {})
         self.update_rowcount = update_rowcount
         self.claim_rowcount = update_rowcount if claim_rowcount is None else claim_rowcount
+        self.metadata_update_rowcount = metadata_update_rowcount
         self.update_error = update_error
         self.position_row = (
             dict(position_row)
@@ -90,12 +93,12 @@ class _Connection:
                 raise self.update_error
             (
                 requested_position,
+                meta_payload,
                 client_id,
                 local_id,
                 broker_id,
                 contract,
                 mode,
-                same_position,
             ) = params
             eligible = bool(
                 self.row
@@ -105,13 +108,14 @@ class _Connection:
                 and self.row.get("contract") == contract
                 and self.row.get("kind") == "ENTRY"
                 and str(self.row.get("execution_mode") or "").strip().lower() == mode
-                and (
-                    self.row.get("position_id") in (None, "")
-                    or self.row.get("position_id") == same_position
-                )
+                and self.row.get("position_id") in (None, "")
             )
             if eligible and self.update_rowcount:
                 self.row["position_id"] = requested_position
+                self.row["meta"] = {
+                    **(self.row.get("meta") or {}),
+                    **json.loads(meta_payload),
+                }
             return _Result(rowcount=self.update_rowcount if eligible else 0)
         if normalized.startswith("UPDATE orders") and "canonical_owner_handoff_standing_stop_state" in normalized:
             if self.update_error:
@@ -139,18 +143,19 @@ class _Connection:
             if "last_error=CASE" in normalized:
                 meta_payload, client_id, local_id = params[:3]
                 if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
-                    self.row["meta"] = {
-                        **(self.row.get("meta") or {}),
-                        **json.loads(meta_payload),
-                    }
-                    if str(self.row.get("last_error") or "").startswith(
-                        (
-                            "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED",
-                            "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
-                        )
-                    ):
-                        self.row["last_error"] = None
-                return _Result(rowcount=1 if self.row else 0)
+                    if self.metadata_update_rowcount:
+                        self.row["meta"] = {
+                            **(self.row.get("meta") or {}),
+                            **json.loads(meta_payload),
+                        }
+                        if str(self.row.get("last_error") or "").startswith(
+                            (
+                                "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED",
+                                "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                            )
+                        ):
+                            self.row["last_error"] = None
+                return _Result(rowcount=self.metadata_update_rowcount if self.row else 0)
             if "last_error=%s" in normalized:
                 last_error = params[0]
                 if "meta=" in normalized:
@@ -159,20 +164,22 @@ class _Connection:
                     meta_payload = None
                     client_id, local_id = params[1:3]
                 if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
-                    self.row["last_error"] = last_error
-                    if meta_payload is not None:
-                        self.row["meta"] = {
-                            **(self.row.get("meta") or {}),
-                            **json.loads(meta_payload),
-                        }
-                return _Result(rowcount=1 if self.row else 0)
+                    if self.metadata_update_rowcount:
+                        self.row["last_error"] = last_error
+                        if meta_payload is not None:
+                            self.row["meta"] = {
+                                **(self.row.get("meta") or {}),
+                                **json.loads(meta_payload),
+                            }
+                return _Result(rowcount=self.metadata_update_rowcount if self.row else 0)
             meta_payload, client_id, local_id = params[:3]
             if self.row and self.row.get("client_id") == client_id and self.row.get("local_order_id") == local_id:
-                self.row["meta"] = {
-                    **(self.row.get("meta") or {}),
-                    **json.loads(meta_payload),
-                }
-            return _Result(rowcount=1 if self.row else 0)
+                if self.metadata_update_rowcount:
+                    self.row["meta"] = {
+                        **(self.row.get("meta") or {}),
+                        **json.loads(meta_payload),
+                    }
+            return _Result(rowcount=self.metadata_update_rowcount if self.row else 0)
         if normalized.startswith("SELECT client_id"):
             if self.row is None:
                 return _Result(row=None)
@@ -324,6 +331,43 @@ def test_handoff_marker_update_fences_broker_contract_and_mode(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "overrides",
+    [
+        {"broker_order_id": "NONE"},
+        {"broker_order_id": "0"},
+        {"contract": ""},
+        {"execution_mode": " LIVE "},
+        {"execution_mode": None},
+    ],
+)
+def test_handoff_metadata_writes_reject_incomplete_identity(monkeypatch, overrides):
+    from ap import fill_monitor as fm
+
+    db = _Connection(_order())
+    _install_db(monkeypatch, db)
+
+    assert fm._update_canonical_handoff_order(
+        _order(**overrides),
+        meta_patch={"canonical_owner_handoff_retry_required": True},
+        last_error="FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+        operation="test",
+    ) is False
+    assert db.calls == []
+
+
+def test_handoff_last_error_fallback_zero_row_is_failure(monkeypatch):
+    from ap import fill_monitor as fm
+
+    db = _Connection(_order(), metadata_update_rowcount=0)
+    _install_db(monkeypatch, db)
+
+    assert fm._persist_canonical_handoff_last_error_fallback(
+        _order(), "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN"
+    ) is False
+    assert db.row["last_error"] is None
+
+
+@pytest.mark.parametrize(
     "last_error",
     [
         "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED:database_error",
@@ -343,6 +387,24 @@ def test_canonical_owner_handoff_recovery_predicate_matches_each_retry_source(la
     assert fm._is_canonical_owner_handoff_recovery(order) is True
     assert fm._is_canonical_owner_handoff_recovery(
         {**order, "broker_order_id": "N/A"}
+    ) is False
+
+
+def test_canonical_owner_handoff_recovery_includes_durable_pending_marker():
+    from ap import fill_monitor as fm
+
+    order = _order(
+        status="FILLED",
+        position_id="canonical-position-1",
+        meta={"canonical_owner_handoff_entry_handoff_proven": False},
+    )
+
+    assert fm._is_canonical_owner_handoff_recovery(order) is True
+    assert fm._is_canonical_owner_handoff_recovery(
+        {
+            **order,
+            "meta": {"canonical_owner_handoff_entry_handoff_proven": True},
+        }
     ) is False
 
 
@@ -370,6 +432,8 @@ def test_pending_sql_attests_the_same_retry_prefix_constants(monkeypatch):
 
     assert fm.get_pending_orders("jason@example.com") == []
     assert "last_error" in captured["sql"]
+    assert "canonical_owner_handoff_entry_handoff_proven" in captured["sql"]
+    assert "UPPER(BTRIM(broker_order_id)) NOT IN" in captured["sql"]
     assert tuple(
         f"{prefix}%" for prefix in fm._CANONICAL_OWNER_HANDOFF_RETRY_ERROR_PREFIXES
     ) == tuple(captured["params"][1:])
@@ -419,14 +483,15 @@ def test_filled_entry_binds_null_position_id_and_reads_back(monkeypatch):
     )
     assert "kind='ENTRY'" in update_sql
     assert "LOWER(BTRIM(COALESCE(execution_mode,'')))=%s" in update_sql
+    assert "meta=COALESCE(meta, '{}'::jsonb)" in update_sql
     assert update_params == (
         "canonical-position-1",
+        '{"canonical_owner_handoff_entry_handoff_proven":false}',
         "jason@example.com",
         "entry-local-1",
         "entry-broker-1",
         "INTC260810P00098000",
         "live",
-        "canonical-position-1",
     )
 
 
@@ -522,9 +587,11 @@ def test_bind_fails_closed_on_position_identity_mismatch(monkeypatch):
         ({"client_id": ""}, "client_id_missing"),
         ({"local_order_id": ""}, "local_order_id_missing"),
         ({"broker_order_id": ""}, "broker_order_id_missing_or_invalid"),
+        ({"broker_order_id": "NONE"}, "broker_order_id_missing_or_invalid"),
         ({"contract": "", "symbol": ""}, "contract_missing"),
         ({"kind": "EXIT"}, "kind_not_ENTRY"),
         ({"execution_mode": "sandbox"}, "execution_mode_missing_or_invalid"),
+        ({"execution_mode": " LIVE "}, "execution_mode_missing_or_invalid"),
     ],
 )
 def test_bind_rejects_incomplete_identity_before_database_write(monkeypatch, overrides, detail):
@@ -1330,6 +1397,100 @@ def test_restart_reloads_last_error_fallback_and_repairs_without_terminal_transi
     assert db.row["last_error"] is None
     assert db.row["meta"]["canonical_owner_handoff_retry_required"] is False
     assert verify_calls == [1]
+
+
+def test_filled_handoff_uses_durable_db_proof_when_broker_poll_unavailable(monkeypatch):
+    from ap import fill_monitor as fm
+
+    events = []
+    _patch_process_side_effects(monkeypatch, events)
+    order = _order(
+        status="FILLED",
+        position_id=None,
+        filled_qty=1,
+        fill_price=1.46,
+        meta={"canonical_owner_handoff_entry_handoff_proven": False},
+    )
+    db = _Connection(
+        {
+            "client_id": "jason@example.com",
+            "local_order_id": "entry-local-1",
+            "broker_order_id": "entry-broker-1",
+            "contract": "INTC260810P00098000",
+            "kind": "ENTRY",
+            "execution_mode": "live",
+            "status": "FILLED",
+            "position_id": None,
+            "filled_qty": 1,
+            "fill_price": 1.46,
+            "meta": {"canonical_owner_handoff_entry_handoff_proven": False},
+        }
+    )
+    _install_db(monkeypatch, db)
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {
+            "status": "UNKNOWN",
+            "filled_qty": 0,
+            "avg_fill": 0.0,
+            "reason": "broker_timeout",
+            "raw": {},
+        },
+    )
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *args, **kwargs: events.append("open") or "canonical-position-1",
+    )
+    monkeypatch.setattr(
+        fm,
+        "_establish_canonical_handoff_standing_stop",
+        lambda **_kwargs: pytest.fail(
+            "DB-only recovery must not submit a standing stop without broker truth"
+        ),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_cancel_pair_opposite",
+        lambda *args, **kwargs: pytest.fail(
+            "DB-only recovery must not create a broker cancel mutation"
+        ),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: events.append("seed")
+        or {"ok": True, "disposition": "SEEDED"},
+    )
+    monkeypatch.setattr(
+        fm,
+        "_verify_canonical_entry_owner",
+        lambda *args, **kwargs: events.append("verify") or {"ok": True},
+    )
+
+    class _OSM:
+        def transition(self, *args, **kwargs):
+            raise AssertionError("durable FILLED recovery must not terminalize again")
+
+    class _Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    fm.process_pending_order(
+        object(),
+        order,
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(_lock=_Lock()),
+    )
+
+    assert db.row["position_id"] == "canonical-position-1"
+    assert db.row["meta"]["canonical_owner_handoff_entry_handoff_proven"] is True
+    assert events.index("open") < events.index("seed") < events.index("verify")
 
 
 def test_exit_engine_quarantine_is_exactly_fenced_by_client_mode_and_contract():
