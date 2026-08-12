@@ -209,6 +209,59 @@ def _owner(position_id, *, client_id="jason@example.com", mode="live", contract=
     )
 
 
+def _adoption_position(
+    position_id,
+    *,
+    client_id="jason@example.com",
+    mode="live",
+    contract="INTC260810P00098000",
+):
+    from ap_exit_engine import ManagedPosition
+
+    position = ManagedPosition(
+        ticker="INTC",
+        option_symbol=contract,
+        side="PUT",
+        quantity=1,
+        entry_price=1.46,
+        underlying_entry=98.0,
+        underlying_target=100.0,
+        underlying_stop=96.0,
+    )
+    position.position_id = position_id
+    position.client_id = client_id
+    position.execution_mode = mode
+    position.quantity_remaining = 1
+    return position
+
+
+def _install_adoption_positions(engine, positions):
+    with engine._lock:
+        engine._positions.extend(positions)
+        engine._positions_by_id.update({p.position_id: p for p in positions})
+
+
+def _adopt_exact(
+    engine,
+    *,
+    canonical_position_id="jason-live-canonical",
+    client_id="jason@example.com",
+    mode="live",
+):
+    return engine.adopt_canonical_position_identity(
+        contract="INTC260810P00098000",
+        canonical_position_id=canonical_position_id,
+        local_order_id="entry-local-1",
+        broker_order_id="entry-broker-1",
+        signal_id="signal-1",
+        canonical_signal_id="signal-1",
+        entry_fill=1.46,
+        entry_ts=None,
+        execution_mode=mode,
+        client_id=client_id,
+    )
+
+
 def test_handoff_marker_update_fences_broker_contract_and_mode(monkeypatch):
     from ap import fill_monitor as fm
 
@@ -649,6 +702,80 @@ def test_standing_stop_claim_is_durable_before_broker_call(monkeypatch):
     assert result["protection_proven"] is True
     assert db.row["meta"]["canonical_owner_handoff_standing_stop_state"] == "SUBMITTED"
     assert db.row["meta"]["canonical_owner_handoff_standing_stop_id"] == "stop-1"
+
+
+def test_rest_2xx_without_standing_stop_order_id_is_unproven():
+    from ap import fill_monitor as fm
+
+    class _Response:
+        status_code = 202
+        text = "accepted"
+
+        @staticmethod
+        def json():
+            return {"order": {"status": "accepted"}}
+
+    broker = SimpleNamespace(
+        base_url="https://broker.example",
+        account_id="acct-1",
+        session=SimpleNamespace(post=lambda *args, **kwargs: _Response()),
+    )
+
+    result = fm._place_standing_stop_best_effort(
+        broker=broker, order=_order(), qty=1, entry_price=1.46
+    )
+
+    assert result["outcome"] == "OUTCOME_UNPROVEN"
+    assert result["ok"] is False
+    assert not result.get("broker_stop_id")
+
+
+@pytest.mark.parametrize("stop_response", [{"success": True}, True])
+def test_helper_success_without_standing_stop_order_id_is_unproven(stop_response):
+    from ap import fill_monitor as fm
+
+    broker = SimpleNamespace(
+        place_stop_order=lambda **kwargs: stop_response,
+    )
+
+    result = fm._place_standing_stop_best_effort(
+        broker=broker, order=_order(), qty=1, entry_price=1.46
+    )
+
+    assert result["outcome"] == "OUTCOME_UNPROVEN"
+    assert result["ok"] is False
+    assert not result.get("broker_stop_id")
+
+
+def test_submitted_standing_stop_without_order_id_cannot_prove_protection(monkeypatch):
+    from ap import fill_monitor as fm
+
+    order = _order()
+    db = _Connection(
+        {
+            "client_id": "jason@example.com",
+            "local_order_id": "entry-local-1",
+            "broker_order_id": "entry-broker-1",
+            "contract": "INTC260810P00098000",
+            "kind": "ENTRY",
+            "execution_mode": "live",
+            "meta": {},
+        }
+    )
+    _install_db(monkeypatch, db)
+    monkeypatch.setattr(
+        fm,
+        "_place_standing_stop_best_effort",
+        lambda **_kwargs: {"outcome": "SUBMITTED"},
+    )
+
+    result = fm._establish_canonical_handoff_standing_stop(
+        broker=object(), order=order, qty=1, entry_price=1.46
+    )
+
+    assert result["state"] == "OUTCOME_UNPROVEN"
+    assert result["protection_proven"] is False
+    assert db.row["meta"]["canonical_owner_handoff_standing_stop_state"] == "OUTCOME_UNPROVEN"
 
 
 def test_submitted_standing_stop_is_not_called_again(monkeypatch):
@@ -1260,3 +1387,86 @@ def test_exit_engine_malformed_quarantine_mode_performs_zero_mutations():
     assert result["ok"] is False
     assert result["quarantined_ids"] == []
     assert engine.active_positions() == [position]
+
+
+@pytest.mark.parametrize(
+    ("foreign_client", "foreign_mode"),
+    [
+        ("jose@example.com", "live"),
+        ("jason@example.com", "paper"),
+    ],
+)
+def test_existing_canonical_adoption_ignores_foreign_same_contract_owner_domain(
+    foreign_client, foreign_mode
+):
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(None, email="jason@example.com")
+    canonical = _adoption_position("jason-live-canonical")
+    foreign = _adoption_position(
+        "broker-repair-foreign",
+        client_id=foreign_client,
+        mode=foreign_mode,
+    )
+    _install_adoption_positions(engine, [canonical, foreign])
+
+    result = _adopt_exact(engine)
+
+    assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+    assert result.adopted is True
+    assert foreign in engine._positions
+    assert engine._positions_by_id[foreign.position_id] is foreign
+    assert getattr(foreign, "adoption_identity_quarantined", False) is False
+    assert engine.active_positions() == [canonical, foreign]
+
+
+def test_exact_repair_is_adopted_while_foreign_same_contract_repair_stays_untouched():
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(None, email="jason@example.com")
+    canonical = _adoption_position("jason-live-canonical")
+    exact_repair = _adoption_position(
+        "broker-repair-jason-live",
+        client_id="jason@example.com",
+        mode="live",
+    )
+    foreign_repair = _adoption_position(
+        "broker-repair-jose-paper",
+        client_id="jose@example.com",
+        mode="paper",
+    )
+    _install_adoption_positions(engine, [canonical, exact_repair, foreign_repair])
+
+    result = _adopt_exact(engine)
+
+    assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+    assert result.adopted is True
+    assert exact_repair.position_id not in engine._positions_by_id
+    assert exact_repair not in engine._positions
+    assert foreign_repair in engine._positions
+    assert getattr(foreign_repair, "adoption_identity_quarantined", False) is False
+
+
+def test_foreign_repair_before_exact_repair_does_not_veto_adoption():
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(None, email="jason@example.com")
+    foreign_repair = _adoption_position(
+        "broker-repair-jose-live",
+        client_id="jose@example.com",
+        mode="live",
+    )
+    exact_repair = _adoption_position(
+        "broker-repair-jason-live",
+        client_id="jason@example.com",
+        mode="live",
+    )
+    _install_adoption_positions(engine, [foreign_repair, exact_repair])
+
+    result = _adopt_exact(engine)
+
+    assert result.disposition == "ADOPTED"
+    assert result.adopted is True
+    assert engine._positions_by_id["jason-live-canonical"] is exact_repair
+    assert foreign_repair in engine._positions
+    assert getattr(foreign_repair, "adoption_identity_quarantined", False) is False

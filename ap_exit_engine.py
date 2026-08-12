@@ -3666,31 +3666,29 @@ class APExitEngine:
                         reason="canonical_object_mismatch",
                     )
 
+                def _in_adoption_owner_domain(position) -> bool:
+                    """Match only the exact client/mode/contract owner domain."""
+                    return (
+                        not getattr(position, "closed", False)
+                        and str(getattr(position, "option_symbol", "") or "").upper().strip()
+                        == _contract
+                        and str(getattr(position, "client_id", "") or "").strip().lower()
+                        == _client
+                        and str(getattr(position, "execution_mode", "") or "").strip().lower()
+                        == _norm_canonical
+                    )
+
                 # Merge every active broker-repair for this exact client/mode/contract
-                # into canonical. Unknown-client, foreign-client, blank-mode, or
-                # wrong-mode repairs stay quarantined and cannot donate quote authority.
+                # into canonical. Foreign ownership domains are unrelated state:
+                # leave them untouched, and neither let them donate state nor veto
+                # this exact owner handoff.
                 _repairs_to_remove = []
-                _identity_unproven_repairs = []
                 for p in self._positions:
                     if not str(getattr(p, "position_id", "") or "").startswith("broker-repair-"):
                         continue
-                    if str(getattr(p, "option_symbol", "") or "").upper().strip() != _contract:
-                        continue
-                    if getattr(p, "closed", False):
-                        continue
-                    _rp_cli = str(getattr(p, "client_id", "") or "").strip().lower()
-                    if not _client or _rp_cli != _client:
-                        _mark_adoption_identity_quarantined(
-                            p, f"repair_client={_rp_cli!r} canonical_client={_client!r}",
-                        )
-                        _identity_unproven_repairs.append(p)
-                        continue
-                    _rp_mode = str(getattr(p, "execution_mode", "") or "").strip().lower()
-                    if _rp_mode not in {"live", "paper"} or _rp_mode != _norm_canonical:
-                        _mark_adoption_identity_quarantined(
-                            p, f"repair_mode={_rp_mode!r} canonical_mode={_norm_canonical!r}",
-                        )
-                        _identity_unproven_repairs.append(p)
+                    if not _in_adoption_owner_domain(p):
+                        # A same-contract repair owned by another client or mode
+                        # is not evidence about this handoff.  Do not mutate it.
                         continue
                     _repairs_to_remove.append(p)
                 for _rp in _repairs_to_remove:
@@ -3771,34 +3769,24 @@ class APExitEngine:
 
                 _reclassify_hard_ref_for_entry(_existing_canon)
 
-                # Assert exactly one nonclosed active object for this contract.
-                _active_for_contract = [
+                # Assert exactly one nonclosed active object in this exact
+                # client/mode/contract domain.  Other owner domains may quite
+                # legitimately hold the same OCC contract at the same time.
+                _active_for_owner_domain = [
                     p for p in self._positions
-                    if str(getattr(p, "option_symbol", "") or "").upper().strip() == _contract
-                    and not getattr(p, "closed", False)
+                    if _in_adoption_owner_domain(p)
                 ]
-                if len(_active_for_contract) != 1:
+                if len(_active_for_owner_domain) != 1:
                     log.critical(
                         "[exit_eng] CANONICAL_COLLAPSE_INVARIANT_VIOLATED | "
-                        "contract=%s active_count=%d — expected exactly 1",
-                        _contract, len(_active_for_contract),
+                        "client=%s mode=%s contract=%s active_count=%d — expected exactly 1",
+                        _client, _norm_canonical, _contract,
+                        len(_active_for_owner_domain),
                     )
                     return CanonicalAdoptionResult(
                         disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
                         adopted=False, safe_to_seed=False, retryable=True,
-                        reason=f"active_count={len(_active_for_contract)}",
-                    )
-
-                if _identity_unproven_repairs:
-                    log.critical(
-                        "[exit_eng] RETRY_REPAIR_IDENTITY_UNPROVEN | "
-                        "canonical=%s contract=%s retained_repairs=%d",
-                        _canon_id, _contract, len(_identity_unproven_repairs),
-                    )
-                    return CanonicalAdoptionResult(
-                        disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
-                        adopted=False, safe_to_seed=False, retryable=True,
-                        reason=f"retained_repairs={len(_identity_unproven_repairs)}",
+                        reason=f"active_count={len(_active_for_owner_domain)}",
                     )
 
                 return CanonicalAdoptionResult(
@@ -3820,17 +3808,9 @@ class APExitEngine:
                 # exact known execution mode before we overwrite identity fields.
                 _repair_client = str(getattr(pos, "client_id", "") or "").strip().lower()
                 if not _client or _repair_client != _client:
-                    log.critical(
-                        "[exit_eng] RETRY_CLIENT_MISMATCH | "
-                        "contract=%s repair_client=%s canonical_client=%s — "
-                        "refusing unknown/cross-client adoption",
-                        _contract, _repair_client, _client,
-                    )
-                    return CanonicalAdoptionResult(
-                        disposition="RETRY_CLIENT_MISMATCH", adopted=False,
-                        safe_to_seed=False, retryable=True,
-                        reason=f"repair_client={_repair_client} != {_client}",
-                    )
+                    # Foreign-client repairs are a different ownership domain;
+                    # ignore them and continue scanning for Jason's exact repair.
+                    continue
 
                 _repair_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
                 _mode_ok = (
@@ -3839,17 +3819,9 @@ class APExitEngine:
                     and _repair_mode == _mode
                 )
                 if not _mode_ok:
-                    log.critical(
-                        "[exit_eng] RETRY_MODE_MISMATCH | "
-                        "contract=%s repair_mode=%s canonical_mode=%s — "
-                        "refusing unknown/incompatible mode adoption",
-                        _contract, _repair_mode, _mode,
-                    )
-                    return CanonicalAdoptionResult(
-                        disposition="RETRY_MODE_MISMATCH", adopted=False,
-                        safe_to_seed=False, retryable=True,
-                        reason=f"repair_mode={_repair_mode} vs canonical={_mode}",
-                    )
+                    # A different/unknown mode is likewise outside this exact
+                    # owner domain; it must not veto a later exact repair.
+                    continue
 
                 # Found a valid broker-repair position — upgrade in place.
                 old_id = _pid

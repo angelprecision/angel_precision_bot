@@ -1727,7 +1727,10 @@ def _place_standing_stop_best_effort(
 
         def _classify_helper_response(stop_resp):
             if stop_resp is True:
-                return _outcome("SUBMITTED")
+                return _outcome(
+                    "OUTCOME_UNPROVEN",
+                    detail_reason="broker_helper_success_without_order_id",
+                )
             if stop_resp is False:
                 return _outcome("FAILED", detail_reason="broker_helper_rejected")
             if not isinstance(stop_resp, dict):
@@ -1758,24 +1761,15 @@ def _place_standing_stop_best_effort(
                     detail_reason="broker_helper_rejected",
                     broker_stop_status=stop_stat,
                 )
-            if stop_id or stop_resp.get("success") is True or stop_stat in {
-                "accepted",
-                "open",
-                "working",
-                "submitted",
-                "queued",
-                "new",
-                "pending",
-                "live",
-            }:
+            if _has_proven_broker_order_id(stop_id):
                 return _outcome(
                     "SUBMITTED",
-                    broker_stop_id=str(stop_id or "").strip(),
+                    broker_stop_id=str(stop_id).strip(),
                     broker_stop_status=stop_stat or "unknown",
                 )
             return _outcome(
                 "OUTCOME_UNPROVEN",
-                detail_reason="broker_helper_response_missing_success_proof",
+                detail_reason="broker_helper_response_missing_order_id",
                 broker_stop_status=stop_stat or "unknown",
             )
 
@@ -1880,6 +1874,12 @@ def _place_standing_stop_best_effort(
                     detail_reason="broker_rest_response_parse_failed",
                     exception_type=type(exc).__name__,
                     exception=str(exc),
+                )
+            if not _has_proven_broker_order_id(stop_id):
+                return _outcome(
+                    "OUTCOME_UNPROVEN",
+                    detail_reason="broker_rest_response_missing_order_id",
+                    broker_stop_status=str(stop_stat or "unknown"),
                 )
             log.info(
                 "[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",
@@ -2251,6 +2251,13 @@ def _persist_canonical_handoff_standing_stop_state(
 ) -> bool:
     if state not in _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATES:
         return False
+    if state == "SUBMITTED" and not _has_proven_broker_order_id(broker_stop_id):
+        log.critical(
+            "[%s] refusing SUBMITTED standing-stop marker without broker order id | local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+        return False
     meta_patch = {
         _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATE_KEY: state,
         _CANONICAL_OWNER_HANDOFF_STANDING_STOP_ATTEMPTED_KEY: True,
@@ -2322,6 +2329,27 @@ def _claim_canonical_handoff_standing_stop(order: dict) -> dict:
         meta.get(_CANONICAL_OWNER_HANDOFF_STANDING_STOP_ID_KEY) or ""
     ).strip()
     if current_state == "SUBMITTED":
+        if not _has_proven_broker_order_id(broker_stop_id):
+            persisted = _persist_canonical_handoff_standing_stop_state(
+                order,
+                "OUTCOME_UNPROVEN",
+                detail_reason="submitted_state_missing_broker_stop_id",
+            )
+            if not persisted:
+                return _failure(
+                    "submitted_state_missing_broker_stop_id_persistence_failed",
+                    state="SUBMITTED",
+                )
+            return {
+                "ok": False,
+                "claimant": False,
+                "state": "OUTCOME_UNPROVEN",
+                "outcome": "OUTCOME_UNPROVEN",
+                "protection_proven": False,
+                "standing_stop_attempted": True,
+                "broker_stop_id": "",
+                "detail_reason": "submitted_state_missing_broker_stop_id",
+            }
         return {
             "ok": True,
             "claimant": False,
@@ -2422,13 +2450,45 @@ def _normalize_standing_stop_call_result(raw_result) -> dict:
     if isinstance(raw_result, dict):
         outcome = str(raw_result.get("outcome") or "").strip().upper()
         if outcome in {"SUBMITTED", "FAILED", "OUTCOME_UNPROVEN"}:
+            if outcome == "SUBMITTED":
+                broker_stop_id = str(raw_result.get("broker_stop_id") or "").strip()
+                if not _has_proven_broker_order_id(broker_stop_id):
+                    return dict(
+                        raw_result,
+                        ok=False,
+                        outcome="OUTCOME_UNPROVEN",
+                        broker_stop_id="",
+                        detail_reason=(
+                            raw_result.get("detail_reason")
+                            or "standing_stop_submitted_without_broker_order_id"
+                        ),
+                    )
+                return dict(raw_result, ok=True, outcome=outcome, broker_stop_id=broker_stop_id)
             return dict(raw_result, outcome=outcome)
         if raw_result.get("ok") is True:
-            return dict(raw_result, ok=True, outcome="SUBMITTED")
+            broker_stop_id = str(raw_result.get("broker_stop_id") or "").strip()
+            if not _has_proven_broker_order_id(broker_stop_id):
+                return dict(
+                    raw_result,
+                    ok=False,
+                    outcome="OUTCOME_UNPROVEN",
+                    broker_stop_id="",
+                    detail_reason="standing_stop_success_without_broker_order_id",
+                )
+            return dict(
+                raw_result,
+                ok=True,
+                outcome="SUBMITTED",
+                broker_stop_id=broker_stop_id,
+            )
         if raw_result.get("ok") is False:
             return dict(raw_result, ok=False, outcome="FAILED")
     if raw_result is True:
-        return {"ok": True, "outcome": "SUBMITTED"}
+        return {
+            "ok": False,
+            "outcome": "OUTCOME_UNPROVEN",
+            "detail_reason": "standing_stop_success_without_broker_order_id",
+        }
     if raw_result is False:
         return {"ok": False, "outcome": "FAILED"}
     return {
@@ -2459,6 +2519,17 @@ def _establish_canonical_handoff_standing_stop(
         )
     )
     outcome = call_result.get("outcome")
+    if outcome == "SUBMITTED" and not _has_proven_broker_order_id(
+        call_result.get("broker_stop_id")
+    ):
+        call_result = {
+            **call_result,
+            "ok": False,
+            "outcome": "OUTCOME_UNPROVEN",
+            "broker_stop_id": "",
+            "detail_reason": "standing_stop_submitted_without_broker_order_id",
+        }
+        outcome = call_result.get("outcome")
     if outcome == "SUBMITTED":
         persisted = _persist_canonical_handoff_standing_stop_state(
             order,
