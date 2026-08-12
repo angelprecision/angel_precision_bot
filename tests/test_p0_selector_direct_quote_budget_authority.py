@@ -879,7 +879,8 @@ class TestAggregateAuditTruthfulness:
 #   * receive an independent fresh selector budget;
 #   * preserve incident-shaped candidate rank and attempt/skip order;
 #   * recover the declared survivor or exhaust on zero/stale candidates;
-#   * report SELECTOR_REQUEST_BUDGET_EXHAUSTED only for all-failing fixtures;
+#   * report the canonical candidate-level retryable/terminal reason for
+#     all-failing fixtures, while preserving budget diagnostics separately;
 #   * NOT submit / cancel / replace any broker order;
 #   * persist the dedicated durable outcome RETRY_LATER_SELECTOR_BUDGET on
 #     the deferred-retry row with exact identity fields intact.
@@ -1111,9 +1112,10 @@ class TestJuly23FleetAcceptanceReplay:
         """8 tickers × 3 real production identities = 24 canonical
         selector requests. Each request receives its own fresh 8-call
         budget and follows an explicit incident fixture: recoverable cases
-        select the declared rank; all-failing cases exhaust with
-        SELECTOR_REQUEST_BUDGET_EXHAUSTED. Original quality reasons remain
-        attached and the selection pass never touches broker orders.
+        select the declared rank; all-failing cases retain their canonical
+        candidate-level zero-quote, structural, affordability, or budget
+        reason. Original quality reasons remain attached and the selection
+        pass never touches broker orders.
 
         Durable persistence of the resulting RETRY_LATER_SELECTOR_BUDGET
         row is exercised by
@@ -1147,6 +1149,8 @@ class TestJuly23FleetAcceptanceReplay:
                     diagnostics = failure["selection_diagnostics"]
                     assert failure["reason_code"] in {
                         "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                        "CHAIN_ROW_ZERO_BID_ASK",
+                        "DIRECT_QUOTE_ZERO_BID_ASK",
                         "MONEYNESS_OUT_OF_RANGE",
                         "DELTA_OUT_OF_RANGE",
                         "DTE_OUT_OF_RANGE",

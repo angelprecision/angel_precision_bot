@@ -1187,6 +1187,65 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     attempted = attempted if isinstance(attempted, dict) else {}
     skipped = data.get("structural_skip_results")
     skipped = skipped if isinstance(skipped, dict) else {}
+    candidate_outcomes = data.get("candidate_outcomes")
+    candidate_scoped = isinstance(candidate_outcomes, dict)
+    candidate_outcomes = candidate_outcomes if candidate_scoped else {}
+
+    # A durable cursor is intentionally retained across refreshed selector
+    # attempts for audit/restart continuity.  It is not, however, a current
+    # candidate universe.  When the deferred selector supplies the refreshed
+    # universe, make a local evidence view containing only symbols that still
+    # exist in that universe.  The caller's durable cursor is never mutated.
+    if "current_candidate_universe" in data:
+        raw_universe = data.get("current_candidate_universe")
+        if isinstance(raw_universe, (list, tuple, set, frozenset)):
+            current_candidate_universe = {
+                "".join(str(symbol or "").upper().split())
+                for symbol in raw_universe
+                if "".join(str(symbol or "").upper().split())
+            }
+            attempted = {
+                symbol: record
+                for symbol, record in attempted.items()
+                if "".join(str(symbol or "").upper().split())
+                in current_candidate_universe
+            }
+
+    def _attempt_reason(record) -> str:
+        if isinstance(record, dict):
+            return str(record.get("result_reason") or "")
+        return str(record or "")
+
+    # The aggregate quality buckets are useful diagnostics, but they are not
+    # candidate authority: one candidate's OI/spread rejection must not veto a
+    # different candidate whose provider/quote evidence remains retryable.
+    # Deferred selector calls provide this per-candidate map; older pure
+    # resolver callers retain the aggregate fallback below.
+    scoped_reasons = [
+        str(reason or "")
+        for reason in candidate_outcomes.values()
+        if str(reason or "")
+    ]
+    scoped_reasons.extend(
+        _attempt_reason(record)
+        for symbol, record in attempted.items()
+        if symbol not in candidate_outcomes and _attempt_reason(record)
+    )
+    eligible = list(data.get("eligible_unattempted_symbols") or [])
+    candidate_accounting_complete = (
+        bool(data.get("candidate_accounting_complete"))
+        if candidate_scoped
+        else True
+    )
+    candidate_has_unknown = any(
+        get_policy(reason).classification == UNKNOWN_FAIL_CLOSED
+        for reason in scoped_reasons
+        if not str(reason).startswith("STRUCTURAL_")
+    )
+    candidate_has_retryable = any(
+        get_policy(reason).classification == RETRYABLE_DATA
+        for reason in scoped_reasons
+    )
 
     # This amendment is surgical: it demotes ONLY affordability so that one
     # unaffordable candidate cannot terminalize a request while retryable
@@ -1213,50 +1272,77 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     }
     affordability_reasons = no_affordable_reasons | premium_cap_reasons
 
-    # ── Step 2: terminal policy veto (excluding affordability) ───────────────
-    terminal_policy = next(
-        (
+    # ── Steps 2–3: terminal authority over the viable candidate set ─────────
+    # In a real deferred selector call, terminal policy/quality can apply only
+    # after candidate-scoped accounting proves that no candidate is still
+    # retryable, unattempted, or unknown. Aggregate reject buckets remain the
+    # compatibility path for callers that do not provide candidate outcomes.
+    if candidate_scoped:
+        scoped_non_structural = [
             reason
-            for reason in quality
-            if reason not in affordability_reasons
-            and get_policy(reason).classification == TERMINAL_POLICY
-        ),
-        None,
-    )
-    if terminal_policy:
-        return terminal_policy
-
-    # ── Step 3: non-affordability terminal structural geometry ───────────────
-    # The affordability structural skips are intentionally EXCLUDED here and
-    # resolved by the full-set affordability accounting below. This preserves
-    # the pre-amendment position of DTE/moneyness/delta/policy geometry.
-    structural_values = set(skipped.values())
-    for structural, canonical in (
-        ("STRUCTURAL_DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
-        ("STRUCTURAL_MONEYNESS_OUT_OF_RANGE", "MONEYNESS_OUT_OF_RANGE"),
-        ("STRUCTURAL_DELTA_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE"),
-        ("STRUCTURAL_TERMINAL_POLICY_REJECT", "TERMINAL_POLICY_REJECT"),
-    ):
-        if structural in structural_values:
-            return canonical
-
-    # ── Step 4: terminal quality veto (excluding affordability) ──────────────
-    terminal_quality = next(
-        (
+            for reason in scoped_reasons
+            if not str(reason).startswith("STRUCTURAL_")
+        ]
+        scoped_non_affordability = [
             reason
-            for reason in quality
+            for reason in scoped_non_structural
             if reason not in affordability_reasons
-            and get_policy(reason).classification == TERMINAL_QUALITY
-        ),
-        None,
-    )
-    if terminal_quality:
-        return terminal_quality
+        ]
+        if (
+            candidate_accounting_complete
+            and not eligible
+            and not candidate_has_retryable
+            and not candidate_has_unknown
+        ):
+            terminal_policy = next(
+                (
+                    reason
+                    for reason in scoped_non_affordability
+                    if get_policy(reason).classification == TERMINAL_POLICY
+                ),
+                None,
+            )
+            if terminal_policy:
+                return terminal_policy
 
-    # ── Step 5: actual request-budget exhaustion with candidates left ────────
+            terminal_quality = next(
+                (
+                    reason
+                    for reason in scoped_non_affordability
+                    if get_policy(reason).classification == TERMINAL_QUALITY
+                ),
+                None,
+            )
+            if terminal_quality:
+                return terminal_quality
+    else:
+        terminal_policy = next(
+            (
+                reason
+                for reason in quality
+                if reason not in affordability_reasons
+                and get_policy(reason).classification == TERMINAL_POLICY
+            ),
+            None,
+        )
+        if terminal_policy:
+            return terminal_policy
+
+        terminal_quality = next(
+            (
+                reason
+                for reason in quality
+                if reason not in affordability_reasons
+                and get_policy(reason).classification == TERMINAL_QUALITY
+            ),
+            None,
+        )
+        if terminal_quality:
+            return terminal_quality
+
+    # ── Step 4: actual request-budget exhaustion with candidates left ────────
     # A single affordability skip may not outrank actual exhaustion while
     # another eligible candidate remains unattempted.
-    eligible = list(data.get("eligible_unattempted_symbols") or [])
     if (
         bool(data.get("actual_limit_reached"))
         and bool(data.get("budget_exhausted_stage"))
@@ -1264,40 +1350,72 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     ):
         return "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
 
-    # ── Step 6: retryable attempted-data failure ─────────────────────────────
+    # ── Step 5: retryable attempted-data failure ─────────────────────────────
     transient_counts: dict[str, int] = {}
     for record in attempted.values():
-        if isinstance(record, dict):
-            reason = str(record.get("result_reason") or "")
-        else:
-            reason = str(record or "")
+        reason = _attempt_reason(record)
         if reason and get_policy(reason).classification == RETRYABLE_DATA:
             transient_counts[reason] = transient_counts.get(reason, 0) + 1
     if transient_counts:
         return sorted(transient_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
-    # ── Step 7: retryable quality/data failure ───────────────────────────────
-    retryable_quality = [
-        (str(reason), int(count or 0))
-        for reason, count in quality.items()
-        if get_policy(str(reason)).classification == RETRYABLE_DATA
-    ]
+    # ── Step 6: retryable quality/data failure ───────────────────────────────
+    if candidate_scoped:
+        retryable_quality_counts: dict[str, int] = {}
+        for reason in scoped_reasons:
+            if get_policy(reason).classification == RETRYABLE_DATA:
+                retryable_quality_counts[reason] = retryable_quality_counts.get(reason, 0) + 1
+        retryable_quality = list(retryable_quality_counts.items())
+    else:
+        retryable_quality = [
+            (str(reason), int(count or 0))
+            for reason, count in quality.items()
+            if get_policy(str(reason)).classification == RETRYABLE_DATA
+        ]
     if retryable_quality:
         return sorted(retryable_quality, key=lambda item: (-item[1], item[0]))[0][0]
+
+    # ── Step 7: non-affordability terminal structural geometry ───────────────
+    # Structural geometry is authoritative only after the relevant candidate
+    # set has been accounted for. In particular, one far-OTM/DTE/delta row
+    # must not terminalize a request while a different candidate is still
+    # unresolved for retryable provider/quote data. The durable eligible list
+    # is the selector's explicit proof that an eligible direct-quote candidate
+    # remains unattempted; an empty list is required before structural truth
+    # can terminalize the request.
+    structural_values = set(skipped.values())
+    if (
+        not eligible
+        and candidate_accounting_complete
+        and not candidate_has_retryable
+        and not candidate_has_unknown
+    ):
+        for structural, canonical in (
+            ("STRUCTURAL_DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
+            ("STRUCTURAL_MONEYNESS_OUT_OF_RANGE", "MONEYNESS_OUT_OF_RANGE"),
+            ("STRUCTURAL_DELTA_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE"),
+            ("STRUCTURAL_TERMINAL_POLICY_REJECT", "TERMINAL_POLICY_REJECT"),
+        ):
+            if structural in structural_values:
+                return canonical
 
     # ── Step 8: affordability terminal — only when the FULL candidate set is
     # accounted for and every accounted candidate is an affordability reason.
     # Do NOT infer the whole set is unaffordable because one candidate is.
     # (no_affordable_reasons / premium_cap_reasons / affordability_reasons are
     # declared once near the top of this function.)
-    accounted_reasons: list[str] = []
-    for record in attempted.values():
-        if isinstance(record, dict):
-            accounted_reasons.append(str(record.get("result_reason") or ""))
-        else:
-            accounted_reasons.append(str(record or ""))
-    accounted_reasons.extend(str(value or "") for value in skipped.values())
-    accounted_reasons.extend(str(reason or "") for reason in quality.keys())
+    if candidate_scoped:
+        accounted_reasons = list(scoped_reasons)
+        accounted_reasons.extend(
+            str(value or "") for value in skipped.values()
+            if str(value or "") not in accounted_reasons
+        )
+    else:
+        accounted_reasons = []
+        for record in attempted.values():
+            accounted_reasons.append(_attempt_reason(record))
+        accounted_reasons.extend(str(value or "") for value in skipped.values())
+        accounted_reasons.extend(str(reason or "") for reason in quality.keys())
     accounted_reasons = [reason for reason in accounted_reasons if reason]
 
     # Affordability is the terminal reason ONLY when the entire candidate set is
@@ -1314,6 +1432,9 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     # truthful higher-priority reason above or to UNKNOWN.
     if (
         not eligible
+        and (not candidate_scoped or candidate_accounting_complete)
+        and not candidate_has_retryable
+        and not candidate_has_unknown
         and accounted_reasons
         and all(reason in affordability_reasons for reason in accounted_reasons)
     ):

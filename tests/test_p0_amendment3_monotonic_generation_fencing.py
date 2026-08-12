@@ -27,6 +27,9 @@ assert the fencing contract deterministically without a live database.
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -240,6 +243,182 @@ def test_two_claims_same_prior_generation_bind_identical_expected_previous(db_sp
     # Both are single atomic UPDATEs carrying the generation predicate.
     assert a_sql == b_sql
     assert "materialization_generation')::int, 0) = %s" in a_sql
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Real PostgreSQL claim/CAS regressions for PR #439
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _real_osm_claim(monkeypatch, initial_meta: dict):
+    """Run the production APOrderStateMachine claim against PostgreSQL."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "").strip()
+    if not database_url:
+        pytest.skip("disposable PostgreSQL URL not configured")
+
+    import psycopg2.extras
+
+    schema = f"pr439_osm_claim_{uuid.uuid4().hex}"
+    local_order_id = f"oid-pr439-{uuid.uuid4().hex}"
+    signal_id = f"sig-pr439-{uuid.uuid4().hex}"
+    client_id = "client@example.com"
+
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(
+                f"""
+                CREATE TABLE "{schema}".orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    broker_order_id TEXT,
+                    submitted_ts TIMESTAMPTZ,
+                    signal_id TEXT,
+                    execution_mode TEXT NOT NULL,
+                    meta JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+
+        stored_meta = dict(initial_meta)
+        with admin.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO "{schema}".orders
+                    (local_order_id, client_id, kind, status, signal_id,
+                     execution_mode, meta)
+                VALUES (%s, %s, 'ENTRY', 'PENDING_TRIGGER', %s, 'live', %s::jsonb)
+                """,
+                (
+                    local_order_id,
+                    client_id,
+                    signal_id,
+                    json.dumps(stored_meta),
+                ),
+            )
+
+        @contextmanager
+        def _pg_conn():
+            connection = psycopg2.connect(database_url)
+            cursor = connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            try:
+                cursor.execute(f'SET search_path TO "{schema}"')
+
+                class _Wrapper:
+                    @property
+                    def rowcount(self):
+                        return cursor.rowcount
+
+                    def execute(self, sql, params=()):
+                        cursor.execute(sql, params)
+                        return self
+
+                yield _Wrapper()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                cursor.close()
+                connection.close()
+
+        def _read_meta_and_updated_ts():
+            connection = psycopg2.connect(database_url)
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT meta, updated_ts
+                        FROM "{schema}".orders
+                        WHERE local_order_id = %s
+                        """,
+                        (local_order_id,),
+                    )
+                    row = cursor.fetchone()
+                    return row[0], row[1]
+            finally:
+                connection.close()
+
+        monkeypatch.setattr(osm_mod, "conn", _pg_conn)
+        monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, *a, **k: fn())
+        before = _read_meta_and_updated_ts()
+        osm = APOrderStateMachine(client_id)
+        result = osm.claim_deferred_materialization(
+            local_order_id,
+            owner="materializer:pr439",
+            new_generation=2,
+            lease_until=(datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+            trigger_crossed_at=datetime.now(timezone.utc).isoformat(),
+            trigger_price=100.0,
+            observed_underlying_price=100.2,
+            signal_id=signal_id,
+            execution_mode="live",
+            retry_attempt=2,
+        )
+        after = _read_meta_and_updated_ts()
+        return result, before, after
+    finally:
+        with admin.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+def test_real_osm_claim_aligned_counters_advance_together(monkeypatch):
+    result, before, after = _real_osm_claim(
+        monkeypatch,
+        {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_generation": 1,
+            "broker_ready": False,
+            "retry_attempt": 1,
+            "breach_attempt_count": 1,
+            "materialization_attempts": 1,
+        },
+    )
+    assert result is True
+    assert after[0]["materialization_generation"] == 2
+    assert after[0]["retry_attempt"] == 2
+    assert after[0]["breach_attempt_count"] == 2
+    assert after[0]["materialization_attempts"] == 2
+    assert after[0] != before[0]
+
+
+def test_real_osm_claim_counter_mismatch_fails_without_mutation(monkeypatch):
+    result, before, after = _real_osm_claim(
+        monkeypatch,
+        {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_generation": 1,
+            "broker_ready": False,
+            "retry_attempt": 1,
+            "breach_attempt_count": 99,
+            "materialization_attempts": 99,
+        },
+    )
+    assert result is False
+    assert after == before
+
+
+def test_real_osm_claim_malformed_counter_fails_without_mutation(monkeypatch):
+    result, before, after = _real_osm_claim(
+        monkeypatch,
+        {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_generation": 1,
+            "broker_ready": False,
+            "retry_attempt": 1,
+            "breach_attempt_count": 1,
+            "materialization_attempts": "not-an-integer",
+        },
+    )
+    assert result is False
+    assert after == before
 
 
 # ═══════════════════════════════════════════════════════════════════════
