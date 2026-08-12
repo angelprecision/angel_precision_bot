@@ -2189,6 +2189,115 @@ class APOrderStateMachine:
             )
             return False
 
+    def cas_entry_efficiency_state(
+        self,
+        local_order_id: str,
+        *,
+        signal_id: str,
+        canonical_signal_id: str,
+        client_id: str,
+        execution_mode: str,
+        expected_state: str,
+        expected_generation: int,
+        next_state: str,
+        next_generation: int,
+        meta_patch: dict,
+    ) -> bool:
+        """CAS one pre-submit entry-efficiency lifecycle transition.
+
+        This is intentionally narrower than ``update_order_meta``.  It proves
+        the exact entry identity and refuses to touch a row once broker intent,
+        broker ownership, split-brain quarantine, or reconciliation has
+        appeared.  A failed CAS is therefore a safety stop, never permission
+        to continue toward selector or broker work.
+        """
+        local_id = str(local_order_id or "").strip()
+        durable_signal_id = str(signal_id or "").strip()
+        durable_canonical_signal_id = str(canonical_signal_id or "").strip()
+        durable_client_id = str(client_id or "").strip().lower()
+        durable_mode = str(execution_mode or "").strip().lower()
+        try:
+            expected_gen = int(expected_generation)
+            next_gen = int(next_generation)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            not local_id
+            or not durable_signal_id
+            or not durable_canonical_signal_id
+            or not durable_client_id
+            or durable_mode not in {"paper", "live"}
+            or expected_gen < 0
+            or next_gen != expected_gen + 1
+        ):
+            return False
+        try:
+            patch_json = json.dumps(
+                {
+                    **dict(meta_patch or {}),
+                    "entry_efficiency_state": str(next_state or ""),
+                    "entry_efficiency_generation": next_gen,
+                },
+                default=str,
+            )
+        except Exception:
+            return False
+
+        def _fn():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                    "    updated_ts = NOW() "
+                    "WHERE local_order_id=%s "
+                    "  AND client_id=%s "
+                    "  AND kind='ENTRY' "
+                    "  AND COALESCE(signal_id,'')=%s "
+                    "  AND COALESCE(canonical_signal_id, NULLIF(meta->>'canonical_signal_id',''), '')=%s "
+                    "  AND LOWER(COALESCE(execution_mode,''))=%s "
+                    "  AND status='PENDING_TRIGGER' "
+                    "  AND COALESCE(broker_order_id,'')='' "
+                    "  AND submitted_ts IS NULL "
+                    "  AND NULLIF(COALESCE(meta->>'submit_intent_at',''), '') IS NULL "
+                    "  AND LOWER(COALESCE(meta->>'split_brain_quarantine','false')) IN ('false','') "
+                    "  AND LOWER(COALESCE(meta->>'reconciliation_required','false')) IN ('false','') "
+                    "  AND COALESCE(meta->>'entry_efficiency_state','')=%s "
+                    "  AND CASE "
+                    "        WHEN COALESCE(meta->>'entry_efficiency_generation','') ~ '^[0-9]+$' "
+                    "        THEN (meta->>'entry_efficiency_generation')::int "
+                    "        ELSE 0 "
+                    "      END=%s",
+                    (
+                        patch_json,
+                        local_id,
+                        durable_client_id,
+                        durable_signal_id,
+                        durable_canonical_signal_id,
+                        durable_mode,
+                        str(expected_state or ""),
+                        expected_gen,
+                    ),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.critical(
+                "[%s] entry-efficiency CAS failed local_order_id=%s signal_id=%s "
+                "expected=%s/%s next=%s/%s error=%s",
+                self.client_id,
+                local_id,
+                durable_signal_id,
+                expected_state,
+                expected_gen,
+                next_state,
+                next_gen,
+                exc,
+            )
+            return False
+
     def retire_unsubmitted_exit_intent(self, local_order_id: str, *, last_error: str) -> bool:
         """Atomically retire one EXIT_REQUESTED row only if no submit evidence exists."""
         error_text = str(last_error or "NO_POST_ATTEMPTED")

@@ -12,7 +12,7 @@ import json as _json
 import sys as _sys
 import threading as _threading
 from dataclasses import dataclass as _dataclass, field as _field
-from datetime import datetime as _datetime, timezone as _timezone
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 from pathlib import Path as _Path
 from typing import Any as _Any, Optional as _Optional
 
@@ -37,6 +37,42 @@ _SIDE_ALIASES = {
     "BEAR": "PUT", "BEARISH": "PUT",
 }
 _TERMINAL_ENTRY = frozenset({"CANCELED", "EXPIRED", "REJECTED", "ERROR"})
+_ENTRY_EFFICIENCY_WAIT_STATES = frozenset({
+    "WAIT_CONFIRMATION",
+    "REARM_FOR_REBREACH",
+})
+
+
+def _parse_entry_efficiency_at(value: _Any) -> _datetime | None:
+    if isinstance(value, _datetime):
+        parsed = value
+    elif value is None or str(value).strip() == "":
+        return None
+    else:
+        try:
+            parsed = _datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_timezone.utc)
+    return parsed.astimezone(_timezone.utc)
+
+
+def _entry_efficiency_relation(watched: _Any, bid: float, ask: float) -> bool:
+    trigger = getattr(watched, "entry_trigger", None)
+    try:
+        trigger_value = float(trigger)
+    except (TypeError, ValueError):
+        return False
+    if str(getattr(watched, "side", "")).upper() == "PUT":
+        return bid > 0 and bid <= trigger_value
+    return ask > 0 and ask >= trigger_value
+
+
+def _entry_efficiency_truthy(value: _Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @_dataclass(frozen=True)
@@ -111,6 +147,132 @@ class WatchedSignal(_BaseWatchedSignal):
             raise ValueError(f"[{ticker or 'UNKNOWN'}] invalid_or_missing_side; expected CALL or PUT")
         signal["side"] = side
         super().__init__(signal, overnight=overnight)
+        metadata = signal.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = _json.loads(metadata)
+            except Exception:
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        self.entry_efficiency_state = str(
+            metadata.get("entry_efficiency_state") or ""
+        ).strip().upper()
+        try:
+            self.entry_efficiency_generation = max(
+                0, int(metadata.get("entry_efficiency_generation") or 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.entry_efficiency_generation = 0
+        self.entry_efficiency_rearm_pending = bool(
+            _entry_efficiency_truthy(metadata.get("entry_efficiency_rearm_pending"))
+        )
+        self.entry_efficiency_rebreach_at = _parse_entry_efficiency_at(
+            metadata.get("entry_efficiency_rebreach_at")
+        )
+        self.entry_efficiency_next_eval_at = _parse_entry_efficiency_at(
+            metadata.get("entry_efficiency_next_eval_at")
+        )
+        self.entry_efficiency_deadline_at = _parse_entry_efficiency_at(
+            metadata.get("entry_efficiency_deadline_at")
+        )
+        self._entry_efficiency_persistence_blocked = False
+        self._entry_efficiency_persist_request: dict[str, _Any] | None = None
+
+    def _stage_entry_efficiency_rearm(self, *, bid: float, ask: float) -> None:
+        expected_state = str(self.entry_efficiency_state or "WAIT_CONFIRMATION").upper()
+        expected_generation = int(getattr(self, "entry_efficiency_generation", 0) or 0)
+        now = _datetime.now(_timezone.utc)
+        next_at = now + _timedelta(seconds=5)
+        self.entry_efficiency_state = "REARM_FOR_REBREACH"
+        self.entry_efficiency_generation = expected_generation + 1
+        self.entry_efficiency_rearm_pending = True
+        self.entry_efficiency_next_eval_at = None
+        self._entry_efficiency_persist_request = {
+            "expected_state": expected_state,
+            "expected_generation": expected_generation,
+            "next_state": "REARM_FOR_REBREACH",
+            "next_generation": expected_generation + 1,
+            "rollback_state": expected_state,
+            "rollback_generation": expected_generation,
+            "rollback_rearm_pending": False,
+            "rollback_next_eval_at": next_at,
+            "patch": {
+                "entry_efficiency_rearm_pending": True,
+                "entry_efficiency_next_eval_at": None,
+                "entry_efficiency_rearm_bid": bid,
+                "entry_efficiency_rearm_ask": ask,
+                "entry_efficiency_rearm_detected_at": now.isoformat(),
+            },
+        }
+
+    def check(self, bid: float, ask: float, quote_age_ms: _Optional[int] = None) -> str:
+        prior_state = str(getattr(self, "entry_efficiency_state", "") or "").upper()
+        if prior_state not in _ENTRY_EFFICIENCY_WAIT_STATES:
+            return super().check(bid, ask, quote_age_ms=quote_age_ms)
+
+        prior_generation = int(getattr(self, "entry_efficiency_generation", 0) or 0)
+        prior_rearm = bool(getattr(self, "entry_efficiency_rearm_pending", False))
+        prior_next = getattr(self, "entry_efficiency_next_eval_at", None)
+        prior_crossed = getattr(self, "trigger_crossed_at", None)
+        prior_triggered = getattr(self, "triggered_at", None)
+        prior_trigger_price = getattr(self, "trigger_price", None)
+        prior_first_bid = getattr(self, "first_breach_bid", 0.0)
+        prior_first_ask = getattr(self, "first_breach_ask", 0.0)
+        prior_breach_price = getattr(self, "breach_price", 0.0)
+        if (
+            prior_state == "REARM_FOR_REBREACH"
+            and self.breach_count == 0
+            and _entry_efficiency_relation(self, bid, ask)
+        ):
+            self.entry_efficiency_rebreach_at = _datetime.now(_timezone.utc)
+        new_state = super().check(bid, ask, quote_age_ms=quote_age_ms)
+
+        if new_state in {
+            _base.WatchState.EXPIRED,
+            _base.WatchState.INVALIDATED,
+        }:
+            return new_state
+
+        if prior_state == "WAIT_CONFIRMATION" and not _entry_efficiency_relation(self, bid, ask):
+            # A pullback is a durable re-arm candidate, but its state change is
+            # not trusted until the OSM CAS in the poll loop succeeds.
+            self.breach_count = 0
+            self._stage_entry_efficiency_rearm(bid=bid, ask=ask)
+            self.state = _base.WatchState.PENDING
+            return self.state
+
+        if prior_state == "REARM_FOR_REBREACH" and not _entry_efficiency_relation(
+            self, bid, ask
+        ):
+            self.breach_count = 0
+            self.state = _base.WatchState.PENDING
+            return self.state
+
+        if prior_state == "WAIT_CONFIRMATION":
+            next_at = _parse_entry_efficiency_at(prior_next)
+            due = next_at is None or _datetime.now(_timezone.utc) >= next_at
+            if not due and new_state == _base.WatchState.TRIGGERED:
+                # The underlying watcher may have completed its ordinary
+                # two-poll breach while the efficiency clock is still held.
+                # Roll back only that in-memory confirmation; no durable
+                # trigger proof is allowed to advance during the wait.
+                self.state = _base.WatchState.PENDING
+                self.breach_count = 0
+                self._pending_first_breach_at = None
+                self.trigger_crossed_at = prior_crossed
+                self.triggered_at = prior_triggered
+                self.trigger_price = prior_trigger_price
+                self.first_breach_bid = prior_first_bid
+                self.first_breach_ask = prior_first_ask
+                self.breach_price = prior_breach_price
+                self.entry_efficiency_state = prior_state
+                self.entry_efficiency_generation = prior_generation
+                self.entry_efficiency_rearm_pending = prior_rearm
+                self.entry_efficiency_next_eval_at = prior_next
+                return self.state
+
+        return new_state
 
 
 class APEntryWatcher(_BaseAPEntryWatcher):
@@ -127,6 +289,76 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         # Serializes registry admission without extending self._lock across OSM/DB work.
         self._watch_admission_gate = _threading.RLock()
         self._watch_poll_gate = _threading.RLock()
+
+    def _persist_entry_efficiency_transition(self, watched, request: dict) -> bool:
+        """Persist one staged watcher transition outside the watcher lock."""
+        osm = getattr(self, "order_state_machine", None)
+        cas = getattr(osm, "cas_entry_efficiency_state", None)
+        signal = getattr(watched, "signal", {}) or {}
+        metadata = signal.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if not callable(cas):
+            return False
+        client_id = str(
+            signal.get("client_id")
+            or signal.get("client_email")
+            or metadata.get("client_id")
+            or ""
+        ).strip().lower()
+        execution_mode = str(
+            signal.get("execution_mode")
+            or metadata.get("execution_mode")
+            or getattr(self, "mode", "")
+            or ""
+        ).strip().lower()
+        local_order_id = str(signal.get("local_order_id") or "").strip()
+        signal_id = str(signal.get("signal_id") or "").strip()
+        canonical_signal_id = str(
+            signal.get("canonical_signal_id")
+            or metadata.get("canonical_signal_id")
+            or ""
+        ).strip()
+        patch = dict(request.get("patch") or {})
+        try:
+            ok = bool(cas(
+                local_order_id,
+                signal_id=signal_id,
+                canonical_signal_id=canonical_signal_id,
+                client_id=client_id,
+                execution_mode=execution_mode,
+                expected_state=request.get("expected_state", ""),
+                expected_generation=int(request.get("expected_generation") or 0),
+                next_state=str(request.get("next_state") or ""),
+                next_generation=int(request.get("next_generation") or 0),
+                meta_patch=patch,
+            ))
+        except Exception:
+            ok = False
+        if not ok:
+            return False
+        next_state = str(request.get("next_state") or "").upper()
+        next_generation = int(request.get("next_generation") or 0)
+        metadata.update(patch)
+        metadata["entry_efficiency_state"] = next_state
+        metadata["entry_efficiency_generation"] = next_generation
+        signal["metadata"] = metadata
+        watched.entry_efficiency_state = next_state
+        watched.entry_efficiency_generation = next_generation
+        watched.entry_efficiency_rearm_pending = bool(
+            _entry_efficiency_truthy(metadata.get("entry_efficiency_rearm_pending"))
+        )
+        watched.entry_efficiency_rebreach_at = _parse_entry_efficiency_at(
+            metadata.get("entry_efficiency_rebreach_at")
+        )
+        watched.entry_efficiency_next_eval_at = _parse_entry_efficiency_at(
+            metadata.get("entry_efficiency_next_eval_at")
+        )
+        watched.entry_efficiency_deadline_at = _parse_entry_efficiency_at(
+            metadata.get("entry_efficiency_deadline_at")
+        )
+        watched._entry_efficiency_persistence_blocked = False
+        return True
 
     @property
     def _last_reject_reason(self) -> str:
