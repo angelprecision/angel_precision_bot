@@ -1131,6 +1131,12 @@ class APBrokerReconciler:
                     filled_ts=str(row["filled_ts"]) if row.get("filled_ts") else None,
                     local_order_id=str(row.get("local_order_id") or ""),
                     broker_order_id=str(row.get("broker_order_id") or ""),
+                    expected_pending_exit_local_order_id=str(
+                        row.get("local_order_id") or ""
+                    ),
+                    expected_pending_exit_broker_order_id=str(
+                        row.get("broker_order_id") or ""
+                    ),
                     close_source="reconciler_broker_exit_fill",
                     close_confidence="HIGH",
                 )

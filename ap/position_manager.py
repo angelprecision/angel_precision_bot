@@ -2165,6 +2165,8 @@ class APPositionManager:
         filled_ts: Optional[str] = None,
         local_order_id: str = "",
         broker_order_id: str = "",
+        expected_pending_exit_local_order_id: str = "",
+        expected_pending_exit_broker_order_id: str = "",
         close_source: str = "broker_exit_fill",
         close_confidence: str = "HIGH",
         exit_reason: str = "exit_filled",
@@ -2182,7 +2184,41 @@ class APPositionManager:
         Called by:
           - APOrderStateMachine.transition() when EXIT_FILLED succeeds
           - APBrokerReconciler._heal_exit_filled_positions_from_orders() as backup
+
+        The reconciler backup path supplies the EXIT identity pair it proved
+        before entering this method. When supplied, that pair is rechecked
+        against the position row while the position lock is held, so a
+        replacement or one-sided pending EXIT can never finalize from stale
+        healer evidence.
         """
+        expected_pending_local = str(
+            expected_pending_exit_local_order_id or ""
+        ).strip()
+        expected_pending_broker = str(
+            expected_pending_exit_broker_order_id or ""
+        ).strip()
+        if expected_pending_local or expected_pending_broker:
+            supplied_local = str(local_order_id or "").strip()
+            supplied_broker = str(broker_order_id or "").strip()
+            if (
+                not expected_pending_local
+                or not expected_pending_broker
+                or supplied_local != expected_pending_local
+                or supplied_broker != expected_pending_broker
+            ):
+                log.critical(
+                    "[%s] close_position_from_exit_fill blocked | pos=%s "
+                    "invalid expected EXIT identity pair local=%s broker=%s "
+                    "supplied_local=%s supplied_broker=%s",
+                    self.client_id,
+                    position_id,
+                    expected_pending_local,
+                    expected_pending_broker,
+                    supplied_local,
+                    supplied_broker,
+                )
+                return False
+
         try:
             exit_px  = float(exit_price or 0)
             fill_qty = int(filled_qty or 0)
@@ -2211,6 +2247,33 @@ class APPositionManager:
                 pos = c.fetchone()
                 if not pos:
                     return False, "position_not_found"
+
+                if expected_pending_local or expected_pending_broker:
+                    locked_pending_local = str(
+                        pos.get("pending_exit_local_order_id") or ""
+                    ).strip()
+                    locked_pending_broker = str(
+                        pos.get("pending_exit_broker_order_id") or ""
+                    ).strip()
+                    if (
+                        not locked_pending_local
+                        or not locked_pending_broker
+                        or locked_pending_local != expected_pending_local
+                        or locked_pending_broker != expected_pending_broker
+                    ):
+                        log.warning(
+                            "[%s] close_position_from_exit_fill blocked | pos=%s "
+                            "EXIT identity changed before finalization "
+                            "expected_local=%s expected_broker=%s "
+                            "locked_local=%s locked_broker=%s",
+                            self.client_id,
+                            position_id,
+                            expected_pending_local,
+                            expected_pending_broker,
+                            locked_pending_local,
+                            locked_pending_broker,
+                        )
+                        return False, "exit_identity_changed_before_finalize"
 
                 # ── Canonical state classification under FOR UPDATE (PR #386) ─
                 # The row lock is the ONLY correct serialization point. Any

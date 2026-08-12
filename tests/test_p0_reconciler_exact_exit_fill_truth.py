@@ -297,6 +297,86 @@ def test_backup_healer_requires_exact_current_exit_generation_pair(
     assert "O.BROKER_ORDER_ID = P.PENDING_EXIT_BROKER_ORDER_ID" in healer_sql
     assert fake_pm.close_position_from_exit_fill.call_count == expected_heals
     assert summary["positions_corrected"] == expected_heals
+    if expected_heals:
+        close_kwargs = fake_pm.close_position_from_exit_fill.call_args.kwargs
+        assert close_kwargs["expected_pending_exit_local_order_id"] == row_local
+        assert close_kwargs["expected_pending_exit_broker_order_id"] == row_broker
+
+
+@pytest.mark.parametrize(
+    ("locked_local", "locked_broker"),
+    [
+        pytest.param("", "222", id="locked-local-missing"),
+        pytest.param("exit-B", "", id="locked-broker-missing"),
+        pytest.param("exit-C", "333", id="locked-pair-replaced"),
+    ],
+)
+def test_backup_healer_finalizer_rechecks_both_exit_identities_under_lock(
+    monkeypatch,
+    locked_local: str,
+    locked_broker: str,
+):
+    """Stale healer evidence cannot finalize after the pending EXIT changes."""
+    position = {
+        "id": POSITION_ID,
+        "client_id": CLIENT,
+        "status": "OPEN",
+        "qty": 2,
+        "quantity_remaining": 2,
+        "avg_fill": 2.33,
+        "pending_exit_local_order_id": locked_local,
+        "pending_exit_broker_order_id": locked_broker,
+    }
+    updates: list[tuple] = []
+
+    class _Cursor:
+        def __init__(self):
+            self._row = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if compact.startswith("SELECT * FROM POSITIONS") and "FOR UPDATE" in compact:
+                self._row = dict(position)
+            elif compact.startswith("UPDATE POSITIONS"):
+                updates.append((sql, params))
+
+        def fetchone(self):
+            return self._row
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(position_manager_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(position_manager_mod, "run_with_retry", lambda fn: fn())
+
+    pm = position_manager_mod.APPositionManager(CLIENT)
+    ok = pm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=4.79,
+        filled_qty=2,
+        filled_ts="2026-08-10T19:00:00+00:00",
+        local_order_id="exit-B",
+        broker_order_id="222",
+        expected_pending_exit_local_order_id="exit-B",
+        expected_pending_exit_broker_order_id="222",
+        close_source="reconciler_broker_exit_fill",
+        close_confidence="HIGH",
+    )
+
+    assert ok is False
+    assert updates == []
 
 
 def test_exact_c_incident_old_same_ticker_fill_is_not_evidence(monkeypatch):
