@@ -4181,6 +4181,16 @@ class APContractSelectionEngine:
                         )
                         or {}
                     )
+                    # The cursor is durable audit history, not authority for
+                    # a refreshed candidate universe.  Keep every historical
+                    # record in the cursor, but expose only current-universe
+                    # records to the final-reason reducer so a disappeared
+                    # symbol cannot revive an old retryable outcome.
+                    _current_cursor_attempted = {
+                        _symbol: _record
+                        for _symbol, _record in _cursor_attempted.items()
+                        if _symbol in _recovery_candidate_universe
+                    }
                     _structural_reasons = {
                         item.get("symbol"): item.get("skip_reason")
                         for item in request_context.structural_skips
@@ -4228,9 +4238,12 @@ class APContractSelectionEngine:
                         "eligible_unattempted_symbols": list(
                             request_context.direct_quote_unattempted_symbols
                         ),
-                        "attempted_results": _cursor_attempted,
+                        "attempted_results": _current_cursor_attempted,
                         "structural_skip_results": _structural_reasons,
                         "candidate_outcomes": dict(_recovery_candidate_outcomes),
+                        "current_candidate_universe": list(
+                            _recovery_candidate_universe
+                        ),
                         "candidate_accounting_complete": _candidate_accounting_complete,
                         "candidate_universe_count": len(_recovery_candidate_universe),
                         "candidate_accounted_count": len(

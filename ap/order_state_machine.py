@@ -2754,12 +2754,51 @@ class APOrderStateMachine:
                 _attempt_predicate = ""
                 _attempt_params: list = []
                 if _prev_attempt is not None:
-                    # Verify the canonical retry_attempt is at the expected
-                    # prior value — prevents double-claiming an attempt slot.
-                    _attempt_predicate = (
-                        " AND COALESCE((meta->>'retry_attempt')::int, 0) = %s"
+                    # Verify every canonical durable attempt counter before
+                    # merging the next value.  The runtime resolver treats a
+                    # missing/blank field as absent, but any present field
+                    # must be a non-negative integer equal to the expected
+                    # prior attempt.  CASE keeps malformed text out of the
+                    # numeric cast, so malformed rows simply miss the CAS
+                    # and cannot be rewritten into apparent agreement.
+                    _counter_predicates = []
+                    for _counter_name in (
+                        "retry_attempt",
+                        "breach_attempt_count",
+                        "materialization_attempts",
+                    ):
+                        _counter_value = (
+                            "NULLIF(BTRIM(meta->>'"
+                            + _counter_name
+                            + "'), '')"
+                        )
+                        _counter_predicates.append(
+                            " CASE"
+                            f" WHEN {_counter_value} IS NULL THEN TRUE"
+                            f" WHEN {_counter_value} ~ '^[0-9]+$'"
+                            f" THEN {_counter_value}::numeric = %s"
+                            " ELSE FALSE END"
+                        )
+                    _present_counter_predicate = " OR ".join(
+                        "NULLIF(BTRIM(meta->>'" + _counter_name + "'), '') IS NOT NULL"
+                        for _counter_name in (
+                            "retry_attempt",
+                            "breach_attempt_count",
+                            "materialization_attempts",
+                        )
                     )
-                    _attempt_params = [_prev_attempt]
+                    _attempt_predicate = (
+                        " AND ("
+                        + " AND ".join(_counter_predicates)
+                        + ")"
+                        # A retry claim for attempt N>1 needs at least one
+                        # durable prior counter as a fence.  The initial
+                        # attempt may legitimately have all three absent.
+                        + " AND ("
+                        + _present_counter_predicate
+                        + " OR %s = 0)"
+                    )
+                    _attempt_params = [_prev_attempt] * 4
                 cur = c.execute(
                     """
                     UPDATE orders

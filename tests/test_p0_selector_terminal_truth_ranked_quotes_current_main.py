@@ -24,7 +24,12 @@ from ap.contract_selector import (
     _structural_direct_quote_skip,
 )
 from ap_execution_core import APExecutionCore
-from ap.selector_retry_policy import resolve_selector_recovery_final_reason
+from ap.selector_retry_policy import (
+    load_selector_recovery_cursor,
+    new_selector_recovery_cursor,
+    record_selector_recovery_attempt,
+    resolve_selector_recovery_final_reason,
+)
 from ap_execution_core import (
     _build_deferred_retry_schedule_meta,
     _build_deferred_retry_terminal_meta,
@@ -139,6 +144,7 @@ def _run_selector(
     request_kind: str = SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
     valid_symbol: str = "__NO_VALID_DIRECT_QUOTE__",
     valid_quote: dict | None = None,
+    recovery_cursor: dict | None = None,
 ):
     monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", str(limit))
     broker = _DirectQuoteBroker(
@@ -160,6 +166,7 @@ def _run_selector(
         plan["ticker"],
         str(plan["execution_mode"]).lower(),
         selector_request_kind=request_kind,
+        recovery_cursor=recovery_cursor,
     )
     selected = selector.select(plan, request_context=context)
     failure = plan.get("metadata", {}).get("selector_failure") or {}
@@ -676,6 +683,158 @@ def test_pr439_candidate_scoped_structural_reason_requires_complete_accounting()
         }
     )
     assert reason == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+
+
+@pytest.mark.parametrize(
+    ("old_reason", "current_reason", "expected"),
+    [
+        (
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+            "OI_TOO_LOW",
+            "OI_TOO_LOW",
+        ),
+        (
+            "OI_TOO_LOW",
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+        ),
+    ],
+)
+def test_pr439_disappeared_cursor_symbol_cannot_vote_on_current_reason(
+    old_reason, current_reason, expected
+):
+    """A refreshed chain owns the final reason; the cursor remains audit data."""
+    old_symbol = "SPY260801C00101000"
+    current_symbol = "SPY260801C00102000"
+    reason = resolve_selector_recovery_final_reason(
+        {
+            "attempted_results": {
+                old_symbol: {
+                    "result_reason": old_reason,
+                    "transient": old_reason != "OI_TOO_LOW",
+                },
+            },
+            "candidate_outcomes": {current_symbol: current_reason},
+            "current_candidate_universe": [current_symbol],
+            "candidate_accounting_complete": True,
+            "eligible_unattempted_symbols": [],
+        }
+    )
+    assert reason == expected
+
+
+@pytest.mark.parametrize(
+    ("old_reason", "current_reason", "expected"),
+    [
+        (
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+            "OI_TOO_LOW",
+            "OI_TOO_LOW",
+        ),
+        (
+            "OI_TOO_LOW",
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+        ),
+    ],
+)
+def test_pr439_disappeared_cursor_symbol_stays_ignored_after_reload_restart(
+    old_reason, current_reason, expected
+):
+    """Reloaded durable history must not regain current-reason authority."""
+    old_symbol = "SPY260801C00101000"
+    current_symbol = "SPY260801C00102000"
+    cursor = new_selector_recovery_cursor(
+        local_order_id="oid-pr439-restart",
+        client_id="jason-live",
+        execution_mode="live",
+        signal_id="sig-pr439-restart",
+        materialization_generation=1,
+        selector_attempt_count=1,
+    )
+    cursor = record_selector_recovery_attempt(
+        cursor,
+        symbol=old_symbol,
+        attempt_number=1,
+        expiration=_NEAR_EXPIRY,
+        result_reason=old_reason,
+        transient=old_reason != "OI_TOO_LOW",
+    )
+    reloaded, load_reason = load_selector_recovery_cursor(
+        cursor,
+        local_order_id="oid-pr439-restart",
+        client_id="jason-live",
+        execution_mode="LIVE",
+        signal_id="sig-pr439-restart",
+        materialization_generation=1,
+        selector_attempt_count=1,
+    )
+    assert load_reason is None
+    assert old_symbol in reloaded["attempted_symbols"]
+
+    reason = resolve_selector_recovery_final_reason(
+        {
+            "attempted_results": reloaded["attempted_symbols"],
+            "candidate_outcomes": {current_symbol: current_reason},
+            "current_candidate_universe": [current_symbol],
+            "candidate_accounting_complete": True,
+            "eligible_unattempted_symbols": [],
+        }
+    )
+    assert reason == expected
+
+
+@pytest.mark.parametrize(
+    ("old_reason", "current_row", "expected"),
+    [
+        (
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+            _row("SPY", 102.0, bid=1.10, ask=1.14, oi=0, volume=0),
+            "OI_TOO_LOW",
+        ),
+        (
+            "OI_TOO_LOW",
+            _row("SPY", 102.0, bid=0.0, ask=0.0, oi=1200, volume=300),
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+        ),
+    ],
+)
+def test_pr439_selector_callsite_keeps_cursor_audit_but_filters_final_reason(
+    monkeypatch, old_reason, current_row, expected
+):
+    """The production selector seam applies the current-universe filter."""
+    plan = _plan(ticker="SPY", underlying=100.0, budget=2000.0)
+    old_symbol = _row("SPY", 101.0)["symbol"]
+    cursor = new_selector_recovery_cursor(
+        local_order_id="oid-pr439-callsite",
+        client_id=plan["client_id"],
+        execution_mode=plan["execution_mode"],
+        signal_id=plan["signal_id"],
+        materialization_generation=1,
+        selector_attempt_count=1,
+    )
+    cursor = record_selector_recovery_attempt(
+        cursor,
+        symbol=old_symbol,
+        attempt_number=1,
+        expiration=_NEAR_EXPIRY,
+        result_reason=old_reason,
+        transient=old_reason == "DIRECT_QUOTE_ZERO_BID_ASK",
+    )
+
+    selected, broker, context, failure, _ = _run_selector(
+        monkeypatch,
+        plan=plan,
+        chain=[current_row],
+        limit=1,
+        recovery_cursor=cursor,
+    )
+
+    assert selected is None
+    assert failure["reason_code"] == expected
+    assert old_symbol in context.recovery_cursor["attempted_symbols"]
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
 
 
 def test_pr439_pro_quality_unavailable_recovery_owns_candidate_reason(monkeypatch):

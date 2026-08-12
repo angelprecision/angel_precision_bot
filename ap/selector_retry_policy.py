@@ -1191,6 +1191,26 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     candidate_scoped = isinstance(candidate_outcomes, dict)
     candidate_outcomes = candidate_outcomes if candidate_scoped else {}
 
+    # A durable cursor is intentionally retained across refreshed selector
+    # attempts for audit/restart continuity.  It is not, however, a current
+    # candidate universe.  When the deferred selector supplies the refreshed
+    # universe, make a local evidence view containing only symbols that still
+    # exist in that universe.  The caller's durable cursor is never mutated.
+    if "current_candidate_universe" in data:
+        raw_universe = data.get("current_candidate_universe")
+        if isinstance(raw_universe, (list, tuple, set, frozenset)):
+            current_candidate_universe = {
+                "".join(str(symbol or "").upper().split())
+                for symbol in raw_universe
+                if "".join(str(symbol or "").upper().split())
+            }
+            attempted = {
+                symbol: record
+                for symbol, record in attempted.items()
+                if "".join(str(symbol or "").upper().split())
+                in current_candidate_universe
+            }
+
     def _attempt_reason(record) -> str:
         if isinstance(record, dict):
             return str(record.get("result_reason") or "")
