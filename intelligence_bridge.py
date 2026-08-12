@@ -111,8 +111,22 @@ UNAVAILABLE = "UNAVAILABLE"
 NOT_AVAILABLE_YET = "NOT_AVAILABLE_YET"
 
 _OCC_RE = re.compile(r"^[A-Z0-9.]{1,10}\d{6}[CP]\d{8}$")
-_MAX_SELECTED_QUOTE_AGE_SECONDS = float(
-    os.getenv("GATE_G_MAX_SELECTED_QUOTE_AGE_SECONDS", "120")
+
+
+def _positive_finite_env_float(name: str, default: float) -> Optional[float]:
+    """Read a positive finite authority bound without trusting bad config."""
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+_MAX_SELECTED_QUOTE_AGE_SECONDS = _positive_finite_env_float(
+    "GATE_G_MAX_SELECTED_QUOTE_AGE_SECONDS", 120.0
 )
 # Gate G does not infer selected-contract authority from a generic broker label,
 # a signal timestamp, or a caller-provided fallback.  This is the closed
@@ -200,7 +214,7 @@ def _parse_timestamp(value: Any) -> Optional[_dt.datetime]:
             raw = raw[:-1] + "+00:00"
         parsed = _dt.datetime.fromisoformat(raw)
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+            return None
         return parsed.astimezone(_dt.timezone.utc)
     except ValueError:
         return None
@@ -373,6 +387,22 @@ def _candidate_contract_identity_claims(signal: dict) -> list[dict]:
     return claims
 
 
+def _selected_contract_source_values(
+    container: dict,
+    nested: Optional[dict],
+) -> set[str]:
+    """Collect every explicit source alias from one contract claim."""
+    values: set[str] = set()
+    for mapping in (container, nested):
+        if not isinstance(mapping, dict):
+            continue
+        for key in ("source", "quote_source", "provider"):
+            if key not in mapping or mapping[key] is None:
+                continue
+            values.add(str(mapping[key]).strip().lower())
+    return values
+
+
 def _extract_selected_contract_evidence(
     signal: dict,
     *,
@@ -440,6 +470,93 @@ def _extract_selected_contract_evidence(
             "claimed_contracts": claimed_contracts,
         }
 
+    # Preserve the concrete identity diagnostic before checking provenance.
+    # A source problem must not hide a client, mode, signal, or OCC mismatch.
+    for claim in identity_claims:
+        if not claim.get("contract"):
+            return {
+                "exists": False,
+                "authoritative": False,
+                "classification": UNAVAILABLE,
+                "reason": "selected_contract_not_occ",
+                "claimed_contracts": claimed_contracts,
+            }
+        if claim.get("client") != expected_client or not expected_client:
+            return {
+                "exists": False,
+                "authoritative": False,
+                "classification": UNAVAILABLE,
+                "reason": "selected_contract_client_mismatch",
+                "claimed_contracts": claimed_contracts,
+            }
+        if claim.get("mode") != expected_mode or not expected_mode:
+            return {
+                "exists": False,
+                "authoritative": False,
+                "classification": UNAVAILABLE,
+                "reason": "selected_contract_execution_mode_mismatch",
+                "claimed_contracts": claimed_contracts,
+            }
+        candidate_signal = claim.get("signal") or ""
+        if (
+            not candidate_signal
+            or (expected_canonical and candidate_signal != expected_canonical)
+            or (not expected_canonical and expected_signal and candidate_signal != expected_signal)
+            or (not expected_canonical and not expected_signal)
+        ):
+            return {
+                "exists": False,
+                "authoritative": False,
+                "classification": UNAVAILABLE,
+                "reason": "selected_contract_signal_identity_mismatch",
+                "claimed_contracts": claimed_contracts,
+            }
+
+    # A valid alias cannot launder a malformed duplicate identity field from
+    # the same source container.  The claim must be complete, not merely
+    # usable after dictionary precedence has selected one value.
+    if any(claim.get("complete") is not True for claim in identity_claims):
+        return {
+            "exists": False,
+            "authoritative": False,
+            "classification": UNAVAILABLE,
+            "reason": "selected_contract_identity_conflict",
+            "claimed_contracts": claimed_contracts,
+        }
+
+    # Source provenance is part of the authority contract, not a diagnostic
+    # preference.  Every explicit alias and every duplicate candidate must
+    # agree on the same closed trusted producer token.  Otherwise insertion
+    # order could select a trusted-looking dictionary while silently ignoring
+    # contradictory source metadata.
+    source_claims = [
+        _selected_contract_source_values(container, nested)
+        for _, container, nested in records
+    ]
+    claimed_quote_sources = sorted({
+        source
+        for values in source_claims
+        for source in values
+    })
+    if (
+        not source_claims
+        or any(
+            len(values) != 1
+            or not values.issubset(TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES)
+            for values in source_claims
+        )
+        or len(claimed_quote_sources) != 1
+    ):
+        return {
+            "exists": False,
+            "authoritative": False,
+            "classification": UNAVAILABLE,
+            "reason": "selected_contract_quote_source_untrusted",
+            "claimed_contracts": claimed_contracts,
+            "claimed_quote_sources": claimed_quote_sources,
+        }
+    quote_source = claimed_quote_sources[0]
+
     last_reason = "selected_contract_unavailable"
     for candidate, source_container, nested_contract in records:
         # ``candidate`` carries the selected-contract fields from either a
@@ -488,16 +605,9 @@ def _extract_selected_contract_evidence(
             last_reason = "selected_contract_signal_identity_mismatch"
             continue
 
-        quote_sources = set()
-        for source in (source_container, nested_contract):
-            quote_source_raw, _ = _first_present(source, "quote_source")
-            if quote_source_raw is not None:
-                quote_sources.add(str(quote_source_raw).strip().lower())
-        if len(quote_sources) != 1:
-            last_reason = "selected_contract_quote_source_untrusted"
-            continue
-        quote_source = next(iter(quote_sources))
-        if quote_source not in TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES:
+        if _selected_contract_source_values(
+            source_container, nested_contract
+        ) != {quote_source}:
             last_reason = "selected_contract_quote_source_untrusted"
             continue
 
@@ -515,8 +625,16 @@ def _extract_selected_contract_evidence(
         if quote_ts is None:
             last_reason = "selected_contract_quote_timestamp_missing_or_invalid"
             continue
+        max_quote_age_seconds = _MAX_SELECTED_QUOTE_AGE_SECONDS
+        if (
+            max_quote_age_seconds is None
+            or not math.isfinite(float(max_quote_age_seconds))
+            or float(max_quote_age_seconds) <= 0
+        ):
+            last_reason = "selected_contract_quote_freshness_config_invalid"
+            continue
         age_seconds = (_dt.datetime.now(_dt.timezone.utc) - quote_ts).total_seconds()
-        if age_seconds < -5 or age_seconds > _MAX_SELECTED_QUOTE_AGE_SECONDS:
+        if age_seconds < -5 or age_seconds > float(max_quote_age_seconds):
             last_reason = "selected_contract_quote_stale"
             continue
 

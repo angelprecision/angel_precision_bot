@@ -200,6 +200,74 @@ def test_unrecognized_selected_contract_quote_source_cannot_create_authority(
     assert evidence["reason"] == "selected_contract_quote_source_untrusted"
 
 
+@pytest.mark.parametrize("source_field", ["source", "provider"])
+def test_trusted_source_alias_can_attest_selected_contract(source_field):
+    signal = _selected_signal()
+    signal["selected_contract"][source_field] = ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is True
+    assert evidence["authoritative"] is True
+    assert evidence["source"] == ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+
+
+@pytest.mark.parametrize("source_field", ["source", "provider"])
+def test_conflicting_explicit_source_alias_cannot_create_authority(source_field):
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
+    signal["selected_contract"][source_field] = "untrusted-provider"
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
+
+
+def test_duplicate_identity_with_conflicting_source_provenance_is_quarantined():
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
+    signal["metadata"] = {
+        "selected_contract": {
+            **signal["selected_contract"],
+            "quote_source": "untrusted-provider",
+        }
+    }
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
+
+
+def test_malformed_duplicate_identity_alias_cannot_be_ignored():
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
+    signal["contract_symbol"] = "not-an-occ-contract"
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_identity_conflict"
+
+
 def test_same_occ_conflicting_client_identity_is_quarantined():
     signal = _selected_signal()
     signal["metadata"] = {
@@ -360,6 +428,40 @@ def test_stale_selected_contract_is_quarantined():
     assert evidence["exists"] is False
     assert evidence["classification"] == ib.UNAVAILABLE
     assert evidence["reason"] == "selected_contract_quote_stale"
+
+
+@pytest.mark.parametrize("bad_limit", [float("nan"), float("inf"), 0.0, -1.0, None])
+def test_invalid_selected_quote_age_limit_cannot_create_authority(monkeypatch, bad_limit):
+    monkeypatch.setattr(ib, "_MAX_SELECTED_QUOTE_AGE_SECONDS", bad_limit)
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
+    evidence = ib._extract_selected_contract_evidence(
+        _selected_signal(
+            quote_ts=old,
+            quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+        ),
+        client_id="client-a", execution_mode="LIVE",
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_freshness_config_invalid"
+
+
+def test_timezone_naive_selected_quote_timestamp_cannot_create_authority():
+    naive_now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
+    evidence = ib._extract_selected_contract_evidence(
+        _selected_signal(
+            quote_ts=naive_now,
+            quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+        ),
+        client_id="client-a", execution_mode="LIVE",
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_timestamp_missing_or_invalid"
 
 
 def test_selected_contract_client_mismatch_has_no_authority():
