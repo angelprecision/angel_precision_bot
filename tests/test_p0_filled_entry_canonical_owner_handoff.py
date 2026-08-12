@@ -49,6 +49,7 @@ class _Connection:
         row=None,
         *,
         update_rowcount=1,
+        claim_rowcount=None,
         update_error=None,
         position_row=None,
     ):
@@ -56,7 +57,9 @@ class _Connection:
         if self.row is not None:
             self.row.setdefault("broker_order_id", "entry-broker-1")
             self.row.setdefault("contract", "INTC260810P00098000")
+            self.row.setdefault("last_error", None)
         self.update_rowcount = update_rowcount
+        self.claim_rowcount = update_rowcount if claim_rowcount is None else claim_rowcount
         self.update_error = update_error
         self.position_row = (
             dict(position_row)
@@ -110,6 +113,26 @@ class _Connection:
             if eligible and self.update_rowcount:
                 self.row["position_id"] = requested_position
             return _Result(rowcount=self.update_rowcount if eligible else 0)
+        if normalized.startswith("UPDATE orders") and "canonical_owner_handoff_standing_stop_state" in normalized:
+            if self.update_error:
+                raise self.update_error
+            meta_payload = params[0]
+            client_id, local_id = params[1:3]
+            meta_patch = json.loads(meta_payload)
+            eligible = bool(
+                self.row
+                and self.row.get("client_id") == client_id
+                and self.row.get("local_order_id") == local_id
+                and not str(
+                    (self.row.get("meta") or {}).get(
+                        "canonical_owner_handoff_standing_stop_state", ""
+                    )
+                    or ""
+                ).strip()
+            )
+            if eligible and self.claim_rowcount:
+                self.row["meta"] = {**(self.row.get("meta") or {}), **meta_patch}
+            return _Result(rowcount=self.claim_rowcount if eligible else 0)
         if normalized.startswith("UPDATE orders"):
             if self.update_error:
                 raise self.update_error
@@ -120,6 +143,13 @@ class _Connection:
                         **(self.row.get("meta") or {}),
                         **json.loads(meta_payload),
                     }
+                    if str(self.row.get("last_error") or "").startswith(
+                        (
+                            "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED",
+                            "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                        )
+                    ):
+                        self.row["last_error"] = None
                 return _Result(rowcount=1 if self.row else 0)
             if "last_error=%s" in normalized:
                 last_error = params[0]
@@ -203,6 +233,58 @@ def test_handoff_marker_update_fences_broker_contract_and_mode(monkeypatch):
     assert "broker_order_id=%s" in sql
     assert "contract=%s" in sql
     assert "LOWER(BTRIM(COALESCE(execution_mode,'')))=%s" in sql
+
+
+@pytest.mark.parametrize(
+    "last_error",
+    [
+        "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED:database_error",
+        "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN:owner_missing",
+    ],
+)
+def test_canonical_owner_handoff_recovery_predicate_matches_each_retry_source(last_error):
+    from ap import fill_monitor as fm
+
+    order = _order(
+        status="FILLED",
+        position_id="canonical-position-1",
+        last_error=last_error,
+        meta={},
+    )
+
+    assert fm._is_canonical_owner_handoff_recovery(order) is True
+    assert fm._is_canonical_owner_handoff_recovery(
+        {**order, "broker_order_id": "N/A"}
+    ) is False
+
+
+def test_pending_sql_attests_the_same_retry_prefix_constants(monkeypatch):
+    from ap import fill_monitor as fm
+
+    captured = {}
+
+    class _PendingResult:
+        def fetchall(self):
+            return []
+
+    class _PendingConnection:
+        def execute(self, sql, params):
+            captured["sql"] = sql
+            captured["params"] = params
+            return _PendingResult()
+
+    @contextmanager
+    def _conn():
+        yield _PendingConnection()
+
+    monkeypatch.setattr(fm, "conn", _conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda fn: fn())
+
+    assert fm.get_pending_orders("jason@example.com") == []
+    assert "last_error" in captured["sql"]
+    assert tuple(
+        f"{prefix}%" for prefix in fm._CANONICAL_OWNER_HANDOFF_RETRY_ERROR_PREFIXES
+    ) == tuple(captured["params"][1:])
 
 
 def test_open_position_safe_does_not_replay_terminal_position():
@@ -532,6 +614,145 @@ def test_seed_exit_engine_returns_structured_failure_for_retry(monkeypatch):
     assert result["adoption_disposition"] == "RETRY_REPAIR_IDENTITY_UNPROVEN"
 
 
+def test_standing_stop_claim_is_durable_before_broker_call(monkeypatch):
+    from ap import fill_monitor as fm
+
+    order = _order()
+    db = _Connection(
+        {
+            "client_id": "jason@example.com",
+            "local_order_id": "entry-local-1",
+            "broker_order_id": "entry-broker-1",
+            "contract": "INTC260810P00098000",
+            "kind": "ENTRY",
+            "execution_mode": "live",
+            "meta": {},
+        }
+    )
+    _install_db(monkeypatch, db)
+    observed_states = []
+
+    def _place(**kwargs):
+        observed_states.append(kwargs["order"]["meta"][(
+            "canonical_owner_handoff_standing_stop_state"
+        )])
+        return {"outcome": "SUBMITTED", "broker_stop_id": "stop-1"}
+
+    monkeypatch.setattr(fm, "_place_standing_stop_best_effort", _place)
+
+    result = fm._establish_canonical_handoff_standing_stop(
+        broker=object(), order=order, qty=1, entry_price=1.46
+    )
+
+    assert observed_states == ["SUBMITTING"]
+    assert result["state"] == "SUBMITTED"
+    assert result["protection_proven"] is True
+    assert db.row["meta"]["canonical_owner_handoff_standing_stop_state"] == "SUBMITTED"
+    assert db.row["meta"]["canonical_owner_handoff_standing_stop_id"] == "stop-1"
+
+
+def test_submitted_standing_stop_is_not_called_again(monkeypatch):
+    from ap import fill_monitor as fm
+
+    order = _order(
+        meta={
+            "canonical_owner_handoff_standing_stop_state": "SUBMITTED",
+            "canonical_owner_handoff_standing_stop_id": "stop-1",
+        }
+    )
+    monkeypatch.setattr(
+        fm,
+        "_place_standing_stop_best_effort",
+        lambda **_kwargs: pytest.fail("SUBMITTED state must not resubmit"),
+    )
+
+    result = fm._establish_canonical_handoff_standing_stop(
+        broker=object(), order=order, qty=1, entry_price=1.46
+    )
+
+    assert result["state"] == "SUBMITTED"
+    assert result["protection_proven"] is True
+
+
+def test_prior_submitting_standing_stop_is_marked_unproven_without_resubmit(monkeypatch):
+    from ap import fill_monitor as fm
+
+    order = _order(
+        meta={"canonical_owner_handoff_standing_stop_state": "SUBMITTING"}
+    )
+    db = _Connection(
+        {
+            "client_id": "jason@example.com",
+            "local_order_id": "entry-local-1",
+            "broker_order_id": "entry-broker-1",
+            "contract": "INTC260810P00098000",
+            "kind": "ENTRY",
+            "execution_mode": "live",
+            "meta": dict(order["meta"]),
+        }
+    )
+    _install_db(monkeypatch, db)
+    monkeypatch.setattr(
+        fm,
+        "_place_standing_stop_best_effort",
+        lambda **_kwargs: pytest.fail("prior SUBMITTING state must not resubmit"),
+    )
+
+    result = fm._establish_canonical_handoff_standing_stop(
+        broker=object(), order=order, qty=1, entry_price=1.46
+    )
+
+    assert result["state"] == "OUTCOME_UNPROVEN"
+    assert result["protection_proven"] is False
+    assert db.row["meta"]["canonical_owner_handoff_standing_stop_state"] == "OUTCOME_UNPROVEN"
+
+
+@pytest.mark.parametrize(
+    ("call_result", "expected_state"),
+    [
+        ({"outcome": "FAILED", "detail_reason": "broker_rejected"}, "FAILED"),
+        ({"outcome": "OUTCOME_UNPROVEN", "detail_reason": "timeout"}, "OUTCOME_UNPROVEN"),
+    ],
+)
+def test_standing_stop_failure_outcomes_are_durable_and_not_retried(
+    monkeypatch, call_result, expected_state
+):
+    from ap import fill_monitor as fm
+
+    order = _order()
+    db = _Connection(
+        {
+            "client_id": "jason@example.com",
+            "local_order_id": "entry-local-1",
+            "broker_order_id": "entry-broker-1",
+            "contract": "INTC260810P00098000",
+            "kind": "ENTRY",
+            "execution_mode": "live",
+            "meta": {},
+        }
+    )
+    _install_db(monkeypatch, db)
+    calls = []
+    monkeypatch.setattr(
+        fm,
+        "_place_standing_stop_best_effort",
+        lambda **_kwargs: calls.append(1) or call_result,
+    )
+
+    first = fm._establish_canonical_handoff_standing_stop(
+        broker=object(), order=order, qty=1, entry_price=1.46
+    )
+    second = fm._establish_canonical_handoff_standing_stop(
+        broker=object(), order=order, qty=1, entry_price=1.46
+    )
+
+    assert first["state"] == expected_state
+    assert second["state"] == expected_state
+    assert first["protection_proven"] is False
+    assert second["protection_proven"] is False
+    assert calls == [1]
+
+
 def _patch_process_side_effects(monkeypatch, events):
     from ap import fill_monitor as fm
 
@@ -555,7 +776,7 @@ def _patch_process_side_effects(monkeypatch, events):
     monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
 
 
-def test_process_binds_before_stop_seed_and_owner_verification(monkeypatch):
+def test_process_establishes_stop_before_bind_seed_and_owner_verification(monkeypatch):
     from ap import fill_monitor as fm
 
     events = []
@@ -614,13 +835,13 @@ def test_process_binds_before_stop_seed_and_owner_verification(monkeypatch):
     )
 
     assert db.row["position_id"] == "canonical-position-1"
-    assert events.index("open") < events.index("bind")
-    assert events.index("bind") < events.index("standing_stop")
+    assert events.index("open") < events.index("standing_stop")
+    assert events.index("standing_stop") < events.index("bind")
     assert events.index("standing_stop") < events.index("seed")
     assert events.index("seed") < events.index("verify")
 
 
-def test_process_bind_failure_emits_and_skips_stop_and_seed(monkeypatch):
+def test_process_bind_failure_keeps_stop_attempt_before_bind_and_skips_seed(monkeypatch):
     from ap import fill_monitor as fm
 
     events = []
@@ -632,7 +853,7 @@ def test_process_bind_failure_emits_and_skips_stop_and_seed(monkeypatch):
         "kind": "ENTRY",
         "execution_mode": "live",
         "position_id": "different-position",
-    }, update_rowcount=0)
+    }, update_rowcount=0, claim_rowcount=1)
     _install_db(monkeypatch, db)
     monkeypatch.setattr(
         fm,
@@ -668,8 +889,8 @@ def test_process_bind_failure_emits_and_skips_stop_and_seed(monkeypatch):
     )
 
     assert failures
-    assert failures[0]["reason_code"] == "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED"
-    assert "standing_stop" not in events
+    assert failures[0]["reason_code"] == "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN_NO_PROTECTION"
+    assert "standing_stop" in events
     assert "seed" not in events
     assert db.row["position_id"] == "different-position"
 
@@ -819,7 +1040,197 @@ def test_filled_handoff_retry_replays_without_terminal_osm_transition(monkeypatc
     assert events.index("open") < events.index("standing_stop") < events.index("seed") < events.index("verify")
 
 
-def test_exit_engine_quarantines_and_releases_same_contract_on_retry():
+@pytest.mark.parametrize(
+    ("failure_stage", "last_error"),
+    [
+        (
+            "bind",
+            "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED:database_error",
+        ),
+        (
+            "seed",
+            "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN:owner_lookup_failed",
+        ),
+    ],
+)
+def test_restart_reloads_last_error_fallback_and_repairs_without_terminal_transition(
+    monkeypatch, failure_stage, last_error
+):
+    from ap import fill_monitor as fm
+
+    events = []
+    _patch_process_side_effects(monkeypatch, events)
+    db = _Connection(
+        {
+            "client_id": "jason@example.com",
+            "local_order_id": "entry-local-1",
+            "kind": "ENTRY",
+            "execution_mode": "live",
+            "position_id": "different-position" if failure_stage == "bind" else None,
+            "meta": {},
+        },
+        update_rowcount=0 if failure_stage == "bind" else 1,
+        claim_rowcount=1,
+    )
+    _install_db(monkeypatch, db)
+
+    stop_calls = []
+    seed_calls = []
+    verify_calls = []
+    retry_persistence_failed = {"value": True}
+
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *a, **k: events.append("open") or "canonical-position-1",
+    )
+    monkeypatch.setattr(
+        fm,
+        "_place_standing_stop_best_effort",
+        lambda **_kwargs: stop_calls.append(1)
+        or {"outcome": "SUBMITTED", "broker_stop_id": "stop-1"},
+    )
+
+    def _seed(*_args, **_kwargs):
+        seed_calls.append(1)
+        if failure_stage == "seed" and len(seed_calls) == 1:
+            return {
+                "ok": False,
+                "reason_code": last_error,
+                "detail_reason": "owner_lookup_failed",
+            }
+        return {"ok": True, "disposition": "SEEDED"}
+
+    monkeypatch.setattr(fm, "_seed_exit_engine", _seed)
+    monkeypatch.setattr(
+        fm,
+        "_verify_canonical_entry_owner",
+        lambda *_args, **_kwargs: verify_calls.append(1) or {"ok": True},
+    )
+
+    original_update = fm._update_canonical_handoff_order
+
+    def _update(order, **kwargs):
+        if (
+            kwargs.get("operation") == "retry marker"
+            and retry_persistence_failed["value"]
+        ):
+            return False
+        return original_update(order, **kwargs)
+
+    monkeypatch.setattr(fm, "_update_canonical_handoff_order", _update)
+    monkeypatch.setattr(
+        fm,
+        "_persist_canonical_handoff_last_error_fallback",
+        lambda _order, reason: db.row.__setitem__("last_error", reason),
+    )
+
+    engine = SimpleNamespace(
+        clear_canonical_owner_handoff_quarantine=lambda **_kwargs: {"ok": True},
+        quarantine_canonical_owner_handoff=lambda **_kwargs: {"ok": True},
+    )
+
+    class _OSM:
+        transition_calls = 0
+
+        def transition(self, *args, **kwargs):
+            self.transition_calls += 1
+            if self.transition_calls > 1:
+                raise AssertionError("restart recovery must not terminalize FILLED again")
+            return True
+
+    osm = _OSM()
+    fm.process_pending_order(
+        object(), _order(), osm=osm, pm=object(), exit_engine=engine
+    )
+    assert db.row["last_error"].startswith(last_error.split(":", 1)[0])
+
+    retry_persistence_failed["value"] = False
+    restarted_order = _order(
+        status="FILLED",
+        position_id="canonical-position-1",
+        last_error=db.row["last_error"],
+        meta=dict(db.row.get("meta") or {}),
+    )
+    if failure_stage == "bind":
+        db.row["position_id"] = "canonical-position-1"
+
+    fm.process_pending_order(
+        object(), restarted_order, osm=osm, pm=object(), exit_engine=engine
+    )
+
+    assert osm.transition_calls == 1
+    assert len(stop_calls) == 1
+    assert db.row["last_error"] is None
+    assert db.row["meta"]["canonical_owner_handoff_retry_required"] is False
+    assert verify_calls == [1]
+
+
+def test_exit_engine_quarantine_is_exactly_fenced_by_client_mode_and_contract():
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    engine = APExitEngine(None, email="jason@example.com")
+    positions = []
+    for position_id, client_id, mode, contract in [
+        ("jason-live", "jason@example.com", "live", "INTC260810P00098000"),
+        ("jason-paper", "jason@example.com", "paper", "INTC260810P00098000"),
+        ("jose-live", "jose@example.com", "live", "INTC260810P00098000"),
+        ("tradefluence-paper", "tradefluence@example.com", "paper", "INTC260810P00098000"),
+        ("jason-live-other-contract", "jason@example.com", "live", "INTC260810C00098000"),
+    ]:
+        position = ManagedPosition(
+            ticker="INTC",
+            option_symbol=contract,
+            side="PUT",
+            quantity=1,
+            entry_price=1.46,
+            underlying_entry=98.0,
+            underlying_target=100.0,
+            underlying_stop=96.0,
+        )
+        position.position_id = position_id
+        position.client_id = client_id
+        position.execution_mode = mode
+        position.quantity_remaining = 1
+        positions.append(position)
+    with engine._lock:
+        engine._positions.extend(positions)
+        engine._positions_by_id.update({p.position_id: p for p in positions})
+
+    quarantined = engine.quarantine_canonical_owner_handoff(
+        canonical_position_id="jason-live",
+        contract="INTC260810P00098000",
+        client_id=" JASON@EXAMPLE.COM ",
+        execution_mode=" LIVE ",
+        reason="owner_cardinality_or_identity_unproven",
+    )
+    assert quarantined["ok"] is True
+    assert quarantined["quarantined_ids"] == ["jason-live"]
+    assert {p.position_id for p in engine.active_positions()} == {
+        "jason-paper",
+        "jose-live",
+        "tradefluence-paper",
+        "jason-live-other-contract",
+    }
+
+    cleared = engine.clear_canonical_owner_handoff_quarantine(
+        canonical_position_id="jason-live",
+        contract="INTC260810P00098000",
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+    assert cleared["ok"] is True
+    assert cleared["cleared_ids"] == ["jason-live"]
+    assert {p.position_id for p in engine.active_positions()} == {
+        "jason-live",
+        "jason-paper",
+        "jose-live",
+        "tradefluence-paper",
+        "jason-live-other-contract",
+    }
+
+
+def test_exit_engine_malformed_quarantine_mode_performs_zero_mutations():
     from ap_exit_engine import APExitEngine, ManagedPosition
 
     engine = APExitEngine(None, email="jason@example.com")
@@ -833,48 +1244,19 @@ def test_exit_engine_quarantines_and_releases_same_contract_on_retry():
         underlying_target=100.0,
         underlying_stop=96.0,
     )
-    position.position_id = "canonical-position-1"
+    position.position_id = "jason-live"
     position.client_id = "jason@example.com"
     position.execution_mode = "live"
     position.quantity_remaining = 1
     engine.add_position(position)
 
-    foreign = ManagedPosition(
-        ticker="INTC",
-        option_symbol="INTC260810P00098000",
-        side="PUT",
-        quantity=1,
-        entry_price=1.46,
-        underlying_entry=98.0,
-        underlying_target=100.0,
-        underlying_stop=96.0,
-    )
-    foreign.position_id = "broker-repair-foreign"
-    foreign.client_id = "other@example.com"
-    foreign.execution_mode = "paper"
-    foreign.quantity_remaining = 1
-    with engine._lock:
-        engine._positions.append(foreign)
-        engine._positions_by_id[foreign.position_id] = foreign
-
-    quarantined = engine.quarantine_canonical_owner_handoff(
-        canonical_position_id="canonical-position-1",
+    result = engine.quarantine_canonical_owner_handoff(
+        canonical_position_id="jason-live",
         contract="INTC260810P00098000",
         client_id="jason@example.com",
-        execution_mode="live",
-        reason="owner_cardinality_or_identity_unproven",
+        execution_mode="sandbox",
     )
-    assert quarantined["quarantined_ids"] == [
-        "canonical-position-1",
-        "broker-repair-foreign",
-    ]
-    assert engine.active_positions() == []
 
-    cleared = engine.clear_canonical_owner_handoff_quarantine(
-        canonical_position_id="canonical-position-1",
-        contract="INTC260810P00098000",
-        client_id="jason@example.com",
-        execution_mode="live",
-    )
-    assert cleared["cleared_ids"] == ["canonical-position-1"]
+    assert result["ok"] is False
+    assert result["quarantined_ids"] == []
     assert engine.active_positions() == [position]

@@ -4094,10 +4094,25 @@ class APExitEngine:
         execution_mode: str = "",
         reason: str = "canonical_owner_handoff_failed",
     ) -> dict:
-        """Fail closed for every nonclosed owner of an unproven contract."""
+        """Quarantine only the exact client/mode/contract owner candidates."""
         target_contract = str(contract or "").strip().upper()
-        if not target_contract:
-            return {"ok": False, "quarantined_ids": []}
+        target_client = str(client_id or "").strip().lower()
+        target_mode = str(execution_mode or "").strip().lower()
+        canonical_id = str(canonical_position_id or "").strip()
+        if not target_contract or not target_client or target_mode not in {"live", "paper"}:
+            log.critical(
+                "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINE_INVALID_IDENTITY | "
+                "contract=%s canonical=%s client=%s mode=%s",
+                target_contract,
+                canonical_id,
+                target_client,
+                target_mode,
+            )
+            return {
+                "ok": False,
+                "quarantined_ids": [],
+                "detail_reason": "client_id_or_execution_mode_missing_or_malformed",
+            }
 
         quarantined_ids = []
         with self._lock:
@@ -4107,7 +4122,14 @@ class APExitEngine:
                     or getattr(pos, "contract", "")
                     or ""
                 ).strip().upper()
-                if pos_contract != target_contract or getattr(pos, "closed", False):
+                pos_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                pos_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                if (
+                    pos_contract != target_contract
+                    or pos_client != target_client
+                    or pos_mode != target_mode
+                    or getattr(pos, "closed", False)
+                ):
                     continue
                 position_id = str(getattr(pos, "position_id", "") or "").strip()
                 _mark_adoption_identity_quarantined(
@@ -4120,16 +4142,18 @@ class APExitEngine:
             "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINED | "
             "contract=%s canonical=%s client=%s mode=%s quarantined=%s reason=%s",
             target_contract,
-            str(canonical_position_id or ""),
-            str(client_id or ""),
-            str(execution_mode or ""),
+            canonical_id,
+            target_client,
+            target_mode,
             quarantined_ids,
             reason,
         )
         return {
-            "ok": bool(quarantined_ids),
+            "ok": True,
             "quarantined_ids": quarantined_ids,
             "contract": target_contract,
+            "client_id": target_client,
+            "execution_mode": target_mode,
         }
 
     def clear_canonical_owner_handoff_quarantine(
@@ -4140,11 +4164,30 @@ class APExitEngine:
         client_id: str = "",
         execution_mode: str = "",
     ) -> dict:
-        """Allow a durable retry to re-run adoption and prove one owner."""
+        """Clear quarantine for one exact canonical client/mode/contract owner."""
         target_contract = str(contract or "").strip().upper()
         canonical_id = str(canonical_position_id or "").strip()
-        if not target_contract or not canonical_id:
-            return {"ok": False, "cleared_ids": []}
+        target_client = str(client_id or "").strip().lower()
+        target_mode = str(execution_mode or "").strip().lower()
+        if (
+            not target_contract
+            or not canonical_id
+            or not target_client
+            or target_mode not in {"live", "paper"}
+        ):
+            log.critical(
+                "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINE_CLEAR_INVALID_IDENTITY | "
+                "contract=%s canonical=%s client=%s mode=%s",
+                target_contract,
+                canonical_id,
+                target_client,
+                target_mode,
+            )
+            return {
+                "ok": False,
+                "cleared_ids": [],
+                "detail_reason": "canonical_or_client_or_mode_missing_or_malformed",
+            }
 
         cleared_ids = []
         with self._lock:
@@ -4154,7 +4197,14 @@ class APExitEngine:
                     or getattr(pos, "contract", "")
                     or ""
                 ).strip().upper()
-                if pos_contract != target_contract or getattr(pos, "closed", False):
+                pos_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                pos_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                if (
+                    pos_contract != target_contract
+                    or pos_client != target_client
+                    or pos_mode != target_mode
+                    or getattr(pos, "closed", False)
+                ):
                     continue
                 if str(getattr(pos, "position_id", "") or "").strip() != canonical_id:
                     continue
@@ -4168,15 +4218,17 @@ class APExitEngine:
             "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINE_CLEARED | "
             "contract=%s canonical=%s client=%s mode=%s cleared=%s",
             target_contract,
-            str(canonical_position_id or ""),
-            str(client_id or ""),
-            str(execution_mode or ""),
+            canonical_id,
+            target_client,
+            target_mode,
             cleared_ids,
         )
         return {
             "ok": True,
             "cleared_ids": cleared_ids,
             "contract": target_contract,
+            "client_id": target_client,
+            "execution_mode": target_mode,
         }
 
     def attach_quote_monitor(self, monitor) -> None:

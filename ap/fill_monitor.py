@@ -58,6 +58,23 @@ RUN_ID = os.getenv("AP_RUN_ID", "unknown")
 STRATEGY_VERSION = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
 GIT_COMMIT = get_git_commit()
 
+_CANONICAL_OWNER_HANDOFF_RETRY_ERROR_PREFIXES = (
+    "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED",
+    "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+)
+_CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATE_KEY = (
+    "canonical_owner_handoff_standing_stop_state"
+)
+_CANONICAL_OWNER_HANDOFF_STANDING_STOP_ID_KEY = (
+    "canonical_owner_handoff_standing_stop_id"
+)
+_CANONICAL_OWNER_HANDOFF_STANDING_STOP_ATTEMPTED_KEY = (
+    "canonical_owner_handoff_standing_stop_attempted"
+)
+_CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATES = frozenset(
+    {"SUBMITTING", "SUBMITTED", "FAILED", "OUTCOME_UNPROVEN"}
+)
+
 ALLOW_LEGACY_FILL_MONITOR = (
     os.getenv("ALLOW_LEGACY_FILL_MONITOR", "0").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -255,6 +272,7 @@ def get_pending_orders(client_id: str) -> list[dict]:
                     execution_mode,
                     filled_ts,
                     meta,
+                    last_error,
                     meta->>'canonical_signal_id' AS canonical_signal_id,
                     meta->>'underlying_entry'    AS underlying_entry_meta,
                     meta->>'entry_underlying'    AS entry_underlying_meta,
@@ -277,9 +295,11 @@ def get_pending_orders(client_id: str) -> list[dict]:
                       AND (
                         position_id IS NULL
                         OR BTRIM(position_id) = ''
-                        OR meta->>'canonical_owner_handoff_retry_required' = 'true'
-                        OR last_error LIKE 'FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED%'
-                        OR last_error LIKE 'FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN%'
+                        OR LOWER(BTRIM(COALESCE(
+                            meta->>'canonical_owner_handoff_retry_required', ''
+                        ))) = 'true'
+                        OR last_error LIKE %s
+                        OR last_error LIKE %s
                       )
                     )
                   )
@@ -288,7 +308,13 @@ def get_pending_orders(client_id: str) -> list[dict]:
                   AND broker_order_id != 'N/A'
                 ORDER BY created_ts ASC
                 """,
-                (client_id,),
+                (
+                    client_id,
+                    *(
+                        f"{prefix}%"
+                        for prefix in _CANONICAL_OWNER_HANDOFF_RETRY_ERROR_PREFIXES
+                    ),
+                ),
             ).fetchall()
             return [dict(r) for r in rows]
     return run_with_retry(_fn)
@@ -297,6 +323,32 @@ def get_pending_orders(client_id: str) -> list[dict]:
 def _has_proven_broker_order_id(value) -> bool:
     broker_id = str(value or "").strip()
     return bool(broker_id and broker_id.upper() != "N/A")
+
+
+def _is_canonical_owner_handoff_recovery(order: dict) -> bool:
+    """Return the one restart predicate for a durably FILLED ENTRY handoff."""
+    if not isinstance(order, dict):
+        return False
+    if str(order.get("kind") or "").strip().upper() != "ENTRY":
+        return False
+    if str(order.get("status") or "").strip().upper() != "FILLED":
+        return False
+    if not _has_proven_broker_order_id(order.get("broker_order_id")):
+        return False
+
+    position_id_missing = not str(order.get("position_id") or "").strip()
+    retry_marker_value = _canonical_handoff_meta(order).get(
+        "canonical_owner_handoff_retry_required"
+    )
+    retry_marker = retry_marker_value is True or str(
+        retry_marker_value or ""
+    ).strip().lower() == "true"
+    last_error = str(order.get("last_error") or "").strip()
+    retry_error = any(
+        last_error.startswith(prefix)
+        for prefix in _CANONICAL_OWNER_HANDOFF_RETRY_ERROR_PREFIXES
+    )
+    return position_id_missing or retry_marker or retry_error
 
 
 def _mode_source_state(value) -> tuple[str, str]:
@@ -1646,40 +1698,127 @@ def _place_standing_stop_best_effort(
     qty: int,
     entry_price: float,
 ):
-    """Optional secondary broker-side stop, after local position persistence."""
+    """Submit the optional broker stop and classify the broker outcome.
+
+    This helper intentionally does not decide whether a retry may submit.  The
+    caller must first claim the durable standing-stop intent.  Exceptions after
+    a broker call are ``OUTCOME_UNPROVEN`` because the broker may have accepted
+    the order before the process lost its response.
+    """
+    def _outcome(outcome: str, *, detail_reason: str = "", **extra) -> dict:
+        return {
+            "ok": outcome == "SUBMITTED",
+            "outcome": outcome,
+            "detail_reason": detail_reason,
+            **extra,
+        }
+
     try:
         if qty <= 0 or entry_price <= 0:
-            return False
+            return _outcome("FAILED", detail_reason="invalid_qty_or_entry_price")
 
-        stop_pct = float(os.getenv("BROKER_STANDING_STOP_PCT", "0.30"))
+        try:
+            stop_pct = float(os.getenv("BROKER_STANDING_STOP_PCT", "0.30"))
+        except (TypeError, ValueError):
+            return _outcome("FAILED", detail_reason="invalid_stop_percentage")
         stop_px = round(entry_price * (1 - stop_pct), 2)
         contract = order.get("contract", "")
         ticker = (order.get("symbol") or "").upper()
 
-        if hasattr(broker, "place_stop_order"):
-            stop_resp = broker.place_stop_order(symbol=contract, qty=qty, stop_price=stop_px)
-            stop_id = None
-            stop_stat = "unknown"
-            if isinstance(stop_resp, dict):
-                stop_id = stop_resp.get("id") or stop_resp.get("order_id") or stop_resp.get("broker_order_id")
-                stop_stat = str(stop_resp.get("status") or stop_resp.get("state") or "unknown")
-            log.info("[%s] Standing stop placed via broker helper @ $%.2f | broker_stop=%s status=%s", ticker, stop_px, stop_id or "?", stop_stat)
-            audit(
-                order["client_id"],
-                "INFO",
-                "STOP_ORDER_PLACED",
-                {
-                    "local_order_id": order.get("local_order_id"),
-                    "ticker": ticker,
-                    "contract": contract,
-                    "qty": int(qty),
-                    "stop_px": stop_px,
-                    "broker_stop_order_id": stop_id,
-                    "broker_stop_status": stop_stat,
-                    "source": "broker_helper",
-                },
+        def _classify_helper_response(stop_resp):
+            if stop_resp is True:
+                return _outcome("SUBMITTED")
+            if stop_resp is False:
+                return _outcome("FAILED", detail_reason="broker_helper_rejected")
+            if not isinstance(stop_resp, dict):
+                return _outcome(
+                    "OUTCOME_UNPROVEN",
+                    detail_reason="broker_helper_response_unrecognized",
+                )
+
+            stop_id = (
+                stop_resp.get("id")
+                or stop_resp.get("order_id")
+                or stop_resp.get("broker_order_id")
             )
-            return True
+            stop_stat = str(
+                stop_resp.get("status") or stop_resp.get("state") or ""
+            ).strip().lower()
+            if stop_resp.get("success") is False or stop_stat in {
+                "rejected",
+                "reject",
+                "failed",
+                "failure",
+                "error",
+                "canceled",
+                "cancelled",
+            }:
+                return _outcome(
+                    "FAILED",
+                    detail_reason="broker_helper_rejected",
+                    broker_stop_status=stop_stat,
+                )
+            if stop_id or stop_resp.get("success") is True or stop_stat in {
+                "accepted",
+                "open",
+                "working",
+                "submitted",
+                "queued",
+                "new",
+                "pending",
+                "live",
+            }:
+                return _outcome(
+                    "SUBMITTED",
+                    broker_stop_id=str(stop_id or "").strip(),
+                    broker_stop_status=stop_stat or "unknown",
+                )
+            return _outcome(
+                "OUTCOME_UNPROVEN",
+                detail_reason="broker_helper_response_missing_success_proof",
+                broker_stop_status=stop_stat or "unknown",
+            )
+
+        if hasattr(broker, "place_stop_order"):
+            try:
+                stop_resp = broker.place_stop_order(
+                    symbol=contract, qty=qty, stop_price=stop_px
+                )
+            except Exception as exc:
+                return _outcome(
+                    "OUTCOME_UNPROVEN",
+                    detail_reason="broker_helper_exception",
+                    exception_type=type(exc).__name__,
+                    exception=str(exc),
+                )
+            result = _classify_helper_response(stop_resp)
+            if result.get("outcome") == "SUBMITTED":
+                log.info(
+                    "[%s] Standing stop placed via broker helper @ $%.2f | "
+                    "broker_stop=%s status=%s",
+                    ticker,
+                    stop_px,
+                    result.get("broker_stop_id") or "?",
+                    result.get("broker_stop_status") or "unknown",
+                )
+                audit(
+                    order["client_id"],
+                    "INFO",
+                    "STOP_ORDER_PLACED",
+                    {
+                        "local_order_id": order.get("local_order_id"),
+                        "ticker": ticker,
+                        "contract": contract,
+                        "qty": int(qty),
+                        "stop_px": stop_px,
+                        "broker_stop_order_id": result.get("broker_stop_id"),
+                        "broker_stop_status": result.get(
+                            "broker_stop_status", "unknown"
+                        ),
+                        "source": "broker_helper",
+                    },
+                )
+            return result
 
         base_url = (
             getattr(broker, "base_url", None)
@@ -1694,27 +1833,54 @@ def _place_standing_stop_best_effort(
 
         if not base_url or not account_id or not getattr(broker, "session", None):
             log.warning("[%s] Standing stop skipped — broker stop interface unavailable", ticker)
-            return False
+            return _outcome("FAILED", detail_reason="broker_stop_interface_unavailable")
 
-        resp = broker.session.post(
-            f"{base_url}/v1/accounts/{account_id}/orders",
-            data={
-                "class": "option",
-                "option_symbol": contract,
-                "side": "sell_to_close",
-                "quantity": qty,
-                "type": "stop",
-                "stop": stop_px,
-                "duration": "gtc",
-            },
-            headers={"Accept": "application/json"},
-            timeout=10,
-        )
+        try:
+            resp = broker.session.post(
+                f"{base_url}/v1/accounts/{account_id}/orders",
+                data={
+                    "class": "option",
+                    "option_symbol": contract,
+                    "side": "sell_to_close",
+                    "quantity": qty,
+                    "type": "stop",
+                    "stop": stop_px,
+                    "duration": "gtc",
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+        except Exception as exc:
+            return _outcome(
+                "OUTCOME_UNPROVEN",
+                detail_reason="broker_rest_exception",
+                exception_type=type(exc).__name__,
+                exception=str(exc),
+            )
 
         if resp.status_code < 300:
-            stop_data = (resp.json() or {}).get("order", {}) or {}
-            stop_id = stop_data.get("id", "?")
-            stop_stat = stop_data.get("status", "unknown")
+            try:
+                payload = resp.json() or {}
+                stop_data = payload.get("order", {}) or {}
+                if not isinstance(stop_data, dict):
+                    return _outcome(
+                        "OUTCOME_UNPROVEN",
+                        detail_reason="broker_rest_response_unrecognized",
+                    )
+                stop_id = (
+                    stop_data.get("id")
+                    or stop_data.get("order_id")
+                    or stop_data.get("broker_order_id")
+                    or ""
+                )
+                stop_stat = stop_data.get("status", "unknown")
+            except Exception as exc:
+                return _outcome(
+                    "OUTCOME_UNPROVEN",
+                    detail_reason="broker_rest_response_parse_failed",
+                    exception_type=type(exc).__name__,
+                    exception=str(exc),
+                )
             log.info(
                 "[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",
                 ticker,
@@ -1737,7 +1903,11 @@ def _place_standing_stop_best_effort(
                     "source": "rest",
                 },
             )
-            return True
+            return _outcome(
+                "SUBMITTED",
+                broker_stop_id=str(stop_id or "").strip(),
+                broker_stop_status=str(stop_stat or "unknown"),
+            )
         else:
             err_body = getattr(resp, "text", "")[:200]
             log.warning("[%s] Standing stop FAILED — exit engine sole protection | %s", ticker, err_body)
@@ -1752,11 +1922,21 @@ def _place_standing_stop_best_effort(
                     "body": err_body,
                 },
             )
-            return False
+            return _outcome(
+                "FAILED",
+                detail_reason="broker_rest_rejected",
+                broker_http_status=getattr(resp, "status_code", None),
+            )
 
     except Exception as exc:
         log.warning("[%s] Standing stop placement error: %s", order.get("symbol", "?"), exc)
-        return False
+        return {
+            "ok": False,
+            "outcome": "OUTCOME_UNPROVEN",
+            "detail_reason": "standing_stop_unexpected_exception",
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+        }
 
 
 def _load_managed_position_class():
@@ -2038,6 +2218,306 @@ def _canonical_handoff_identity_where(order: dict) -> tuple[list[str], list]:
     return clauses, values
 
 
+def _canonical_handoff_standing_stop_state(order: dict) -> str:
+    """Read the durable standing-stop state without authorizing a resubmit."""
+    meta = _canonical_handoff_meta(order)
+    raw_state = str(
+        meta.get(_CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATE_KEY) or ""
+    ).strip().upper()
+    if raw_state in _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATES:
+        return raw_state
+    if raw_state or _canonical_handoff_meta_flag(
+        order, _CANONICAL_OWNER_HANDOFF_STANDING_STOP_ATTEMPTED_KEY
+    ):
+        # The pre-amendment boolean only proved that a call was attempted; it
+        # never proved the broker outcome.  It therefore cannot authorize a
+        # second submission.
+        return "OUTCOME_UNPROVEN"
+    return ""
+
+
+def _apply_canonical_handoff_meta_patch(order: dict, meta_patch: dict) -> None:
+    meta = _canonical_handoff_meta(order)
+    meta.update(meta_patch)
+    order["meta"] = meta
+
+
+def _persist_canonical_handoff_standing_stop_state(
+    order: dict,
+    state: str,
+    *,
+    broker_stop_id: str = "",
+    detail_reason: str = "",
+) -> bool:
+    if state not in _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATES:
+        return False
+    meta_patch = {
+        _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATE_KEY: state,
+        _CANONICAL_OWNER_HANDOFF_STANDING_STOP_ATTEMPTED_KEY: True,
+    }
+    if broker_stop_id:
+        meta_patch[_CANONICAL_OWNER_HANDOFF_STANDING_STOP_ID_KEY] = str(
+            broker_stop_id
+        ).strip()
+    if detail_reason:
+        meta_patch["canonical_owner_handoff_standing_stop_detail"] = str(
+            detail_reason
+        )
+    persisted = _update_canonical_handoff_order(
+        order,
+        operation=f"standing-stop {state.lower()} marker",
+        meta_patch=meta_patch,
+    )
+    if persisted:
+        _apply_canonical_handoff_meta_patch(order, meta_patch)
+    return persisted
+
+
+def _claim_canonical_handoff_standing_stop(order: dict) -> dict:
+    """CAS-claim the only durable right to call the standing-stop broker API."""
+    client_id = str(order.get("client_id") or "").strip()
+    local_order_id = str(order.get("local_order_id") or "").strip()
+    broker_order_id = str(order.get("broker_order_id") or "").strip()
+    contract = str(order.get("contract") or order.get("symbol") or "").strip().upper()
+    kind = str(order.get("kind") or "").strip().upper()
+    execution_mode = _normalize_execution_mode_token(order.get("execution_mode"))
+
+    def _failure(detail_reason: str, *, state: str = "OUTCOME_UNPROVEN") -> dict:
+        log.critical(
+            "[%s] standing-stop durable claim failed | local=%s contract=%s "
+            "mode=%s state=%s detail=%s",
+            client_id,
+            local_order_id,
+            contract,
+            execution_mode,
+            state,
+            detail_reason,
+        )
+        return {
+            "ok": False,
+            "claimant": False,
+            "state": state,
+            "outcome": "OUTCOME_UNPROVEN",
+            "protection_proven": False,
+            "standing_stop_attempted": bool(state),
+            "detail_reason": detail_reason,
+        }
+
+    if not client_id:
+        return _failure("client_id_missing")
+    if not local_order_id:
+        return _failure("local_order_id_missing")
+    if not _has_proven_broker_order_id(broker_order_id):
+        return _failure("broker_order_id_missing_or_invalid")
+    if not contract:
+        return _failure("contract_missing")
+    if kind != "ENTRY":
+        return _failure("kind_not_ENTRY")
+    if not execution_mode:
+        return _failure("execution_mode_missing_or_invalid")
+
+    current_state = _canonical_handoff_standing_stop_state(order)
+    meta = _canonical_handoff_meta(order)
+    broker_stop_id = str(
+        meta.get(_CANONICAL_OWNER_HANDOFF_STANDING_STOP_ID_KEY) or ""
+    ).strip()
+    if current_state == "SUBMITTED":
+        return {
+            "ok": True,
+            "claimant": False,
+            "state": "SUBMITTED",
+            "outcome": "SUBMITTED",
+            "protection_proven": True,
+            "standing_stop_attempted": True,
+            "broker_stop_id": broker_stop_id,
+            "detail_reason": "already_submitted",
+        }
+    if current_state:
+        if current_state == "SUBMITTING":
+            # A prior process may have died after broker acceptance and before
+            # writing SUBMITTED.  Convert only the local interpretation; the
+            # durable row remains SUBMITTING if this marker cannot commit.
+            persisted = _persist_canonical_handoff_standing_stop_state(
+                order,
+                "OUTCOME_UNPROVEN",
+                detail_reason="prior_claim_outcome_unproven",
+            )
+            if not persisted:
+                return _failure(
+                    "prior_submitting_state_outcome_unproven_persistence_failed",
+                    state="SUBMITTING",
+                )
+            current_state = "OUTCOME_UNPROVEN"
+        log.critical(
+            "[%s] standing-stop resubmit blocked | local=%s state=%s",
+            client_id,
+            local_order_id,
+            current_state,
+        )
+        return {
+            "ok": False,
+            "claimant": False,
+            "state": current_state,
+            "outcome": current_state,
+            "protection_proven": current_state == "SUBMITTED",
+            "standing_stop_attempted": True,
+            "broker_stop_id": broker_stop_id,
+            "detail_reason": "durable_state_blocks_automatic_resubmit",
+        }
+
+    where_clauses, where_params = _canonical_handoff_identity_where(order)
+
+    def _claim():
+        with conn() as c:
+            updated = c.execute(
+                "UPDATE orders SET "
+                "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                "updated_ts=NOW() "
+                "WHERE " + " AND ".join(where_clauses) + " "
+                "AND (meta->>'canonical_owner_handoff_standing_stop_state' "
+                "IS NULL OR BTRIM(meta->>'canonical_owner_handoff_standing_stop_state')='')",
+                [
+                    json_dumps(
+                        {
+                            _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATE_KEY: "SUBMITTING",
+                            _CANONICAL_OWNER_HANDOFF_STANDING_STOP_ATTEMPTED_KEY: True,
+                        }
+                    ),
+                    *where_params,
+                ],
+            )
+            return int(
+                getattr(updated, "rowcount", getattr(c, "rowcount", 0)) or 0
+            )
+
+    try:
+        rowcount = run_with_retry(_claim)
+    except Exception as exc:
+        return _failure(
+            "standing_stop_claim_database_error",
+            state="OUTCOME_UNPROVEN",
+        ) | {"exception_type": type(exc).__name__, "exception": str(exc)}
+    if int(rowcount or 0) != 1:
+        return _failure("standing_stop_claim_lost_or_order_missing")
+
+    _apply_canonical_handoff_meta_patch(
+        order,
+        {
+            _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATE_KEY: "SUBMITTING",
+            _CANONICAL_OWNER_HANDOFF_STANDING_STOP_ATTEMPTED_KEY: True,
+        },
+    )
+    return {
+        "ok": True,
+        "claimant": True,
+        "state": "SUBMITTING",
+        "outcome": "SUBMITTING",
+        "protection_proven": False,
+        "standing_stop_attempted": True,
+        "detail_reason": "durable_claim_acquired",
+    }
+
+
+def _normalize_standing_stop_call_result(raw_result) -> dict:
+    if isinstance(raw_result, dict):
+        outcome = str(raw_result.get("outcome") or "").strip().upper()
+        if outcome in {"SUBMITTED", "FAILED", "OUTCOME_UNPROVEN"}:
+            return dict(raw_result, outcome=outcome)
+        if raw_result.get("ok") is True:
+            return dict(raw_result, ok=True, outcome="SUBMITTED")
+        if raw_result.get("ok") is False:
+            return dict(raw_result, ok=False, outcome="FAILED")
+    if raw_result is True:
+        return {"ok": True, "outcome": "SUBMITTED"}
+    if raw_result is False:
+        return {"ok": False, "outcome": "FAILED"}
+    return {
+        "ok": False,
+        "outcome": "OUTCOME_UNPROVEN",
+        "detail_reason": "standing_stop_call_result_unrecognized",
+    }
+
+
+def _establish_canonical_handoff_standing_stop(
+    *,
+    broker: BrokerAdapter,
+    order: dict,
+    qty: int,
+    entry_price: float,
+) -> dict:
+    """Resolve standing-stop protection before identity bind, at most once."""
+    claim = _claim_canonical_handoff_standing_stop(order)
+    if not claim.get("claimant"):
+        return claim
+
+    call_result = _normalize_standing_stop_call_result(
+        _place_standing_stop_best_effort(
+            broker=broker,
+            order=order,
+            qty=qty,
+            entry_price=entry_price,
+        )
+    )
+    outcome = call_result.get("outcome")
+    if outcome == "SUBMITTED":
+        persisted = _persist_canonical_handoff_standing_stop_state(
+            order,
+            "SUBMITTED",
+            broker_stop_id=str(call_result.get("broker_stop_id") or "").strip(),
+            detail_reason=call_result.get("detail_reason", ""),
+        )
+        if persisted:
+            return {
+                **call_result,
+                "state": "SUBMITTED",
+                "protection_proven": True,
+                "standing_stop_attempted": True,
+            }
+        log.critical(
+            "[%s] standing-stop success marker failed; outcome remains unproven | local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+        return {
+            **call_result,
+            "state": "SUBMITTING",
+            "outcome": "OUTCOME_UNPROVEN",
+            "protection_proven": False,
+            "standing_stop_attempted": True,
+            "detail_reason": "submitted_marker_persistence_failed",
+        }
+
+    desired_state = (
+        "FAILED" if outcome == "FAILED" else "OUTCOME_UNPROVEN"
+    )
+    persisted = _persist_canonical_handoff_standing_stop_state(
+        order,
+        desired_state,
+        detail_reason=call_result.get("detail_reason", ""),
+    )
+    if not persisted:
+        log.critical(
+            "[%s] standing-stop %s marker failed; no automatic retry is allowed | local=%s",
+            order.get("client_id"),
+            desired_state,
+            order.get("local_order_id"),
+        )
+        return {
+            **call_result,
+            "state": "SUBMITTING",
+            "outcome": "OUTCOME_UNPROVEN",
+            "protection_proven": False,
+            "standing_stop_attempted": True,
+            "detail_reason": "standing_stop_outcome_marker_persistence_failed",
+        }
+    return {
+        **call_result,
+        "state": desired_state,
+        "protection_proven": False,
+        "standing_stop_attempted": True,
+    }
+
+
 def _update_canonical_handoff_order(
     order: dict,
     *,
@@ -2156,28 +2636,31 @@ def _persist_canonical_owner_handoff_retry(
         _persist_canonical_handoff_last_error_fallback(order, reason_code)
 
 
-def _mark_canonical_owner_handoff_stop_attempted(order: dict) -> None:
-    """Record a successful standing-stop submission before later handoff work."""
-    _update_canonical_handoff_order(
-        order,
-        operation="standing-stop marker",
-        meta_patch={
-            "canonical_owner_handoff_standing_stop_attempted": True,
-        },
-    )
+def _mark_canonical_owner_handoff_stop_attempted(order: dict) -> bool:
+    """Compatibility wrapper for callers that already proved submission."""
+    return _persist_canonical_handoff_standing_stop_state(order, "SUBMITTED")
 
 
-def _clear_canonical_owner_handoff_retry(order: dict) -> None:
+def _clear_canonical_owner_handoff_retry(order: dict) -> bool:
     """Clear only the handoff retry marker after exact owner proof succeeds."""
-    _update_canonical_handoff_order(
+    persisted = _update_canonical_handoff_order(
         order,
         clear_handoff_error=True,
         operation="retry clear",
         meta_patch={
             "canonical_owner_handoff_retry_required": False,
+            "canonical_owner_handoff_reason_code": "",
+            "canonical_owner_handoff_entry_handoff_proven": True,
             "canonical_owner_handoff_resolved_at": now_utc_iso(),
         },
     )
+    if not persisted:
+        log.critical(
+            "[%s] canonical owner handoff success could not clear retry state | local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+    return persisted
 
 
 def _verify_canonical_entry_owner(
@@ -2317,15 +2800,21 @@ def _quarantine_canonical_owner_handoff(
     order: dict,
     canonical_position_id: str,
     failure: dict,
-) -> None:
-    """Disable same-contract exit owners until the next retry proves one."""
+) -> dict:
+    """Disable only the exact client/mode/contract owners until retry proof."""
     quarantine_fn = getattr(
         exit_engine, "quarantine_canonical_owner_handoff", None
     )
     if not callable(quarantine_fn):
-        return
+        log.critical(
+            "[%s] canonical owner quarantine unavailable | local=%s contract=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+            order.get("contract") or order.get("symbol"),
+        )
+        return {"ok": False, "detail_reason": "quarantine_unavailable"}
     try:
-        quarantine_fn(
+        result = quarantine_fn(
             canonical_position_id=str(canonical_position_id or ""),
             contract=str(
                 order.get("contract") or order.get("symbol") or ""
@@ -2340,6 +2829,23 @@ def _quarantine_canonical_owner_handoff(
                 or "canonical_owner_handoff_failed"
             ),
         )
+        if isinstance(result, dict):
+            if result.get("ok") is False:
+                log.critical(
+                    "[%s] canonical owner quarantine returned failure | local=%s detail=%s",
+                    order.get("client_id"),
+                    order.get("local_order_id"),
+                    result.get("detail_reason") or "unspecified",
+                )
+            return result
+        if result is False:
+            log.critical(
+                "[%s] canonical owner quarantine returned false | local=%s",
+                order.get("client_id"),
+                order.get("local_order_id"),
+            )
+            return {"ok": False, "detail_reason": "quarantine_returned_false"}
+        return {"ok": True}
     except Exception as exc:
         # Durable retry persistence still occurs in the failure emitter.  A
         # quarantine failure is separately surfaced because an existing owner
@@ -2351,6 +2857,12 @@ def _quarantine_canonical_owner_handoff(
             order.get("contract") or order.get("symbol"),
             exc,
         )
+        return {
+            "ok": False,
+            "detail_reason": "quarantine_call_failed",
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+        }
 
 
 def _emit_seed_failure_diagnostic(
@@ -2921,16 +3433,7 @@ def process_pending_order(
     local_id = order["local_order_id"]
     broker_id = order.get("broker_order_id")
     kind = (order.get("kind") or "ENTRY").upper()
-    canonical_owner_handoff_recovery = (
-        kind == "ENTRY"
-        and str(order.get("status") or "").strip().upper() == "FILLED"
-        and (
-            not str(order.get("position_id") or "").strip()
-            or _canonical_handoff_meta_flag(
-                order, "canonical_owner_handoff_retry_required"
-            )
-        )
-    )
+    canonical_owner_handoff_recovery = _is_canonical_owner_handoff_recovery(order)
     entry_handoff_proven = kind != "ENTRY"
 
     requested_exit_recovery = (
@@ -3100,18 +3603,73 @@ def process_pending_order(
                     "position_opened" if position_id else "MISSING",
                 )
                 if position_id:
+                    # A broker-side standing stop is temporary protection, not
+                    # canonical ownership.  Fence it before the DB identity
+                    # bind so a bind failure cannot leave a confirmed LIVE fill
+                    # with no automated protective path.
+                    standing_stop_result = _establish_canonical_handoff_standing_stop(
+                        broker=broker,
+                        order=order,
+                        qty=qty,
+                        entry_price=price,
+                    )
+                    standing_stop_attempted = bool(
+                        standing_stop_result.get("standing_stop_attempted")
+                    )
+                    standing_stop_state = str(
+                        standing_stop_result.get("state") or ""
+                    ).strip().upper()
+                    standing_stop_proven = bool(
+                        standing_stop_result.get("protection_proven")
+                    )
+
                     # Durable canonical identity must be proven before any
                     # exit-engine adoption/seed decision is treated as live.
                     bind_result = _bind_filled_entry_position_id(order, position_id)
                     if not bind_result.get("ok"):
                         bind_failure = dict(bind_result)
-                        bind_failure["standing_stop_attempted"] = False
-                        _quarantine_canonical_owner_handoff(
-                            exit_engine=exit_engine,
-                            order=order,
-                            canonical_position_id=position_id,
-                            failure=bind_failure,
+                        bind_failure.update(
+                            {
+                                "standing_stop_attempted": standing_stop_attempted,
+                                "standing_stop_state": standing_stop_state,
+                                "standing_stop_proven": standing_stop_proven,
+                            }
                         )
+                        owner_state, proven_count, unproven_count = (
+                            _classify_existing_protective_owner(
+                                exit_engine=exit_engine,
+                                contract=str(
+                                    order.get("contract") or order.get("symbol") or ""
+                                ).strip().upper(),
+                                client_id=str(order.get("client_id") or "").strip(),
+                                expected_mode=_normalize_execution_mode_token(
+                                    order.get("execution_mode")
+                                ),
+                            )
+                        )
+                        bind_failure.update(
+                            {
+                                "protective_owner_state": owner_state,
+                                "protective_owner_proven_count": proven_count,
+                                "protective_owner_unproven_count": unproven_count,
+                            }
+                        )
+                        if owner_state == "OWNER_IDENTITY_UNPROVEN":
+                            quarantine_result = _quarantine_canonical_owner_handoff(
+                                exit_engine=exit_engine,
+                                order=order,
+                                canonical_position_id=position_id,
+                                failure=bind_failure,
+                            )
+                            if not quarantine_result.get("ok"):
+                                bind_failure["quarantine_failure"] = quarantine_result
+                        elif owner_state == "NO_OWNER" and not standing_stop_proven:
+                            bind_failure.update(
+                                {
+                                    "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN_NO_PROTECTION",
+                                    "detail_reason": "bind_failed_no_owner_no_proven_standing_stop",
+                                }
+                            )
                         _emit_canonical_owner_handoff_failure(
                             order, position_id, bind_failure
                         )
@@ -3124,28 +3682,9 @@ def process_pending_order(
                             order.get("contract") or order.get("symbol"),
                         )
 
-                        # Secondary broker-side stop is best-effort protection,
-                        # but only after the durable ENTRY identity is bound.
-                        stop_already_attempted = _canonical_handoff_meta_flag(
-                            order,
-                            "canonical_owner_handoff_standing_stop_attempted",
-                        )
-                        if stop_already_attempted:
-                            standing_stop_attempted = True
-                        else:
-                            standing_stop_attempted = bool(
-                                _place_standing_stop_best_effort(
-                                    broker=broker,
-                                    order=order,
-                                    qty=qty,
-                                    entry_price=price,
-                                )
-                            )
-                            if standing_stop_attempted:
-                                _mark_canonical_owner_handoff_stop_attempted(order)
-
                         seed_failure = None
                         owner_failure = None
+                        clear_failure = None
                         with _canonical_owner_handoff_lock(exit_engine):
                             clear_fn = getattr(
                                 exit_engine,
@@ -3154,7 +3693,7 @@ def process_pending_order(
                             )
                             if callable(clear_fn):
                                 try:
-                                    clear_fn(
+                                    clear_result = clear_fn(
                                         canonical_position_id=position_id,
                                         contract=str(
                                             order.get("contract") or order.get("symbol") or ""
@@ -3164,51 +3703,75 @@ def process_pending_order(
                                             order.get("execution_mode")
                                         ),
                                     )
+                                    if not isinstance(clear_result, dict) or not clear_result.get(
+                                        "ok"
+                                    ):
+                                        clear_failure = {
+                                            "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                                            "detail_reason": "canonical_owner_quarantine_clear_failed",
+                                            "clear_result": clear_result,
+                                        }
                                 except Exception as clear_err:
-                                    log.warning(
-                                        "[%s] canonical owner quarantine clear failed before retry: %s",
-                                        order.get("client_id"),
-                                        clear_err,
-                                    )
-
-                            seed_result = _seed_exit_engine(
-                                exit_engine, position_id, order, result, signal_id
-                            )
-                            if not isinstance(seed_result, dict) or not seed_result.get("ok"):
-                                seed_failure = (
-                                    dict(seed_result)
-                                    if isinstance(seed_result, dict)
-                                    else {
+                                    clear_failure = {
                                         "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
-                                        "detail_reason": "seed_result_missing_or_invalid",
+                                        "detail_reason": "canonical_owner_quarantine_clear_failed",
+                                        "exception_type": type(clear_err).__name__,
+                                        "exception": str(clear_err),
                                     }
+
+                            if clear_failure is None:
+                                seed_result = _seed_exit_engine(
+                                    exit_engine, position_id, order, result, signal_id
                                 )
-                                seed_failure.setdefault(
-                                    "standing_stop_attempted", standing_stop_attempted
-                                )
-                                _quarantine_canonical_owner_handoff(
-                                    exit_engine=exit_engine,
-                                    order=order,
-                                    canonical_position_id=position_id,
-                                    failure=seed_failure,
-                                )
-                            else:
-                                owner_result = _verify_canonical_entry_owner(
-                                    exit_engine, order, position_id
-                                )
-                                if not owner_result.get("ok"):
-                                    owner_failure = dict(owner_result)
-                                    owner_failure.setdefault(
+                                if not isinstance(seed_result, dict) or not seed_result.get("ok"):
+                                    seed_failure = (
+                                        dict(seed_result)
+                                        if isinstance(seed_result, dict)
+                                        else {
+                                            "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                                            "detail_reason": "seed_result_missing_or_invalid",
+                                        }
+                                    )
+                                    seed_failure.setdefault(
                                         "standing_stop_attempted", standing_stop_attempted
                                     )
-                                    _quarantine_canonical_owner_handoff(
+                                    seed_failure.setdefault(
+                                        "standing_stop_state", standing_stop_state
+                                    )
+                                    quarantine_result = _quarantine_canonical_owner_handoff(
                                         exit_engine=exit_engine,
                                         order=order,
                                         canonical_position_id=position_id,
-                                        failure=owner_failure,
+                                        failure=seed_failure,
                                     )
+                                    if not quarantine_result.get("ok"):
+                                        seed_failure["quarantine_failure"] = quarantine_result
+                                else:
+                                    owner_result = _verify_canonical_entry_owner(
+                                        exit_engine, order, position_id
+                                    )
+                                    if not owner_result.get("ok"):
+                                        owner_failure = dict(owner_result)
+                                        owner_failure.setdefault(
+                                            "standing_stop_attempted", standing_stop_attempted
+                                        )
+                                        owner_failure.setdefault(
+                                            "standing_stop_state", standing_stop_state
+                                        )
+                                        quarantine_result = _quarantine_canonical_owner_handoff(
+                                            exit_engine=exit_engine,
+                                            order=order,
+                                            canonical_position_id=position_id,
+                                            failure=owner_failure,
+                                        )
+                                        if not quarantine_result.get("ok"):
+                                            owner_failure["quarantine_failure"] = quarantine_result
 
-                        if seed_failure is not None:
+                        if clear_failure is not None:
+                            _emit_canonical_owner_handoff_failure(
+                                order, position_id, clear_failure
+                            )
+                        elif seed_failure is not None:
                             _emit_canonical_owner_handoff_failure(
                                 order, position_id, seed_failure
                             )
@@ -3216,9 +3779,19 @@ def process_pending_order(
                             _emit_canonical_owner_handoff_failure(
                                 order, position_id, owner_failure
                             )
-                        else:
-                            _clear_canonical_owner_handoff_retry(order)
+                        elif _clear_canonical_owner_handoff_retry(order):
                             entry_handoff_proven = True
+                        else:
+                            _emit_canonical_owner_handoff_failure(
+                                order,
+                                position_id,
+                                {
+                                    "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                                    "detail_reason": "retry_state_clear_failed",
+                                    "standing_stop_attempted": standing_stop_attempted,
+                                    "standing_stop_state": standing_stop_state,
+                                },
+                            )
 
                 if not position_id:
                     log.critical(
