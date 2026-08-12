@@ -4903,9 +4903,14 @@ class APExecutionCore:
                     recovery_cursor_persist=_persist_selector_cursor_progress,
                 )
 
-                # Attempts 2..5 must prove the chart is still valid before
-                # spending any option-selector or direct-quote capacity.
-                if _selector_attempt_number > 1:
+                # Retry attempts and preclaimed restart recovery must prove
+                # the chart is still valid before spending any option-selector
+                # or direct-quote capacity.  The preclaim is ownership proof,
+                # not fresh market truth.
+                _requires_market_truth_revalidation = (
+                    _selector_attempt_number > 1 or _recovery_pre_claimed
+                )
+                if _requires_market_truth_revalidation:
                     from ap.live_submit_gates import (
                         MarketTruthAuthority,
                         check_market_validity_gate,

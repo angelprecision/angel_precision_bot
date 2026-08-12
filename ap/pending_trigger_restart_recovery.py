@@ -72,6 +72,31 @@ _MAT_BROKER_READY        = "broker_ready"               # must be False on RETRY
 # Max attempts from the same env var the deferred materializer reads
 _MAT_MAX_ATTEMPTS_ENV    = "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS"
 
+# These are broker-owned timestamps only.  In particular, ``reconciled_at``
+# and other local recovery timestamps must never become submission chronology.
+_BROKER_SUBMITTED_TIMESTAMP_FIELDS = (
+    "broker_submitted_ts",
+    "broker_submitted_at",
+    "submitted_ts",
+    "submitted_at",
+    "order_created_at",
+    "create_date",
+    "created_at",
+)
+_EXISTING_SUBMITTED_TIMESTAMP_FIELDS = (
+    "submitted_ts",
+    "broker_submitted_ts",
+    "broker_submitted_at",
+)
+_BROKER_FILLED_TIMESTAMP_FIELDS = (
+    "last_fill_date",
+    "filled_at",
+    "filled_ts",
+    "transaction_date",
+    "update_date",
+    "updated_at",
+)
+
 # Dedicated pre-breach restart rearm retry fields. These are intentionally
 # separate from #323 post-breach materialization retry metadata.
 _RR_STATUS_FIELD     = "restart_rearm_status"
@@ -723,6 +748,39 @@ class PendingTriggerRestartRecovery:
             "expired": "EXPIRED",
         }
         local_status = status_map.get(remote_status, "SUBMITTED")
+
+        # Recovery time is diagnostic only.  It is never a substitute for
+        # broker chronology: a stale order must retain its actual submission
+        # age, and an unknown broker timestamp must remain unknown.
+        submitted_ts, submitted_ts_source, submitted_ts_malformed = (
+            _first_broker_timestamp(
+                broker_order,
+                _BROKER_SUBMITTED_TIMESTAMP_FIELDS,
+            )
+        )
+        if submitted_ts_malformed:
+            self._mark_failure(local_oid, "broker_adoption_submitted_ts_malformed")
+            return _RowOutcome.UNRESOLVED
+        if submitted_ts is None:
+            existing_meta = _strict_recovery_meta(row)
+            if existing_meta is None:
+                self._mark_failure(local_oid, "broker_adoption_row_meta_malformed")
+                return _RowOutcome.UNRESOLVED
+            existing_timestamps = dict(existing_meta)
+            # The canonical column is authoritative when present; metadata is
+            # only the existing persisted fallback used by older rows.
+            if row.get("submitted_ts") is not None:
+                existing_timestamps["submitted_ts"] = row.get("submitted_ts")
+            submitted_ts, submitted_ts_source, existing_ts_malformed = (
+                _first_broker_timestamp(
+                    existing_timestamps,
+                    _EXISTING_SUBMITTED_TIMESTAMP_FIELDS,
+                )
+            )
+            if existing_ts_malformed:
+                self._mark_failure(local_oid, "broker_adoption_existing_ts_malformed")
+                return _RowOutcome.UNRESOLVED
+
         filled_qty = None
         for field_name in (
             "exec_quantity",
@@ -745,6 +803,26 @@ class PendingTriggerRestartRecovery:
                     return _RowOutcome.UNRESOLVED
                 break
 
+        filled_ts, filled_ts_source, filled_ts_malformed = _first_broker_timestamp(
+            broker_order,
+            _BROKER_FILLED_TIMESTAMP_FIELDS,
+        )
+        if filled_ts_malformed:
+            self._mark_failure(local_oid, "broker_adoption_filled_ts_malformed")
+            return _RowOutcome.UNRESOLVED
+        if local_status in {"FILLED", "PARTIAL_FILL"} and (
+            filled_qty is None
+            or filled_qty <= 0
+            or fill_price is None
+            or fill_price <= 0
+            or filled_ts is None
+        ):
+            # Never advance a broker-owned order to a fill state without the
+            # exact positive economics and broker fill chronology required by
+            # the position handoff.
+            self._mark_failure(local_oid, "broker_adoption_fill_proof_incomplete")
+            return _RowOutcome.UNRESOLVED
+
         now = _now_iso()
         try:
             accepted = bool(
@@ -752,7 +830,7 @@ class PendingTriggerRestartRecovery:
                     local_oid,
                     "SUBMITTED",
                     broker_order_id=remote_id,
-                    submitted_ts=now,
+                    submitted_ts=submitted_ts,
                 )
             )
         except Exception as exc:
@@ -771,6 +849,7 @@ class PendingTriggerRestartRecovery:
                         broker_order_id=remote_id,
                         filled_qty=filled_qty,
                         fill_price=fill_price,
+                        filled_ts=filled_ts,
                         last_error=(
                             str(
                                 broker_order.get("reason")
@@ -799,6 +878,12 @@ class PendingTriggerRestartRecovery:
                         "recovery_classification": "BROKER_ORDER_ADOPTED",
                         "broker_reconcile_status": remote_status,
                         "broker_reconcile_response": broker_order,
+                        "broker_submitted_ts": submitted_ts,
+                        "broker_submitted_ts_source": (
+                            submitted_ts_source or "unavailable"
+                        ),
+                        "broker_filled_ts": filled_ts,
+                        "broker_filled_ts_source": filled_ts_source or "unavailable",
                         "current_owner": "ORDER_MONITOR",
                         "lifecycle_state": local_status,
                     },
@@ -2337,6 +2422,26 @@ def _parse_timezone_aware(raw) -> Optional[datetime]:
     except (TypeError, ValueError):
         return None
     return value if value.tzinfo is not None else None
+
+
+def _first_broker_timestamp(
+    payload: dict,
+    field_names: tuple[str, ...],
+) -> tuple[Optional[str], Optional[str], bool]:
+    """Return the first exact timestamp, its source, and malformed state."""
+    if not isinstance(payload, dict):
+        return None, None, True
+    for field_name in field_names:
+        if field_name not in payload:
+            continue
+        raw = payload.get(field_name)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        parsed = _parse_timezone_aware(raw)
+        if parsed is None:
+            return None, field_name, True
+        return parsed.astimezone(timezone.utc).isoformat(), field_name, False
+    return None, None, False
 
 
 def _interpret_position_truth(

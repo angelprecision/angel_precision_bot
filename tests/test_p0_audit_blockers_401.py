@@ -289,14 +289,16 @@ class TestRetryMaximumAuthorityNoLocalFallback:
         assert not hasattr(restart_recovery_mod, "_resolve_max_attempts")
 
     def test_restart_recovery_call_sites_no_longer_reference_removed_wrapper(self):
-        """Structural guard: both restart-recovery call sites now call the
+        """Structural guard: all restart-recovery call sites now call the
         canonical resolver directly and handle
         DeferredMaterializationConfigConflict inline (UNRESOLVED / None),
         rather than routing through a wrapper that substituted a number."""
         import inspect
         import ap.pending_trigger_restart_recovery as restart_recovery_mod
         source = inspect.getsource(restart_recovery_mod)
-        assert source.count("resolve_deferred_materialization_max_attempts()") == 2
+        # PR #445 adds the prebroker recovery retry path; it must use the
+        # same canonical resolver rather than reintroducing a local ceiling.
+        assert source.count("resolve_deferred_materialization_max_attempts()") == 3
         assert "DeferredMaterializationConfigConflict" in source
         assert "return 3" not in source
 
