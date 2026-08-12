@@ -730,7 +730,10 @@ def test_rest_2xx_without_standing_stop_order_id_is_unproven():
     assert not result.get("broker_stop_id")
 
 
-@pytest.mark.parametrize("stop_response", [{"success": True}, True])
+@pytest.mark.parametrize(
+    "stop_response",
+    [{"success": True}, True, {"id": True, "status": "accepted"}],
+)
 def test_helper_success_without_standing_stop_order_id_is_unproven(stop_response):
     from ap import fill_monitor as fm
 

@@ -326,7 +326,10 @@ def _has_proven_broker_order_id(value) -> bool:
     broker_id = str(value or "").strip()
     return bool(
         broker_id
-        and broker_id.upper() not in {"N/A", "NA", "NONE", "NULL", "UNKNOWN", "?"}
+        and broker_id.upper() not in {
+            "N/A", "NA", "NONE", "NULL", "UNKNOWN", "?",
+            "TRUE", "FALSE", "0",
+        }
     )
 
 
