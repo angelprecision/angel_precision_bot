@@ -122,6 +122,7 @@ RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))  # was 1
 # the cached last summary and skip the full broker/DB/OSM pass.
 RUN_ONCE_MIN_INTERVAL_SEC = float(os.getenv("RECONCILER_RUN_ONCE_MIN_INTERVAL_SEC", "3.0"))
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+RECONCILER_PROOF_REPAIR_PAGE_SIZE = 50
 
 # PR fix/health-and-reconciler-startup-noise:
 # Grace window after reconciler thread start during which a missing
@@ -295,6 +296,17 @@ def _strict_positive_finite_float(value: object) -> float | None:
     return parsed
 
 
+def _finite_float(value: object) -> float | None:
+    """Return any finite scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def _strict_positive_whole_number(value: object) -> int | None:
     """Return a positive whole-number scalar without allowing bool coercion."""
     if isinstance(value, bool):
@@ -348,6 +360,7 @@ class APBrokerReconciler:
         self._ghost_tracker: dict[str, int] = {}  # ghost detection count per contract
         self._ghost_fill_confirmed: set[str] = set()  # broker_oids already confirmed terminal — skip re-check
         self._missing_id_exit_tracker: dict[str, int] = {}  # missing broker-id EXIT recovery pass count
+        self._reconciler_proof_repair_cursor: tuple[object | None, str] | None = None
         self.fill_monitor = None      # optional fill_monitor_final_hardened-7.py instance
         self.require_fill_monitor = (
             os.getenv("RECONCILER_REQUIRE_FILL_MONITOR", "0").strip().lower()
@@ -4073,7 +4086,13 @@ class APBrokerReconciler:
             response = (
                 self.supabase_client
                 .table("proof_trades")
-                .select("id,client_email,position_id,local_order_id")
+                .select(
+                    "id,client_email,position_id,local_order_id,execution_mode,"
+                    "entry_option_price,exit_option_price,contracts,"
+                    "option_pnl_pct,win,"
+                    "exit_local_order_id,broker_exit_order_id,"
+                    "broker_exit_fill_ts,broker_exit_filled_qty"
+                )
                 .eq("client_email", self.client_id)
                 .eq("position_id", pos_id)
                 .eq("local_order_id", entry_local_order_id)
@@ -4086,6 +4105,83 @@ class APBrokerReconciler:
             if not isinstance(rows, list):
                 rows = list(rows)
             return [dict(row) for row in rows if isinstance(row, dict)]
+
+        def _existing_proof_mismatch(row: dict) -> str | None:
+            """Require an already-stored proof to carry the same EXIT truth."""
+            stored_client_id = str(row.get("client_email") or "").strip()
+            stored_position_id = str(row.get("position_id") or "").strip()
+            stored_entry_local = str(row.get("local_order_id") or "").strip()
+            stored_exit_local = str(row.get("exit_local_order_id") or "").strip()
+            stored_exit_broker = str(row.get("broker_exit_order_id") or "").strip()
+            stored_mode = str(row.get("execution_mode") or "").strip().lower()
+            stored_fill_ts = _parse_reconciler_timestamp(row.get("broker_exit_fill_ts"))
+            stored_fill_qty = _strict_positive_whole_number(
+                row.get("broker_exit_filled_qty")
+            )
+            stored_entry_px = _strict_positive_finite_float(
+                row.get("entry_option_price")
+            )
+            stored_exit_px = _strict_positive_finite_float(
+                row.get("exit_option_price")
+            )
+            stored_contracts = _strict_positive_whole_number(row.get("contracts"))
+            stored_pnl_pct = _finite_float(row.get("option_pnl_pct"))
+            expected_pnl_pct = round(
+                ((evidence_fill_price - expected_entry_price) / expected_entry_price) * 100,
+                2,
+            )
+            stored_win = row.get("win")
+            expected_win = evidence_fill_price > expected_entry_price
+
+            # APProofLogger stores option economics rounded to four decimals;
+            # compare against that durable representation, not the unrounded
+            # broker scalar supplied to the logger.
+            stored_entry_px_matches = (
+                stored_entry_px is not None
+                and math.isclose(
+                    stored_entry_px,
+                    round(expected_entry_price, 4),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+            stored_exit_px_matches = (
+                stored_exit_px is not None
+                and math.isclose(
+                    stored_exit_px,
+                    round(evidence_fill_price, 4),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+            checks = (
+                ("client_id", stored_client_id == str(self.client_id or "").strip()),
+                ("position_id", stored_position_id == pos_id),
+                ("entry_local_order_id", stored_entry_local == entry_local_order_id),
+                ("exit_local_order_id", stored_exit_local == evidence_local),
+                ("broker_exit_order_id", stored_exit_broker == evidence_broker),
+                ("execution_mode", stored_mode == proof_mode),
+                ("broker_exit_fill_ts", stored_fill_ts == evidence_filled_ts),
+                ("broker_exit_filled_qty", stored_fill_qty == evidence_filled_qty),
+                ("entry_option_price", stored_entry_px_matches),
+                ("exit_option_price", stored_exit_px_matches),
+                ("contracts", stored_contracts == expected_close_qty),
+                (
+                    "option_pnl_pct",
+                    stored_pnl_pct is not None
+                    and math.isclose(
+                        stored_pnl_pct,
+                        expected_pnl_pct,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ),
+                ),
+                ("win", isinstance(stored_win, bool) and stored_win == expected_win),
+            )
+            for field, matches in checks:
+                if not matches:
+                    return field
+            return None
 
         try:
             existing_rows = _exact_rows()
@@ -4102,6 +4198,17 @@ class APBrokerReconciler:
                 entry_local_order_id=entry_local_order_id,
             )
         if existing_rows:
+            existing_mismatch = _existing_proof_mismatch(existing_rows[0])
+            if existing_mismatch:
+                return _result(
+                    "EVIDENCE_UNPROVEN",
+                    reason=(
+                        "existing_proof_exit_provenance_unconfirmed:"
+                        f"{existing_mismatch}"
+                    ),
+                    entry_local_order_id=entry_local_order_id,
+                    proof_id=existing_rows[0].get("id"),
+                )
             return _result(
                 "ALREADY_EXISTS",
                 success=True,
@@ -4195,6 +4302,17 @@ class APBrokerReconciler:
                 entry_local_order_id=entry_local_order_id,
             )
         if len(confirmed_rows) == 1:
+            confirmed_mismatch = _existing_proof_mismatch(confirmed_rows[0])
+            if confirmed_mismatch:
+                return _result(
+                    "PERSIST_FAILED",
+                    reason=(
+                        "inserted_proof_exit_provenance_unconfirmed:"
+                        f"{confirmed_mismatch}"
+                    ),
+                    entry_local_order_id=entry_local_order_id,
+                    proof_id=confirmed_rows[0].get("id"),
+                )
             return _result(
                 "PERSISTED",
                 success=True,
@@ -4238,23 +4356,46 @@ class APBrokerReconciler:
             )
             return
 
+        cursor = self._reconciler_proof_repair_cursor
         try:
             from ap.db import conn, run_with_retry
 
             def _scan():
                 with conn() as c:
+                    pagination_sql = ""
+                    params: list[object] = [self.client_id]
+                    if cursor is not None:
+                        cursor_exit_ts, cursor_position_id = cursor
+                        if cursor_exit_ts is None:
+                            pagination_sql = (
+                                " AND p.exit_ts IS NULL"
+                                " AND p.id::text < %s"
+                            )
+                            params.append(cursor_position_id)
+                        else:
+                            pagination_sql = (
+                                " AND ("
+                                "p.exit_ts IS NULL"
+                                " OR p.exit_ts < %s"
+                                " OR (p.exit_ts = %s AND p.id::text < %s)"
+                                ")"
+                            )
+                            params.extend(
+                                [cursor_exit_ts, cursor_exit_ts, cursor_position_id]
+                            )
                     c.execute(
-                        """
+                        f"""
                         SELECT p.*
                         FROM positions p
                         WHERE p.client_id = %s
                           AND UPPER(TRIM(COALESCE(p.status, ''))) = 'CLOSED'
                           AND UPPER(TRIM(COALESCE(p.close_source, ''))) =
                               'RECONCILER_AUTO_CLOSE'
-                        ORDER BY p.exit_ts DESC NULLS LAST
-                        LIMIT 50
+                          {pagination_sql}
+                        ORDER BY p.exit_ts DESC NULLS LAST, p.id::text DESC
+                        LIMIT {RECONCILER_PROOF_REPAIR_PAGE_SIZE}
                         """,
-                        (self.client_id,),
+                        tuple(params),
                     )
                     return [dict(row) for row in (c.fetchall() or [])]
 
@@ -4273,6 +4414,12 @@ class APBrokerReconciler:
                 self.client_id,
                 scan_exc,
             )
+            return
+
+        if not candidates:
+            # End of the current keyset sweep.  Start a fresh sweep next cycle
+            # so newly-closed rows are not hidden behind an old cursor.
+            self._reconciler_proof_repair_cursor = None
             return
 
         summary["reconciler_proof_repair_candidates"] += len(candidates)
@@ -4374,6 +4521,19 @@ class APBrokerReconciler:
                     or proof_result.get("disposition")
                     or "proof_persistence_not_confirmed"
                 )
+
+        if len(candidates) < RECONCILER_PROOF_REPAIR_PAGE_SIZE:
+            self._reconciler_proof_repair_cursor = None
+        else:
+            last_candidate = candidates[-1]
+            self._reconciler_proof_repair_cursor = (
+                last_candidate.get("exit_ts"),
+                str(
+                    last_candidate.get("id")
+                    or last_candidate.get("position_id")
+                    or ""
+                ).strip(),
+            )
 
     def _import_broker_positions_missing_from_db(
         self,

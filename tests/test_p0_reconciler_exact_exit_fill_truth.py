@@ -1015,6 +1015,16 @@ def test_exact_exit_evidence_identity_reaches_position_engine_and_proof(monkeypa
                 "client_email": CLIENT,
                 "position_id": kwargs["position_id"],
                 "local_order_id": kwargs["local_order_id"],
+                "execution_mode": kwargs["execution_mode"],
+                "entry_option_price": kwargs["entry_option_price"],
+                "exit_option_price": kwargs["exit_option_price"],
+                "contracts": kwargs["contracts"],
+                "option_pnl_pct": kwargs["option_pnl_pct"],
+                "win": kwargs["win"],
+                "exit_local_order_id": kwargs["exit_local_order_id"],
+                "broker_exit_order_id": kwargs["broker_exit_order_id"],
+                "broker_exit_fill_ts": kwargs["broker_exit_fill_ts"].isoformat(),
+                "broker_exit_filled_qty": kwargs["broker_exit_filled_qty"],
             }
         )
         return {"_proof_persisted": True}
@@ -1050,6 +1060,80 @@ def test_exact_exit_evidence_identity_reaches_position_engine_and_proof(monkeypa
     assert mark_kwargs["broker_exit_order_id"] == "TR-195"
     assert mark_kwargs["broker_exit_fill_ts"].isoformat() == evidence["filled_ts"]
     assert mark_kwargs["broker_exit_filled_qty"] == 2
+
+
+def _complete_durable_reconciler_proof() -> dict:
+    return {
+        "id": "proof-existing",
+        "client_email": CLIENT,
+        "position_id": POSITION_ID,
+        "local_order_id": "entry-local-1",
+        "execution_mode": MODE_LIVE,
+        "entry_option_price": 2.33,
+        "exit_option_price": 4.79,
+        "contracts": 2,
+        "option_pnl_pct": 105.58,
+        "win": True,
+        "exit_local_order_id": "exit-local-1",
+        "broker_exit_order_id": "TR-195",
+        "broker_exit_fill_ts": "2026-08-10T19:00:00+00:00",
+        "broker_exit_filled_qty": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        pytest.param("exit_local_order_id", None, id="missing-exit-local"),
+        pytest.param("broker_exit_order_id", "OLD-BROKER", id="wrong-exit-broker"),
+        pytest.param("broker_exit_fill_ts", None, id="missing-fill-timestamp"),
+        pytest.param("broker_exit_filled_qty", 1, id="wrong-fill-quantity"),
+        pytest.param("exit_option_price", 1.95, id="wrong-exit-economics"),
+        pytest.param("option_pnl_pct", 0.0, id="wrong-pnl-economics"),
+    ],
+)
+def test_existing_incomplete_or_mismatched_proof_is_hold_not_already_exists(
+    monkeypatch, field, replacement
+):
+    state, rec = _restart_fixture(monkeypatch)
+    existing = _complete_durable_reconciler_proof()
+    if replacement is None:
+        existing.pop(field)
+    else:
+        existing[field] = replacement
+    rec.supabase_client.proof_rows.append(existing)
+
+    result = rec._persist_exact_reconciler_proof(
+        pos=dict(state.position),
+        exact_exit_evidence=dict(state.exit),
+        close_qty=2,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+    )
+
+    assert result["success"] is False, field
+    assert result["disposition"] == "EVIDENCE_UNPROVEN", field
+    assert "existing_proof_exit_provenance_unconfirmed" in result["reason"]
+    assert rec.supabase_client.insert_payloads == []
+
+
+def test_existing_complete_proof_is_already_exists_only_after_exact_confirmation(monkeypatch):
+    state, rec = _restart_fixture(monkeypatch)
+    rec.supabase_client.proof_rows.append(_complete_durable_reconciler_proof())
+
+    result = rec._persist_exact_reconciler_proof(
+        pos=dict(state.position),
+        exact_exit_evidence=dict(state.exit),
+        close_qty=2,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+    )
+
+    assert result["success"] is True
+    assert result["disposition"] == "ALREADY_EXISTS"
+    assert rec.supabase_client.insert_payloads == []
 
 
 def test_reconciler_skips_fallback_proof_after_canonical_callback_persists(monkeypatch):
@@ -1643,7 +1727,7 @@ class _RestartCursor:
             }
             return self
 
-        if "FROM POSITIONS" in upper and "ID::TEXT" in upper:
+        if "FROM POSITIONS" in upper and "ID::TEXT" in upper and "SELECT P.*" not in upper:
             self._one = dict(self.state.position)
             return self
 
@@ -1838,6 +1922,88 @@ def test_reconciler_close_then_restart_repairs_exact_proof_once(monkeypatch):
     assert state.position["status"] == "CLOSED"
     assert dict(state.position)["close_source"] == "RECONCILER_AUTO_CLOSE"
     assert position_before["status"] == "OPEN"
+
+
+def test_restart_repair_keyset_paginates_past_first_fifty_rows(monkeypatch):
+    """A full page of already-seen/held rows cannot starve older candidates."""
+    rows = []
+    for index in range(51):
+        row = _position()
+        row.update(
+            {
+                "id": f"position-{index:03d}",
+                "status": "CLOSED",
+                "close_source": "RECONCILER_AUTO_CLOSE",
+                "exit_ts": f"2026-08-10T19:{index:02d}:00+00:00",
+            }
+        )
+        rows.append(row)
+
+    class _PagingCursor:
+        def __init__(self):
+            self.calls: list[tuple] = []
+            self._many: list[dict] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if "SELECT P.* FROM POSITIONS P" not in compact:
+                self._many = []
+                return
+            params = tuple(params)
+            self.calls.append(params)
+            candidates = [dict(row) for row in rows if row["client_id"] == params[0]]
+            if len(params) == 4:
+                cursor_ts, _same_ts, cursor_id = params[1:]
+                candidates = [
+                    row
+                    for row in candidates
+                    if row["exit_ts"] < cursor_ts
+                    or (row["exit_ts"] == cursor_ts and row["id"] < cursor_id)
+                ]
+            elif len(params) == 2:
+                cursor_id = params[1]
+                candidates = [row for row in candidates if row["exit_ts"] is None and row["id"] < cursor_id]
+            candidates.sort(key=lambda row: (row["exit_ts"] is not None, row["exit_ts"] or "", row["id"]), reverse=True)
+            self._many = candidates[:50]
+
+        def fetchall(self):
+            return list(self._many)
+
+    cursor = _PagingCursor()
+
+    class _PagingConnection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(db_mod, "conn", lambda: _PagingConnection())
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+    rec = _reconciler()
+    rec._get_recent_exit_fill = MagicMock(return_value=None)
+    rec._alert = MagicMock()
+
+    first_summary = _empty_summary(CLIENT)
+    rec._repair_missing_reconciler_proofs(first_summary)
+    second_summary = _empty_summary(CLIENT)
+    rec._repair_missing_reconciler_proofs(second_summary)
+
+    assert len(cursor.calls) == 2
+    assert cursor.calls[0] == (CLIENT,)
+    assert len(cursor.calls[1]) == 4
+    assert cursor.calls[1][3] == "position-001"
+    assert first_summary["reconciler_proof_repair_candidates"] == 50
+    assert second_summary["reconciler_proof_repair_candidates"] == 1
+    assert first_summary["reconciler_proof_repair_failures"] == 50
+    assert second_summary["reconciler_proof_repair_failures"] == 1
+    assert rec._reconciler_proof_repair_cursor is None
 
 
 @pytest.mark.parametrize(
