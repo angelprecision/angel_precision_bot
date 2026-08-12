@@ -152,20 +152,210 @@ def test_loose_preselector_quote_fields_are_not_selected_authority(monkeypatch):
 
 
 def test_exact_selected_contract_activates_only_exact_quality_path(monkeypatch):
-    signal = _selected_signal()
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
     gate, pipeline = _run_with_fake_pipeline(monkeypatch, signal)
     name, kwargs = pipeline.calls[0]
     assert name == "run"
     assert kwargs["contract_quality_authoritative"] is True
     assert kwargs["account_state_authoritative"] is False
     assert kwargs["dte"] == 0
-    assert gate["gate_diagnostics"]["selected_contract_evidence"]["exists"] is True
+    evidence = gate["gate_diagnostics"]["selected_contract_evidence"]
+    assert evidence["exists"] is True
+    assert evidence["source"] == ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+
+
+def test_trusted_quote_source_can_be_attested_by_selected_container():
+    signal = _selected_signal()
+    signal["quote_source"] = ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is True
+    assert evidence["authoritative"] is True
+    assert evidence["source"] == ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+
+
+@pytest.mark.parametrize("quote_source", [None, "whatever", "tradier_live"])
+def test_unrecognized_selected_contract_quote_source_cannot_create_authority(
+    quote_source,
+):
+    contract = _selected_signal()["selected_contract"]
+    if quote_source is None:
+        contract.pop("quote_source", None)
+    else:
+        contract["quote_source"] = quote_source
+
+    evidence = ib._extract_selected_contract_evidence(
+        {"selected_contract": contract, "signal_id": "sig-1"},
+        client_id="client-a", execution_mode="LIVE",
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_quote_source_untrusted"
+
+
+def test_same_occ_conflicting_client_identity_is_quarantined():
+    signal = _selected_signal()
+    signal["metadata"] = {
+        "selected_contract": {
+            **signal["selected_contract"],
+            "selected_client_id": "client-b",
+        }
+    }
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_identity_conflict"
+
+
+def test_same_occ_conflicting_execution_mode_identity_is_quarantined():
+    signal = _selected_signal()
+    signal["metadata"] = {
+        "selected_contract": {
+            **signal["selected_contract"],
+            "selected_execution_mode": "PAPER",
+        }
+    }
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_identity_conflict"
+
+
+def test_same_occ_conflicting_signal_identity_is_quarantined():
+    signal = _selected_signal()
+    signal["metadata"] = {
+        "selected_contract": {
+            **signal["selected_contract"],
+            "canonical_signal_id": "sig-2",
+        }
+    }
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_identity_conflict"
+
+
+@pytest.mark.parametrize("container_name", ["selector_metadata", "approved_plan"])
+def test_same_occ_identity_conflict_is_checked_in_every_candidate_container(
+    container_name,
+):
+    signal = _selected_signal()
+    conflicting = {
+        **signal["selected_contract"],
+        "selected_client_id": "client-b",
+    }
+    metadata = {"selected_contract": conflicting}
+    if container_name == "approved_plan":
+        signal[container_name] = types.SimpleNamespace(metadata=metadata)
+    else:
+        signal[container_name] = metadata
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_identity_conflict"
+
+
+def test_duplicate_selected_contracts_with_identical_identity_remain_eligible():
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
+    signal["metadata"] = {
+        "selected_contract": dict(signal["selected_contract"]),
+    }
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is True
+    assert evidence["authoritative"] is True
+    assert evidence["classification"] == ib.PRODUCTION_EXACT
+    assert evidence["source"] == ib.SELECTED_CONTRACT_TRUSTED_SOURCE
+
+
+def test_top_level_and_nested_occ_identity_conflict_is_quarantined():
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
+    signal["contract_symbol"] = "AAPL260821P00190000"
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["classification"] == ib.UNAVAILABLE
+    assert evidence["reason"] == "selected_contract_identity_conflict"
+
+
+def test_outer_signal_timestamp_cannot_attest_selected_contract_quote():
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
+    signal["timestamp"] = _now()
+    signal["selected_contract"].pop("quote_ts")
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["reason"] == "selected_contract_quote_timestamp_missing_or_invalid"
+
+
+def test_outer_signal_observed_at_cannot_attest_nested_selected_contract_quote():
+    signal = _selected_signal(
+        quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+    )
+    signal["observed_at"] = _now()
+    signal["selected_contract"].pop("quote_ts")
+
+    evidence = ib._extract_selected_contract_evidence(
+        signal, client_id="client-a", execution_mode="LIVE"
+    )
+
+    assert evidence["exists"] is False
+    assert evidence["authoritative"] is False
+    assert evidence["reason"] == "selected_contract_quote_timestamp_missing_or_invalid"
 
 
 def test_stale_selected_contract_is_quarantined():
     old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)).isoformat()
     evidence = ib._extract_selected_contract_evidence(
-        _selected_signal(quote_ts=old), client_id="client-a", execution_mode="LIVE"
+        _selected_signal(
+            quote_ts=old,
+            quote_source=ib.SELECTED_CONTRACT_TRUSTED_SOURCE,
+        ),
+        client_id="client-a", execution_mode="LIVE"
     )
     assert evidence["exists"] is False
     assert evidence["classification"] == ib.UNAVAILABLE
@@ -542,8 +732,13 @@ def test_unavailable_vix_flows_get_vix_to_pipeline_risk_detail_and_bridge(monkey
     assert risk_detail["authority_diagnostics"]["vix"]["classification"] == "UNAVAILABLE"
     assert risk_detail["authority_diagnostics"]["vix"]["authoritative"] is False
     assert gate["approved"] is True
-    assert gate["intel_status"] != "RISK_VETO"
+    assert gate["intel_status"] == "VIX_ADVISORY"
+    assert (
+        gate["gate_diagnostics"]["canonical_admission_reason_code"]
+        == "INTEL_VIX_ADVISORY"
+    )
     assert gate["risk_detail"]["reason_code"] == "VIX_UNAVAILABLE"
+    assert gate["risk_detail"]["hard_veto"] is False
 
 
 def test_structured_hard_risk_veto_remains_authoritative():

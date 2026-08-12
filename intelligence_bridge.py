@@ -114,6 +114,15 @@ _OCC_RE = re.compile(r"^[A-Z0-9.]{1,10}\d{6}[CP]\d{8}$")
 _MAX_SELECTED_QUOTE_AGE_SECONDS = float(
     os.getenv("GATE_G_MAX_SELECTED_QUOTE_AGE_SECONDS", "120")
 )
+# Gate G does not infer selected-contract authority from a generic broker label,
+# a signal timestamp, or a caller-provided fallback.  This is the closed
+# producer attestation reserved for the selector/revalidator contract.  The
+# current deferred materializer does not emit it, so its metadata remains
+# advisory until the later selected-contract contract is frozen.
+SELECTED_CONTRACT_TRUSTED_SOURCE = "selector_revalidated_production"
+TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES = frozenset({
+    SELECTED_CONTRACT_TRUSTED_SOURCE,
+})
 
 
 def _safe_float(value: Any, *, field: str = "value") -> tuple[Optional[float], str]:
@@ -168,6 +177,11 @@ def _normalize_mode(value: Any) -> str:
     return ""
 
 
+def _normalize_occ(value: Any) -> str:
+    contract = "".join(str(value or "").upper().split())
+    return contract if _OCC_RE.fullmatch(contract) else ""
+
+
 def _parse_timestamp(value: Any) -> Optional[_dt.datetime]:
     if value is None:
         return None
@@ -216,34 +230,147 @@ def _signal_execution_mode(signal: dict) -> str:
     return "LIVE" if _INTEL_IS_LIVE else "PAPER"
 
 
-def _candidate_contract_sources(signal: dict) -> list[dict]:
-    """Return only containers that explicitly claim selected-contract data."""
-    sources: list[dict] = []
+def _iter_candidate_contract_containers(signal: dict):
+    """Yield source containers and their nested selected-contract payloads."""
     if not isinstance(signal, dict):
-        return sources
+        return
+
+    plan_metadata = []
+    for plan_key in ("_approved_plan", "approved_plan"):
+        plan = signal.get(plan_key)
+        if isinstance(plan, dict):
+            plan_metadata.append(plan.get("metadata"))
+        else:
+            plan_metadata.append(getattr(plan, "metadata", None))
 
     for container in (
         signal,
         signal.get("metadata"),
         signal.get("selector_metadata"),
-        getattr(signal.get("_approved_plan"), "metadata", None),
+        *plan_metadata,
     ):
         if not isinstance(container, dict):
             continue
         nested = container.get("selected_contract")
-        if isinstance(nested, dict):
-            merged = dict(container)
-            merged.update(nested)
-            sources.append(merged)
-        elif any(
+        if isinstance(nested, dict) or any(
             key in container
             for key in (
-                "selected_contract", "contract_symbol", "occ_symbol",
+                "selected_contract", "contract_symbol", "occ_symbol", "option_symbol",
                 "selected_dte", "selected_bid", "selected_ask",
             )
         ):
-            sources.append(dict(container))
-    return sources
+            yield container, nested if isinstance(nested, dict) else None
+
+
+def _candidate_contract_records(signal: dict):
+    records = []
+    for container, nested in _iter_candidate_contract_containers(signal):
+        if isinstance(nested, dict):
+            merged = dict(container)
+            merged.update(nested)
+        else:
+            merged = dict(container)
+        records.append((merged, container, nested))
+    return records
+
+
+def _candidate_contract_sources(signal: dict) -> list[dict]:
+    """Return merged candidate payloads for callers that need a flat view."""
+    return [candidate for candidate, _, _ in _candidate_contract_records(signal)]
+
+
+def _identity_values(parts, keys, normalizer):
+    """Collect normalized immutable-identity values across duplicated fields."""
+    values: set[str] = set()
+    invalid = False
+    for mapping in parts:
+        if not isinstance(mapping, dict):
+            continue
+        for key in keys:
+            if key not in mapping:
+                continue
+            raw = mapping.get(key)
+            if raw is None or (key == "selected_contract" and isinstance(raw, dict)):
+                continue
+            normalized = normalizer(raw)
+            if normalized:
+                values.add(normalized)
+            else:
+                invalid = True
+    return values, invalid
+
+
+def _candidate_contract_identity_claim(container: dict, nested: dict | None):
+    """Build one complete immutable identity claim for a source container.
+
+    The outer wrapper and nested selected-contract object are one source
+    claim, but every duplicated identity field is retained for conflict
+    detection.  This prevents ``dict.update`` precedence from deciding money
+    authority when both layers disagree.
+    """
+    parts = [container]
+    if isinstance(nested, dict):
+        parts.append(nested)
+
+    contract_values, contract_invalid = _identity_values(
+        parts,
+        ("contract_symbol", "occ_symbol", "option_symbol", "selected_contract"),
+        _normalize_occ,
+    )
+    has_contract_claim = any(
+        isinstance(mapping, dict)
+        and any(key in mapping and mapping.get(key) is not None for key in (
+            "selected_contract", "contract_symbol", "occ_symbol", "option_symbol",
+        ))
+        for mapping in parts
+    )
+    if not has_contract_claim:
+        return None
+
+    client_values, client_invalid = _identity_values(
+        parts,
+        ("selected_client_id", "client_id", "client_email"),
+        lambda value: str(value).strip(),
+    )
+    mode_values, mode_invalid = _identity_values(
+        parts,
+        ("selected_execution_mode", "execution_mode", "mode"),
+        _normalize_mode,
+    )
+    signal_values, signal_invalid = _identity_values(
+        parts,
+        ("canonical_signal_id", "originating_signal_id", "signal_id"),
+        lambda value: str(value).strip(),
+    )
+
+    complete = (
+        len(contract_values) == 1
+        and len(client_values) == 1
+        and len(mode_values) == 1
+        and len(signal_values) == 1
+        and not any((contract_invalid, client_invalid, mode_invalid, signal_invalid))
+    )
+    return {
+        "contract": next(iter(contract_values), ""),
+        "client": next(iter(client_values), ""),
+        "mode": next(iter(mode_values), ""),
+        "signal": next(iter(signal_values), ""),
+        "complete": complete,
+        "identity_conflict": any(
+            len(values) > 1
+            for values in (contract_values, client_values, mode_values, signal_values)
+        ),
+        "contract_values": sorted(contract_values),
+    }
+
+
+def _candidate_contract_identity_claims(signal: dict) -> list[dict]:
+    claims: list[dict] = []
+    for container, nested in _iter_candidate_contract_containers(signal):
+        claim = _candidate_contract_identity_claim(container, nested)
+        if claim is not None:
+            claims.append(claim)
+    return claims
 
 
 def _extract_selected_contract_evidence(
@@ -266,8 +393,8 @@ def _extract_selected_contract_evidence(
     expected_mode = _normalize_mode(execution_mode)
     expected_signal = str(signal.get("signal_id") or "").strip()
     expected_canonical = str(signal.get("canonical_signal_id") or "").strip()
-    sources = _candidate_contract_sources(signal)
-    if not sources:
+    records = _candidate_contract_records(signal)
+    if not records:
         return {
             "exists": False,
             "authoritative": False,
@@ -275,36 +402,51 @@ def _extract_selected_contract_evidence(
             "reason": "no_selected_occ_contract",
         }
 
-    # A retry/queue payload can contain both signal-level and nested metadata.
-    # If those containers claim different OCC identities, do not choose one by
-    # dictionary order.  Money identity conflicts are quarantined until the
-    # selector/reconciler supplies one unambiguous current contract.
-    claimed_contracts: set[str] = set()
-    for candidate in sources:
-        nested_contract = candidate.get("selected_contract")
-        if isinstance(nested_contract, dict):
-            contract_raw, _ = _first_present(
-                nested_contract, "contract_symbol", "occ_symbol", "option_symbol"
-            )
-        else:
-            contract_raw, _ = _first_present(
-                candidate, "contract_symbol", "occ_symbol", "option_symbol", "selected_contract"
-            )
-        contract = "".join(str(contract_raw or "").upper().split())
-        if _OCC_RE.fullmatch(contract):
-            claimed_contracts.add(contract)
-    if len(claimed_contracts) > 1:
+    # A retry/queue payload can contain multiple claims for the same OCC.  The
+    # entire immutable identity tuple must agree before any one candidate can
+    # become authority; a valid Jason/LIVE candidate must not hide a Jose/PAPER
+    # duplicate merely because the OCC symbol matches.
+    identity_claims = _candidate_contract_identity_claims(signal)
+    claimed_contracts = sorted({
+        contract
+        for claim in identity_claims
+        for contract in claim.get("contract_values", [])
+        if contract
+    })
+    identity_tuples = {
+        (
+            claim.get("contract"),
+            claim.get("client"),
+            claim.get("mode"),
+            claim.get("signal"),
+        )
+        for claim in identity_claims
+    }
+    if (
+        not identity_claims
+        or any(claim.get("identity_conflict") for claim in identity_claims)
+        or len(claimed_contracts) > 1
+        or len(identity_tuples) > 1
+        or (
+            len(identity_claims) > 1
+            and any(not claim.get("complete") for claim in identity_claims)
+        )
+    ):
         return {
             "exists": False,
             "authoritative": False,
             "classification": UNAVAILABLE,
             "reason": "selected_contract_identity_conflict",
-            "claimed_contracts": sorted(claimed_contracts),
+            "claimed_contracts": claimed_contracts,
         }
 
     last_reason = "selected_contract_unavailable"
-    for candidate in sources:
-        nested_contract = candidate.get("selected_contract")
+    for candidate, source_container, nested_contract in records:
+        # ``candidate`` carries the selected-contract fields from either a
+        # flat producer container or its nested payload.  It intentionally
+        # excludes generic ``timestamp`` by key selection below, so an outer
+        # signal timestamp cannot attest to an option quote.
+        quote_payload = candidate
         if isinstance(nested_contract, dict):
             contract_raw, contract_key = _first_present(
                 nested_contract, "contract_symbol", "occ_symbol", "option_symbol"
@@ -346,10 +488,28 @@ def _extract_selected_contract_evidence(
             last_reason = "selected_contract_signal_identity_mismatch"
             continue
 
-        quote_ts_raw, quote_ts_key = _first_present(
-            candidate,
-            "quote_ts", "quote_timestamp", "quote_observed_at",
-            "observed_at", "timestamp",
+        quote_sources = set()
+        for source in (source_container, nested_contract):
+            quote_source_raw, _ = _first_present(source, "quote_source")
+            if quote_source_raw is not None:
+                quote_sources.add(str(quote_source_raw).strip().lower())
+        if len(quote_sources) != 1:
+            last_reason = "selected_contract_quote_source_untrusted"
+            continue
+        quote_source = next(iter(quote_sources))
+        if quote_source not in TRUSTED_SELECTED_CONTRACT_QUOTE_SOURCES:
+            last_reason = "selected_contract_quote_source_untrusted"
+            continue
+
+        # Only an explicit quote observation timestamp from the selected
+        # contract payload is eligible.  A generic outer signal timestamp is
+        # not quote provenance and must not launder stale option data.
+        timestamp_payload = (
+            nested_contract if isinstance(nested_contract, dict) else source_container
+        )
+        quote_ts_raw, _ = _first_present(
+            timestamp_payload,
+            "quote_ts", "quote_timestamp", "quote_observed_at", "observed_at",
         )
         quote_ts = _parse_timestamp(quote_ts_raw)
         if quote_ts is None:
@@ -360,8 +520,8 @@ def _extract_selected_contract_evidence(
             last_reason = "selected_contract_quote_stale"
             continue
 
-        bid_raw, _ = _first_present(candidate, "selected_bid", "bid", "option_bid")
-        ask_raw, _ = _first_present(candidate, "selected_ask", "ask", "option_ask")
+        bid_raw, _ = _first_present(quote_payload, "selected_bid", "bid", "option_bid")
+        ask_raw, _ = _first_present(quote_payload, "selected_ask", "ask", "option_ask")
         bid, bid_status = _safe_float(bid_raw, field="bid")
         ask, ask_status = _safe_float(ask_raw, field="ask")
         if bid is None or ask is None or bid < 0 or ask <= 0 or ask < bid:
@@ -372,7 +532,7 @@ def _extract_selected_contract_evidence(
             last_reason = "selected_contract_quote_mid_invalid"
             continue
 
-        spread_raw, _ = _first_present(candidate, "selected_spread_pct", "spread_pct")
+        spread_raw, _ = _first_present(quote_payload, "selected_spread_pct", "spread_pct")
         spread, spread_status = _safe_float(spread_raw, field="spread_pct")
         if spread is None:
             spread = (ask - bid) / mid
@@ -380,14 +540,14 @@ def _extract_selected_contract_evidence(
             last_reason = f"selected_contract_spread_invalid:{spread_status}"
             continue
 
-        delta_raw, _ = _first_present(candidate, "selected_delta", "delta", "option_delta")
+        delta_raw, _ = _first_present(quote_payload, "selected_delta", "delta", "option_delta")
         oi_raw, _ = _first_present(
-            candidate, "selected_open_interest", "open_interest", "oi"
+            quote_payload, "selected_open_interest", "open_interest", "oi"
         )
         volume_raw, _ = _first_present(
-            candidate, "selected_volume", "volume", "option_volume"
+            quote_payload, "selected_volume", "volume", "option_volume"
         )
-        dte_raw, _ = _first_present(candidate, "selected_dte", "dte")
+        dte_raw, _ = _first_present(quote_payload, "selected_dte", "dte")
         delta, delta_status = _safe_float(delta_raw, field="delta")
         open_interest, oi_status = _safe_int(oi_raw, field="open_interest")
         volume, volume_status = _safe_int(volume_raw, field="volume")
@@ -395,7 +555,7 @@ def _extract_selected_contract_evidence(
 
         if dte is None:
             expiration_raw, _ = _first_present(
-                candidate, "selected_expiration", "expiration", "expiration_date"
+                quote_payload, "selected_expiration", "expiration", "expiration_date"
             )
             try:
                 expiration = _dt.date.fromisoformat(str(expiration_raw)[:10])
@@ -414,7 +574,7 @@ def _extract_selected_contract_evidence(
             "exists": True,
             "authoritative": True,
             "classification": PRODUCTION_EXACT,
-            "source": str(candidate.get("quote_source") or candidate.get("source") or "selected_contract"),
+            "source": quote_source,
             "source_ts": quote_ts.isoformat(),
             "quote_age_seconds": round(max(0.0, age_seconds), 3),
             "contract_symbol": contract,
@@ -1307,6 +1467,40 @@ def _map_result(result: dict, fallback_score: float) -> dict:
                 **_diagnostics_from_risk(risk),
                 "intel_status": "REGIME_MISMATCH_ADVISORY",
                 "canonical_admission_reason_code": "INTEL_REGIME_MISMATCH_ADVISORY",
+                "scanner_score": round(fallback_score, 1),
+                "legacy_intel_score": round(score, 1),
+            },
+        }
+
+    # VIX data authority and the approval policy outcome are separate facts.
+    # An unavailable/stale/unproven VIX observation may continue Gate G, but it
+    # must remain non-authoritative so the LIVE final gate cannot reinterpret a
+    # downstream score as an authoritative intelligence approval.
+    if (
+        str(risk.get("reason_code") or "").strip().upper() == "VIX_UNAVAILABLE"
+        and risk.get("hard_veto") is False
+        and risk.get("approved") is True
+    ):
+        try:
+            advisory_contracts = int(contracts or 0)
+        except (TypeError, ValueError):
+            advisory_contracts = 0
+        advisory_contracts = max(0, advisory_contracts)
+        return {
+            "approved": True,
+            "score": round(score, 1),
+            "contracts": advisory_contracts,
+            "reasoning": (
+                f"vix_unavailable_advisory: {reasoning[:160]} "
+                "(hard_veto=False)"
+            ),
+            "intel_status": "VIX_ADVISORY",
+            "intel_score": round(score, 1),
+            "risk_detail": risk,
+            "gate_diagnostics": {
+                **_diagnostics_from_risk(risk),
+                "intel_status": "VIX_ADVISORY",
+                "canonical_admission_reason_code": "INTEL_VIX_ADVISORY",
                 "scanner_score": round(fallback_score, 1),
                 "legacy_intel_score": round(score, 1),
             },
