@@ -9,6 +9,8 @@ on:
       - "ap/morning_handoff.py"
       - "ap/preopen_readiness.py"
       - "ap/schema_attestation.py"
+      - "ap_recovery.py"
+      - "client_runner.py"
       - "migrations/20260811_orders_retry_hotpath_indexes.sql"
       - "tests/test_p0_profitability_db_hotpath.py"
       - ".github/workflows/p0_db_hotpath.yml"

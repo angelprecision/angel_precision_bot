@@ -1,6 +1,6 @@
 """P0 #433 — production DB hot-path and schema-shape contracts.
 
-The first three integration cases execute the exact current-main SQL before
+The integration cases execute the exact current-main SQL before
 and after the index migration.  The remaining cases pin the non-performance
 contracts that must not move while the scan is optimized: malformed JSON is
 still parsed in Python, client/mode ownership stays explicit, and known
@@ -25,11 +25,13 @@ MIGRATION_PATH = REPO_ROOT / "migrations" / "20260811_orders_retry_hotpath_index
 ORDER_MONITOR_PATH = REPO_ROOT / "ap" / "order_monitor.py"
 MORNING_HANDOFF_PATH = REPO_ROOT / "ap" / "morning_handoff.py"
 PREOPEN_READINESS_PATH = REPO_ROOT / "ap" / "preopen_readiness.py"
+RECOVERY_PATH = REPO_ROOT / "ap_recovery.py"
 SCHEMA_ATTESTATION_PATH = REPO_ROOT / "ap" / "schema_attestation.py"
 
 ARMED_INDEX = "idx_orders_entry_canceled_retry_armed_updated"
 STALE_INDEX = "idx_orders_entry_canceled_retry_inflight_updated"
 PENDING_INDEX = "idx_orders_entry_pending_trigger_recovery_created"
+DEFERRED_INDEX = "idx_orders_entry_pending_trigger_recovery_mode_created"
 
 
 def _function_source(path: Path, name: str) -> str:
@@ -83,6 +85,25 @@ def _active_pending_sql() -> str:
     )
 
 
+def _deferred_sql() -> str:
+    return _literal_sql(
+        _function_source(RECOVERY_PATH, "_recover_deferred_breach_lifecycles"),
+        "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s",
+    )
+
+
+def _runtime_shape_files() -> list[Path]:
+    return sorted(
+        {
+            *REPO_ROOT.glob("*.py"),
+            *REPO_ROOT.glob("*.sql"),
+            *((REPO_ROOT / "ap").rglob("*.py")),
+            *((REPO_ROOT / "sql").rglob("*.sql")),
+        },
+        key=str,
+    )
+
+
 def _pg_dsn() -> str:
     return (
         os.getenv("P0_DB_HOTPATH_TEST_DATABASE_URL")
@@ -124,6 +145,17 @@ def hotpath_db():
                     broker_order_id TEXT,
                     submitted_ts TIMESTAMPTZ,
                     filled_ts TIMESTAMPTZ,
+                    plan_id TEXT,
+                    score DOUBLE PRECISION,
+                    tier TEXT,
+                    trigger_price DOUBLE PRECISION,
+                    stop_underlying DOUBLE PRECISION,
+                    target_underlying DOUBLE PRECISION,
+                    pattern TEXT,
+                    timeframe TEXT,
+                    qty INTEGER,
+                    limit_price DOUBLE PRECISION,
+                    reserved_cost DOUBLE PRECISION,
                     created_ts TIMESTAMPTZ NOT NULL,
                     updated_ts TIMESTAMPTZ NOT NULL,
                     meta JSONB NOT NULL DEFAULT '{}'::jsonb
@@ -228,12 +260,64 @@ def _canonical_index_predicate(predicate: str) -> str:
     normalized = predicate.lower()
     normalized = re.sub(r"::text\b", "", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
-    normalized = normalized.replace("(", "").replace(")", "")
     return normalized.strip()
 
 
+def _strip_outer_parentheses(expression: str) -> str:
+    expression = expression.strip()
+    while expression.startswith("(") and expression.endswith(")"):
+        depth = 0
+        enclosed = True
+        for index, char in enumerate(expression):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(expression) - 1:
+                    enclosed = False
+                    break
+        if not enclosed or depth != 0:
+            break
+        expression = expression[1:-1].strip()
+    return expression
+
+
+def _split_top_level(expression: str, delimiter: str) -> list[str]:
+    pieces = []
+    start = 0
+    depth = 0
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if depth == 0 and expression.startswith(delimiter, index):
+            pieces.append(expression[start:index].strip())
+            start = index + len(delimiter)
+            index = start
+            continue
+        index += 1
+    pieces.append(expression[start:].strip())
+    return pieces
+
+
 def _predicate_terms(predicate: str) -> set[str]:
-    return {term.strip() for term in _canonical_index_predicate(predicate).split(" and ")}
+    normalized = _strip_outer_parentheses(_canonical_index_predicate(predicate))
+    terms = []
+    for term in _split_top_level(normalized, " and "):
+        term = _strip_outer_parentheses(term)
+        or_parts = _split_top_level(term, " or ")
+        if len(or_parts) > 1:
+            term = " or ".join(_strip_outer_parentheses(part) for part in or_parts)
+        term = re.sub(
+            r"\(\s*([a-z_][\w.]*\s*->>?\s*'[^']*')\s*\)",
+            r"\1",
+            term,
+        )
+        terms.append(term)
+    return set(terms)
 
 
 def _seed_retry_rows(cur, now: datetime) -> None:
@@ -304,8 +388,21 @@ def _seed_explain_rows(cur, now: datetime) -> None:
         _insert_order(
             cur,
             local_id=f"explain-pending-{i}",
+            mode="legacy",
             status="PENDING_TRIGGER",
             filled=now if i % 50 == 0 else None,
+            created=now - timedelta(seconds=i),
+            updated=now,
+        )
+        _insert_order(
+            cur,
+            local_id=f"explain-deferred-{i}",
+            mode=mode,
+            status="pending_trigger",
+            # The real deferred-recovery SQL intentionally has no filled_ts
+            # predicate. Keep these rows out of the separate active-readiness
+            # fixture while proving that exact deferred query unchanged.
+            filled=now,
             created=now - timedelta(seconds=i),
             updated=now,
         )
@@ -362,13 +459,61 @@ def test_pending_trigger_query_returns_byte_equivalent_rows_before_after_indexes
     assert [row["local_order_id"] for row in after] == ["pending-live", "pending-paper"]
 
 
+def test_deferred_breach_recovery_returns_byte_equivalent_rows_before_after_indexes(hotpath_db):
+    db, _ = hotpath_db
+    now = datetime.now(timezone.utc)
+    with db.cursor() as cur:
+        _insert_order(
+            cur, local_id="deferred-paper-spaced", mode="  PaPeR  ",
+            status="pending_trigger", created=now - timedelta(hours=5), updated=now,
+        )
+        _insert_order(
+            cur, local_id="deferred-paper-blank-broker", mode="paper",
+            status="PENDING_TRIGGER",
+            broker_id="", created=now - timedelta(hours=4), updated=now,
+        )
+        _insert_order(
+            cur, local_id="deferred-live", mode="live",
+            created=now - timedelta(hours=3), updated=now,
+        )
+        _insert_order(
+            cur, local_id="deferred-null-mode", mode=None,
+            created=now - timedelta(hours=2), updated=now,
+        )
+        _insert_order(
+            cur, local_id="deferred-broker-owned", broker_id="broker-1",
+            created=now - timedelta(hours=1, minutes=30), updated=now,
+        )
+        _insert_order(
+            cur, local_id="deferred-submitted", submitted=now,
+            created=now - timedelta(hours=1), updated=now,
+        )
+        _insert_order(
+            cur, local_id="deferred-exit", kind="EXIT",
+            created=now - timedelta(minutes=30), updated=now,
+        )
+        _insert_order(
+            cur, local_id="deferred-other-status", status="CANCELED",
+            created=now - timedelta(minutes=20), updated=now,
+        )
+        sql = _deferred_sql()
+        params = ("client-A", "paper")
+        before = _fetch(cur, sql, params)
+        _apply_migration(cur)
+        after = _fetch(cur, sql, params)
+    assert after == before
+    assert [row["local_order_id"] for row in after] == [
+        "deferred-paper-spaced", "deferred-paper-blank-broker",
+    ]
+
+
 def test_live_and_paper_retry_rows_remain_isolated():
     sql = _armed_sql()
     assert "client_id = %s" in sql
     assert "execution_mode = %s" in sql
     assert "meta ->> 'execution_mode' = %s" in sql
     assert "meta ->> 'mode' = %s" in sql
-    assert "COALESCE(execution_mode, 'live')" not in sql.lower()
+    assert "coalesce(execution_mode, 'live')" not in sql.lower()
 
 
 def test_null_execution_mode_has_no_implicit_live_default():
@@ -429,10 +574,10 @@ def test_index_and_shape_tests_do_not_import_or_call_broker_paths():
     assert "cancel_order" not in migration
 
 
-def test_migration_is_idempotent_and_uses_three_narrow_partial_indexes():
+def test_migration_is_idempotent_and_uses_four_narrow_partial_indexes():
     migration = MIGRATION_PATH.read_text(encoding="utf-8")
-    assert migration.count("CREATE INDEX IF NOT EXISTS") == 3
-    for name in (ARMED_INDEX, STALE_INDEX, PENDING_INDEX):
+    assert migration.count("CREATE INDEX IF NOT EXISTS") == 4
+    for name in (ARMED_INDEX, STALE_INDEX, PENDING_INDEX, DEFERRED_INDEX):
         assert name in migration
     assert re.search(r"(?im)^\s*CREATE INDEX CONCURRENTLY", migration) is None
     assert re.search(r"(?im)^\s*BEGIN\s*;", migration) is None
@@ -453,15 +598,16 @@ def test_clean_postgres_can_apply_migration_twice(hotpath_db):
               AND indexname = ANY(%s)
             ORDER BY indexname
             """,
-            ([ARMED_INDEX, STALE_INDEX, PENDING_INDEX],),
+            ([ARMED_INDEX, STALE_INDEX, PENDING_INDEX, DEFERRED_INDEX],),
         )
         assert [row["indexname"] for row in cur.fetchall()] == sorted(
-            [ARMED_INDEX, PENDING_INDEX, STALE_INDEX]
+            [ARMED_INDEX, DEFERRED_INDEX, PENDING_INDEX, STALE_INDEX]
         )
         cur.execute(
             """
             SELECT c.relname AS indexname,
                    pg_get_indexdef(c.oid) AS indexdef,
+                   pg_get_expr(i.indexprs, i.indrelid) AS expressions,
                    pg_get_expr(i.indpred, i.indrelid) AS predicate
             FROM pg_index i
             JOIN pg_class c ON c.oid = i.indexrelid
@@ -470,7 +616,7 @@ def test_clean_postgres_can_apply_migration_twice(hotpath_db):
               AND t.relname = 'orders'
               AND c.relname = ANY(%s)
             """,
-            ([ARMED_INDEX, STALE_INDEX, PENDING_INDEX],),
+            ([ARMED_INDEX, STALE_INDEX, PENDING_INDEX, DEFERRED_INDEX],),
         )
         definitions = {row["indexname"]: row for row in cur.fetchall()}
         expected = {
@@ -487,7 +633,7 @@ def test_clean_postgres_can_apply_migration_twice(hotpath_db):
                 "terms": {
                     "kind = 'entry'",
                     "status = 'canceled'",
-                    "meta ->> 'retry_status' = any array['in_flight', 'submitting']",
+                    "meta ->> 'retry_status' = any (array['in_flight', 'submitting'])",
                 },
             },
             PENDING_INDEX: {
@@ -499,6 +645,15 @@ def test_clean_postgres_can_apply_migration_twice(hotpath_db):
                     "submitted_ts is null",
                 },
             },
+            DEFERRED_INDEX: {
+                "keys": "using btree (client_id, lower(trim(both from coalesce(execution_mode,",
+                "terms": {
+                    "kind = 'entry'",
+                    "upper(coalesce(status, '')) = 'pending_trigger'",
+                    "broker_order_id is null or broker_order_id = ''",
+                    "submitted_ts is null",
+                },
+            },
         }
         assert set(definitions) == set(expected)
         for name, shape in expected.items():
@@ -506,10 +661,14 @@ def test_clean_postgres_can_apply_migration_twice(hotpath_db):
             indexdef = " ".join(actual["indexdef"].lower().split())
             assert shape["keys"] in indexdef, actual["indexdef"]
             assert _predicate_terms(actual["predicate"]) == shape["terms"], actual["predicate"]
+        deferred_expression = " ".join(
+            (definitions[DEFERRED_INDEX]["expressions"] or "").lower().split()
+        )
+        assert "lower(trim(both from coalesce(execution_mode," in deferred_expression
         assert "filled_ts" not in definitions[PENDING_INDEX]["indexdef"].lower()
 
 
-def test_explain_proves_all_three_indexes_are_eligible_and_used(hotpath_db):
+def test_explain_proves_all_four_indexes_are_eligible_and_used(hotpath_db):
     db, _ = hotpath_db
     now = datetime.now(timezone.utc)
     with db.cursor() as cur:
@@ -531,9 +690,16 @@ def test_explain_proves_all_three_indexes_are_eligible_and_used(hotpath_db):
             expected_rows=490,
             expected_removed=10,
         )
+        deferred_plan = _explain_json(cur, _deferred_sql(), ("client-A", "paper"))
+        _assert_index_scan(
+            deferred_plan,
+            index_name=DEFERRED_INDEX,
+            expected_rows=250,
+            expected_removed=0,
+        )
 
 
-def test_production_shaped_scale_scan_is_bounded_by_existing_limit(hotpath_db):
+def test_production_shaped_scale_scan_is_bounded_by_underlying_index_work(hotpath_db):
     db, _ = hotpath_db
     now = datetime.now(timezone.utc)
     with db.cursor() as cur:
@@ -550,11 +716,13 @@ def test_production_shaped_scale_scan_is_bounded_by_existing_limit(hotpath_db):
         cur.execute("ANALYZE orders")
         plan = _explain_json(cur, _armed_sql(), ("client-A", *_mode_params("paper")))
     scan = _assert_index_scan(plan, index_name=ARMED_INDEX, limit_rows=64)
+    assert int(scan.get("Actual Loops", 0)) == 1
+    assert int(scan.get("Actual Rows", 0)) + int(scan.get("Rows Removed by Filter", 0)) <= 128
     assert int(scan.get("Rows Removed by Filter", 0)) > 0
 
 
 def test_schema_shape_rejects_trade_queue_ticker_assumption():
-    runtime_files = list((REPO_ROOT / "ap").rglob("*.py")) + list((REPO_ROOT / "sql").rglob("*.sql"))
+    runtime_files = _runtime_shape_files()
     offenders = []
     for path in runtime_files:
         text = path.read_text(encoding="utf-8")
@@ -566,7 +734,7 @@ def test_schema_shape_rejects_trade_queue_ticker_assumption():
 
 
 def test_schema_shape_rejects_absent_trade_queue_meta_column():
-    runtime_files = list((REPO_ROOT / "ap").rglob("*.py")) + list((REPO_ROOT / "sql").rglob("*.sql"))
+    runtime_files = _runtime_shape_files()
     offenders = []
     for path in runtime_files:
         text = path.read_text(encoding="utf-8")
@@ -574,17 +742,33 @@ def test_schema_shape_rejects_absent_trade_queue_meta_column():
             # Inspect SQL string literals, not the whole Python module: a
             # nearby order-row ``meta`` reference must not be mistaken for a
             # trade_queue projection.
-            tree = ast.parse(text)
-            sql_literals = [
-                node.value
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-            ]
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                # A legacy root-level operational script is not importable
+                # Python, but it still belongs in the production-shape scan.
+                sql_literals = [text]
+            else:
+                sql_literals = [
+                    node.value
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                ]
         else:
             sql_literals = re.split(r";", re.sub(r"--[^\n]*", "", text))
         for statement in sql_literals:
-            if re.search(r"\bFROM\s+(?:public\.)?trade_queue\b", statement, flags=re.IGNORECASE) and re.search(r"\bmeta\b", statement, flags=re.IGNORECASE):
+            has_trade_queue = re.search(
+                r"\b(?:FROM|JOIN)\s+(?:public\.)?trade_queue\b",
+                statement,
+                flags=re.IGNORECASE,
+            )
+            has_trade_queue_meta = re.search(
+                r"\b(?:trade_queue|tq)\s*\.\s*meta\b",
+                statement,
+                flags=re.IGNORECASE,
+            )
+            if has_trade_queue and has_trade_queue_meta:
                 offenders.append(str(path.relative_to(REPO_ROOT)))
     assert offenders == []
     schema_source = SCHEMA_ATTESTATION_PATH.read_text(encoding="utf-8")
@@ -595,9 +779,9 @@ def test_schema_shape_rejects_absent_trade_queue_meta_column():
 
 
 def test_hotpath_sql_keeps_exact_client_id_fence():
-    for sql in (_armed_sql(), _stale_sql(), _pending_sql()):
+    for sql in (_armed_sql(), _stale_sql(), _pending_sql(), _deferred_sql()):
         assert "client_id = %s" in sql
-        assert "LOWER(client_id)" not in sql.upper()
+        assert "lower(client_id)" not in sql.lower()
         assert "client_id::" not in sql.lower()
         assert "COALESCE(client_id" not in sql
 
@@ -610,3 +794,12 @@ def test_hotpath_sql_keeps_execution_mode_fence_without_taxonomy_rewrite():
         assert "meta ->> 'mode' = %s" in sql
         assert "COALESCE(execution_mode" not in sql
         assert "LOWER(TRIM" not in sql
+
+
+def test_deferred_recovery_preserves_legacy_mode_and_status_normalization():
+    sql = _deferred_sql()
+    assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in sql
+    assert "UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'" in sql
+    assert "(broker_order_id IS NULL OR broker_order_id = '')" in sql
+    assert "submitted_ts IS NULL" in sql
+    assert "ORDER BY created_ts ASC" in sql

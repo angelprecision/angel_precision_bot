@@ -58,20 +58,29 @@ The exact runtime callers are:
   ordered by `created_ts`;
 - `ap.morning_handoff._has_unowned_pending_trigger_orders` — watcher reseed
   guard using the same exact `PENDING_TRIGGER` identity predicates.
+- `APStartupRecovery._recover_deferred_breach_lifecycles` — continuously
+  revisited by `ClientRunner`'s approximately 20-second health loop; it keeps
+  legacy `LOWER(TRIM(COALESCE(execution_mode, '')))` and
+  `UPPER(COALESCE(status, ''))` normalization, accepts null/blank broker
+  identity, requires `submitted_ts IS NULL`, and orders by `created_ts`.
 
 The retry callers already parse `retry_ready_at` and attempt counters in
-Python. The implementation therefore adds only the three narrow partial
-indexes in `migrations/20260811_orders_retry_hotpath_indexes.sql`; it does not
-cast JSON metadata or rewrite client/mode ownership predicates.
+Python. The implementation therefore adds only four narrow partial indexes in
+`migrations/20260811_orders_retry_hotpath_indexes.sql`; the fourth is an
+expression/partial index matching the deferred-recovery mode/status
+normalization exactly. It does not cast JSON metadata or rewrite client/mode
+ownership predicates, and it does not change `ap_recovery.py` runtime logic.
 
 Focused contract coverage is in
 `tests/test_p0_profitability_db_hotpath.py` and runs through
 `.github/workflows/p0_db_hotpath.yml`. It includes exact result-set comparison
-before/after indexes, clean PostgreSQL idempotency with actual index-definition
-attestation, direct fixture EXPLAIN/index eligibility for all three paths,
-recursive scan-work bounds including the PENDING_TRIGGER residual
-`filled_ts IS NULL` filter, malformed-metadata guards, and the two known
-production schema-shape checks.
+before/after indexes for all four exact paths, clean PostgreSQL idempotency with
+actual index-definition/expression attestation, direct fixture
+EXPLAIN/index-eligibility evidence for ARMED, stale retry, both
+PENDING_TRIGGER paths, recursive scan-work bounds beneath `Limit`, the
+PENDING_TRIGGER residual `filled_ts IS NULL` filter, malformed-metadata guards,
+and the two known production schema-shape checks across root and nested
+production files.
 
 ### 1. Inventory slow queries from production logs
 
@@ -80,6 +89,7 @@ Capture the exact current-main SQL and call sites for at least:
 - canceled ENTRY + `retry_status=ARMED`
 - canceled ENTRY + `retry_status IN (IN_FLIGHT,SUBMITTING)`
 - PENDING_TRIGGER recovery scans
+- deferred-breach `PENDING_TRIGGER` recovery scans from `APStartupRecovery`
 - any watcher/restart query appearing repeatedly above the statement-timeout threshold
 
 For each, record:
@@ -105,6 +115,7 @@ Candidate forms to evaluate, not blindly copy:
 - expression/partial index including `(meta->>'retry_status')` for canceled-entry retry scans
 - expression index for numeric/validated `retry_ready_at` only if malformed legacy JSON cannot make index creation/queries unsafe
 - `(client_id, execution_mode, created_ts)` partial where `kind='ENTRY' AND status='PENDING_TRIGGER' AND broker_order_id IS NULL AND submitted_ts IS NULL`
+- `(client_id, lower(trim(coalesce(execution_mode,''))), created_ts)` expression/partial for the exact deferred-breach recovery predicate, including normalized status and null/blank broker identity
 
 The implementation must use real production cardinality/EXPLAIN evidence to choose indexes.
 
@@ -167,24 +178,25 @@ Do not claim performance from unit tests alone.
 
 1. ARMED retry query returns same exact rows before/after index/query optimization.
 2. IN_FLIGHT/SUBMITTING stale recovery returns same exact rows.
-3. PENDING_TRIGGER recovery returns same exact rows.
-4. LIVE/PAPER rows remain isolated.
-5. null execution mode does not default to LIVE.
-6. legacy valid metadata remains classified consistently.
-7. malformed retry timestamp behavior unchanged.
-8. negative retry timestamp/counter behavior unchanged.
-9. duplicate rows/order identities unchanged.
-10. ordering by readiness/update/create time preserved.
-11. LIMIT semantics preserved.
-12. no broker calls caused by preflight/index tests.
-13. migration idempotent.
-14. clean PostgreSQL applies migration twice safely.
-15. EXPLAIN proves intended index is eligible/used on production-shaped fixture.
-16. production-shaped table scale test demonstrates bounded runtime.
-17. schema-shape test rejects `trade_queue.ticker` assumption.
-18. schema-shape test rejects querying absent `meta` column.
-19. no client-id rewrite.
-20. no execution-mode rewrite.
+3. Existing PENDING_TRIGGER recovery returns same exact rows.
+4. Deferred-breach PENDING_TRIGGER recovery returns same exact rows, including legacy mode/status and blank broker normalization.
+5. LIVE/PAPER rows remain isolated.
+6. null execution mode does not default to LIVE.
+7. legacy valid metadata remains classified consistently.
+8. malformed retry timestamp behavior unchanged.
+9. negative retry timestamp/counter behavior unchanged.
+10. duplicate rows/order identities unchanged.
+11. ordering by readiness/update/create time preserved.
+12. LIMIT semantics preserved.
+13. no broker calls caused by preflight/index tests.
+14. migration idempotent.
+15. clean PostgreSQL applies migration twice safely and attests actual definitions.
+16. EXPLAIN directly proves ARMED, stale retry, existing PENDING_TRIGGER, and deferred-recovery indexes are eligible/used.
+17. recursive plan inspection proves underlying scan work is bounded beneath `Limit`.
+18. the existing PENDING_TRIGGER index's `filled_ts IS NULL` residual filter is visible and selective on the fixture.
+19. schema-shape tests reject `trade_queue.ticker` and absent `meta` assumptions across root and nested production files.
+20. no client-id rewrite.
+21. retry execution-mode fences are not rewritten, while deferred recovery retains its explicit legacy normalization.
 
 ## Scope budget
 
@@ -231,7 +243,7 @@ Required final assertions:
 
 ## Definition of done
 
-The active ENTRY lifecycle no longer spends 10-15 seconds scanning thousands of irrelevant rows for a LIMIT-16 result, and production-shape mistakes are caught before runtime.
+The active ENTRY lifecycle no longer spends 10-15 seconds scanning thousands of irrelevant rows for small retry/recovery result sets, including the continuously polled deferred-breach path, and production-shape mistakes are caught before runtime.
 
 ## Release verdict
 

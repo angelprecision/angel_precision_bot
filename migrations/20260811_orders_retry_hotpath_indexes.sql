@@ -2,16 +2,18 @@
 -- P0 #433 — production ENTRY/retry hot-path indexes
 -- =============================================================================
 -- These indexes are deliberately shaped from the current-main SQL in
--- ap/order_monitor.py and ap/morning_handoff.py.  The runtime keeps parsing
+-- ap/order_monitor.py, ap/morning_handoff.py, and ap_recovery.py.  The runtime keeps parsing
 -- retry_ready_at/retry counters in Python; this migration never casts legacy
 -- JSON text and therefore cannot turn malformed metadata into a statement
 -- failure.
 --
 -- The partial predicates are fixed lifecycle predicates.  client_id and the
--- ordered timestamp are the only key columns because the callers keep their
--- exact client/mode ownership fences in the WHERE clause.  In particular, do
--- not replace those fences with a nullable execution_mode fallback or a LIVE
--- default merely to make an index expression shorter.
+-- ordered timestamp are the only ordinary key columns because the retry
+-- callers keep their exact client/mode ownership fences in the WHERE clause.
+-- The deferred-recovery expression index is the one intentional exception: it
+-- matches that caller's legacy lower/trim/coalesce mode predicate exactly.
+-- Do not replace that predicate with a nullable execution_mode fallback or a
+-- LIVE default merely to make an index expression shorter.
 --
 -- All statements are idempotent.  The migration runner owns the transaction;
 -- do not add BEGIN/COMMIT or CREATE INDEX CONCURRENTLY here.
@@ -41,4 +43,18 @@ CREATE INDEX IF NOT EXISTS idx_orders_entry_pending_trigger_recovery_created
     WHERE kind = 'ENTRY'
       AND status = 'PENDING_TRIGGER'
       AND broker_order_id IS NULL
+      AND submitted_ts IS NULL;
+
+-- APStartupRecovery._recover_deferred_breach_lifecycles(): continuously
+-- revisited PENDING_TRIGGER ENTRY rows, preserving legacy mode/status
+-- normalization and the blank-or-null broker identity guard.
+CREATE INDEX IF NOT EXISTS idx_orders_entry_pending_trigger_recovery_mode_created
+    ON orders (
+        client_id,
+        (LOWER(TRIM(COALESCE(execution_mode, '')))),
+        created_ts
+    )
+    WHERE kind = 'ENTRY'
+      AND UPPER(COALESCE(status, '')) = 'PENDING_TRIGGER'
+      AND (broker_order_id IS NULL OR broker_order_id = '')
       AND submitted_ts IS NULL;
