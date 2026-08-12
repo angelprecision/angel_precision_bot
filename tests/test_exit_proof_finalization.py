@@ -40,6 +40,7 @@ Run:
 from __future__ import annotations
 
 import inspect
+import math
 import os
 import re
 import textwrap
@@ -78,7 +79,7 @@ class TestExitFillCallbackWiring:
 
     def test_finalize_proof_method_exists(self):
         m = re.search(
-            r"def _finalize_proof\(self,\s*pos[^)]*,\s*actual_fill_price[^)]*\)",
+            r"def _finalize_proof\(\s*self\s*,\s*pos[\s\S]*?actual_fill_price[\s\S]*?\)",
             EX_CORE,
         )
         assert m, (
@@ -144,7 +145,7 @@ class TestFinalizeProofIsTheOnlyWriter:
     @pytest.fixture
     def finalize_body(self):
         m = re.search(
-            r"^    def _finalize_proof\(self.*?(?=^    def )",
+            r"^    def _finalize_proof\(.*?(?=^    def )",
             EX_CORE, re.DOTALL | re.MULTILINE,
         )
         assert m, "_finalize_proof not found"
@@ -192,7 +193,7 @@ class TestFinalizeProofIsTheOnlyWriter:
         leak proof writes back to the submit-time path."""
         # Strip the body of _finalize_proof, then search what remains.
         m = re.search(
-            r"^    def _finalize_proof\(self.*?(?=^    def )",
+            r"^    def _finalize_proof\(.*?(?=^    def )",
             EX_CORE, re.DOTALL | re.MULTILINE,
         )
         without_finalize = EX_CORE.replace(m.group(0), "")
@@ -212,7 +213,7 @@ class TestFinalizeProofIsTheOnlyWriter:
         """Mark-as-closed against the signal store must happen only from
         _finalize_proof, after broker-confirmed fill."""
         m = re.search(
-            r"^    def _finalize_proof\(self.*?(?=^    def )",
+            r"^    def _finalize_proof\(.*?(?=^    def )",
             EX_CORE, re.DOTALL | re.MULTILINE,
         )
         without_finalize = EX_CORE.replace(m.group(0), "")
@@ -240,7 +241,7 @@ class TestActualFillPriceUsed:
     @pytest.fixture
     def finalize_body(self):
         m = re.search(
-            r"^    def _finalize_proof\(self.*?(?=^    def )",
+            r"^    def _finalize_proof\(.*?(?=^    def )",
             EX_CORE, re.DOTALL | re.MULTILINE,
         )
         assert m
@@ -292,7 +293,7 @@ class TestActualFillPriceUsed:
 @pytest.fixture(scope="module")
 def finalize_proof_callable():
     body_match = re.search(
-        r"^    def _finalize_proof\(self.*?(?=^    def )",
+        r"^    def _finalize_proof\(.*?(?=^    def )",
         EX_CORE, re.DOTALL | re.MULTILINE,
     )
     assert body_match, "could not locate _finalize_proof"
@@ -317,7 +318,11 @@ def finalize_proof_callable():
     #   - _record_intel_outcome (PR B FIX-6; falls back to None if the
     #     intelligence_bridge import fails. Safe default = None; the
     #     method's `if _record_intel_outcome:` guard handles None.)
-    src = "import os\nimport logging\nlog = logging.getLogger('test_finalize')\n"
+    src = (
+        "import os\nimport math\nimport logging\n"
+        "from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE, parse_aware_utc_timestamp\n"
+        "log = logging.getLogger('test_finalize')\n"
+    )
     src += f'BREAKEVEN_BAND_PCT = float(os.getenv("BREAKEVEN_BAND_PCT", "{_be_default}"))\n'
     src += "_record_intel_outcome = None\n"
     src += "class _Harness:\n"
@@ -444,6 +449,84 @@ class TestFinalizeProofBehavior:
         assert lt_kwargs["exit_option_price"] == pytest.approx(3.50)
         # exit_fill_price is None because the broker didn't give us one.
         assert lt_kwargs["exit_fill_price"] is None
+
+    @pytest.mark.parametrize(
+        "bad_price",
+        [
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="infinity"),
+            pytest.param(float("-inf"), id="negative-infinity"),
+            pytest.param(True, id="boolean-true"),
+            pytest.param(False, id="boolean-false"),
+        ],
+    )
+    def test_invalid_callback_price_is_zero_sink_mutation(
+        self, finalize_proof_callable, bad_price
+    ):
+        h = _build_harness(finalize_proof_callable)
+        pos = _build_pos(_make_staged())
+
+        assert h._finalize_proof(pos, actual_fill_price=bad_price) is False
+        assert pos._proof_finalized is False
+        assert h.proof.log_trade.call_count == 0
+        assert h.feedback.record_outcome.call_count == 0
+        assert h.store.update_status.call_count == 0
+        assert h.shadow.record_live_outcome.call_count == 0
+
+    @pytest.mark.parametrize(
+        "bad_qty",
+        [
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="infinity"),
+            pytest.param(True, id="boolean"),
+            pytest.param(1.5, id="fractional"),
+            pytest.param(0, id="zero"),
+        ],
+    )
+    def test_invalid_callback_quantity_is_zero_sink_mutation(
+        self, finalize_proof_callable, bad_qty
+    ):
+        h = _build_harness(finalize_proof_callable)
+        pos = _build_pos(_make_staged())
+
+        assert h._finalize_proof(
+            pos,
+            actual_fill_price=3.60,
+            broker_exit_filled_qty=bad_qty,
+        ) is False
+        assert pos._proof_finalized is False
+        assert h.proof.log_trade.call_count == 0
+        assert h.feedback.record_outcome.call_count == 0
+        assert h.store.update_status.call_count == 0
+        assert h.shadow.record_live_outcome.call_count == 0
+
+    @pytest.mark.parametrize(
+        "bad_ts",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param("2026-05-26T14:00:00", id="naive"),
+            pytest.param("2026-05-26T13:59:59+00:00", id="before-entry"),
+        ],
+    )
+    def test_invalid_callback_timestamp_is_zero_sink_mutation(
+        self, finalize_proof_callable, bad_ts
+    ):
+        h = _build_harness(finalize_proof_callable)
+        pos = _build_pos(_make_staged())
+
+        assert h._finalize_proof(
+            pos,
+            actual_fill_price=3.60,
+            exit_local_order_id="exit-local-1",
+            broker_exit_order_id="broker-exit-1",
+            broker_exit_fill_ts=bad_ts,
+            broker_exit_filled_qty=2,
+        ) is False
+        assert pos._proof_finalized is False
+        assert h.proof.log_trade.call_count == 0
+        assert h.feedback.record_outcome.call_count == 0
+        assert h.store.update_status.call_count == 0
+        assert h.shadow.record_live_outcome.call_count == 0
 
     def test_no_staged_dict_is_noop(self, finalize_proof_callable):
         """Position with no _proof_staged dict: finalize must be a no-op

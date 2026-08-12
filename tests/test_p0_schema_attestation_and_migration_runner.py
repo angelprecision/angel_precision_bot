@@ -203,6 +203,12 @@ def test_production_declaration_covers_claims_table():
     assert "generation_key" in sa.REQUIRED_SCHEMA["exit_decision_generation_claims"]
     assert "proof_trades" in sa.REQUIRED_SCHEMA
     assert "performance_taxonomy" in sa.REQUIRED_SCHEMA["proof_trades"]
+    assert {
+        "exit_local_order_id",
+        "broker_exit_order_id",
+        "broker_exit_fill_ts",
+        "broker_exit_filled_qty",
+    } <= sa.REQUIRED_SCHEMA["proof_trades"]
 
 
 def test_production_declaration_covers_trigger_provenance_source_column():

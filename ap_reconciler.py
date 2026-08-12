@@ -28,7 +28,7 @@ Checks:
 
   Positions:
     E. DB OPEN/CLOSING → broker position missing
-       → evidence-based close only after filled exit evidence or three-pass ghost confirm
+       → close only after exact filled EXIT evidence; broker-flat passes remain HOLD diagnostics
     F. DB qty vs broker qty mismatch
        → alert
     G. Broker OPEN → DB missing
@@ -77,6 +77,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
@@ -84,6 +85,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    has_broker_fill_timestamp_provenance,
+)
 
 log = logging.getLogger("ap.reconciler")
 
@@ -121,6 +127,7 @@ RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))  # was 1
 # the cached last summary and skip the full broker/DB/OSM pass.
 RUN_ONCE_MIN_INTERVAL_SEC = float(os.getenv("RECONCILER_RUN_ONCE_MIN_INTERVAL_SEC", "3.0"))
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+RECONCILER_PROOF_REPAIR_PAGE_SIZE = 50
 
 # PR fix/health-and-reconciler-startup-noise:
 # Grace window after reconciler thread start during which a missing
@@ -253,12 +260,82 @@ def _empty_summary(client_id: str, run: int = 0) -> dict:
         "broker_positions_hidden_by_closed_status_count": 0,
         "reconciler_partial_close_preserved_count":     0,
         "reconciler_full_close_count":                  0,
+        "reconciler_proof_repair_candidates":           0,
+        "reconciler_proof_repair_persisted":             0,
+        "reconciler_proof_repair_already_exists":        0,
+        "reconciler_proof_repair_failures":              0,
     }
 
 
 def _normalize_execution_mode(value: object) -> str | None:
     mode = str(value or "").strip().lower()
     return mode if mode in _VALID_EXECUTION_MODES else None
+
+
+def _parse_reconciler_timestamp(value: object) -> Optional[datetime]:
+    """Parse a durable timestamp without accepting malformed/naive truth."""
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _strict_positive_finite_float(value: object) -> float | None:
+    """Return a positive finite scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _finite_float(value: object) -> float | None:
+    """Return any finite scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _strict_positive_whole_number(value: object) -> int | None:
+    """Return a positive whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _strict_nonnegative_whole_number(value: object) -> int | None:
+    """Return a non-negative whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
 
 
 class APBrokerReconciler:
@@ -301,6 +378,7 @@ class APBrokerReconciler:
         self._ghost_tracker: dict[str, int] = {}  # ghost detection count per contract
         self._ghost_fill_confirmed: set[str] = set()  # broker_oids already confirmed terminal — skip re-check
         self._missing_id_exit_tracker: dict[str, int] = {}  # missing broker-id EXIT recovery pass count
+        self._reconciler_proof_repair_cursor: tuple[object | None, str] | None = None
         self.fill_monitor = None      # optional fill_monitor_final_hardened-7.py instance
         self.require_fill_monitor = (
             os.getenv("RECONCILER_REQUIRE_FILL_MONITOR", "0").strip().lower()
@@ -526,6 +604,21 @@ class APBrokerReconciler:
                 )
                 summary["errors"].append(f"partial_close_repair: {e}")
 
+            # P0-428: repair the only durable close state that can be left
+            # without proof when the process dies after the positions commit.
+            # This pass is proof-only; it never closes/reopens positions or
+            # changes order lifecycle state.
+            try:
+                self._repair_missing_reconciler_proofs(summary)
+            except Exception as e:
+                log.error(
+                    "[%s] Missing reconciler proof repair error: %s",
+                    self.client_id,
+                    e,
+                    exc_info=True,
+                )
+                summary["errors"].append(f"reconciler_proof_repair: {e}")
+
             try:
                 self._check_duplicate_positions(summary)
             except Exception as e:
@@ -632,12 +725,7 @@ class APBrokerReconciler:
             val = broker_raw.get(key)
             if val is None or val == "":
                 continue
-            try:
-                qty = int(float(val))
-                if qty >= 0:
-                    return qty
-            except Exception:
-                continue
+            return _strict_nonnegative_whole_number(val)
         return None
 
     def _extract_avg_fill_price(self, broker_raw: dict) -> Optional[float]:
@@ -657,20 +745,41 @@ class APBrokerReconciler:
             val = broker_raw.get(key)
             if val is None or val == "":
                 continue
-            try:
-                px = float(val)
-                if px > 0:
-                    return px
-            except Exception:
-                continue
+            return _strict_positive_finite_float(val)
         return None
+
+    def _extract_broker_fill_timestamp_with_source(
+        self, broker_raw: dict, order: dict | None = None
+    ) -> tuple[Optional[datetime], Optional[str]]:
+        """Read explicit broker fill time and its producer token only."""
+        del order  # Durable ``orders.filled_ts`` is not broker provenance.
+        for key in (
+            "filled_ts",
+            "filled_at",
+            "fill_ts",
+            "last_fill_date",
+            "transaction_date",
+        ):
+            if key in broker_raw:
+                parsed = _parse_reconciler_timestamp(broker_raw.get(key))
+                return (
+                    parsed,
+                    BROKER_FILL_TIMESTAMP_SOURCE if parsed is not None else None,
+                )
+        return None, None
+
+    def _extract_broker_fill_timestamp(
+        self, broker_raw: dict, order: dict | None = None
+    ) -> Optional[datetime]:
+        """Read explicit broker fill time without substituting durable time."""
+        return self._extract_broker_fill_timestamp_with_source(broker_raw, order)[0]
 
     def _db_order_filled_qty(self, order: dict) -> int:
         for key in ("filled_qty", "filled_quantity", "exec_quantity", "quantity_filled"):
             try:
                 val = order.get(key)
                 if val is not None and val != "":
-                    return max(0, int(float(val)))
+                    return _strict_nonnegative_whole_number(val) or 0
             except Exception:
                 pass
         return 0
@@ -680,7 +789,7 @@ class APBrokerReconciler:
             try:
                 val = order.get(key)
                 if val is not None and val != "":
-                    return max(0, int(float(val)))
+                    return _strict_nonnegative_whole_number(val) or 0
             except Exception:
                 pass
         return 0
@@ -725,17 +834,34 @@ class APBrokerReconciler:
         filled_qty: int,
         fill_price: float,
         broker_order_id: str | None = None,
+        filled_ts=None,
+        filled_ts_source: str | None = None,
     ) -> bool:
         """Compatibility bridge for OSM v3 apply_fill_update()."""
         status_u = str(status or "").upper()
+        validated_qty = _strict_positive_whole_number(filled_qty)
+        validated_price = _strict_positive_finite_float(fill_price)
+        if validated_qty is None or validated_price is None:
+            log.critical(
+                "[%s] OSM fill update blocked | order=%s status=%s "
+                "filled_qty=%r fill_price=%r",
+                self.client_id,
+                local_id,
+                status_u,
+                filled_qty,
+                fill_price,
+            )
+            return False
         apply_fn = getattr(self.osm, "apply_fill_update", None)
         if callable(apply_fn) and status_u in {"PARTIAL_FILL", "EXIT_PARTIAL_FILL"}:
             try:
                 return bool(apply_fn(
                     local_id,
-                    cumulative_filled=int(filled_qty),
-                    fill_price=float(fill_price) if fill_price is not None else None,
+                    cumulative_filled=validated_qty,
+                    fill_price=validated_price,
                     broker_order_id=broker_order_id,
+                    filled_ts=filled_ts,
+                    filled_ts_source=filled_ts_source,
                 ))
             except TypeError as te:
                 log.warning(
@@ -745,8 +871,10 @@ class APBrokerReconciler:
         return bool(self.osm.transition(
             local_id,
             status_u,
-            filled_qty=int(filled_qty),
-            fill_price=float(fill_price) if fill_price is not None else None,
+            filled_qty=validated_qty,
+            fill_price=validated_price,
+            filled_ts=filled_ts,
+            filled_ts_source=filled_ts_source,
         ))
 
     def _handle_stale_acknowledged_exits(self, summary: dict) -> None:
@@ -824,16 +952,33 @@ class APBrokerReconciler:
 
                 fill_qty = self._extract_explicit_cumulative_fill_qty(broker_raw)
                 fill_px  = self._extract_avg_fill_price(broker_raw)
+                fill_ts, fill_ts_source = self._extract_broker_fill_timestamp_with_source(
+                    broker_raw, row
+                )
 
                 if broker_status in BROKER_FILLED and fill_qty and fill_px:
                     family     = self._order_family_from_kind_and_status(row, db_status)
                     new_status = "EXIT_FILLED" if family == "EXIT" else "FILLED"
+                    if family == "EXIT" and (
+                        fill_ts is None
+                        or fill_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+                    ):
+                        self._alert(
+                            f"BROKER_EXIT_FILL_TIMESTAMP_UNPROVEN | {contract} | {local_id} | "
+                            "stale ACK recovery lacks an explicit aware fill timestamp; holding"
+                        )
+                        summary["orders_alerted"] += 1
+                        continue
                     try:
                         self.osm.transition(
                             local_id, new_status,
                             broker_order_id=broker_id,
                             filled_qty=int(fill_qty),
                             fill_price=float(fill_px),
+                            filled_ts=fill_ts.isoformat() if fill_ts else None,
+                            filled_ts_source=(
+                                fill_ts_source if family == "EXIT" else None
+                            ),
                             last_error="stale_ack_exit_broker_filled",
                         )
                         summary["orders_corrected"] = int(summary.get("orders_corrected", 0)) + 1
@@ -1007,6 +1152,7 @@ class APBrokerReconciler:
                             o.fill_price,
                             o.filled_qty,
                             o.filled_ts,
+                            o.meta,
                             o.broker_order_id
                         FROM orders o
                         JOIN positions p ON p.id = o.position_id AND p.client_id = o.client_id
@@ -1015,6 +1161,18 @@ class APBrokerReconciler:
                           AND o.status = 'EXIT_FILLED'
                           AND o.fill_price IS NOT NULL
                           AND COALESCE(o.filled_qty, 0) > 0
+                          AND o.filled_ts IS NOT NULL
+                          AND COALESCE(p.entry_ts, p.opened_at) IS NOT NULL
+                          AND o.filled_ts >= COALESCE(p.entry_ts, p.opened_at)
+                          AND COALESCE(o.meta->>'exit_fill_timestamp_source', '') = %s
+                          AND LOWER(TRIM(COALESCE(o.execution_mode, ''))) =
+                              LOWER(TRIM(COALESCE(p.execution_mode, '')))
+                          AND UPPER(TRIM(COALESCE(o.contract, ''))) =
+                              UPPER(TRIM(COALESCE(p.contract, '')))
+                          AND NULLIF(TRIM(COALESCE(p.pending_exit_local_order_id, '')), '') IS NOT NULL
+                          AND NULLIF(TRIM(COALESCE(p.pending_exit_broker_order_id, '')), '') IS NOT NULL
+                          AND o.local_order_id = p.pending_exit_local_order_id
+                          AND o.broker_order_id = p.pending_exit_broker_order_id
                           AND p.avg_fill IS NOT NULL
                           AND p.avg_fill > 0
                           AND (
@@ -1026,7 +1184,7 @@ class APBrokerReconciler:
                         ORDER BY o.filled_ts DESC
                         LIMIT 50
                         """,
-                        (self.client_id,),
+                        (self.client_id, BROKER_FILL_TIMESTAMP_SOURCE),
                     )
                     return c.fetchall()
 
@@ -1038,13 +1196,30 @@ class APBrokerReconciler:
             healed = 0
             for row in rows:
                 row = dict(row) if not isinstance(row, dict) else row
+                if not has_broker_fill_timestamp_provenance(row.get("meta")):
+                    log.critical(
+                        "[%s] EXIT_FILLED healer blocked without broker timestamp provenance "
+                        "local=%s broker=%s",
+                        self.client_id,
+                        row.get("local_order_id"),
+                        row.get("broker_order_id"),
+                    )
+                    continue
                 ok = pm.close_position_from_exit_fill(
                     position_id=str(row["position_id"]),
-                    exit_price=float(row["fill_price"]),
-                    filled_qty=int(row["filled_qty"]),
+                    # Keep DB scalars raw; the shared finalizer owns strict
+                    # finite-price and whole-quantity validation.
+                    exit_price=row.get("fill_price"),
+                    filled_qty=row.get("filled_qty"),
                     filled_ts=str(row["filled_ts"]) if row.get("filled_ts") else None,
                     local_order_id=str(row.get("local_order_id") or ""),
                     broker_order_id=str(row.get("broker_order_id") or ""),
+                    expected_pending_exit_local_order_id=str(
+                        row.get("local_order_id") or ""
+                    ),
+                    expected_pending_exit_broker_order_id=str(
+                        row.get("broker_order_id") or ""
+                    ),
                     close_source="reconciler_broker_exit_fill",
                     close_confidence="HIGH",
                 )
@@ -1287,19 +1462,31 @@ class APBrokerReconciler:
             )
 
         # Endpoint 2: recent fill evidence. Prefer to advance OSM so OSM owns hooks.
-        recent_fill = self._get_recent_exit_fill(contract, underlying)
+        recent_fill = self._get_recent_exit_fill(
+            contract,
+            position_id=pos_id,
+            execution_mode=order.get("execution_mode") or "",
+            local_order_id=local_id,
+            broker_order_id=str(order.get("broker_order_id") or "").strip(),
+        )
         if recent_fill:
-            fill_qty = self._safe_int(recent_fill.get("filled_qty"), requested_qty or 0)
-            fill_px  = self._safe_float(recent_fill.get("fill_price"), 0.0)
-            if fill_qty > 0 and fill_px > 0:
+            fill_qty = _strict_positive_whole_number(recent_fill.get("filled_qty"))
+            fill_px = _strict_positive_finite_float(recent_fill.get("fill_price"))
+            if fill_qty is not None and fill_px is not None:
                 try:
-                    self.osm.transition(
+                    transitioned = self.osm.transition(
                         local_id,
                         "EXIT_FILLED",
                         filled_qty=fill_qty,
                         fill_price=fill_px,
+                        filled_ts=recent_fill.get("filled_ts"),
+                        filled_ts_source=recent_fill.get("filled_ts_source"),
                         last_error="reconciler_missing_id_recent_exit_fill_resolved",
                     )
+                    if not transitioned:
+                        raise RuntimeError(
+                            "reconciler_missing_id_recent_exit_fill_transition_rejected"
+                        )
                     self._alert(
                         f"MISSING_ID_EXIT_RESOLVED_BY_RECENT_FILL | {contract or '?'} | {local_id} | "
                         f"pos={pos_id} qty={fill_qty} price={fill_px:.4f}"
@@ -1412,9 +1599,12 @@ class APBrokerReconciler:
 
             recent_fill = self._get_recent_exit_fill(
                 contract,
-                self._norm_underlying(
-                    order.get("underlying") or order.get("ticker") or self._norm_underlying(contract)
-                ),
+                position_id=str(
+                    order.get("position_id") or order.get("positionId") or ""
+                ).strip(),
+                execution_mode=order.get("execution_mode") or "",
+                local_order_id=str(local_id or "").strip(),
+                broker_order_id=str(order.get("broker_order_id") or "").strip(),
             )
             if recent_fill:
                 self._alert(
@@ -1536,12 +1726,11 @@ class APBrokerReconciler:
 
     def _broker_order_qty_from_raw(self, raw: dict) -> int:
         for key in ("quantity", "qty", "order_qty", "remaining_quantity", "remaining_qty"):
-            try:
-                val = raw.get(key)
-                if val is not None and val != "":
-                    return abs(int(float(val)))
-            except Exception:
-                pass
+            val = raw.get(key)
+            if val is None or val == "":
+                continue
+            parsed = _strict_nonnegative_whole_number(val)
+            return parsed if parsed is not None else 0
         return 0
 
     def _broker_order_side_action_from_raw(self, raw: dict) -> str:
@@ -1847,6 +2036,9 @@ class APBrokerReconciler:
 
         filled_qty = self._extract_explicit_cumulative_fill_qty(broker_raw)
         avg_fill   = self._extract_avg_fill_price(broker_raw)
+        filled_ts, filled_ts_source = self._extract_broker_fill_timestamp_with_source(
+            broker_raw, order
+        )
         if filled_qty is None:
             self._alert(
                 f"BROKER_FILL_QTY_NOT_NORMALIZED | {contract} | {local_id} | "
@@ -1863,6 +2055,17 @@ class APBrokerReconciler:
             )
             summary["orders_alerted"] += 1
             return
+        if family == "EXIT" and (
+            filled_ts is None
+            or filled_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+        ):
+            self._alert(
+                f"BROKER_EXIT_FILL_TIMESTAMP_UNPROVEN | {contract} | {local_id} | "
+                "broker returned EXIT fill status without an explicit aware fill timestamp; "
+                "skipping OSM correction"
+            )
+            summary["orders_alerted"] += 1
+            return
 
         requested_qty    = self._db_order_requested_qty(order)
         db_filled_before = self._db_order_filled_qty(order)
@@ -1874,7 +2077,16 @@ class APBrokerReconciler:
         ):
             partial_status = "PARTIAL_FILL" if family == "ENTRY" else "EXIT_PARTIAL_FILL"
             try:
-                self._apply_osm_fill_update(local_id, partial_status, db_filled_before, avg_fill)
+                self._apply_osm_fill_update(
+                    local_id,
+                    partial_status,
+                    db_filled_before,
+                    avg_fill,
+                    filled_ts=filled_ts,
+                    filled_ts_source=(
+                        filled_ts_source if family == "EXIT" else None
+                    ),
+                )
                 log.warning(
                     "[%s] RECONCILE_INTERMEDIATE_FILL_UPDATE | %s | %s | qty=%s before terminal qty=%s",
                     self.client_id, contract, local_id, db_filled_before, filled_qty,
@@ -1894,6 +2106,10 @@ class APBrokerReconciler:
                 new_status,
                 filled_qty=filled_qty,
                 fill_price=avg_fill,
+                filled_ts=filled_ts,
+                filled_ts_source=(
+                    filled_ts_source if family == "EXIT" else None
+                ),
                 broker_order_id=str(
                     broker_raw.get("id")
                     or broker_raw.get("order_id")
@@ -2342,9 +2558,9 @@ class APBrokerReconciler:
                         self._link_order_to_position(local_id, pos_id)
                         linked += 1
                     else:
-                        qty      = int(o.get("filled_qty") or 0)
-                        entry_px = float(o.get("fill_price") or 0.0)
-                        if qty > 0 and entry_px > 0:
+                        qty = _strict_positive_whole_number(o.get("filled_qty"))
+                        entry_px = _strict_positive_finite_float(o.get("fill_price"))
+                        if qty is not None and entry_px is not None:
                             pos_id = self._create_closed_repair_position(
                                 o, contract, "BROKER_MANUAL_CLOSE_IMPORT",
                                 "HISTORICAL_LIVE_DEBT"
@@ -2429,9 +2645,24 @@ class APBrokerReconciler:
 
                     underlying = self._norm_underlying(contract)
                     side       = (o.get("direction") or "CALL").upper()
-                    qty        = int(o.get("filled_qty") or 0)
-                    entry_px   = float(o.get("fill_price") or 0.0)
+                    qty = _strict_positive_whole_number(o.get("filled_qty"))
+                    entry_px = _strict_positive_finite_float(o.get("fill_price"))
                     filled_ts  = o.get("filled_ts")
+
+                    if qty is None or entry_px is None:
+                        failed += 1
+                        orphan_backfill_failed_current_live += 1
+                        log.critical(
+                            "[%s] filled_order_missing_position_p0 HOLD | "
+                            "order=%s contract=%s malformed entry economics "
+                            "qty=%r fill_price=%r",
+                            self.client_id,
+                            local_id,
+                            contract,
+                            o.get("filled_qty"),
+                            o.get("fill_price"),
+                        )
+                        continue
 
                     if broker_truth_ok:
                         broker_holds      = contract.upper() in broker_open_syms
@@ -2457,7 +2688,7 @@ class APBrokerReconciler:
                     )
 
                     pos_id = None
-                    if self.pm is not None and qty > 0 and entry_px > 0:
+                    if self.pm is not None:
                         try:
                             pos_id = self._create_imported_position(
                                 contract=contract, underlying=underlying,
@@ -2627,8 +2858,18 @@ class APBrokerReconciler:
         import uuid as _uuid
         underlying = self._norm_underlying(contract)
         side       = (o.get("direction") or "CALL").upper()
-        qty        = int(o.get("filled_qty") or 0)
-        entry_px   = float(o.get("fill_price") or 0.0)
+        qty = _strict_positive_whole_number(o.get("filled_qty"))
+        entry_px = _strict_positive_finite_float(o.get("fill_price"))
+        if qty is None or entry_px is None:
+            log.critical(
+                "[%s] CLOSED_REPAIR position creation blocked | malformed "
+                "fill economics order=%s qty=%r fill_price=%r",
+                self.client_id,
+                o.get("local_order_id"),
+                o.get("filled_qty"),
+                o.get("fill_price"),
+            )
+            return None
         filled_ts  = o.get("filled_ts")
         broker_id  = str(o.get("broker_order_id") or "")
         local_id   = str(o.get("local_order_id")  or "")
@@ -2754,12 +2995,10 @@ class APBrokerReconciler:
         return s
 
     def _safe_int(self, value, default: int = 0) -> int:
-        try:
-            if value is None or value == "":
-                return int(default)
-            return int(float(value))
-        except Exception:
+        if value is None or value == "":
             return int(default)
+        parsed = _strict_nonnegative_whole_number(value)
+        return parsed if parsed is not None else int(default)
 
     def _safe_float(self, value, default: float = 0.0) -> float:
         try:
@@ -2828,18 +3067,16 @@ class APBrokerReconciler:
             or c_sym
         )
 
-    def _broker_position_qty(self, bp: dict) -> int:
-        raw = (
-            bp.get("quantity")
-            or bp.get("qty")
-            or bp.get("long_quantity")
-            or bp.get("short_quantity")
-            or 0
-        )
-        try:
-            return abs(int(float(raw)))
-        except Exception:
-            return 0
+    def _broker_position_qty(self, bp: dict) -> int | None:
+        for key in ("quantity", "qty", "long_quantity", "short_quantity"):
+            if key not in bp:
+                continue
+            raw = bp.get(key)
+            if raw is None or raw == "":
+                continue
+            parsed = _strict_nonnegative_whole_number(raw)
+            return parsed
+        return None
 
     def _broker_position_entry_price(self, bp: dict) -> float:
         """
@@ -2850,17 +3087,14 @@ class APBrokerReconciler:
             "avg_fill", "avg_price", "average_price", "average_cost",
             "cost_per_share", "price", "last_price",
         ):
-            try:
-                val = bp.get(key)
-                if val is not None and float(val) > 0:
-                    return float(val)
-            except Exception:
-                pass
+            val = _strict_positive_finite_float(bp.get(key))
+            if val is not None:
+                return val
 
         try:
             qty        = self._broker_position_qty(bp)
             cost_basis = float(bp.get("cost_basis") or bp.get("costbasis") or 0)
-            if qty > 0 and cost_basis > 0:
+            if qty is not None and qty > 0 and math.isfinite(cost_basis) and cost_basis > 0:
                 return abs(cost_basis) / qty / 100.0
         except Exception:
             pass
@@ -2927,28 +3161,138 @@ class APBrokerReconciler:
             log.error("[%s] Failed to fetch DB open/closing positions: %s", self.client_id, e)
             return []
 
-    def _get_recent_exit_fill(self, contract: str, underlying: str) -> Optional[dict]:
-        """Look up the most recent filled EXIT order for this contract."""
+    def _get_recent_exit_fill(
+        self,
+        contract: str,
+        *,
+        position_id: str,
+        execution_mode: str,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+    ) -> Optional[dict]:
+        """Return one exact current-generation broker EXIT fill, if proven.
+
+        Position identity alone is deliberately insufficient here: a position can
+        have multiple EXIT generations over its lifetime.  Callers must provide
+        the current local and/or broker EXIT identity; without one, a historical
+        fill is not safe evidence for a new close or missing-ID recovery.
+        """
+        contract = self._norm_contract(contract)
+        position_id = str(position_id or "").strip()
+        mode = _normalize_execution_mode(execution_mode)
+        local_order_id = str(local_order_id or "").strip()
+        broker_order_id = str(broker_order_id or "").strip()
+        if local_order_id.lower() in {"none", "null"}:
+            local_order_id = ""
+        if broker_order_id.lower() in {"none", "null"}:
+            broker_order_id = ""
+        if (
+            not contract
+            or not position_id
+            or mode is None
+            or not (local_order_id or broker_order_id)
+        ):
+            return None
+
         try:
             from ap.db import conn, run_with_retry
 
             def _fetch():
                 with conn() as c:
+                    identity_predicates = []
+                    identity_params = []
+                    if local_order_id:
+                        identity_predicates.append("o.local_order_id = %s")
+                        identity_params.append(local_order_id)
+                    if broker_order_id:
+                        identity_predicates.append("o.broker_order_id = %s")
+                        identity_params.append(broker_order_id)
+
                     c.execute(
-                        """
-                        SELECT fill_price, filled_qty, updated_ts
-                        FROM   orders
-                        WHERE  client_id = %s
-                          AND  kind = 'EXIT'
-                          AND  status IN ('FILLED', 'EXIT_FILLED')
-                          AND  (contract = %s OR symbol = %s OR symbol = %s)
-                        ORDER  BY updated_ts DESC
-                        LIMIT  1
+                        f"""
+                        SELECT o.broker_order_id,
+                               o.local_order_id,
+                               o.position_id,
+                               o.contract,
+                               o.execution_mode,
+                               o.status,
+                               o.fill_price,
+                               o.filled_qty,
+                               o.filled_ts,
+                               o.meta,
+                               o.updated_ts,
+                               COALESCE(p.entry_ts, p.opened_at) AS position_entry_ts
+                        FROM   orders o
+                        JOIN   positions p
+                          ON   p.client_id = o.client_id
+                         AND   p.id::text = o.position_id::text
+                        WHERE  o.client_id = %s
+                          AND  LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s
+                          AND  o.kind = 'EXIT'
+                          AND  o.status IN ('FILLED', 'EXIT_FILLED')
+                          AND  UPPER(TRIM(COALESCE(o.contract, ''))) = %s
+                          AND  o.position_id::text = %s
+                          AND  {' AND '.join(identity_predicates)}
+                          AND  COALESCE(o.meta->>'exit_fill_timestamp_source', '') = %s
+                        ORDER  BY COALESCE(o.filled_ts, o.updated_ts) DESC
+                        LIMIT  2
                         """,
-                        (self.client_id, contract, contract, underlying),
+                        (
+                            self.client_id,
+                            mode,
+                            contract,
+                            position_id,
+                            *identity_params,
+                            BROKER_FILL_TIMESTAMP_SOURCE,
+                        ),
                     )
-                    row = c.fetchone()
-                    return dict(row) if row else None
+                    rows = c.fetchall() or []
+
+                    # More than one exact candidate is unresolved economic truth;
+                    # never newest-wins two fills for the same position identity.
+                    if len(rows) > 1:
+                        self._alert(
+                            "RECONCILER_EXIT_FILL_IDENTITY_AMBIGUOUS | "
+                            f"client={self.client_id} mode={mode} "
+                            f"position_id={position_id} contract={contract} "
+                            f"candidate_count={len(rows)}"
+                        )
+                        return None
+
+                    if not rows:
+                        return None
+
+                    row = dict(rows[0])
+                    row_broker_order_id = str(row.get("broker_order_id") or "").strip()
+                    row_local_order_id = str(row.get("local_order_id") or "").strip()
+                    row_status = str(row.get("status") or "").upper().strip()
+                    filled_ts = _parse_reconciler_timestamp(row.get("filled_ts"))
+                    position_entry_ts = _parse_reconciler_timestamp(
+                        row.get("position_entry_ts")
+                    )
+                    if (
+                        not row_broker_order_id
+                        or row_broker_order_id.lower() in {"none", "null"}
+                        or not row_local_order_id
+                        or row_status not in {"FILLED", "EXIT_FILLED"}
+                        or self._norm_contract(row.get("contract")) != contract
+                        or str(row.get("position_id") or "").strip() != position_id
+                        or _normalize_execution_mode(row.get("execution_mode")) != mode
+                        or (local_order_id and row_local_order_id != local_order_id)
+                        or (broker_order_id and row_broker_order_id != broker_order_id)
+                        or not has_broker_fill_timestamp_provenance(row.get("meta"))
+                        or filled_ts is None
+                        or position_entry_ts is None
+                        or filled_ts < position_entry_ts
+                    ):
+                        return None
+
+                    fill_price = _strict_positive_finite_float(row.get("fill_price"))
+                    filled_qty = _strict_positive_whole_number(row.get("filled_qty"))
+                    if fill_price is None or filled_qty is None:
+                        return None
+                    row["filled_ts_source"] = BROKER_FILL_TIMESTAMP_SOURCE
+                    return row
 
             return run_with_retry(_fetch)
         except Exception as e:
@@ -2956,14 +3300,11 @@ class APBrokerReconciler:
             return None
 
     def _mark_ghost_seen(self, contract: str) -> bool:
-        """Three-pass ghost detection to reduce false closes from broker API gaps."""
+        """Track repeated broker-flat observations for diagnostics."""
         key   = self._norm_contract(contract)
         count = int(self._ghost_tracker.get(key, 0)) + 1
         self._ghost_tracker[key] = count
-        if count >= 3:
-            del self._ghost_tracker[key]
-            return True
-        return False
+        return count >= 3
 
     def _reconcile_positions(self, summary: dict):
         """
@@ -2971,7 +3312,8 @@ class APBrokerReconciler:
 
         Policy:
           1. Match DB positions by exact contract symbol first.
-          2. Auto-close DB positions only with filled exit evidence or three-pass ghost confirm.
+          2. Auto-close DB positions only with exact filled EXIT evidence; broker-flat
+             observations without that evidence remain open for manual-close recovery.
           3. Import broker-open positions missing from DB so restarts cannot orphan trades.
 
         FIX-7: db_underlyings removed — it was constructed and passed to
@@ -2989,6 +3331,26 @@ class APBrokerReconciler:
             c_sym = self._broker_position_contract(bp)
             u_sym = self._broker_position_underlying(bp)
             qty   = self._broker_position_qty(bp)
+            if qty is None:
+                if c_sym:
+                    broker_by_contract[c_sym] = bp
+                if u_sym:
+                    broker_by_underlying.setdefault(u_sym, []).append(bp)
+                summary["positions_alerted"] = int(
+                    summary.get("positions_alerted", 0)
+                ) + 1
+                log.critical(
+                    "[%s] RECONCILER_BROKER_POSITION_QTY_UNUSABLE "
+                    "contract=%s raw_quantity=%r — holding without mutation",
+                    self.client_id,
+                    c_sym or "?",
+                    {
+                        key: bp.get(key)
+                        for key in ("quantity", "qty", "long_quantity", "short_quantity")
+                        if key in bp
+                    },
+                )
+                continue
             if qty <= 0:
                 continue
             if c_sym:
@@ -3007,8 +3369,35 @@ class APBrokerReconciler:
             pos_id     = pos.get("id") or pos.get("position_id")
             contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
             underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
-            db_qty     = int(pos.get("qty") or pos.get("quantity") or 0)
-            entry_px   = float(pos.get("avg_fill") or pos.get("entry_price") or 0.0)
+            raw_db_qty = (
+                pos.get("qty")
+                if pos.get("qty") is not None
+                else pos.get("quantity")
+            )
+            raw_entry_px = (
+                pos.get("avg_fill")
+                if pos.get("avg_fill") is not None
+                else pos.get("entry_price")
+            )
+            db_qty = _strict_positive_whole_number(raw_db_qty)
+            entry_px = _strict_positive_finite_float(raw_entry_px)
+            if db_qty is None or entry_px is None:
+                summary.setdefault("errors", []).append(
+                    "reconciler_malformed_position_economics"
+                )
+                summary["positions_alerted"] = int(
+                    summary.get("positions_alerted", 0)
+                ) + 1
+                log.critical(
+                    "[%s] RECONCILER_POSITION_BLOCKED malformed persisted "
+                    "economics pos=%s contract=%s qty=%r entry_px=%r",
+                    self.client_id,
+                    pos_id,
+                    contract,
+                    raw_db_qty,
+                    raw_entry_px,
+                )
+                continue
 
             position_execution_mode = _normalize_execution_mode(pos.get("execution_mode"))
             if position_execution_mode is None:
@@ -3052,6 +3441,18 @@ class APBrokerReconciler:
             if broker_pos is not None:
                 self._ghost_tracker.pop(contract, None)
                 broker_qty = self._broker_position_qty(broker_pos)
+                if broker_qty is None:
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted", 0)
+                    ) + 1
+                    log.critical(
+                        "[%s] RECONCILER_POSITION_BLOCKED broker quantity "
+                        "unusable pos=%s contract=%s — holding without mutation",
+                        self.client_id,
+                        pos_id,
+                        contract,
+                    )
+                    continue
                 if broker_qty != db_qty and db_qty > 0:
                     log.warning(
                         "[%s] POSITION_QTY_MISMATCH | %s | DB=%d broker=%d",
@@ -3090,14 +3491,92 @@ class APBrokerReconciler:
         summary: dict,
     ) -> None:
         pos_id    = pos.get("id") or pos.get("position_id")
-        exit_fill = self._get_recent_exit_fill(contract, underlying)
+        position_mode = _normalize_execution_mode(pos.get("execution_mode"))
+        current_exit_local_id = str(
+            pos.get("pending_exit_local_order_id") or ""
+        ).strip()
+        current_exit_broker_id = str(
+            pos.get("pending_exit_broker_order_id") or ""
+        ).strip()
+        if not current_exit_local_id or not current_exit_broker_id:
+            self._alert(
+                "RECONCILER_EXIT_FILL_IDENTITY_UNPROVEN | "
+                f"client_id={self.client_id} "
+                f"position_id={str(pos_id or '') or '?'} "
+                f"contract={contract or '?'} "
+                "reason=current_exit_local_and_broker_identity_pair_missing"
+            )
+            summary["positions_alerted"] += 1
+            return
+        exit_fill = self._get_recent_exit_fill(
+            contract,
+            position_id=str(pos_id or "").strip(),
+            execution_mode=position_mode or "",
+            local_order_id=current_exit_local_id,
+            broker_order_id=current_exit_broker_id,
+        )
 
-        if exit_fill and float(exit_fill.get("fill_price") or 0) > 0:
-            exit_px          = float(exit_fill["fill_price"])
+        exit_fill_price = (
+            _strict_positive_finite_float(exit_fill.get("fill_price"))
+            if exit_fill
+            else None
+        )
+        if exit_fill and exit_fill_price is not None:
+            filled_qty_value = _strict_positive_whole_number(
+                exit_fill.get("filled_qty")
+            )
+            raw_remaining = pos.get("quantity_remaining")
+            if raw_remaining is None:
+                raw_remaining = pos.get("qty") or db_qty
+            remaining_value = _strict_positive_whole_number(raw_remaining)
+
+            if (
+                filled_qty_value is None
+                or remaining_value is None
+                or filled_qty_value != remaining_value
+            ):
+                self._alert(
+                    "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN | "
+                    f"client_id={self.client_id} "
+                    f"execution_mode={position_mode or '?'} "
+                    f"position_id={str(pos_id or '') or '?'} "
+                    f"contract={contract or '?'} "
+                    f"filled_qty={filled_qty_value!r} "
+                    f"quantity_remaining={remaining_value!r} "
+                    "reason=single_exit_fill_does_not_cover_unresolved_position"
+                )
+                summary["positions_alerted"] += 1
+                return
+
+            filled_qty = filled_qty_value
+            exit_px = exit_fill_price
             close_confidence = "HIGH"
+            exact_exit_evidence = {
+                "client_id": self.client_id,
+                "broker_order_id": str(exit_fill.get("broker_order_id") or "").strip(),
+                "exit_local_order_id": str(exit_fill.get("local_order_id") or "").strip(),
+                "filled_ts": exit_fill.get("filled_ts"),
+                "filled_ts_source": BROKER_FILL_TIMESTAMP_SOURCE,
+                "meta": exit_fill.get("meta"),
+                "filled_qty": filled_qty,
+                "fill_price": exit_px,
+                "position_id": str(exit_fill.get("position_id") or "").strip(),
+                "contract": self._norm_contract(exit_fill.get("contract")),
+                "execution_mode": _normalize_execution_mode(
+                    exit_fill.get("execution_mode")
+                ),
+                "status": str(exit_fill.get("status") or "").upper().strip(),
+            }
             log.info(
-                "[%s] RECONCILE_CLOSE_EVIDENCE | %s | filled exit found @ $%.4f",
-                self.client_id, contract, exit_px,
+                "[%s] RECONCILE_CLOSE_EVIDENCE | %s | local=%s broker=%s "
+                "filled_ts=%s filled_qty=%d @ $%.4f",
+                self.client_id,
+                contract,
+                exact_exit_evidence["exit_local_order_id"] or "?",
+                exact_exit_evidence["broker_order_id"] or "?",
+                exact_exit_evidence["filled_ts"] or "?",
+                filled_qty,
+                exit_px,
             )
         else:
             pos_id_str       = str(pos_id or "")
@@ -3113,30 +3592,22 @@ class APBrokerReconciler:
                 return
 
             pass_count = int(self._ghost_tracker.get(self._norm_contract(contract), 0)) + 1
-            if not self._mark_ghost_seen(contract):
-                log.warning(
-                    "[%s] GHOST_PASS_%d | %s | broker has no position — waiting for stronger evidence",
-                    self.client_id, pass_count, contract,
-                )
-                summary["positions_alerted"] += 1
-                return
-            _current_px = self._get_current_option_price(contract)
-            if _current_px > 0:
-                exit_px          = _current_px
-                close_confidence = "MEDIUM_THREE_PASS_CURRENT_MARK"
-                log.warning(
-                    "[%s] GHOST_PASS_3 | %s | no broker position, no active exit — "
-                    "auto-closing at current mark $%.4f",
-                    self.client_id, contract, _current_px,
-                )
-            else:
-                exit_px          = entry_px
-                close_confidence = "MEDIUM_THREE_PASS_NO_EXIT_EVIDENCE"
-                log.warning(
-                    "[%s] GHOST_PASS_3 | %s | no broker position, no active exit, "
-                    "no live quote — auto-closing at entry price (P&L = $0)",
-                    self.client_id, contract,
-                )
+            self._mark_ghost_seen(contract)
+            log.warning(
+                "[%s] GHOST_PASS_%d | %s | broker has no position — "
+                "exact broker EXIT fill still required",
+                self.client_id, pass_count, contract,
+            )
+            self._alert(
+                "BROKER_POSITION_MISSING_EXIT_FILL_UNPROVEN | "
+                f"client_id={self.client_id} execution_mode={position_mode or '?'} "
+                f"position_id={str(pos_id or '') or '?'} contract={contract or '?'} "
+                f"underlying={underlying or '?'} ghost_pass={pass_count} "
+                "local_active_exit=false broker_working_exit=false "
+                "reason=exact_broker_exit_fill_missing"
+            )
+            summary["positions_alerted"] += 1
+            return
 
         # Lifecycle visibility: ghost/autoclose is a major data-correction event.
         # Record it before the DB row is changed so a future trace can explain
@@ -3146,14 +3617,24 @@ class APBrokerReconciler:
             ticker=self._norm_underlying(underlying or contract),
             category_name="DATA",
             severity_name="WARNING",
-            reason_code="BROKER_POSITION_MISSING_THREE_PASS_CONFIRM",
-            human_reason="broker position missing after three-pass confirmation; reconciler auto-closing DB position",
+            reason_code="BROKER_POSITION_MISSING_EXACT_EXIT_FILL_CONFIRMED",
+            human_reason=(
+                "broker position missing; exact current-generation broker EXIT fill "
+                "confirmed; reconciler auto-closing DB position"
+            ),
             contract=contract,
             pos_id=pos_id,
             db_qty=db_qty,
             entry_px=entry_px,
             exit_px=exit_px,
             close_confidence=close_confidence,
+            broker_exit_order_id=exact_exit_evidence["broker_order_id"],
+            exit_local_order_id=exact_exit_evidence["exit_local_order_id"],
+            broker_exit_fill_ts=exact_exit_evidence["filled_ts"],
+            broker_exit_filled_qty=exact_exit_evidence["filled_qty"],
+            broker_exit_fill_timestamp_source=exact_exit_evidence[
+                "filled_ts_source"
+            ],
             client_id=self.client_id,
         )
 
@@ -3166,6 +3647,8 @@ class APBrokerReconciler:
             exit_px=exit_px,
             close_confidence=close_confidence,
             summary=summary,
+            exact_exit_fill_qty=filled_qty,
+            exact_exit_evidence=exact_exit_evidence,
             side=side if "side" in dir() else (pos.get("side") or pos.get("direction") or "CALL"),
         )
 
@@ -3180,17 +3663,103 @@ class APBrokerReconciler:
         exit_px: float,
         close_confidence: str,
         summary: dict,
+        exact_exit_fill_qty: int | None = None,
+        exact_exit_evidence: Optional[dict] = None,
         side: str = "CALL",
     ) -> None:
         """
         P0-PARTIAL-CLOSE: Extracted auto-close DB write.
-        Called by _handle_db_position_missing_at_broker after three-pass ghost
-        confirmation. The ONLY place that writes RECONCILER_AUTO_CLOSE to positions.
+        Called by _handle_db_position_missing_at_broker after exact EXIT evidence
+        is accepted. The ONLY place that writes RECONCILER_AUTO_CLOSE to positions.
 
         Rule: status=CLOSED iff quantity_remaining becomes 0.
               Otherwise status=PARTIAL (broker is flat but prior scale-outs exist).
         """
         pos_id = pos.get("id") or pos.get("position_id")
+        evidence = dict(exact_exit_evidence or {})
+        evidence_broker_order_id = str(
+            evidence.get("broker_order_id") or ""
+        ).strip()
+        evidence_local_order_id = str(
+            evidence.get("exit_local_order_id") or evidence.get("local_order_id") or ""
+        ).strip()
+        evidence_position_id = str(evidence.get("position_id") or "").strip()
+        evidence_contract = self._norm_contract(evidence.get("contract"))
+        evidence_mode = _normalize_execution_mode(evidence.get("execution_mode"))
+        evidence_status = str(evidence.get("status") or "").upper().strip()
+        evidence_fill_timestamp_source = str(
+            evidence.get("filled_ts_source")
+            or evidence.get("exit_fill_timestamp_source")
+            or (
+                BROKER_FILL_TIMESTAMP_SOURCE
+                if has_broker_fill_timestamp_provenance(evidence.get("meta"))
+                else ""
+            )
+            or ""
+        ).strip()
+        evidence_filled_ts = _parse_reconciler_timestamp(evidence.get("filled_ts"))
+        evidence_filled_qty_value = _strict_positive_whole_number(
+            evidence.get("filled_qty")
+        )
+        evidence_fill_price = _strict_positive_finite_float(evidence.get("fill_price"))
+        expected_db_qty = _strict_positive_whole_number(db_qty)
+        expected_exit_price = _strict_positive_finite_float(exit_px)
+        expected_entry_price = _strict_positive_finite_float(entry_px)
+        expected_mode = _normalize_execution_mode(
+            pos.get("execution_mode") or self.execution_mode
+        )
+        position_entry_ts = _parse_reconciler_timestamp(
+            pos.get("entry_ts")
+            or pos.get("opened_at")
+            or evidence.get("position_entry_ts")
+        )
+        provided_exact_qty = (
+            _strict_positive_whole_number(exact_exit_fill_qty)
+            if exact_exit_fill_qty is not None
+            else None
+        )
+        evidence_valid = (
+            bool(evidence)
+            and bool(evidence_broker_order_id)
+            and bool(evidence_local_order_id)
+            and evidence_position_id == str(pos_id or "").strip()
+            and evidence_contract == self._norm_contract(contract)
+            and expected_mode is not None
+            and evidence_mode == expected_mode
+            and evidence_status in {"FILLED", "EXIT_FILLED"}
+            and evidence_fill_timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
+            and evidence_filled_ts is not None
+            and position_entry_ts is not None
+            and evidence_filled_ts >= position_entry_ts
+            and evidence_filled_qty_value is not None
+            and evidence_fill_price is not None
+            and expected_db_qty is not None
+            and expected_exit_price is not None
+            and expected_entry_price is not None
+            and math.isclose(
+                evidence_fill_price,
+                expected_exit_price,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            and (
+                exact_exit_fill_qty is None
+                or provided_exact_qty == evidence_filled_qty_value
+            )
+        )
+        if not evidence_valid:
+            self._alert(
+                "RECONCILER_EXIT_FILL_EVIDENCE_UNPROVEN | "
+                f"client_id={self.client_id} position_id={str(pos_id or '') or '?'} "
+                f"contract={contract or '?'} reason=invalid_or_missing_exact_exit_bundle"
+            )
+            summary["positions_alerted"] += 1
+            return
+
+        exact_exit_fill_qty = evidence_filled_qty_value
+        db_qty = expected_db_qty
+        exit_px = evidence_fill_price
+        entry_px = expected_entry_price
         pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
         pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
 
@@ -3218,7 +3787,9 @@ class APBrokerReconciler:
                 with conn() as c:
                     # Re-fetch the row under lock so we use the freshest remaining qty.
                     c.execute(
-                        "SELECT quantity_remaining, qty FROM positions "
+                        "SELECT quantity_remaining, qty, "
+                        "pending_exit_local_order_id, pending_exit_broker_order_id "
+                        "FROM positions "
                         "WHERE id = %s AND client_id = %s FOR UPDATE",
                         (pos_id, self.client_id),
                     )
@@ -3227,14 +3798,142 @@ class APBrokerReconciler:
                         return None
 
                     _row = dict(row)
+                    locked_local_order_id = str(
+                        _row.get("pending_exit_local_order_id") or ""
+                    ).strip()
+                    locked_broker_order_id = str(
+                        _row.get("pending_exit_broker_order_id") or ""
+                    ).strip()
+                    if (
+                        not locked_local_order_id
+                        or not locked_broker_order_id
+                        or locked_local_order_id != evidence_local_order_id
+                        or locked_broker_order_id != evidence_broker_order_id
+                    ):
+                        return {
+                            "blocked_reason": "RECONCILER_EXIT_FILL_EVIDENCE_CHANGED",
+                            "broker_order_id": evidence_broker_order_id,
+                            "local_order_id": evidence_local_order_id,
+                        }
+
+                    # Re-read the exact broker EXIT row in the same transaction
+                    # immediately before the position UPDATE.  Position identity
+                    # alone is not enough: an older EXIT generation for the same
+                    # position must never authorize this mutation.
+                    c.execute(
+                        """
+                        SELECT broker_order_id,
+                               local_order_id,
+                               position_id,
+                               contract,
+                               execution_mode,
+                               status,
+                               fill_price,
+                               filled_qty,
+                               filled_ts,
+                               meta
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'EXIT'
+                          AND status IN ('FILLED', 'EXIT_FILLED')
+                          AND position_id::text = %s
+                          AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                          AND local_order_id = %s
+                          AND broker_order_id = %s
+                        FOR SHARE
+                        """,
+                        (
+                            self.client_id,
+                            str(pos_id or "").strip(),
+                            self._norm_contract(contract),
+                            expected_mode,
+                            evidence_local_order_id,
+                            evidence_broker_order_id,
+                        ),
+                    )
+                    durable_evidence_row = c.fetchone()
+                    if not durable_evidence_row:
+                        return {
+                            "blocked_reason": "RECONCILER_EXIT_FILL_EVIDENCE_CHANGED",
+                            "broker_order_id": evidence_broker_order_id,
+                            "local_order_id": evidence_local_order_id,
+                        }
+                    durable_evidence_row = dict(durable_evidence_row)
+                    durable_filled_ts = _parse_reconciler_timestamp(
+                        durable_evidence_row.get("filled_ts")
+                    )
+                    durable_filled_qty = _strict_positive_whole_number(
+                        durable_evidence_row.get("filled_qty")
+                    )
+                    durable_fill_price = _strict_positive_finite_float(
+                        durable_evidence_row.get("fill_price")
+                    )
+                    if (
+                        str(durable_evidence_row.get("broker_order_id") or "").strip()
+                        != evidence_broker_order_id
+                        or str(durable_evidence_row.get("local_order_id") or "").strip()
+                        != evidence_local_order_id
+                        or str(durable_evidence_row.get("position_id") or "").strip()
+                        != evidence_position_id
+                        or self._norm_contract(durable_evidence_row.get("contract"))
+                        != evidence_contract
+                        or _normalize_execution_mode(
+                            durable_evidence_row.get("execution_mode")
+                        )
+                        != evidence_mode
+                        or str(durable_evidence_row.get("status") or "").upper().strip()
+                        not in {"FILLED", "EXIT_FILLED"}
+                        or not has_broker_fill_timestamp_provenance(
+                            durable_evidence_row.get("meta")
+                        )
+                        or durable_filled_ts != evidence_filled_ts
+                        or durable_filled_qty is None
+                        or durable_filled_qty != exact_exit_fill_qty
+                        or durable_fill_price is None
+                        or not math.isclose(
+                            durable_fill_price,
+                            evidence_fill_price,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                    ):
+                        return {
+                            "blocked_reason": "RECONCILER_EXIT_FILL_EVIDENCE_CHANGED",
+                            "broker_order_id": evidence_broker_order_id,
+                            "local_order_id": evidence_local_order_id,
+                        }
+
                     _stored_remaining = _row.get("quantity_remaining")
-                    _stored_qty       = int(_row.get("qty") or db_qty or 0)
+                    _stored_qty = _strict_positive_whole_number(
+                        _row.get("qty") if _row.get("qty") is not None else db_qty
+                    )
+                    if _stored_qty is None:
+                        return {
+                            "blocked_reason": "RECONCILER_POSITION_QTY_INVALID",
+                        }
 
                     # Resolve current remaining; fall back to full qty if null
                     if _stored_remaining is None:
                         current_remaining = _stored_qty
                     else:
-                        current_remaining = int(_stored_remaining)
+                        current_remaining = _strict_positive_whole_number(
+                            _stored_remaining
+                        )
+                    if current_remaining is None:
+                        return {
+                            "blocked_reason": "RECONCILER_POSITION_REMAINING_INVALID",
+                        }
+
+                    if (
+                        exact_exit_fill_qty is not None
+                        and exact_exit_fill_qty != current_remaining
+                    ):
+                        return {
+                            "blocked_reason": "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN",
+                            "filled_qty": exact_exit_fill_qty,
+                            "quantity_remaining": current_remaining,
+                        }
 
                     # How many contracts does this auto-close account for?
                     # Broker says zero — so we close whatever is remaining.
@@ -3305,6 +4004,24 @@ class APBrokerReconciler:
             summary["positions_alerted"] += 1
             return
 
+        if _result.get("blocked_reason"):
+            self._alert(
+                f"{_result.get('blocked_reason')} | "
+                f"client_id={self.client_id} contract={contract or '?'} "
+                f"position_id={str(pos_id or '') or '?'} "
+                f"broker_order_id={_result.get('broker_order_id', evidence_broker_order_id)} "
+                f"local_order_id={_result.get('local_order_id', evidence_local_order_id)} "
+                "reason="
+                + (
+                    "position_remaining_changed_before_close"
+                    if _result.get("blocked_reason")
+                    == "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN"
+                    else "durable_exit_evidence_changed_before_close"
+                )
+            )
+            summary["positions_alerted"] += 1
+            return
+
         final_status  = _result["final_status"]
         close_qty     = _result["close_qty"]
         new_remaining = _result["new_remaining"]
@@ -3321,9 +4038,27 @@ class APBrokerReconciler:
 
         # Only notify exit engine if position is truly fully closed
         _ee = getattr(self, "exit_engine", None)
+        _canonical_proof_persisted = False
         if _ee and final_status == "CLOSED":
             try:
-                _ee.mark_position_closed(str(pos_id), reason="reconciler_auto_close")
+                _canonical_proof_persisted = (
+                    _ee.mark_position_closed(
+                        str(pos_id),
+                        reason="reconciler_auto_close",
+                        qty_filled=exact_exit_fill_qty,
+                        fill_price=exit_px,
+                        local_order_id=evidence_local_order_id,
+                        broker_order_id=evidence_broker_order_id,
+                        broker_exit_order_id=evidence_broker_order_id,
+                        broker_exit_fill_ts=evidence_filled_ts,
+                        broker_exit_filled_qty=exact_exit_fill_qty,
+                        broker_exit_fill_timestamp_source=(
+                            BROKER_FILL_TIMESTAMP_SOURCE
+                        ),
+                        proof_contracts_override=close_qty,
+                        reconciled=True,
+                    ) is True
+                )
             except Exception as _e:
                 log.warning("reconciler_mark_position_closed_failed: %s", _e)
 
@@ -3348,142 +4083,697 @@ class APBrokerReconciler:
             )
             return
 
-        # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
-        # Without this, any position closed outside the exit engine (manual broker
-        # close, overnight expiry, emergency flatten) is invisible in the trade ledger.
-        _proof_write_failed = False
-        try:
-            from ap_proof_logger import APProofLogger as _APProofLogger
-
-            if not self.supabase_client:
-                # Missing client → operator-visible error, never silently discard.
-                log.error(
-                    "[%s] RECONCILER_PROOF_WRITE_BLOCKED contract=%s position_id=%s "
-                    "reason=missing_supabase_client",
-                    self.client_id, contract, pos_id,
-                )
-                _proof_write_failed = True
-            else:
-                _local_order_id = str(pos.get("local_order_id") or "")
-                _pos_id_str     = str(pos_id or "")
-
-                # ── Idempotency: three-state lookup ───────────────────────────
-                # IDEMPOTENCY_EXISTS  — existing row confirmed → skip, no failure
-                # IDEMPOTENCY_CLEAR   — no existing row       → proceed with insert
-                # IDEMPOTENCY_UNKNOWN — lookup failed          → block insert, log error
-                _IDEM_EXISTS  = "EXISTS"
-                _IDEM_CLEAR   = "CLEAR"
-                _IDEM_UNKNOWN = "UNKNOWN"
-                _idem_state   = _IDEM_UNKNOWN   # default: treat uncertainty as block
-                _idem_err_str = None
-
-                try:
-                    _existing = (
-                        self.supabase_client
-                        .table("proof_trades")
-                        .select("id")
-                        .eq("position_id", _pos_id_str)
-                        .limit(1)
-                        .execute()
-                    )
-                    _existing_rows = (_existing.data or []) if _existing else []
-                    if not _existing_rows and _local_order_id:
-                        _existing2 = (
-                            self.supabase_client
-                            .table("proof_trades")
-                            .select("id")
-                            .eq("local_order_id", _local_order_id)
-                            .limit(1)
-                            .execute()
-                        )
-                        _existing_rows = (_existing2.data or []) if _existing2 else []
-                    _idem_state = _IDEM_EXISTS if _existing_rows else _IDEM_CLEAR
-                except Exception as _idem_exc:
-                    _idem_state   = _IDEM_UNKNOWN
-                    _idem_err_str = str(_idem_exc)
-
-                if _idem_state == _IDEM_EXISTS:
-                    log.info(
-                        "[%s] RECONCILER_PROOF_ALREADY_EXISTS contract=%s position_id=%s "
-                        "local_order_id=%s — skipping duplicate insert",
-                        self.client_id, contract, _pos_id_str, _local_order_id,
-                    )
-                    # safe no-op — not a write failure
-
-                elif _idem_state == _IDEM_UNKNOWN:
-                    # Lookup failed → do NOT insert (fail closed, not open).
-                    log.error(
-                        "[%s] RECONCILER_PROOF_IDEMPOTENCY_UNVERIFIED contract=%s "
-                        "position_id=%s local_order_id=%s client=%s "
-                        "error=%s — insert blocked to prevent duplicates",
-                        self.client_id, contract, _pos_id_str, _local_order_id,
-                        self.client_id, _idem_err_str,
-                    )
-                    _proof_write_failed = True
-
-                else:
-                    # IDEMPOTENCY_CLEAR — proceed with proof insert
-                    _proof = _APProofLogger(
-                        supabase_client=self.supabase_client,
-                        client_email=self.client_id,
-                        mode=self.execution_mode or "unknown",
-                    )
-                    _proof_result = _proof.log_trade(
-                        ticker             = self._norm_underlying(underlying or contract),
-                        pattern            = "",
-                        side               = side or "CALL",
-                        timeframe          = "1d",
-                        score              = 0,
-                        tier               = "A",
-                        context_score      = 0,
-                        setup_status       = "reconciler_auto_close",
-                        entry_trigger      = entry_px,
-                        entry_option_price = entry_px,
-                        exit_option_price  = exit_px,
-                        underlying_entry   = 0.0,
-                        underlying_exit    = 0.0,
-                        contracts          = close_qty or 1,
-                        exit_reason        = f"RECONCILER_AUTO_CLOSE | {close_confidence} | broker_position_missing",
-                        option_pnl_pct     = pnl_pct,
-                        underlying_pnl_pct = 0.0,
-                        win                = exit_px > entry_px,
-                        spread_pct         = 0.0,
-                        chain_grade        = "",
-                        synthetic_entry    = False,
-                        position_id        = _pos_id_str,
-                        local_order_id     = _local_order_id,
-                        execution_mode     = self.execution_mode or "",
-                    )
-                    # Check confirmed persistence — never emit PROOF_LOGGED on cache-only write.
-                    if _proof_result.get("_proof_persisted") is True:
-                        log.info(
-                            "[%s] RECONCILER_PROOF_LOGGED contract=%s position_id=%s pnl=%.1f%%",
-                            self.client_id, contract, _pos_id_str, pnl_pct,
-                        )
-                    else:
-                        _proof_write_failed = True
-                        log.error(
-                            "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
-                            "error=%s (non-fatal — position close is complete)",
-                            self.client_id, contract, _pos_id_str,
-                            _proof_result.get("_proof_persistence_error") or "persistence_not_confirmed",
-                        )
-
-        except Exception as _proof_err:
-            _proof_write_failed = True
-            log.error(
-                "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
-                "error=%s (non-fatal — position close is complete)",
-                self.client_id, contract, pos_id, _proof_err,
+        if _canonical_proof_persisted:
+            log.info(
+                "[%s] RECONCILER_PROOF_CANONICAL_CALLBACK_PERSISTED contract=%s "
+                "position_id=%s entry_local_order_id=%s exit_local_order_id=%s "
+                "broker_exit_order_id=%s — fallback proof write skipped",
+                self.client_id,
+                contract,
+                pos_id,
+                str(pos.get("local_order_id") or pos.get("entry_local_order_id") or "").strip(),
+                evidence_local_order_id,
+                evidence_broker_order_id,
             )
-        if _proof_write_failed:
+            try:
+                from ap_proof_logger import funnel as _funnel_r
+                _funnel_r.inc("reconciler_corrections")
+            except Exception as _funnel_err:
+                log.debug(
+                    "[%s] canonical reconciler proof funnel increment failed: %s",
+                    self.client_id,
+                    _funnel_err,
+                )
+            return
+
+        # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
+        # The helper validates exact EXIT truth and originating ENTRY identity,
+        # confirms durable persistence, and is also used by restart repair.
+        proof_result = self._persist_exact_reconciler_proof(
+            pos=pos,
+            exact_exit_evidence={
+                **evidence,
+                "client_id": self.client_id,
+                "position_entry_ts": pos.get("entry_ts") or pos.get("opened_at"),
+            },
+            close_qty=close_qty,
+            entry_px=entry_px,
+            exit_px=exit_px,
+            close_confidence=close_confidence,
+        )
+        if proof_result.get("success") is True:
+            log.info(
+                "[%s] RECONCILER_PROOF_%s contract=%s position_id=%s "
+                "entry_local_order_id=%s exit_local_order_id=%s broker_exit_order_id=%s",
+                self.client_id,
+                proof_result.get("disposition", "CONFIRMED"),
+                contract,
+                pos_id,
+                proof_result.get("entry_local_order_id", ""),
+                evidence_local_order_id,
+                evidence_broker_order_id,
+            )
+        else:
             summary.setdefault("proof_write_failures", 0)
             summary["proof_write_failures"] += 1
+            log.error(
+                "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
+                "disposition=%s reason=%s (non-fatal — position close is complete)",
+                self.client_id,
+                contract,
+                pos_id,
+                proof_result.get("disposition", "PERSIST_FAILED"),
+                proof_result.get("reason", "persistence_not_confirmed"),
+            )
         try:
             from ap_proof_logger import funnel as _funnel_r
             _funnel_r.inc("reconciler_corrections")
         except Exception:
             pass
+
+    def _persist_exact_reconciler_proof(
+        self,
+        *,
+        pos: dict,
+        exact_exit_evidence: dict,
+        close_qty: int,
+        entry_px: float,
+        exit_px: float,
+        close_confidence: str,
+    ) -> dict:
+        """Persist one exact reconciler close proof, with durable confirmation.
+
+        This is deliberately proof-only.  It does not close a position, change an
+        order, or contact the broker.  The caller supplies the exact EXIT evidence
+        that already authorized the reconciler close; restart repair obtains a
+        fresh copy through ``_get_recent_exit_fill`` before calling here.
+
+        ``success`` is true only for a confirmed durable row or an exact durable
+        row found by the idempotency lookup.  The logger's in-process cache and a
+        successful-but-unconfirmed insert are never treated as proof success.
+        """
+
+        def _result(
+            disposition: str,
+            *,
+            success: bool = False,
+            reason: str = "",
+            **extra,
+        ) -> dict:
+            return {
+                "success": bool(success),
+                "disposition": disposition,
+                "reason": reason,
+                **extra,
+            }
+
+        pos_id = str(pos.get("id") or pos.get("position_id") or "").strip()
+        pos_client_id = str(pos.get("client_id") or "").strip()
+        if not pos_id or pos_client_id != str(self.client_id or "").strip():
+            return _result(
+                "IDENTITY_UNPROVEN",
+                reason="position_client_or_id_missing_or_mismatched",
+            )
+
+        expected_mode = _normalize_execution_mode(pos.get("execution_mode"))
+        reconciler_mode = _normalize_execution_mode(self.execution_mode)
+        if expected_mode is None or reconciler_mode is None or expected_mode != reconciler_mode:
+            return _result(
+                "EVIDENCE_UNPROVEN",
+                reason="position_execution_mode_missing_or_mismatched",
+            )
+
+        contract = self._norm_contract(
+            pos.get("contract") or pos.get("option_symbol") or pos.get("symbol") or ""
+        )
+        pending_local = str(pos.get("pending_exit_local_order_id") or "").strip()
+        pending_broker = str(pos.get("pending_exit_broker_order_id") or "").strip()
+        evidence = dict(exact_exit_evidence or {})
+        evidence_client_id = str(evidence.get("client_id") or "").strip()
+        evidence_position_id = str(evidence.get("position_id") or "").strip()
+        evidence_contract = self._norm_contract(evidence.get("contract"))
+        evidence_mode = _normalize_execution_mode(evidence.get("execution_mode"))
+        evidence_local = str(
+            evidence.get("exit_local_order_id") or evidence.get("local_order_id") or ""
+        ).strip()
+        evidence_broker = str(
+            evidence.get("broker_order_id") or evidence.get("broker_exit_order_id") or ""
+        ).strip()
+        evidence_status = str(evidence.get("status") or "").upper().strip()
+        evidence_fill_timestamp_source = str(
+            evidence.get("filled_ts_source")
+            or evidence.get("exit_fill_timestamp_source")
+            or (
+                BROKER_FILL_TIMESTAMP_SOURCE
+                if has_broker_fill_timestamp_provenance(evidence.get("meta"))
+                else ""
+            )
+            or ""
+        ).strip()
+        evidence_filled_ts = _parse_reconciler_timestamp(
+            evidence.get("filled_ts") or evidence.get("broker_exit_fill_ts")
+        )
+        entry_ts = _parse_reconciler_timestamp(
+            pos.get("entry_ts")
+            or pos.get("opened_at")
+            or evidence.get("position_entry_ts")
+        )
+        evidence_fill_price = _strict_positive_finite_float(evidence.get("fill_price"))
+        expected_exit_price = _strict_positive_finite_float(exit_px)
+        evidence_filled_qty = _strict_positive_whole_number(
+            evidence.get("filled_qty")
+            if evidence.get("filled_qty") is not None
+            else evidence.get("broker_exit_filled_qty")
+        )
+        expected_close_qty = _strict_positive_whole_number(close_qty)
+        expected_entry_price = _strict_positive_finite_float(entry_px)
+
+        if (
+            not pending_local
+            or not pending_broker
+            or not contract
+            or evidence_client_id != str(self.client_id or "").strip()
+            or evidence_position_id != pos_id
+            or evidence_contract != contract
+            or evidence_mode != expected_mode
+            or evidence_local != pending_local
+            or evidence_broker != pending_broker
+            or evidence_status not in {"FILLED", "EXIT_FILLED"}
+            or evidence_fill_timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
+            or evidence_filled_ts is None
+            or entry_ts is None
+            or evidence_filled_ts < entry_ts
+            or evidence_fill_price is None
+            or expected_exit_price is None
+            or not math.isclose(
+                evidence_fill_price,
+                expected_exit_price,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            or evidence_filled_qty is None
+            or expected_close_qty is None
+            or evidence_filled_qty != expected_close_qty
+            or expected_entry_price is None
+        ):
+            return _result(
+                "EVIDENCE_UNPROVEN",
+                reason="invalid_or_mismatched_exact_exit_bundle",
+            )
+
+        try:
+            from ap.proof_taxonomy_guard import resolve_originating_entry_identity
+
+            identity = resolve_originating_entry_identity(
+                client_id=self.client_id,
+                position_id=pos_id,
+                supplied_local_order_id=str(
+                    pos.get("local_order_id") or pos.get("entry_local_order_id") or ""
+                ).strip(),
+            )
+        except Exception as identity_exc:
+            log.error(
+                "[%s] RECONCILER_PROOF_ENTRY_IDENTITY_LOOKUP_FAILED position_id=%s error=%s",
+                self.client_id,
+                pos_id,
+                identity_exc,
+            )
+            identity = None
+
+        entry_local_order_id = str(getattr(identity, "local_order_id", "") or "").strip()
+        identity_position_id = str(getattr(identity, "position_id", "") or "").strip()
+        identity_client_id = str(getattr(identity, "client_id", "") or "").strip()
+        if (
+            identity is None
+            or not entry_local_order_id
+            or identity_position_id != pos_id
+            or identity_client_id != str(self.client_id or "").strip()
+        ):
+            return _result(
+                "IDENTITY_UNPROVEN",
+                reason="originating_entry_identity_missing_or_mismatched",
+            )
+
+        # Unknown origin mode is intentionally retained as quarantine truth.  It
+        # may not be promoted from the current reconciler runtime mode.
+        origin_mode = _normalize_execution_mode(getattr(identity, "execution_mode", None))
+        proof_mode = origin_mode or "unknown"
+
+        if not self.supabase_client:
+            return _result("PERSIST_FAILED", reason="missing_supabase_client")
+
+        def _exact_rows() -> list[dict]:
+            response = (
+                self.supabase_client
+                .table("proof_trades")
+                .select(
+                    "id,client_email,position_id,local_order_id,execution_mode,"
+                    "entry_option_price,exit_option_price,contracts,"
+                    "option_pnl_pct,win,"
+                    "exit_local_order_id,broker_exit_order_id,"
+                    "broker_exit_fill_ts,broker_exit_filled_qty"
+                )
+                .eq("client_email", self.client_id)
+                .eq("position_id", pos_id)
+                .eq("local_order_id", entry_local_order_id)
+                .limit(2)
+                .execute()
+            )
+            rows = getattr(response, "data", None) if response is not None else None
+            if rows is None:
+                raise RuntimeError("proof_identity_confirmation_missing_response")
+            if not isinstance(rows, list):
+                rows = list(rows)
+            return [dict(row) for row in rows if isinstance(row, dict)]
+
+        def _existing_proof_mismatch(row: dict) -> str | None:
+            """Require an already-stored proof to carry the same EXIT truth."""
+            stored_client_id = str(row.get("client_email") or "").strip()
+            stored_position_id = str(row.get("position_id") or "").strip()
+            stored_entry_local = str(row.get("local_order_id") or "").strip()
+            stored_exit_local = str(row.get("exit_local_order_id") or "").strip()
+            stored_exit_broker = str(row.get("broker_exit_order_id") or "").strip()
+            stored_mode = str(row.get("execution_mode") or "").strip().lower()
+            stored_fill_ts = _parse_reconciler_timestamp(row.get("broker_exit_fill_ts"))
+            stored_fill_qty = _strict_positive_whole_number(
+                row.get("broker_exit_filled_qty")
+            )
+            stored_entry_px = _strict_positive_finite_float(
+                row.get("entry_option_price")
+            )
+            stored_exit_px = _strict_positive_finite_float(
+                row.get("exit_option_price")
+            )
+            stored_contracts = _strict_positive_whole_number(row.get("contracts"))
+            stored_pnl_pct = _finite_float(row.get("option_pnl_pct"))
+            expected_pnl_pct = round(
+                ((evidence_fill_price - expected_entry_price) / expected_entry_price) * 100,
+                2,
+            )
+            stored_win = row.get("win")
+            expected_win = evidence_fill_price > expected_entry_price
+
+            # APProofLogger stores option economics rounded to four decimals;
+            # compare against that durable representation, not the unrounded
+            # broker scalar supplied to the logger.
+            stored_entry_px_matches = (
+                stored_entry_px is not None
+                and math.isclose(
+                    stored_entry_px,
+                    round(expected_entry_price, 4),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+            stored_exit_px_matches = (
+                stored_exit_px is not None
+                and math.isclose(
+                    stored_exit_px,
+                    round(evidence_fill_price, 4),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+            checks = (
+                ("client_id", stored_client_id == str(self.client_id or "").strip()),
+                ("position_id", stored_position_id == pos_id),
+                ("entry_local_order_id", stored_entry_local == entry_local_order_id),
+                ("exit_local_order_id", stored_exit_local == evidence_local),
+                ("broker_exit_order_id", stored_exit_broker == evidence_broker),
+                ("execution_mode", stored_mode == proof_mode),
+                ("broker_exit_fill_ts", stored_fill_ts == evidence_filled_ts),
+                ("broker_exit_filled_qty", stored_fill_qty == evidence_filled_qty),
+                ("entry_option_price", stored_entry_px_matches),
+                ("exit_option_price", stored_exit_px_matches),
+                ("contracts", stored_contracts == expected_close_qty),
+                (
+                    "option_pnl_pct",
+                    stored_pnl_pct is not None
+                    and math.isclose(
+                        stored_pnl_pct,
+                        expected_pnl_pct,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ),
+                ),
+                ("win", isinstance(stored_win, bool) and stored_win == expected_win),
+            )
+            for field, matches in checks:
+                if not matches:
+                    return field
+            return None
+
+        try:
+            existing_rows = _exact_rows()
+        except Exception as idempotency_exc:
+            return _result(
+                "PERSIST_FAILED",
+                reason=f"proof_identity_lookup_failed:{idempotency_exc}",
+            )
+
+        if len(existing_rows) > 1:
+            return _result(
+                "PERSIST_FAILED",
+                reason="duplicate_exact_proof_rows",
+                entry_local_order_id=entry_local_order_id,
+            )
+        if existing_rows:
+            existing_mismatch = _existing_proof_mismatch(existing_rows[0])
+            if existing_mismatch:
+                return _result(
+                    "EVIDENCE_UNPROVEN",
+                    reason=(
+                        "existing_proof_exit_provenance_unconfirmed:"
+                        f"{existing_mismatch}"
+                    ),
+                    entry_local_order_id=entry_local_order_id,
+                    proof_id=existing_rows[0].get("id"),
+                )
+            return _result(
+                "ALREADY_EXISTS",
+                success=True,
+                reason="exact_durable_proof_confirmed",
+                entry_local_order_id=entry_local_order_id,
+                proof_id=existing_rows[0].get("id"),
+            )
+
+        try:
+            from ap_proof_logger import APProofLogger
+
+            pnl_pct = round(
+                ((evidence_fill_price - expected_entry_price) / expected_entry_price) * 100,
+                2,
+            )
+            proof = APProofLogger(
+                supabase_client=self.supabase_client,
+                client_email=self.client_id,
+                mode=proof_mode,
+            )
+            proof_result = proof.log_trade(
+                ticker=self._norm_underlying(
+                    pos.get("underlying") or pos.get("ticker") or contract
+                ),
+                pattern="",
+                side=pos.get("side") or pos.get("direction") or "CALL",
+                timeframe="1d",
+                score=0,
+                tier="A",
+                context_score=0,
+                setup_status="reconciler_auto_close",
+                entry_trigger=expected_entry_price,
+                entry_option_price=expected_entry_price,
+                exit_option_price=evidence_fill_price,
+                underlying_entry=0.0,
+                underlying_exit=0.0,
+                contracts=expected_close_qty,
+                exit_reason=(
+                    f"RECONCILER_AUTO_CLOSE | {close_confidence} | "
+                    "broker_position_missing"
+                ),
+                option_pnl_pct=pnl_pct,
+                underlying_pnl_pct=0.0,
+                win=evidence_fill_price > expected_entry_price,
+                spread_pct=0.0,
+                chain_grade="",
+                opened_at=entry_ts,
+                closed_at=evidence_filled_ts,
+                synthetic_entry=False,
+                position_id=pos_id,
+                local_order_id=entry_local_order_id,
+                exit_local_order_id=evidence_local,
+                execution_mode=proof_mode,
+                broker_exit_order_id=evidence_broker,
+                broker_exit_fill_ts=evidence_filled_ts,
+                broker_exit_filled_qty=evidence_filled_qty,
+            )
+            if not (
+                isinstance(proof_result, dict)
+                and proof_result.get("_proof_persisted") is True
+            ):
+                return _result(
+                    "PERSIST_FAILED",
+                    reason=(
+                        proof_result.get("_proof_persistence_error")
+                        if isinstance(proof_result, dict)
+                        else "persistence_not_confirmed"
+                    )
+                    or "persistence_not_confirmed",
+                    entry_local_order_id=entry_local_order_id,
+                )
+        except Exception as proof_exc:
+            log.error(
+                "[%s] RECONCILER_PROOF_INSERT_FAILED position_id=%s error=%s",
+                self.client_id,
+                pos_id,
+                proof_exc,
+            )
+            return _result(
+                "PERSIST_FAILED",
+                reason=f"proof_insert_failed:{proof_exc}",
+                entry_local_order_id=entry_local_order_id,
+            )
+
+        try:
+            confirmed_rows = _exact_rows()
+        except Exception as confirmation_exc:
+            return _result(
+                "PERSIST_FAILED",
+                reason=f"proof_durable_confirmation_failed:{confirmation_exc}",
+                entry_local_order_id=entry_local_order_id,
+            )
+        if len(confirmed_rows) == 1:
+            confirmed_mismatch = _existing_proof_mismatch(confirmed_rows[0])
+            if confirmed_mismatch:
+                return _result(
+                    "PERSIST_FAILED",
+                    reason=(
+                        "inserted_proof_exit_provenance_unconfirmed:"
+                        f"{confirmed_mismatch}"
+                    ),
+                    entry_local_order_id=entry_local_order_id,
+                    proof_id=confirmed_rows[0].get("id"),
+                )
+            return _result(
+                "PERSISTED",
+                success=True,
+                reason="exact_durable_proof_confirmed_after_insert",
+                entry_local_order_id=entry_local_order_id,
+                proof_id=confirmed_rows[0].get("id"),
+            )
+        if len(confirmed_rows) > 1:
+            return _result(
+                "PERSIST_FAILED",
+                reason="duplicate_exact_proof_rows_after_insert",
+                entry_local_order_id=entry_local_order_id,
+            )
+        return _result(
+            "PERSIST_FAILED",
+            reason="proof_insert_not_durably_confirmed",
+            entry_local_order_id=entry_local_order_id,
+        )
+
+    def _repair_missing_reconciler_proofs(self, summary: dict) -> None:
+        """Repair proof only for already-closed reconciler positions.
+
+        The scan is intentionally bounded and has no position/order mutation
+        authority.  Each candidate must survive a fresh exact EXIT lookup and
+        the same strict proof helper used by the immediate close path.
+        """
+        for key in (
+            "reconciler_proof_repair_candidates",
+            "reconciler_proof_repair_persisted",
+            "reconciler_proof_repair_already_exists",
+            "reconciler_proof_repair_failures",
+        ):
+            summary.setdefault(key, 0)
+
+        expected_mode = _normalize_execution_mode(self.execution_mode)
+        if expected_mode is None:
+            summary["reconciler_proof_repair_failures"] += 1
+            self._alert(
+                "RECONCILER_PROOF_REPAIR_HOLD | "
+                f"client_id={self.client_id} reason=unknown_reconciler_execution_mode"
+            )
+            return
+
+        cursor = self._reconciler_proof_repair_cursor
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _scan():
+                with conn() as c:
+                    pagination_sql = ""
+                    params: list[object] = [self.client_id]
+                    if cursor is not None:
+                        cursor_exit_ts, cursor_position_id = cursor
+                        if cursor_exit_ts is None:
+                            pagination_sql = (
+                                " AND p.exit_ts IS NULL"
+                                " AND p.id::text < %s"
+                            )
+                            params.append(cursor_position_id)
+                        else:
+                            pagination_sql = (
+                                " AND ("
+                                "p.exit_ts IS NULL"
+                                " OR p.exit_ts < %s"
+                                " OR (p.exit_ts = %s AND p.id::text < %s)"
+                                ")"
+                            )
+                            params.extend(
+                                [cursor_exit_ts, cursor_exit_ts, cursor_position_id]
+                            )
+                    c.execute(
+                        f"""
+                        SELECT p.*
+                        FROM positions p
+                        WHERE p.client_id = %s
+                          AND UPPER(TRIM(COALESCE(p.status, ''))) = 'CLOSED'
+                          AND UPPER(TRIM(COALESCE(p.close_source, ''))) =
+                              'RECONCILER_AUTO_CLOSE'
+                          {pagination_sql}
+                        ORDER BY p.exit_ts DESC NULLS LAST, p.id::text DESC
+                        LIMIT {RECONCILER_PROOF_REPAIR_PAGE_SIZE}
+                        """,
+                        tuple(params),
+                    )
+                    return [dict(row) for row in (c.fetchall() or [])]
+
+            candidates = run_with_retry(_scan) or []
+        except Exception as scan_exc:
+            summary["reconciler_proof_repair_failures"] += 1
+            summary.setdefault("proof_write_failures", 0)
+            summary["proof_write_failures"] += 1
+            self._alert(
+                "RECONCILER_PROOF_REPAIR_HOLD | "
+                f"client_id={self.client_id} reason=closed_candidate_scan_failed "
+                f"error={scan_exc}"
+            )
+            log.error(
+                "[%s] reconciler closed proof candidate scan failed: %s",
+                self.client_id,
+                scan_exc,
+            )
+            return
+
+        if not candidates:
+            # End of the current keyset sweep.  Start a fresh sweep next cycle
+            # so newly-closed rows are not hidden behind an old cursor.
+            self._reconciler_proof_repair_cursor = None
+            return
+
+        summary["reconciler_proof_repair_candidates"] += len(candidates)
+
+        for pos in candidates:
+            pos_id = str(pos.get("id") or pos.get("position_id") or "").strip()
+            contract = self._norm_contract(
+                pos.get("contract") or pos.get("option_symbol") or pos.get("symbol") or ""
+            )
+            mode = _normalize_execution_mode(pos.get("execution_mode"))
+            local_id = str(pos.get("pending_exit_local_order_id") or "").strip()
+            broker_id = str(pos.get("pending_exit_broker_order_id") or "").strip()
+
+            def _hold(reason: str) -> None:
+                summary["reconciler_proof_repair_failures"] += 1
+                summary.setdefault("proof_write_failures", 0)
+                summary["proof_write_failures"] += 1
+                self._alert(
+                    "RECONCILER_PROOF_REPAIR_HOLD | "
+                    f"client_id={self.client_id} execution_mode={mode or '?'} "
+                    f"position_id={pos_id or '?'} contract={contract or '?'} "
+                    f"reason={reason}"
+                )
+
+            if (
+                str(pos.get("client_id") or "").strip() != self.client_id
+                or str(pos.get("status") or "").upper().strip() != "CLOSED"
+                or str(pos.get("close_source") or "").upper().strip()
+                != "RECONCILER_AUTO_CLOSE"
+            ):
+                _hold("candidate_identity_changed")
+                continue
+            if not pos_id or not contract:
+                _hold("position_identity_missing")
+                continue
+            if mode is None or mode != expected_mode:
+                _hold("execution_mode_missing_or_mismatched")
+                continue
+            if not local_id or not broker_id:
+                _hold("current_exit_identity_missing")
+                continue
+
+            exit_fill = self._get_recent_exit_fill(
+                contract,
+                position_id=pos_id,
+                execution_mode=mode,
+                local_order_id=local_id,
+                broker_order_id=broker_id,
+            )
+            if not exit_fill:
+                _hold("exact_durable_exit_evidence_missing_or_ambiguous")
+                continue
+
+            exact_exit_evidence = dict(exit_fill)
+            exact_exit_evidence["client_id"] = self.client_id
+            exact_exit_evidence.setdefault(
+                "position_entry_ts",
+                pos.get("entry_ts") or pos.get("opened_at"),
+            )
+            close_qty = _strict_positive_whole_number(
+                exact_exit_evidence.get("filled_qty")
+            )
+            exit_px = _strict_positive_finite_float(
+                exact_exit_evidence.get("fill_price")
+            )
+            entry_px = _strict_positive_finite_float(
+                pos.get("avg_fill") or pos.get("entry_price")
+            )
+            if close_qty is None or exit_px is None or entry_px is None:
+                _hold("malformed_exact_exit_or_entry_economics")
+                continue
+
+            proof_result = self._persist_exact_reconciler_proof(
+                pos=pos,
+                exact_exit_evidence=exact_exit_evidence,
+                close_qty=close_qty,
+                entry_px=entry_px,
+                exit_px=exit_px,
+                close_confidence="HIGH",
+            )
+            if proof_result.get("success") is True:
+                if proof_result.get("disposition") == "PERSISTED":
+                    summary["reconciler_proof_repair_persisted"] += 1
+                else:
+                    summary["reconciler_proof_repair_already_exists"] += 1
+                log.info(
+                    "[%s] RECONCILER_PROOF_REPAIR_%s position_id=%s "
+                    "entry_local_order_id=%s exit_local_order_id=%s broker_exit_order_id=%s",
+                    self.client_id,
+                    proof_result.get("disposition", "CONFIRMED"),
+                    pos_id,
+                    proof_result.get("entry_local_order_id", ""),
+                    local_id,
+                    broker_id,
+                )
+            else:
+                _hold(
+                    proof_result.get("reason")
+                    or proof_result.get("disposition")
+                    or "proof_persistence_not_confirmed"
+                )
+
+        if len(candidates) < RECONCILER_PROOF_REPAIR_PAGE_SIZE:
+            self._reconciler_proof_repair_cursor = None
+        else:
+            last_candidate = candidates[-1]
+            self._reconciler_proof_repair_cursor = (
+                last_candidate.get("exit_ts"),
+                str(
+                    last_candidate.get("id")
+                    or last_candidate.get("position_id")
+                    or ""
+                ).strip(),
+            )
 
     def _import_broker_positions_missing_from_db(
         self,
@@ -3508,7 +4798,7 @@ class APBrokerReconciler:
                 continue
 
             qty = self._broker_position_qty(bp)
-            if qty <= 0:
+            if qty is None or qty <= 0:
                 continue
 
             from zoneinfo import ZoneInfo as _ZoneInfo
@@ -4097,13 +5387,20 @@ class APBrokerReconciler:
         contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
         underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
         side       = str(pos.get("direction") or pos.get("side") or "CALL").upper()
-        qty        = int(
+        raw_qty = (
             pos.get("qty")
-            or pos.get("quantity")
-            or pos.get("quantity_remaining")
-            or 0
+            if pos.get("qty") is not None
+            else pos.get("quantity")
         )
-        entry_px         = self._safe_float(pos.get("avg_fill") or pos.get("entry_price"), 0.0)
+        if raw_qty is None:
+            raw_qty = pos.get("quantity_remaining")
+        qty = _strict_positive_whole_number(raw_qty)
+        raw_entry_px = (
+            pos.get("avg_fill")
+            if pos.get("avg_fill") is not None
+            else pos.get("entry_price")
+        )
+        entry_px = _strict_positive_finite_float(raw_entry_px)
         underlying_entry = self._derive_underlying_entry_from_position(
             pos,
             underlying=underlying,
@@ -4114,7 +5411,16 @@ class APBrokerReconciler:
             or str(pos.get("close_confidence") or "").upper().endswith("PRICE_UNTRUSTED")
         )
 
-        if qty <= 0 or entry_px <= 0 or not contract:
+        if qty is None or entry_px is None or not contract:
+            log.critical(
+                "[%s] EXIT_SEED_BLOCKED malformed persisted economics pos=%s "
+                "contract=%s qty=%r entry_px=%r",
+                self.client_id,
+                pos_id,
+                contract,
+                raw_qty,
+                raw_entry_px,
+            )
             return
 
         self._seed_exit_engine_from_import(
@@ -4518,6 +5824,7 @@ class APBrokerReconciler:
 
             # ── Step 2: fetch broker truth once ──────────────────────────────
             broker_open_by_contract: dict[str, int] = {}
+            broker_unusable_contracts: set[str] = set()
             broker_truth_available  = False
             try:
                 if self.broker and hasattr(self.broker, "list_positions"):
@@ -4527,6 +5834,9 @@ class APBrokerReconciler:
                             str(bp.get("symbol") or bp.get("contract") or "")
                         )
                         qty = self._broker_position_qty(bp)
+                        if sym and qty is None:
+                            broker_unusable_contracts.add(sym)
+                            continue
                         if sym and qty > 0:
                             broker_open_by_contract[sym] = qty
                     broker_truth_available = True
@@ -4543,8 +5853,28 @@ class APBrokerReconciler:
                 contract   = self._norm_contract(
                     row.get("contract") or row.get("option_symbol") or ""
                 )
-                rem_qty    = int(row.get("quantity_remaining") or 0)
-                full_qty   = int(row.get("qty") or rem_qty)
+                rem_qty = _strict_positive_whole_number(
+                    row.get("quantity_remaining")
+                )
+                full_qty = _strict_positive_whole_number(
+                    row.get("qty")
+                    if row.get("qty") is not None
+                    else rem_qty
+                )
+                if rem_qty is None or full_qty is None:
+                    log.critical(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR HOLD | malformed "
+                        "persisted quantity pos=%s contract=%s remaining=%r qty=%r",
+                        self.client_id,
+                        pos_id,
+                        contract,
+                        row.get("quantity_remaining"),
+                        row.get("qty"),
+                    )
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted", 0)
+                    ) + 1
+                    continue
 
                 if not broker_truth_available:
                     # Cannot verify — flag for operator, do not touch status
@@ -4557,6 +5887,19 @@ class APBrokerReconciler:
                     )
                     summary["broker_positions_hidden_by_closed_status_count"] = \
                         int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    continue
+
+                if contract in broker_unusable_contracts:
+                    log.critical(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR HOLD | broker quantity "
+                        "unusable pos=%s contract=%s; no status mutation",
+                        self.client_id,
+                        pos_id,
+                        contract,
+                    )
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted", 0)
+                    ) + 1
                     continue
 
                 broker_qty = broker_open_by_contract.get(contract, 0)

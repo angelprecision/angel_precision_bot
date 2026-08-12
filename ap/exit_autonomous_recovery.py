@@ -18,11 +18,14 @@ Safety rules
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE, parse_aware_utc_timestamp
 
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
@@ -63,10 +66,91 @@ def _qty(raw: dict) -> int:
         try:
             val = raw.get(key)
             if val not in (None, ""):
-                return abs(int(float(val)))
+                if isinstance(val, bool):
+                    continue
+                parsed = float(val)
+                if math.isfinite(parsed) and parsed > 0 and parsed.is_integer():
+                    return int(parsed)
         except Exception:
             pass
     return 0
+
+
+def _filled_qty(raw: dict) -> int:
+    """Read only explicit broker execution quantity; never requested qty."""
+    for key in (
+        "filled_qty",
+        "filled_quantity",
+        "cumulative_filled_qty",
+        "exec_quantity",
+    ):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if value in (None, "") or isinstance(value, bool):
+            return 0
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+            return 0
+        return int(parsed)
+    return 0
+
+
+_BROKER_FILL_TIMESTAMP_KEYS = (
+    "filled_ts",
+    "filled_at",
+    "fill_ts",
+    "last_fill_date",
+    "transaction_date",
+)
+
+
+def _broker_fill_timestamp(raw: dict) -> datetime | None:
+    """Return explicit broker fill time; never manufacture recovery time."""
+    for key in _BROKER_FILL_TIMESTAMP_KEYS:
+        if key in raw:
+            return parse_aware_utc_timestamp(raw.get(key))
+    return None
+
+
+def _position_value(pos: Any, name: str, default: Any = None) -> Any:
+    if isinstance(pos, dict):
+        return pos.get(name, default)
+    return getattr(pos, name, default)
+
+
+def _position_remaining(pos: Any) -> Optional[int]:
+    raw = _position_value(pos, "quantity_remaining")
+    if raw in (None, "") or isinstance(raw, bool):
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _broker_position_qty(raw: dict) -> Optional[int]:
+    """Read broker position quantity without converting malformed scalars."""
+    for key in ("quantity", "qty", "long_quantity", "short_quantity"):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(parsed) or not parsed.is_integer():
+            return None
+        return abs(int(parsed))
+    return None
 
 
 def _is_exit_like(raw: dict) -> bool:
@@ -274,30 +358,110 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                         pid,
                         local_order_id=local_id,
                         broker_order_id=pending_broker_id,
-                        qty=int(getattr(pos, "pending_exit_qty", 0) or 0),
+                        qty=_qty({"qty": getattr(pos, "pending_exit_qty", 0)}),
                         reason="autonomous_recovery_confirmed_broker_open_exit",
                     )
                 return RecoveryAction("CONFIRMED_OPEN", "broker_order_still_open", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
             if st == "filled":
-                filled_qty = _qty(raw) or int(getattr(pos, "pending_exit_qty", 0) or 0)
+                filled_qty = _filled_qty(raw)
                 fill_price = None
-                for key in ("avg_fill_price", "average_fill_price", "fill_price", "filled_avg_price", "price"):
+                for key in ("avg_fill_price", "average_fill_price", "fill_price", "filled_avg_price"):
                     try:
                         if raw.get(key) not in (None, ""):
-                            fill_price = float(raw.get(key))
+                            candidate = float(raw.get(key))
+                            if not math.isfinite(candidate) or candidate <= 0:
+                                continue
+                            fill_price = candidate
                             break
                     except Exception:
                         pass
-                if exit_engine and hasattr(exit_engine, "mark_position_closed"):
-                    exit_engine.mark_position_closed(
+                if filled_qty <= 0 or fill_price is None:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_exact_economics_missing",
                         pid,
-                        reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
-                        qty_filled=filled_qty,
-                        fill_price=fill_price,
-                        local_order_id=local_id,
-                        broker_order_id=pending_broker_id,
-                        cumulative_filled=filled_qty,
-                        reconciled=True,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "fill_price": fill_price,
+                            "quote_health": qh,
+                            "requires_exact_exit_fill": True,
+                        },
+                    )
+                fill_ts = _broker_fill_timestamp(raw)
+                entry_ts = parse_aware_utc_timestamp(
+                    _position_value(pos, "opened_at")
+                    or _position_value(pos, "entry_ts")
+                )
+                if fill_ts is None or entry_ts is None or fill_ts < entry_ts:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_timestamp_unproven",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "fill_price": fill_price,
+                            "filled_ts": fill_ts.isoformat() if fill_ts else None,
+                            "entry_ts": entry_ts.isoformat() if entry_ts else None,
+                            "quote_health": qh,
+                            "requires_aware_broker_fill_timestamp": True,
+                        },
+                    )
+                remaining_qty = _position_remaining(pos)
+                if remaining_qty is None or filled_qty != remaining_qty:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_quantity_mismatch",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "remaining_qty": remaining_qty,
+                            "fill_price": fill_price,
+                            "filled_ts": fill_ts.isoformat(),
+                            "quote_health": qh,
+                            "requires_exact_remaining_coverage": True,
+                        },
+                    )
+                mark = getattr(exit_engine, "mark_position_closed", None) if exit_engine else None
+                if not callable(mark):
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_close_hook_missing",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {"status": st, "quote_health": qh},
+                    )
+                mark_result = mark(
+                    pid,
+                    reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
+                    qty_filled=filled_qty,
+                    fill_price=fill_price,
+                    local_order_id=local_id,
+                    broker_order_id=pending_broker_id,
+                    cumulative_filled=filled_qty,
+                    broker_exit_order_id=pending_broker_id,
+                    broker_exit_filled_qty=filled_qty,
+                    broker_exit_fill_ts=fill_ts,
+                    broker_exit_fill_timestamp_source=BROKER_FILL_TIMESTAMP_SOURCE,
+                    reconciled=True,
+                )
+                if mark_result is False:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_close_rejected",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {"status": st, "quote_health": qh},
                     )
                 return RecoveryAction("MARKED_CLOSED", "broker_order_filled", pid, local_id, pending_broker_id, {"status": st, "filled_qty": filled_qty, "quote_health": qh})
             if st in TERMINAL_BROKER_STATUSES:
@@ -311,7 +475,12 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                             pid,
                             local_order_id=local_id,
                             broker_order_id=other_bid,
-                            qty=int(_qty(other_raw) or getattr(pos, "pending_exit_qty", 0) or 0),
+                            qty=_qty(
+                                {
+                                    "qty": getattr(pos, "pending_exit_qty", 0)
+                                    or _qty(other_raw)
+                                }
+                            ),
                             reason="autonomous_recovery_found_different_open_exit",
                         )
                     return RecoveryAction("CONFIRMED_OPEN", "different_broker_exit_still_open", pid, local_id, other_bid, {"old_status": st, "contract": contract, "quote_health": qh})
@@ -337,7 +506,12 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                 pid,
                 local_order_id=local_id,
                 broker_order_id=recovered_broker_id,
-                qty=int(getattr(pos, "pending_exit_qty", 0) or _qty(raw) or 0),
+                qty=_qty(
+                    {
+                        "qty": getattr(pos, "pending_exit_qty", 0)
+                        or _qty(raw)
+                    }
+                ),
                 reason="autonomous_recovery_matched_live_exit_order",
             )
         return RecoveryAction("RECOVERED_BROKER_ID", "matched_single_live_exit_order", pid, local_id, recovered_broker_id, {"contract": contract, "quote_health": qh})
@@ -362,26 +536,46 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
         return RecoveryAction("NOOP", "multiple_live_exit_orders_cancel_not_proven", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
 
     # Negative proof: no matching open sell-to-close order currently at broker.
-    # Before marking replacement safe, verify the contract is still held.
-    # If position is flat at the broker (exit filled, callback dropped), close it
-    # instead of spawning a duplicate sell-to-close that Tradier will reject.
+    # A flat broker position is not an EXIT fill record: it carries neither an
+    # authoritative price nor an exact filled quantity/order identity. Hold for
+    # the reconciler/manual-close path rather than manufacturing a close.
     try:
         _broker_positions = broker.list_positions() if hasattr(broker, "list_positions") else []
-        _contract_held = any(
-            str(p.get("symbol") or "").upper() == str(contract or "").upper()
-            for p in (_broker_positions or [])
-            if int(p.get("quantity") or 0) != 0
-        )
-        if not _contract_held and contract:
-            # Position is flat at broker — exit filled but callback was dropped.
-            # Mark position closed rather than allowing a duplicate exit submission.
-            if exit_engine and hasattr(exit_engine, "mark_position_closed"):
-                exit_engine.mark_position_closed(pid, exit_price=None, filled_qty=getattr(pos, "contracts", 0))
+        _contract_held = False
+        _position_truth_unknown = False
+        for p in (_broker_positions or []):
+            if str(p.get("symbol") or p.get("contract") or "").upper() != str(contract or "").upper():
+                continue
+            _position_qty = _broker_position_qty(p)
+            if _position_qty is None:
+                _position_truth_unknown = True
+                break
+            if _position_qty != 0:
+                _contract_held = True
+        if _position_truth_unknown:
             return RecoveryAction(
-                "MARKED_CLOSED",
-                "autonomous_recovery_contract_flat_at_broker",
+                "NOOP",
+                "autonomous_recovery_broker_position_quantity_unusable",
+                pid,
+                local_id,
+                "",
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "requires_exact_exit_fill": True,
+                },
+            )
+        if not _contract_held and contract:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_contract_flat_requires_exact_exit_fill",
                 pid, local_id, "",
-                {"contract": contract, "quote_health": qh, "source": "negative_proof_position_check"},
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "source": "negative_proof_position_check",
+                    "requires_exact_exit_fill": True,
+                },
             )
     except Exception as _bp_exc:
         log.debug("exit_autonomous_recovery: broker position check failed (non-fatal): %s", _bp_exc)

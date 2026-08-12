@@ -77,6 +77,119 @@ def _make_broker_pos(contract: str, qty: int) -> dict:
     return {"symbol": contract, "quantity": qty, "cost_basis": 1.50}
 
 
+def _exact_close_bundle(pos: dict, *, contract: str, filled_qty: int, fill_price: float) -> dict:
+    """Give legacy partial-close assertions the current #428 exact EXIT contract."""
+    pos.update(
+        {
+            "execution_mode": "paper",
+            "entry_ts": "2026-08-10T18:00:00+00:00",
+            "pending_exit_local_order_id": f"exit-{pos['id']}",
+            "pending_exit_broker_order_id": f"broker-{pos['id']}",
+        }
+    )
+    return {
+        "client_id": pos["client_id"],
+        "broker_order_id": pos["pending_exit_broker_order_id"],
+        "local_order_id": pos["pending_exit_local_order_id"],
+        "exit_local_order_id": pos["pending_exit_local_order_id"],
+        "position_id": pos["id"],
+        "contract": contract,
+        "execution_mode": "paper",
+        "status": "EXIT_FILLED",
+        "fill_price": fill_price,
+        "filled_qty": filled_qty,
+        "filled_ts": "2026-08-10T19:00:00+00:00",
+        "meta": {"exit_fill_timestamp_source": "broker_response"},
+    }
+
+
+def _run_exact_close_for_legacy_test(
+    rec,
+    summary: dict,
+    *,
+    pos: dict,
+    contract: str,
+    db_qty: int,
+    entry_px: float,
+    exit_px: float,
+    db_row: dict,
+) -> dict:
+    """Exercise the old partial-close assertions with current exact evidence."""
+    evidence = _exact_close_bundle(
+        pos,
+        contract=contract,
+        filled_qty=int(db_row.get("quantity_remaining") or db_row.get("qty") or db_qty),
+        fill_price=exit_px,
+    )
+    locked_position = {
+        **db_row,
+        "pending_exit_local_order_id": evidence["exit_local_order_id"],
+        "pending_exit_broker_order_id": evidence["broker_order_id"],
+    }
+    written: dict = {}
+
+    class _FakeCursor:
+        def __init__(self):
+            self._row = None
+
+        def execute(self, sql, params=None):
+            sql_up = sql.strip().upper()
+            if "FROM ORDERS" in sql_up:
+                self._row = dict(evidence)
+            elif "FROM POSITIONS" in sql_up and "FOR UPDATE" in sql_up:
+                self._row = locked_position
+            else:
+                self._row = None
+
+        def fetchone(self):
+            return self._row
+
+    cursor = _FakeCursor()
+
+    def _fake_execute(sql, params=None):
+        sql_up = sql.strip().upper()
+        if "FROM ORDERS" in sql_up:
+            cursor._row = dict(evidence)
+        elif "FROM POSITIONS" in sql_up and "FOR UPDATE" in sql_up:
+            cursor._row = locked_position
+        elif sql_up.startswith("UPDATE POSITIONS"):
+            written["status"] = params[0]
+            written["quantity_remaining"] = params[5]
+            cursor._row = None
+        else:
+            cursor._row = None
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    rec._persist_exact_reconciler_proof = MagicMock(
+        return_value={"success": False, "disposition": "PERSIST_FAILED"}
+    )
+    # Use a real cursor-shaped double: production calls execute() and then
+    # fetchone() on the same cursor after each exact SELECT.
+    cursor.execute = _fake_execute
+    with patch("ap.db.conn", return_value=_Connection()), \
+         patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
+        rec._execute_reconciler_close(
+            pos=pos,
+            contract=contract,
+            underlying=pos.get("underlying") or "?",
+            db_qty=db_qty,
+            entry_px=entry_px,
+            exit_px=exit_px,
+            close_confidence="HIGH",
+            summary=summary,
+            exact_exit_fill_qty=evidence["filled_qty"],
+            exact_exit_evidence=evidence,
+            side=pos.get("side") or "CALL",
+        )
+    return written
+
+
 # =============================================================================
 # 1. Reconciler auto-close: PARTIAL when quantity_remaining > 0
 # =============================================================================
@@ -113,40 +226,17 @@ class TestReconcilerAutoClosePartialGuard(unittest.TestCase):
 
         # Simulate DB returning a row with remaining qty = 5, full qty = 7
         db_row = {"quantity_remaining": 5, "qty": 7}
-        written = {}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            sql_up = sql.strip().upper()
-            if "FOR UPDATE" in sql_up:
-                cursor.fetchone.return_value = db_row
-            elif sql_up.startswith("UPDATE POSITIONS"):
-                # Capture what status was written
-                # params order: status, exit_ts, exit_price, pnl, pnl_pct,
-                #               quantity_remaining, close_source, confidence, id, client
-                written["status"]             = params[0]
-                written["quantity_remaining"] = params[5]
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
         pos = _make_pos(qty=7, quantity_remaining=5, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="PG260620C00155000",
-                underlying="PG",
-                db_qty=7,
-                entry_px=1.50,
-                exit_px=0.10,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
+        written = _run_exact_close_for_legacy_test(
+            rec,
+            summary,
+            pos=pos,
+            contract="PG260620C00155000",
+            db_qty=7,
+            entry_px=1.50,
+            exit_px=0.10,
+            db_row=db_row,
+        )
 
         # P0 FIX: broker is flat → ALL remaining contracts gone → qty_remaining=0
         # Before fix: status=CLOSED but quantity_remaining=5 (left unchanged) — invalid state
@@ -159,42 +249,23 @@ class TestReconcilerAutoClosePartialGuard(unittest.TestCase):
 
     def test_fully_closed_position_gets_CLOSED(self):
         """
-        When quantity_remaining=0 (all contracts exited), status must be CLOSED.
+        When the exact fill covers the last remaining contract, status is CLOSED.
         """
         from ap_reconciler import APBrokerReconciler, _empty_summary
 
         rec, summary = self._build_reconciler_stub()
-        db_row = {"quantity_remaining": 0, "qty": 7}
-        written = {}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            elif sql.strip().upper().startswith("UPDATE POSITIONS"):
-                written["status"]             = params[0]
-                written["quantity_remaining"] = params[5]
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
-        pos = _make_pos(qty=7, quantity_remaining=0, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="PG260620C00155000",
-                underlying="PG",
-                db_qty=7,
-                entry_px=1.50,
-                exit_px=0.10,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
+        db_row = {"quantity_remaining": 1, "qty": 7}
+        pos = _make_pos(qty=7, quantity_remaining=1, status="OPEN")
+        written = _run_exact_close_for_legacy_test(
+            rec,
+            summary,
+            pos=pos,
+            contract="PG260620C00155000",
+            db_qty=7,
+            entry_px=1.50,
+            exit_px=0.10,
+            db_row=db_row,
+        )
 
         self.assertEqual(written.get("status"), "CLOSED")
         self.assertEqual(summary["reconciler_full_close_count"], 1)
@@ -209,35 +280,17 @@ class TestReconcilerAutoClosePartialGuard(unittest.TestCase):
 
         rec, summary = self._build_reconciler_stub()
         db_row = {"quantity_remaining": None, "qty": 5}
-        written = {}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            elif sql.strip().upper().startswith("UPDATE POSITIONS"):
-                written["status"] = params[0]
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
         pos = _make_pos(qty=5, quantity_remaining=None, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="AAPL260620C00200000",
-                underlying="AAPL",
-                db_qty=5,
-                entry_px=2.00,
-                exit_px=0.05,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
+        written = _run_exact_close_for_legacy_test(
+            rec,
+            summary,
+            pos=pos,
+            contract="AAPL260620C00200000",
+            db_qty=5,
+            entry_px=2.00,
+            exit_px=0.05,
+            db_row=db_row,
+        )
 
         # NULL → full qty → close_qty = full_qty → new_remaining = 0 → CLOSED
         self.assertEqual(written.get("status"), "CLOSED")
@@ -256,31 +309,17 @@ class TestReconcilerAutoClosePartialGuard(unittest.TestCase):
         # qty_remaining=3 → broker flat → close_qty=3 → new_remaining=0 → CLOSED
         db_row = {"quantity_remaining": 3, "qty": 5}
 
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
         pos = _make_pos(qty=5, quantity_remaining=3, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="AAPL260620C00200000",
-                underlying="AAPL",
-                db_qty=5,
-                entry_px=2.00,
-                exit_px=0.05,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
+        _run_exact_close_for_legacy_test(
+            rec,
+            summary,
+            pos=pos,
+            contract="AAPL260620C00200000",
+            db_qty=5,
+            entry_px=2.00,
+            exit_px=0.05,
+            db_row=db_row,
+        )
 
         # broker-flat, all remaining closed → CLOSED → exit engine notified
         mock_ee.mark_position_closed.assert_called_once()
@@ -293,33 +332,19 @@ class TestReconcilerAutoClosePartialGuard(unittest.TestCase):
         mock_ee = MagicMock()
         rec.exit_engine = mock_ee
 
-        db_row = {"quantity_remaining": 0, "qty": 5}
+        db_row = {"quantity_remaining": 1, "qty": 5}
 
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
-        pos = _make_pos(qty=5, quantity_remaining=0, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="AAPL260620C00200000",
-                underlying="AAPL",
-                db_qty=5,
-                entry_px=2.00,
-                exit_px=0.05,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
+        pos = _make_pos(qty=5, quantity_remaining=1, status="OPEN")
+        _run_exact_close_for_legacy_test(
+            rec,
+            summary,
+            pos=pos,
+            contract="AAPL260620C00200000",
+            db_qty=5,
+            entry_px=2.00,
+            exit_px=0.05,
+            db_row=db_row,
+        )
 
         mock_ee.mark_position_closed.assert_called_once()
 
@@ -687,10 +712,11 @@ class TestPartialCloseSkipsProofTrade(unittest.TestCase):
 
 class TestScopeGuard(unittest.TestCase):
     """
-    Confirm the fix touches zero scanner/entry/sizing files.
+    Confirm the fix touches zero scanner/entry/sizing files. The shared
+    broker-fill finalizer is intentionally amended for provenance enforcement.
     The changed files are a strict subset of:
       ap_reconciler.py, ap_exit_engine.py,
-      ap/position_manager.py, ap/admin_api.py
+      ap/position_manager.py, ap_execution_core.py, ap/admin_api.py
     """
 
     CHANGED_FILES = {
@@ -702,7 +728,6 @@ class TestScopeGuard(unittest.TestCase):
 
     FORBIDDEN_FILES = {
         "ap_master_control.py",
-        "ap_execution_core.py",
         "ap/contract_selector.py",
         "ap/position_sizer.py",
         "ap/queue.py",

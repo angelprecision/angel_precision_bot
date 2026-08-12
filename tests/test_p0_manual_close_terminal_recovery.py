@@ -32,6 +32,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/tes
 import ap.db as db_mod
 import ap.position_manager as pm_mod
 from ap import manual_close_reconciliation as manual_mod
+from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE_KEY
 
 
 CLIENT = "jason@example.com"
@@ -344,6 +345,7 @@ def test_first_close_returns_false_when_proof_binding_fails(monkeypatch):
 
     ok = apm.close_position_from_exit_fill(
         position_id=POSITION_ID, exit_price=0.90, filled_qty=2,
+        filled_ts="2026-07-21T15:57:39+00:00",
         broker_order_id="BROKER-1", exit_reason="broker_close",
         close_source="broker_exit_fill",
     )
@@ -569,6 +571,7 @@ def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
         "db_contract": CONTRACT,
         "db_direction": "CALL",
     }]}
@@ -621,6 +624,7 @@ def test_reconciler_pass0_does_not_evict_when_recovery_defers(monkeypatch):
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
         "db_contract": CONTRACT,
         "db_direction": "CALL",
     }]}

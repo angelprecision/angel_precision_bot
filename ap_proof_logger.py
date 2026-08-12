@@ -21,10 +21,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from datetime import datetime, date, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+from ap.utils import parse_aware_utc_timestamp
 
 log = logging.getLogger("ap.proof_logger")
 ET  = ZoneInfo("America/New_York")
@@ -475,8 +478,60 @@ class APProofLogger:
         exit_pricing_tier:   str  = "",
         exit_attempt:        int  = 0,
         seconds_to_fill:     float = 0.0,
+        broker_exit_order_id: str = "",
+        broker_exit_fill_ts:  Optional[datetime] = None,
+        broker_exit_filled_qty: Optional[int] = None,
+        exit_local_order_id: str = "",
     ) -> dict:
         now = datetime.now(timezone.utc)
+        _broker_provenance_supplied = bool(
+            broker_exit_order_id
+            or broker_exit_fill_ts is not None
+            or broker_exit_filled_qty is not None
+            or exit_local_order_id
+        )
+        _normalized_broker_exit_ts = None
+        if _broker_provenance_supplied:
+            _normalized_broker_exit_ts = parse_aware_utc_timestamp(
+                broker_exit_fill_ts
+            )
+            _raw_broker_qty = broker_exit_filled_qty
+            _valid_broker_qty = None
+            if not isinstance(_raw_broker_qty, bool):
+                try:
+                    _candidate_qty = float(_raw_broker_qty)
+                    if (
+                        _candidate_qty > 0
+                        and _candidate_qty.is_integer()
+                        and math.isfinite(_candidate_qty)
+                    ):
+                        _valid_broker_qty = int(_candidate_qty)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            _opened_at = parse_aware_utc_timestamp(opened_at) if opened_at is not None else None
+            if (
+                not str(broker_exit_order_id or "").strip()
+                or not str(exit_local_order_id or "").strip()
+                or _normalized_broker_exit_ts is None
+                or _valid_broker_qty is None
+                or (_opened_at is not None and _normalized_broker_exit_ts < _opened_at)
+            ):
+                log.critical(
+                    "[PROOF] broker EXIT provenance rejected | ticker=%s "
+                    "local=%r broker=%r fill_ts=%r qty=%r opened_at=%r",
+                    ticker,
+                    exit_local_order_id,
+                    broker_exit_order_id,
+                    broker_exit_fill_ts,
+                    broker_exit_filled_qty,
+                    opened_at,
+                )
+                return {
+                    "_proof_persisted": False,
+                    "_proof_persistence_error": "invalid_broker_exit_provenance",
+                }
+            broker_exit_filled_qty = _valid_broker_qty
+            broker_exit_fill_ts = _normalized_broker_exit_ts
         # execution_mode is COPIED from the originating entry order (source of
         # truth stamped at entry creation), NOT recomputed from self.mode — the
         # client may have switched modes while the position was open. Missing →
@@ -541,6 +596,21 @@ class APProofLogger:
             "exit_attempt":       exit_attempt if exit_attempt else None,
             "seconds_to_fill":    round(seconds_to_fill, 1) if seconds_to_fill else None,
         }
+        # Exact broker EXIT provenance is supplied by reconciler/manual truth
+        # paths when available. Keep these fields optional so older callers and
+        # schemas retain their existing fallback behavior.
+        if broker_exit_order_id:
+            row["broker_exit_order_id"] = str(broker_exit_order_id)
+        if broker_exit_fill_ts is not None:
+            row["broker_exit_fill_ts"] = (
+                broker_exit_fill_ts.isoformat()
+                if isinstance(broker_exit_fill_ts, datetime)
+                else str(broker_exit_fill_ts)
+            )
+        if broker_exit_filled_qty:
+            row["broker_exit_filled_qty"] = int(broker_exit_filled_qty)
+        if exit_local_order_id:
+            row["exit_local_order_id"] = str(exit_local_order_id)
 
         # Cache for convenience — not source of truth
         with self._lock:
@@ -571,6 +641,8 @@ class APProofLogger:
             "entry_option_price", "exit_option_price", "contracts",
             "exit_reason", "option_pnl_pct", "underlying_pnl_pct", "win",
             "synthetic_entry", "position_id", "local_order_id",
+            "exit_local_order_id",
+            "broker_exit_order_id", "broker_exit_fill_ts", "broker_exit_filled_qty",
         }
         # ── Persistence-status tracking ──────────────────────────────────────
         # _persisted is set True only after a confirmed Supabase insert.

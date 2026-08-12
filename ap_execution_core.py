@@ -36,7 +36,11 @@ from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
-from ap.utils                import now_utc_iso
+from ap.utils                import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    now_utc_iso,
+    parse_aware_utc_timestamp,
+)
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -47,11 +51,45 @@ except ImportError:
 log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+_BROKER_FILL_TIMESTAMP_KEYS = (
+    "filled_ts",
+    "filled_at",
+    "fill_ts",
+    "last_fill_date",
+    "transaction_date",
+)
 
 
 def _normalize_execution_mode(value) -> str | None:
     mode = str(value or "").strip().lower()
     return mode if mode in _VALID_EXECUTION_MODES else None
+
+
+def _strict_positive_whole_number(value: object) -> int | None:
+    """Return a positive whole-number scalar without bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _extract_explicit_broker_fill_timestamp(
+    raw: Mapping,
+) -> tuple[str | None, str | None]:
+    """Return only an explicit aware broker fill timestamp and its source."""
+    for key in _BROKER_FILL_TIMESTAMP_KEYS:
+        if key not in raw:
+            continue
+        parsed = parse_aware_utc_timestamp(raw.get(key))
+        if parsed is None:
+            return None, None
+        return parsed.isoformat(), BROKER_FILL_TIMESTAMP_SOURCE
+    return None, None
 
 
 def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_flag) -> str | None:
@@ -3489,22 +3527,34 @@ class APExecutionCore:
         tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
         expected_contract = str(row.get("contract") or "")
-        expected_qty = int(row.get("qty") or 0)
+        expected_qty = _strict_positive_whole_number(row.get("qty"))
+        if not exact_tag:
+            # An empty broker listing is still an unresolved crash-window
+            # observation. Preserve the identity-fence taxonomy even when the
+            # durable row's requested quantity is itself malformed; there is
+            # no candidate on which quantity matching could be performed.
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD",
+            }
+        if expected_qty is None:
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_EXPECTED_QTY_INVALID",
+            }
         strong = [
             o for o in exact_tag
             if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
             and str(o.get("side") or "").lower() == "buy_to_open"
-            and int(float(o.get("quantity") or 0)) == expected_qty
+            and _strict_positive_whole_number(o.get("quantity")) == expected_qty
         ]
         if len(exact_tag) > 1 or len(strong) > 1:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
         if exact_tag and not strong:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH"}
         if not strong:
-            # A broker order listing can be delayed, paginated, or incomplete.
-            # Once submit intent is durable, one empty listing can never prove
-            # that the POST did not land.  Retain the identity fence until exact
-            # broker truth or an explicit operator reconciliation resolves it.
             return {
                 **_base,
                 "disposition": "RECONCILE_PENDING",
@@ -3619,12 +3669,20 @@ class APExecutionCore:
         tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
         expected_contract = str(row.get("contract") or "")
-        expected_qty = int(row.get("qty") or 0)
+        expected_qty = _strict_positive_whole_number(row.get("qty"))
+        if not exact_tag:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD"}
+        if expected_qty is None:
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_EXPECTED_QTY_INVALID",
+            }
         strong = [
             o for o in exact_tag
             if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
             and str(o.get("side") or "").lower() == "sell_to_close"
-            and int(float(o.get("quantity") or 0)) == expected_qty
+            and _strict_positive_whole_number(o.get("quantity")) == expected_qty
         ]
         if len(exact_tag) > 1 or len(strong) > 1:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
@@ -3654,6 +3712,22 @@ class APExecutionCore:
         }
         local_status = status_map.get(remote_status, "EXIT_SUBMITTED")
 
+        filled_ts = None
+        filled_ts_source = None
+        if local_status in {"EXIT_FILLED", "EXIT_PARTIAL_FILL"}:
+            filled_ts, filled_ts_source = _extract_explicit_broker_fill_timestamp(remote)
+            if (
+                filled_ts is None
+                or filled_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+            ):
+                return {
+                    **_base,
+                    "disposition": "RECONCILE_PENDING",
+                    "reason_code": "RECONCILE_EXIT_FILL_TIMESTAMP_UNPROVEN",
+                    "broker_order_id": remote_id,
+                    "status": local_status,
+                }
+
         adopted = osm.transition(
             local_order_id,
             "EXIT_SUBMITTED",
@@ -3674,14 +3748,24 @@ class APExecutionCore:
                 return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
 
         if local_status != "EXIT_SUBMITTED":
-            osm.transition(
+            transitioned = osm.transition(
                 local_order_id,
                 local_status,
                 broker_order_id=remote_id,
                 filled_qty=remote.get("exec_quantity") or remote.get("filled_quantity"),
                 fill_price=remote.get("avg_fill_price"),
+                filled_ts=filled_ts,
+                filled_ts_source=filled_ts_source,
                 last_error=(str(remote.get("reason") or remote.get("message") or "") or None),
             )
+            if not transitioned:
+                return {
+                    **_base,
+                    "disposition": "RECONCILE_PENDING",
+                    "reason_code": "RECONCILE_EXIT_FILL_TRANSITION_FAILED",
+                    "broker_order_id": remote_id,
+                    "status": local_status,
+                }
 
         if callable(getattr(osm, "update_order_meta", None)):
             osm.update_order_meta(local_order_id, {
@@ -9946,7 +10030,18 @@ class APExecutionCore:
         except Exception:
             return None
 
-    def _finalize_proof(self, pos: "ManagedPosition", actual_fill_price: float = 0.0) -> None:
+    def _finalize_proof(
+        self,
+        pos: "ManagedPosition",
+        actual_fill_price: float = 0.0,
+        *,
+        exit_local_order_id: str = "",
+        broker_exit_order_id: str = "",
+        broker_exit_fill_ts: Optional[datetime] = None,
+        broker_exit_fill_timestamp_source: Optional[str] = None,
+        broker_exit_filled_qty: Optional[int] = None,
+        proof_contracts_override: Optional[int] = None,
+    ) -> bool:
         """Write proof/P&L/feedback using the ACTUAL broker fill price.
 
         Called from mark_position_closed via the exit engine's
@@ -9959,20 +10054,108 @@ class APExecutionCore:
         """
         staged = getattr(pos, "_proof_staged", None)
         if not staged:
-            return
+            return False
         if getattr(pos, "_proof_finalized", False):
             log.info(
                 "[EXIT_PROOF_FINALIZE_SKIPPED_ALREADY_LOGGED] %s | "
                 "position already finalized — skipping duplicate",
                 getattr(pos, "ticker", "?"),
             )
-            return
-        pos._proof_finalized = True  # type: ignore[attr-defined]
+            return bool(getattr(pos, "_proof_persisted", False))
 
-        # Use actual fill price; fall back to estimated if broker returns 0/None
-        fill = float(actual_fill_price or 0)
-        est  = float(staged.get("exit_option_price") or 0)
+        if broker_exit_filled_qty is not None:
+            if isinstance(broker_exit_filled_qty, bool):
+                return False
+            try:
+                _proof_qty = float(broker_exit_filled_qty)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (
+                not math.isfinite(_proof_qty)
+                or _proof_qty <= 0
+                or not _proof_qty.is_integer()
+            ):
+                return False
+            broker_exit_filled_qty = int(_proof_qty)
+
+            _proof_fill_ts = parse_aware_utc_timestamp(broker_exit_fill_ts)
+            _proof_fill_ts_source = (
+                str(broker_exit_fill_timestamp_source).strip()
+                if isinstance(broker_exit_fill_timestamp_source, str)
+                else None
+            )
+            _proof_entry_ts = parse_aware_utc_timestamp(
+                staged.get("opened_at") or staged.get("entry_ts")
+            )
+            if (
+                not str(exit_local_order_id or "").strip()
+                or not str(broker_exit_order_id or "").strip()
+                or _proof_fill_ts is None
+                or _proof_fill_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+                or _proof_entry_ts is None
+                or _proof_fill_ts < _proof_entry_ts
+            ):
+                log.critical(
+                    "[%s] _finalize_proof blocked | unproven broker EXIT provenance "
+                    "local=%r broker=%r fill_ts=%r entry_ts=%r",
+                    getattr(pos, "ticker", "?"),
+                    exit_local_order_id,
+                    broker_exit_order_id,
+                    broker_exit_fill_ts,
+                    _proof_entry_ts,
+                )
+                return False
+            broker_exit_fill_ts = _proof_fill_ts
+
+        # Reconciler exact-close callbacks may be completing only the remaining
+        # tranche after an earlier scale-out.  Keep ordinary proof semantics
+        # based on the staged entry quantity, but let that explicit callback
+        # override the proof row's contracts with the exact final EXIT qty.
+        proof_contracts = staged.get("contracts", 1)
+        if proof_contracts_override is not None:
+            proof_contracts = _strict_positive_whole_number(proof_contracts_override)
+            if proof_contracts is None:
+                return False
+
+        # Validate the callback payload before changing the idempotency flag or
+        # touching any proof/feedback/status sink. ``0``/``None`` remain the
+        # explicit paper-sandbox "no price supplied" fallback; bool, NaN,
+        # infinity, negative, and unparseable values are malformed evidence.
+        if isinstance(actual_fill_price, bool):
+            log.critical(
+                "[%s] _finalize_proof blocked | boolean actual fill price=%r",
+                getattr(pos, "ticker", "?"), actual_fill_price,
+            )
+            return False
+        try:
+            fill = float(actual_fill_price or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(fill) or fill < 0:
+            log.critical(
+                "[%s] _finalize_proof blocked | invalid actual fill price=%r",
+                getattr(pos, "ticker", "?"), actual_fill_price,
+            )
+            return False
+        try:
+            est = float(staged.get("exit_option_price") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(est):
+            log.critical(
+                "[%s] _finalize_proof blocked | invalid staged exit price=%r",
+                getattr(pos, "ticker", "?"), staged.get("exit_option_price"),
+            )
+            return False
         final_exit_price = fill if fill > 0 else est
+        if not math.isfinite(final_exit_price) or final_exit_price <= 0:
+            log.critical(
+                "[%s] _finalize_proof blocked | no finite-positive exit price "
+                "actual=%r staged=%r",
+                getattr(pos, "ticker", "?"), actual_fill_price, est,
+            )
+            return False
+        pos._proof_finalized = True  # type: ignore[attr-defined]
 
         entry_px = float(staged.get("entry_option_price") or 0)
         if entry_px > 0 and final_exit_price > 0:
@@ -10019,9 +10202,9 @@ class APExecutionCore:
         # Dropping them when proof errors creates silent data loss exactly
         # in degraded DB conditions (when intel matters most for diagnosis).
         # Track proof outcome with a flag; do NOT early-return.
-        proof_ok = True
+        proof_ok = False
         try:
-            self.proof.log_trade(
+            _proof_result = self.proof.log_trade(
                 ticker             = staged["ticker"],
                 pattern            = staged.get("pattern", ""),
                 side               = staged.get("side", ""),
@@ -10035,7 +10218,7 @@ class APExecutionCore:
                 exit_option_price  = final_exit_price,
                 underlying_entry   = underlying_entry,
                 underlying_exit    = underlying_exit,
-                contracts          = staged.get("contracts", 1),
+                contracts          = proof_contracts,
                 exit_reason        = staged.get("exit_reason", ""),
                 option_pnl_pct     = opt_pnl_pct_for_proof,
                 underlying_pnl_pct = u_pnl_pct,
@@ -10046,13 +10229,20 @@ class APExecutionCore:
                 synthetic_entry    = staged.get("synthetic_entry", False),
                 position_id        = staged.get("position_id", ""),
                 local_order_id     = staged.get("local_order_id", ""),
+                exit_local_order_id = str(exit_local_order_id or "").strip(),
+                broker_exit_order_id = str(broker_exit_order_id or "").strip(),
+                broker_exit_fill_ts  = broker_exit_fill_ts,
+                broker_exit_filled_qty = broker_exit_filled_qty,
                 # Slippage vs staged estimate
                 exit_fill_price    = fill if fill > 0 else None,
                 exit_limit_placed  = est if est > 0 else None,
                 slippage_vs_bid    = slippage_vs_est,
             )
+            proof_ok = bool(
+                isinstance(_proof_result, dict)
+                and _proof_result.get("_proof_persisted") is True
+            )
         except Exception as proof_err:
-            proof_ok = False
             log.error(
                 "[%s] _finalize_proof: proof.log_trade failed: %s — "
                 "continuing to feedback/shadow/intel (proof-independent)",
@@ -10101,6 +10291,9 @@ class APExecutionCore:
                 )
             except Exception as _alpha_err:
                 log.warning("Alpha tracker update failed: %s", _alpha_err)
+
+        pos._proof_persisted = proof_ok  # type: ignore[attr-defined]
+        return proof_ok
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
         log.info(

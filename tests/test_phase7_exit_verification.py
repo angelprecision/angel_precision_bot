@@ -196,8 +196,10 @@ class TestPartialExitOSMHandoff:
         # (not the OrderStatus enum entry).
         idx = self.OSM_SRC.find("── EXIT_PARTIAL_FILL")
         assert idx > 0, "OSM must have an EXIT_PARTIAL_FILL handler block"
-        # Look in a window of 800 chars after the marker.
-        window = self.OSM_SRC[idx:idx + 800]
+        # The handler now validates timestamp/economics before computing the
+        # cumulative delta; keep this structural guard wide enough to cover
+        # that fail-closed prefix while retaining the routing assertion.
+        window = self.OSM_SRC[idx:idx + 1600]
         assert "_delta = max(0, _cum_filled - _prev_filled)" in window, \
             "EXIT_PARTIAL_FILL must compute _delta = cum - prev"
         assert "note_partial_exit_fill" in window, \
@@ -224,11 +226,11 @@ class TestPartialExitOSMHandoff:
     def test_zero_qty_fill_quarantines_not_closes(self):
         """EXIT_FILLED with qty=0 must quarantine the order, not silently
         close the position. This is the bug the FIX-H comment guards."""
-        idx = self.OSM_SRC.find("EXIT_FILLED with zero/unknown quantity")
+        idx = self.OSM_SRC.find("EXIT_FILLED malformed fill economics")
         assert idx > 0
-        window = self.OSM_SRC[idx:idx + 600]
+        window = self.OSM_SRC[idx:idx + 900]
         assert "identity_quarantine=True" in window
-        assert "EXIT_FILLED_ZERO_QTY_QUARANTINE" in window
+        assert "EXIT_FILLED_INVALID_ECONOMICS_QUARANTINE" in window
 
     def test_duplicate_callback_clears_only_when_safe(self):
         """A duplicate EXIT_FILLED callback (cum hasn't advanced) must call

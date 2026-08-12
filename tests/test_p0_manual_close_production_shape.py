@@ -6,6 +6,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/tes
 
 import ap.db as db_mod
 from ap import manual_close_reconciliation as manual_mod
+from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE_KEY
 
 
 CLIENT = "jasoncosby1@gmail.com"
@@ -142,3 +143,4 @@ def test_jason_production_position_shape_uses_direction_when_side_is_null(monkey
     assert cursor.rows[0]["direction"] == "CALL"
     assert cursor.rows[0]["position_id"] == POSITION_ID
     assert cursor.rows[0]["execution_mode"] == "live"
+    assert cursor.rows[0]["meta"][BROKER_FILL_TIMESTAMP_SOURCE_KEY] == "broker_response"

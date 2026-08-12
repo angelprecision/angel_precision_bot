@@ -30,6 +30,7 @@ from ap.exit_fill_truth_guard import (
     retry_exit_fill_reconciliation,
     retry_pending_exit_fill_reconciliations,
 )
+from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE_KEY
 
 
 def _position(*, qty: int, entry: float) -> dict:
@@ -311,7 +312,7 @@ def _exit_order(**overrides) -> dict:
         "filled_qty": 1,
         "fill_price": 1.35,
         "filled_ts": "2026-07-16T18:40:51Z",
-        "meta": {},
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
     }
     row.update(overrides)
     return row
@@ -458,6 +459,7 @@ def test_zero_row_position_update_stops_before_order_or_proof_mutation(monkeypat
     monkeypatch.setattr(guard, "_load_exit_fills", lambda *_: [{
         "local_order_id": "exit-local-1", "broker_order_id": "broker-exit-1",
         "filled_qty": 1, "fill_price": 1.35, "filled_ts": "2026-07-16T18:40:51Z",
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
     }])
     monkeypatch.setattr(guard, "_load_entry_order", lambda *_: {})
     monkeypatch.setattr(guard, "_table_columns", lambda *_: {
@@ -508,6 +510,7 @@ def test_partial_fill_projects_exact_durable_exit_ownership(monkeypatch) -> None
         "filled_qty": 2,
         "fill_price": 1.50,
         "filled_ts": "2026-07-17T16:00:00Z",
+        "meta": {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"},
     }])
     monkeypatch.setattr(guard, "_load_entry_order", lambda *_: {})
     monkeypatch.setattr(guard, "_table_columns", lambda *_: {
@@ -543,7 +546,7 @@ def test_partial_fill_projects_exact_durable_exit_ownership(monkeypatch) -> None
     }
 
 
-def test_partial_fill_with_null_filled_ts_is_reconciled_from_exact_current_local_order(monkeypatch) -> None:
+def test_partial_fill_with_null_filled_ts_holds_before_position_mutation(monkeypatch) -> None:
     import ap.exit_fill_truth_guard as guard
 
     position_updates_seen = []
@@ -645,28 +648,14 @@ def test_partial_fill_with_null_filled_ts_is_reconciled_from_exact_current_local
         "filled_ts": None,
     }
 
-    first = _run_reconciliation_attempt(order, result_payload, attempt_count=1)
-    second = _run_reconciliation_attempt(order, result_payload, attempt_count=1)
+    for _ in range(2):
+        with pytest.raises(
+            guard.LifecycleProjectionError,
+            match="EXIT_FILL_TIMESTAMP_UNPROVEN",
+        ):
+            _run_reconciliation_attempt(order, result_payload, attempt_count=1)
 
-    assert len(position_updates_seen) == 2
-    for updates in position_updates_seen:
-        assert updates["contracts_exited"] == 2
-        assert updates["quantity_remaining"] == 2
-        assert updates["realized_pnl"] == pytest.approx(100.0)
-        assert updates["realized_pnl_pct"] == pytest.approx(50.0)
-        assert "status" not in updates
-        assert updates["exit_in_flight"] is True
-        assert updates["pending_exit_local_order_id"] == "exit-current"
-        assert updates["pending_exit_broker_order_id"] == "broker-current"
-        assert updates["pending_exit_qty"] == 2
-    assert first["projection"].remaining_qty == 2
-    assert first["projection"].exited_qty == 2
-    assert first["projection"].realized_pnl == pytest.approx(100.0)
-    assert first["proof_rows_updated"] == 0
-    assert first["proof_reconciliation"] is None
-    assert first["exit_ownership"]["pending_exit_local_order_id"] == "exit-current"
-    assert second["projection"].remaining_qty == 2
-    assert second["projection"].exited_qty == 2
+    assert position_updates_seen == []
 
 
 def test_exact_originating_entry_proof_identity_wins_over_position_fallback() -> None:

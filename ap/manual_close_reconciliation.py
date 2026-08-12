@@ -46,6 +46,13 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    BROKER_FILL_TIMESTAMP_SOURCE_KEY,
+    has_broker_fill_timestamp_provenance,
+    parse_aware_utc_timestamp,
+)
+
 log = logging.getLogger("client_runner.manual_close")
 
 MANUAL_CLOSE_INTERVAL_SEC = float(
@@ -95,6 +102,8 @@ def position_direction(position: dict) -> str:
 
 
 def positive_float(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
     try:
         parsed = float(value)
     except Exception:
@@ -105,54 +114,23 @@ def positive_float(value: Any) -> float:
 
 
 def positive_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
     try:
-        parsed = int(float(value))
+        parsed_float = float(value)
     except Exception:
         return 0
-    return parsed if parsed > 0 else 0
+    if (
+        not math.isfinite(parsed_float)
+        or parsed_float <= 0
+        or not parsed_float.is_integer()
+    ):
+        return 0
+    return int(parsed_float)
 
 
 def parse_timestamp(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, (int, float)):
-        raw = float(value)
-        if raw > 10_000_000_000:
-            raw /= 1000.0
-        try:
-            parsed = datetime.fromtimestamp(raw, tz=timezone.utc)
-        except Exception:
-            return None
-    else:
-        text = str(value).strip()
-        if not text:
-            return None
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(text)
-        except Exception:
-            parsed = None
-            for fmt in (
-                "%Y-%m-%dT%H:%M:%S.%f%z",
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%d %H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S.%f",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S",
-            ):
-                try:
-                    parsed = datetime.strptime(text, fmt)
-                    break
-                except Exception:
-                    continue
-            if parsed is None:
-                return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parse_aware_utc_timestamp(value)
 
 
 def normalize_positions_payload(payload: Any) -> list[dict]:
@@ -353,8 +331,8 @@ def order_filled_qty(order: dict) -> int:
         qty = positive_int(order.get(key))
         if qty > 0:
             return qty
-    if order_status(order) == "filled":
-        return positive_int(order.get("quantity") or order.get("qty"))
+    # A terminal broker status is not execution quantity truth.  Requested
+    # quantity is never a safe substitute for an explicit filled quantity.
     return 0
 
 
@@ -380,13 +358,12 @@ def order_created_at(order: dict) -> datetime | None:
 
 
 def order_filled_at(order: dict) -> datetime | None:
+    # Order lifecycle timestamps do not prove execution time.
     for key in (
         "last_fill_date",
         "filled_at",
         "filled_ts",
         "transaction_date",
-        "update_date",
-        "updated_at",
     ):
         parsed = parse_timestamp(order.get(key))
         if parsed is not None:
@@ -416,6 +393,7 @@ def _normalize_fill(order: dict) -> dict | None:
         "filled_qty": filled_qty,
         "fill_price": fill_price,
         "filled_at": filled_at,
+        "filled_ts_source": BROKER_FILL_TIMESTAMP_SOURCE,
         "created_at": order_created_at(order),
         "raw_status": order_status(order),
         "raw_side": order_side(order),
@@ -441,6 +419,7 @@ def _validate_durable_fills(
       * filled_qty > 0
       * fill_price > 0
       * filled_at is a datetime instance (not None, not string, not epoch)
+      * meta exit timestamp source is explicitly ``broker_response``
       * filled_at >= position entry timestamp (when entry is known)
       * db_status: nonempty AND in {EXIT_FILLED, EXIT_PARTIAL_FILL}
       * db_contract: nonempty AND exactly equals position contract
@@ -500,6 +479,13 @@ def _validate_durable_fills(
                 "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_INVALID pos=%s "
                 "broker_id=%s filled_at_type=%s — rejected",
                 client_id, position_id, bid, type(filled_at).__name__,
+            )
+            continue
+        if not has_broker_fill_timestamp_provenance(f.get("meta")):
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_UNPROVEN pos=%s "
+                "broker_id=%s — rejected",
+                client_id, position_id, bid,
             )
             continue
         if not db_status or db_status not in DURABLE_EXIT_FILLED_STATUSES:
@@ -680,6 +666,7 @@ def select_external_close_fills(
         "filled_qty": required_qty,
         "fill_price": round(average_fill, 6),
         "filled_ts": all_fills[-1]["filled_at"].isoformat(),
+        "filled_ts_source": BROKER_FILL_TIMESTAMP_SOURCE,
         "broker_order_id": all_fills[-1]["broker_order_id"],
         "broker_order_ids": [r["broker_order_id"] for r in all_fills],
     }, "exact_external_broker_fill"
@@ -751,6 +738,7 @@ def load_manual_close_state(
                     filled_qty,
                     fill_price,
                     filled_ts,
+                    meta,
                     execution_mode,
                     status,
                     contract,
@@ -780,6 +768,14 @@ def load_manual_close_state(
                         # non-durable status (e.g. still pending). Not valid as
                         # recovery evidence; skip without adding to bot_ids.
                         continue
+                    row_meta = row.get("meta")
+                    if not has_broker_fill_timestamp_provenance(row_meta):
+                        log.warning(
+                            "[%s] MANUAL_CLOSE_DURABLE_EXIT_TIMESTAMP_UNPROVEN "
+                            "pos=%s broker_id=%s — skipped",
+                            client_id, position_id, broker_order_id,
+                        )
+                        continue
                     filled_qty = positive_int(row.get("filled_qty"))
                     fill_price = positive_float(row.get("fill_price"))
                     filled_at = parse_timestamp(row.get("filled_ts"))
@@ -794,6 +790,8 @@ def load_manual_close_state(
                             "created_at": None,
                             "raw_status": row_status,
                             "raw_side": "sell_to_close",
+                            "meta": row_meta,
+                            "filled_ts_source": BROKER_FILL_TIMESTAMP_SOURCE,
                             # DB-sourced identity fields for cross-position validation.
                             "db_contract": db_contract,
                             "db_direction": db_direction,
@@ -983,6 +981,7 @@ def adopt_external_exit_fills(
                         "external_broker_order": True,
                         "broker_order_side": str(fill.get("raw_side") or "sell_to_close"),
                         "broker_order_status": str(fill.get("raw_status") or "filled"),
+                        BROKER_FILL_TIMESTAMP_SOURCE_KEY: BROKER_FILL_TIMESTAMP_SOURCE,
                         "broker_create_date_present": created_at is not None,
                         "adopted_without_submit": True,
                         "position_id": position_id,
@@ -1135,6 +1134,19 @@ def _finalize_position(
     # therefore removed. The finalizer returns True for already-terminal
     # positions and False for missing positions or DB errors, which is the
     # correct tri-state contract: terminal→evict, unknown/error→retain.
+    evidence_source = str(
+        evidence.get("filled_ts_source")
+        or evidence.get("exit_fill_timestamp_source")
+        or ""
+    ).strip()
+    if evidence_source != BROKER_FILL_TIMESTAMP_SOURCE:
+        log.critical(
+            "[%s] MANUAL_CLOSE_FINALIZE_BLOCKED pos=%s contract=%s "
+            "filled timestamp provenance=%r",
+            client_id, position_id, contract, evidence_source,
+        )
+        return False
+
     broker_ids = ",".join(evidence["broker_order_ids"])
     exit_reason = (
         "MANUAL_CLIENT_CLOSE_BROKER_CONFIRMED "
@@ -1462,6 +1474,7 @@ def detect_manual_closes(self) -> None:
             "filled_qty": adopted_qty,
             "fill_price": round(avg_price, 6),
             "filled_ts": all_fills[-1]["filled_at"].isoformat(),
+            "filled_ts_source": BROKER_FILL_TIMESTAMP_SOURCE,
             "broker_order_id": all_fills[-1]["broker_order_id"],
             "broker_order_ids": [f["broker_order_id"] for f in all_fills],
         }

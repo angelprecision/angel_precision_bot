@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 os.environ.setdefault("AP_ENV", "test")
 
@@ -126,6 +128,72 @@ def test_broker_filled_zero_qty_is_error_not_filled(monkeypatch):
     assert result["reason"] == "BROKER_FILLED_ZERO_QTY"
     assert result["filled_qty"] == 0
     assert events
+
+
+@pytest.mark.parametrize(
+    "fill_timestamp",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("2026-07-21T15:57:39", id="naive"),
+    ],
+)
+def test_exit_fill_without_aware_broker_timestamp_is_held(monkeypatch, fill_timestamp):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+
+    order = _base_order(
+        kind="EXIT",
+        direction="CALL",
+        contract="AAPL260626C00195000",
+        status="EXIT_SUBMITTED",
+        filled_ts="2026-08-12T18:19:27.123456+00:00",
+    )
+    raw = {
+        "status": "filled",
+        "exec_quantity": 1,
+        "avg_fill_price": 1.05,
+    }
+    if fill_timestamp is not None:
+        raw["transaction_date"] = fill_timestamp
+
+    result = fm.check_order_with_broker(_Broker(raw), order)
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_EXIT_FILL_TIMESTAMP_UNPROVEN"
+    assert result["filled_ts"] is None
+    assert result["filled_ts_source"] is None
+
+
+def test_exit_fill_timestamp_source_is_broker_response_only(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+
+    order = _base_order(
+        kind="EXIT",
+        direction="CALL",
+        contract="AAPL260626C00195000",
+        status="EXIT_SUBMITTED",
+        filled_ts="2026-08-12T18:19:27.123456+00:00",
+    )
+    result = fm.check_order_with_broker(
+        _Broker(
+            {
+                "status": "filled",
+                "exec_quantity": 1,
+                "avg_fill_price": 1.05,
+                "transaction_date": "2026-08-12T18:20:27.123456+00:00",
+            }
+        ),
+        order,
+    )
+
+    assert result["status"] == "EXIT_FILLED"
+    assert result["filled_ts"] == "2026-08-12T18:20:27.123456+00:00"
+    assert result["filled_ts_source"] == "broker_response"
 
 
 def test_release_symbol_lock_even_when_reserved_cost_missing(monkeypatch):

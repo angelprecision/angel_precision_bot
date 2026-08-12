@@ -33,6 +33,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/tes
 import ap.db as db_mod
 import client_runner as runner_mod
 from ap import manual_close_reconciliation as manual_mod
+from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE_KEY
 
 
 CLIENT = "jasoncosby1@gmail.com"
@@ -40,6 +41,7 @@ CONTRACT = "F260731C00014000"
 POSITION_ID = "ca06eeca-f55b-4778-8756-66c91bae877b"
 ENTRY_TS = "2026-07-21T15:26:58.911238+00:00"
 DETECTED_EPOCH = datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp()
+BROKER_FILL_META = {BROKER_FILL_TIMESTAMP_SOURCE_KEY: "broker_response"}
 
 
 class _Broker:
@@ -223,6 +225,7 @@ def test_manual_close_adopts_exact_fill_then_calls_canonical_finalizer(monkeypat
     assert adopted[0]["execution_mode"] == "live"
     assert adopted[0]["position"]["id"] == POSITION_ID
     assert adopted[0]["evidence"]["broker_order_ids"] == ["137780001"]
+    assert adopted[0]["evidence"]["filled_ts_source"] == "broker_response"
 
     assert len(pm.calls) == 1
     call = pm.calls[0]
@@ -235,6 +238,34 @@ def test_manual_close_adopts_exact_fill_then_calls_canonical_finalizer(monkeypat
     assert call["close_confidence"] == "HIGH"
     assert "MANUAL_CLIENT_CLOSE_BROKER_CONFIRMED" in call["exit_reason"]
     assert runner.core.exit_eng.closed == [POSITION_ID]
+
+
+def test_manual_close_rejects_naive_external_fill_timestamp(monkeypatch):
+    evidence, reason = manual_mod.select_external_close_fills(
+        orders=[_filled_exit(transaction_date="2026-07-21T15:57:39")],
+        position=_position(),
+        bot_exit_order_ids=set(),
+        adopted_fills=[],
+        detected_at=datetime.fromtimestamp(DETECTED_EPOCH, tz=timezone.utc),
+    )
+
+    assert evidence is None
+    assert reason == "no_exact_external_filled_exit_order"
+
+
+def test_manual_close_rejects_order_update_timestamp_as_fill_time():
+    raw = {
+        "id": "UPDATE-ONLY",
+        "status": "filled",
+        "side": "sell_to_close",
+        "symbol": CONTRACT,
+        "quantity": 2,
+        "exec_quantity": 2,
+        "avg_fill_price": 0.75,
+        "update_date": "2026-07-21T15:57:39+00:00",
+    }
+
+    assert manual_mod._normalize_fill(raw) is None
 
 
 # ─── broker error paths (uncertainty, never "empty account") ─────────────────
@@ -468,6 +499,7 @@ def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": BROKER_FILL_META,
         "db_contract": CONTRACT,
         "db_direction": "CALL",
     }
@@ -786,6 +818,7 @@ def test_cross_session_recovery_empty_broker_orders_finalizes_from_durable_rows(
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": BROKER_FILL_META,
         "db_contract": CONTRACT,
         "db_direction": "CALL",
     }
@@ -806,6 +839,32 @@ def test_cross_session_recovery_empty_broker_orders_finalizes_from_durable_rows(
     assert call["close_source"] == "manual_client_close_broker_fill"
     # Exit engine eviction must still fire.
     assert runner.core.exit_eng.closed == [POSITION_ID]
+
+
+def test_legacy_durable_exit_timestamp_without_provenance_holds(monkeypatch):
+    legacy_fill = {
+        "broker_order_id": "LEGACY-EXIT",
+        "filled_qty": 2,
+        "fill_price": 0.75,
+        "filled_at": datetime(2026, 7, 21, 15, 57, 39, tzinfo=timezone.utc),
+        "created_at": None,
+        "raw_status": "EXIT_FILLED",
+        "raw_side": "sell_to_close",
+        "db_contract": CONTRACT,
+        "db_direction": "CALL",
+    }
+    broker = _Broker(orders=[])
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+    _install_scan_boundaries(
+        monkeypatch,
+        adopted_fills_by_pos={POSITION_ID: [legacy_fill]},
+    )
+
+    runner._detect_manual_closes()
+
+    assert pm.calls == []
+    assert runner.core.exit_eng.closed == []
 
 
 # ─── Blocker 3: PARTIAL and ACTIVE status positions are scannable ─────────────
@@ -948,6 +1007,7 @@ def test_two_finalization_attempts_produce_one_terminal_economic_result(monkeypa
         "filled_qty": 2,
         "fill_price": 0.75,
         "filled_ts": "2026-07-21T15:57:39+00:00",
+        "filled_ts_source": "broker_response",
         "broker_order_id": "137780001",
         "broker_order_ids": ["137780001"],
     }
@@ -1153,6 +1213,7 @@ def test_wrong_contract_durable_fill_is_rejected_before_aggregate(monkeypatch):
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": BROKER_FILL_META,
         "db_contract": "WRONG0000C00010000",   # different contract
         "db_direction": "CALL",
     }
@@ -1181,6 +1242,7 @@ def test_wrong_direction_durable_fill_is_rejected_before_aggregate(monkeypatch):
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": BROKER_FILL_META,
         "db_contract": "F260731C00014000",
         "db_direction": "PUT",   # wrong — position is CALL
     }
@@ -1209,6 +1271,7 @@ def test_non_exit_filled_status_durable_fill_is_rejected(monkeypatch):
         "created_at": None,
         "raw_status": "OPEN",   # not a terminal filled status
         "raw_side": "sell_to_close",
+        "meta": BROKER_FILL_META,
         "db_contract": "F260731C00014000",
         "db_direction": "CALL",
     }
@@ -1237,6 +1300,7 @@ def test_stale_timestamp_durable_fill_is_rejected(monkeypatch):
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": BROKER_FILL_META,
         "db_contract": "F260731C00014000",
         "db_direction": "CALL",
     }
@@ -1282,6 +1346,7 @@ def test_durable_recovery_succeeds_when_broker_orders_endpoint_raises(monkeypatc
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": BROKER_FILL_META,
         "db_contract": "F260731C00014000",
         "db_direction": "CALL",
     }
@@ -1336,6 +1401,7 @@ def test_pass1_does_not_finalize_when_broker_still_holds_position(monkeypatch):
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "meta": BROKER_FILL_META,
         "db_contract": "F260731C00014000",
         "db_direction": "CALL",
     }

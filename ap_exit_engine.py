@@ -71,6 +71,10 @@ from ap.exit_thresholds import (
     effective_thresholds as _shared_effective_thresholds,
     option_profile as _shared_option_profile,
 )
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    parse_aware_utc_timestamp,
+)
 
 
 try:
@@ -3063,11 +3067,39 @@ def _is_protective_exit(reason: str) -> bool:
 
 
 def _positive_or_none(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     try:
         num = float(value)
     except Exception:
         return None
     return num if num > 0 and math.isfinite(num) else None
+
+
+def _positive_whole_or_none(value) -> Optional[int]:
+    """Return a positive whole-number fill quantity without bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(num) or num <= 0 or not num.is_integer():
+        return None
+    return int(num)
+
+
+def _nonnegative_whole_or_none(value) -> Optional[int]:
+    """Return a finite non-negative whole number without bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(num) or num < 0 or not num.is_integer():
+        return None
+    return int(num)
 
 
 def _decision_window(decision: "ExitDecision", now_et: Optional[datetime] = None) -> str:
@@ -5349,13 +5381,22 @@ class APExitEngine:
         pending_broker  = str(getattr(pos, "pending_exit_broker_order_id", "") or "")
         supplied_identity = bool(local_order_id or broker_order_id)
         pending_identity  = bool(pending_local or pending_broker)
-        if not supplied_identity:
-            return bool(allow_missing_when_no_pending_identity and not pending_identity)
-        if local_order_id and pending_local and local_order_id != pending_local:
-            return False
-        if broker_order_id and pending_broker and broker_order_id != pending_broker:
-            return False
-        return True
+        if pending_identity:
+            # A current EXIT generation is an inseparable pair. Matching only
+            # one side, or accepting a one-sided pending identity, is not
+            # enough to authorize a position mutation.
+            return bool(
+                pending_local
+                and pending_broker
+                and local_order_id
+                and broker_order_id
+                and local_order_id == pending_local
+                and broker_order_id == pending_broker
+            )
+        # Without a pending generation there is no durable authority to match.
+        # The permissive option only preserves the no-identity/no-identity
+        # compatibility case for non-mutating cleanup callers.
+        return bool(allow_missing_when_no_pending_identity and not supplied_identity)
 
     def _reject_stale_exit_hook(
         self,
@@ -5403,6 +5444,11 @@ class APExitEngine:
         fill_price: Optional[float] = None,
         local_order_id: str = "",
         broker_order_id: str = "",
+        broker_exit_order_id: str = "",
+        broker_exit_fill_ts: Optional[datetime] = None,
+        broker_exit_fill_timestamp_source: Optional[str] = None,
+        broker_exit_filled_qty: Optional[int] = None,
+        proof_contracts_override: Optional[int] = None,
         cumulative_filled: Optional[int] = None,
         cumulative_filled_qty: Optional[int] = None,
         force: bool = False,
@@ -5418,15 +5464,84 @@ class APExitEngine:
         if "RECONCILER" in reason_s.upper():
             force = True
 
+        _callback_qty_raw = (
+            broker_exit_filled_qty
+            if broker_exit_filled_qty is not None
+            else qty_filled
+        )
+        _callback_qty = _positive_whole_or_none(_callback_qty_raw)
+        _callback_price = _positive_or_none(fill_price)
+        _callback_fill_ts = parse_aware_utc_timestamp(broker_exit_fill_ts)
+        _callback_fill_ts_source = (
+            str(broker_exit_fill_timestamp_source).strip()
+            if isinstance(broker_exit_fill_timestamp_source, str)
+            else None
+        )
+        _proof_contracts_override = _positive_whole_or_none(proof_contracts_override)
+        if (
+            _callback_qty_raw is not None
+            or fill_price is not None
+        ) and (
+            _callback_qty is None
+            or _callback_price is None
+        ):
+            log.critical(
+                "[%s] mark_position_closed blocked | invalid EXIT fill economics "
+                "pos=%s qty=%r price=%r",
+                getattr(self, "_email", "?"),
+                position_id,
+                _callback_qty_raw,
+                fill_price,
+            )
+            return False
+        if _callback_qty_raw is not None and (
+            _callback_fill_ts is None
+            or _callback_fill_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+        ):
+            log.critical(
+                "[%s] mark_position_closed blocked | unproven broker EXIT fill timestamp "
+                "pos=%s fill_ts=%r",
+                getattr(self, "_email", "?"),
+                position_id,
+                broker_exit_fill_ts,
+            )
+            return False
+        if proof_contracts_override is not None and _proof_contracts_override is None:
+            log.critical(
+                "[%s] mark_position_closed blocked | invalid proof contracts override "
+                "pos=%s contracts=%r",
+                getattr(self, "_email", "?"),
+                position_id,
+                proof_contracts_override,
+            )
+            return False
+        if (
+            _callback_qty is not None
+            and _proof_contracts_override is not None
+            and _proof_contracts_override != _callback_qty
+        ):
+            log.critical(
+                "[%s] mark_position_closed blocked | proof contracts override "
+                "does not match broker EXIT quantity pos=%s contracts=%s qty=%s",
+                getattr(self, "_email", "?"),
+                position_id,
+                _proof_contracts_override,
+                _callback_qty,
+            )
+            return False
+
         # PR-A / BUG-3: O(1) lookup via self._positions_by_id (was O(n) scan).
         with self._lock:
             _matched = self._positions_by_id.get(str(position_id or ""))
             for pos in (_matched,) if _matched is not None else ():
-                if not force and not self._exit_identity_matches(
+                # A forced/reconciled close still needs the exact current EXIT
+                # generation. ``force`` may change retry policy, but it cannot
+                # turn missing, one-sided, or replaced identity into fill truth.
+                if not self._exit_identity_matches(
                     pos,
                     local_order_id=local_order_id,
                     broker_order_id=broker_order_id,
-                    allow_missing_when_no_pending_identity=True,
+                    allow_missing_when_no_pending_identity=False,
                 ):
                     self._reject_stale_exit_hook(
                         pos, hook_name="mark_position_closed",
@@ -5434,6 +5549,48 @@ class APExitEngine:
                         broker_order_id=broker_order_id, reason=reason_s,
                     )
                     return
+                if _callback_qty is None or _callback_price is None:
+                    log.critical(
+                        "[%s] mark_position_closed blocked | exact EXIT identity "
+                        "lacked finite-positive price or positive-whole quantity "
+                        "pos=%s qty=%r price=%r",
+                        getattr(self, "_email", "?"),
+                        position_id,
+                        _callback_qty_raw,
+                        fill_price,
+                    )
+                    return False
+                _entry_ts = parse_aware_utc_timestamp(
+                    getattr(pos, "opened_at", None)
+                    or getattr(pos, "entry_ts", None)
+                )
+                if _entry_ts is None or _callback_fill_ts < _entry_ts:
+                    log.critical(
+                        "[%s] mark_position_closed blocked | broker EXIT fill timestamp "
+                        "is missing, malformed, or before entry pos=%s fill_ts=%r entry_ts=%r",
+                        getattr(self, "_email", "?"),
+                        position_id,
+                        _callback_fill_ts,
+                        _entry_ts,
+                    )
+                    return False
+                _remaining_qty = _nonnegative_whole_or_none(
+                    getattr(pos, "quantity_remaining", None)
+                )
+                if (
+                    _remaining_qty is None
+                    or _remaining_qty <= 0
+                    or _callback_qty != _remaining_qty
+                ):
+                    log.critical(
+                        "[%s] mark_position_closed blocked | broker EXIT quantity "
+                        "does not exactly cover remaining pos=%s qty=%s remaining=%s",
+                        getattr(self, "_email", "?"),
+                        position_id,
+                        _callback_qty,
+                        _remaining_qty,
+                    )
+                    return False
                 pos.closed        = True
                 pos.close_reason  = reason_s or pos.close_reason or "broker_confirmed_closed"
                 pos.quantity_remaining = 0
@@ -5441,8 +5598,8 @@ class APExitEngine:
                 # detect this broker-confirmed close and do not mark stale in-flight state.
                 pos._submit_generation += 1
                 try:
-                    if fill_price is not None:
-                        pos.current_option_price = float(fill_price)
+                    if _callback_price is not None:
+                        pos.current_option_price = _callback_price
                 except Exception as _fp_err:
                     log.error("Failed to set fill_price on position: %s", _fp_err)
                 # FIX 2: fire proof finalization with broker-confirmed fill price.
@@ -5450,11 +5607,46 @@ class APExitEngine:
                 # only knew the limit price. on_exit_fill_confirmed calls
                 # APExecutionCore._finalize_proof() which writes proof/P&L/feedback
                 # using actual fill_price, not the estimated bid/mid at submit.
+                _proof_callback_result = None
                 try:
                     _fill_cb = getattr(self, "on_exit_fill_confirmed", None)
-                    if _fill_cb is not None and callable(_fill_cb):
-                        _fill_cb(pos, float(fill_price) if fill_price is not None else 0.0)
+                    if (
+                        _fill_cb is not None
+                        and callable(_fill_cb)
+                        and _callback_qty is not None
+                        and _callback_price is not None
+                    ):
+                        _proof_callback_result = _fill_cb(
+                            pos,
+                            _callback_price,
+                            exit_local_order_id=(
+                                local_order_id
+                                or getattr(pos, "pending_exit_local_order_id", "")
+                                or ""
+                            ),
+                            broker_exit_order_id=(
+                                broker_exit_order_id
+                                or broker_order_id
+                                or getattr(pos, "pending_exit_broker_order_id", "")
+                                or ""
+                            ),
+                            broker_exit_fill_ts=_callback_fill_ts,
+                            broker_exit_fill_timestamp_source=(
+                                _callback_fill_ts_source
+                            ),
+                            broker_exit_filled_qty=(
+                                _callback_qty
+                            ),
+                            **(
+                                {
+                                    "proof_contracts_override": _proof_contracts_override,
+                                }
+                                if _proof_contracts_override is not None
+                                else {}
+                            ),
+                        )
                 except Exception as _cb_err:
+                    _proof_callback_result = False
                     log.error("on_exit_fill_confirmed callback failed (non-fatal): %s", _cb_err)
                 pos.exit_in_flight   = False
                 pos.pending_exit_reason = ""
@@ -5490,6 +5682,11 @@ class APExitEngine:
                 # and get_position() returning closed positions to callers.
                 if pos.position_id and pos.position_id in self._positions_by_id:
                     del self._positions_by_id[pos.position_id]
+                log.info(
+                    "[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s",
+                    position_id, reason,
+                )
+                return _proof_callback_result
         log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
 
     def clear_exit_in_flight(
@@ -5607,27 +5804,47 @@ class APExitEngine:
             return
         if cumulative_filled_qty is None and cumulative_filled is not None:
             cumulative_filled_qty = cumulative_filled
-        try:
-            if fill_price is not None:
-                fill_price = float(fill_price)
-        except Exception:
-            fill_price = None
+
+        # Partial fills mutate in-memory quantity and may persist a scale-out
+        # snapshot. They require the same exact economics contract as a full
+        # close: finite-positive price and positive-whole execution quantity.
+        # Never truncate or launder malformed broker values before this boundary.
+        _raw_fill_qty = (
+            cumulative_filled_qty
+            if cumulative_filled_qty is not None
+            else qty_filled
+        )
+        _validated_fill_qty = _positive_whole_or_none(_raw_fill_qty)
+        _validated_fill_price = _positive_or_none(fill_price)
+        if _validated_fill_qty is None or _validated_fill_price is None:
+            log.critical(
+                "[exit_eng] partial exit fill blocked | pos_id=%s "
+                "qty=%r price=%r — requires positive-whole qty and "
+                "finite-positive price",
+                position_id,
+                _raw_fill_qty,
+                fill_price,
+            )
+            return False
+        fill_price = _validated_fill_price
 
         applied_delta = 0
         # PR-A / BUG-3: O(1) lookup via self._positions_by_id (was O(n) scan).
         with self._lock:
             _matched = self._positions_by_id.get(str(position_id or ""))
             for pos in (_matched,) if _matched is not None else ():
-                if local_order_id and pos.pending_exit_local_order_id and local_order_id != pos.pending_exit_local_order_id:
-                    log.warning(
-                        "[exit_eng] Ignoring stale local exit fill | pos_id=%s got=%s expected=%s",
-                        position_id, local_order_id, pos.pending_exit_local_order_id,
-                    )
-                    return
-                if broker_order_id and pos.pending_exit_broker_order_id and broker_order_id != pos.pending_exit_broker_order_id:
-                    log.warning(
-                        "[exit_eng] Ignoring stale broker exit fill | pos_id=%s got=%s expected=%s",
-                        position_id, broker_order_id, pos.pending_exit_broker_order_id,
+                if not self._exit_identity_matches(
+                    pos,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    allow_missing_when_no_pending_identity=False,
+                ):
+                    self._reject_stale_exit_hook(
+                        pos,
+                        hook_name="note_partial_exit_fill",
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_order_id,
+                        reason="partial_fill_identity_unproven",
                     )
                     return
 
@@ -5639,17 +5856,37 @@ class APExitEngine:
                     or f"pending:{pos.position_id}:{pos.last_exit_signal_ts.isoformat() if pos.last_exit_signal_ts else 'unknown'}"
                 )
 
+                prev = _nonnegative_whole_or_none(
+                    pos.last_applied_exit_cum_fill_by_order.get(order_key, 0)
+                )
+                last_cum = _nonnegative_whole_or_none(
+                    pos.last_applied_exit_cum_fill
+                )
+                current_remaining = _nonnegative_whole_or_none(
+                    pos.quantity_remaining
+                )
+                pending_filled = _nonnegative_whole_or_none(
+                    pos.pending_exit_filled_qty
+                )
+                if (
+                    prev is None
+                    or last_cum is None
+                    or current_remaining is None
+                    or pending_filled is None
+                ):
+                    log.critical(
+                        "[exit_eng] partial exit fill blocked | malformed "
+                        "durable quantity state pos_id=%s order_key=%s",
+                        position_id,
+                        order_key,
+                    )
+                    return False
+
                 if cumulative_filled_qty is not None:
-                    cum   = max(0, int(cumulative_filled_qty or 0))
-                    prev  = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
+                    cum = _validated_fill_qty
                     delta = max(0, cum - prev)
-                    pos.last_applied_exit_cum_fill_by_order[order_key] = max(prev, cum)
-                    pos.last_applied_exit_cum_fill = max(int(pos.last_applied_exit_cum_fill or 0), cum)
                 else:
-                    delta = max(0, int(qty_filled or 0))
-                    prev  = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
-                    pos.last_applied_exit_cum_fill_by_order[order_key] = prev + delta
-                    pos.last_applied_exit_cum_fill += delta
+                    delta = _validated_fill_qty
 
                 if delta <= 0:
                     self._emit_exit_event(
@@ -5667,11 +5904,17 @@ class APExitEngine:
                     )
                     return
 
+                if cumulative_filled_qty is not None:
+                    pos.last_applied_exit_cum_fill_by_order[order_key] = max(prev, cum)
+                    pos.last_applied_exit_cum_fill = max(last_cum, cum)
+                else:
+                    pos.last_applied_exit_cum_fill_by_order[order_key] = prev + delta
+                    pos.last_applied_exit_cum_fill = last_cum + delta
+
                 applied_delta = delta
-                if fill_price is not None:
-                    pos.current_option_price = float(fill_price)
-                pos.pending_exit_filled_qty += delta
-                pos.quantity_remaining = max(0, int(pos.quantity_remaining or 0) - delta)
+                pos.current_option_price = fill_price
+                pos.pending_exit_filled_qty = pending_filled + delta
+                pos.quantity_remaining = max(0, current_remaining - delta)
                 pos.last_applied_exit_local_order_id  = local_order_id  or pos.pending_exit_local_order_id  or pos.last_applied_exit_local_order_id
                 pos.last_applied_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or pos.last_applied_exit_broker_order_id
                 if local_order_id or broker_order_id or pos.pending_exit_local_order_id or pos.pending_exit_broker_order_id:
@@ -6218,15 +6461,128 @@ class APExitEngine:
         for _fk in ("filled_qty", "filled_quantity", "cumulative_filled_qty", "exec_quantity"):
             _v = broker_raw.get(_fk)
             if _v is not None:
-                try: _filled_qty = int(float(_v)); break
-                except Exception: pass
-        for _pk in ("avg_fill_price", "average_fill_price", "fill_price", "avg_price"):
+                _filled_qty = _positive_whole_or_none(_v)
+                break
+        for _pk in ("avg_fill_price", "average_fill_price", "fill_price", "filled_avg_price"):
             _v = broker_raw.get(_pk)
             if _v is not None:
-                try: _fill_price = float(_v); break
-                except Exception: pass
+                _fill_price = _positive_or_none(_v)
+                break
+
+        _fill_ts = None
+        for _tk in (
+            "filled_ts",
+            "filled_at",
+            "fill_ts",
+            "last_fill_date",
+            "transaction_date",
+        ):
+            if _tk in broker_raw:
+                _fill_ts = parse_aware_utc_timestamp(broker_raw.get(_tk))
+                break
+
+        if broker_status in _broker_filled and (
+            _filled_qty is None or _fill_price is None or _fill_ts is None
+        ):
+            log.critical(
+                "[%s] QUARANTINE_FORCE_RECONCILE_FILL_TRUTH_INVALID | pos=%s "
+                "broker=%s status=%s filled_qty=%r fill_price=%r — holding",
+                ticker,
+                position_id or "?",
+                broker_oid,
+                broker_status,
+                _filled_qty,
+                _fill_price,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_FILL_TRUTH_INVALID",
+                explanation=(
+                    "Broker fill status lacked finite-positive price or "
+                    "positive-whole cumulative quantity; no close mutation applied."
+                ),
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "broker_order_id": broker_oid,
+                    "broker_status": broker_status,
+                    "filled_qty": _filled_qty,
+                    "fill_price": _fill_price,
+                    "filled_ts": _fill_ts.isoformat() if _fill_ts else None,
+                },
+            )
+            return
+
+        _entry_ts = parse_aware_utc_timestamp(
+            getattr(pos, "opened_at", None) or getattr(pos, "entry_ts", None)
+        )
+        _remaining_qty = _nonnegative_whole_or_none(
+            getattr(pos, "quantity_remaining", None)
+        )
+        if (
+            _fill_ts is None
+            or _entry_ts is None
+            or _fill_ts < _entry_ts
+            or _remaining_qty is None
+            or _remaining_qty <= 0
+            or _filled_qty is None
+            or _filled_qty > _remaining_qty
+        ):
+            log.critical(
+                "[%s] QUARANTINE_FORCE_RECONCILE_FILL_PROVENANCE_INVALID | "
+                "pos=%s broker=%s fill_ts=%r entry_ts=%r filled_qty=%r remaining=%r — holding",
+                ticker,
+                position_id or "?",
+                broker_oid,
+                _fill_ts,
+                _entry_ts,
+                _filled_qty,
+                _remaining_qty,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_FILL_PROVENANCE_INVALID",
+                explanation=(
+                    "Forced broker fill lacks an aware post-entry timestamp or "
+                    "exceeds the current remaining position quantity; no mutation applied."
+                ),
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "broker_order_id": broker_oid,
+                    "broker_status": broker_status,
+                    "filled_qty": _filled_qty,
+                    "remaining_qty": _remaining_qty,
+                    "fill_ts": _fill_ts.isoformat() if _fill_ts else None,
+                },
+            )
+            return
 
         if broker_status == "filled":
+            if _filled_qty != _remaining_qty:
+                log.critical(
+                    "[%s] QUARANTINE_FORCE_RECONCILE_FILL_COVERAGE_MISMATCH | "
+                    "pos=%s broker=%s filled_qty=%s remaining=%s — holding",
+                    ticker, position_id or "?", broker_oid,
+                    _filled_qty, _remaining_qty,
+                )
+                self._emit_exit_event(
+                    pos,
+                    decision="ALERT",
+                    reason_code="FORCE_RECONCILE_FILL_COVERAGE_MISMATCH",
+                    explanation=(
+                        "Broker FILLED quantity does not exactly cover the current "
+                        "remaining position; no terminal close applied."
+                    ),
+                    stage="exit_reconciliation",
+                    extra_inputs={
+                        "broker_order_id": broker_oid,
+                        "broker_status": broker_status,
+                        "filled_qty": _filled_qty,
+                        "remaining_qty": _remaining_qty,
+                    },
+                )
+                return
             # Full fill confirmed — hard close is correct and safe.
             log.critical(
                 "[%s] QUARANTINE_FORCE_RECONCILE_FILL_CONFIRMED | pos=%s broker=%s | "
@@ -6250,9 +6606,14 @@ class APExitEngine:
             self.mark_position_closed(
                 position_id,
                 reason=f"quarantine_force_reconcile_broker_{broker_status}",
+                qty_filled=_filled_qty,
                 fill_price=_fill_price,
                 broker_order_id=broker_oid,
                 local_order_id=pos.pending_exit_local_order_id,
+                broker_exit_order_id=broker_oid,
+                broker_exit_filled_qty=_filled_qty,
+                broker_exit_fill_ts=_fill_ts,
+                broker_exit_fill_timestamp_source=BROKER_FILL_TIMESTAMP_SOURCE,
                 force=True,
             )
 
@@ -6746,12 +7107,36 @@ class APExitEngine:
             local_id  = str(row.get("local_order_id")  or "")
             broker_id = str(row.get("broker_order_id") or "")
             status    = str(row.get("status")           or "")
+            pending_qty = _positive_whole_or_none(row.get("qty"))
+            if pending_qty is None:
+                pending_qty = _positive_whole_or_none(
+                    getattr(pos, "quantity_remaining", None)
+                )
+            pending_filled_qty = _nonnegative_whole_or_none(row.get("filled_qty", 0))
+            if (
+                not local_id
+                or not broker_id
+                or pending_qty is None
+                or pending_filled_qty is None
+            ):
+                log.critical(
+                    "[%s] HYDRATE_ACTIVE_EXIT_BLOCKED malformed exact EXIT "
+                    "identity/economics | pos=%s local=%r broker=%r qty=%r "
+                    "filled_qty=%r",
+                    getattr(pos, "ticker", "?"),
+                    getattr(pos, "position_id", "?"),
+                    local_id,
+                    broker_id,
+                    row.get("qty"),
+                    row.get("filled_qty"),
+                )
+                return False
 
             pos.exit_in_flight                = True
             pos.pending_exit_local_order_id   = local_id
             pos.pending_exit_broker_order_id  = broker_id
-            pos.pending_exit_qty              = int(row.get("qty")        or getattr(pos, "quantity_remaining", 0) or 0)
-            pos.pending_exit_filled_qty       = int(row.get("filled_qty") or 0)
+            pos.pending_exit_qty              = pending_qty
+            pos.pending_exit_filled_qty       = pending_filled_qty
 
             log.warning(
                 "[%s] HYDRATED ACTIVE EXIT IDENTITY | pos=%s local=%s broker=%s status=%s",
@@ -6777,7 +7162,40 @@ class APExitEngine:
             seeded = 0
             for row in rows:
                 try:
-                    original_qty = int(row.get("qty", 1) or 1)
+                    original_qty = _positive_whole_or_none(row.get("qty"))
+                    raw_entry_price = (
+                        row.get("avg_fill")
+                        if row.get("avg_fill") is not None
+                        else row.get("entry_price")
+                    )
+                    entry_price = _positive_or_none(raw_entry_price)
+                    raw_qty_remaining = row.get("quantity_remaining")
+                    qty_remaining = (
+                        original_qty
+                        if raw_qty_remaining is None
+                        else _nonnegative_whole_or_none(raw_qty_remaining)
+                    )
+                    scale_outs_done = _nonnegative_whole_or_none(
+                        row.get("scale_outs_done", 0)
+                    )
+                    if (
+                        original_qty is None
+                        or entry_price is None
+                        or qty_remaining is None
+                        or scale_outs_done is None
+                    ):
+                        log.critical(
+                            "[%s] seed_from_db BLOCKED malformed persisted "
+                            "position economics pos=%s qty=%r remaining=%r "
+                            "entry_price=%r scale_outs=%r",
+                            self._email,
+                            row.get("id"),
+                            row.get("qty"),
+                            raw_qty_remaining,
+                            raw_entry_price,
+                            row.get("scale_outs_done", 0),
+                        )
+                        continue
                     _raw_ticker = str(row.get("underlying", "") or row.get("symbol", "") or "")
                     _contract_sym = str(row.get("contract", "") or "")
                     _ticker = _normalize_ticker(_raw_ticker, _contract_sym)
@@ -6793,7 +7211,7 @@ class APExitEngine:
                         option_symbol=_contract_sym,
                         side=row.get("direction", "CALL"),
                         quantity=original_qty,
-                        entry_price=float(row.get("avg_fill", 0) or 0),
+                        entry_price=entry_price,
                         underlying_entry=_underlying_entry,
                         underlying_target=float(row.get("target_underlying") or 0),
                         underlying_stop=float(row.get("stop_underlying") or 0),
@@ -6803,8 +7221,8 @@ class APExitEngine:
                         # PR #176: carry execution_mode from positions row
                         execution_mode=str(row.get("execution_mode") or "").lower().strip(),
                     )
-                    mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
-                    _qty_remaining = int(row.get("quantity_remaining", 0) or 0)
+                    mp.scale_outs_done      = scale_outs_done
+                    _qty_remaining = qty_remaining
                     if _qty_remaining > 0:
                         mp.quantity_remaining = min(_qty_remaining, mp.quantity) if mp.quantity > 0 else _qty_remaining
                     else:
@@ -6852,9 +7270,14 @@ class APExitEngine:
                     _persisted_href = {}
                     if isinstance(_meta, dict):
                         _persisted_href = _meta.get("hard_exit_reference") or {}
-                    if isinstance(_persisted_href, dict) and _persisted_href.get("price", 0) > 0:
+                    _persisted_href_price = (
+                        _positive_or_none(_persisted_href.get("price"))
+                        if isinstance(_persisted_href, dict)
+                        else None
+                    )
+                    if _persisted_href_price is not None:
                         try:
-                            mp.hard_exit_reference_price    = float(_persisted_href.get("price", 0))
+                            mp.hard_exit_reference_price    = _persisted_href_price
                             mp.hardexitreferenceprice       = mp.hard_exit_reference_price
                             mp.hard_exit_reference_source   = str(_persisted_href.get("source", ""))
                             mp.hardexitreferencesource      = mp.hard_exit_reference_source
@@ -6917,7 +7340,7 @@ class APExitEngine:
                         except Exception as _hr_e:
                             log.warning("seed_from_db hard-ref restore failed: %s", _hr_e)
                             _persisted_href = {}
-                    if not (isinstance(_persisted_href, dict) and _persisted_href.get("price", 0) > 0):
+                    if _persisted_href_price is None:
                         # No persisted hard-ref — position has NO hard-exit authority
                         # until the first fresh quote arrives.  Mark explicitly.
                         mp.hard_exit_reference_price = 0.0
@@ -7200,9 +7623,33 @@ class APExitEngine:
             from ap.db import conn, run_with_retry
             underlying = self._underlying_from_occ(sym)
             side       = self._parse_occ_side(sym)
-            qty        = int(bp.get("quantity") or 0)
-            cost_basis = float(bp.get("cost_basis") or 0)
-            entry_px   = round(cost_basis / max(qty, 1) / 100, 6) if qty > 0 and cost_basis > 0 else 0.0
+            raw_qty = (
+                bp.get("quantity")
+                if bp.get("quantity") is not None
+                else bp.get("qty")
+            )
+            qty = _positive_whole_or_none(raw_qty)
+            raw_cost_basis = (
+                bp.get("cost_basis")
+                if bp.get("cost_basis") is not None
+                else bp.get("costbasis")
+            )
+            cost_basis = _positive_or_none(raw_cost_basis)
+            entry_px = (
+                round(cost_basis / qty / 100, 6)
+                if qty is not None and cost_basis is not None
+                else None
+            )
+            entry_px = _positive_or_none(entry_px)
+            if qty is None or entry_px is None:
+                log.critical(
+                    "[exit_eng] _upsert_broker_position_to_db %s blocked: "
+                    "malformed broker quantity/cost basis qty=%r cost_basis=%r",
+                    sym,
+                    raw_qty,
+                    raw_cost_basis,
+                )
+                return None
             entry_ts   = bp.get("date_acquired")
 
             def _ins():
@@ -7293,17 +7740,32 @@ class APExitEngine:
         side_raw  = str(row.get("side") or row.get("direction") or "").upper()
         side      = side_raw if side_raw in ("CALL", "PUT") else self._parse_occ_side(sym)
         _qr = row.get("quantity_remaining")
-        _db_qty_before = int(_qr if _qr is not None else (row.get("qty") or 0))
+        _db_qty_before = _nonnegative_whole_or_none(
+            _qr if _qr is not None else row.get("qty")
+        )
+        if _qr is not None and _db_qty_before is None:
+            raise ValueError("malformed persisted quantity_remaining")
+        raw_entry_px = (
+            row.get("entry_price")
+            if row.get("entry_price") is not None
+            else row.get("avg_fill")
+        )
+        entry_px = _positive_or_none(raw_entry_px)
+        if entry_px is None:
+            raise ValueError("malformed persisted entry price")
+        validated_override = _positive_whole_or_none(qty_override)
         # Broker-truth mode: qty_override wins when prefer_qty_override=True and override>0.
         # Normal DB-seed mode: preserve P0-PARTIAL-CLOSE behavior (qr=0 stays 0).
-        if prefer_qty_override and qty_override and int(qty_override) > 0:
-            qty = int(qty_override)
+        if prefer_qty_override and validated_override is not None:
+            qty = validated_override
         else:
             # P0-PARTIAL-CLOSE: do NOT use `or` — quantity_remaining=0 is a valid
             # value meaning fully closed. Falling back to qty would load original
             # entry size into the exit engine for a row that has zero contracts left.
-            qty = int(_qr if _qr is not None else (row.get("qty") or qty_override or 1))
-        entry_px  = float(row.get("entry_price") or row.get("avg_fill") or 0.0)
+            raw_qty = _qr if _qr is not None else row.get("qty")
+            qty = _nonnegative_whole_or_none(raw_qty)
+            if qty is None:
+                raise ValueError("malformed persisted position quantity")
         pos_id    = str(row.get("id") or "")
         sig_id    = str(row.get("signal_id") or "")
         opened_at = None
@@ -7354,14 +7816,17 @@ class APExitEngine:
             )
         # Final broker-truth enforcement: if prefer_qty_override is active,
         # ensure both quantity fields match broker qty regardless of constructor defaults.
-        if prefer_qty_override and qty_override and int(qty_override) > 0:
-            mp.quantity            = int(qty_override)
-            mp.quantity_remaining  = int(qty_override)
-            if _db_qty_before != int(qty_override):
+        if prefer_qty_override and validated_override is not None:
+            mp.quantity            = validated_override
+            mp.quantity_remaining  = validated_override
+            if _db_qty_before != validated_override:
                 log.info(
                     "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIRED_IN_MEMORY "
                     "sym=%s db_qty_before=%d broker_qty=%d loaded_qty=%d",
-                    sym, _db_qty_before, int(qty_override), mp.quantity_remaining,
+                    sym,
+                    _db_qty_before if _db_qty_before is not None else 0,
+                    validated_override,
+                    mp.quantity_remaining,
                 )
         return mp
 
@@ -7473,11 +7938,22 @@ class APExitEngine:
             )
             return False
 
-        broker_map = {
-            str(p.get("symbol") or "").upper(): p
-            for p in broker_positions
-            if int(p.get("quantity") or 0) > 0
-        }
+        broker_map = {}
+        for p in broker_positions:
+            symbol = str(p.get("symbol") or p.get("contract") or "").upper()
+            quantity = _positive_whole_or_none(
+                p.get("quantity") if p.get("quantity") is not None else p.get("qty")
+            )
+            if quantity is None:
+                log.critical(
+                    "[exit_eng] EXIT_BROKER_POSITION_PRECHECK_HOLD "
+                    "contract=%s malformed quantity=%r",
+                    symbol or "?",
+                    p.get("quantity") if p.get("quantity") is not None else p.get("qty"),
+                )
+                continue
+            if quantity > 0 and symbol:
+                broker_map[symbol] = p
         broker_syms = set(broker_map.keys())
 
         # ── 2. Current engine symbols ─────────────────────────────────────────
@@ -7519,9 +7995,29 @@ class APExitEngine:
 
         for sym in sorted(missing_from_engine):
             bp         = broker_map[sym]
-            broker_qty = int(bp.get("quantity") or 0)
-            cost_basis = float(bp.get("cost_basis") or 0)
-            entry_px   = cost_basis / max(broker_qty, 1) / 100
+            broker_qty = _positive_whole_or_none(
+                bp.get("quantity") if bp.get("quantity") is not None else bp.get("qty")
+            )
+            cost_basis = _positive_or_none(
+                bp.get("cost_basis")
+                if bp.get("cost_basis") is not None
+                else bp.get("costbasis")
+            )
+            entry_px = (
+                _positive_or_none(cost_basis / broker_qty / 100)
+                if broker_qty is not None and cost_basis is not None
+                else None
+            )
+            if broker_qty is None or entry_px is None:
+                log.critical(
+                    "[exit_eng] EXIT_BROKER_POSITION_REPAIR_HOLD "
+                    "contract=%s malformed quantity/cost basis qty=%r cost_basis=%r",
+                    sym,
+                    bp.get("quantity") if bp.get("quantity") is not None else bp.get("qty"),
+                    bp.get("cost_basis") if bp.get("cost_basis") is not None else bp.get("costbasis"),
+                )
+                repair_failed_syms.append(sym)
+                continue
 
             db_seen            = False
             db_repaired        = False
@@ -7542,7 +8038,18 @@ class APExitEngine:
             if db_row:
                 db_seen          = True
                 db_status_before = db_row.get("status")
-                db_qty_before    = int(db_row.get("quantity_remaining") or 0)
+                db_qty_before = _nonnegative_whole_or_none(
+                    db_row.get("quantity_remaining")
+                )
+                if db_qty_before is None:
+                    log.critical(
+                        "[exit_eng] EXIT_BROKER_POSITION_DB_ROW_HOLD "
+                        "contract=%s malformed quantity_remaining=%r",
+                        sym,
+                        db_row.get("quantity_remaining"),
+                    )
+                    repair_failed_syms.append(sym)
+                    continue
                 log.info(
                     "[exit_eng] EXIT_BROKER_POSITION_DB_ROW_FOUND "
                     "client=%s contract_symbol=%s db_status_before=%s "
