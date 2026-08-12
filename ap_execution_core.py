@@ -51,6 +51,13 @@ except ImportError:
 log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+_BROKER_FILL_TIMESTAMP_KEYS = (
+    "filled_ts",
+    "filled_at",
+    "fill_ts",
+    "last_fill_date",
+    "transaction_date",
+)
 
 
 def _normalize_execution_mode(value) -> str | None:
@@ -69,6 +76,20 @@ def _strict_positive_whole_number(value: object) -> int | None:
     if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
         return None
     return int(parsed)
+
+
+def _extract_explicit_broker_fill_timestamp(
+    raw: Mapping,
+) -> tuple[str | None, str | None]:
+    """Return only an explicit aware broker fill timestamp and its source."""
+    for key in _BROKER_FILL_TIMESTAMP_KEYS:
+        if key not in raw:
+            continue
+        parsed = parse_aware_utc_timestamp(raw.get(key))
+        if parsed is None:
+            return None, None
+        return parsed.isoformat(), BROKER_FILL_TIMESTAMP_SOURCE
+    return None, None
 
 
 def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_flag) -> str | None:
@@ -3691,6 +3712,22 @@ class APExecutionCore:
         }
         local_status = status_map.get(remote_status, "EXIT_SUBMITTED")
 
+        filled_ts = None
+        filled_ts_source = None
+        if local_status in {"EXIT_FILLED", "EXIT_PARTIAL_FILL"}:
+            filled_ts, filled_ts_source = _extract_explicit_broker_fill_timestamp(remote)
+            if (
+                filled_ts is None
+                or filled_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
+            ):
+                return {
+                    **_base,
+                    "disposition": "RECONCILE_PENDING",
+                    "reason_code": "RECONCILE_EXIT_FILL_TIMESTAMP_UNPROVEN",
+                    "broker_order_id": remote_id,
+                    "status": local_status,
+                }
+
         adopted = osm.transition(
             local_order_id,
             "EXIT_SUBMITTED",
@@ -3711,14 +3748,24 @@ class APExecutionCore:
                 return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
 
         if local_status != "EXIT_SUBMITTED":
-            osm.transition(
+            transitioned = osm.transition(
                 local_order_id,
                 local_status,
                 broker_order_id=remote_id,
                 filled_qty=remote.get("exec_quantity") or remote.get("filled_quantity"),
                 fill_price=remote.get("avg_fill_price"),
+                filled_ts=filled_ts,
+                filled_ts_source=filled_ts_source,
                 last_error=(str(remote.get("reason") or remote.get("message") or "") or None),
             )
+            if not transitioned:
+                return {
+                    **_base,
+                    "disposition": "RECONCILE_PENDING",
+                    "reason_code": "RECONCILE_EXIT_FILL_TRANSITION_FAILED",
+                    "broker_order_id": remote_id,
+                    "status": local_status,
+                }
 
         if callable(getattr(osm, "update_order_meta", None)):
             osm.update_order_meta(local_order_id, {

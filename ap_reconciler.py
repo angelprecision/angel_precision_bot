@@ -1474,13 +1474,19 @@ class APBrokerReconciler:
             fill_px = _strict_positive_finite_float(recent_fill.get("fill_price"))
             if fill_qty is not None and fill_px is not None:
                 try:
-                    self.osm.transition(
+                    transitioned = self.osm.transition(
                         local_id,
                         "EXIT_FILLED",
                         filled_qty=fill_qty,
                         fill_price=fill_px,
+                        filled_ts=recent_fill.get("filled_ts"),
+                        filled_ts_source=recent_fill.get("filled_ts_source"),
                         last_error="reconciler_missing_id_recent_exit_fill_resolved",
                     )
+                    if not transitioned:
+                        raise RuntimeError(
+                            "reconciler_missing_id_recent_exit_fill_transition_rejected"
+                        )
                     self._alert(
                         f"MISSING_ID_EXIT_RESOLVED_BY_RECENT_FILL | {contract or '?'} | {local_id} | "
                         f"pos={pos_id} qty={fill_qty} price={fill_px:.4f}"

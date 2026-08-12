@@ -1542,6 +1542,35 @@ def test_missing_id_exit_generation_mismatch_cannot_promote_current_order(
     )
 
 
+def test_missing_id_recent_fill_passes_provenance_and_requires_transition_success():
+    rec = _reconciler()
+    rec._alert = MagicMock()
+    rec._recover_missing_broker_id_exit = MagicMock(return_value=False)
+    recent_fill = _exit_row(filled_qty=2, status="EXIT_FILLED")
+    recent_fill["filled_ts_source"] = "broker_response"
+    rec._get_recent_exit_fill = MagicMock(return_value=recent_fill)
+    rec.osm.transition = MagicMock(return_value=False)
+    summary = _empty_summary(CLIENT)
+    order = {
+        "local_order_id": "exit-local-1",
+        "kind": "EXIT",
+        "status": "EXIT_SUBMITTED",
+        "position_id": POSITION_ID,
+        "contract": TARGET_CONTRACT,
+        "underlying": "C",
+        "execution_mode": MODE_LIVE,
+        "qty": 2,
+        "filled_qty": 0,
+        "broker_order_id": None,
+    }
+
+    assert rec._resolve_missing_id_exit_truth(order, summary, reason="audit") is False
+    transition = rec.osm.transition.call_args
+    assert transition.kwargs["filled_ts"] == recent_fill["filled_ts"]
+    assert transition.kwargs["filled_ts_source"] == "broker_response"
+    assert summary["orders_corrected"] == 0
+
+
 @pytest.mark.parametrize(
     ("filled_ts", "position_entry_ts"),
     [
@@ -3205,3 +3234,75 @@ def test_unknown_origin_mode_stays_quarantined_and_never_becomes_live(monkeypatc
     assert rec.supabase_client.proof_rows[0]["execution_mode"] == "unknown"
     assert rec.supabase_client.proof_rows[0]["execution_mode"] != MODE_LIVE
     assert summary["reconciler_proof_repair_persisted"] == 1
+
+
+def _execution_core_exit_intent_fixture(*, remote_updates=None):
+    from ap.broker_submit_identity import canonical_broker_submit_key
+    from ap_execution_core import APExecutionCore
+
+    local_order_id = "exit-intent-1"
+    row = {
+        "client_id": CLIENT,
+        "execution_mode": MODE_LIVE,
+        "kind": "EXIT",
+        "status": "EXIT_SUBMITTED",
+        "broker_order_id": None,
+        "contract": TARGET_CONTRACT,
+        "qty": 2,
+        "meta": {
+            "submit_intent_at": "2026-08-10T18:59:00+00:00",
+            "broker_submit_key": local_order_id,
+        },
+    }
+    remote = {
+        "id": "TR-EXIT-1",
+        "tag": canonical_broker_submit_key(local_order_id),
+        "status": "filled",
+        "option_symbol": TARGET_CONTRACT,
+        "side": "sell_to_close",
+        "quantity": 2,
+        "exec_quantity": 2,
+        "avg_fill_price": 1.95,
+    }
+    remote.update(remote_updates or {})
+
+    osm = MagicMock()
+    osm.get_order.return_value = row
+    broker = MagicMock()
+    broker.list_orders.return_value = [remote]
+    core = object.__new__(APExecutionCore)
+    core.client_id = CLIENT
+    core.execution_mode = MODE_LIVE
+    core.osm = osm
+    core.broker = broker
+    return core, osm, local_order_id
+
+
+def test_exit_intent_recovery_holds_filled_remote_without_explicit_timestamp():
+    core, osm, local_order_id = _execution_core_exit_intent_fixture()
+
+    result = core.reconcile_exit_broker_intent(local_order_id=local_order_id)
+
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["reason_code"] == "RECONCILE_EXIT_FILL_TIMESTAMP_UNPROVEN"
+    osm.transition.assert_not_called()
+    osm.update_order_meta.assert_not_called()
+
+
+def test_exit_intent_recovery_checks_filled_transition_result_and_source():
+    core, osm, local_order_id = _execution_core_exit_intent_fixture(
+        remote_updates={"transaction_date": "2026-08-10T19:00:00+00:00"},
+    )
+    osm.transition.side_effect = [True, False]
+
+    result = core.reconcile_exit_broker_intent(local_order_id=local_order_id)
+
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["reason_code"] == "RECONCILE_EXIT_FILL_TRANSITION_FAILED"
+    assert osm.transition.call_args_list[1].kwargs["filled_ts"] == (
+        "2026-08-10T19:00:00+00:00"
+    )
+    assert osm.transition.call_args_list[1].kwargs["filled_ts_source"] == (
+        "broker_response"
+    )
+    osm.update_order_meta.assert_not_called()
