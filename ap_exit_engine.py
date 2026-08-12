@@ -1016,6 +1016,72 @@ def _is_behavior_active_position(pos) -> bool:
         return False
 
 
+_OWNER_IDENTITY_UNKNOWN_TOKENS = frozenset(
+    {"", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "?"}
+)
+
+
+def _normalize_owner_identity_token(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_proven_owner_client_id(value) -> bool:
+    return _normalize_owner_identity_token(value).upper() not in {
+        token.upper() for token in _OWNER_IDENTITY_UNKNOWN_TOKENS
+    }
+
+
+def _canonical_repair_value(pos, name: str, default=""):
+    if isinstance(pos, dict):
+        return pos.get(name, default)
+    return getattr(pos, name, default)
+
+
+def _classify_canonical_repair_owner_domain(
+    pos,
+    *,
+    client_id: str,
+    execution_mode: str,
+    contract: str,
+) -> str:
+    """Classify an active same-contract broker repair without guessing identity."""
+    position_id = str(_canonical_repair_value(pos, "position_id", "") or "").strip()
+    position_contract = str(
+        _canonical_repair_value(pos, "option_symbol", "")
+        or _canonical_repair_value(pos, "contract", "")
+        or ""
+    ).strip().upper()
+    target_contract = str(contract or "").strip().upper()
+    if not position_id.startswith("broker-repair-") or position_contract != target_contract:
+        return "NOT_CANDIDATE"
+
+    repair_client = _normalize_owner_identity_token(
+        _canonical_repair_value(pos, "client_id", "")
+    )
+    repair_mode = _normalize_owner_identity_token(
+        _canonical_repair_value(pos, "execution_mode", "")
+    )
+    target_client = _normalize_owner_identity_token(client_id)
+    target_mode = _normalize_owner_identity_token(execution_mode)
+
+    if (
+        not _is_proven_owner_client_id(target_client)
+        or target_mode not in {"live", "paper"}
+        or not _is_proven_owner_client_id(repair_client)
+    ):
+        return "IDENTITY_UNPROVEN"
+    # A proven client mismatch is sufficient to prove a foreign owner domain;
+    # a malformed mode on that foreign row must not let this client's adoption
+    # quarantine or disable another client's protective owner.
+    if repair_client != target_client:
+        return "PROVEN_FOREIGN_DOMAIN"
+    if repair_mode not in {"live", "paper"}:
+        return "IDENTITY_UNPROVEN"
+    if repair_client == target_client and repair_mode == target_mode:
+        return "EXACT_OWNER_DOMAIN"
+    return "PROVEN_FOREIGN_DOMAIN"
+
+
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
 
 
@@ -3595,6 +3661,17 @@ class APExitEngine:
                 disposition="RETRY_ADOPTION_ERROR", adopted=False,
                 safe_to_seed=False, retryable=True, reason="missing_contract_or_id",
             )
+        if not _is_proven_owner_client_id(_client):
+            return CanonicalAdoptionResult(
+                disposition="RETRY_CLIENT_MISMATCH", adopted=False,
+                safe_to_seed=False, retryable=True, reason="missing_client_id",
+            )
+        if _mode not in {"live", "paper"}:
+            return CanonicalAdoptionResult(
+                disposition="RETRY_MODE_MISMATCH", adopted=False,
+                safe_to_seed=False, retryable=True,
+                reason=f"unsupported_execution_mode={_mode!r}",
+            )
 
         with self._lock:
             # ── Final Blocker 1: Canonical + repair collapse ───────────────────
@@ -3603,6 +3680,48 @@ class APExitEngine:
             # same client/contract, merge safe state into the canonical object,
             # then remove the repair objects so exactly one active position remains.
             _existing_canon = self._positions_by_id.get(_canon_id)
+
+            # Same-contract repairs with incomplete identity are not foreign
+            # owners.  Quarantine them before adoption/owner proof so they can
+            # never remain behavior-active beside a canonical owner.  This does
+            # not touch a proven foreign client/mode domain.
+            _unquarantined_ambiguous_repairs = []
+            for _candidate in self._positions:
+                if not _is_behavior_active_position(_candidate):
+                    continue
+                _candidate_class = _classify_canonical_repair_owner_domain(
+                    _candidate,
+                    client_id=_client,
+                    execution_mode=_mode,
+                    contract=_contract,
+                )
+                if _candidate_class != "IDENTITY_UNPROVEN":
+                    continue
+                _candidate_id = str(
+                    getattr(_candidate, "position_id", "") or ""
+                ).strip()
+                _mark_adoption_identity_quarantined(
+                    _candidate,
+                    "canonical_owner_handoff_identity_unproven",
+                )
+                if not _is_adoption_identity_quarantined(_candidate):
+                    _unquarantined_ambiguous_repairs.append(_candidate_id)
+                else:
+                    log.critical(
+                        "[exit_eng] IDENTITY_UNPROVEN_REPAIR_QUARANTINED | "
+                        "client=%s mode=%s contract=%s repair=%s",
+                        _client, _mode, _contract, _candidate_id,
+                    )
+            if _unquarantined_ambiguous_repairs:
+                return CanonicalAdoptionResult(
+                    disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
+                    adopted=False, safe_to_seed=False, retryable=True,
+                    reason=(
+                        "ambiguous_repairs_not_quarantined="
+                        + ",".join(_unquarantined_ambiguous_repairs)
+                    ),
+                )
+
             if _existing_canon is not None:
                 _canon_sym  = str(getattr(_existing_canon, "option_symbol", "") or "").upper().strip()
                 _canon_cli  = str(getattr(_existing_canon, "client_id", "") or "").strip().lower()
@@ -3666,31 +3785,29 @@ class APExitEngine:
                         reason="canonical_object_mismatch",
                     )
 
+                def _in_adoption_owner_domain(position) -> bool:
+                    """Match only the exact client/mode/contract owner domain."""
+                    return (
+                        not getattr(position, "closed", False)
+                        and str(getattr(position, "option_symbol", "") or "").upper().strip()
+                        == _contract
+                        and str(getattr(position, "client_id", "") or "").strip().lower()
+                        == _client
+                        and str(getattr(position, "execution_mode", "") or "").strip().lower()
+                        == _norm_canonical
+                    )
+
                 # Merge every active broker-repair for this exact client/mode/contract
-                # into canonical. Unknown-client, foreign-client, blank-mode, or
-                # wrong-mode repairs stay quarantined and cannot donate quote authority.
+                # into canonical. Foreign ownership domains are unrelated state:
+                # leave them untouched, and neither let them donate state nor veto
+                # this exact owner handoff.
                 _repairs_to_remove = []
-                _identity_unproven_repairs = []
                 for p in self._positions:
                     if not str(getattr(p, "position_id", "") or "").startswith("broker-repair-"):
                         continue
-                    if str(getattr(p, "option_symbol", "") or "").upper().strip() != _contract:
-                        continue
-                    if getattr(p, "closed", False):
-                        continue
-                    _rp_cli = str(getattr(p, "client_id", "") or "").strip().lower()
-                    if not _client or _rp_cli != _client:
-                        _mark_adoption_identity_quarantined(
-                            p, f"repair_client={_rp_cli!r} canonical_client={_client!r}",
-                        )
-                        _identity_unproven_repairs.append(p)
-                        continue
-                    _rp_mode = str(getattr(p, "execution_mode", "") or "").strip().lower()
-                    if _rp_mode not in {"live", "paper"} or _rp_mode != _norm_canonical:
-                        _mark_adoption_identity_quarantined(
-                            p, f"repair_mode={_rp_mode!r} canonical_mode={_norm_canonical!r}",
-                        )
-                        _identity_unproven_repairs.append(p)
+                    if not _in_adoption_owner_domain(p):
+                        # A same-contract repair owned by another client or mode
+                        # is not evidence about this handoff.  Do not mutate it.
                         continue
                     _repairs_to_remove.append(p)
                 for _rp in _repairs_to_remove:
@@ -3771,34 +3888,24 @@ class APExitEngine:
 
                 _reclassify_hard_ref_for_entry(_existing_canon)
 
-                # Assert exactly one nonclosed active object for this contract.
-                _active_for_contract = [
+                # Assert exactly one nonclosed active object in this exact
+                # client/mode/contract domain.  Other owner domains may quite
+                # legitimately hold the same OCC contract at the same time.
+                _active_for_owner_domain = [
                     p for p in self._positions
-                    if str(getattr(p, "option_symbol", "") or "").upper().strip() == _contract
-                    and not getattr(p, "closed", False)
+                    if _in_adoption_owner_domain(p)
                 ]
-                if len(_active_for_contract) != 1:
+                if len(_active_for_owner_domain) != 1:
                     log.critical(
                         "[exit_eng] CANONICAL_COLLAPSE_INVARIANT_VIOLATED | "
-                        "contract=%s active_count=%d — expected exactly 1",
-                        _contract, len(_active_for_contract),
+                        "client=%s mode=%s contract=%s active_count=%d — expected exactly 1",
+                        _client, _norm_canonical, _contract,
+                        len(_active_for_owner_domain),
                     )
                     return CanonicalAdoptionResult(
                         disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
                         adopted=False, safe_to_seed=False, retryable=True,
-                        reason=f"active_count={len(_active_for_contract)}",
-                    )
-
-                if _identity_unproven_repairs:
-                    log.critical(
-                        "[exit_eng] RETRY_REPAIR_IDENTITY_UNPROVEN | "
-                        "canonical=%s contract=%s retained_repairs=%d",
-                        _canon_id, _contract, len(_identity_unproven_repairs),
-                    )
-                    return CanonicalAdoptionResult(
-                        disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
-                        adopted=False, safe_to_seed=False, retryable=True,
-                        reason=f"retained_repairs={len(_identity_unproven_repairs)}",
+                        reason=f"active_count={len(_active_for_owner_domain)}",
                     )
 
                 return CanonicalAdoptionResult(
@@ -3820,17 +3927,9 @@ class APExitEngine:
                 # exact known execution mode before we overwrite identity fields.
                 _repair_client = str(getattr(pos, "client_id", "") or "").strip().lower()
                 if not _client or _repair_client != _client:
-                    log.critical(
-                        "[exit_eng] RETRY_CLIENT_MISMATCH | "
-                        "contract=%s repair_client=%s canonical_client=%s — "
-                        "refusing unknown/cross-client adoption",
-                        _contract, _repair_client, _client,
-                    )
-                    return CanonicalAdoptionResult(
-                        disposition="RETRY_CLIENT_MISMATCH", adopted=False,
-                        safe_to_seed=False, retryable=True,
-                        reason=f"repair_client={_repair_client} != {_client}",
-                    )
+                    # Foreign-client repairs are a different ownership domain;
+                    # ignore them and continue scanning for Jason's exact repair.
+                    continue
 
                 _repair_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
                 _mode_ok = (
@@ -3839,17 +3938,9 @@ class APExitEngine:
                     and _repair_mode == _mode
                 )
                 if not _mode_ok:
-                    log.critical(
-                        "[exit_eng] RETRY_MODE_MISMATCH | "
-                        "contract=%s repair_mode=%s canonical_mode=%s — "
-                        "refusing unknown/incompatible mode adoption",
-                        _contract, _repair_mode, _mode,
-                    )
-                    return CanonicalAdoptionResult(
-                        disposition="RETRY_MODE_MISMATCH", adopted=False,
-                        safe_to_seed=False, retryable=True,
-                        reason=f"repair_mode={_repair_mode} vs canonical={_mode}",
-                    )
+                    # A different/unknown mode is likewise outside this exact
+                    # owner domain; it must not veto a later exact repair.
+                    continue
 
                 # Found a valid broker-repair position — upgrade in place.
                 old_id = _pid
@@ -4021,10 +4112,21 @@ class APExitEngine:
                     and existing.option_symbol == pos.option_symbol
                     and not existing.closed
                 )
-                if same_id or same_sym:
+                _existing_client = str(getattr(existing, "client_id", "") or "").strip().lower()
+                _existing_mode = str(getattr(existing, "execution_mode", "") or "").strip().lower()
+                _incoming_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                same_owner_domain = (
+                    same_sym
+                    and _existing_client
+                    and _incoming_client
+                    and _existing_mode in {"live", "paper"}
+                    and _incoming_mode in {"live", "paper"}
+                    and _existing_client == _incoming_client
+                    and _existing_mode == _incoming_mode
+                )
+                if same_id or same_owner_domain:
                     _incoming_id = str(getattr(pos, "position_id", "") or "")
-                    _incoming_client = str(getattr(pos, "client_id", "") or "").strip().lower()
-                    _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
                     _incoming_is_proven_canonical = (
                         _incoming_id
                         and not _incoming_id.startswith("broker-repair-")
@@ -4084,6 +4186,152 @@ class APExitEngine:
     def active_positions(self) -> list[ManagedPosition]:
         with self._lock:
             return [p for p in self._positions if _is_behavior_active_position(p)]
+
+    def quarantine_canonical_owner_handoff(
+        self,
+        *,
+        canonical_position_id: str,
+        contract: str,
+        client_id: str = "",
+        execution_mode: str = "",
+        reason: str = "canonical_owner_handoff_failed",
+    ) -> dict:
+        """Quarantine only the exact client/mode/contract owner candidates."""
+        target_contract = str(contract or "").strip().upper()
+        target_client = str(client_id or "").strip().lower()
+        target_mode = str(execution_mode or "").strip().lower()
+        canonical_id = str(canonical_position_id or "").strip()
+        if not target_contract or not target_client or target_mode not in {"live", "paper"}:
+            log.critical(
+                "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINE_INVALID_IDENTITY | "
+                "contract=%s canonical=%s client=%s mode=%s",
+                target_contract,
+                canonical_id,
+                target_client,
+                target_mode,
+            )
+            return {
+                "ok": False,
+                "quarantined_ids": [],
+                "detail_reason": "client_id_or_execution_mode_missing_or_malformed",
+            }
+
+        quarantined_ids = []
+        with self._lock:
+            for pos in self._positions:
+                pos_contract = str(
+                    getattr(pos, "option_symbol", "")
+                    or getattr(pos, "contract", "")
+                    or ""
+                ).strip().upper()
+                pos_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                pos_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                if (
+                    pos_contract != target_contract
+                    or pos_client != target_client
+                    or pos_mode != target_mode
+                    or getattr(pos, "closed", False)
+                ):
+                    continue
+                position_id = str(getattr(pos, "position_id", "") or "").strip()
+                _mark_adoption_identity_quarantined(
+                    pos,
+                    reason or "canonical_owner_handoff_failed",
+                )
+                quarantined_ids.append(position_id)
+
+        log.critical(
+            "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINED | "
+            "contract=%s canonical=%s client=%s mode=%s quarantined=%s reason=%s",
+            target_contract,
+            canonical_id,
+            target_client,
+            target_mode,
+            quarantined_ids,
+            reason,
+        )
+        return {
+            "ok": True,
+            "quarantined_ids": quarantined_ids,
+            "contract": target_contract,
+            "client_id": target_client,
+            "execution_mode": target_mode,
+        }
+
+    def clear_canonical_owner_handoff_quarantine(
+        self,
+        *,
+        canonical_position_id: str,
+        contract: str,
+        client_id: str = "",
+        execution_mode: str = "",
+    ) -> dict:
+        """Clear quarantine for one exact canonical client/mode/contract owner."""
+        target_contract = str(contract or "").strip().upper()
+        canonical_id = str(canonical_position_id or "").strip()
+        target_client = str(client_id or "").strip().lower()
+        target_mode = str(execution_mode or "").strip().lower()
+        if (
+            not target_contract
+            or not canonical_id
+            or not target_client
+            or target_mode not in {"live", "paper"}
+        ):
+            log.critical(
+                "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINE_CLEAR_INVALID_IDENTITY | "
+                "contract=%s canonical=%s client=%s mode=%s",
+                target_contract,
+                canonical_id,
+                target_client,
+                target_mode,
+            )
+            return {
+                "ok": False,
+                "cleared_ids": [],
+                "detail_reason": "canonical_or_client_or_mode_missing_or_malformed",
+            }
+
+        cleared_ids = []
+        with self._lock:
+            for pos in self._positions:
+                pos_contract = str(
+                    getattr(pos, "option_symbol", "")
+                    or getattr(pos, "contract", "")
+                    or ""
+                ).strip().upper()
+                pos_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                pos_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                if (
+                    pos_contract != target_contract
+                    or pos_client != target_client
+                    or pos_mode != target_mode
+                    or getattr(pos, "closed", False)
+                ):
+                    continue
+                if str(getattr(pos, "position_id", "") or "").strip() != canonical_id:
+                    continue
+                if _is_adoption_identity_quarantined(pos):
+                    _clear_adoption_identity_quarantine(pos)
+                    cleared_ids.append(
+                        str(getattr(pos, "position_id", "") or "").strip()
+                    )
+
+        log.info(
+            "[exit_eng] CANONICAL_OWNER_HANDOFF_QUARANTINE_CLEARED | "
+            "contract=%s canonical=%s client=%s mode=%s cleared=%s",
+            target_contract,
+            canonical_id,
+            target_client,
+            target_mode,
+            cleared_ids,
+        )
+        return {
+            "ok": True,
+            "cleared_ids": cleared_ids,
+            "contract": target_contract,
+            "client_id": target_client,
+            "execution_mode": target_mode,
+        }
 
     def attach_quote_monitor(self, monitor) -> None:
         """Wire the PositionQuoteMonitor for observability and wake-driven exits."""
