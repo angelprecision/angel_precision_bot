@@ -111,6 +111,7 @@ jobs:
             tests/test_p0_selector_recovery_cursor.py \
             tests/test_p0_selector_recovery_july27_replay.py \
             tests/test_p0_item11_behavioral_regressions.py \
+            tests/test_p0_intelligence_truth_outcome_binding.py \
             tests/test_p0_audit_blockers_401.py \
             tests/test_p0_selector_recovery_deploy_preflight.py \
             tests/test_p0_pr401_deployability_closure.py \

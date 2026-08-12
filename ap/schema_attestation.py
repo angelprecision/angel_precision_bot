@@ -13,6 +13,9 @@ Contract:
       lifecycle guards and the core execution path reference verbatim in
       SQL. Only columns whose absence breaks execution belong here —
       dynamically-filtered optional columns do not.
+    * ``INTELLIGENCE_REQUIRED_SCHEMA`` and ``attest_intelligence_schema``
+      attest the separate observe-only learning plane; they are intentionally
+      not part of broker/lifecycle ``REQUIRED_SCHEMA``.
     * ``attest_schema()`` compares the declaration against
       ``information_schema`` in one query and returns a structured report.
     * Strictness: LIVE mode (``BOT_MODE``/``MODE``) raises
@@ -42,6 +45,44 @@ log = logging.getLogger("ap.schema_attestation")
 
 class SchemaAttestationError(RuntimeError):
     """Deployed code requires schema the database does not have."""
+
+
+# Intelligence truth is an evidence-plane contract.  Keep this declaration
+# separate so health/preflight can attest the learning plane without making
+# broker trading depend on a successful intelligence read.
+INTELLIGENCE_REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
+    "ap_intelligence_snapshots": frozenset({
+        "id", "client_id", "execution_mode", "canonical_signal_id", "signal_id",
+        "local_order_id", "phase", "context_revision", "profile_version",
+        "parent_snapshot_id", "input_hash", "config_hash", "git_commit",
+        "data_as_of", "computed_at", "status", "payload", "created_at",
+    }),
+    "ap_intelligence_jobs": frozenset({
+        "id", "client_id", "execution_mode", "canonical_signal_id", "phase",
+        "status", "attempt_count", "max_attempts", "next_attempt_at",
+        "snapshot_id", "created_at", "updated_at",
+    }),
+    # The binder reads these proof-truth fields directly.  Keep this in the
+    # intelligence contract rather than broadening broker preflight with an
+    # analytics-only table dependency.
+    "proof_trades": frozenset({
+        "id", "client_email", "local_order_id", "execution_mode", "mode",
+        "performance_taxonomy", "training_eligible",
+        "official_live_performance_eligible",
+    }),
+    "blocked_signal_counterfactuals": frozenset({
+        "id", "signal_id", "canonical_signal_id", "client_id", "execution_mode",
+        "ticker", "direction", "block_stage", "block_reason", "reason_code",
+        "blocked_at", "entry_ref", "target_ref", "stop_ref", "resolution",
+        "hypothetical_r", "resolved_at", "meta",
+    }),
+    "ap_intelligence_outcome_bindings": frozenset({
+        "id", "snapshot_id", "proof_trade_id", "client_id", "execution_mode",
+        "originating_local_order_id", "canonical_signal_id", "phase",
+        "profile_version", "input_hash", "config_hash", "binding_method",
+        "binding_version", "bound_at",
+    }),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -229,3 +270,14 @@ def attest_schema(
             len(required), report["mode"], strict_effective,
         )
     return report
+
+
+def attest_intelligence_schema(*, strict: bool = False) -> dict[str, Any]:
+    """Attest the observe-only intelligence plane without gating trading.
+
+    This deliberately uses a separate declaration from ``REQUIRED_SCHEMA``.
+    The latter is consumed by LIVE broker/lifecycle preflight; an unavailable
+    analytics plane must be visible as intelligence health degradation without
+    becoming a new broker authority in PR #432.
+    """
+    return attest_schema(strict=strict, required=INTELLIGENCE_REQUIRED_SCHEMA)
