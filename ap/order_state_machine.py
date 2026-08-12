@@ -65,7 +65,7 @@ try:
     from psycopg2 import errors as pg_errors
 except ImportError:
     pg_errors = None
-from ap.utils import now_utc_iso
+from ap.utils import now_utc_iso, parse_aware_utc_timestamp
 
 
 def _normalize_broker_submitted_ts(value) -> str | None:
@@ -1058,6 +1058,30 @@ class APOrderStateMachine:
         current     = dict(current)
         old_status  = str(current.get("status") or "")
         kind        = str(current.get("kind") or "")
+
+        normalized_exit_fill_ts = None
+        if new_status in (OrderStatus.EXIT_FILLED, OrderStatus.EXIT_PARTIAL_FILL):
+            normalized_exit_fill_ts = parse_aware_utc_timestamp(filled_ts)
+            if normalized_exit_fill_ts is None:
+                reason = "exit_fill_timestamp_unproven"
+                log.critical(
+                    "[%s] EXIT transition blocked | order=%s status=%s "
+                    "filled_ts=%r is missing, malformed, or naive",
+                    self.client_id, local_order_id, new_status, filled_ts,
+                )
+                self._emit_transition_event(
+                    local_order_id=local_order_id,
+                    old_status=old_status,
+                    new_status=new_status,
+                    order=current,
+                    decision="REJECT",
+                    reason_code="EXIT_FILL_TIMESTAMP_UNPROVEN",
+                    explanation=reason,
+                    broker_order_id=broker_order_id,
+                    filled_qty=filled_qty,
+                    fill_price=fill_price,
+                )
+                return False
         raw_prev_filled = current.get("filled_qty")
         prev_filled = _strict_nonnegative_whole_number(raw_prev_filled)
         if raw_prev_filled not in (None, "") and prev_filled is None:
@@ -1202,7 +1226,15 @@ class APOrderStateMachine:
         if position_id:
             updates.append("position_id=%s"); params.append(position_id)
         if new_status in (OrderStatus.FILLED, OrderStatus.EXIT_FILLED):
-            updates.append("filled_ts=%s"); params.append(filled_ts or now_utc_iso())
+            updates.append("filled_ts=%s")
+            params.append(
+                normalized_exit_fill_ts.isoformat()
+                if normalized_exit_fill_ts is not None
+                else (filled_ts or now_utc_iso())
+            )
+        elif new_status == OrderStatus.EXIT_PARTIAL_FILL:
+            updates.append("filled_ts=%s")
+            params.append(normalized_exit_fill_ts.isoformat())
         if kind.upper() == "ENTRY" and OrderStatus.is_terminal(new_status):
             updates.append(
                 "meta=COALESCE(meta, '{}'::jsonb) "
@@ -1380,6 +1412,11 @@ class APOrderStateMachine:
         self._handle_exit_engine_hooks(
             current=current, new_status=new_status, position_id=position_id,
             filled_qty=filled_qty, fill_price=fill_price,
+            filled_ts=(
+                normalized_exit_fill_ts.isoformat()
+                if normalized_exit_fill_ts is not None
+                else filled_ts
+            ),
             broker_order_id=broker_order_id or current.get("broker_order_id"),
             local_order_id=local_order_id,
         )
@@ -1899,6 +1936,7 @@ class APOrderStateMachine:
         position_id=None,
         filled_qty=None,
         fill_price=None,
+        filled_ts=None,
         broker_order_id=None,
         local_order_id=None,
     ) -> None:
@@ -1926,6 +1964,27 @@ class APOrderStateMachine:
 
             _local_id    = local_order_id or current.get("local_order_id")
             _broker_id   = broker_order_id or current.get("broker_order_id")
+            _normalized_fill_ts = None
+            if new_status in (
+                OrderStatus.EXIT_FILLED,
+                OrderStatus.EXIT_PARTIAL_FILL,
+            ):
+                _normalized_fill_ts = parse_aware_utc_timestamp(filled_ts)
+                if _normalized_fill_ts is None:
+                    log.critical(
+                        "[%s] EXIT hook blocked | order=%s pos=%s "
+                        "broker fill timestamp unproven=%r",
+                        self.client_id, _local_id, _pos_id, filled_ts,
+                    )
+                    self._call_exit_engine(
+                        _ee, "set_pending_exit_order", _pos_id,
+                        local_order_id=str(_local_id or ""),
+                        broker_order_id=str(_broker_id or ""),
+                        qty=0,
+                        reason="EXIT_FILL_TIMESTAMP_UNPROVEN_QUARANTINE",
+                        identity_quarantine=True,
+                    )
+                    return
             _order_qty   = self._safe_int(current.get("qty"), 0)
             _raw_prev_filled = current.get("filled_qty")
             _prev_filled = _strict_nonnegative_whole_number(_raw_prev_filled)
@@ -2079,6 +2138,28 @@ class APOrderStateMachine:
                     )
                     return
 
+                if _delta > int(_remaining_before):
+                    log.critical(
+                        "[%s] EXIT_FILLED quantity exceeds current remaining -- "
+                        "quarantining | order=%s pos=%s delta=%s remaining_before=%s",
+                        self.client_id,
+                        _local_id,
+                        _pos_id,
+                        _delta,
+                        _remaining_before,
+                    )
+                    self._call_exit_engine(
+                        _ee,
+                        "set_pending_exit_order",
+                        _pos_id,
+                        local_order_id=str(_local_id or ""),
+                        broker_order_id=str(_broker_id or ""),
+                        qty=0,
+                        reason="EXIT_FILLED_COVERAGE_MISMATCH_QUARANTINE",
+                        identity_quarantine=True,
+                    )
+                    return
+
                 if _delta < int(_remaining_before):
                     log.info(
                         "[%s] EXIT_FILLED treated as completed scale-out | order=%s pos=%s "
@@ -2122,6 +2203,7 @@ class APOrderStateMachine:
                     fill_price=fill_price,
                     local_order_id=str(_local_id or ""),
                     broker_order_id=str(_broker_id or ""),
+                    broker_exit_fill_ts=_normalized_fill_ts,
                     cumulative_filled=_cum_filled,
                 )
                 # Finalize position row from confirmed broker fill truth.
@@ -2193,6 +2275,7 @@ class APOrderStateMachine:
         cumulative_filled: int,
         fill_price=None,
         broker_order_id=None,
+        filled_ts=None,
     ) -> bool:
         order = self._get_order(local_order_id)
         if not order:
@@ -2215,6 +2298,7 @@ class APOrderStateMachine:
             broker_order_id=broker_order_id or order.get("broker_order_id"),
             filled_qty=cumulative_filled,
             fill_price=fill_price,
+            filled_ts=filled_ts,
         )
 
     def increment_retry(self, local_order_id: str):
@@ -7186,11 +7270,18 @@ class APOrderStateMachine:
 
             validated_price = _strict_positive_finite_float(_fill_price)
             validated_qty = _strict_positive_whole_number(_filled_qty)
-            if not position_id or validated_price is None or validated_qty is None:
+            normalized_filled_ts = parse_aware_utc_timestamp(_filled_ts)
+            if (
+                not position_id
+                or validated_price is None
+                or validated_qty is None
+                or normalized_filled_ts is None
+            ):
                 log.warning(
                     "[%s] _finalize_position_from_exit_order skipped — incomplete fill data | "
-                    "order=%s pos=%s price=%r qty=%r",
+                    "order=%s pos=%s price=%r qty=%r filled_ts=%r",
                     self.client_id, local_order_id, position_id, _fill_price, _filled_qty,
+                    _filled_ts,
                 )
                 return
 
@@ -7201,7 +7292,7 @@ class APOrderStateMachine:
                 position_id=position_id,
                 exit_price=validated_price,
                 filled_qty=validated_qty,
-                filled_ts=str(_filled_ts) if _filled_ts else now_utc_iso(),
+                filled_ts=normalized_filled_ts.isoformat(),
                 local_order_id=local_order_id,
                 broker_order_id=_broker_id,
                 close_source="broker_exit_fill",

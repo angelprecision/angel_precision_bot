@@ -344,6 +344,7 @@ def test_first_close_returns_false_when_proof_binding_fails(monkeypatch):
 
     ok = apm.close_position_from_exit_fill(
         position_id=POSITION_ID, exit_price=0.90, filled_qty=2,
+        filled_ts="2026-07-21T15:57:39+00:00",
         broker_order_id="BROKER-1", exit_reason="broker_close",
         close_source="broker_exit_fill",
     )

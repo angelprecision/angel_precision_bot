@@ -456,6 +456,66 @@ def test_shared_finalizer_rejects_invalid_exit_economics_before_db_mutation(
     assert conn_calls == []
 
 
+def test_shared_finalizer_rejects_exit_underfill_without_position_mutation(
+    monkeypatch,
+):
+    """A broker FILLED quantity must cover the locked remaining position exactly."""
+    position = {
+        "id": POSITION_ID,
+        "client_id": CLIENT,
+        "status": "OPEN",
+        "qty": 5,
+        "quantity_remaining": 2,
+        "avg_fill": 2.33,
+        "entry_ts": "2026-08-10T18:00:00+00:00",
+        "pending_exit_local_order_id": "exit-local-1",
+        "pending_exit_broker_order_id": "TR-195",
+    }
+    updates: list[tuple] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if compact.startswith("SELECT * FROM POSITIONS") and "FOR UPDATE" in compact:
+                self._row = dict(position)
+            elif compact.startswith("UPDATE POSITIONS"):
+                updates.append((sql, params))
+
+        def fetchone(self):
+            return getattr(self, "_row", None)
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(position_manager_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(position_manager_mod, "run_with_retry", lambda fn: fn())
+
+    pm = position_manager_mod.APPositionManager(CLIENT)
+    assert pm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=4.79,
+        filled_qty=1,
+        filled_ts="2026-08-10T19:00:00+00:00",
+        local_order_id="exit-local-1",
+        broker_order_id="TR-195",
+        expected_pending_exit_local_order_id="exit-local-1",
+        expected_pending_exit_broker_order_id="TR-195",
+    ) is False
+    assert updates == []
+
+
 def test_shared_finalizer_rechecks_pending_pair_even_when_expected_pair_omitted(
     monkeypatch,
 ):
@@ -622,6 +682,100 @@ def test_osm_fill_transition_rejects_malformed_economics_before_db_write(
 
 
 @pytest.mark.parametrize(
+    "filled_ts",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("2026-08-10T19:00:00", id="naive"),
+    ],
+)
+def test_osm_exit_fill_requires_aware_timestamp_before_db_write(
+    monkeypatch, filled_ts
+):
+    from ap.order_state_machine import APOrderStateMachine
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT
+    osm._get_order = lambda _local_id: {
+        "local_order_id": "exit-local-1",
+        "client_id": CLIENT,
+        "kind": "EXIT",
+        "status": "EXIT_SUBMITTED",
+        "filled_qty": 0,
+    }
+    osm._record_error = MagicMock()
+    osm._emit_transition_event = MagicMock()
+    monkeypatch.setattr(
+        "ap.order_state_machine.run_with_retry",
+        lambda _fn: pytest.fail("unproven EXIT timestamp reached DB mutation"),
+    )
+
+    assert osm.transition(
+        "exit-local-1",
+        "EXIT_FILLED",
+        broker_order_id="TR-195",
+        filled_qty=2,
+        fill_price=4.79,
+        filled_ts=filled_ts,
+    ) is False
+    assert osm._emit_transition_event.call_args.kwargs["reason_code"] == (
+        "EXIT_FILL_TIMESTAMP_UNPROVEN"
+    )
+
+
+def test_osm_exit_filled_overcoverage_quarantines_without_close(monkeypatch):
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_module
+
+    class _ExitEngine:
+        def __init__(self):
+            self.pending_calls = []
+            self.closed_calls = []
+            self.partial_calls = []
+
+        def set_pending_exit_order(self, position_id, **kwargs):
+            self.pending_calls.append((position_id, kwargs))
+
+        def mark_position_closed(self, position_id, **kwargs):
+            self.closed_calls.append((position_id, kwargs))
+
+        def note_partial_exit_fill(self, position_id, qty, **kwargs):
+            self.partial_calls.append((position_id, qty, kwargs))
+
+    engine = _ExitEngine()
+    monkeypatch.setattr(
+        osm_module, "_get_exit_engine_for_client", lambda _client: engine
+    )
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT
+    osm._get_position_remaining_from_db = MagicMock(return_value=2)
+    osm._get_exit_engine_position = MagicMock()
+
+    osm._handle_exit_engine_hooks(
+        current={
+            "local_order_id": "exit-local-1",
+            "kind": "EXIT",
+            "qty": 2,
+            "filled_qty": 0,
+            "position_id": POSITION_ID,
+        },
+        new_status="EXIT_FILLED",
+        position_id=POSITION_ID,
+        filled_qty=3,
+        fill_price=4.79,
+        filled_ts="2026-08-10T19:00:00+00:00",
+        broker_order_id="TR-195",
+        local_order_id="exit-local-1",
+    )
+
+    assert engine.closed_calls == []
+    assert engine.partial_calls == []
+    assert len(engine.pending_calls) == 1
+    assert engine.pending_calls[0][1]["reason"] == (
+        "EXIT_FILLED_COVERAGE_MISMATCH_QUARANTINE"
+    )
+
+
+@pytest.mark.parametrize(
     ("filled_qty", "fill_price"),
     [
         pytest.param(0, 4.79, id="zero-qty"),
@@ -727,6 +881,127 @@ def test_autonomous_filled_order_without_price_holds_without_close():
     assert action.action == "NOOP"
     assert action.reason == "autonomous_recovery_broker_filled_exact_economics_missing"
     engine.mark_position_closed.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw_qty", "raw_timestamp", "expected_reason"),
+    [
+        pytest.param(
+            1,
+            "2026-08-10T19:00:00+00:00",
+            "autonomous_recovery_broker_filled_quantity_mismatch",
+            id="underfill",
+        ),
+        pytest.param(
+            2,
+            None,
+            "autonomous_recovery_broker_filled_timestamp_unproven",
+            id="missing-timestamp",
+        ),
+        pytest.param(
+            2,
+            "2026-08-10T19:00:00",
+            "autonomous_recovery_broker_filled_timestamp_unproven",
+            id="naive-timestamp",
+        ),
+    ],
+)
+def test_autonomous_recovery_holds_without_exact_qty_and_timestamp(
+    raw_qty, raw_timestamp, expected_reason
+):
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        option_symbol=TARGET_CONTRACT,
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+        pending_exit_qty=2,
+        quantity_remaining=2,
+        opened_at=datetime(2026, 8, 10, 18, 0, tzinfo=timezone.utc),
+    )
+
+    raw = {
+        "status": "filled",
+        "exec_quantity": raw_qty,
+        "avg_fill_price": 4.79,
+    }
+    if raw_timestamp is not None:
+        raw["transaction_date"] = raw_timestamp
+
+    class _Broker:
+        def get_order(self, _broker_id):
+            return raw
+
+    engine = MagicMock()
+    action = recover_exit_position(pos, broker=_Broker(), exit_engine=engine)
+
+    assert action.action == "NOOP"
+    assert action.reason == expected_reason
+    engine.mark_position_closed.assert_not_called()
+
+
+def test_autonomous_recovery_exact_fill_forwards_broker_timestamp():
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    fill_ts = datetime(2026, 8, 10, 19, 0, tzinfo=timezone.utc)
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        option_symbol=TARGET_CONTRACT,
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+        pending_exit_qty=2,
+        quantity_remaining=2,
+        opened_at=datetime(2026, 8, 10, 18, 0, tzinfo=timezone.utc),
+    )
+
+    class _Broker:
+        def get_order(self, _broker_id):
+            return {
+                "status": "filled",
+                "exec_quantity": 2,
+                "avg_fill_price": 4.79,
+                "transaction_date": fill_ts.isoformat(),
+            }
+
+    engine = MagicMock()
+    action = recover_exit_position(pos, broker=_Broker(), exit_engine=engine)
+
+    assert action.action == "MARKED_CLOSED"
+    assert engine.mark_position_closed.call_args.kwargs["broker_exit_fill_ts"] == fill_ts
+
+
+def test_force_reconcile_filled_undercoverage_holds_without_close():
+    from ap_exit_engine import APExitEngine
+
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        ticker="C",
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+        quantity_remaining=2,
+        opened_at=datetime(2026, 8, 10, 18, 0, tzinfo=timezone.utc),
+    )
+    engine = APExitEngine.__new__(APExitEngine)
+    engine.broker = MagicMock()
+    engine.broker.get_order.return_value = {
+        "status": "filled",
+        "exec_quantity": 1,
+        "avg_fill_price": 4.79,
+        "transaction_date": "2026-08-10T19:00:00+00:00",
+    }
+    engine._emit_exit_event = MagicMock()
+    engine.mark_position_closed = MagicMock()
+    engine.note_partial_exit_fill = MagicMock()
+
+    engine._attempt_quarantine_force_reconcile(pos, 10)
+
+    engine.mark_position_closed.assert_not_called()
+    engine.note_partial_exit_fill.assert_not_called()
+    assert any(
+        call.kwargs.get("reason_code") == "FORCE_RECONCILE_FILL_COVERAGE_MISMATCH"
+        for call in engine._emit_exit_event.call_args_list
+    )
 
 
 @pytest.mark.parametrize(
@@ -1798,6 +2073,7 @@ def test_reconciler_exact_scale_out_callback_uses_remaining_qty_for_proof():
         quantity_remaining=2,
         _submit_generation=0,
         current_option_price=2.33,
+        opened_at=datetime(2026, 8, 10, 18, 0, tzinfo=timezone.utc),
         exit_in_flight=True,
         pending_exit_reason="",
         pending_exit_action="",
@@ -1914,6 +2190,7 @@ def test_reconciler_scale_out_canonical_proof_is_restart_idempotent(monkeypatch)
         quantity_remaining=2,
         _submit_generation=0,
         current_option_price=2.33,
+        opened_at=datetime(2026, 8, 10, 18, 0, tzinfo=timezone.utc),
         exit_in_flight=True,
         pending_exit_reason="",
         pending_exit_action="",

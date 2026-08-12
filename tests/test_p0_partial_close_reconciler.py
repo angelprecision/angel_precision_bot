@@ -711,10 +711,11 @@ class TestPartialCloseSkipsProofTrade(unittest.TestCase):
 
 class TestScopeGuard(unittest.TestCase):
     """
-    Confirm the fix touches zero scanner/entry/sizing files.
+    Confirm the fix touches zero scanner/entry/sizing files. The shared
+    broker-fill finalizer is intentionally amended for provenance enforcement.
     The changed files are a strict subset of:
       ap_reconciler.py, ap_exit_engine.py,
-      ap/position_manager.py, ap/admin_api.py
+      ap/position_manager.py, ap_execution_core.py, ap/admin_api.py
     """
 
     CHANGED_FILES = {
@@ -726,7 +727,6 @@ class TestScopeGuard(unittest.TestCase):
 
     FORBIDDEN_FILES = {
         "ap_master_control.py",
-        "ap_execution_core.py",
         "ap/contract_selector.py",
         "ap/position_sizer.py",
         "ap/queue.py",

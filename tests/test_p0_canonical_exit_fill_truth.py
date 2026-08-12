@@ -543,7 +543,7 @@ def test_partial_fill_projects_exact_durable_exit_ownership(monkeypatch) -> None
     }
 
 
-def test_partial_fill_with_null_filled_ts_is_reconciled_from_exact_current_local_order(monkeypatch) -> None:
+def test_partial_fill_with_null_filled_ts_holds_before_position_mutation(monkeypatch) -> None:
     import ap.exit_fill_truth_guard as guard
 
     position_updates_seen = []
@@ -645,28 +645,14 @@ def test_partial_fill_with_null_filled_ts_is_reconciled_from_exact_current_local
         "filled_ts": None,
     }
 
-    first = _run_reconciliation_attempt(order, result_payload, attempt_count=1)
-    second = _run_reconciliation_attempt(order, result_payload, attempt_count=1)
+    for _ in range(2):
+        with pytest.raises(
+            guard.LifecycleProjectionError,
+            match="EXIT_FILL_TIMESTAMP_UNPROVEN",
+        ):
+            _run_reconciliation_attempt(order, result_payload, attempt_count=1)
 
-    assert len(position_updates_seen) == 2
-    for updates in position_updates_seen:
-        assert updates["contracts_exited"] == 2
-        assert updates["quantity_remaining"] == 2
-        assert updates["realized_pnl"] == pytest.approx(100.0)
-        assert updates["realized_pnl_pct"] == pytest.approx(50.0)
-        assert "status" not in updates
-        assert updates["exit_in_flight"] is True
-        assert updates["pending_exit_local_order_id"] == "exit-current"
-        assert updates["pending_exit_broker_order_id"] == "broker-current"
-        assert updates["pending_exit_qty"] == 2
-    assert first["projection"].remaining_qty == 2
-    assert first["projection"].exited_qty == 2
-    assert first["projection"].realized_pnl == pytest.approx(100.0)
-    assert first["proof_rows_updated"] == 0
-    assert first["proof_reconciliation"] is None
-    assert first["exit_ownership"]["pending_exit_local_order_id"] == "exit-current"
-    assert second["projection"].remaining_qty == 2
-    assert second["projection"].exited_qty == 2
+    assert position_updates_seen == []
 
 
 def test_exact_originating_entry_proof_identity_wins_over_position_fallback() -> None:

@@ -318,7 +318,11 @@ def finalize_proof_callable():
     #   - _record_intel_outcome (PR B FIX-6; falls back to None if the
     #     intelligence_bridge import fails. Safe default = None; the
     #     method's `if _record_intel_outcome:` guard handles None.)
-    src = "import os\nimport math\nimport logging\nlog = logging.getLogger('test_finalize')\n"
+    src = (
+        "import os\nimport math\nimport logging\n"
+        "from ap.utils import parse_aware_utc_timestamp\n"
+        "log = logging.getLogger('test_finalize')\n"
+    )
     src += f'BREAKEVEN_BAND_PCT = float(os.getenv("BREAKEVEN_BAND_PCT", "{_be_default}"))\n'
     src += "_record_intel_outcome = None\n"
     src += "class _Harness:\n"
@@ -489,6 +493,34 @@ class TestFinalizeProofBehavior:
             pos,
             actual_fill_price=3.60,
             broker_exit_filled_qty=bad_qty,
+        ) is False
+        assert pos._proof_finalized is False
+        assert h.proof.log_trade.call_count == 0
+        assert h.feedback.record_outcome.call_count == 0
+        assert h.store.update_status.call_count == 0
+        assert h.shadow.record_live_outcome.call_count == 0
+
+    @pytest.mark.parametrize(
+        "bad_ts",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param("2026-05-26T14:00:00", id="naive"),
+            pytest.param("2026-05-26T13:59:59+00:00", id="before-entry"),
+        ],
+    )
+    def test_invalid_callback_timestamp_is_zero_sink_mutation(
+        self, finalize_proof_callable, bad_ts
+    ):
+        h = _build_harness(finalize_proof_callable)
+        pos = _build_pos(_make_staged())
+
+        assert h._finalize_proof(
+            pos,
+            actual_fill_price=3.60,
+            exit_local_order_id="exit-local-1",
+            broker_exit_order_id="broker-exit-1",
+            broker_exit_fill_ts=bad_ts,
+            broker_exit_filled_qty=2,
         ) is False
         assert pos._proof_finalized is False
         assert h.proof.log_trade.call_count == 0

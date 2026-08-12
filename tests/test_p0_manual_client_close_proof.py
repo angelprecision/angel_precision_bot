@@ -237,6 +237,19 @@ def test_manual_close_adopts_exact_fill_then_calls_canonical_finalizer(monkeypat
     assert runner.core.exit_eng.closed == [POSITION_ID]
 
 
+def test_manual_close_rejects_naive_external_fill_timestamp(monkeypatch):
+    evidence, reason = manual_mod.select_external_close_fills(
+        orders=[_filled_exit(transaction_date="2026-07-21T15:57:39")],
+        position=_position(),
+        bot_exit_order_ids=set(),
+        adopted_fills=[],
+        detected_at=datetime.fromtimestamp(DETECTED_EPOCH, tz=timezone.utc),
+    )
+
+    assert evidence is None
+    assert reason == "no_exact_external_filled_exit_order"
+
+
 # ─── broker error paths (uncertainty, never "empty account") ─────────────────
 
 def test_positions_query_failure_never_reads_orders_or_mutates(monkeypatch):

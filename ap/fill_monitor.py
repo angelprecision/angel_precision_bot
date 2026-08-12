@@ -45,7 +45,7 @@ from typing import Optional
 
 from ap.trace import trace_gate
 from ap.db import conn, run_with_retry
-from ap.utils import now_utc_iso, json_dumps, json_loads
+from ap.utils import now_utc_iso, json_dumps, json_loads, parse_aware_utc_timestamp
 from ap.logger import get_logger
 from ap.config import Config
 from ap.state import release_equity, release_symbol_lock
@@ -117,6 +117,27 @@ def _strict_nonnegative_whole_number(value) -> int | None:
     if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
         return None
     return int(parsed)
+
+
+_BROKER_FILL_TIMESTAMP_KEYS = (
+    "filled_ts",
+    "filled_at",
+    "fill_ts",
+    "last_fill_date",
+    "transaction_date",
+)
+
+
+def _broker_fill_timestamp(raw: dict, order: dict) -> str | None:
+    """Return explicit aware broker fill time; never substitute local time."""
+    for key in _BROKER_FILL_TIMESTAMP_KEYS:
+        if key in raw:
+            parsed = parse_aware_utc_timestamp(raw.get(key))
+            return parsed.isoformat() if parsed is not None else None
+    if order.get("filled_ts") not in (None, ""):
+        parsed = parse_aware_utc_timestamp(order.get("filled_ts"))
+        return parsed.isoformat() if parsed is not None else None
+    return None
 
 ALLOW_LEGACY_FILL_MONITOR = (
     os.getenv("ALLOW_LEGACY_FILL_MONITOR", "0").strip().lower()
@@ -1176,11 +1197,13 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 raw_fill_price = raw.get(_price_key)
                 break
         avg_fill = _strict_positive_finite_float(raw_fill_price) or 0.0
+        filled_ts = _broker_fill_timestamp(raw, order)
 
         result = {
             "status": our,
             "filled_qty": filled_qty,
             "avg_fill": avg_fill,
+            "filled_ts": filled_ts,
             "reason": raw.get("reason") or status,
             "raw": raw,
         }
@@ -1297,6 +1320,36 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 **result,
                 "status": "ERROR",
                 "filled_qty": 0,
+                "reason": reason,
+            }
+
+        if kind == "EXIT" and our in {"EXIT_FILLED", "EXIT_PARTIAL_FILL"} and filled_ts is None:
+            reason = "BROKER_EXIT_FILL_TIMESTAMP_UNPROVEN"
+            client_id = str(order.get("client_id") or "default")
+            payload = {
+                "local_order_id": order.get("local_order_id"),
+                "broker_order_id": broker_order_id,
+                "kind": kind,
+                "mapped_status": our,
+                "filled_qty": filled_qty,
+                "avg_fill": avg_fill,
+            }
+            log.critical("[%s] %s | %s", client_id, reason, payload)
+            audit(client_id, "CRITICAL", reason, payload)
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code=reason,
+                explanation=(
+                    "Broker EXIT fill lacks an explicit timezone-aware fill timestamp; "
+                    "OSM/position/proof mutation is held pending authoritative evidence."
+                ),
+                result=result,
+                extra_context=payload,
+            )
+            return {
+                **result,
+                "status": "ERROR",
                 "reason": reason,
             }
 
@@ -4229,6 +4282,7 @@ def process_pending_order(
                         mapped,
                         filled_qty=new_filled,
                         fill_price=result.get("avg_fill"),
+                        filled_ts=result.get("filled_ts"),
                         broker_order_id=broker_id,
                     )
             except Exception as exc:
@@ -4579,6 +4633,7 @@ def process_pending_order(
                         local_order_id=local_id,
                         cumulative_filled=new_filled,
                         fill_price=result.get("avg_fill"),
+                        filled_ts=result.get("filled_ts"),
                         broker_order_id=broker_id,
                     )
                 else:
@@ -4587,6 +4642,7 @@ def process_pending_order(
                         mapped,
                         filled_qty=new_filled,
                         fill_price=result.get("avg_fill"),
+                        filled_ts=result.get("filled_ts"),
                         broker_order_id=broker_id,
                     )
                 partial_applied = True

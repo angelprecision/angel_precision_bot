@@ -36,7 +36,7 @@ from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
-from ap.utils                import now_utc_iso
+from ap.utils                import now_utc_iso, parse_aware_utc_timestamp
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -10025,6 +10025,29 @@ class APExecutionCore:
             ):
                 return False
             broker_exit_filled_qty = int(_proof_qty)
+
+            _proof_fill_ts = parse_aware_utc_timestamp(broker_exit_fill_ts)
+            _proof_entry_ts = parse_aware_utc_timestamp(
+                staged.get("opened_at") or staged.get("entry_ts")
+            )
+            if (
+                not str(exit_local_order_id or "").strip()
+                or not str(broker_exit_order_id or "").strip()
+                or _proof_fill_ts is None
+                or _proof_entry_ts is None
+                or _proof_fill_ts < _proof_entry_ts
+            ):
+                log.critical(
+                    "[%s] _finalize_proof blocked | unproven broker EXIT provenance "
+                    "local=%r broker=%r fill_ts=%r entry_ts=%r",
+                    getattr(pos, "ticker", "?"),
+                    exit_local_order_id,
+                    broker_exit_order_id,
+                    broker_exit_fill_ts,
+                    _proof_entry_ts,
+                )
+                return False
+            broker_exit_fill_ts = _proof_fill_ts
 
         # Reconciler exact-close callbacks may be completing only the remaining
         # tranche after an earlier scale-out.  Keep ordinary proof semantics

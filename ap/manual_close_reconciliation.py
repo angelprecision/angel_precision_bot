@@ -46,6 +46,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from ap.utils import parse_aware_utc_timestamp
+
 log = logging.getLogger("client_runner.manual_close")
 
 MANUAL_CLOSE_INTERVAL_SEC = float(
@@ -123,46 +125,7 @@ def positive_int(value: Any) -> int:
 
 
 def parse_timestamp(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, (int, float)):
-        raw = float(value)
-        if raw > 10_000_000_000:
-            raw /= 1000.0
-        try:
-            parsed = datetime.fromtimestamp(raw, tz=timezone.utc)
-        except Exception:
-            return None
-    else:
-        text = str(value).strip()
-        if not text:
-            return None
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(text)
-        except Exception:
-            parsed = None
-            for fmt in (
-                "%Y-%m-%dT%H:%M:%S.%f%z",
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%d %H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S.%f",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S",
-            ):
-                try:
-                    parsed = datetime.strptime(text, fmt)
-                    break
-                except Exception:
-                    continue
-            if parsed is None:
-                return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parse_aware_utc_timestamp(value)
 
 
 def normalize_positions_payload(payload: Any) -> list[dict]:

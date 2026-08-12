@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ap.utils import parse_aware_utc_timestamp
+
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
 OPEN_BROKER_STATUSES = {"open", "pending", "accepted", "submitted", "queued", "working", "acknowledged", "partially_filled"}
@@ -95,6 +97,42 @@ def _filled_qty(raw: dict) -> int:
             return 0
         return int(parsed)
     return 0
+
+
+_BROKER_FILL_TIMESTAMP_KEYS = (
+    "filled_ts",
+    "filled_at",
+    "fill_ts",
+    "last_fill_date",
+    "transaction_date",
+)
+
+
+def _broker_fill_timestamp(raw: dict) -> datetime | None:
+    """Return explicit broker fill time; never manufacture recovery time."""
+    for key in _BROKER_FILL_TIMESTAMP_KEYS:
+        if key in raw:
+            return parse_aware_utc_timestamp(raw.get(key))
+    return None
+
+
+def _position_value(pos: Any, name: str, default: Any = None) -> Any:
+    if isinstance(pos, dict):
+        return pos.get(name, default)
+    return getattr(pos, name, default)
+
+
+def _position_remaining(pos: Any) -> Optional[int]:
+    raw = _position_value(pos, "quantity_remaining")
+    if raw in (None, "") or isinstance(raw, bool):
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
 
 
 def _broker_position_qty(raw: dict) -> Optional[int]:
@@ -352,6 +390,46 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                             "requires_exact_exit_fill": True,
                         },
                     )
+                fill_ts = _broker_fill_timestamp(raw)
+                entry_ts = parse_aware_utc_timestamp(
+                    _position_value(pos, "opened_at")
+                    or _position_value(pos, "entry_ts")
+                )
+                if fill_ts is None or entry_ts is None or fill_ts < entry_ts:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_timestamp_unproven",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "fill_price": fill_price,
+                            "filled_ts": fill_ts.isoformat() if fill_ts else None,
+                            "entry_ts": entry_ts.isoformat() if entry_ts else None,
+                            "quote_health": qh,
+                            "requires_aware_broker_fill_timestamp": True,
+                        },
+                    )
+                remaining_qty = _position_remaining(pos)
+                if remaining_qty is None or filled_qty != remaining_qty:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_quantity_mismatch",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "remaining_qty": remaining_qty,
+                            "fill_price": fill_price,
+                            "filled_ts": fill_ts.isoformat(),
+                            "quote_health": qh,
+                            "requires_exact_remaining_coverage": True,
+                        },
+                    )
                 mark = getattr(exit_engine, "mark_position_closed", None) if exit_engine else None
                 if not callable(mark):
                     return RecoveryAction(
@@ -372,6 +450,7 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                     cumulative_filled=filled_qty,
                     broker_exit_order_id=pending_broker_id,
                     broker_exit_filled_qty=filled_qty,
+                    broker_exit_fill_ts=fill_ts,
                     reconciled=True,
                 )
                 if mark_result is False:

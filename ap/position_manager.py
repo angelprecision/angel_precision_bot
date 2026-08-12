@@ -28,7 +28,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from ap.db import conn, run_with_retry
-from ap.utils import now_utc_iso
+from ap.utils import now_utc_iso, parse_aware_utc_timestamp
 
 log = logging.getLogger("ap.position_manager")
 ET = ZoneInfo("America/New_York")
@@ -2275,7 +2275,8 @@ class APPositionManager:
             )
             return False
 
-        ts = filled_ts or now_utc_iso()
+        fill_ts_dt = parse_aware_utc_timestamp(filled_ts)
+        ts = fill_ts_dt.isoformat() if fill_ts_dt is not None else None
 
         def _fn():
             with conn() as c:
@@ -2443,6 +2444,26 @@ class APPositionManager:
                     return False, "nonterminal_position_has_zero_remaining"
                 # ── End canonical state classification ────────────────────────
 
+                if fill_ts_dt is None:
+                    log.critical(
+                        "[%s] close_position_from_exit_fill blocked | pos=%s "
+                        "broker EXIT fill timestamp is missing, malformed, or naive",
+                        self.client_id,
+                        position_id,
+                    )
+                    return False, "invalid_broker_exit_fill_timestamp"
+                entry_ts_dt = parse_aware_utc_timestamp(
+                    pos.get("entry_ts") or pos.get("opened_at")
+                )
+                if entry_ts_dt is not None and fill_ts_dt < entry_ts_dt:
+                    log.critical(
+                        "[%s] close_position_from_exit_fill blocked | pos=%s "
+                        "broker EXIT fill precedes entry",
+                        self.client_id,
+                        position_id,
+                    )
+                    return False, "broker_exit_fill_before_entry"
+
                 avg_fill = _avg_fill
                 qty      = _idm_qty
                 current_remaining = pos.get("quantity_remaining")
@@ -2453,10 +2474,21 @@ class APPositionManager:
                 if avg_fill is None or qty is None or current_remaining is None or current_remaining <= 0:
                     return False, "invalid_position_cost_basis"
 
+                if fill_qty != current_remaining:
+                    log.critical(
+                        "[%s] close_position_from_exit_fill blocked | pos=%s "
+                        "EXIT fill qty=%s does not exactly cover remaining=%s",
+                        self.client_id,
+                        position_id,
+                        fill_qty,
+                        current_remaining,
+                    )
+                    return False, "exit_fill_quantity_does_not_cover_remaining"
+
                 # current_remaining is guaranteed > 0 here (idempotency guard
                 # handled the zero-remaining case above).
-                close_qty    = min(fill_qty, current_remaining)
-                new_remaining = max(current_remaining - close_qty, 0)
+                close_qty    = fill_qty
+                new_remaining = 0
 
                 realized_pnl     = round((exit_px - avg_fill) * close_qty * 100, 2)
                 realized_pnl_pct = round(((exit_px - avg_fill) / avg_fill) * 100, 2) if avg_fill else 0.0

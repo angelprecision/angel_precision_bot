@@ -71,6 +71,7 @@ from ap.exit_thresholds import (
     effective_thresholds as _shared_effective_thresholds,
     option_profile as _shared_option_profile,
 )
+from ap.utils import parse_aware_utc_timestamp
 
 
 try:
@@ -5466,6 +5467,7 @@ class APExitEngine:
         )
         _callback_qty = _positive_whole_or_none(_callback_qty_raw)
         _callback_price = _positive_or_none(fill_price)
+        _callback_fill_ts = parse_aware_utc_timestamp(broker_exit_fill_ts)
         _proof_contracts_override = _positive_whole_or_none(proof_contracts_override)
         if (
             _callback_qty_raw is not None
@@ -5483,6 +5485,15 @@ class APExitEngine:
                 fill_price,
             )
             return False
+        if _callback_qty_raw is not None and _callback_fill_ts is None:
+            log.critical(
+                "[%s] mark_position_closed blocked | unproven broker EXIT fill timestamp "
+                "pos=%s fill_ts=%r",
+                getattr(self, "_email", "?"),
+                position_id,
+                broker_exit_fill_ts,
+            )
+            return False
         if proof_contracts_override is not None and _proof_contracts_override is None:
             log.critical(
                 "[%s] mark_position_closed blocked | invalid proof contracts override "
@@ -5490,6 +5501,20 @@ class APExitEngine:
                 getattr(self, "_email", "?"),
                 position_id,
                 proof_contracts_override,
+            )
+            return False
+        if (
+            _callback_qty is not None
+            and _proof_contracts_override is not None
+            and _proof_contracts_override != _callback_qty
+        ):
+            log.critical(
+                "[%s] mark_position_closed blocked | proof contracts override "
+                "does not match broker EXIT quantity pos=%s contracts=%s qty=%s",
+                getattr(self, "_email", "?"),
+                position_id,
+                _proof_contracts_override,
+                _callback_qty,
             )
             return False
 
@@ -5521,6 +5546,37 @@ class APExitEngine:
                         position_id,
                         _callback_qty_raw,
                         fill_price,
+                    )
+                    return False
+                _entry_ts = parse_aware_utc_timestamp(
+                    getattr(pos, "opened_at", None)
+                    or getattr(pos, "entry_ts", None)
+                )
+                if _entry_ts is None or _callback_fill_ts < _entry_ts:
+                    log.critical(
+                        "[%s] mark_position_closed blocked | broker EXIT fill timestamp "
+                        "is missing, malformed, or before entry pos=%s fill_ts=%r entry_ts=%r",
+                        getattr(self, "_email", "?"),
+                        position_id,
+                        _callback_fill_ts,
+                        _entry_ts,
+                    )
+                    return False
+                _remaining_qty = _nonnegative_whole_or_none(
+                    getattr(pos, "quantity_remaining", None)
+                )
+                if (
+                    _remaining_qty is None
+                    or _remaining_qty <= 0
+                    or _callback_qty != _remaining_qty
+                ):
+                    log.critical(
+                        "[%s] mark_position_closed blocked | broker EXIT quantity "
+                        "does not exactly cover remaining pos=%s qty=%s remaining=%s",
+                        getattr(self, "_email", "?"),
+                        position_id,
+                        _callback_qty,
+                        _remaining_qty,
                     )
                     return False
                 pos.closed        = True
@@ -5562,7 +5618,7 @@ class APExitEngine:
                                 or getattr(pos, "pending_exit_broker_order_id", "")
                                 or ""
                             ),
-                            broker_exit_fill_ts=broker_exit_fill_ts,
+                            broker_exit_fill_ts=_callback_fill_ts,
                             broker_exit_filled_qty=(
                                 _callback_qty
                             ),
@@ -6398,8 +6454,20 @@ class APExitEngine:
                 _fill_price = _positive_or_none(_v)
                 break
 
+        _fill_ts = None
+        for _tk in (
+            "filled_ts",
+            "filled_at",
+            "fill_ts",
+            "last_fill_date",
+            "transaction_date",
+        ):
+            if _tk in broker_raw:
+                _fill_ts = parse_aware_utc_timestamp(broker_raw.get(_tk))
+                break
+
         if broker_status in _broker_filled and (
-            _filled_qty is None or _fill_price is None
+            _filled_qty is None or _fill_price is None or _fill_ts is None
         ):
             log.critical(
                 "[%s] QUARANTINE_FORCE_RECONCILE_FILL_TRUTH_INVALID | pos=%s "
@@ -6425,11 +6493,81 @@ class APExitEngine:
                     "broker_status": broker_status,
                     "filled_qty": _filled_qty,
                     "fill_price": _fill_price,
+                    "filled_ts": _fill_ts.isoformat() if _fill_ts else None,
+                },
+            )
+            return
+
+        _entry_ts = parse_aware_utc_timestamp(
+            getattr(pos, "opened_at", None) or getattr(pos, "entry_ts", None)
+        )
+        _remaining_qty = _nonnegative_whole_or_none(
+            getattr(pos, "quantity_remaining", None)
+        )
+        if (
+            _fill_ts is None
+            or _entry_ts is None
+            or _fill_ts < _entry_ts
+            or _remaining_qty is None
+            or _remaining_qty <= 0
+            or _filled_qty is None
+            or _filled_qty > _remaining_qty
+        ):
+            log.critical(
+                "[%s] QUARANTINE_FORCE_RECONCILE_FILL_PROVENANCE_INVALID | "
+                "pos=%s broker=%s fill_ts=%r entry_ts=%r filled_qty=%r remaining=%r — holding",
+                ticker,
+                position_id or "?",
+                broker_oid,
+                _fill_ts,
+                _entry_ts,
+                _filled_qty,
+                _remaining_qty,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_FILL_PROVENANCE_INVALID",
+                explanation=(
+                    "Forced broker fill lacks an aware post-entry timestamp or "
+                    "exceeds the current remaining position quantity; no mutation applied."
+                ),
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "broker_order_id": broker_oid,
+                    "broker_status": broker_status,
+                    "filled_qty": _filled_qty,
+                    "remaining_qty": _remaining_qty,
+                    "fill_ts": _fill_ts.isoformat() if _fill_ts else None,
                 },
             )
             return
 
         if broker_status == "filled":
+            if _filled_qty != _remaining_qty:
+                log.critical(
+                    "[%s] QUARANTINE_FORCE_RECONCILE_FILL_COVERAGE_MISMATCH | "
+                    "pos=%s broker=%s filled_qty=%s remaining=%s — holding",
+                    ticker, position_id or "?", broker_oid,
+                    _filled_qty, _remaining_qty,
+                )
+                self._emit_exit_event(
+                    pos,
+                    decision="ALERT",
+                    reason_code="FORCE_RECONCILE_FILL_COVERAGE_MISMATCH",
+                    explanation=(
+                        "Broker FILLED quantity does not exactly cover the current "
+                        "remaining position; no terminal close applied."
+                    ),
+                    stage="exit_reconciliation",
+                    extra_inputs={
+                        "broker_order_id": broker_oid,
+                        "broker_status": broker_status,
+                        "filled_qty": _filled_qty,
+                        "remaining_qty": _remaining_qty,
+                    },
+                )
+                return
             # Full fill confirmed — hard close is correct and safe.
             log.critical(
                 "[%s] QUARANTINE_FORCE_RECONCILE_FILL_CONFIRMED | pos=%s broker=%s | "
@@ -6459,6 +6597,7 @@ class APExitEngine:
                 local_order_id=pos.pending_exit_local_order_id,
                 broker_exit_order_id=broker_oid,
                 broker_exit_filled_qty=_filled_qty,
+                broker_exit_fill_ts=_fill_ts,
                 force=True,
             )
 

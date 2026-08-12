@@ -19,6 +19,7 @@ from ap.operator.live_execution_journal import (
     PRICE_SOURCE_TRADIER_EXIT,
     classify_official,
 )
+from ap.utils import parse_aware_utc_timestamp
 
 log = get_logger("ap.exit_fill_truth_guard")
 
@@ -33,6 +34,11 @@ _PARTIAL_RESULT_STATUSES = {
     "PARTIAL_FILL", "PARTIALLY_FILLED", "PARTIAL", "EXIT_PARTIAL_FILL",
 }
 _RECONCILIATION_STALE_ATTEMPT_LEASE = timedelta(minutes=5)
+
+
+def _parse_reconciler_timestamp(value: Any) -> datetime | None:
+    """Parse broker/durable fill time without accepting naive timestamps."""
+    return parse_aware_utc_timestamp(value)
 
 
 class LifecycleProjectionError(ValueError):
@@ -93,12 +99,23 @@ def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> L
     if entry_price <= 0:
         raise LifecycleProjectionError("position_entry_price_missing_or_invalid")
 
+    entry_raw = position.get("entry_ts") or position.get("opened_at")
+    entry_ts = parse_aware_utc_timestamp(entry_raw) if entry_raw not in (None, "") else None
+    if entry_raw not in (None, "") and entry_ts is None:
+        raise LifecycleProjectionError("position_entry_timestamp_missing_or_invalid")
+
     normalized: list[tuple[Any, int, float]] = []
     for row in fills:
         fill_qty = _int(row.get("filled_qty"))
         fill_price = _float(row.get("fill_price"))
         if fill_qty > 0 and fill_price > 0:
-            normalized.append((row.get("filled_ts"), fill_qty, fill_price))
+            fill_ts_raw = row.get("filled_ts")
+            fill_ts = parse_aware_utc_timestamp(fill_ts_raw)
+            if fill_ts is None:
+                raise LifecycleProjectionError("exit_fill_timestamp_missing_or_invalid")
+            if entry_ts is not None and fill_ts < entry_ts:
+                raise LifecycleProjectionError("exit_fill_before_entry")
+            normalized.append((fill_ts_raw, fill_qty, fill_price))
     normalized.sort(key=lambda item: str(item[0] or ""))
 
     exited_qty = sum(item[1] for item in normalized)
@@ -690,7 +707,11 @@ def _run_reconciliation_attempt(
     attempt_count: int,
 ) -> dict:
     client_id = str(order.get("client_id") or "").strip()
-    fill_ts = result.get("filled_ts") or order.get("filled_ts") or datetime.now(timezone.utc)
+    fill_ts = _parse_reconciler_timestamp(
+        result.get("filled_ts") or order.get("filled_ts")
+    )
+    if fill_ts is None:
+        raise LifecycleProjectionError("EXIT_FILL_TIMESTAMP_UNPROVEN")
 
     def _tx() -> dict:
         with conn() as c:
