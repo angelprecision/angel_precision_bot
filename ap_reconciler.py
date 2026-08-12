@@ -254,6 +254,10 @@ def _empty_summary(client_id: str, run: int = 0) -> dict:
         "broker_positions_hidden_by_closed_status_count": 0,
         "reconciler_partial_close_preserved_count":     0,
         "reconciler_full_close_count":                  0,
+        "reconciler_proof_repair_candidates":           0,
+        "reconciler_proof_repair_persisted":             0,
+        "reconciler_proof_repair_already_exists":        0,
+        "reconciler_proof_repair_failures":              0,
     }
 
 
@@ -276,6 +280,32 @@ def _parse_reconciler_timestamp(value: object) -> Optional[datetime]:
         return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _strict_positive_finite_float(value: object) -> float | None:
+    """Return a positive finite scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _strict_positive_whole_number(value: object) -> int | None:
+    """Return a positive whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
 
 
 class APBrokerReconciler:
@@ -542,6 +572,21 @@ class APBrokerReconciler:
                     "[%s] Partial-close repair error: %s", self.client_id, e, exc_info=True
                 )
                 summary["errors"].append(f"partial_close_repair: {e}")
+
+            # P0-428: repair the only durable close state that can be left
+            # without proof when the process dies after the positions commit.
+            # This pass is proof-only; it never closes/reopens positions or
+            # changes order lifecycle state.
+            try:
+                self._repair_missing_reconciler_proofs(summary)
+            except Exception as e:
+                log.error(
+                    "[%s] Missing reconciler proof repair error: %s",
+                    self.client_id,
+                    e,
+                    exc_info=True,
+                )
+                summary["errors"].append(f"reconciler_proof_repair: {e}")
 
             try:
                 self._check_duplicate_positions(summary)
@@ -3803,152 +3848,515 @@ class APBrokerReconciler:
             return
 
         # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
-        # Without this, any position closed outside the exit engine (manual broker
-        # close, overnight expiry, emergency flatten) is invisible in the trade ledger.
-        _proof_write_failed = False
-        try:
-            from ap_proof_logger import APProofLogger as _APProofLogger
-
-            if not self.supabase_client:
-                # Missing client → operator-visible error, never silently discard.
-                log.error(
-                    "[%s] RECONCILER_PROOF_WRITE_BLOCKED contract=%s position_id=%s "
-                    "reason=missing_supabase_client",
-                    self.client_id, contract, pos_id,
-                )
-                _proof_write_failed = True
-            else:
-                _entry_local_order_id = str(
-                    pos.get("local_order_id")
-                    or pos.get("entry_local_order_id")
-                    or ""
-                ).strip()
-                _exit_local_order_id  = evidence_local_order_id
-                _pos_id_str            = str(pos_id or "")
-                if not _entry_local_order_id:
-                    raise RuntimeError("missing_entry_local_order_id")
-
-                # ── Idempotency: three-state lookup ───────────────────────────
-                # IDEMPOTENCY_EXISTS  — existing row confirmed → skip, no failure
-                # IDEMPOTENCY_CLEAR   — no existing row       → proceed with insert
-                # IDEMPOTENCY_UNKNOWN — lookup failed          → block insert, log error
-                _IDEM_EXISTS  = "EXISTS"
-                _IDEM_CLEAR   = "CLEAR"
-                _IDEM_UNKNOWN = "UNKNOWN"
-                _idem_state   = _IDEM_UNKNOWN   # default: treat uncertainty as block
-                _idem_err_str = None
-
-                try:
-                    _existing = (
-                        self.supabase_client
-                        .table("proof_trades")
-                        .select("id")
-                        .eq("position_id", _pos_id_str)
-                        .limit(1)
-                        .execute()
-                    )
-                    _existing_rows = (_existing.data or []) if _existing else []
-                    if not _existing_rows and _entry_local_order_id:
-                        _existing2 = (
-                            self.supabase_client
-                            .table("proof_trades")
-                            .select("id")
-                            .eq("local_order_id", _entry_local_order_id)
-                            .limit(1)
-                            .execute()
-                        )
-                        _existing_rows = (_existing2.data or []) if _existing2 else []
-                    _idem_state = _IDEM_EXISTS if _existing_rows else _IDEM_CLEAR
-                except Exception as _idem_exc:
-                    _idem_state   = _IDEM_UNKNOWN
-                    _idem_err_str = str(_idem_exc)
-
-                if _idem_state == _IDEM_EXISTS:
-                    log.info(
-                        "[%s] RECONCILER_PROOF_ALREADY_EXISTS contract=%s position_id=%s "
-                        "local_order_id=%s — skipping duplicate insert",
-                        self.client_id, contract, _pos_id_str, _entry_local_order_id,
-                    )
-                    # safe no-op — not a write failure
-
-                elif _idem_state == _IDEM_UNKNOWN:
-                    # Lookup failed → do NOT insert (fail closed, not open).
-                    log.error(
-                        "[%s] RECONCILER_PROOF_IDEMPOTENCY_UNVERIFIED contract=%s "
-                        "position_id=%s local_order_id=%s client=%s "
-                        "error=%s — insert blocked to prevent duplicates",
-                        self.client_id, contract, _pos_id_str, _entry_local_order_id,
-                        self.client_id, _idem_err_str,
-                    )
-                    _proof_write_failed = True
-
-                else:
-                    # IDEMPOTENCY_CLEAR — proceed with proof insert
-                    _proof = _APProofLogger(
-                        supabase_client=self.supabase_client,
-                        client_email=self.client_id,
-                        mode=self.execution_mode or "unknown",
-                    )
-                    _proof_result = _proof.log_trade(
-                        ticker             = self._norm_underlying(underlying or contract),
-                        pattern            = "",
-                        side               = side or "CALL",
-                        timeframe          = "1d",
-                        score              = 0,
-                        tier               = "A",
-                        context_score      = 0,
-                        setup_status       = "reconciler_auto_close",
-                        entry_trigger      = entry_px,
-                        entry_option_price = entry_px,
-                        exit_option_price  = exit_px,
-                        underlying_entry   = 0.0,
-                        underlying_exit    = 0.0,
-                        contracts          = close_qty or 1,
-                        exit_reason        = f"RECONCILER_AUTO_CLOSE | {close_confidence} | broker_position_missing",
-                        option_pnl_pct     = pnl_pct,
-                        underlying_pnl_pct = 0.0,
-                        win                = exit_px > entry_px,
-                        spread_pct         = 0.0,
-                        chain_grade        = "",
-                        synthetic_entry    = False,
-                        position_id        = _pos_id_str,
-                        local_order_id     = _entry_local_order_id,
-                        exit_local_order_id = _exit_local_order_id,
-                        execution_mode     = self.execution_mode or "",
-                        broker_exit_order_id = evidence_broker_order_id,
-                        broker_exit_fill_ts  = evidence_filled_ts,
-                        broker_exit_filled_qty = exact_exit_fill_qty,
-                    )
-                    # Check confirmed persistence — never emit PROOF_LOGGED on cache-only write.
-                    if _proof_result.get("_proof_persisted") is True:
-                        log.info(
-                            "[%s] RECONCILER_PROOF_LOGGED contract=%s position_id=%s pnl=%.1f%%",
-                            self.client_id, contract, _pos_id_str, pnl_pct,
-                        )
-                    else:
-                        _proof_write_failed = True
-                        log.error(
-                            "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
-                            "error=%s (non-fatal — position close is complete)",
-                            self.client_id, contract, _pos_id_str,
-                            _proof_result.get("_proof_persistence_error") or "persistence_not_confirmed",
-                        )
-
-        except Exception as _proof_err:
-            _proof_write_failed = True
-            log.error(
-                "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
-                "error=%s (non-fatal — position close is complete)",
-                self.client_id, contract, pos_id, _proof_err,
+        # The helper validates exact EXIT truth and originating ENTRY identity,
+        # confirms durable persistence, and is also used by restart repair.
+        proof_result = self._persist_exact_reconciler_proof(
+            pos=pos,
+            exact_exit_evidence={
+                **evidence,
+                "client_id": self.client_id,
+                "position_entry_ts": pos.get("entry_ts") or pos.get("opened_at"),
+            },
+            close_qty=close_qty,
+            entry_px=entry_px,
+            exit_px=exit_px,
+            close_confidence=close_confidence,
+        )
+        if proof_result.get("success") is True:
+            log.info(
+                "[%s] RECONCILER_PROOF_%s contract=%s position_id=%s "
+                "entry_local_order_id=%s exit_local_order_id=%s broker_exit_order_id=%s",
+                self.client_id,
+                proof_result.get("disposition", "CONFIRMED"),
+                contract,
+                pos_id,
+                proof_result.get("entry_local_order_id", ""),
+                evidence_local_order_id,
+                evidence_broker_order_id,
             )
-        if _proof_write_failed:
+        else:
             summary.setdefault("proof_write_failures", 0)
             summary["proof_write_failures"] += 1
+            log.error(
+                "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
+                "disposition=%s reason=%s (non-fatal — position close is complete)",
+                self.client_id,
+                contract,
+                pos_id,
+                proof_result.get("disposition", "PERSIST_FAILED"),
+                proof_result.get("reason", "persistence_not_confirmed"),
+            )
         try:
             from ap_proof_logger import funnel as _funnel_r
             _funnel_r.inc("reconciler_corrections")
         except Exception:
             pass
+
+    def _persist_exact_reconciler_proof(
+        self,
+        *,
+        pos: dict,
+        exact_exit_evidence: dict,
+        close_qty: int,
+        entry_px: float,
+        exit_px: float,
+        close_confidence: str,
+    ) -> dict:
+        """Persist one exact reconciler close proof, with durable confirmation.
+
+        This is deliberately proof-only.  It does not close a position, change an
+        order, or contact the broker.  The caller supplies the exact EXIT evidence
+        that already authorized the reconciler close; restart repair obtains a
+        fresh copy through ``_get_recent_exit_fill`` before calling here.
+
+        ``success`` is true only for a confirmed durable row or an exact durable
+        row found by the idempotency lookup.  The logger's in-process cache and a
+        successful-but-unconfirmed insert are never treated as proof success.
+        """
+
+        def _result(
+            disposition: str,
+            *,
+            success: bool = False,
+            reason: str = "",
+            **extra,
+        ) -> dict:
+            return {
+                "success": bool(success),
+                "disposition": disposition,
+                "reason": reason,
+                **extra,
+            }
+
+        pos_id = str(pos.get("id") or pos.get("position_id") or "").strip()
+        pos_client_id = str(pos.get("client_id") or "").strip()
+        if not pos_id or pos_client_id != str(self.client_id or "").strip():
+            return _result(
+                "IDENTITY_UNPROVEN",
+                reason="position_client_or_id_missing_or_mismatched",
+            )
+
+        expected_mode = _normalize_execution_mode(pos.get("execution_mode"))
+        reconciler_mode = _normalize_execution_mode(self.execution_mode)
+        if expected_mode is None or reconciler_mode is None or expected_mode != reconciler_mode:
+            return _result(
+                "EVIDENCE_UNPROVEN",
+                reason="position_execution_mode_missing_or_mismatched",
+            )
+
+        contract = self._norm_contract(
+            pos.get("contract") or pos.get("option_symbol") or pos.get("symbol") or ""
+        )
+        pending_local = str(pos.get("pending_exit_local_order_id") or "").strip()
+        pending_broker = str(pos.get("pending_exit_broker_order_id") or "").strip()
+        evidence = dict(exact_exit_evidence or {})
+        evidence_client_id = str(evidence.get("client_id") or "").strip()
+        evidence_position_id = str(evidence.get("position_id") or "").strip()
+        evidence_contract = self._norm_contract(evidence.get("contract"))
+        evidence_mode = _normalize_execution_mode(evidence.get("execution_mode"))
+        evidence_local = str(
+            evidence.get("exit_local_order_id") or evidence.get("local_order_id") or ""
+        ).strip()
+        evidence_broker = str(
+            evidence.get("broker_order_id") or evidence.get("broker_exit_order_id") or ""
+        ).strip()
+        evidence_status = str(evidence.get("status") or "").upper().strip()
+        evidence_filled_ts = _parse_reconciler_timestamp(
+            evidence.get("filled_ts") or evidence.get("broker_exit_fill_ts")
+        )
+        entry_ts = _parse_reconciler_timestamp(
+            pos.get("entry_ts")
+            or pos.get("opened_at")
+            or evidence.get("position_entry_ts")
+        )
+        evidence_fill_price = _strict_positive_finite_float(evidence.get("fill_price"))
+        expected_exit_price = _strict_positive_finite_float(exit_px)
+        evidence_filled_qty = _strict_positive_whole_number(
+            evidence.get("filled_qty")
+            if evidence.get("filled_qty") is not None
+            else evidence.get("broker_exit_filled_qty")
+        )
+        expected_close_qty = _strict_positive_whole_number(close_qty)
+        expected_entry_price = _strict_positive_finite_float(entry_px)
+
+        if (
+            not pending_local
+            or not pending_broker
+            or not contract
+            or evidence_client_id != str(self.client_id or "").strip()
+            or evidence_position_id != pos_id
+            or evidence_contract != contract
+            or evidence_mode != expected_mode
+            or evidence_local != pending_local
+            or evidence_broker != pending_broker
+            or evidence_status not in {"FILLED", "EXIT_FILLED"}
+            or evidence_filled_ts is None
+            or entry_ts is None
+            or evidence_filled_ts < entry_ts
+            or evidence_fill_price is None
+            or expected_exit_price is None
+            or not math.isclose(
+                evidence_fill_price,
+                expected_exit_price,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            or evidence_filled_qty is None
+            or expected_close_qty is None
+            or evidence_filled_qty != expected_close_qty
+            or expected_entry_price is None
+        ):
+            return _result(
+                "EVIDENCE_UNPROVEN",
+                reason="invalid_or_mismatched_exact_exit_bundle",
+            )
+
+        try:
+            from ap.proof_taxonomy_guard import resolve_originating_entry_identity
+
+            identity = resolve_originating_entry_identity(
+                client_id=self.client_id,
+                position_id=pos_id,
+                supplied_local_order_id=str(
+                    pos.get("local_order_id") or pos.get("entry_local_order_id") or ""
+                ).strip(),
+            )
+        except Exception as identity_exc:
+            log.error(
+                "[%s] RECONCILER_PROOF_ENTRY_IDENTITY_LOOKUP_FAILED position_id=%s error=%s",
+                self.client_id,
+                pos_id,
+                identity_exc,
+            )
+            identity = None
+
+        entry_local_order_id = str(getattr(identity, "local_order_id", "") or "").strip()
+        identity_position_id = str(getattr(identity, "position_id", "") or "").strip()
+        identity_client_id = str(getattr(identity, "client_id", "") or "").strip()
+        if (
+            identity is None
+            or not entry_local_order_id
+            or identity_position_id != pos_id
+            or identity_client_id != str(self.client_id or "").strip()
+        ):
+            return _result(
+                "IDENTITY_UNPROVEN",
+                reason="originating_entry_identity_missing_or_mismatched",
+            )
+
+        # Unknown origin mode is intentionally retained as quarantine truth.  It
+        # may not be promoted from the current reconciler runtime mode.
+        origin_mode = _normalize_execution_mode(getattr(identity, "execution_mode", None))
+        proof_mode = origin_mode or "unknown"
+
+        if not self.supabase_client:
+            return _result("PERSIST_FAILED", reason="missing_supabase_client")
+
+        def _exact_rows() -> list[dict]:
+            response = (
+                self.supabase_client
+                .table("proof_trades")
+                .select("id,client_email,position_id,local_order_id")
+                .eq("client_email", self.client_id)
+                .eq("position_id", pos_id)
+                .eq("local_order_id", entry_local_order_id)
+                .limit(2)
+                .execute()
+            )
+            rows = getattr(response, "data", None) if response is not None else None
+            if rows is None:
+                raise RuntimeError("proof_identity_confirmation_missing_response")
+            if not isinstance(rows, list):
+                rows = list(rows)
+            return [dict(row) for row in rows if isinstance(row, dict)]
+
+        try:
+            existing_rows = _exact_rows()
+        except Exception as idempotency_exc:
+            return _result(
+                "PERSIST_FAILED",
+                reason=f"proof_identity_lookup_failed:{idempotency_exc}",
+            )
+
+        if len(existing_rows) > 1:
+            return _result(
+                "PERSIST_FAILED",
+                reason="duplicate_exact_proof_rows",
+                entry_local_order_id=entry_local_order_id,
+            )
+        if existing_rows:
+            return _result(
+                "ALREADY_EXISTS",
+                success=True,
+                reason="exact_durable_proof_confirmed",
+                entry_local_order_id=entry_local_order_id,
+                proof_id=existing_rows[0].get("id"),
+            )
+
+        try:
+            from ap_proof_logger import APProofLogger
+
+            pnl_pct = round(
+                ((evidence_fill_price - expected_entry_price) / expected_entry_price) * 100,
+                2,
+            )
+            proof = APProofLogger(
+                supabase_client=self.supabase_client,
+                client_email=self.client_id,
+                mode=proof_mode,
+            )
+            proof_result = proof.log_trade(
+                ticker=self._norm_underlying(
+                    pos.get("underlying") or pos.get("ticker") or contract
+                ),
+                pattern="",
+                side=pos.get("side") or pos.get("direction") or "CALL",
+                timeframe="1d",
+                score=0,
+                tier="A",
+                context_score=0,
+                setup_status="reconciler_auto_close",
+                entry_trigger=expected_entry_price,
+                entry_option_price=expected_entry_price,
+                exit_option_price=evidence_fill_price,
+                underlying_entry=0.0,
+                underlying_exit=0.0,
+                contracts=expected_close_qty,
+                exit_reason=(
+                    f"RECONCILER_AUTO_CLOSE | {close_confidence} | "
+                    "broker_position_missing"
+                ),
+                option_pnl_pct=pnl_pct,
+                underlying_pnl_pct=0.0,
+                win=evidence_fill_price > expected_entry_price,
+                spread_pct=0.0,
+                chain_grade="",
+                opened_at=entry_ts,
+                closed_at=evidence_filled_ts,
+                synthetic_entry=False,
+                position_id=pos_id,
+                local_order_id=entry_local_order_id,
+                exit_local_order_id=evidence_local,
+                execution_mode=proof_mode,
+                broker_exit_order_id=evidence_broker,
+                broker_exit_fill_ts=evidence_filled_ts,
+                broker_exit_filled_qty=evidence_filled_qty,
+            )
+            if not (
+                isinstance(proof_result, dict)
+                and proof_result.get("_proof_persisted") is True
+            ):
+                return _result(
+                    "PERSIST_FAILED",
+                    reason=(
+                        proof_result.get("_proof_persistence_error")
+                        if isinstance(proof_result, dict)
+                        else "persistence_not_confirmed"
+                    )
+                    or "persistence_not_confirmed",
+                    entry_local_order_id=entry_local_order_id,
+                )
+        except Exception as proof_exc:
+            log.error(
+                "[%s] RECONCILER_PROOF_INSERT_FAILED position_id=%s error=%s",
+                self.client_id,
+                pos_id,
+                proof_exc,
+            )
+            return _result(
+                "PERSIST_FAILED",
+                reason=f"proof_insert_failed:{proof_exc}",
+                entry_local_order_id=entry_local_order_id,
+            )
+
+        try:
+            confirmed_rows = _exact_rows()
+        except Exception as confirmation_exc:
+            return _result(
+                "PERSIST_FAILED",
+                reason=f"proof_durable_confirmation_failed:{confirmation_exc}",
+                entry_local_order_id=entry_local_order_id,
+            )
+        if len(confirmed_rows) == 1:
+            return _result(
+                "PERSISTED",
+                success=True,
+                reason="exact_durable_proof_confirmed_after_insert",
+                entry_local_order_id=entry_local_order_id,
+                proof_id=confirmed_rows[0].get("id"),
+            )
+        if len(confirmed_rows) > 1:
+            return _result(
+                "PERSIST_FAILED",
+                reason="duplicate_exact_proof_rows_after_insert",
+                entry_local_order_id=entry_local_order_id,
+            )
+        return _result(
+            "PERSIST_FAILED",
+            reason="proof_insert_not_durably_confirmed",
+            entry_local_order_id=entry_local_order_id,
+        )
+
+    def _repair_missing_reconciler_proofs(self, summary: dict) -> None:
+        """Repair proof only for already-closed reconciler positions.
+
+        The scan is intentionally bounded and has no position/order mutation
+        authority.  Each candidate must survive a fresh exact EXIT lookup and
+        the same strict proof helper used by the immediate close path.
+        """
+        for key in (
+            "reconciler_proof_repair_candidates",
+            "reconciler_proof_repair_persisted",
+            "reconciler_proof_repair_already_exists",
+            "reconciler_proof_repair_failures",
+        ):
+            summary.setdefault(key, 0)
+
+        expected_mode = _normalize_execution_mode(self.execution_mode)
+        if expected_mode is None:
+            summary["reconciler_proof_repair_failures"] += 1
+            self._alert(
+                "RECONCILER_PROOF_REPAIR_HOLD | "
+                f"client_id={self.client_id} reason=unknown_reconciler_execution_mode"
+            )
+            return
+
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _scan():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT p.*
+                        FROM positions p
+                        WHERE p.client_id = %s
+                          AND UPPER(TRIM(COALESCE(p.status, ''))) = 'CLOSED'
+                          AND UPPER(TRIM(COALESCE(p.close_source, ''))) =
+                              'RECONCILER_AUTO_CLOSE'
+                        ORDER BY p.exit_ts DESC NULLS LAST
+                        LIMIT 50
+                        """,
+                        (self.client_id,),
+                    )
+                    return [dict(row) for row in (c.fetchall() or [])]
+
+            candidates = run_with_retry(_scan) or []
+        except Exception as scan_exc:
+            summary["reconciler_proof_repair_failures"] += 1
+            summary.setdefault("proof_write_failures", 0)
+            summary["proof_write_failures"] += 1
+            self._alert(
+                "RECONCILER_PROOF_REPAIR_HOLD | "
+                f"client_id={self.client_id} reason=closed_candidate_scan_failed "
+                f"error={scan_exc}"
+            )
+            log.error(
+                "[%s] reconciler closed proof candidate scan failed: %s",
+                self.client_id,
+                scan_exc,
+            )
+            return
+
+        summary["reconciler_proof_repair_candidates"] += len(candidates)
+
+        for pos in candidates:
+            pos_id = str(pos.get("id") or pos.get("position_id") or "").strip()
+            contract = self._norm_contract(
+                pos.get("contract") or pos.get("option_symbol") or pos.get("symbol") or ""
+            )
+            mode = _normalize_execution_mode(pos.get("execution_mode"))
+            local_id = str(pos.get("pending_exit_local_order_id") or "").strip()
+            broker_id = str(pos.get("pending_exit_broker_order_id") or "").strip()
+
+            def _hold(reason: str) -> None:
+                summary["reconciler_proof_repair_failures"] += 1
+                summary.setdefault("proof_write_failures", 0)
+                summary["proof_write_failures"] += 1
+                self._alert(
+                    "RECONCILER_PROOF_REPAIR_HOLD | "
+                    f"client_id={self.client_id} execution_mode={mode or '?'} "
+                    f"position_id={pos_id or '?'} contract={contract or '?'} "
+                    f"reason={reason}"
+                )
+
+            if (
+                str(pos.get("client_id") or "").strip() != self.client_id
+                or str(pos.get("status") or "").upper().strip() != "CLOSED"
+                or str(pos.get("close_source") or "").upper().strip()
+                != "RECONCILER_AUTO_CLOSE"
+            ):
+                _hold("candidate_identity_changed")
+                continue
+            if not pos_id or not contract:
+                _hold("position_identity_missing")
+                continue
+            if mode is None or mode != expected_mode:
+                _hold("execution_mode_missing_or_mismatched")
+                continue
+            if not local_id or not broker_id:
+                _hold("current_exit_identity_missing")
+                continue
+
+            exit_fill = self._get_recent_exit_fill(
+                contract,
+                position_id=pos_id,
+                execution_mode=mode,
+                local_order_id=local_id,
+                broker_order_id=broker_id,
+            )
+            if not exit_fill:
+                _hold("exact_durable_exit_evidence_missing_or_ambiguous")
+                continue
+
+            exact_exit_evidence = dict(exit_fill)
+            exact_exit_evidence["client_id"] = self.client_id
+            exact_exit_evidence.setdefault(
+                "position_entry_ts",
+                pos.get("entry_ts") or pos.get("opened_at"),
+            )
+            close_qty = _strict_positive_whole_number(
+                exact_exit_evidence.get("filled_qty")
+            )
+            exit_px = _strict_positive_finite_float(
+                exact_exit_evidence.get("fill_price")
+            )
+            entry_px = _strict_positive_finite_float(
+                pos.get("avg_fill") or pos.get("entry_price")
+            )
+            if close_qty is None or exit_px is None or entry_px is None:
+                _hold("malformed_exact_exit_or_entry_economics")
+                continue
+
+            proof_result = self._persist_exact_reconciler_proof(
+                pos=pos,
+                exact_exit_evidence=exact_exit_evidence,
+                close_qty=close_qty,
+                entry_px=entry_px,
+                exit_px=exit_px,
+                close_confidence="HIGH",
+            )
+            if proof_result.get("success") is True:
+                if proof_result.get("disposition") == "PERSISTED":
+                    summary["reconciler_proof_repair_persisted"] += 1
+                else:
+                    summary["reconciler_proof_repair_already_exists"] += 1
+                log.info(
+                    "[%s] RECONCILER_PROOF_REPAIR_%s position_id=%s "
+                    "entry_local_order_id=%s exit_local_order_id=%s broker_exit_order_id=%s",
+                    self.client_id,
+                    proof_result.get("disposition", "CONFIRMED"),
+                    pos_id,
+                    proof_result.get("entry_local_order_id", ""),
+                    local_id,
+                    broker_id,
+                )
+            else:
+                _hold(
+                    proof_result.get("reason")
+                    or proof_result.get("disposition")
+                    or "proof_persistence_not_confirmed"
+                )
 
     def _import_broker_positions_missing_from_db(
         self,

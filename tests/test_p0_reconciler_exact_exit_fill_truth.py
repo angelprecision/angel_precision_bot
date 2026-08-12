@@ -959,31 +959,62 @@ def test_exact_exit_evidence_identity_reaches_position_engine_and_proof(monkeypa
     monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
 
     class _Query:
+        def __init__(self, supabase):
+            self.supabase = supabase
+            self.filters = []
+
         def select(self, *_args):
             return self
 
-        def eq(self, *_args):
+        def eq(self, key, value):
+            self.filters.append((key, str(value)))
             return self
 
         def limit(self, *_args):
             return self
 
         def execute(self):
-            return type("_Result", (), {"data": []})()
+            rows = [
+                row
+                for row in self.supabase.proof_rows
+                if all(str(row.get(key, "")) == value for key, value in self.filters)
+            ]
+            return type("_Result", (), {"data": rows})()
 
     class _Supabase:
+        def __init__(self):
+            self.proof_rows = []
+
         def table(self, *_args):
-            return _Query()
+            return _Query(self)
 
     rec = _reconciler()
     rec.supabase_client = _Supabase()
     rec.exit_engine = MagicMock()
     summary = _empty_summary(CLIENT)
 
+    monkeypatch.setattr(
+        "ap.proof_taxonomy_guard.resolve_originating_entry_identity",
+        lambda **_kwargs: SimpleNamespace(
+            client_id=CLIENT,
+            position_id=POSITION_ID,
+            local_order_id="entry-local-1",
+            execution_mode=MODE_LIVE,
+        ),
+    )
+
     from ap_proof_logger import APProofLogger
 
     def _capture_log_trade(_self, **kwargs):
         proof_calls.append(kwargs)
+        rec.supabase_client.proof_rows.append(
+            {
+                "id": "proof-1",
+                "client_email": CLIENT,
+                "position_id": kwargs["position_id"],
+                "local_order_id": kwargs["local_order_id"],
+            }
+        )
         return {"_proof_persisted": True}
 
     monkeypatch.setattr(APProofLogger, "log_trade", _capture_log_trade)
@@ -1457,3 +1488,362 @@ def test_unproven_path_makes_no_broker_submit_or_cancel_call():
 
     for method_name in ("post", "submit_order", "place_order", "cancel_order"):
         getattr(rec.broker, method_name).assert_not_called()
+
+
+class _RestartDbState:
+    """Production-shaped durable state for the close-then-restart regression."""
+
+    def __init__(self):
+        self.position = _position()
+        self.position.update(
+            {
+                "qty": 2,
+                "quantity_remaining": 2,
+                "status": "OPEN",
+                "close_source": "",
+                "exit_ts": None,
+            }
+        )
+        self.entry = {
+            "client_id": CLIENT,
+            "local_order_id": "entry-local-1",
+            "broker_order_id": "ENTRY-BROKER-1",
+            "position_id": POSITION_ID,
+            "contract": TARGET_CONTRACT,
+            "kind": "ENTRY",
+            "status": "FILLED",
+            "execution_mode": MODE_LIVE,
+            "filled_qty": 2,
+            "fill_price": 2.33,
+            "filled_ts": "2026-08-10T18:00:00+00:00",
+        }
+        self.exit = _exit_row(
+            filled_qty=2,
+            fill_price=4.79,
+            position_entry_ts="2026-08-10T18:00:00+00:00",
+        )
+        self.position_updates: list[tuple] = []
+        self.order_updates: list[tuple] = []
+
+
+class _RestartCursor:
+    def __init__(self, state: _RestartDbState):
+        self.state = state
+        self._one = None
+        self._many: list[dict] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=()):
+        compact = " ".join(str(sql).split())
+        upper = compact.upper()
+        self._one = None
+        self._many = []
+
+        if upper.startswith("UPDATE POSITIONS"):
+            self.state.position_updates.append((sql, tuple(params)))
+            if len(params) >= 10:
+                (
+                    status,
+                    exit_ts,
+                    exit_price,
+                    realized_pnl,
+                    realized_pnl_pct,
+                    quantity_remaining,
+                    close_source,
+                    close_confidence,
+                    position_id,
+                    client_id,
+                ) = params[:10]
+                if (
+                    str(position_id) == POSITION_ID
+                    and str(client_id) == CLIENT
+                ):
+                    self.state.position.update(
+                        {
+                            "status": status,
+                            "exit_ts": exit_ts,
+                            "exit_price": exit_price,
+                            "realized_pnl": realized_pnl,
+                            "realized_pnl_pct": realized_pnl_pct,
+                            "quantity_remaining": quantity_remaining,
+                            "close_source": close_source,
+                            "close_confidence": close_confidence,
+                        }
+                    )
+            return self
+
+        if upper.startswith("UPDATE ORDERS"):
+            self.state.order_updates.append((sql, tuple(params)))
+            return self
+
+        if "FROM ORDERS O" in upper and "JOIN POSITIONS P" in upper:
+            self._many = [dict(self.state.exit)]
+            return self
+
+        if "FROM ORDERS" in upper and "KIND = 'EXIT'" in upper:
+            self._one = dict(self.state.exit)
+            return self
+
+        if "FROM ORDERS" in upper:
+            # Both the taxonomy resolver and APProofLogger's mode resolver use
+            # an exact originating ENTRY local-order lookup.
+            requested_local = str(params[-1] if params else "").strip()
+            if not requested_local or requested_local == self.state.entry["local_order_id"]:
+                self._one = dict(self.state.entry)
+            return self
+
+        if "FROM POSITIONS" in upper and "FOR UPDATE" in upper:
+            self._one = {
+                key: self.state.position.get(key)
+                for key in (
+                    "quantity_remaining",
+                    "qty",
+                    "pending_exit_local_order_id",
+                    "pending_exit_broker_order_id",
+                )
+            }
+            return self
+
+        if "FROM POSITIONS" in upper and "ID::TEXT" in upper:
+            self._one = dict(self.state.position)
+            return self
+
+        if "SELECT P.* FROM POSITIONS P" in upper:
+            if (
+                str(self.state.position.get("status") or "").upper() == "CLOSED"
+                and str(self.state.position.get("close_source") or "").upper()
+                == "RECONCILER_AUTO_CLOSE"
+            ):
+                self._many = [dict(self.state.position)]
+            return self
+
+    def fetchone(self):
+        return self._one
+
+    def fetchall(self):
+        return list(self._many)
+
+
+class _RestartConnection:
+    def __init__(self, state: _RestartDbState):
+        self.cursor = _RestartCursor(state)
+
+    def __enter__(self):
+        return self.cursor
+
+    def __exit__(self, *_args):
+        return False
+
+
+class _RestartSupabaseTable:
+    def __init__(self, client):
+        self.client = client
+        self.filters: list[tuple[str, str]] = []
+        self.insert_row: dict | None = None
+
+    def select(self, *_args):
+        return self
+
+    def eq(self, key, value):
+        self.filters.append((key, str(value)))
+        return self
+
+    def limit(self, value):
+        self.limit_value = int(value)
+        return self
+
+    def insert(self, row):
+        self.insert_row = dict(row)
+        return self
+
+    def execute(self):
+        if self.insert_row is not None:
+            row = dict(self.insert_row)
+            row.setdefault("id", f"proof-{len(self.client.proof_rows) + 1}")
+            self.client.proof_rows.append(row)
+            self.client.insert_payloads.append(row)
+            return SimpleNamespace(data=[dict(row)])
+        rows = [
+            dict(row)
+            for row in self.client.proof_rows
+            if all(str(row.get(key, "")) == value for key, value in self.filters)
+        ]
+        return SimpleNamespace(data=rows[: getattr(self, "limit_value", len(rows))])
+
+
+class _RestartSupabase:
+    def __init__(self):
+        self.proof_rows: list[dict] = []
+        self.insert_payloads: list[dict] = []
+
+    def table(self, _name):
+        return _RestartSupabaseTable(self)
+
+
+class _UnavailableSupabase:
+    def table(self, _name):
+        raise RuntimeError("supabase unavailable before restart")
+
+
+def _install_restart_db(monkeypatch, state: _RestartDbState):
+    monkeypatch.setattr(db_mod, "conn", lambda: _RestartConnection(state))
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+
+
+def _restart_fixture(monkeypatch):
+    state = _RestartDbState()
+    _install_restart_db(monkeypatch, state)
+    rec = _reconciler()
+    rec.supabase_client = _RestartSupabase()
+    return state, rec
+
+
+def test_reconciler_close_then_restart_repairs_exact_proof_once(monkeypatch):
+    """A process death after CLOSED commit must be repairable and idempotent."""
+    state, first = _restart_fixture(monkeypatch)
+    first.supabase_client = _UnavailableSupabase()
+    first_summary = _empty_summary(CLIENT)
+    position_before = dict(state.position)
+    entry_before = dict(state.entry)
+    exit_before = dict(state.exit)
+
+    # Exact EXIT evidence authorizes the durable position close.  The unavailable
+    # proof sink simulates the process dying before proof persistence completes.
+    first._execute_reconciler_close(
+        pos=dict(state.position),
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=2,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+        summary=first_summary,
+        exact_exit_fill_qty=2,
+        exact_exit_evidence=dict(state.exit),
+    )
+    assert state.position["status"] == "CLOSED"
+    assert state.position["close_source"] == "RECONCILER_AUTO_CLOSE"
+    assert first_summary["proof_write_failures"] == 1
+
+    # Restart with a fresh reconciler instance and a now-available proof sink.
+    second = _reconciler()
+    proof_sink = _RestartSupabase()
+    second.supabase_client = proof_sink
+    summary = _empty_summary(CLIENT)
+    second._repair_missing_reconciler_proofs(summary)
+
+    assert summary["reconciler_proof_repair_persisted"] == 1
+    assert len(proof_sink.proof_rows) == 1
+    proof = proof_sink.proof_rows[0]
+    assert proof["position_id"] == POSITION_ID
+    assert proof["local_order_id"] == "entry-local-1"
+    assert proof["exit_local_order_id"] == "exit-local-1"
+    assert proof["broker_exit_order_id"] == "TR-195"
+    assert proof["broker_exit_fill_ts"] == "2026-08-10T19:00:00+00:00"
+    assert proof["broker_exit_filled_qty"] == 2
+
+    # The repair is proof-only: position remains closed, order rows are untouched,
+    # and no broker mutation path is reachable.
+    assert state.position["status"] == "CLOSED"
+    assert state.position["quantity_remaining"] == 0
+    assert state.entry == entry_before
+    assert state.exit == exit_before
+    assert state.order_updates == []
+    assert first.broker.method_calls == []
+    assert second.broker.method_calls == []
+
+    # A second restart pass confirms the exact existing row and does not insert.
+    second_summary = _empty_summary(CLIENT)
+    second._repair_missing_reconciler_proofs(second_summary)
+    assert second_summary["reconciler_proof_repair_already_exists"] == 1
+    assert second_summary["reconciler_proof_repair_persisted"] == 0
+    assert len(proof_sink.proof_rows) == 1
+    assert state.position["status"] == "CLOSED"
+    assert dict(state.position)["close_source"] == "RECONCILER_AUTO_CLOSE"
+    assert position_before["status"] == "OPEN"
+
+
+@pytest.mark.parametrize(
+    ("case", "mutate_position", "mutate_exit"),
+    [
+        ("wrong_execution_mode", lambda pos: pos.update(execution_mode=MODE_PAPER), lambda row: None),
+        ("wrong_position", lambda pos: None, lambda row: row.update(position_id="other-position")),
+        ("wrong_contract", lambda pos: None, lambda row: row.update(contract=OLD_CONTRACT)),
+        ("wrong_exit_local", lambda pos: None, lambda row: row.update(local_order_id="old-exit")),
+        ("wrong_exit_broker", lambda pos: None, lambda row: row.update(broker_order_id="old-broker")),
+        ("partial_status", lambda pos: None, lambda row: row.update(status="EXIT_PARTIAL_FILL")),
+        ("malformed_quantity", lambda pos: None, lambda row: row.update(filled_qty=True)),
+        ("malformed_price", lambda pos: None, lambda row: row.update(fill_price=float("nan"))),
+        ("missing_timestamp", lambda pos: None, lambda row: row.update(filled_ts=None)),
+        ("naive_timestamp", lambda pos: None, lambda row: row.update(filled_ts="2026-08-10T19:00:00")),
+        ("pre_entry_timestamp", lambda pos: None, lambda row: row.update(filled_ts="2026-08-10T17:00:00+00:00")),
+    ],
+)
+def test_restart_repair_holds_on_malformed_or_mismatched_truth(
+    monkeypatch,
+    case,
+    mutate_position,
+    mutate_exit,
+):
+    state, rec = _restart_fixture(monkeypatch)
+    state.position.update(status="CLOSED", close_source="RECONCILER_AUTO_CLOSE", quantity_remaining=0)
+    mutate_position(state.position)
+    bad_exit = dict(state.exit)
+    mutate_exit(bad_exit)
+    rec._get_recent_exit_fill = MagicMock(return_value=bad_exit)
+    rec._alert = MagicMock()
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_missing_reconciler_proofs(summary)
+
+    assert summary["reconciler_proof_repair_failures"] == 1, case
+    assert rec.supabase_client.proof_rows == []
+    assert state.position["status"] == "CLOSED"
+    assert state.order_updates == []
+    assert rec.broker.method_calls == []
+    assert any("RECONCILER_PROOF_REPAIR_HOLD" in call.args[0] for call in rec._alert.call_args_list)
+
+
+def test_restart_repair_holds_on_ambiguous_exit_or_missing_entry_identity(monkeypatch):
+    state, rec = _restart_fixture(monkeypatch)
+    state.position.update(status="CLOSED", close_source="RECONCILER_AUTO_CLOSE", quantity_remaining=0)
+    rec._get_recent_exit_fill = MagicMock(return_value=None)
+    rec._alert = MagicMock()
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_missing_reconciler_proofs(summary)
+    assert rec.supabase_client.proof_rows == []
+    assert summary["reconciler_proof_repair_failures"] == 1
+
+    # Exact EXIT truth may be present, but missing originating ENTRY identity is
+    # still a HOLD and cannot be promoted from the runtime LIVE mode.
+    rec._get_recent_exit_fill = MagicMock(return_value=dict(state.exit))
+    monkeypatch.setattr(
+        "ap.proof_taxonomy_guard.resolve_originating_entry_identity",
+        lambda **_kwargs: None,
+    )
+    summary = _empty_summary(CLIENT)
+    rec._repair_missing_reconciler_proofs(summary)
+    assert rec.supabase_client.proof_rows == []
+    assert summary["reconciler_proof_repair_failures"] == 1
+    assert rec.broker.method_calls == []
+
+
+def test_unknown_origin_mode_stays_quarantined_and_never_becomes_live(monkeypatch):
+    state, rec = _restart_fixture(monkeypatch)
+    state.position.update(status="CLOSED", close_source="RECONCILER_AUTO_CLOSE", quantity_remaining=0)
+    state.entry["execution_mode"] = ""
+    rec._get_recent_exit_fill = MagicMock(return_value=dict(state.exit))
+
+    summary = _empty_summary(CLIENT)
+    rec._repair_missing_reconciler_proofs(summary)
+
+    assert len(rec.supabase_client.proof_rows) == 1
+    assert rec.supabase_client.proof_rows[0]["execution_mode"] == "unknown"
+    assert rec.supabase_client.proof_rows[0]["execution_mode"] != MODE_LIVE
+    assert summary["reconciler_proof_repair_persisted"] == 1
