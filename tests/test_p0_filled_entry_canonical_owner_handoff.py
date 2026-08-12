@@ -1135,6 +1135,69 @@ def test_broker_nonfinite_fill_price_holds_before_position_engine_or_broker_muta
     assert broker_mutations == []
 
 
+@pytest.mark.parametrize("fill_price", [True, False])
+def test_broker_boolean_fill_price_is_rejected_before_side_effects(
+    monkeypatch, fill_price
+):
+    from ap import fill_monitor as fm
+
+    events = []
+    broker_mutations = []
+    real_check_order_with_broker = fm.check_order_with_broker
+    _patch_process_side_effects(monkeypatch, events)
+    monkeypatch.setattr(
+        fm, "check_order_with_broker", real_check_order_with_broker
+    )
+
+    class _Broker:
+        def get_order(self, _broker_order_id):
+            return {
+                "status": "FILLED",
+                "exec_quantity": 1,
+                "avg_fill_price": fill_price,
+            }
+
+        def cancel_order(self, *args, **kwargs):
+            broker_mutations.append(("cancel", args, kwargs))
+
+        def place_stop_order(self, *args, **kwargs):
+            broker_mutations.append(("stop", args, kwargs))
+
+    def _unexpected(name):
+        def _call(*_args, **_kwargs):
+            pytest.fail(f"{name} must not run for a boolean broker fill price")
+
+        return _call
+
+    for name in (
+        "_open_position_safe",
+        "_establish_canonical_handoff_standing_stop",
+        "_cancel_pair_opposite",
+        "_seed_exit_engine",
+        "_verify_canonical_entry_owner",
+    ):
+        monkeypatch.setattr(fm, name, _unexpected(name))
+
+    class _OSM:
+        def transition(self, *_args, **_kwargs):
+            pytest.fail("OSM transition must not run for a boolean fill price")
+
+        def increment_retry(self, *_args, **_kwargs):
+            return None
+
+    fm.process_pending_order(
+        _Broker(),
+        _order(),
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
+    )
+
+    assert events == []
+    assert broker_mutations == []
+
+
 def test_explicit_unproven_runtime_mode_cannot_fall_back_to_engine_mode():
     from ap import fill_monitor as fm
 

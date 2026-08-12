@@ -1017,14 +1017,23 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         else:
             filled_qty = 0
 
-        raw_avg_fill = raw.get("avg_fill_price") or raw.get("price") or 0.0
-        try:
-            avg_fill = float(raw_avg_fill)
-        except (TypeError, ValueError, OverflowError):
-            # Keep the broker response as contradictory evidence instead of
-            # converting it into an empty ERROR that could qualify for the
-            # DB-only unavailable-poll recovery path.
+        raw_avg_fill = raw.get("avg_fill_price")
+        if raw_avg_fill is None:
+            raw_avg_fill = raw.get("price")
+        if raw_avg_fill is None:
+            raw_avg_fill = 0.0
+        if isinstance(raw_avg_fill, bool):
+            # Validate the external scalar before coercion; float(True) would
+            # otherwise turn malformed broker data into an executable $1.00.
             avg_fill = None
+        else:
+            try:
+                avg_fill = float(raw_avg_fill)
+            except (TypeError, ValueError, OverflowError):
+                # Keep the broker response as contradictory evidence instead
+                # of converting it into an empty ERROR that could qualify for
+                # the DB-only unavailable-poll recovery path.
+                avg_fill = None
 
         result = {
             "status": our,
