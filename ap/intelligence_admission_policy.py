@@ -34,6 +34,7 @@ Producer/authority table (traced 2026-07-18):
   intelligence_bridge (TIMEOUT)   | intel_status| no        | INTEL_UNAVAILABLE_FAIL_OPEN
   intelligence_bridge (ERROR)     | intel_status| no        | INTEL_ERROR_FAIL_OPEN
   intelligence_bridge (UNAVAIL.)  | intel_status| no        | INTEL_UNAVAILABLE_FAIL_OPEN
+  intelligence_bridge (VIX_ADVIS.)| intel_status| no        | INTEL_VIX_ADVISORY
   ap/intelligence_evaluation.py   | observe_only| never     | INTEL_ADVISORY_ONLY
   ap_quality_mode.py              | (separate)  | own gate  | unchanged — not admission policy
 
@@ -95,6 +96,7 @@ INTEL_LOW_DATA_QUALITY_FAIL_OPEN = "INTEL_LOW_DATA_QUALITY_FAIL_OPEN"
 INTEL_ADVISORY_ONLY    = "INTEL_ADVISORY_ONLY"
 INTEL_OBSERVE_ONLY_MODE = "INTEL_OBSERVE_ONLY_MODE"
 INTEL_REGIME_MISMATCH_ADVISORY = "INTEL_REGIME_MISMATCH_ADVISORY"
+INTEL_VIX_ADVISORY = "INTEL_VIX_ADVISORY"
 
 # ---------------------------------------------------------------------------
 # Allowlist: intel_status values that are authoritative enough to deny entry.
@@ -112,6 +114,7 @@ _FAIL_OPEN_STATUS_MAP: dict[str, str] = {
     "UNAVAILABLE":    INTEL_UNAVAILABLE_FAIL_OPEN,
     "TIMEOUT":        INTEL_UNAVAILABLE_FAIL_OPEN,
     "ERROR":          INTEL_ERROR_FAIL_OPEN,
+    "VIX_ADVISORY":   INTEL_VIX_ADVISORY,
 }
 
 

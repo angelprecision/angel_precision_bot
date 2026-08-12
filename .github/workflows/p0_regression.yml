@@ -104,6 +104,7 @@ jobs:
             tests/test_p1_intelligence_admission_policy.py \
             tests/test_p1_intel_admission_e2e_final_gate.py \
             tests/test_p0_forward_regime_advisory_flow.py \
+            tests/test_p0_gate_g_production_shape.py \
             tests/test_p0_selector_direct_quote_budget_authority.py \
             tests/test_p0_selector_terminal_truth_ranked_quotes_current_main.py \
             tests/test_p0_trigger_anchored_strike_selection.py \

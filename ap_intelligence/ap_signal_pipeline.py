@@ -134,6 +134,11 @@ class APSignalPipeline:
         # ── legacy compat ────────────────────────────────────────────────
         option_cost_per_contract: float = None,  # DEPRECATED — use option_premium
         lookback_days:        int    = 60,
+        contract_quality_authoritative: bool = True,
+        account_state_authoritative: bool = True,
+        input_provenance: dict | None = None,
+        contract_evidence: dict | None = None,
+        gate_context: dict | None = None,
     ) -> dict:
         """
         Run the full pipeline and return a complete decision packet.
@@ -165,16 +170,93 @@ class APSignalPipeline:
         """
 
         timestamp = datetime.datetime.now().isoformat()
+        input_provenance = dict(input_provenance or {})
+        gate_context = dict(gate_context or {})
+
+        def _record_input(name: str, value, *, source: str,
+                          classification: str, authoritative: bool,
+                          reason: str = "") -> None:
+            input_provenance.setdefault(name, {
+                "value": value,
+                "source": source,
+                "source_ts": gate_context.get("source_ts"),
+                "classification": classification,
+                "authoritative": bool(authoritative),
+                "reason": reason,
+            })
 
         # ── Handle legacy option_cost_per_contract ────────────────────────
         if option_cost_per_contract is not None and option_premium is None:
             option_premium = option_cost_per_contract / 100.0
+            _record_input(
+                "option_premium",
+                option_premium,
+                source="legacy_option_cost_per_contract",
+                classification="PRODUCTION_DERIVED",
+                authoritative=False,
+                reason="legacy compatibility conversion",
+            )
 
         # ── Derive defaults if not provided ───────────────────────────────
         if atr_value is None:
             atr_value = underlying_price * 0.015       # ~1.5% daily ATR estimate
+            _record_input(
+                "atr_value",
+                atr_value,
+                source="pipeline_default",
+                classification="DEFAULT_ADVISORY",
+                authoritative=False,
+                reason="scanner ATR was unavailable",
+            )
         if option_premium is None:
             option_premium = underlying_price * 0.01   # ~1% OTM estimate
+            _record_input(
+                "option_premium",
+                option_premium,
+                source="pipeline_default",
+                classification="DEFAULT_ADVISORY",
+                authoritative=False,
+                reason="selected contract premium was unavailable",
+            )
+
+        _record_input(
+            "dte",
+            dte,
+            source="contract_evidence" if contract_quality_authoritative else "signal_or_default",
+            classification=(
+                "PRODUCTION_EXACT"
+                if contract_quality_authoritative
+                else "ESTIMATED_ADVISORY"
+            ),
+            authoritative=contract_quality_authoritative,
+            reason=(
+                "selected contract evidence supplied"
+                if contract_quality_authoritative
+                else "pre-selector DTE is not contract authority"
+            ),
+        )
+        for _name, _value in (
+            ("option_delta", option_delta),
+            ("bid_ask_spread_pct", bid_ask_spread_pct),
+            ("open_interest", open_interest),
+            ("daily_volume_options", daily_volume_options),
+        ):
+            _record_input(
+                _name,
+                _value,
+                source="contract_evidence" if contract_quality_authoritative else "pipeline_default_or_signal_metadata",
+                classification=(
+                    "PRODUCTION_EXACT"
+                    if contract_quality_authoritative
+                    else "ESTIMATED_ADVISORY"
+                ),
+                authoritative=contract_quality_authoritative,
+                reason=(
+                    "selected contract evidence supplied"
+                    if contract_quality_authoritative
+                    else "pre-selector contract quality is unavailable"
+                ),
+            )
 
         # ── 1. Get price data ─────────────────────────────────────────────
         end   = datetime.date.today().strftime("%Y-%m-%d")
@@ -221,7 +303,22 @@ class APSignalPipeline:
             daily_volume_options  = daily_volume_options,
             dte                   = dte,
             atr_stop_multiple     = atr_stop_multiple,
+            contract_quality_authoritative=contract_quality_authoritative,
+            account_state_authoritative=account_state_authoritative,
+            authority_diagnostics=input_provenance,
             # allow_0dte removed — APRiskManager stores it on self, not evaluate()
+        )
+
+        _observed_contract_quality_passes = bool(
+            getattr(risk_result.contract_quality, "passes", False)
+        )
+        # Before selector, default/estimated contract fields must not look like
+        # an authoritative rejection to the portfolio manager.  The selector
+        # and fresh quote path remains the execution-quality authority.
+        _pm_contract_quality_passes = (
+            _observed_contract_quality_passes
+            if contract_quality_authoritative
+            else True
         )
 
         # ── Build signals dict for portfolio manager ───────────────────────
@@ -257,7 +354,14 @@ class APSignalPipeline:
                 # v2 additions
                 "stop_price":         getattr(risk_result, "stop_price", None),
                 "risk_per_contract":  getattr(risk_result, "risk_per_contract", None),
-                "contract_quality":   getattr(risk_result, "contract_quality_passed", None),
+                "contract_quality":   _pm_contract_quality_passes,
+                "contract_quality_passes": _pm_contract_quality_passes,
+                "contract_quality_observed_passes": _observed_contract_quality_passes,
+                "contract_quality_authoritative": bool(contract_quality_authoritative),
+                "account_state_authoritative": bool(account_state_authoritative),
+                "authority_diagnostics": dict(
+                    getattr(risk_result, "authority_diagnostics", {}) or {}
+                ),
             },
         }
 
@@ -293,8 +397,42 @@ class APSignalPipeline:
                 "atr_value":          atr_value,
                 "stop_price":         getattr(risk_result, "stop_price", None),
             },
-            "mode":            self.mode_cfg.mode,
+            "mode":            getattr(getattr(self, "mode_cfg", None), "mode", "unknown"),
+            "gate_context":   gate_context,
+            "input_provenance": input_provenance,
+            "contract_evidence": dict(contract_evidence or {}),
+            "account_state_authoritative": bool(account_state_authoritative),
         })
+
+        _decision_score = getattr(decision, "score", None)
+        if _decision_score is None:
+            _decision_score = getattr(decision, "ev_score", None)
+
+        _gate_diagnostics = {
+            "client_id": gate_context.get("client_id"),
+            "execution_mode": gate_context.get("execution_mode"),
+            "canonical_signal_id": gate_context.get("canonical_signal_id"),
+            "input_provenance": input_provenance,
+            "selected_contract_evidence": dict(contract_evidence or {
+                "exists": False,
+                "classification": "NOT_AVAILABLE_YET",
+            }),
+            "account_state": {
+                "source": (
+                    "canonical_master_control_snapshot"
+                    if account_state_authoritative
+                    else "unavailable_pre_selector"
+                ),
+                "classification": (
+                    "PRODUCTION_EXACT"
+                    if account_state_authoritative
+                    else "UNAVAILABLE"
+                ),
+                "authoritative": bool(account_state_authoritative),
+            },
+            "contract_quality_authoritative": bool(contract_quality_authoritative),
+            "legacy_intel_score": float(_decision_score) if _decision_score is not None else 0.0,
+        }
 
         return {
             "ticker":          ticker,
@@ -304,8 +442,8 @@ class APSignalPipeline:
             "contracts":       decision.contracts,
             "max_usd":         decision.max_usd,
             "confidence":      decision.confidence,
-            "score":           getattr(decision, "score", None) or float(getattr(decision, "ev_score", None) or 0),
-            "mode":            self.mode_cfg.mode,
+            "score":           float(_decision_score) if _decision_score is not None else 0.0,
+            "mode":            getattr(getattr(self, "mode_cfg", None), "mode", "unknown"),
             "reasoning":       decision.reasoning,
             "signal_breakdown":decision.signal_breakdown,
             "tech_breakdown":  tech_result.get("breakdown", {}),
@@ -321,8 +459,17 @@ class APSignalPipeline:
                 "max_position_usd":        risk_result.max_position_usd,
                 "spy_trend":               risk_result.spy_trend,
                 "vix":                     risk_result.vix,
-                "contract_quality_passed": getattr(risk_result, "contract_quality_passed", None),
+                "contract_quality_passed": _pm_contract_quality_passes,
+                "contract_quality_passes": _pm_contract_quality_passes,
+                "contract_quality_observed_passes": _observed_contract_quality_passes,
+                "contract_quality_authoritative": bool(contract_quality_authoritative),
+                "account_state_authoritative": bool(account_state_authoritative),
+                "authority_diagnostics": dict(
+                    getattr(risk_result, "authority_diagnostics", {}) or {}
+                ),
+                "gate_diagnostics": _gate_diagnostics,
             },
+            "gate_diagnostics": _gate_diagnostics,
         }
 
     # ──────────────────────────────────────────────────────────────────────
@@ -337,6 +484,9 @@ class APSignalPipeline:
         underlying_price:   float,
         dte:                int   = 1,
         allow_0dte:         bool  = True,
+        gate_context:       dict | None = None,
+        input_provenance:   dict | None = None,
+        contract_evidence:  dict | None = None,
     ) -> dict:
         """
         Minimal-param pipeline call.  All contract params estimated from
@@ -351,6 +501,15 @@ class APSignalPipeline:
             underlying_price     = underlying_price,
             dte                  = dte,
             allow_0dte           = allow_0dte,
+            contract_quality_authoritative=False,
+            account_state_authoritative=False,
+            gate_context=gate_context,
+            input_provenance=input_provenance,
+            contract_evidence=contract_evidence or {
+                "exists": False,
+                "classification": "NOT_AVAILABLE_YET",
+                "reason": "run_quick has no selected OCC contract",
+            },
         )
 
     # ──────────────────────────────────────────────────────────────────────
