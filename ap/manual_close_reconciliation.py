@@ -95,6 +95,8 @@ def position_direction(position: dict) -> str:
 
 
 def positive_float(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
     try:
         parsed = float(value)
     except Exception:
@@ -105,11 +107,19 @@ def positive_float(value: Any) -> float:
 
 
 def positive_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
     try:
-        parsed = int(float(value))
+        parsed_float = float(value)
     except Exception:
         return 0
-    return parsed if parsed > 0 else 0
+    if (
+        not math.isfinite(parsed_float)
+        or parsed_float <= 0
+        or not parsed_float.is_integer()
+    ):
+        return 0
+    return int(parsed_float)
 
 
 def parse_timestamp(value: Any) -> datetime | None:
@@ -353,8 +363,8 @@ def order_filled_qty(order: dict) -> int:
         qty = positive_int(order.get(key))
         if qty > 0:
             return qty
-    if order_status(order) == "filled":
-        return positive_int(order.get("quantity") or order.get("qty"))
+    # A terminal broker status is not execution quantity truth.  Requested
+    # quantity is never a safe substitute for an explicit filled quantity.
     return 0
 
 

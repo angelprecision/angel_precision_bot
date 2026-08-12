@@ -40,6 +40,7 @@ Run:
 from __future__ import annotations
 
 import inspect
+import math
 import os
 import re
 import textwrap
@@ -317,7 +318,7 @@ def finalize_proof_callable():
     #   - _record_intel_outcome (PR B FIX-6; falls back to None if the
     #     intelligence_bridge import fails. Safe default = None; the
     #     method's `if _record_intel_outcome:` guard handles None.)
-    src = "import os\nimport logging\nlog = logging.getLogger('test_finalize')\n"
+    src = "import os\nimport math\nimport logging\nlog = logging.getLogger('test_finalize')\n"
     src += f'BREAKEVEN_BAND_PCT = float(os.getenv("BREAKEVEN_BAND_PCT", "{_be_default}"))\n'
     src += "_record_intel_outcome = None\n"
     src += "class _Harness:\n"
@@ -444,6 +445,56 @@ class TestFinalizeProofBehavior:
         assert lt_kwargs["exit_option_price"] == pytest.approx(3.50)
         # exit_fill_price is None because the broker didn't give us one.
         assert lt_kwargs["exit_fill_price"] is None
+
+    @pytest.mark.parametrize(
+        "bad_price",
+        [
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="infinity"),
+            pytest.param(float("-inf"), id="negative-infinity"),
+            pytest.param(True, id="boolean-true"),
+            pytest.param(False, id="boolean-false"),
+        ],
+    )
+    def test_invalid_callback_price_is_zero_sink_mutation(
+        self, finalize_proof_callable, bad_price
+    ):
+        h = _build_harness(finalize_proof_callable)
+        pos = _build_pos(_make_staged())
+
+        assert h._finalize_proof(pos, actual_fill_price=bad_price) is False
+        assert pos._proof_finalized is False
+        assert h.proof.log_trade.call_count == 0
+        assert h.feedback.record_outcome.call_count == 0
+        assert h.store.update_status.call_count == 0
+        assert h.shadow.record_live_outcome.call_count == 0
+
+    @pytest.mark.parametrize(
+        "bad_qty",
+        [
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="infinity"),
+            pytest.param(True, id="boolean"),
+            pytest.param(1.5, id="fractional"),
+            pytest.param(0, id="zero"),
+        ],
+    )
+    def test_invalid_callback_quantity_is_zero_sink_mutation(
+        self, finalize_proof_callable, bad_qty
+    ):
+        h = _build_harness(finalize_proof_callable)
+        pos = _build_pos(_make_staged())
+
+        assert h._finalize_proof(
+            pos,
+            actual_fill_price=3.60,
+            broker_exit_filled_qty=bad_qty,
+        ) is False
+        assert pos._proof_finalized is False
+        assert h.proof.log_trade.call_count == 0
+        assert h.feedback.record_outcome.call_count == 0
+        assert h.store.update_status.call_count == 0
+        assert h.shadow.record_live_outcome.call_count == 0
 
     def test_no_staged_dict_is_noop(self, finalize_proof_callable):
         """Position with no _proof_staged dict: finalize must be a no-op

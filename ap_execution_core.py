@@ -54,6 +54,19 @@ def _normalize_execution_mode(value) -> str | None:
     return mode if mode in _VALID_EXECUTION_MODES else None
 
 
+def _strict_positive_whole_number(value: object) -> int | None:
+    """Return a positive whole-number scalar without bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
 def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_flag) -> str | None:
     explicit_values = [
         getattr(approved_plan, "execution_mode", None),
@@ -3489,12 +3502,18 @@ class APExecutionCore:
         tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
         expected_contract = str(row.get("contract") or "")
-        expected_qty = int(row.get("qty") or 0)
+        expected_qty = _strict_positive_whole_number(row.get("qty"))
+        if expected_qty is None:
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_EXPECTED_QTY_INVALID",
+            }
         strong = [
             o for o in exact_tag
             if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
             and str(o.get("side") or "").lower() == "buy_to_open"
-            and int(float(o.get("quantity") or 0)) == expected_qty
+            and _strict_positive_whole_number(o.get("quantity")) == expected_qty
         ]
         if len(exact_tag) > 1 or len(strong) > 1:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
@@ -3619,12 +3638,18 @@ class APExecutionCore:
         tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
         expected_contract = str(row.get("contract") or "")
-        expected_qty = int(row.get("qty") or 0)
+        expected_qty = _strict_positive_whole_number(row.get("qty"))
+        if expected_qty is None:
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_EXPECTED_QTY_INVALID",
+            }
         strong = [
             o for o in exact_tag
             if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
             and str(o.get("side") or "").lower() == "sell_to_close"
-            and int(float(o.get("quantity") or 0)) == expected_qty
+            and _strict_positive_whole_number(o.get("quantity")) == expected_qty
         ]
         if len(exact_tag) > 1 or len(strong) > 1:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
@@ -9976,12 +10001,61 @@ class APExecutionCore:
                 getattr(pos, "ticker", "?"),
             )
             return bool(getattr(pos, "_proof_persisted", False))
-        pos._proof_finalized = True  # type: ignore[attr-defined]
 
-        # Use actual fill price; fall back to estimated if broker returns 0/None
-        fill = float(actual_fill_price or 0)
-        est  = float(staged.get("exit_option_price") or 0)
+        if broker_exit_filled_qty is not None:
+            if isinstance(broker_exit_filled_qty, bool):
+                return False
+            try:
+                _proof_qty = float(broker_exit_filled_qty)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (
+                not math.isfinite(_proof_qty)
+                or _proof_qty <= 0
+                or not _proof_qty.is_integer()
+            ):
+                return False
+            broker_exit_filled_qty = int(_proof_qty)
+
+        # Validate the callback payload before changing the idempotency flag or
+        # touching any proof/feedback/status sink. ``0``/``None`` remain the
+        # explicit paper-sandbox "no price supplied" fallback; bool, NaN,
+        # infinity, negative, and unparseable values are malformed evidence.
+        if isinstance(actual_fill_price, bool):
+            log.critical(
+                "[%s] _finalize_proof blocked | boolean actual fill price=%r",
+                getattr(pos, "ticker", "?"), actual_fill_price,
+            )
+            return False
+        try:
+            fill = float(actual_fill_price or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(fill) or fill < 0:
+            log.critical(
+                "[%s] _finalize_proof blocked | invalid actual fill price=%r",
+                getattr(pos, "ticker", "?"), actual_fill_price,
+            )
+            return False
+        try:
+            est = float(staged.get("exit_option_price") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(est):
+            log.critical(
+                "[%s] _finalize_proof blocked | invalid staged exit price=%r",
+                getattr(pos, "ticker", "?"), staged.get("exit_option_price"),
+            )
+            return False
         final_exit_price = fill if fill > 0 else est
+        if not math.isfinite(final_exit_price) or final_exit_price <= 0:
+            log.critical(
+                "[%s] _finalize_proof blocked | no finite-positive exit price "
+                "actual=%r staged=%r",
+                getattr(pos, "ticker", "?"), actual_fill_price, est,
+            )
+            return False
+        pos._proof_finalized = True  # type: ignore[attr-defined]
 
         entry_px = float(staged.get("entry_option_price") or 0)
         if entry_px > 0 and final_exit_price > 0:

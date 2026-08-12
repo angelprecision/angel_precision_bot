@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -116,6 +117,45 @@ _ROWCOUNT_NONE_IS_FATAL: bool = (
     os.getenv("OSM_ROWCOUNT_NONE_IS_FATAL", "1").strip().lower()
     not in {"0", "false", "no", "off"}
 )
+
+
+def _strict_positive_finite_float(value: object) -> float | None:
+    """Return a positive finite scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _strict_positive_whole_number(value: object) -> int | None:
+    """Return a positive whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _strict_nonnegative_whole_number(value: object) -> int | None:
+    """Return a finite non-negative whole number without bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
 
 
 def probe_db_rowcount() -> Optional[int]:
@@ -358,16 +398,16 @@ class APOrderStateMachine:
     @staticmethod
     def _safe_int(value, default=0):
         """
-        Convert value to int, returning default on failure.
+        Convert a finite whole-number scalar to int, returning default on
+        failure. In particular, do not truncate fractional broker/DB values
+        or coerce booleans into execution quantities.
         FIX-E: default is intentionally untyped so callers can pass None to
         distinguish "not provided" from zero.
         """
-        try:
-            if value is None or value == "":
-                return default
-            return int(float(value))
-        except Exception:
+        if value is None or value == "":
             return default
+        parsed = _strict_nonnegative_whole_number(value)
+        return parsed if parsed is not None else default
 
     @staticmethod
     def _call_exit_engine(exit_engine, method_name: str, *args, **kwargs):
@@ -1018,12 +1058,73 @@ class APOrderStateMachine:
         current     = dict(current)
         old_status  = str(current.get("status") or "")
         kind        = str(current.get("kind") or "")
-        prev_filled = self._safe_int(current.get("filled_qty"), 0)
+        raw_prev_filled = current.get("filled_qty")
+        prev_filled = _strict_nonnegative_whole_number(raw_prev_filled)
+        if raw_prev_filled not in (None, "") and prev_filled is None:
+            reason = "invalid_persisted_fill_qty"
+            log.critical(
+                "[%s] FILL TRANSITION BLOCKED | order=%s persisted filled_qty=%r",
+                self.client_id,
+                local_order_id,
+                raw_prev_filled,
+            )
+            self._record_error(local_order_id, reason)
+            self._emit_transition_event(
+                local_order_id=local_order_id,
+                old_status=old_status,
+                new_status=new_status,
+                order=current,
+                decision="REJECT",
+                reason_code="INVALID_PERSISTED_FILL_QTY",
+                explanation=reason,
+                broker_order_id=broker_order_id,
+                filled_qty=filled_qty,
+                fill_price=fill_price,
+            )
+            return False
+        prev_filled = prev_filled or 0
         same_state_fill_update = False
         same_state_identity_update = False
 
+        if new_status in {
+            OrderStatus.FILLED,
+            OrderStatus.PARTIAL_FILL,
+            OrderStatus.EXIT_FILLED,
+            OrderStatus.EXIT_PARTIAL_FILL,
+        }:
+            validated_qty = _strict_positive_whole_number(filled_qty)
+            validated_price = _strict_positive_finite_float(fill_price)
+            if validated_qty is None or validated_price is None:
+                reason = "invalid_fill_economics"
+                log.critical(
+                    "[%s] FILL TRANSITION BLOCKED | order=%s status=%s "
+                    "filled_qty=%r fill_price=%r — requires positive-whole qty "
+                    "and finite-positive price",
+                    self.client_id,
+                    local_order_id,
+                    new_status,
+                    filled_qty,
+                    fill_price,
+                )
+                self._record_error(local_order_id, reason)
+                self._emit_transition_event(
+                    local_order_id=local_order_id,
+                    old_status=old_status,
+                    new_status=new_status,
+                    order=current,
+                    decision="REJECT",
+                    reason_code="INVALID_FILL_ECONOMICS",
+                    explanation=reason,
+                    broker_order_id=broker_order_id,
+                    filled_qty=filled_qty,
+                    fill_price=fill_price,
+                )
+                return False
+            filled_qty = validated_qty
+            fill_price = validated_price
+
         if filled_qty is not None:
-            incoming_filled = self._safe_int(filled_qty, None)
+            incoming_filled = _strict_positive_whole_number(filled_qty)
             if incoming_filled is None:
                 log.critical("[%s] INVALID FILL QTY | order=%s filled_qty=%r",
                              self.client_id, local_order_id, filled_qty)
@@ -1091,9 +1192,9 @@ class APOrderStateMachine:
         if broker_order_id:
             updates.append("broker_order_id=%s"); params.append(broker_order_id)
         if filled_qty is not None:
-            updates.append("filled_qty=%s"); params.append(int(filled_qty))
+            updates.append("filled_qty=%s"); params.append(filled_qty)
         if fill_price is not None:
-            updates.append("fill_price=%s"); params.append(float(fill_price))
+            updates.append("fill_price=%s"); params.append(fill_price)
         if last_error:
             updates.append("last_error=%s"); params.append(last_error)
         if submitted_ts:
@@ -1609,17 +1710,14 @@ class APOrderStateMachine:
             latest_mode = latest_dict.get("execution_mode")
             latest_position = latest_dict.get("position_id")
             latest_kind = latest_dict.get("kind")
-            try:
-                latest_qty = int(latest_dict.get("qty") or 0)
-            except (TypeError, ValueError):
-                latest_qty = 0
+            latest_qty = _strict_positive_whole_number(latest_dict.get("qty"))
             latest_identity_matches = bool(
                 latest_client == self_client_id
                 and latest_kind == "EXIT"
                 and latest_mode == mode
                 and latest_position
                 and latest_position == expected_position
-                and latest_qty > 0
+                and latest_qty is not None
                 # Binding audit correction (Blocker 3): reload identity
                 # requires exact quantity equality unconditionally.
                 and expected_qty_value is not None
@@ -1829,8 +1927,34 @@ class APOrderStateMachine:
             _local_id    = local_order_id or current.get("local_order_id")
             _broker_id   = broker_order_id or current.get("broker_order_id")
             _order_qty   = self._safe_int(current.get("qty"), 0)
-            _prev_filled = self._safe_int(current.get("filled_qty"), 0)
-            _cum_filled  = self._safe_int(filled_qty, None)  # FIX-E: None means "not provided"
+            _raw_prev_filled = current.get("filled_qty")
+            _prev_filled = _strict_nonnegative_whole_number(_raw_prev_filled)
+            if _raw_prev_filled not in (None, "") and _prev_filled is None:
+                log.critical(
+                    "[%s] EXIT hook blocked | malformed persisted filled_qty "
+                    "order=%s pos=%s value=%r",
+                    self.client_id,
+                    _local_id,
+                    _pos_id,
+                    _raw_prev_filled,
+                )
+                self._call_exit_engine(
+                    _ee,
+                    "set_pending_exit_order",
+                    _pos_id,
+                    local_order_id=str(_local_id or ""),
+                    broker_order_id=str(_broker_id or ""),
+                    qty=0,
+                    reason="EXIT_INVALID_PERSISTED_FILL_QTY_QUARANTINE",
+                    identity_quarantine=True,
+                )
+                return
+            _prev_filled = _prev_filled or 0
+            _cum_filled  = (
+                _strict_positive_whole_number(filled_qty)
+                if filled_qty is not None
+                else None
+            )
 
             if _cum_filled is not None and _cum_filled < _prev_filled:
                 log.critical(
@@ -1868,10 +1992,19 @@ class APOrderStateMachine:
 
             # ── EXIT_PARTIAL_FILL ───────────────────────────────────────────
             if new_status == OrderStatus.EXIT_PARTIAL_FILL:
-                if _cum_filled is None:
+                if _cum_filled is None or _strict_positive_finite_float(fill_price) is None:
                     log.warning(
-                        "[%s] EXIT_PARTIAL_FILL missing filled_qty | order=%s pos=%s -- not applying",
-                        self.client_id, _local_id, _pos_id,
+                        "[%s] EXIT_PARTIAL_FILL malformed fill economics | order=%s pos=%s "
+                        "filled_qty=%r fill_price=%r -- quarantining",
+                        self.client_id, _local_id, _pos_id, filled_qty, fill_price,
+                    )
+                    self._call_exit_engine(
+                        _ee, "set_pending_exit_order", _pos_id,
+                        local_order_id=str(_local_id or ""),
+                        broker_order_id=str(_broker_id or ""),
+                        qty=0,
+                        reason="EXIT_PARTIAL_FILL_INVALID_ECONOMICS_QUARANTINE",
+                        identity_quarantine=True,
                     )
                     return
                 _delta = max(0, _cum_filled - _prev_filled)
@@ -1887,22 +2020,22 @@ class APOrderStateMachine:
 
             # ── EXIT_FILLED ─────────────────────────────────────────────────
             if new_status == OrderStatus.EXIT_FILLED:
-                if _cum_filled is None or _cum_filled <= 0:
-                    _cum_filled = _order_qty
-
-                # FIX-H: zero qty → quarantine, not clear
-                if _cum_filled <= 0:
+                # Never substitute requested order quantity for missing or
+                # malformed broker execution quantity. EXIT_FILLED is allowed
+                # to mutate position/proof state only with exact positive-whole
+                # quantity and finite-positive execution price.
+                if _cum_filled is None or _strict_positive_finite_float(fill_price) is None:
                     log.critical(
-                        "[%s] EXIT_FILLED with zero/unknown quantity -- QUARANTINING | "
-                        "order=%s pos=%s | broker fill data unreliable",
-                        self.client_id, _local_id, _pos_id,
+                        "[%s] EXIT_FILLED malformed fill economics -- QUARANTINING | "
+                        "order=%s pos=%s filled_qty=%r fill_price=%r | broker fill data unreliable",
+                        self.client_id, _local_id, _pos_id, filled_qty, fill_price,
                     )
                     self._call_exit_engine(
                         _ee, "set_pending_exit_order", _pos_id,
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         qty=0,
-                        reason="EXIT_FILLED_ZERO_QTY_QUARANTINE",
+                        reason="EXIT_FILLED_INVALID_ECONOMICS_QUARANTINE",
                         identity_quarantine=True,
                     )
                     return
@@ -6995,7 +7128,9 @@ class APOrderStateMachine:
             if not row:
                 return None
             if row.get("quantity_remaining") is not None:
-                return int(row.get("quantity_remaining") or 0)
+                return _strict_nonnegative_whole_number(
+                    row.get("quantity_remaining")
+                )
             # Fallback: quantity_remaining is NULL in DB.
             # This is correct on first fill (before any scale-out), but if it fires
             # after a scale-out it means DB is not being updated — partial close will
@@ -7006,7 +7141,7 @@ class APOrderStateMachine:
                 "quantity_remaining is not being updated in DB",
                 self.client_id, position_id, row.get("qty"),
             )
-            return int(row.get("qty") or 0)
+            return _strict_nonnegative_whole_number(row.get("qty"))
         except Exception:
             return None
 
@@ -7049,7 +7184,9 @@ class APOrderStateMachine:
             _filled_ts     = order.get("filled_ts")
             _broker_id     = str(order.get("broker_order_id") or "")
 
-            if not position_id or _fill_price is None or int(_filled_qty or 0) <= 0:
+            validated_price = _strict_positive_finite_float(_fill_price)
+            validated_qty = _strict_positive_whole_number(_filled_qty)
+            if not position_id or validated_price is None or validated_qty is None:
                 log.warning(
                     "[%s] _finalize_position_from_exit_order skipped — incomplete fill data | "
                     "order=%s pos=%s price=%r qty=%r",
@@ -7062,8 +7199,8 @@ class APOrderStateMachine:
                 pm = APPositionManager(self.client_id)
             pm.close_position_from_exit_fill(
                 position_id=position_id,
-                exit_price=float(_fill_price),
-                filled_qty=int(_filled_qty),
+                exit_price=validated_price,
+                filled_qty=validated_qty,
                 filled_ts=str(_filled_ts) if _filled_ts else now_utc_iso(),
                 local_order_id=local_order_id,
                 broker_order_id=_broker_id,

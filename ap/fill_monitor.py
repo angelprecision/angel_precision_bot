@@ -80,6 +80,44 @@ _CANONICAL_OWNER_HANDOFF_STANDING_STOP_STATES = frozenset(
     {"SUBMITTING", "SUBMITTED", "FAILED", "OUTCOME_UNPROVEN"}
 )
 
+def _strict_positive_finite_float(value) -> float | None:
+    """Return a positive finite scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _strict_positive_whole_number(value) -> int | None:
+    """Return a positive whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _strict_nonnegative_whole_number(value) -> int | None:
+    """Return a non-negative whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
 ALLOW_LEGACY_FILL_MONITOR = (
     os.getenv("ALLOW_LEGACY_FILL_MONITOR", "0").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -1107,53 +1145,37 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             }
             our = "ACKNOWLEDGED" if status in ACTIVE_BROKER_STATUSES else status_map.get(status, "UNKNOWN")
 
-        explicit_filled_qty = raw.get("exec_quantity")
-        quantity_field = "exec_quantity"
-        if explicit_filled_qty is None:
-            explicit_filled_qty = raw.get("filled_quantity")
-            quantity_field = "filled_quantity"
+        explicit_filled_qty = None
+        for _qty_key in (
+            "exec_quantity",
+            "filled_quantity",
+            "filled_qty",
+            "cumulative_filled_qty",
+        ):
+            if _qty_key in raw:
+                explicit_filled_qty = raw.get(_qty_key)
+                break
         if explicit_filled_qty is not None:
-            filled_qty = _validated_broker_quantity(explicit_filled_qty)
-            if filled_qty is None:
-                return _broker_quantity_error_result(
-                    order,
-                    broker_order_id,
-                    raw,
-                    quantity_field=quantity_field,
-                    quantity_value=explicit_filled_qty,
-                )
+            filled_qty = _strict_positive_whole_number(explicit_filled_qty) or 0
         elif our in ("FILLED", "EXIT_FILLED"):
-            quantity_field = "quantity"
-            raw_quantity = raw.get("quantity")
-            filled_qty = _validated_broker_quantity(raw_quantity)
-            if filled_qty is None:
-                return _broker_quantity_error_result(
-                    order,
-                    broker_order_id,
-                    raw,
-                    quantity_field=quantity_field,
-                    quantity_value=raw_quantity,
-                )
+            # Requested order quantity is not execution truth. A terminal
+            # broker status without an explicit executed quantity remains a
+            # fill-truth hold; do not synthesize it from ``quantity``.
+            filled_qty = 0
         else:
             filled_qty = 0
 
-        raw_avg_fill = raw.get("avg_fill_price")
-        if raw_avg_fill is None:
-            raw_avg_fill = raw.get("price")
-        if raw_avg_fill is None:
-            raw_avg_fill = 0.0
-        if isinstance(raw_avg_fill, bool):
-            # Validate the external scalar before coercion; float(True) would
-            # otherwise turn malformed broker data into an executable $1.00.
-            avg_fill = None
-        else:
-            try:
-                avg_fill = float(raw_avg_fill)
-            except (TypeError, ValueError, OverflowError):
-                # Keep the broker response as contradictory evidence instead
-                # of converting it into an empty ERROR that could qualify for
-                # the DB-only unavailable-poll recovery path.
-                avg_fill = None
+        raw_fill_price = None
+        for _price_key in (
+            "avg_fill_price",
+            "average_fill_price",
+            "fill_price",
+            "filled_avg_price",
+        ):
+            if _price_key in raw:
+                raw_fill_price = raw.get(_price_key)
+                break
+        avg_fill = _strict_positive_finite_float(raw_fill_price) or 0.0
 
         result = {
             "status": our,
@@ -1208,7 +1230,11 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         # filled_qty <= 0 is impossible truth for filled or partial-fill states.  Block the OSM transition and
         # emit a critical audit + fill event so operators see it.  The
         # reconciler/next broker poll will re-check on the next tick.
-        if our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"} and int(filled_qty or 0) <= 0:
+        if our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"} and (
+            _strict_positive_whole_number(explicit_filled_qty)
+            if explicit_filled_qty is not None
+            else None
+        ) is None:
             reason = "BROKER_FILLED_ZERO_QTY"
             client_id = str(order.get("client_id") or "default")
             payload = {
@@ -1229,6 +1255,40 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                     "Broker reported a fill/partial fill but no positive "
                     "cumulative filled quantity; OSM transition and side "
                     "effects blocked pending next broker/reconciler pass."
+                ),
+                result=result,
+                extra_context=payload,
+            )
+            return {
+                **result,
+                "status": "ERROR",
+                "filled_qty": 0,
+                "reason": reason,
+            }
+
+        if our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"} and (
+            _strict_positive_finite_float(raw_fill_price) is None
+        ):
+            reason = "BROKER_FILLED_INVALID_PRICE"
+            client_id = str(order.get("client_id") or "default")
+            payload = {
+                "local_order_id": order.get("local_order_id"),
+                "broker_order_id": broker_order_id,
+                "kind": kind,
+                "mapped_status": our,
+                "filled_qty": filled_qty,
+                "avg_fill": raw_fill_price,
+                "broker_reason": raw.get("reason") or status,
+            }
+            log.critical("[%s] %s | %s", client_id, reason, payload)
+            audit(client_id, "CRITICAL", reason, payload)
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code=reason,
+                explanation=(
+                    "Broker reported a fill/partial fill without a finite-positive "
+                    "execution price; OSM transition and side effects blocked."
                 ),
                 result=result,
                 extra_context=payload,
@@ -3845,8 +3905,12 @@ def _sanitize_cumulative_filled(order: dict, result: dict) -> tuple[int, bool]:
     local_id = str(order.get("local_order_id") or "")
     broker_id = order.get("broker_order_id")
 
-    raw_filled = int(result.get("filled_qty") or 0)
-    order_qty = int(order.get("qty") or 0)
+    raw_filled = _strict_nonnegative_whole_number(result.get("filled_qty"))
+    order_qty = _strict_nonnegative_whole_number(order.get("qty"))
+    if raw_filled is None:
+        raw_filled = 0
+    if order_qty is None:
+        order_qty = 0
 
     if order_qty > 0 and raw_filled > order_qty:
         clamped = order_qty
@@ -4079,7 +4143,15 @@ def process_pending_order(
             )
             return
 
-    prev_filled = int(order.get("filled_qty") or 0)
+    prev_filled = _strict_nonnegative_whole_number(order.get("filled_qty"))
+    if prev_filled is None:
+        log.critical(
+            "[%s] Durable order filled_qty malformed | order=%s value=%r — holding",
+            client_id,
+            local_id,
+            order.get("filled_qty"),
+        )
+        return
     new_filled, overfill_clamped = _sanitize_cumulative_filled(order, result)
 
     if mapped not in ("UNKNOWN", "ERROR"):

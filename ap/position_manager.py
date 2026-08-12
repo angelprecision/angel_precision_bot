@@ -60,6 +60,19 @@ def _strict_positive_whole_number(value: object) -> int | None:
     return int(parsed)
 
 
+def _strict_nonnegative_whole_number(value: object) -> int | None:
+    """Return a non-negative whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PR #237 — Position Manager fail-closed side normalization.
 #
@@ -181,21 +194,28 @@ def _validate_persisted_terminal_truth(row: dict) -> tuple[bool, str]:
     if isinstance(raw_pnl_pct, str) and not raw_pnl_pct.strip():
         return False, "missing_realized_pnl_pct"
 
+    avg_fill_raw = row.get("avg_fill")
+    if avg_fill_raw is None or (
+        isinstance(avg_fill_raw, str) and not avg_fill_raw.strip()
+    ):
+        avg_fill_raw = row.get("entry_price")
+    qty = _strict_positive_whole_number(row.get("qty"))
+    avg_fill = _strict_positive_finite_float(avg_fill_raw)
+    exit_price = _strict_positive_finite_float(row.get("exit_price"))
+    if isinstance(raw_pnl_pct, bool):
+        return False, "invalid_realized_pnl_pct"
     try:
-        qty = int(row.get("qty") or 0)
-        avg_fill = float(row.get("avg_fill") or row.get("entry_price") or 0)
-        exit_price = float(row.get("exit_price") or 0)
         pnl_pct = float(raw_pnl_pct)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False, "unparseable_numeric"
-    if qty <= 0:
+    if qty is None:
         return False, "invalid_qty"
     # PR #386 amendment 2: every numeric field entering canonical proof
     # must be finite (rejects +inf, -inf, and NaN). A value that "looks"
     # positive but is infinity would otherwise silently pass the >0 gate.
-    if not _math.isfinite(avg_fill) or avg_fill <= 0:
+    if avg_fill is None:
         return False, "invalid_entry_price"
-    if not _math.isfinite(exit_price) or exit_price <= 0:
+    if exit_price is None:
         return False, "invalid_exit_price"
     if not _math.isfinite(pnl_pct):
         return False, "non_finite_pnl_pct"
@@ -2223,9 +2243,9 @@ class APPositionManager:
         expected_pending_broker = str(
             expected_pending_exit_broker_order_id or ""
         ).strip()
+        supplied_local = str(local_order_id or "").strip()
+        supplied_broker = str(broker_order_id or "").strip()
         if expected_pending_local or expected_pending_broker:
-            supplied_local = str(local_order_id or "").strip()
-            supplied_broker = str(broker_order_id or "").strip()
             if (
                 not expected_pending_local
                 or not expected_pending_broker
@@ -2267,13 +2287,13 @@ class APPositionManager:
                 if not pos:
                     return False, "position_not_found"
 
+                locked_pending_local = str(
+                    pos.get("pending_exit_local_order_id") or ""
+                ).strip()
+                locked_pending_broker = str(
+                    pos.get("pending_exit_broker_order_id") or ""
+                ).strip()
                 if expected_pending_local or expected_pending_broker:
-                    locked_pending_local = str(
-                        pos.get("pending_exit_local_order_id") or ""
-                    ).strip()
-                    locked_pending_broker = str(
-                        pos.get("pending_exit_broker_order_id") or ""
-                    ).strip()
                     if (
                         not locked_pending_local
                         or not locked_pending_broker
@@ -2293,6 +2313,34 @@ class APPositionManager:
                             locked_pending_broker,
                         )
                         return False, "exit_identity_changed_before_finalize"
+                elif supplied_local or supplied_broker:
+                    # OSM historically called this shared boundary without
+                    # expected-* arguments. A pending EXIT pair is still
+                    # authorization-bearing, so a stale callback must not
+                    # finalize merely because the optional expectation was
+                    # omitted by that caller.
+                    if (
+                        (locked_pending_local or locked_pending_broker)
+                        and (
+                            not locked_pending_local
+                            or not locked_pending_broker
+                            or supplied_local != locked_pending_local
+                            or supplied_broker != locked_pending_broker
+                        )
+                    ):
+                        log.warning(
+                            "[%s] close_position_from_exit_fill blocked | pos=%s "
+                            "caller EXIT identity does not match locked pending pair "
+                            "supplied_local=%s supplied_broker=%s "
+                            "locked_local=%s locked_broker=%s",
+                            self.client_id,
+                            position_id,
+                            supplied_local,
+                            supplied_broker,
+                            locked_pending_local,
+                            locked_pending_broker,
+                        )
+                        return False, "caller_exit_identity_does_not_match_pending"
 
                 # ── Canonical state classification under FOR UPDATE (PR #386) ─
                 # The row lock is the ONLY correct serialization point. Any
@@ -2317,11 +2365,29 @@ class APPositionManager:
                 _idm_status = str(pos.get("status") or "").upper().strip()
                 _idm_terminal = _idm_status in PositionStatus.TERMINAL
                 _idm_remaining_raw = pos.get("quantity_remaining")
-                _idm_qty = int(pos.get("qty") or 0)
+                _idm_qty = _strict_positive_whole_number(pos.get("qty"))
                 _idm_remaining = (
                     _idm_qty if _idm_remaining_raw is None
-                    else int(_idm_remaining_raw or 0)
+                    else _strict_nonnegative_whole_number(_idm_remaining_raw)
                 )
+                _avg_fill_raw = pos.get("avg_fill")
+                if _avg_fill_raw is None or (
+                    isinstance(_avg_fill_raw, str) and not _avg_fill_raw.strip()
+                ):
+                    _avg_fill_raw = pos.get("entry_price")
+                _avg_fill = _strict_positive_finite_float(_avg_fill_raw)
+                if _idm_qty is None or _idm_remaining is None or _avg_fill is None:
+                    log.critical(
+                        "[%s] close_position_from_exit_fill invariant | pos=%s "
+                        "malformed persisted position economics qty=%r remaining=%r avg_fill=%r "
+                        "— refusing mutation",
+                        self.client_id,
+                        position_id,
+                        pos.get("qty"),
+                        _idm_remaining_raw,
+                        _avg_fill_raw,
+                    )
+                    return False, "invalid_persisted_position_economics"
                 if _idm_terminal and _idm_remaining <= 0:
                     log.info(
                         "[%s] close_position_from_exit_fill idempotent | "
@@ -2337,9 +2403,9 @@ class APPositionManager:
                         "status": _idm_status,
                         "quantity_remaining": _idm_remaining,
                         "qty": _idm_qty,
-                        "avg_fill": float(pos.get("avg_fill") or pos.get("entry_price") or 0),
-                        "entry_option_price": float(pos.get("avg_fill") or pos.get("entry_price") or 0),
-                        "exit_price": float(pos.get("exit_price") or 0),
+                        "avg_fill": _avg_fill,
+                        "entry_option_price": _avg_fill,
+                        "exit_price": _strict_positive_finite_float(pos.get("exit_price")) or 0.0,
                         "filled_qty": 0,
                         "remaining": 0,
                         "realized_pnl": float(pos.get("realized_pnl") or 0),
@@ -2377,14 +2443,14 @@ class APPositionManager:
                     return False, "nonterminal_position_has_zero_remaining"
                 # ── End canonical state classification ────────────────────────
 
-                avg_fill = float(pos.get("avg_fill") or pos.get("entry_price") or 0)
-                qty      = int(pos.get("qty") or 0)
+                avg_fill = _avg_fill
+                qty      = _idm_qty
                 current_remaining = pos.get("quantity_remaining")
                 if current_remaining is None:
                     current_remaining = qty
-                current_remaining = int(current_remaining or 0)
+                current_remaining = _strict_nonnegative_whole_number(current_remaining)
 
-                if avg_fill <= 0 or qty <= 0:
+                if avg_fill is None or qty is None or current_remaining is None or current_remaining <= 0:
                     return False, "invalid_position_cost_basis"
 
                 # current_remaining is guaranteed > 0 here (idempotency guard

@@ -320,6 +320,19 @@ def _strict_positive_whole_number(value: object) -> int | None:
     return int(parsed)
 
 
+def _strict_nonnegative_whole_number(value: object) -> int | None:
+    """Return a non-negative whole-number scalar without allowing bool coercion."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
 class APBrokerReconciler:
     """
     Continuously reconciles broker truth against DB state.
@@ -707,12 +720,7 @@ class APBrokerReconciler:
             val = broker_raw.get(key)
             if val is None or val == "":
                 continue
-            try:
-                qty = int(float(val))
-                if qty >= 0:
-                    return qty
-            except Exception:
-                continue
+            return _strict_nonnegative_whole_number(val)
         return None
 
     def _extract_avg_fill_price(self, broker_raw: dict) -> Optional[float]:
@@ -732,12 +740,7 @@ class APBrokerReconciler:
             val = broker_raw.get(key)
             if val is None or val == "":
                 continue
-            try:
-                px = float(val)
-                if px > 0:
-                    return px
-            except Exception:
-                continue
+            return _strict_positive_finite_float(val)
         return None
 
     def _db_order_filled_qty(self, order: dict) -> int:
@@ -745,7 +748,7 @@ class APBrokerReconciler:
             try:
                 val = order.get(key)
                 if val is not None and val != "":
-                    return max(0, int(float(val)))
+                    return _strict_nonnegative_whole_number(val) or 0
             except Exception:
                 pass
         return 0
@@ -755,7 +758,7 @@ class APBrokerReconciler:
             try:
                 val = order.get(key)
                 if val is not None and val != "":
-                    return max(0, int(float(val)))
+                    return _strict_nonnegative_whole_number(val) or 0
             except Exception:
                 pass
         return 0
@@ -803,13 +806,26 @@ class APBrokerReconciler:
     ) -> bool:
         """Compatibility bridge for OSM v3 apply_fill_update()."""
         status_u = str(status or "").upper()
+        validated_qty = _strict_positive_whole_number(filled_qty)
+        validated_price = _strict_positive_finite_float(fill_price)
+        if validated_qty is None or validated_price is None:
+            log.critical(
+                "[%s] OSM fill update blocked | order=%s status=%s "
+                "filled_qty=%r fill_price=%r",
+                self.client_id,
+                local_id,
+                status_u,
+                filled_qty,
+                fill_price,
+            )
+            return False
         apply_fn = getattr(self.osm, "apply_fill_update", None)
         if callable(apply_fn) and status_u in {"PARTIAL_FILL", "EXIT_PARTIAL_FILL"}:
             try:
                 return bool(apply_fn(
                     local_id,
-                    cumulative_filled=int(filled_qty),
-                    fill_price=float(fill_price) if fill_price is not None else None,
+                    cumulative_filled=validated_qty,
+                    fill_price=validated_price,
                     broker_order_id=broker_order_id,
                 ))
             except TypeError as te:
@@ -820,8 +836,8 @@ class APBrokerReconciler:
         return bool(self.osm.transition(
             local_id,
             status_u,
-            filled_qty=int(filled_qty),
-            fill_price=float(fill_price) if fill_price is not None else None,
+            filled_qty=validated_qty,
+            fill_price=validated_price,
         ))
 
     def _handle_stale_acknowledged_exits(self, summary: dict) -> None:
@@ -1389,9 +1405,9 @@ class APBrokerReconciler:
             broker_order_id=str(order.get("broker_order_id") or "").strip(),
         )
         if recent_fill:
-            fill_qty = self._safe_int(recent_fill.get("filled_qty"), requested_qty or 0)
-            fill_px  = self._safe_float(recent_fill.get("fill_price"), 0.0)
-            if fill_qty > 0 and fill_px > 0:
+            fill_qty = _strict_positive_whole_number(recent_fill.get("filled_qty"))
+            fill_px = _strict_positive_finite_float(recent_fill.get("fill_price"))
+            if fill_qty is not None and fill_px is not None:
                 try:
                     self.osm.transition(
                         local_id,
@@ -1639,12 +1655,11 @@ class APBrokerReconciler:
 
     def _broker_order_qty_from_raw(self, raw: dict) -> int:
         for key in ("quantity", "qty", "order_qty", "remaining_quantity", "remaining_qty"):
-            try:
-                val = raw.get(key)
-                if val is not None and val != "":
-                    return abs(int(float(val)))
-            except Exception:
-                pass
+            val = raw.get(key)
+            if val is None or val == "":
+                continue
+            parsed = _strict_nonnegative_whole_number(val)
+            return parsed if parsed is not None else 0
         return 0
 
     def _broker_order_side_action_from_raw(self, raw: dict) -> str:
@@ -2445,9 +2460,9 @@ class APBrokerReconciler:
                         self._link_order_to_position(local_id, pos_id)
                         linked += 1
                     else:
-                        qty      = int(o.get("filled_qty") or 0)
-                        entry_px = float(o.get("fill_price") or 0.0)
-                        if qty > 0 and entry_px > 0:
+                        qty = _strict_positive_whole_number(o.get("filled_qty"))
+                        entry_px = _strict_positive_finite_float(o.get("fill_price"))
+                        if qty is not None and entry_px is not None:
                             pos_id = self._create_closed_repair_position(
                                 o, contract, "BROKER_MANUAL_CLOSE_IMPORT",
                                 "HISTORICAL_LIVE_DEBT"
@@ -2532,9 +2547,24 @@ class APBrokerReconciler:
 
                     underlying = self._norm_underlying(contract)
                     side       = (o.get("direction") or "CALL").upper()
-                    qty        = int(o.get("filled_qty") or 0)
-                    entry_px   = float(o.get("fill_price") or 0.0)
+                    qty = _strict_positive_whole_number(o.get("filled_qty"))
+                    entry_px = _strict_positive_finite_float(o.get("fill_price"))
                     filled_ts  = o.get("filled_ts")
+
+                    if qty is None or entry_px is None:
+                        failed += 1
+                        orphan_backfill_failed_current_live += 1
+                        log.critical(
+                            "[%s] filled_order_missing_position_p0 HOLD | "
+                            "order=%s contract=%s malformed entry economics "
+                            "qty=%r fill_price=%r",
+                            self.client_id,
+                            local_id,
+                            contract,
+                            o.get("filled_qty"),
+                            o.get("fill_price"),
+                        )
+                        continue
 
                     if broker_truth_ok:
                         broker_holds      = contract.upper() in broker_open_syms
@@ -2560,7 +2590,7 @@ class APBrokerReconciler:
                     )
 
                     pos_id = None
-                    if self.pm is not None and qty > 0 and entry_px > 0:
+                    if self.pm is not None:
                         try:
                             pos_id = self._create_imported_position(
                                 contract=contract, underlying=underlying,
@@ -2730,8 +2760,18 @@ class APBrokerReconciler:
         import uuid as _uuid
         underlying = self._norm_underlying(contract)
         side       = (o.get("direction") or "CALL").upper()
-        qty        = int(o.get("filled_qty") or 0)
-        entry_px   = float(o.get("fill_price") or 0.0)
+        qty = _strict_positive_whole_number(o.get("filled_qty"))
+        entry_px = _strict_positive_finite_float(o.get("fill_price"))
+        if qty is None or entry_px is None:
+            log.critical(
+                "[%s] CLOSED_REPAIR position creation blocked | malformed "
+                "fill economics order=%s qty=%r fill_price=%r",
+                self.client_id,
+                o.get("local_order_id"),
+                o.get("filled_qty"),
+                o.get("fill_price"),
+            )
+            return None
         filled_ts  = o.get("filled_ts")
         broker_id  = str(o.get("broker_order_id") or "")
         local_id   = str(o.get("local_order_id")  or "")
@@ -2857,12 +2897,10 @@ class APBrokerReconciler:
         return s
 
     def _safe_int(self, value, default: int = 0) -> int:
-        try:
-            if value is None or value == "":
-                return int(default)
-            return int(float(value))
-        except Exception:
+        if value is None or value == "":
             return int(default)
+        parsed = _strict_nonnegative_whole_number(value)
+        return parsed if parsed is not None else int(default)
 
     def _safe_float(self, value, default: float = 0.0) -> float:
         try:
@@ -2931,18 +2969,16 @@ class APBrokerReconciler:
             or c_sym
         )
 
-    def _broker_position_qty(self, bp: dict) -> int:
-        raw = (
-            bp.get("quantity")
-            or bp.get("qty")
-            or bp.get("long_quantity")
-            or bp.get("short_quantity")
-            or 0
-        )
-        try:
-            return abs(int(float(raw)))
-        except Exception:
-            return 0
+    def _broker_position_qty(self, bp: dict) -> int | None:
+        for key in ("quantity", "qty", "long_quantity", "short_quantity"):
+            if key not in bp:
+                continue
+            raw = bp.get(key)
+            if raw is None or raw == "":
+                continue
+            parsed = _strict_nonnegative_whole_number(raw)
+            return parsed
+        return None
 
     def _broker_position_entry_price(self, bp: dict) -> float:
         """
@@ -2953,17 +2989,14 @@ class APBrokerReconciler:
             "avg_fill", "avg_price", "average_price", "average_cost",
             "cost_per_share", "price", "last_price",
         ):
-            try:
-                val = bp.get(key)
-                if val is not None and float(val) > 0:
-                    return float(val)
-            except Exception:
-                pass
+            val = _strict_positive_finite_float(bp.get(key))
+            if val is not None:
+                return val
 
         try:
             qty        = self._broker_position_qty(bp)
             cost_basis = float(bp.get("cost_basis") or bp.get("costbasis") or 0)
-            if qty > 0 and cost_basis > 0:
+            if qty is not None and qty > 0 and math.isfinite(cost_basis) and cost_basis > 0:
                 return abs(cost_basis) / qty / 100.0
         except Exception:
             pass
@@ -3189,6 +3222,26 @@ class APBrokerReconciler:
             c_sym = self._broker_position_contract(bp)
             u_sym = self._broker_position_underlying(bp)
             qty   = self._broker_position_qty(bp)
+            if qty is None:
+                if c_sym:
+                    broker_by_contract[c_sym] = bp
+                if u_sym:
+                    broker_by_underlying.setdefault(u_sym, []).append(bp)
+                summary["positions_alerted"] = int(
+                    summary.get("positions_alerted", 0)
+                ) + 1
+                log.critical(
+                    "[%s] RECONCILER_BROKER_POSITION_QTY_UNUSABLE "
+                    "contract=%s raw_quantity=%r — holding without mutation",
+                    self.client_id,
+                    c_sym or "?",
+                    {
+                        key: bp.get(key)
+                        for key in ("quantity", "qty", "long_quantity", "short_quantity")
+                        if key in bp
+                    },
+                )
+                continue
             if qty <= 0:
                 continue
             if c_sym:
@@ -3207,8 +3260,35 @@ class APBrokerReconciler:
             pos_id     = pos.get("id") or pos.get("position_id")
             contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
             underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
-            db_qty     = int(pos.get("qty") or pos.get("quantity") or 0)
-            entry_px   = float(pos.get("avg_fill") or pos.get("entry_price") or 0.0)
+            raw_db_qty = (
+                pos.get("qty")
+                if pos.get("qty") is not None
+                else pos.get("quantity")
+            )
+            raw_entry_px = (
+                pos.get("avg_fill")
+                if pos.get("avg_fill") is not None
+                else pos.get("entry_price")
+            )
+            db_qty = _strict_positive_whole_number(raw_db_qty)
+            entry_px = _strict_positive_finite_float(raw_entry_px)
+            if db_qty is None or entry_px is None:
+                summary.setdefault("errors", []).append(
+                    "reconciler_malformed_position_economics"
+                )
+                summary["positions_alerted"] = int(
+                    summary.get("positions_alerted", 0)
+                ) + 1
+                log.critical(
+                    "[%s] RECONCILER_POSITION_BLOCKED malformed persisted "
+                    "economics pos=%s contract=%s qty=%r entry_px=%r",
+                    self.client_id,
+                    pos_id,
+                    contract,
+                    raw_db_qty,
+                    raw_entry_px,
+                )
+                continue
 
             position_execution_mode = _normalize_execution_mode(pos.get("execution_mode"))
             if position_execution_mode is None:
@@ -3252,6 +3332,18 @@ class APBrokerReconciler:
             if broker_pos is not None:
                 self._ghost_tracker.pop(contract, None)
                 broker_qty = self._broker_position_qty(broker_pos)
+                if broker_qty is None:
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted", 0)
+                    ) + 1
+                    log.critical(
+                        "[%s] RECONCILER_POSITION_BLOCKED broker quantity "
+                        "unusable pos=%s contract=%s — holding without mutation",
+                        self.client_id,
+                        pos_id,
+                        contract,
+                    )
+                    continue
                 if broker_qty != db_qty and db_qty > 0:
                     log.warning(
                         "[%s] POSITION_QTY_MISMATCH | %s | DB=%d broker=%d",
@@ -3315,28 +3407,24 @@ class APBrokerReconciler:
             broker_order_id=current_exit_broker_id,
         )
 
-        if exit_fill and float(exit_fill.get("fill_price") or 0) > 0:
-            try:
-                filled_qty_value = float(exit_fill.get("filled_qty"))
-            except (TypeError, ValueError):
-                filled_qty_value = 0.0
-
+        exit_fill_price = (
+            _strict_positive_finite_float(exit_fill.get("fill_price"))
+            if exit_fill
+            else None
+        )
+        if exit_fill and exit_fill_price is not None:
+            filled_qty_value = _strict_positive_whole_number(
+                exit_fill.get("filled_qty")
+            )
             raw_remaining = pos.get("quantity_remaining")
             if raw_remaining is None:
                 raw_remaining = pos.get("qty") or db_qty
-            try:
-                remaining_value = float(raw_remaining)
-            except (TypeError, ValueError):
-                remaining_value = 0.0
+            remaining_value = _strict_positive_whole_number(raw_remaining)
 
             if (
-                not math.isfinite(filled_qty_value)
-                or not filled_qty_value.is_integer()
-                or filled_qty_value <= 0
-                or not math.isfinite(remaining_value)
-                or not remaining_value.is_integer()
-                or remaining_value <= 0
-                or int(filled_qty_value) != int(remaining_value)
+                filled_qty_value is None
+                or remaining_value is None
+                or filled_qty_value != remaining_value
             ):
                 self._alert(
                     "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN | "
@@ -3344,15 +3432,15 @@ class APBrokerReconciler:
                     f"execution_mode={position_mode or '?'} "
                     f"position_id={str(pos_id or '') or '?'} "
                     f"contract={contract or '?'} "
-                    f"filled_qty={filled_qty_value:g} "
-                    f"quantity_remaining={remaining_value:g} "
+                    f"filled_qty={filled_qty_value!r} "
+                    f"quantity_remaining={remaining_value!r} "
                     "reason=single_exit_fill_does_not_cover_unresolved_position"
                 )
                 summary["positions_alerted"] += 1
                 return
 
-            filled_qty = int(filled_qty_value)
-            exit_px          = float(exit_fill["fill_price"])
+            filled_qty = filled_qty_value
+            exit_px = exit_fill_price
             close_confidence = "HIGH"
             exact_exit_evidence = {
                 "client_id": self.client_id,
@@ -3490,6 +3578,7 @@ class APBrokerReconciler:
             evidence.get("filled_qty")
         )
         evidence_fill_price = _strict_positive_finite_float(evidence.get("fill_price"))
+        expected_db_qty = _strict_positive_whole_number(db_qty)
         expected_exit_price = _strict_positive_finite_float(exit_px)
         expected_entry_price = _strict_positive_finite_float(entry_px)
         expected_mode = _normalize_execution_mode(
@@ -3519,6 +3608,7 @@ class APBrokerReconciler:
             and evidence_filled_ts >= position_entry_ts
             and evidence_filled_qty_value is not None
             and evidence_fill_price is not None
+            and expected_db_qty is not None
             and expected_exit_price is not None
             and expected_entry_price is not None
             and math.isclose(
@@ -3542,6 +3632,7 @@ class APBrokerReconciler:
             return
 
         exact_exit_fill_qty = evidence_filled_qty_value
+        db_qty = expected_db_qty
         exit_px = evidence_fill_price
         entry_px = expected_entry_price
         pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
@@ -3646,12 +3737,12 @@ class APBrokerReconciler:
                     durable_filled_ts = _parse_reconciler_timestamp(
                         durable_evidence_row.get("filled_ts")
                     )
-                    try:
-                        durable_filled_qty = float(durable_evidence_row.get("filled_qty"))
-                        durable_fill_price = float(durable_evidence_row.get("fill_price"))
-                    except (TypeError, ValueError):
-                        durable_filled_qty = 0.0
-                        durable_fill_price = 0.0
+                    durable_filled_qty = _strict_positive_whole_number(
+                        durable_evidence_row.get("filled_qty")
+                    )
+                    durable_fill_price = _strict_positive_finite_float(
+                        durable_evidence_row.get("fill_price")
+                    )
                     if (
                         str(durable_evidence_row.get("broker_order_id") or "").strip()
                         != evidence_broker_order_id
@@ -3668,10 +3759,9 @@ class APBrokerReconciler:
                         or str(durable_evidence_row.get("status") or "").upper().strip()
                         not in {"FILLED", "EXIT_FILLED"}
                         or durable_filled_ts != evidence_filled_ts
-                        or not math.isfinite(durable_filled_qty)
-                        or not durable_filled_qty.is_integer()
-                        or int(durable_filled_qty) != exact_exit_fill_qty
-                        or not math.isfinite(durable_fill_price)
+                        or durable_filled_qty is None
+                        or durable_filled_qty != exact_exit_fill_qty
+                        or durable_fill_price is None
                         or not math.isclose(
                             durable_fill_price,
                             evidence_fill_price,
@@ -3686,21 +3776,33 @@ class APBrokerReconciler:
                         }
 
                     _stored_remaining = _row.get("quantity_remaining")
-                    _stored_qty       = int(_row.get("qty") or db_qty or 0)
+                    _stored_qty = _strict_positive_whole_number(
+                        _row.get("qty") if _row.get("qty") is not None else db_qty
+                    )
+                    if _stored_qty is None:
+                        return {
+                            "blocked_reason": "RECONCILER_POSITION_QTY_INVALID",
+                        }
 
                     # Resolve current remaining; fall back to full qty if null
                     if _stored_remaining is None:
                         current_remaining = _stored_qty
                     else:
-                        current_remaining = int(_stored_remaining)
+                        current_remaining = _strict_positive_whole_number(
+                            _stored_remaining
+                        )
+                    if current_remaining is None:
+                        return {
+                            "blocked_reason": "RECONCILER_POSITION_REMAINING_INVALID",
+                        }
 
                     if (
                         exact_exit_fill_qty is not None
-                        and int(exact_exit_fill_qty) != current_remaining
+                        and exact_exit_fill_qty != current_remaining
                     ):
                         return {
                             "blocked_reason": "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN",
-                            "filled_qty": int(exact_exit_fill_qty),
+                            "filled_qty": exact_exit_fill_qty,
                             "quantity_remaining": current_remaining,
                         }
 
@@ -4552,7 +4654,7 @@ class APBrokerReconciler:
                 continue
 
             qty = self._broker_position_qty(bp)
-            if qty <= 0:
+            if qty is None or qty <= 0:
                 continue
 
             from zoneinfo import ZoneInfo as _ZoneInfo
@@ -5141,13 +5243,20 @@ class APBrokerReconciler:
         contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
         underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
         side       = str(pos.get("direction") or pos.get("side") or "CALL").upper()
-        qty        = int(
+        raw_qty = (
             pos.get("qty")
-            or pos.get("quantity")
-            or pos.get("quantity_remaining")
-            or 0
+            if pos.get("qty") is not None
+            else pos.get("quantity")
         )
-        entry_px         = self._safe_float(pos.get("avg_fill") or pos.get("entry_price"), 0.0)
+        if raw_qty is None:
+            raw_qty = pos.get("quantity_remaining")
+        qty = _strict_positive_whole_number(raw_qty)
+        raw_entry_px = (
+            pos.get("avg_fill")
+            if pos.get("avg_fill") is not None
+            else pos.get("entry_price")
+        )
+        entry_px = _strict_positive_finite_float(raw_entry_px)
         underlying_entry = self._derive_underlying_entry_from_position(
             pos,
             underlying=underlying,
@@ -5158,7 +5267,16 @@ class APBrokerReconciler:
             or str(pos.get("close_confidence") or "").upper().endswith("PRICE_UNTRUSTED")
         )
 
-        if qty <= 0 or entry_px <= 0 or not contract:
+        if qty is None or entry_px is None or not contract:
+            log.critical(
+                "[%s] EXIT_SEED_BLOCKED malformed persisted economics pos=%s "
+                "contract=%s qty=%r entry_px=%r",
+                self.client_id,
+                pos_id,
+                contract,
+                raw_qty,
+                raw_entry_px,
+            )
             return
 
         self._seed_exit_engine_from_import(
@@ -5562,6 +5680,7 @@ class APBrokerReconciler:
 
             # ── Step 2: fetch broker truth once ──────────────────────────────
             broker_open_by_contract: dict[str, int] = {}
+            broker_unusable_contracts: set[str] = set()
             broker_truth_available  = False
             try:
                 if self.broker and hasattr(self.broker, "list_positions"):
@@ -5571,6 +5690,9 @@ class APBrokerReconciler:
                             str(bp.get("symbol") or bp.get("contract") or "")
                         )
                         qty = self._broker_position_qty(bp)
+                        if sym and qty is None:
+                            broker_unusable_contracts.add(sym)
+                            continue
                         if sym and qty > 0:
                             broker_open_by_contract[sym] = qty
                     broker_truth_available = True
@@ -5587,8 +5709,28 @@ class APBrokerReconciler:
                 contract   = self._norm_contract(
                     row.get("contract") or row.get("option_symbol") or ""
                 )
-                rem_qty    = int(row.get("quantity_remaining") or 0)
-                full_qty   = int(row.get("qty") or rem_qty)
+                rem_qty = _strict_positive_whole_number(
+                    row.get("quantity_remaining")
+                )
+                full_qty = _strict_positive_whole_number(
+                    row.get("qty")
+                    if row.get("qty") is not None
+                    else rem_qty
+                )
+                if rem_qty is None or full_qty is None:
+                    log.critical(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR HOLD | malformed "
+                        "persisted quantity pos=%s contract=%s remaining=%r qty=%r",
+                        self.client_id,
+                        pos_id,
+                        contract,
+                        row.get("quantity_remaining"),
+                        row.get("qty"),
+                    )
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted", 0)
+                    ) + 1
+                    continue
 
                 if not broker_truth_available:
                     # Cannot verify — flag for operator, do not touch status
@@ -5601,6 +5743,19 @@ class APBrokerReconciler:
                     )
                     summary["broker_positions_hidden_by_closed_status_count"] = \
                         int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    continue
+
+                if contract in broker_unusable_contracts:
+                    log.critical(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR HOLD | broker quantity "
+                        "unusable pos=%s contract=%s; no status mutation",
+                        self.client_id,
+                        pos_id,
+                        contract,
+                    )
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted", 0)
+                    ) + 1
                     continue
 
                 broker_qty = broker_open_by_contract.get(contract, 0)

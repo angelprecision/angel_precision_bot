@@ -456,6 +456,310 @@ def test_shared_finalizer_rejects_invalid_exit_economics_before_db_mutation(
     assert conn_calls == []
 
 
+def test_shared_finalizer_rechecks_pending_pair_even_when_expected_pair_omitted(
+    monkeypatch,
+):
+    """The OSM callback seam cannot bypass the locked current EXIT generation."""
+    position = {
+        "id": POSITION_ID,
+        "client_id": CLIENT,
+        "status": "OPEN",
+        "qty": 2,
+        "quantity_remaining": 2,
+        "avg_fill": 2.33,
+        "pending_exit_local_order_id": "new-local",
+        "pending_exit_broker_order_id": "new-broker",
+    }
+    updates: list[tuple] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if compact.startswith("SELECT * FROM POSITIONS") and "FOR UPDATE" in compact:
+                self._row = dict(position)
+            elif compact.startswith("UPDATE POSITIONS"):
+                updates.append((sql, params))
+
+        def fetchone(self):
+            return getattr(self, "_row", None)
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(position_manager_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(position_manager_mod, "run_with_retry", lambda fn: fn())
+
+    pm = position_manager_mod.APPositionManager(CLIENT)
+    assert pm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=4.79,
+        filled_qty=2,
+        filled_ts="2026-08-10T19:00:00+00:00",
+        local_order_id="old-local",
+        broker_order_id="old-broker",
+    ) is False
+    assert updates == []
+
+
+@pytest.mark.parametrize(
+    "avg_fill",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(True, id="boolean"),
+        pytest.param(0, id="zero-price"),
+    ],
+)
+def test_shared_finalizer_rejects_malformed_persisted_cost_basis_before_update(
+    monkeypatch, avg_fill
+):
+    position = {
+        "id": POSITION_ID,
+        "client_id": CLIENT,
+        "status": "OPEN",
+        "qty": 2,
+        "quantity_remaining": 2,
+        "avg_fill": avg_fill,
+        "pending_exit_local_order_id": "exit-local-1",
+        "pending_exit_broker_order_id": "TR-195",
+    }
+    updates: list[tuple] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if compact.startswith("SELECT * FROM POSITIONS") and "FOR UPDATE" in compact:
+                self._row = dict(position)
+            elif compact.startswith("UPDATE POSITIONS"):
+                updates.append((sql, params))
+
+        def fetchone(self):
+            return getattr(self, "_row", None)
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(position_manager_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(position_manager_mod, "run_with_retry", lambda fn: fn())
+
+    pm = position_manager_mod.APPositionManager(CLIENT)
+    assert pm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=4.79,
+        filled_qty=2,
+        filled_ts="2026-08-10T19:00:00+00:00",
+        local_order_id="exit-local-1",
+        broker_order_id="TR-195",
+        expected_pending_exit_local_order_id="exit-local-1",
+        expected_pending_exit_broker_order_id="TR-195",
+    ) is False
+    assert updates == []
+
+
+@pytest.mark.parametrize(
+    ("filled_qty", "fill_price"),
+    [
+        pytest.param(0, 4.79, id="zero-qty"),
+        pytest.param(True, 4.79, id="boolean-qty"),
+        pytest.param(1.5, 4.79, id="fractional-qty"),
+        pytest.param(2, float("nan"), id="nan-price"),
+        pytest.param(2, float("inf"), id="infinite-price"),
+        pytest.param(2, True, id="boolean-price"),
+    ],
+)
+def test_osm_fill_transition_rejects_malformed_economics_before_db_write(
+    monkeypatch, filled_qty, fill_price
+):
+    from ap.order_state_machine import APOrderStateMachine
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT
+    osm._get_order = lambda _local_id: {
+        "local_order_id": "exit-local-1",
+        "client_id": CLIENT,
+        "kind": "EXIT",
+        "status": "EXIT_SUBMITTED",
+        "filled_qty": 0,
+    }
+    osm._record_error = MagicMock()
+    osm._emit_transition_event = MagicMock()
+    monkeypatch.setattr(
+        "ap.order_state_machine.run_with_retry",
+        lambda _fn: pytest.fail("malformed fill reached DB mutation"),
+    )
+
+    assert osm.transition(
+        "exit-local-1",
+        "EXIT_FILLED",
+        broker_order_id="TR-195",
+        filled_qty=filled_qty,
+        fill_price=fill_price,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("filled_qty", "fill_price"),
+    [
+        pytest.param(0, 4.79, id="zero-qty"),
+        pytest.param(True, 4.79, id="boolean-qty"),
+        pytest.param(1.5, 4.79, id="fractional-qty"),
+        pytest.param(2, float("nan"), id="nan-price"),
+        pytest.param(2, float("inf"), id="infinite-price"),
+        pytest.param(2, True, id="boolean-price"),
+    ],
+)
+def test_osm_exit_hook_quarantines_malformed_economics_without_close(
+    monkeypatch, filled_qty, fill_price
+):
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_module
+
+    class _ExitEngine:
+        def __init__(self):
+            self.pending_calls = []
+            self.closed_calls = []
+            self.finalized_calls = []
+
+        def set_pending_exit_order(self, position_id, **kwargs):
+            self.pending_calls.append((position_id, kwargs))
+
+        def mark_position_closed(self, position_id, **kwargs):
+            self.closed_calls.append((position_id, kwargs))
+
+    engine = _ExitEngine()
+    monkeypatch.setattr(osm_module, "_get_exit_engine_for_client", lambda _client: engine)
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT
+    osm._get_position_remaining_from_db = MagicMock(return_value=2)
+    osm._get_exit_engine_position = MagicMock()
+
+    osm._handle_exit_engine_hooks(
+        current={
+            "local_order_id": "exit-local-1",
+            "kind": "EXIT",
+            "qty": 2,
+            "filled_qty": 0,
+            "position_id": POSITION_ID,
+        },
+        new_status="EXIT_FILLED",
+        position_id=POSITION_ID,
+        filled_qty=filled_qty,
+        fill_price=fill_price,
+        broker_order_id="TR-195",
+        local_order_id="exit-local-1",
+    )
+
+    assert len(engine.pending_calls) == 1
+    assert engine.closed_calls == []
+    osm._get_position_remaining_from_db.assert_not_called()
+
+
+def test_autonomous_flat_broker_position_holds_without_exact_exit_fill():
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        option_symbol=TARGET_CONTRACT,
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="",
+        pending_exit_qty=2,
+        contracts=2,
+    )
+
+    class _Broker:
+        def list_open_orders(self, *args, **kwargs):
+            return []
+
+        def list_positions(self):
+            return []
+
+    engine = MagicMock()
+    action = recover_exit_position(pos, broker=_Broker(), exit_engine=engine)
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_contract_flat_requires_exact_exit_fill"
+    engine.mark_position_closed.assert_not_called()
+
+
+def test_autonomous_filled_order_without_price_holds_without_close():
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        option_symbol=TARGET_CONTRACT,
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+        pending_exit_qty=2,
+    )
+
+    class _Broker:
+        def get_order(self, _broker_id):
+            return {"status": "filled", "exec_quantity": 2}
+
+    engine = MagicMock()
+    action = recover_exit_position(pos, broker=_Broker(), exit_engine=engine)
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_broker_filled_exact_economics_missing"
+    engine.mark_position_closed.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "raw_qty",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(True, id="boolean"),
+        pytest.param(1.5, id="fractional"),
+    ],
+)
+def test_fill_monitor_does_not_truncate_malformed_broker_quantity(raw_qty):
+    from ap.fill_monitor import check_order_with_broker
+
+    broker = MagicMock()
+    broker.get_order.return_value = {
+        "status": "FILLED",
+        "exec_quantity": raw_qty,
+        "avg_fill_price": 4.79,
+    }
+    order = {
+        "client_id": CLIENT,
+        "local_order_id": "exit-local-1",
+        "broker_order_id": "TR-195",
+        "kind": "EXIT",
+    }
+
+    result = check_order_with_broker(broker, order)
+
+    assert result["status"] == "ERROR"
+    assert result["filled_qty"] == 0
+
+
 def test_exact_c_incident_old_same_ticker_fill_is_not_evidence(monkeypatch):
     cursor = _install_exit_rows(
         monkeypatch,
@@ -1559,6 +1863,56 @@ def test_real_exit_engine_callback_carries_exit_provenance_without_overwriting_e
     assert proof["broker_exit_order_id"] == "TR-195"
     assert proof["broker_exit_fill_ts"] == fill_ts
     assert proof["broker_exit_filled_qty"] == 2
+
+
+@pytest.mark.parametrize(
+    ("filled_qty", "fill_price"),
+    [
+        pytest.param(float("nan"), 4.79, id="nan-qty"),
+        pytest.param(float("inf"), 4.79, id="infinite-qty"),
+        pytest.param(True, 4.79, id="boolean-qty"),
+        pytest.param(1.5, 4.79, id="fractional-qty"),
+        pytest.param(2, float("nan"), id="nan-price"),
+        pytest.param(2, float("inf"), id="infinite-price"),
+        pytest.param(2, True, id="boolean-price"),
+    ],
+)
+def test_exit_engine_close_boundary_rejects_malformed_economics_without_mutation(
+    filled_qty, fill_price
+):
+    """Direct engine callbacks must fail before touching position state."""
+    from ap_exit_engine import APExitEngine
+
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        closed=False,
+        quantity_remaining=2,
+        current_option_price=2.33,
+        pending_exit_qty=2,
+        pending_exit_filled_qty=0,
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+    )
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._lock = threading.RLock()
+    engine._positions_by_id = {POSITION_ID: pos}
+    engine._email = CLIENT
+    engine._emit_exit_event = MagicMock()
+    before = dict(vars(pos))
+
+    result = engine.mark_position_closed(
+        POSITION_ID,
+        reason="direct_adversarial_probe",
+        qty_filled=filled_qty,
+        fill_price=fill_price,
+        local_order_id="exit-local-1",
+        broker_order_id="TR-195",
+        force=True,
+    )
+
+    assert result is False
+    assert vars(pos) == before
+    engine._emit_exit_event.assert_not_called()
 
 
 class _ProofSchemaFallbackSupabase:
