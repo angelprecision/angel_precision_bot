@@ -14,6 +14,18 @@ def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def _fresh_vix(value: float = 18.0, **overrides) -> dict:
+    result = {
+        "vix": value,
+        "tradeable": 12.0 <= value <= 35.0,
+        "source": "yfinance:^VIX.fast_info.lastPrice",
+        "observed_at": _now(),
+        "classification": "PRODUCTION_EXACT",
+    }
+    result.update(overrides)
+    return result
+
+
 def _selected_signal(**contract_overrides):
     contract = {
         "contract_symbol": "AAPL260821C00190000",
@@ -237,7 +249,7 @@ def test_no_canonical_account_snapshot_demotes_legacy_account_risk():
     rm.open_positions = {"AAPL": {"sector": "technology", "cost_usd": 1_000_000}}
     with (
         patch("ap_intelligence.agents.ap_risk_manager.get_spy_trend", return_value={"trend": "BULL"}),
-        patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value={"vix": 18.0, "tradeable": True}),
+        patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value=_fresh_vix()),
     ):
         result = rm.evaluate(
             ticker="AAPL", direction="bullish", underlying_price=190.0,
@@ -276,7 +288,7 @@ def test_exact_contract_quality_can_block_when_selected_contract_is_real():
     rm = APRiskManager(portfolio_value=25_000)
     with (
         patch("ap_intelligence.agents.ap_risk_manager.get_spy_trend", return_value={"trend": "BULL"}),
-        patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value={"vix": 18.0, "tradeable": True}),
+        patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value=_fresh_vix()),
     ):
         result = rm.evaluate(
             ticker="AAPL", direction="bullish", underlying_price=190.0,
@@ -296,7 +308,7 @@ def test_regime_mismatch_remains_advisory_without_account_snapshot():
 
     with (
         patch("ap_intelligence.agents.ap_risk_manager.get_spy_trend", return_value={"trend": "BULL"}),
-        patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value={"vix": 18.0, "tradeable": True}),
+        patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value=_fresh_vix()),
     ):
         result = APRiskManager(portfolio_value=25_000).evaluate(
             ticker="AAPL", direction="bearish", underlying_price=190.0,
@@ -338,6 +350,200 @@ def test_vix_observation_has_provenance(monkeypatch):
     assert result["tradeable"] is True
     assert result["source"] == "yfinance:^VIX.fast_info.lastPrice"
     assert result["observed_at"]
+
+
+def _evaluate_vix_payload(payload):
+    from unittest.mock import patch
+    from ap_intelligence.agents.ap_risk_manager import APRiskManager
+
+    with (
+        patch(
+            "ap_intelligence.agents.ap_risk_manager.get_spy_trend",
+            return_value={"trend": "BULL"},
+        ),
+        patch(
+            "ap_intelligence.agents.ap_risk_manager.get_vix",
+            return_value=payload,
+        ),
+    ):
+        return APRiskManager(portfolio_value=25_000).evaluate(
+            ticker="AAPL",
+            direction="bullish",
+            underlying_price=190.0,
+            atr_value=2.5,
+            option_delta=0.45,
+            option_premium=2.5,
+            bid_ask_spread_pct=0.05,
+            open_interest=500,
+            daily_volume_options=200,
+            dte=1,
+            contract_quality_authoritative=False,
+            account_state_authoritative=False,
+        )
+
+
+def test_unavailable_vix_fails_open_as_advisory():
+    result = _evaluate_vix_payload({
+        "vix": None,
+        "tradeable": False,
+        "source": "yfinance:^VIX.fast_info.lastPrice",
+        "observed_at": None,
+        "classification": "UNAVAILABLE",
+    })
+
+    assert result.approved is True
+    assert result.hard_veto is False
+    assert result.reason_code == "VIX_UNAVAILABLE"
+    assert result.authority_diagnostics["vix"]["authoritative"] is False
+    assert result.authority_diagnostics["vix"]["policy_outcome"] == "VIX_ADVISORY"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _fresh_vix(float("nan")),
+        _fresh_vix(18.0, observed_at="not-a-timestamp"),
+        _fresh_vix(18.0, source="untrusted:vix-provider"),
+    ],
+    ids=["non_finite", "bad_timestamp", "unproven_source"],
+)
+def test_nonfinite_or_malformed_vix_fails_open(payload):
+    result = _evaluate_vix_payload(payload)
+
+    assert result.approved is True
+    assert result.hard_veto is False
+    assert result.reason_code == "VIX_UNAVAILABLE"
+    assert result.authority_diagnostics["vix"]["authoritative"] is False
+
+
+def test_stale_real_vix_fails_open_as_advisory():
+    from ap_intelligence.tools.ap_data_tools import VIX_MAX_AGE_SECONDS
+
+    stale_at = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=VIX_MAX_AGE_SECONDS + 1)
+    ).isoformat()
+    result = _evaluate_vix_payload(_fresh_vix(18.0, observed_at=stale_at))
+
+    assert result.approved is True
+    assert result.hard_veto is False
+    assert result.reason_code == "VIX_UNAVAILABLE"
+    assert result.authority_diagnostics["vix"]["reason"] == "vix_timestamp_stale"
+
+
+def test_fresh_real_vix_inside_policy_passes_vix_gate():
+    result = _evaluate_vix_payload(_fresh_vix(18.0))
+
+    assert result.approved is True
+    assert result.hard_veto is False
+    assert result.authority_diagnostics["vix"]["authoritative"] is True
+    assert result.authority_diagnostics["vix"]["policy_outcome"] == "VIX_PASS"
+    assert result.reason_code == "ADVISORY_DATA_UNAVAILABLE"
+
+
+def test_fresh_real_vix_outside_policy_is_hard_cap():
+    result = _evaluate_vix_payload(_fresh_vix(40.0))
+
+    assert result.approved is False
+    assert result.hard_veto is True
+    assert result.reason_code == "VIX_POLICY_HARD_CAP"
+    assert result.authority_diagnostics["vix"]["authoritative"] is True
+    assert result.authority_diagnostics["vix"]["policy_outcome"] == "VIX_POLICY_HARD_CAP"
+
+
+def test_stale_vix_cache_is_refetched_before_authority(monkeypatch):
+    from ap_intelligence.tools import ap_data_tools
+    from ap_intelligence.tools.ap_data_tools import VIX_MAX_AGE_SECONDS
+
+    stale_at = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=VIX_MAX_AGE_SECONDS + 1)
+    ).isoformat()
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.Ticker = lambda _: types.SimpleNamespace(fast_info={"lastPrice": 18.5})
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+    monkeypatch.setattr(ap_data_tools, "_cache_get", lambda _: _fresh_vix(18.0, observed_at=stale_at))
+    monkeypatch.setattr(ap_data_tools, "_cache_set", lambda *_: None)
+
+    result = ap_data_tools.get_vix()
+
+    assert result["vix"] == 18.5
+    assert result["classification"] == "PRODUCTION_EXACT"
+    assert result["observed_at"] != stale_at
+
+
+def test_unavailable_vix_flows_get_vix_to_pipeline_risk_detail_and_bridge(monkeypatch):
+    from unittest.mock import MagicMock, patch
+    from ap_intelligence.agents.ap_risk_manager import APRiskManager
+    from ap_intelligence.ap_signal_pipeline import APSignalPipeline
+    from ap_intelligence.tools import ap_data_tools
+
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.Ticker = lambda _: types.SimpleNamespace(fast_info={"lastPrice": None})
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+    monkeypatch.setattr(ap_data_tools, "_cache_get", lambda _: None)
+    monkeypatch.setattr(ap_data_tools, "_cache_set", lambda *_: None)
+
+    pipeline = APSignalPipeline.__new__(APSignalPipeline)
+    pipeline.technical = MagicMock()
+    pipeline.technical.analyze.return_value = {
+        "signal": "bullish",
+        "confidence": 78.0,
+        "breakdown": {},
+    }
+    pipeline.sentiment = MagicMock()
+    pipeline.fundamentals = MagicMock()
+    pipeline.risk_manager = APRiskManager(portfolio_value=25_000)
+    pipeline.pm = MagicMock()
+    pipeline.pm.decide.return_value = types.SimpleNamespace(
+        action="execute",
+        direction="bullish",
+        contracts=1,
+        max_usd=0.0,
+        confidence=78.0,
+        score=78.0,
+        ev_score=78.0,
+        reasoning="approved with VIX advisory",
+        signal_breakdown={},
+    )
+    pipeline.audit = MagicMock()
+    pipeline.use_sentiment = False
+    pipeline.use_fundamentals = False
+    pipeline.portfolio_value = 25_000
+    pipeline.mode_cfg = types.SimpleNamespace(mode="LIVE")
+
+    with (
+        patch("ap_intelligence.ap_signal_pipeline.get_prices", return_value=None),
+        patch(
+            "ap_intelligence.agents.ap_risk_manager.get_spy_trend",
+            return_value={"trend": "BULL"},
+        ),
+        patch(
+            "ap_intelligence.agents.ap_risk_manager.get_vix",
+            side_effect=ap_data_tools.get_vix,
+        ),
+    ):
+        result = pipeline.run(
+            ticker="AAPL",
+            scanner_signal="bullish",
+            scanner_confidence=78.0,
+            underlying_price=190.0,
+            atr_value=2.5,
+            option_premium=2.5,
+            option_delta=0.45,
+            contract_quality_authoritative=False,
+            account_state_authoritative=False,
+        )
+
+    risk_detail = result["risk_detail"]
+    gate = ib._map_result(result, fallback_score=78.0)
+    assert risk_detail["reason_code"] == "VIX_UNAVAILABLE"
+    assert risk_detail["hard_veto"] is False
+    assert risk_detail["authority_diagnostics"]["vix"]["classification"] == "UNAVAILABLE"
+    assert risk_detail["authority_diagnostics"]["vix"]["authoritative"] is False
+    assert gate["approved"] is True
+    assert gate["intel_status"] != "RISK_VETO"
+    assert gate["risk_detail"]["reason_code"] == "VIX_UNAVAILABLE"
 
 
 def test_structured_hard_risk_veto_remains_authoritative():

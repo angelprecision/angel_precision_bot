@@ -19,6 +19,7 @@ Covers producer → transport → bridge → admission seams:
 """
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -34,7 +35,13 @@ def _spy(trend: str) -> dict:
 
 
 def _vix(*, tradeable: bool = True, value: float = 18.0) -> dict:
-    return {"vix": value, "tradeable": tradeable}
+    return {
+        "vix": value,
+        "tradeable": tradeable,
+        "source": "yfinance:^VIX.fast_info.lastPrice",
+        "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "classification": "PRODUCTION_EXACT",
+    }
 
 
 def _prices(start: float = 100.0, end: float = 110.0) -> pd.DataFrame:

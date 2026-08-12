@@ -390,14 +390,100 @@ def get_spy_trend(lookback: int = 20) -> dict:
     }
 
 
+VIX_TRUSTED_SOURCE = "yfinance:^VIX.fast_info.lastPrice"
+# Gate G's market-safety authority is deliberately much shorter than the
+# shared cache TTL.  A one-hour-old VIX observation is context, not authority.
+VIX_MAX_AGE_SECONDS = 300.0
+
+
+def _parse_vix_timestamp(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def validate_vix_observation(observation: dict, *, now=None) -> tuple[bool, float | None, dict]:
+    """Return whether a VIX observation is trusted enough for Gate G authority.
+
+    This validates data authority only.  The risk manager applies the separate
+    12-35 policy after this function has established a finite, fresh,
+    provenance-bound observation.
+    """
+    payload = observation if isinstance(observation, dict) else {}
+    raw_value = payload.get("vix")
+    source = payload.get("source")
+    observed_at = payload.get("observed_at")
+    classification = payload.get("classification")
+    diagnostics = {
+        "value": None,
+        "source": source,
+        "source_ts": observed_at,
+        "classification": classification,
+        "authoritative": False,
+        "max_age_seconds": VIX_MAX_AGE_SECONDS,
+    }
+
+    if not payload:
+        diagnostics["reason"] = "vix_observation_missing"
+        return False, None, diagnostics
+    if source != VIX_TRUSTED_SOURCE:
+        diagnostics["reason"] = "vix_source_untrusted"
+        return False, None, diagnostics
+    if classification != "PRODUCTION_EXACT":
+        diagnostics["reason"] = "vix_classification_unproven"
+        return False, None, diagnostics
+    if isinstance(raw_value, bool):
+        diagnostics["reason"] = "vix_value_boolean"
+        return False, None, diagnostics
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        diagnostics["reason"] = "vix_value_malformed"
+        return False, None, diagnostics
+    if not math.isfinite(value):
+        diagnostics["reason"] = "vix_value_non_finite"
+        return False, None, diagnostics
+    if value <= 0:
+        diagnostics["reason"] = "vix_value_non_positive"
+        return False, None, diagnostics
+    diagnostics["value"] = round(value, 2)
+
+    observed = _parse_vix_timestamp(observed_at)
+    if observed is None:
+        diagnostics["reason"] = "vix_timestamp_malformed"
+        return False, value, diagnostics
+
+    current = now or datetime.datetime.now(datetime.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=datetime.timezone.utc)
+    current = current.astimezone(datetime.timezone.utc)
+    age_seconds = (current - observed).total_seconds()
+    diagnostics["age_seconds"] = round(age_seconds, 3)
+    if age_seconds < 0:
+        diagnostics["reason"] = "vix_timestamp_in_future"
+        return False, value, diagnostics
+    if age_seconds > VIX_MAX_AGE_SECONDS:
+        diagnostics["reason"] = "vix_timestamp_stale"
+        return False, value, diagnostics
+
+    diagnostics["authoritative"] = True
+    diagnostics["reason"] = "fresh_trusted_vix_observation"
+    return True, value, diagnostics
+
+
 def get_vix() -> dict:
     """Pull VIX from yfinance."""
     cache_key = f"vix_{datetime.date.today()}"
     cached = _cache_get(cache_key)
-    # A cached VIX value is only eligible for the hard market-safety gate when
-    # it carries an observation timestamp.  Older cache records without that
-    # attestation are treated as unavailable rather than as a safe default.
-    if isinstance(cached, dict) and cached.get("observed_at"):
+    # The shared cache may retain a file for one hour, but Gate G accepts only
+    # a fresh, provenance-bound observation from that cache.
+    if validate_vix_observation(cached)[0]:
         return cached
 
     try:
@@ -413,10 +499,12 @@ def get_vix() -> dict:
             "elevated":  vix > 20,
             "extreme":   vix > 30,
             "tradeable": 12 <= vix <= 35,
-            "source":     "yfinance:^VIX.fast_info.lastPrice",
+            "source":     VIX_TRUSTED_SOURCE,
             "observed_at": observed_at,
             "classification": "PRODUCTION_EXACT",
         }
+        if not validate_vix_observation(result)[0]:
+            raise ValueError("VIX observation failed authority validation")
         _cache_set(cache_key, result)
         return result
     except Exception:
@@ -427,7 +515,7 @@ def get_vix() -> dict:
             "elevated": False,
             "extreme": False,
             "tradeable": False,
-            "source": "yfinance:^VIX.fast_info.lastPrice",
+            "source": VIX_TRUSTED_SOURCE,
             "observed_at": None,
             "classification": "UNAVAILABLE",
         }
