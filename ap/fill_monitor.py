@@ -40,6 +40,7 @@ import re
 import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from ap.trace import trace_gate
@@ -486,6 +487,69 @@ def _finite_float_or_none(value) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+_MAX_BROKER_QUANTITY = 2**63 - 1
+
+
+def _validated_broker_quantity(value) -> int | None:
+    """Return a non-negative integral broker quantity, or hold on invalid data."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str) and value != value.strip():
+        return None
+    try:
+        parsed = Decimal(str(value))
+        if (
+            not parsed.is_finite()
+            or parsed < 0
+            or parsed > _MAX_BROKER_QUANTITY
+        ):
+            return None
+        integral = parsed.to_integral_value()
+        if parsed != integral:
+            return None
+        return int(integral)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _broker_quantity_error_result(
+    order: dict,
+    broker_order_id,
+    raw: dict,
+    *,
+    quantity_field: str,
+    quantity_value,
+) -> dict:
+    """Return contradictory broker evidence without laundering it as unavailable."""
+    reason = "BROKER_QUANTITY_INVALID"
+    response_evidence = dict(raw)
+    response_evidence.update(
+        {
+            "_malformed_broker_quantity": True,
+            "quantity_field": quantity_field,
+            "quantity_type": type(quantity_value).__name__,
+        }
+    )
+    audit(
+        str(order.get("client_id") or "default"),
+        "ERROR",
+        reason,
+        {
+            "broker_order_id": broker_order_id,
+            "local_order_id": order.get("local_order_id"),
+            "quantity_field": quantity_field,
+            "quantity_type": type(quantity_value).__name__,
+        },
+    )
+    return {
+        "status": "ERROR",
+        "filled_qty": 0,
+        "avg_fill": 0.0,
+        "reason": reason,
+        "raw": response_evidence,
+    }
 
 
 def _resolve_runtime_execution_mode(
@@ -1043,11 +1107,33 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             }
             our = "ACKNOWLEDGED" if status in ACTIVE_BROKER_STATUSES else status_map.get(status, "UNKNOWN")
 
-        explicit_filled_qty = raw.get("exec_quantity") or raw.get("filled_quantity")
+        explicit_filled_qty = raw.get("exec_quantity")
+        quantity_field = "exec_quantity"
+        if explicit_filled_qty is None:
+            explicit_filled_qty = raw.get("filled_quantity")
+            quantity_field = "filled_quantity"
         if explicit_filled_qty is not None:
-            filled_qty = int(explicit_filled_qty or 0)
+            filled_qty = _validated_broker_quantity(explicit_filled_qty)
+            if filled_qty is None:
+                return _broker_quantity_error_result(
+                    order,
+                    broker_order_id,
+                    raw,
+                    quantity_field=quantity_field,
+                    quantity_value=explicit_filled_qty,
+                )
         elif our in ("FILLED", "EXIT_FILLED"):
-            filled_qty = int(raw.get("quantity") or 0)
+            quantity_field = "quantity"
+            raw_quantity = raw.get("quantity")
+            filled_qty = _validated_broker_quantity(raw_quantity)
+            if filled_qty is None:
+                return _broker_quantity_error_result(
+                    order,
+                    broker_order_id,
+                    raw,
+                    quantity_field=quantity_field,
+                    quantity_value=raw_quantity,
+                )
         else:
             filled_qty = 0
 

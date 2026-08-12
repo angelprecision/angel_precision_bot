@@ -1290,6 +1290,130 @@ def test_malformed_broker_response_cannot_authorize_db_only_recovery(
     assert broker_mutations == []
 
 
+@pytest.mark.parametrize(
+    "malformed_quantity",
+    [True, "bad", "1.5", float("inf"), float("-inf"), -1, 2**63],
+    ids=[
+        "bool",
+        "malformed-string",
+        "fractional-string",
+        "inf",
+        "-inf",
+        "negative",
+        "overflow",
+    ],
+)
+def test_malformed_broker_quantity_cannot_authorize_db_only_recovery(
+    monkeypatch, malformed_quantity
+):
+    from ap import fill_monitor as fm
+
+    events = []
+    broker_mutations = []
+    real_check_order_with_broker = fm.check_order_with_broker
+    _patch_process_side_effects(monkeypatch, events)
+    monkeypatch.setattr(
+        fm, "check_order_with_broker", real_check_order_with_broker
+    )
+
+    class _Broker:
+        def get_order(self, _broker_order_id):
+            return {
+                "status": "FILLED",
+                "exec_quantity": malformed_quantity,
+                "avg_fill_price": 1.46,
+            }
+
+        def cancel_order(self, *args, **kwargs):
+            broker_mutations.append(("cancel", args, kwargs))
+
+        def place_stop_order(self, *args, **kwargs):
+            broker_mutations.append(("stop", args, kwargs))
+
+    order = _order(
+        status="FILLED",
+        position_id=None,
+        filled_qty=1,
+        fill_price=1.46,
+        meta={"canonical_owner_handoff_entry_handoff_proven": False},
+    )
+    result = fm.check_order_with_broker(_Broker(), order)
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_QUANTITY_INVALID"
+    assert result["raw"]["exec_quantity"] is malformed_quantity
+    assert result["raw"]["_malformed_broker_quantity"] is True
+    assert not fm._broker_poll_unavailable_for_durable_filled_recovery(result)
+
+    open_calls = []
+    standing_stop_calls = []
+    pair_cancel_calls = []
+    seed_calls = []
+    verify_calls = []
+
+    monkeypatch.setattr(fm, "_open_position_safe", lambda *a, **k: open_calls.append(1))
+    monkeypatch.setattr(
+        fm,
+        "_establish_canonical_handoff_standing_stop",
+        lambda **k: standing_stop_calls.append(1),
+    )
+    monkeypatch.setattr(
+        fm, "_cancel_pair_opposite", lambda *a, **k: pair_cancel_calls.append(1)
+    )
+    monkeypatch.setattr(fm, "_seed_exit_engine", lambda *a, **k: seed_calls.append(1))
+    monkeypatch.setattr(
+        fm, "_verify_canonical_entry_owner", lambda *a, **k: verify_calls.append(1)
+    )
+
+    transition_calls = []
+
+    class _OSM:
+        def transition(self, *args, **kwargs):
+            transition_calls.append((args, kwargs))
+
+        def increment_retry(self, *_args, **_kwargs):
+            return None
+
+    fm.process_pending_order(
+        _Broker(),
+        order,
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
+    )
+
+    assert transition_calls == []
+    assert open_calls == []
+    assert seed_calls == []
+    assert verify_calls == []
+    assert standing_stop_calls == []
+    assert pair_cancel_calls == []
+    assert broker_mutations == []
+    assert events == []
+
+
+@pytest.mark.parametrize("valid_quantity", [1, "1", 1.0, "1.0"])
+def test_valid_integral_broker_quantity_remains_fill_truth(monkeypatch, valid_quantity):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    result = fm.check_order_with_broker(
+        SimpleNamespace(
+            get_order=lambda _broker_order_id: {
+                "status": "FILLED",
+                "exec_quantity": valid_quantity,
+                "avg_fill_price": 1.46,
+            }
+        ),
+        _order(),
+    )
+
+    assert result["status"] == "FILLED"
+    assert result["filled_qty"] == 1
+
+
 def test_explicit_unproven_runtime_mode_cannot_fall_back_to_engine_mode():
     from ap import fill_monitor as fm
 
