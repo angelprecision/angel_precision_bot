@@ -33,6 +33,18 @@ STALE_INDEX = "idx_orders_entry_canceled_retry_inflight_updated"
 PENDING_INDEX = "idx_orders_entry_pending_trigger_recovery_created"
 DEFERRED_INDEX = "idx_orders_entry_pending_trigger_recovery_mode_created"
 
+_SQL_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
+_SQL_ALIAS_KEYWORDS = frozenset({
+    "as", "on", "where", "join", "left", "right", "inner", "outer",
+    "full", "cross", "and", "or", "group", "order", "having", "limit",
+    "offset", "union", "except", "intersect", "set", "returning", "using",
+    "window", "fetch", "for",
+})
+_SQL_LITERAL_OR_COMMENT = re.compile(
+    r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
 
 def _function_source(path: Path, name: str) -> str:
     source = path.read_text(encoding="utf-8")
@@ -93,15 +105,97 @@ def _deferred_sql() -> str:
 
 
 def _runtime_shape_files() -> list[Path]:
-    return sorted(
-        {
-            *REPO_ROOT.glob("*.py"),
-            *REPO_ROOT.glob("*.sql"),
-            *((REPO_ROOT / "ap").rglob("*.py")),
-            *((REPO_ROOT / "sql").rglob("*.sql")),
-        },
-        key=str,
+    excluded_parts = {".git", "__pycache__", "tests", ".venv", "venv", "node_modules"}
+    paths = [
+        path
+        for suffix in ("*.py", "*.sql")
+        for path in REPO_ROOT.rglob(suffix)
+        if not any(part in excluded_parts for part in path.relative_to(REPO_ROOT).parts)
+    ]
+    return sorted(paths, key=str)
+
+
+def _mask_sql_literals_and_comments(statement: str) -> str:
+    """Keep SQL identifiers while masking strings/comments containing words."""
+    return _SQL_LITERAL_OR_COMMENT.sub(" ", statement)
+
+
+def _trade_queue_aliases(statement: str) -> set[str]:
+    """Return trade_queue plus every alias assigned to it in a SQL statement."""
+    masked = _mask_sql_literals_and_comments(statement)
+    aliases: set[str] = set()
+    source_pattern = re.compile(
+        rf"\b(?:FROM|JOIN)\s+(?:{_SQL_IDENTIFIER}\.)?trade_queue\b"
+        rf"(?:\s+(?:AS\s+)?({_SQL_IDENTIFIER}))?",
+        flags=re.IGNORECASE,
     )
+    for match in source_pattern.finditer(masked):
+        aliases.add("trade_queue")
+        alias = (match.group(1) or "").lower()
+        if alias and alias not in _SQL_ALIAS_KEYWORDS:
+            aliases.add(alias)
+    return aliases
+
+
+def _trade_queue_column_assumption(statement: str, column: str) -> bool:
+    """Detect qualified or unqualified references to an absent queue column."""
+    masked = _mask_sql_literals_and_comments(statement)
+    aliases = _trade_queue_aliases(masked)
+    if not aliases:
+        return False
+    if any(
+        re.search(
+            rf"\b{re.escape(alias)}\s*\.\s*{re.escape(column)}\b",
+            masked,
+            re.IGNORECASE,
+        )
+        for alias in aliases
+    ):
+        return True
+    # Ignore SELECT aliases and UPDATE assignment targets.  They are not column
+    # reads from trade_queue; this matters for mixed CTEs that update orders
+    # while also checking a trade_queue row.
+    unqualified = re.sub(
+        rf"\bAS\s+{re.escape(column)}\b|(?:\bSET\b|,)\s*{re.escape(column)}\s*=",
+        " ",
+        masked,
+        flags=re.IGNORECASE,
+    )
+    # An unqualified column read in a trade_queue-only SELECT is unsafe:
+    # trade_queue has neither `meta` nor `ticker` as a physical column.
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9_.$]){re.escape(column)}(?!\s*\.)",
+            unqualified,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _trade_queue_meta_assumption(statement: str) -> bool:
+    return _trade_queue_column_assumption(statement, "meta")
+
+
+def _trade_queue_ticker_assumption(statement: str) -> bool:
+    return _trade_queue_column_assumption(statement, "ticker")
+
+
+def _sql_shape_fragments(path: Path) -> list[str]:
+    """Return SQL-bearing fragments from a Python or SQL production file."""
+    text = path.read_text(encoding="utf-8")
+    if path.suffix == ".py":
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            # A legacy operational script may not parse, but still belongs in
+            # the production-shape scan.
+            return [text]
+        return [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+    return re.split(r";", re.sub(r"--[^\n]*", "", text))
 
 
 def _pg_dsn() -> str:
@@ -114,17 +208,33 @@ def _pg_dsn() -> str:
 
 @pytest.fixture
 def hotpath_db():
-    psycopg2 = pytest.importorskip("psycopg2")
-    extras = pytest.importorskip("psycopg2.extras")
+    try:
+        import psycopg2
+        import psycopg2.extras as extras
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        if os.getenv("CI", "").strip().lower() in {"1", "true", "yes"}:
+            pytest.fail(
+                "psycopg2 is required in CI; refusing to skip the PostgreSQL "
+                f"contract: {exc}"
+            )
+        pytest.skip(f"psycopg2 unavailable: {exc}")
     dsn = _pg_dsn()
     if not dsn:
+        if os.getenv("CI", "").strip().lower() in {"1", "true", "yes"}:
+            pytest.fail(
+                "P0_DB_HOTPATH_TEST_DATABASE_URL is required in CI; refusing "
+                "to skip the PostgreSQL contract"
+            )
         pytest.skip("P0_DB_HOTPATH_TEST_DATABASE_URL not configured")
 
     schema = f"p0_db_hotpath_{uuid4().hex[:12]}"
     try:
         db = psycopg2.connect(dsn, cursor_factory=extras.RealDictCursor)
     except Exception as exc:  # pragma: no cover - environment dependent
-        pytest.skip(f"PostgreSQL integration unavailable: {exc}")
+        pytest.fail(
+            "PostgreSQL integration was configured but unavailable; refusing to "
+            f"turn the contract into a skip: {exc}"
+        )
     db.autocommit = True
     try:
         with db.cursor() as cur:
@@ -725,50 +835,29 @@ def test_schema_shape_rejects_trade_queue_ticker_assumption():
     runtime_files = _runtime_shape_files()
     offenders = []
     for path in runtime_files:
-        text = path.read_text(encoding="utf-8")
-        if re.search(r"\b(?:trade_queue|tq|q)\.ticker\b", text, flags=re.IGNORECASE):
+        if any(_trade_queue_ticker_assumption(fragment) for fragment in _sql_shape_fragments(path)):
             offenders.append(str(path.relative_to(REPO_ROOT)))
     assert offenders == []
     schema_source = SCHEMA_ATTESTATION_PATH.read_text(encoding="utf-8")
     assert "\"ticker\"" not in schema_source.split('"trade_queue"', 1)[1].split('}', 1)[0]
 
 
+def test_schema_shape_scan_covers_all_production_source_trees():
+    relative_paths = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in _runtime_shape_files()
+    }
+    assert "ap_entry_watcher/__init__.py" in relative_paths
+    assert "ap_intelligence/ap_signal_pipeline.py" in relative_paths
+    assert "scripts/stale_entry_audit.py" in relative_paths
+
+
 def test_schema_shape_rejects_absent_trade_queue_meta_column():
     runtime_files = _runtime_shape_files()
     offenders = []
     for path in runtime_files:
-        text = path.read_text(encoding="utf-8")
-        if path.suffix == ".py":
-            # Inspect SQL string literals, not the whole Python module: a
-            # nearby order-row ``meta`` reference must not be mistaken for a
-            # trade_queue projection.
-            try:
-                tree = ast.parse(text)
-            except SyntaxError:
-                # A legacy root-level operational script is not importable
-                # Python, but it still belongs in the production-shape scan.
-                sql_literals = [text]
-            else:
-                sql_literals = [
-                    node.value
-                    for node in ast.walk(tree)
-                    if isinstance(node, ast.Constant)
-                    and isinstance(node.value, str)
-                ]
-        else:
-            sql_literals = re.split(r";", re.sub(r"--[^\n]*", "", text))
-        for statement in sql_literals:
-            has_trade_queue = re.search(
-                r"\b(?:FROM|JOIN)\s+(?:public\.)?trade_queue\b",
-                statement,
-                flags=re.IGNORECASE,
-            )
-            has_trade_queue_meta = re.search(
-                r"\b(?:trade_queue|tq)\s*\.\s*meta\b",
-                statement,
-                flags=re.IGNORECASE,
-            )
-            if has_trade_queue and has_trade_queue_meta:
+        for statement in _sql_shape_fragments(path):
+            if _trade_queue_meta_assumption(statement):
                 offenders.append(str(path.relative_to(REPO_ROOT)))
     assert offenders == []
     schema_source = SCHEMA_ATTESTATION_PATH.read_text(encoding="utf-8")
@@ -776,6 +865,22 @@ def test_schema_shape_rejects_absent_trade_queue_meta_column():
     assert '"payload"' in queue_block
     assert '"result_json"' in queue_block
     assert '"meta"' not in queue_block
+
+
+def test_schema_shape_guard_handles_arbitrary_trade_queue_aliases():
+    assert _trade_queue_meta_assumption("SELECT q.meta FROM trade_queue q")
+    assert _trade_queue_meta_assumption("SELECT meta FROM trade_queue")
+    assert _trade_queue_meta_assumption(
+        "SELECT tq.meta FROM public.trade_queue AS tq"
+    )
+    assert _trade_queue_ticker_assumption("SELECT q.ticker FROM trade_queue q")
+    assert _trade_queue_ticker_assumption("SELECT ticker FROM trade_queue")
+    assert not _trade_queue_meta_assumption(
+        "SELECT o.meta FROM trade_queue tq JOIN orders o ON o.id = tq.id"
+    )
+    assert not _trade_queue_ticker_assumption(
+        "SELECT s.ticker FROM trade_queue tq JOIN signals s ON s.id = tq.id"
+    )
 
 
 def test_hotpath_sql_keeps_exact_client_id_fence():

@@ -2,7 +2,7 @@
 
 ## Status
 
-**DRAFT / HARD HOLD. IMPLEMENTATION AMENDMENT IN PROGRESS. DO NOT MERGE OR DEPLOY UNTIL PRODUCTION EXPLAIN EVIDENCE IS ATTACHED.**
+**IMPLEMENTATION/CI PASS — RELEASE EVIDENCE GATE EXTERNAL.** This commit records the contract implementation and exact-head CI evidence. Merge/deploy authorization remains separate and requires independently attached production EXPLAIN, lock-safety, catalog, and migration-ledger proof.
 
 Base: `main@3f9f4c65b79c80c6d3442a9144a0018d70624fb6`.
 
@@ -249,9 +249,12 @@ The active ENTRY lifecycle no longer spends 10-15 seconds scanning thousands of 
 
 ## Release verdict
 
-Current state: **HARD HOLD — implementation is covered locally/fixture-level;
-production `EXPLAIN (ANALYZE, BUFFERS)` evidence and deployment proof remain
-required.**
+Current state: **IMPLEMENTATION/CI PASS; RELEASE PROOF AND LEDGER RECONCILIATION
+REMAIN EXTERNAL GATES.** Do not treat fixture planner eligibility, GitHub
+mergeability, or PR prose as deployed-production proof. Record production
+`EXPLAIN (ANALYZE, BUFFERS)`, lock-window safety, exact catalog definitions,
+`indisvalid`/`indisready`, and the sanctioned migration-ledger checksum before
+merge/deploy authorization.
 
 Implementation requires production-safe EXPLAIN evidence, migration review,
 exact-head P0 CI, and independent money-path review.

@@ -7,10 +7,9 @@ on:
     paths:
       - "*.py"
       - "*.sql"
-      - "ap/**/*.py"
-      - "sql/**/*.sql"
-      - "migrations/20260811_orders_retry_hotpath_indexes.sql"
-      - "tests/test_p0_profitability_db_hotpath.py"
+      - "**/*.py"
+      - "**/*.sql"
+      - "docs/pr_specs/p0_profitability_db_hotpath_20260811.md"
       - ".github/workflows/p0_db_hotpath.yml"
   workflow_dispatch:
 
