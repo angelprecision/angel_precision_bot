@@ -59,6 +59,11 @@ except Exception:  # pragma: no cover — defensive
 
 log = logging.getLogger("angel.contract_quote_revalidator")
 
+# Legacy compatibility export only.  It is deliberately fixed and is not read
+# from CONTRACT_REVALIDATE_TOP_N; selector request contexts use the canonical
+# SELECTOR_MAX_DIRECT_QUOTE_CALLS resolver instead.
+DEFAULT_REVALIDATE_TOP_N = 5
+
 # Per-transport/per-symbol cache so a single selector pass doesn't double-fetch.
 # Cleared per process; tests can reset by calling clear_quote_cache().
 _QUOTE_CACHE: dict[str, tuple[float, dict]] = {}

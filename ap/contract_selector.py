@@ -77,6 +77,10 @@ from ap.contract_quote_revalidator import (
     _ctx_persist_attempt,
 )
 
+# PR #302 compatibility export only.  This fixed legacy value is not a
+# behavioral budget; request contexts resolve the canonical budget below.
+DEFAULT_REVALIDATE_TOP_N = 5
+
 # ── P0: exact chain-fetch taxonomy exceptions ────────────────────────────────
 class ChainProviderError(Exception):
     """HTTP or network error from the options chain provider."""

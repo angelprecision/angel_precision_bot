@@ -247,8 +247,14 @@ class TestConfigurationAuthority:
             str(Path(__file__).resolve().parents[1] / "ap" / "contract_quote_revalidator.py")
         )
 
-        assert "DEFAULT_REVALIDATE_TOP_N" not in module_globals
+        assert module_globals["DEFAULT_REVALIDATE_TOP_N"] == 5
         assert "DIRECT_QUOTE_ENV_PARSE_ERROR key=CONTRACT_REVALIDATE_TOP_N" not in caplog.text
+
+    def test_legacy_selector_budget_export_is_fixed_compatibility_only(self, monkeypatch):
+        monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "99")
+        import ap.contract_selector as selector_module
+
+        assert selector_module.DEFAULT_REVALIDATE_TOP_N == 5
 
     def test_canonical_conflict_does_not_reduce_limit(self, caplog):
         import ap.contract_selector as selector_module
