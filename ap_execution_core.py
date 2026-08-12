@@ -3326,6 +3326,110 @@ class APExecutionCore:
                 ),
             }
 
+        if (
+            isinstance(_callback_result, dict)
+            and str(_callback_result.get("disposition") or "").strip().upper()
+            == "RECONCILE_BROKER_INTENT"
+        ):
+            # The canonical callback has already crossed the submit-intent
+            # boundary.  Do not fall through to RETRY_WAIT: PENDING_TRIGGER
+            # is intentionally outside the fill monitor's broker-owned lane.
+            # Re-read the exact claimed generation/identity, then hand the
+            # result to the existing no-POST broker reconciler.
+            try:
+                _intent_row = osm.get_order(local_order_id)
+            except Exception as _intent_read_exc:
+                return _keep(
+                    "RECONCILE_BROKER_INTENT_ROW_READ_ERROR:"
+                    f"{type(_intent_read_exc).__name__}"
+                )
+            _intent_meta = (_intent_row or {}).get("meta") if isinstance(
+                _intent_row, dict
+            ) else None
+            if isinstance(_intent_meta, str):
+                try:
+                    _intent_meta = json.loads(_intent_meta)
+                except Exception:
+                    _intent_meta = None
+            _intent_generation = (
+                _intent_meta.get("materialization_generation")
+                if isinstance(_intent_meta, dict)
+                else None
+            )
+            _intent_state_exact = (
+                isinstance(_intent_row, dict)
+                and str(_intent_row.get("local_order_id") or "").strip()
+                == local_order_id
+                and str(_intent_row.get("client_id") or "").strip().lower()
+                == row_client
+                and str(_intent_row.get("execution_mode") or "").strip().lower()
+                == row_mode
+                and str(_intent_row.get("signal_id") or "").strip() == signal_id
+                and isinstance(_intent_generation, int)
+                and not isinstance(_intent_generation, bool)
+                and _intent_generation == _new_generation
+                and bool(
+                    str(
+                        (_intent_meta or {}).get("submit_intent_at") or ""
+                    ).strip()
+                )
+            )
+            if not _intent_state_exact:
+                log.critical(
+                    "[%s] RECONCILE_BROKER_INTENT_EXACT_STATE_INVALID "
+                    "local_order_id=%s generation=%s expected=%s — "
+                    "retaining broker-intent ownership",
+                    self.client_id,
+                    local_order_id,
+                    _intent_generation,
+                    _new_generation,
+                )
+                return _keep("RECONCILE_BROKER_INTENT_EXACT_STATE_INVALID")
+
+            try:
+                _reconcile = self.reconcile_deferred_broker_intent(
+                    local_order_id=local_order_id
+                ) or {}
+            except Exception as _reconcile_exc:
+                log.error(
+                    "[%s] RECONCILE_BROKER_INTENT_CONSUMER_RAISED "
+                    "local_order_id=%s exc=%s",
+                    self.client_id,
+                    local_order_id,
+                    _reconcile_exc,
+                )
+                return _keep(
+                    "RECONCILE_BROKER_INTENT_CONSUMER_RAISED:"
+                    f"{type(_reconcile_exc).__name__}"
+                )
+
+            _reconcile_disp = str(
+                _reconcile.get("disposition") or ""
+            ).strip().upper()
+            if _reconcile_disp in {"ALREADY_RECONCILED", "SUBMITTED"}:
+                return {
+                    **_base,
+                    "disposition": "SUBMITTED",
+                    "reason_code": str(
+                        _reconcile.get("reason_code")
+                        or "RECONCILE_BROKER_INTENT_CONSUMED"
+                    ),
+                    "broker_order_id": _reconcile.get("broker_order_id"),
+                }
+            if _reconcile_disp in {"RECONCILE_PENDING", "KEEP_WATCHER"}:
+                return {
+                    **_base,
+                    "disposition": "RECONCILE_PENDING",
+                    "reason_code": str(
+                        _reconcile.get("reason_code")
+                        or "RECONCILE_BROKER_INTENT_PENDING"
+                    ),
+                }
+            return _keep(
+                "RECONCILE_BROKER_INTENT_UNEXPECTED_DISPOSITION:"
+                f"{_reconcile_disp or 'BLANK'}"
+            )
+
         # ── Re-read to determine outcome ─────────────────────────────
         try:
             after = osm.get_order(local_order_id) or {}

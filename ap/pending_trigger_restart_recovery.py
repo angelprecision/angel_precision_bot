@@ -263,6 +263,7 @@ class PendingTriggerRestartRecovery:
         dry_run: bool = False,
         caller_source: str = "unknown",
         position_check_fn=None,
+        execution_core=None,
     ) -> None:
         self.client_id      = str(client_id or "").strip()
         self.execution_mode = str(execution_mode or "").strip().lower()
@@ -274,6 +275,7 @@ class PendingTriggerRestartRecovery:
         self.dry_run        = dry_run
         self.caller_source  = str(caller_source or "unknown").strip() or "unknown"
         self.position_check_fn = position_check_fn
+        self.execution_core = execution_core
         self._row_retry_subtypes: dict[str, str] = {}
         self._row_failure_reasons: dict[str, str] = {}
 
@@ -414,6 +416,38 @@ class PendingTriggerRestartRecovery:
         # that path; the exact watcher/order ownership proof is the authority.
         watcher_owned: Optional[bool] = self._check_watcher_owns(local_oid, row)
         _evidence_proven = recovery_trigger_evidence_identity_is_proven(row, local_oid)
+
+        # A synthetic direction-reversal callback intentionally clears the
+        # active trigger evidence before handing the row to recovery.  Route
+        # that exact recovery-owned state before the ordinary evidence gate;
+        # otherwise a valid rearm is mistaken for an unproven trigger and can
+        # fall through to terminal cleanup on the next pass.
+        _rearm_required_outcome = self._recover_direction_reversal_rearm_if_required(
+            row, local_oid, plan_builder_fn=plan_builder_fn
+        )
+        if _rearm_required_outcome is not None:
+            return _rearm_required_outcome
+
+        # A completed direction-reversal handoff leaves the old trigger audit
+        # as history while the durable watcher state becomes
+        # WAITING_FOR_TRIGGER.  Once the exact runtime watcher proof is
+        # present, this is a read-only owned row; do not let the historical
+        # trigger_ready label route it back into terminal cleanup or the
+        # confirmed-trigger evidence gate.
+        _owned_meta = _strict_recovery_meta(row)
+        if (
+            watcher_owned is True
+            and _owned_meta is not None
+            and str(_owned_meta.get("materialization_status") or "").strip().upper()
+            == "WAITING_FOR_TRIGGER"
+            and _owned_meta.get("direction_reversal_rearm_requires_watcher") is False
+            and str(_owned_meta.get("current_owner") or "").strip()
+            and str(_owned_meta.get("watcher_token") or "").strip()
+            and not str(_owned_meta.get("recovery_owner") or "").strip()
+            and not str(_owned_meta.get("recovery_ownership") or "").strip()
+        ):
+            if self._verify_registry_ownership(local_oid, row) is not None:
+                return _RowOutcome.WATCHER_OWNED
 
         # For an unowned row, keep the fail-closed fence before quote checks,
         # selector work, watcher admission, or any terminal/cleanup action.
@@ -1475,6 +1509,33 @@ class PendingTriggerRestartRecovery:
         if after_meta is None:
             self._mark_failure(local_oid, "prebroker_post_callback_malformed_meta")
             return _RowOutcome.UNRESOLVED
+
+        callback_disposition = (
+            str(callback_result.get("disposition") or "").strip().upper()
+            if isinstance(callback_result, dict)
+            else ""
+        )
+        if callback_disposition == "REARM_WATCHER_REQUIRED":
+            return self._consume_rearm_watcher_required(
+                row,
+                local_oid,
+                after=after,
+                callback_result=callback_result,
+                owner=owner,
+                generation=generation,
+                plan_builder_fn=plan_builder_fn,
+                adopt_durable=True,
+            )
+        if callback_disposition == "RECONCILE_BROKER_INTENT":
+            return self._consume_reconcile_broker_intent(
+                row,
+                local_oid,
+                after=after,
+                callback_result=callback_result,
+                owner=owner,
+                generation=generation,
+            )
+
         if after.get("broker_order_id") or after.get("submitted_ts") or after_status in {
             "SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"
         }:
@@ -1515,6 +1576,517 @@ class PendingTriggerRestartRecovery:
         self._mark_failure(
             local_oid,
             "prebroker_callback_no_durable_outcome",
+        )
+        return _RowOutcome.UNRESOLVED
+
+    def _recover_direction_reversal_rearm_if_required(
+        self, row: dict, local_oid: str, *, plan_builder_fn=None
+    ) -> Optional[str]:
+        """Consume a durable synthetic direction-reversal rearm state.
+
+        ``rearm_deferred_materialization_direction_reversal()`` deliberately
+        clears the materialization lifecycle and marks the row as needing a
+        real watcher.  A subsequent recovery pass therefore cannot use the
+        ordinary ``trigger_ready`` proof/classifier without risking terminal
+        cleanup.  Validate the exact row first, then reuse the existing
+        watcher registration/adoption adapters.
+        """
+        meta = _strict_recovery_meta(row)
+        if meta is None or meta.get("direction_reversal_rearm_requires_watcher") is not True:
+            return None
+
+        # APStartupRecovery's due-retry adapter already owns the callback
+        # disposition and its quote-gated retry policy.  Leave that narrow
+        # caller on its established path; this durable-state bridge is for
+        # the orphan/reseed and direct recovery consumers that otherwise fall
+        # back into the stale trigger_ready classifier.
+        if self.caller_source.startswith(
+            "ap_recovery.due_retry.rearm_watcher_required"
+        ):
+            return None
+
+        status = str(row.get("status") or "").strip().upper()
+        if status != "PENDING_TRIGGER":
+            return None
+        if row.get("broker_order_id") or row.get("submitted_ts"):
+            return None
+        if meta.get("submit_intent_at") or meta.get("broker_ready") is True:
+            self._mark_failure(local_oid, "rearm_watcher_required_submit_evidence")
+            return _RowOutcome.UNRESOLVED
+
+        generation = _strict_generation(meta.get("materialization_generation"))
+        owner = str(meta.get("recovery_owner") or "").strip()
+        if (
+            generation is None
+            or not owner
+            or str(meta.get("recovery_ownership") or "").strip()
+            != "recovery_scheduler"
+            or str(meta.get("lifecycle_state") or "").strip()
+            or str(meta.get("materialization_status") or "").strip()
+            or str(meta.get("current_owner") or "").strip()
+            or str(meta.get("watcher_token") or "").strip()
+            or meta.get("watcher_generation") not in (None, "", 0, "0")
+        ):
+            self._mark_failure(local_oid, "rearm_watcher_required_state_invalid")
+            return _RowOutcome.UNRESOLVED
+
+        # A durable rearm is safe to attach only with fresh market truth. A
+        # missing quote belongs in the existing bounded restart-rearm retry;
+        # it must not be confused with the callback-result handoff, which has
+        # already completed its market-truth decision in the same invocation.
+        if self._quote_state_for_row(row) is None:
+            return self._enter_restart_rearm_retry(
+                local_oid,
+                row,
+                reason="restart_recovery_quote_unavailable_before_rearm",
+            )
+
+        return self._consume_rearm_watcher_required(
+            row,
+            local_oid,
+            after=row,
+            callback_result=None,
+            owner=owner,
+            generation=generation,
+            plan_builder_fn=plan_builder_fn,
+            # APStartupRecovery performs the outer exact-generation adoption;
+            # direct/order-monitor consumers complete it here when their OSM
+            # exposes the same narrow CAS adapter.
+            adopt_durable=(
+                self.caller_source.startswith("ap.order_monitor.")
+                and callable(
+                    getattr(
+                        self.osm,
+                        "adopt_direction_reversal_watcher_ownership",
+                        None,
+                    )
+                )
+            ),
+        )
+
+    def _consume_rearm_watcher_required(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        after: dict,
+        callback_result: Optional[dict],
+        owner: str,
+        generation: int,
+        plan_builder_fn=None,
+        adopt_durable: bool,
+    ) -> str:
+        """Route RWR through watcher registration and exact ownership CAS."""
+        result = callback_result if isinstance(callback_result, dict) else {}
+        expected_local = str(result.get("local_order_id") or local_oid).strip()
+        expected_client = str(
+            result.get("expected_client_id") or self.client_id
+        ).strip().lower()
+        expected_mode = str(
+            result.get("expected_execution_mode") or self.execution_mode
+        ).strip().lower()
+        expected_signal = str(
+            result.get("expected_signal_id") or row.get("signal_id") or ""
+        ).strip()
+        expected_canonical = str(
+            result.get("expected_canonical_signal_id")
+            or row.get("canonical_signal_id")
+            or (_extract_meta(row) or {}).get("canonical_signal_id")
+            or ""
+        ).strip()
+        expected_generation = _strict_generation(
+            result.get("expected_generation") if result else generation
+        )
+        if (
+            expected_local != local_oid
+            or expected_client != self.client_id.lower()
+            or expected_mode != self.execution_mode
+            or not expected_signal
+            or expected_generation is None
+            or expected_generation != _strict_generation(generation)
+        ):
+            self._mark_failure(local_oid, "rearm_watcher_required_expectation_invalid")
+            return _RowOutcome.UNRESOLVED
+
+        after_meta = _strict_recovery_meta(after)
+        if after_meta is None:
+            self._mark_failure(local_oid, "rearm_watcher_required_meta_invalid")
+            return _RowOutcome.UNRESOLVED
+        after_canonical = str(
+            after.get("canonical_signal_id")
+            or after_meta.get("canonical_signal_id")
+            or ""
+        ).strip()
+        if (
+            str(after.get("local_order_id") or "").strip() != expected_local
+            or str(after.get("client_id") or "").strip().lower() != expected_client
+            or str(after.get("execution_mode") or "").strip().lower() != expected_mode
+            or str(after.get("signal_id") or "").strip() != expected_signal
+            or (expected_canonical and after_canonical != expected_canonical)
+            or str(after.get("kind") or "").strip().upper() != "ENTRY"
+            or str(after.get("status") or "").strip().upper() != "PENDING_TRIGGER"
+            or after.get("broker_order_id")
+            or after.get("submitted_ts")
+            or after_meta.get("submit_intent_at")
+            or after_meta.get("broker_ready") is True
+            or _strict_generation(after_meta.get("materialization_generation"))
+            != expected_generation
+            or str(after_meta.get("recovery_ownership") or "").strip()
+            != "recovery_scheduler"
+            or str(after_meta.get("recovery_owner") or "").strip() != str(owner).strip()
+            or after_meta.get("direction_reversal_rearm_requires_watcher") is not True
+            or str(after_meta.get("lifecycle_state") or "").strip()
+            or str(after_meta.get("materialization_status") or "").strip()
+            or str(after_meta.get("current_owner") or "").strip()
+            or str(after_meta.get("watcher_token") or "").strip()
+            or after_meta.get("watcher_generation") not in (None, "", 0, "0")
+        ):
+            self._mark_failure(local_oid, "rearm_watcher_required_state_mismatch")
+            return _RowOutcome.UNRESOLVED
+
+        watcher = self.entry_watcher
+        if watcher is None or not callable(getattr(watcher, "watch", None)):
+            return (
+                _RowOutcome.REARM_OWNED
+                if self._retain_rearm_watcher_required(
+                    local_oid,
+                    after,
+                    owner=owner,
+                    generation=expected_generation,
+                    signal_id=expected_signal,
+                    canonical_signal_id=expected_canonical,
+                    reason="watcher_unavailable",
+                )
+                else _RowOutcome.UNRESOLVED
+            )
+
+        watcher_outcome = self._rearm_and_verify(
+            after,
+            local_oid,
+            plan_builder_fn=plan_builder_fn,
+            preserve_on_reject=True,
+        )
+        if watcher_outcome != _RowOutcome.WATCHER_OWNED:
+            return (
+                _RowOutcome.REARM_OWNED
+                if self._retain_rearm_watcher_required(
+                    local_oid,
+                    after,
+                    owner=owner,
+                    generation=expected_generation,
+                    signal_id=expected_signal,
+                    canonical_signal_id=expected_canonical,
+                    reason="watcher_registration_not_proven",
+                )
+                else _RowOutcome.UNRESOLVED
+            )
+
+        if not adopt_durable:
+            return _RowOutcome.WATCHER_OWNED
+
+        watcher_token = str(getattr(watcher, "owner_token", "") or "").strip()
+        adopt = getattr(self.osm, "adopt_direction_reversal_watcher_ownership", None)
+        adopted = False
+        if watcher_token and callable(adopt):
+            try:
+                adopted = bool(
+                    adopt(
+                        local_oid,
+                        recovery_owner=str(owner).strip(),
+                        watcher_token=watcher_token,
+                        generation=expected_generation,
+                        signal_id=expected_signal,
+                        execution_mode=expected_mode,
+                    )
+                )
+            except Exception as exc:
+                log.error(
+                    "RESTART_RECOVERY_REARM_WATCHER_ADOPTION_FAILED local=%s: %s",
+                    local_oid,
+                    exc,
+                )
+
+        if adopted:
+            try:
+                adopted_row = self.osm.get_order(local_oid)
+            except Exception:
+                adopted_row = None
+            adopted_meta = _strict_recovery_meta(adopted_row) if isinstance(adopted_row, dict) else None
+            if (
+                isinstance(adopted_row, dict)
+                and adopted_meta is not None
+                and str(adopted_row.get("status") or "").strip().upper()
+                == "PENDING_TRIGGER"
+                and _strict_generation(adopted_meta.get("materialization_generation"))
+                == expected_generation
+                and str(adopted_meta.get("current_owner") or "").strip()
+                == watcher_token
+                and str(adopted_meta.get("watcher_token") or "").strip()
+                == watcher_token
+                and adopted_meta.get("direction_reversal_rearm_requires_watcher") is False
+                and not str(adopted_meta.get("recovery_owner") or "").strip()
+                and not str(adopted_meta.get("recovery_ownership") or "").strip()
+            ):
+                return _RowOutcome.WATCHER_OWNED
+            # A successful CAS is authoritative even when this verification
+            # reread is inconclusive. Do not evict the watcher or overwrite
+            # its durable ownership with recovery retention.
+            log.critical(
+                "RESTART_RECOVERY_REARM_ADOPTION_VERIFY_INCONCLUSIVE local=%s "
+                "— CAS succeeded; leaving watcher ownership authoritative",
+                local_oid,
+            )
+            return _RowOutcome.WATCHER_OWNED
+
+        if self.last_watcher_registered_by_this_attempt:
+            registration_token = str(self.last_registration_token or "").strip()
+            if registration_token:
+                self._evict_just_registered_watcher(
+                    local_oid,
+                    signal_id=expected_signal,
+                    client_id=expected_client,
+                    execution_mode=expected_mode,
+                    expected_registration_token=registration_token,
+                )
+
+        return (
+            _RowOutcome.REARM_OWNED
+            if self._retain_rearm_watcher_required(
+                local_oid,
+                after,
+                owner=owner,
+                generation=expected_generation,
+                signal_id=expected_signal,
+                canonical_signal_id=expected_canonical,
+                reason="watcher_ownership_adoption_failed",
+            )
+            else _RowOutcome.UNRESOLVED
+        )
+
+    def _evict_just_registered_watcher(
+        self,
+        local_oid: str,
+        *,
+        signal_id: str,
+        client_id: str,
+        execution_mode: str,
+        expected_registration_token: str,
+    ) -> bool:
+        """Evict only this call's exact watcher registration after CAS loss."""
+        watcher = self.entry_watcher
+        pending = getattr(watcher, "_pending", None)
+        if pending is None:
+            return True
+
+        lock = getattr(watcher, "_lock", None)
+
+        def _evict():
+            target = None
+            for candidate in list(pending):
+                signal = getattr(candidate, "signal", {}) or {}
+                if (
+                    str(signal.get("local_order_id") or "").strip() == local_oid
+                    and str(signal.get("signal_id") or "").strip() == signal_id
+                    and str(signal.get("client_id") or "").strip().lower()
+                    == client_id
+                    and str(signal.get("execution_mode") or "").strip().lower()
+                    == execution_mode
+                ):
+                    target = candidate
+                    break
+            if target is None:
+                return True
+            if str(getattr(target, "_registration_token", "") or "").strip() != expected_registration_token:
+                log.warning(
+                    "RESTART_RECOVERY_REARM_EVICTION_FOREIGN_WATCHER local=%s",
+                    local_oid,
+                )
+                return True
+            watcher._pending = [candidate for candidate in watcher._pending if candidate is not target]
+            release = getattr(target, "_release_dedup_key", None)
+            if callable(release):
+                release()
+            else:
+                dedup = getattr(watcher, "_dedup_set", None)
+                if isinstance(dedup, set):
+                    dedup.discard(signal_id)
+            return True
+
+        try:
+            if lock is not None:
+                with lock:
+                    return bool(_evict())
+            return bool(_evict())
+        except Exception as exc:
+            log.error(
+                "RESTART_RECOVERY_REARM_EVICTION_FAILED local=%s exc=%s",
+                local_oid,
+                exc,
+            )
+            return False
+
+    def _retain_rearm_watcher_required(
+        self,
+        local_oid: str,
+        row: dict,
+        *,
+        owner: str,
+        generation: int,
+        signal_id: str,
+        canonical_signal_id: str,
+        reason: str,
+    ) -> bool:
+        """Retain a proven RWR state through the existing fenced OSM adapter."""
+        retain = getattr(
+            self.osm,
+            "retain_rearm_watcher_required_recovery_ownership",
+            None,
+        )
+        if callable(retain):
+            try:
+                return bool(
+                    retain(
+                        local_oid,
+                        recovery_owner=str(owner).strip(),
+                        reason=f"rearm_watcher_required_{reason}",
+                        recovery_retention_mode=self.execution_mode.upper(),
+                        client_id=self.client_id,
+                        signal_id=signal_id,
+                        execution_mode=self.execution_mode,
+                        generation=generation,
+                        expected_recovery_owner=str(owner).strip(),
+                        canonical_signal_id=canonical_signal_id,
+                    )
+                )
+            except Exception as exc:
+                log.error(
+                    "RESTART_RECOVERY_REARM_RETENTION_FAILED local=%s: %s",
+                    local_oid,
+                    exc,
+                )
+                return False
+
+        retain = getattr(self.osm, "retain_recovery_ownership_if_no_watcher", None)
+        if callable(retain):
+            try:
+                return bool(
+                    retain(
+                        local_oid,
+                        recovery_owner=str(owner).strip(),
+                        reason=f"rearm_watcher_required_{reason}",
+                        recovery_retention_mode=self.execution_mode.upper(),
+                    )
+                )
+            except Exception as exc:
+                log.error(
+                    "RESTART_RECOVERY_REARM_GENERIC_RETENTION_FAILED local=%s: %s",
+                    local_oid,
+                    exc,
+                )
+                return False
+        return False
+
+    def _consume_reconcile_broker_intent(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        after: dict,
+        callback_result: dict,
+        owner: str,
+        generation: int,
+    ) -> str:
+        """Consume the callback's broker-intent handoff exactly once."""
+        after_meta = _strict_recovery_meta(after)
+        expected_generation = _strict_generation(generation)
+        if (
+            after_meta is None
+            or expected_generation is None
+            or str(after.get("local_order_id") or "").strip() != local_oid
+            or str(after.get("client_id") or "").strip().lower() != self.client_id.lower()
+            or str(after.get("execution_mode") or "").strip().lower() != self.execution_mode
+            or str(after.get("signal_id") or "").strip() != str(row.get("signal_id") or "").strip()
+            or _strict_generation(after_meta.get("materialization_generation"))
+            != expected_generation
+            or not after_meta.get("submit_intent_at")
+        ):
+            self._mark_failure(local_oid, "reconcile_broker_intent_state_mismatch")
+            return _RowOutcome.UNRESOLVED
+
+        if after.get("broker_order_id") and str(after.get("status") or "").strip().upper() in {
+            "SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"
+        }:
+            return _RowOutcome.SKIPPED
+
+        reconciler = self.execution_core
+        if reconciler is None:
+            callback = getattr(self.entry_watcher, "on_trigger", None)
+            reconciler = getattr(callback, "__self__", None)
+        reconcile = getattr(reconciler, "reconcile_deferred_broker_intent", None)
+        if not callable(reconcile):
+            retained = getattr(self.osm, "retain_recovery_ownership_if_no_watcher", None)
+            retained_ok = False
+            if callable(retained):
+                try:
+                    retained_ok = bool(
+                        retained(
+                            local_oid,
+                            recovery_owner=str(owner).strip(),
+                            reason="reconcile_broker_intent_consumer_unavailable",
+                            recovery_retention_mode=self.execution_mode.upper(),
+                        )
+                    )
+                except Exception:
+                    retained_ok = False
+            self._mark_failure(local_oid, "reconcile_broker_intent_consumer_unavailable")
+            return _RowOutcome.RETRY_OWNED if retained_ok else _RowOutcome.UNRESOLVED
+
+        try:
+            reconciliation = reconcile(local_order_id=local_oid) or {}
+        except Exception as exc:
+            self._mark_failure(
+                local_oid,
+                f"reconcile_broker_intent_failed:{type(exc).__name__}",
+            )
+            return _RowOutcome.UNRESOLVED
+
+        disposition = str(reconciliation.get("disposition") or "").strip().upper()
+        if disposition in {"ALREADY_RECONCILED", "SUBMITTED"}:
+            try:
+                reconciled_row = self.osm.get_order(local_oid)
+            except Exception:
+                reconciled_row = None
+            if (
+                isinstance(reconciled_row, dict)
+                and str(reconciled_row.get("broker_order_id") or "").strip()
+                and str(reconciled_row.get("status") or "").strip().upper()
+                in {"SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"}
+            ):
+                return _RowOutcome.SKIPPED
+
+        if disposition in {"RECONCILE_PENDING", "KEEP_WATCHER"}:
+            reason = str(
+                reconciliation.get("reason_code")
+                or "reconcile_broker_intent_pending"
+            )
+            retained = getattr(self.osm, "retain_recovery_ownership_if_no_watcher", None)
+            if callable(retained):
+                try:
+                    if bool(
+                        retained(
+                            local_oid,
+                            recovery_owner=str(owner).strip(),
+                            reason=reason,
+                            recovery_retention_mode=self.execution_mode.upper(),
+                        )
+                    ):
+                        return _RowOutcome.RETRY_OWNED
+                except Exception:
+                    pass
+
+        self._mark_failure(
+            local_oid,
+            f"reconcile_broker_intent_unresolved:{disposition or 'blank'}",
         )
         return _RowOutcome.UNRESOLVED
 
@@ -1720,7 +2292,14 @@ class PendingTriggerRestartRecovery:
 
     # ── Rearm + post-registration verification ────────────────────────────────
 
-    def _rearm_and_verify(self, row: dict, local_oid: str, *, plan_builder_fn=None) -> str:
+    def _rearm_and_verify(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        plan_builder_fn=None,
+        preserve_on_reject: bool = False,
+    ) -> str:
         """
         Call watch() once, then verify actual registry ownership.
         watch() returning True is NOT proof.
@@ -1730,6 +2309,8 @@ class PendingTriggerRestartRecovery:
         watcher = self.entry_watcher
         if watcher is None or not callable(getattr(watcher, "watch", None)):
             log.critical("RESTART_RECOVERY_WATCHER_UNAVAILABLE local=%s", local_oid)
+            if preserve_on_reject:
+                return _RowOutcome.UNRESOLVED
             return self._enter_restart_rearm_retry(local_oid, row,
                 reason="restart_recovery_watcher_unavailable")
 
@@ -1761,6 +2342,11 @@ class PendingTriggerRestartRecovery:
             return _RowOutcome.UNRESOLVED
 
         if not armed:
+            if preserve_on_reject:
+                self._mark_failure(
+                    local_oid, "restart_recovery_watch_returned_false_preserved"
+                )
+                return _RowOutcome.UNRESOLVED
             if getattr(watcher, "_last_reject_reason", None) == (
                 RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
             ):
@@ -2693,6 +3279,17 @@ def _strict_positive_int(raw) -> Optional[int]:
     return value if value is not None and value > 0 else None
 
 
+def _strict_generation(raw) -> Optional[int]:
+    """Parse an exact positive materialization generation."""
+    return (
+        raw
+        if isinstance(raw, int)
+        and not isinstance(raw, bool)
+        and raw >= 1
+        else None
+    )
+
+
 def _strict_broker_quantity(raw) -> Optional[int]:
     if isinstance(raw, bool):
         return None
@@ -2888,7 +3485,25 @@ def _has_trigger_or_submit_evidence(row: dict) -> bool:
         if meta.get(key):
             return True
     watcher_audit = meta.get("watcher_audit")
-    if isinstance(watcher_audit, dict) and str(watcher_audit.get("reason_code") or "") == "trigger_ready":
+    # The trigger_ready audit is historical after the synthetic direction-
+    # reversal rearm.  The exact RWR state above is the live recovery
+    # authority; do not let that stale diagnostic block its bounded quote
+    # retry or make a valid rearm look like active submit evidence.
+    _valid_direction_reversal_rwr = (
+        meta.get("direction_reversal_rearm_requires_watcher") is True
+        and str(meta.get("recovery_ownership") or "").strip()
+        == "recovery_scheduler"
+        and bool(str(meta.get("recovery_owner") or "").strip())
+        and not str(meta.get("lifecycle_state") or "").strip()
+        and not str(meta.get("materialization_status") or "").strip()
+        and not str(meta.get("current_owner") or "").strip()
+        and not str(meta.get("watcher_token") or "").strip()
+    )
+    if (
+        isinstance(watcher_audit, dict)
+        and str(watcher_audit.get("reason_code") or "") == "trigger_ready"
+        and not _valid_direction_reversal_rwr
+    ):
         return True
     return False
 

@@ -2941,6 +2941,7 @@ class APStartupRecovery:
                                     osm=self.osm,
                                     entry_watcher=self.entry_watcher,
                                     broker=self.broker,
+                                    execution_core=self.execution_core,
                                     caller_source=(
                                         "ap_recovery.due_retry.rearm_watcher_required"
                                     ),
@@ -3657,6 +3658,7 @@ class APStartupRecovery:
                         osm=self.osm,
                         entry_watcher=self.entry_watcher,
                         broker=self.broker,
+                        execution_core=self.execution_core,
                         caller_source="ap_recovery._reseed_watchers",
                     )
                     _outcome = _ptr.recover_one_row(

@@ -79,6 +79,7 @@ class _OSM:
         self.transition_calls = []
         self.meta_calls = []
         self.rearm_calls = []
+        self.adopt_calls = []
 
     def get_order(self, local_order_id):
         row = self.rows.get(local_order_id)
@@ -92,7 +93,7 @@ class _OSM:
         if row.get("status") != "PENDING_TRIGGER":
             return False
         meta = row.setdefault("meta", {})
-        if meta.get("lifecycle_state") not in (None, ""):
+        if meta.get("lifecycle_state") not in (None, "", "RETRY_WAIT"):
             return False
         meta.update(
             {
@@ -142,11 +143,57 @@ class _OSM:
 
     def rearm_deferred_materialization_direction_reversal(self, local_order_id, **kwargs):
         self.rearm_calls.append((local_order_id, kwargs))
+        watcher_token = str(kwargs.get("watcher_token") or "").strip()
+        recovery_owner = str(kwargs.get("owner") or "").strip()
+        generation = kwargs.get("generation")
         self.rows[local_order_id]["meta"].update(
             {
                 "lifecycle_state": "",
                 "materialization_status": "",
                 "materialization_in_flight": False,
+                "materialization_generation": generation,
+                "current_owner": watcher_token,
+                "watcher_token": watcher_token,
+                "watcher_generation": generation if watcher_token else 0,
+                "recovery_ownership": "" if watcher_token else "recovery_scheduler",
+                "recovery_owner": "" if watcher_token else recovery_owner,
+                "direction_reversal_rearm_requires_watcher": not bool(
+                    watcher_token
+                ),
+                "broker_ready": False,
+            }
+        )
+        for key in (
+            "trigger_crossed_at",
+            "trigger_crossed_at_provenance",
+            "trigger_confirmed_at",
+        ):
+            self.rows[local_order_id]["meta"].pop(key, None)
+        return True
+
+    def adopt_direction_reversal_watcher_ownership(self, local_order_id, **kwargs):
+        self.adopt_calls.append((local_order_id, kwargs))
+        row = self.rows[local_order_id]
+        meta = row.setdefault("meta", {})
+        token = str(kwargs.get("watcher_token") or "").strip()
+        generation = kwargs.get("generation")
+        if (
+            row.get("status") != "PENDING_TRIGGER"
+            or not token
+            or meta.get("direction_reversal_rearm_requires_watcher") is not True
+            or meta.get("materialization_generation") != generation
+        ):
+            return False
+        meta.update(
+            {
+                "lifecycle_state": "",
+                "materialization_status": "WAITING_FOR_TRIGGER",
+                "current_owner": token,
+                "watcher_token": token,
+                "watcher_generation": generation,
+                "recovery_ownership": "",
+                "recovery_owner": "",
+                "direction_reversal_rearm_requires_watcher": False,
             }
         )
         return True
@@ -183,7 +230,51 @@ class _Watcher:
         self.on_trigger = callback
 
 
-def _recovery(row, osm, watcher, broker, *, positions=None):
+class _RecoveryWatcher(_Watcher):
+    """Minimal watcher that proves a real registration to PTR."""
+
+    owner_token = "watcher-owner-pr445"
+
+    def __init__(self, callback):
+        super().__init__(callback)
+        self._dedup_set = set()
+        self.watch_calls = []
+
+    def watch(
+        self,
+        plan,
+        local_order_id,
+        *,
+        recovery_rearm=False,
+        registration_provenance_out=None,
+        **_kwargs,
+    ):
+        self.watch_calls.append((plan, local_order_id, recovery_rearm))
+        signal_id = str(getattr(plan, "signal_id", "") or SIGNAL_ID)
+        self._pending.append(
+            SimpleNamespace(
+                signal={
+                    "local_order_id": local_order_id,
+                    "signal_id": signal_id,
+                    "client_id": CLIENT_ID,
+                    "execution_mode": MODE,
+                },
+                state="PENDING",
+                _ownership_quarantine=False,
+            )
+        )
+        self._dedup_set.add(signal_id)
+        if registration_provenance_out is not None:
+            registration_provenance_out.update(
+                {
+                    "created_by_this_call": True,
+                    "registration_token": "registration-pr445",
+                }
+            )
+        return True
+
+
+def _recovery(row, osm, watcher, broker, *, positions=None, execution_core=None):
     return PendingTriggerRestartRecovery(
         client_id=CLIENT_ID,
         execution_mode=MODE,
@@ -192,6 +283,7 @@ def _recovery(row, osm, watcher, broker, *, positions=None):
         broker=broker,
         quote_check_fn=lambda *args: False,
         position_check_fn=lambda _row: positions or [],
+        execution_core=execution_core,
     )
 
 
@@ -480,6 +572,202 @@ def test_exact_no_broker_claims_once_and_continues_through_callback():
     assert recovery.recover_one_row(row) == _RowOutcome.SKIPPED
     assert len(osm.claim_calls) == 1
     assert len(callback_calls) == 1
+
+
+def test_rearm_watcher_required_is_handed_to_exact_generation_watcher_adoption():
+    row = _row()
+    osm = _OSM(row)
+    callback_calls = []
+
+    def _callback(watched):
+        callback_calls.append(watched)
+        owner = watched.signal["owner"]
+        generation = watched.signal["materialization_generation"]
+        assert osm.rearm_deferred_materialization_direction_reversal(
+            LOCAL_ORDER_ID,
+            owner=owner,
+            watcher_token="",
+            generation=generation,
+            signal_id=SIGNAL_ID,
+            execution_mode=MODE,
+            market_truth_audit={"reason": "CALL_NO_LONGER_ABOVE_TRIGGER"},
+        )
+        return {
+            "disposition": "REARM_WATCHER_REQUIRED",
+            "reason_code": "REARM_DIRECTION_REVERSAL",
+            "local_order_id": LOCAL_ORDER_ID,
+            "expected_client_id": CLIENT_ID,
+            "expected_execution_mode": MODE,
+            "expected_signal_id": SIGNAL_ID,
+            "expected_canonical_signal_id": CANONICAL_SIGNAL_ID,
+            "expected_generation": generation,
+        }
+
+    broker = MagicMock()
+    broker.list_orders.return_value = []
+    watcher = _RecoveryWatcher(_callback)
+    recovery = _recovery(row, osm, watcher, broker)
+
+    assert recovery.recover_one_row(row) == _RowOutcome.WATCHER_OWNED
+    assert len(callback_calls) == 1
+    assert len(watcher.watch_calls) == 1
+    assert len(osm.adopt_calls) == 1
+    adopted = osm.rows[LOCAL_ORDER_ID]
+    assert adopted["status"] == "PENDING_TRIGGER"
+    assert adopted["meta"]["materialization_status"] == "WAITING_FOR_TRIGGER"
+    assert adopted["meta"]["current_owner"] == watcher.owner_token
+    assert adopted["meta"]["watcher_token"] == watcher.owner_token
+    assert adopted["meta"]["recovery_owner"] == ""
+    assert adopted["meta"]["direction_reversal_rearm_requires_watcher"] is False
+    assert adopted["contract"] == "DEFERRED:SPY"
+    assert adopted["broker_order_id"] is None
+
+    # A restart/follow-up pass observes the exact watcher ownership and must
+    # not invoke the synthetic callback, register a second watcher, or adopt
+    # the durable row a second time.
+    assert recovery.recover_one_row(osm.get_order(LOCAL_ORDER_ID)) == _RowOutcome.WATCHER_OWNED
+    assert len(callback_calls) == 1
+    assert len(watcher.watch_calls) == 1
+    assert len(osm.adopt_calls) == 1
+    broker.list_orders.assert_called_once_with()
+
+
+def test_reconcile_broker_intent_is_consumed_without_manufacturing_fill_ownership():
+    row = _row()
+    osm = _OSM(row)
+    callback_calls = []
+    actual_contract = "SPY260821C00500000"
+
+    def _callback(_watched):
+        callback_calls.append(True)
+        osm.rows[LOCAL_ORDER_ID]["contract"] = actual_contract
+        osm.rows[LOCAL_ORDER_ID]["meta"].update(
+            {
+                "submit_intent_at": "2026-08-12T16:01:00+00:00",
+                "broker_submit_key": canonical_broker_submit_key(LOCAL_ORDER_ID),
+                "lifecycle_state": "SUBMITTING",
+            }
+        )
+        return {
+            "disposition": "RECONCILE_BROKER_INTENT",
+            "reason_code": "ENTRY_BROKER_IDENTITY_UNPROVEN",
+        }
+
+    broker = MagicMock()
+    broker.list_orders.side_effect = [[], [_broker_order(status="working")]]
+    core = SimpleNamespace(
+        client_id=CLIENT_ID,
+        email=CLIENT_ID,
+        execution_mode=MODE,
+        mode=MODE.upper(),
+        order_state_machine=osm,
+        broker=broker,
+    )
+    core.reconcile_deferred_broker_intent = (
+        APExecutionCore.reconcile_deferred_broker_intent.__get__(core, type(core))
+    )
+    watcher = _Watcher(_callback)
+    recovery = _recovery(row, osm, watcher, broker, execution_core=core)
+
+    assert recovery.recover_one_row(row) == _RowOutcome.SKIPPED
+    assert callback_calls == [True]
+    adopted = osm.rows[LOCAL_ORDER_ID]
+    assert adopted["status"] == "SUBMITTED"
+    assert adopted["contract"] == actual_contract
+    assert adopted["broker_order_id"] == "broker-existing"
+    assert adopted["meta"]["current_owner"] == "ORDER_MONITOR"
+    assert adopted["meta"]["lifecycle_state"] == "SUBMITTED"
+    assert len(osm.transition_calls) == 1
+    assert broker.list_orders.call_count == 2
+    broker.place_order.assert_not_called()
+
+    # The durable broker id/status fence makes a restart read-only: no second
+    # synthetic callback and no second broker reconciliation query.
+    assert recovery.recover_one_row(osm.get_order(LOCAL_ORDER_ID)) == _RowOutcome.SKIPPED
+    assert callback_calls == [True]
+    assert len(osm.transition_calls) == 1
+    assert broker.list_orders.call_count == 2
+
+
+def test_due_retry_reconcile_disposition_reaches_existing_broker_reconciler():
+    row = _row()
+    row["symbol"] = "SPY"
+    row["meta"].update(
+        {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "materialization_generation": 3,
+            "materialization_next_retry_at": "2020-01-01T00:00:00+00:00",
+            "retry_attempt": 0,
+            "retry_max_attempts": 5,
+            "breach_attempt_count": 0,
+            "materialization_attempts": 0,
+        }
+    )
+    osm = _OSM(row)
+    callback_calls = []
+    actual_contract = "SPY260821C00500000"
+
+    def _callback(_watched):
+        callback_calls.append(True)
+        osm.rows[LOCAL_ORDER_ID]["contract"] = actual_contract
+        osm.rows[LOCAL_ORDER_ID]["meta"].update(
+            {
+                "submit_intent_at": "2026-08-12T16:02:00+00:00",
+                "broker_submit_key": canonical_broker_submit_key(LOCAL_ORDER_ID),
+                "lifecycle_state": "SUBMITTING",
+            }
+        )
+        return {
+            "disposition": "RECONCILE_BROKER_INTENT",
+            "reason_code": "ENTRY_BROKER_IDENTITY_UNPROVEN",
+        }
+
+    broker = MagicMock()
+    broker.list_orders.return_value = [_broker_order(status="working")]
+    core = SimpleNamespace(
+        client_id=CLIENT_ID,
+        email=CLIENT_ID,
+        execution_mode=MODE,
+        mode=MODE.upper(),
+        order_state_machine=osm,
+        broker=broker,
+    )
+    core._on_entry_trigger = _callback
+    core.reconcile_deferred_broker_intent = (
+        APExecutionCore.reconcile_deferred_broker_intent.__get__(core, type(core))
+    )
+
+    outcome = APExecutionCore.resume_deferred_materialization_retry(
+        core,
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=3,
+        expected_retry_attempt=1,
+        owner="recovery-retry-pr445",
+    )
+
+    assert outcome["disposition"] == "SUBMITTED"
+    assert callback_calls == [True]
+    assert osm.rows[LOCAL_ORDER_ID]["status"] == "SUBMITTED"
+    assert osm.rows[LOCAL_ORDER_ID]["contract"] == actual_contract
+    assert osm.rows[LOCAL_ORDER_ID]["broker_order_id"] == "broker-existing"
+    assert len(osm.transition_calls) == 1
+    broker.list_orders.assert_called_once_with()
+    broker.place_order.assert_not_called()
+
+    # The accepted durable boundary is terminal for this synthetic retry
+    # invocation; a repeated due-retry call cannot call the callback again.
+    second = APExecutionCore.resume_deferred_materialization_retry(
+        core,
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=3,
+        expected_retry_attempt=1,
+        owner="recovery-retry-pr445",
+    )
+    assert second["disposition"] == "KEEP_WATCHER"
+    assert callback_calls == [True]
+    assert broker.list_orders.call_count == 1
 
 
 def test_broker_truth_unavailable_holds_without_claim_or_cancel():
