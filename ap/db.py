@@ -685,6 +685,45 @@ def list_positions(client_id: str | None = None, limit: int = 200,
     return run_with_retry(_fn)
 
 
+def get_positions_for_entry_identity(
+    *, client_id: str, local_order_id: str, signal_id: str
+) -> list[dict]:
+    """Read only positions exact-bound to one ENTRY identity.
+
+    This is an authority query, not a dashboard listing.  It intentionally
+    has no generic row limit: a matching historical position must not vanish
+    behind the newest-N positions for the client.  Execution mode remains in
+    the returned rows so the caller can classify a missing or conflicting mode
+    as HOLD rather than laundering it through the query predicate.
+    """
+    _client_id = str(client_id or "").strip()
+    _local_order_id = str(local_order_id or "").strip()
+    _signal_id = str(signal_id or "").strip()
+    if not _client_id or not _local_order_id or not _signal_id:
+        raise ValueError(
+            "get_positions_for_entry_identity requires client_id, "
+            "local_order_id, and signal_id"
+        )
+
+    def _fn():
+        with conn() as c:
+            c.execute(
+                """
+                SELECT *
+                FROM positions
+                WHERE LOWER(client_id) = LOWER(%s)
+                  AND (
+                      local_order_id = %s
+                      OR signal_id = %s
+                  )
+                """,
+                (_client_id, _local_order_id, _signal_id),
+            )
+            return c.fetchall()
+
+    return run_with_retry(_fn)
+
+
 # =========================================================================
 # ORDER QUERY HELPERS
 # =========================================================================
@@ -760,6 +799,24 @@ def list_orders(client_id: str | None = None, limit: int = 200,
 def get_open_orders_for_reconcile(client_id: str | None = None,
                                    limit: int = 200,
                                    execution_mode: str | None = None) -> list[dict]:
+    # PENDING_TRIGGER remains excluded for ordinary watcher plans, but an
+    # evidence-bearing row is already broker-owned or broker-ambiguous and
+    # must reach canonical adoption/reconciliation before it can be cleaned
+    # up or handed back to selector recovery.
+    _status_clause = (
+        "AND ("
+        "status IN ("
+        "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
+        "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
+        ") OR ("
+        "status = 'PENDING_TRIGGER' AND ("
+        "  NULLIF(BTRIM(COALESCE(broker_order_id,'')), '') IS NOT NULL"
+        "  OR submitted_ts IS NOT NULL"
+        "  OR NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NOT NULL"
+        ")"
+        ")) "
+    )
+
     def _fn():
         with conn() as c:
             mode = str(execution_mode or "").strip().lower()
@@ -767,26 +824,24 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
                     "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
-                    "AND status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (client_id, mode, limit))
+                    + _status_clause
+                    + "ORDER BY created_ts DESC LIMIT %s",
+                    (client_id, mode, limit),
+                )
             elif client_id:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
-                    "AND status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
+                    + _status_clause
+                    + "ORDER BY created_ts DESC LIMIT %s",
+                    (client_id, limit),
+                )
             else:
                 c.execute(
-                    "SELECT * FROM orders WHERE status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (limit,))
+                    "SELECT * FROM orders WHERE "
+                    + _status_clause.removeprefix("AND ")
+                    + "ORDER BY created_ts DESC LIMIT %s",
+                    (limit,),
+                )
             return c.fetchall()
     return run_with_retry(_fn)
 
@@ -821,9 +876,10 @@ def get_open_orders_with_invalid_execution_mode(client_id: str,
 def get_stale_pending_trigger_orders(client_id: str, older_than_hours: int = 8) -> list[dict]:
     """Find ENTRY orders stuck in PENDING_TRIGGER longer than threshold.
 
-    PENDING_TRIGGER orders have not reached the broker and normally have no
-    broker_order_id, so they should NOT be included in broker polling via
-    get_open_orders_for_reconcile().
+    Ordinary PENDING_TRIGGER watcher plans have not reached the broker and
+    normally have no broker_order_id. Evidence-bearing rows are now included
+    in get_open_orders_for_reconcile() so canonical adoption/reconciliation
+    can own them before any cleanup decision.
 
     This helper exists so reconciler/health/admin tooling can detect leaked
     watcher/queue orders that may reserve capital forever.

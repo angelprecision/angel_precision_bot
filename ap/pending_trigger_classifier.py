@@ -643,6 +643,11 @@ class PendingTriggerClassification:
 
     # Unsafe — must NOT be rearmed; terminal cleanup required
     STUCK_TRIGGER_READY        = "STUCK_TRIGGER_READY"
+    # Narrow crash-window continuation selected only after the canonical
+    # restart owner proves exact identity and zero broker ownership.
+    STUCK_TRIGGER_READY_PREBROKER_RECOVERABLE = (
+        "STUCK_TRIGGER_READY_PREBROKER_RECOVERABLE"
+    )
     STUCK_INVALIDATED          = "STUCK_INVALIDATED"
     STUCK_TERMINAL_MATERIALIZATION = "STUCK_TERMINAL_MATERIALIZATION"
     ORPHAN_NO_WATCHER          = "ORPHAN_NO_WATCHER"
@@ -717,6 +722,7 @@ def classify_pending_trigger_row(
     watcher_owned: Optional[bool] = None,
     is_past_eod: bool = False,
     live_quote_already_through_trigger: Optional[bool] = None,
+    prebroker_recovery_proven: bool = False,
 ) -> str:
     """
     Classify a single orders row.
@@ -731,6 +737,9 @@ def classify_pending_trigger_row(
         live_quote_already_through_trigger: caller-supplied — True if a fresh
             underlying quote confirms price already crossed the trigger. When
             None, the UNSAFE_ALREADY_THROUGH_TRIGGER check is skipped.
+        prebroker_recovery_proven: caller-supplied proof from the canonical
+            restart owner. This selects the one exact no-broker continuation;
+            it does not make the classification generally rearmable.
 
     Returns one of the PendingTriggerClassification constants.
     """
@@ -768,10 +777,38 @@ def classify_pending_trigger_row(
         restart_rearm_status = str(meta.get("restart_rearm_status") or "").strip().upper()
         restart_rearm_next_at = meta.get("restart_rearm_next_at")
 
-        # ── Priority 1: trigger_ready without broker_order_id is the zombie ──
+        # An in-flight canonical materialization claim is a durable ownership
+        # state, not a stale watcher diagnosis.  This must take precedence
+        # over ``watcher_audit.reason_code=trigger_ready`` so a crash after
+        # claim can converge through the existing retry owner.
+        # The restart engine still proves the exact owner/client/mode/lease
+        # before it permits any mutation; this label is routing only.
+        _materialization_lifecycle = str(
+            meta.get("lifecycle_state") or ""
+        ).strip().upper()
+        if (
+            retry_status == "RUNNING"
+            and (
+                meta.get("materialization_in_flight") is True
+                or _materialization_lifecycle == "MATERIALIZING"
+            )
+        ) or (
+            retry_status == "RETRY_PENDING"
+            and (
+                retry_next_at
+                or _materialization_lifecycle in {"RETRY_WAIT", "MATERIALIZING"}
+            )
+        ):
+            return PendingTriggerClassification.WAITING_RETRYABLE
+
+        # ── Priority 1: trigger_ready without broker_order_id ────────────────
         # A watcher decided the row should submit, but broker never accepted.
-        # In LIVE this is NEVER rescuable — the trigger decision is stale.
+        # The historical terminal class remains the default; only the
+        # canonical restart owner may select the narrower continuation after
+        # its separate durable proof has passed.
         if watcher_reason == "trigger_ready":
+            if prebroker_recovery_proven is True:
+                return PendingTriggerClassification.STUCK_TRIGGER_READY_PREBROKER_RECOVERABLE
             return PendingTriggerClassification.STUCK_TRIGGER_READY
 
         # ── Priority 2: real invalidation reason ──
