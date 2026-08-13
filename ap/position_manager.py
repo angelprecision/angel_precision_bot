@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -1857,8 +1856,7 @@ class APPositionManager:
         """
         if int(qty or 0) <= 0:
             raise ValueError(f"qty must be positive, got {qty}")
-        numeric_entry_price = float(entry_price or 0)
-        if not math.isfinite(numeric_entry_price) or numeric_entry_price <= 0:
+        if float(entry_price or 0) <= 0:
             raise ValueError(f"entry_price must be positive, got {entry_price}")
 
         # PR #237: fail-CLOSED on missing/invalid side.  Raises

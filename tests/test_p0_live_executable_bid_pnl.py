@@ -741,7 +741,7 @@ class TestAdoptionIdentityFencing:
         engine._positions_by_id[repair_id] = pos
         return pos
 
-    def test_foreign_client_repair_is_ignored_for_this_adoption_domain(self):
+    def test_client_mismatch_refuses_adoption(self):
         engine = self._base_engine()
         self._add_repair(engine, client="other@client.com")
         result = engine.adopt_canonical_position_identity(
@@ -750,11 +750,9 @@ class TestAdoptionIdentityFencing:
             entry_fill=1.59, entry_ts=None, execution_mode="live",
             client_id=_CLIENT,  # different from repair client
         )
-        assert result.disposition == "NO_REPAIR_FOUND"
+        assert result.disposition == "RETRY_CLIENT_MISMATCH"
         assert result.adopted is False
-        assert result.safe_to_seed is True
         assert engine._positions[0].position_id.startswith("broker-repair-")
-        assert getattr(engine._positions[0], "adoption_identity_quarantined", False) is False
 
     def test_no_adoption_when_canonical_already_exists(self):
         engine = self._base_engine()
@@ -775,7 +773,7 @@ class TestAdoptionIdentityFencing:
         assert result.adopted is True
         assert len([p for p in engine._positions if not p.closed]) == 1
 
-    def test_foreign_mode_repair_is_ignored_for_this_adoption_domain(self):
+    def test_repair_to_paper_mismatch_refused(self):
         engine = self._base_engine()
         self._add_repair(engine, mode="live")  # repair is live
         result = engine.adopt_canonical_position_identity(
@@ -784,12 +782,10 @@ class TestAdoptionIdentityFencing:
             entry_fill=1.59, entry_ts=None, execution_mode="paper",  # canonical says paper
             client_id=_CLIENT,
         )
-        assert result.disposition == "NO_REPAIR_FOUND"
+        assert result.disposition == "RETRY_MODE_MISMATCH"
         assert result.adopted is False
-        assert result.safe_to_seed is True
-        assert getattr(engine._positions[0], "adoption_identity_quarantined", False) is False
 
-    def test_unknown_mode_repair_is_quarantined_for_this_adoption_domain(self):
+    def test_blank_repair_mode_refuses_live_canonical(self):
         engine = self._base_engine()
         self._add_repair(engine, mode="")  # repair mode unknown
         result = engine.adopt_canonical_position_identity(
@@ -798,11 +794,8 @@ class TestAdoptionIdentityFencing:
             entry_fill=1.59, entry_ts=None, execution_mode="live",
             client_id=_CLIENT,
         )
-        assert result.disposition == "NO_REPAIR_FOUND"
+        assert result.disposition == "RETRY_MODE_MISMATCH"
         assert result.adopted is False
-        assert result.safe_to_seed is True
-        assert getattr(engine._positions[0], "adoption_identity_quarantined", False) is True
-        assert engine.active_positions() == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1019,7 +1012,7 @@ class TestCanonicalPlusRepairCollapse:
         assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
         assert result.adopted is True
 
-    def test_blank_mode_repair_is_quarantined_before_paper_canonical_proof(self):
+    def test_blank_mode_repair_is_quarantined_from_paper_canonical(self):
         engine, canon_id, repair_id = self._make_engine_with_both(
             canonical_mode="paper", repair_mode="", repair_client=_CLIENT,
         )
@@ -1036,17 +1029,17 @@ class TestCanonicalPlusRepairCollapse:
         )
 
         canonical = engine._positions_by_id[canon_id]
-        assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
-        assert result.adopted is True
+        assert result.disposition == "RETRY_REPAIR_IDENTITY_UNPROVEN"
+        assert result.adopted is False
         assert result.safe_to_seed is False
-        assert result.retryable is False
+        assert result.retryable is True
         assert repair_id in engine._positions_by_id
         assert repair in engine._positions
         assert getattr(repair, "adoption_identity_quarantined", False) is True
         assert engine.active_positions() == [canonical]
         assert getattr(canonical, "hard_exit_reference_validity", "") != "proven"
 
-    def test_blank_client_repair_is_quarantined_before_matching_mode_proof(self):
+    def test_blank_client_repair_is_quarantined_from_matching_mode_canonical(self):
         engine, canon_id, repair_id = self._make_engine_with_both(
             canonical_mode="live", repair_mode="live", repair_client="",
         )
@@ -1059,10 +1052,10 @@ class TestCanonicalPlusRepairCollapse:
 
         canonical = engine._positions_by_id[canon_id]
         repair = engine._positions_by_id[repair_id]
-        assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
-        assert result.adopted is True
+        assert result.disposition == "RETRY_REPAIR_IDENTITY_UNPROVEN"
+        assert result.adopted is False
         assert result.safe_to_seed is False
-        assert result.retryable is False
+        assert result.retryable is True
         assert repair_id in engine._positions_by_id
         assert any(getattr(p, "position_id", "") == repair_id for p in engine._positions)
         assert getattr(repair, "adoption_identity_quarantined", False) is True
@@ -1720,7 +1713,7 @@ class TestStructuredAdoptionResult:
         assert r.disposition == "NO_REPAIR_FOUND"
         assert r.safe_to_seed is True
 
-    def test_foreign_client_repair_is_not_a_retry_for_this_domain(self):
+    def test_client_mismatch_returns_retry_not_seeds(self):
         from ap_exit_engine import CanonicalAdoptionResult
         engine = self._engine()
         self._add_repair(engine, client="other@client.com")
@@ -1730,15 +1723,15 @@ class TestStructuredAdoptionResult:
             entry_fill=1.59, entry_ts=None, execution_mode="live",
             client_id=_CLIENT,  # different from repair
         )
-        assert r.disposition == "NO_REPAIR_FOUND"
+        assert r.disposition == "RETRY_CLIENT_MISMATCH"
         assert r.adopted is False
-        assert r.safe_to_seed is True
-        assert r.retryable is False
+        assert r.safe_to_seed is False
+        assert r.retryable is True
         # Repair position must still exist (not adopted)
         assert len(engine._positions) == 1
         assert engine._positions[0].position_id.startswith("broker-repair-")
 
-    def test_foreign_mode_repair_is_not_a_retry_for_this_domain(self):
+    def test_mode_mismatch_returns_retry_not_seeds(self):
         from ap_exit_engine import CanonicalAdoptionResult
         engine = self._engine()
         self._add_repair(engine, mode="live")
@@ -1748,8 +1741,8 @@ class TestStructuredAdoptionResult:
             entry_fill=1.59, entry_ts=None, execution_mode="paper",  # mismatch
             client_id=_CLIENT,
         )
-        assert r.disposition == "NO_REPAIR_FOUND"
-        assert r.safe_to_seed is True
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        assert r.safe_to_seed is False
 
     def test_upgrade_in_place_stale_repair_bid_cannot_seed_peak(self):
         engine = self._engine()

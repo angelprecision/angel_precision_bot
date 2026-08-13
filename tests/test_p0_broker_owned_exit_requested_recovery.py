@@ -2875,7 +2875,7 @@ def test_f7_recovered_fill_keeps_canonical_exit_filled_reason_code(monkeypatch):
     )
     monkeypatch.setattr(
         fm, "check_order_with_broker",
-        lambda broker, o: {"status": "EXIT_FILLED", "filled_qty": 4, "avg_fill": 1.25},
+        lambda broker, o: {"status": "EXIT_FILLED", "filled_qty": 4, "fill_price": 1.25},
     )
     monkeypatch.setattr(fm, "reduce_position_on_fill", MagicMock(), raising=False)
 

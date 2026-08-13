@@ -178,7 +178,6 @@ class APSelfHealingSystem:
                     # but #425 broker-owned EXIT recovery must hold when the
                     # runner's runtime mode is absent or invalid.
                     client_mode=getattr(runner, "mode", None),
-                    execution_core=getattr(runner, "core", None),
                 )
                 runner.order_monitor.start()
                 return True

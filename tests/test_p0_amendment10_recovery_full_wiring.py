@@ -3,8 +3,6 @@ import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
 import ap_execution_core
 from ap.order_state_machine import APOrderStateMachine
 
@@ -98,29 +96,6 @@ def _remote(status="open", **overrides):
     return value
 
 
-def _reconcile_existing_broker_order(status="filled", **overrides):
-    core = _core()
-    row = _row(crash=True)
-    transition_calls = []
-
-    def _transition(local_order_id, next_status, **kwargs):
-        transition_calls.append((local_order_id, next_status, dict(kwargs)))
-        row["status"] = next_status
-        if kwargs.get("broker_order_id"):
-            row["broker_order_id"] = kwargs["broker_order_id"]
-        if kwargs.get("filled_qty") is not None:
-            row["filled_qty"] = kwargs["filled_qty"]
-        if kwargs.get("fill_price") is not None:
-            row["fill_price"] = kwargs["fill_price"]
-        return True
-
-    core.order_state_machine.get_order.return_value = row
-    core.order_state_machine.transition.side_effect = _transition
-    core.broker.list_orders.return_value = [_remote(status, **overrides)]
-    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
-    return core, row, transition_calls, result
-
-
 def test_matching_working_order_is_adopted_and_monitor_owned_without_post():
     core = _core()
     core.order_state_machine.get_order.return_value = _row(crash=True)
@@ -132,153 +107,16 @@ def test_matching_working_order_is_adopted_and_monitor_owned_without_post():
     core.broker.place_order.assert_not_called()
 
 
-def test_matching_fill_stays_submitted_for_canonical_fill_monitor():
+def test_matching_fill_advances_through_existing_state_machine():
     core = _core()
     core.order_state_machine.get_order.return_value = _row(crash=True)
     core.order_state_machine.transition.return_value = True
     core.broker.list_orders.return_value = [_remote("filled", exec_quantity=1, avg_fill_price=2.08)]
     result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
-    assert result["status"] == "SUBMITTED"
-    assert core.order_state_machine.transition.call_count == 1
-    assert core.order_state_machine.transition.call_args.args[:2] == ("oid-1", "SUBMITTED")
+    assert result["status"] == "FILLED"
+    assert core.order_state_machine.transition.call_count == 2
+    assert core.order_state_machine.transition.call_args.args[:2] == ("oid-1", "FILLED")
     core.broker.place_order.assert_not_called()
-
-
-def test_reconciled_filled_order_hands_off_once_to_fill_monitor_and_position_owner(
-    monkeypatch,
-):
-    from ap import fill_monitor as fm
-
-    core, row, transition_calls, result = _reconcile_existing_broker_order(
-        "filled", exec_quantity=1, avg_fill_price=2.08
-    )
-    assert result["status"] == "SUBMITTED"
-    assert row["status"] == "SUBMITTED"
-    assert row["broker_order_id"] == "TR-9"
-
-    order = {**row, "meta": dict(row.get("meta") or {}), "filled_qty": 0}
-    core.broker.get_order.return_value = {
-        "status": "filled",
-        "exec_quantity": 1,
-        "avg_fill_price": 2.08,
-    }
-    opened = []
-    bound = []
-    seeded = []
-    verified = []
-    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "trace_gate", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        fm,
-        "_open_position_safe",
-        lambda *args, **kwargs: opened.append((args, kwargs)) or "position-1",
-    )
-    monkeypatch.setattr(
-        fm,
-        "_establish_canonical_handoff_standing_stop",
-        lambda **kwargs: {
-            "state": "SUBMITTED",
-            "standing_stop_attempted": True,
-            "protection_proven": True,
-        },
-    )
-    monkeypatch.setattr(
-        fm,
-        "_bind_filled_entry_position_id",
-        lambda *args: bound.append(args) or {"ok": True, "disposition": "BOUND"},
-    )
-    monkeypatch.setattr(
-        fm,
-        "_seed_exit_engine",
-        lambda *args: seeded.append(args) or {"ok": True, "disposition": "SEEDED"},
-    )
-    monkeypatch.setattr(
-        fm,
-        "_verify_canonical_entry_owner",
-        lambda *args: verified.append(args) or {"ok": True},
-    )
-    monkeypatch.setattr(
-        fm, "_clear_canonical_owner_handoff_retry", lambda *_args: True
-    )
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *_args: None)
-
-    fm.process_pending_order(
-        core.broker,
-        order,
-        osm=core.order_state_machine,
-        pm=object(),
-        exit_engine=SimpleNamespace(),
-        runtime_execution_mode="live",
-    )
-
-    assert core.broker.get_order.call_count == 1
-    assert [call[1] for call in transition_calls] == ["SUBMITTED", "FILLED"]
-    assert transition_calls[-1][2] == {
-        "filled_qty": 1,
-        "fill_price": 2.08,
-        "broker_order_id": "TR-9",
-    }
-    assert len(opened) == 1
-    assert len(bound) == len(seeded) == len(verified) == 1
-    assert row["status"] == "FILLED"
-    assert row["filled_qty"] == 1
-    assert row["fill_price"] == 2.08
-
-
-@pytest.mark.parametrize(
-    ("broker_status", "expected_status", "remote_fields"),
-    [
-        (
-            "partially_filled",
-            "PARTIAL_FILL",
-            {"exec_quantity": 1, "avg_fill_price": 2.08},
-        ),
-        ("rejected", "REJECTED", {}),
-        ("canceled", "CANCELED", {}),
-        ("expired", "EXPIRED", {}),
-    ],
-)
-def test_reconciled_nonfilled_statuses_are_consumed_by_canonical_monitor(
-    monkeypatch, broker_status, expected_status, remote_fields
-):
-    from ap import fill_monitor as fm
-
-    core, row, _reconcile_calls, result = _reconcile_existing_broker_order(
-        broker_status, **remote_fields
-    )
-    assert result["status"] == "SUBMITTED"
-    order = {**row, "meta": dict(row.get("meta") or {}), "filled_qty": 0}
-    core.broker.get_order.return_value = {
-        "status": broker_status,
-        **remote_fields,
-    }
-    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *_args: None)
-    monkeypatch.setattr(
-        fm,
-        "_open_position_safe",
-        lambda *_args, **_kwargs: pytest.fail(
-            "partial/terminal monitor status must not create a position"
-        ),
-    )
-
-    core.order_state_machine.transition.reset_mock()
-    fm.process_pending_order(
-        core.broker,
-        order,
-        osm=core.order_state_machine,
-        pm=None,
-        exit_engine=None,
-        runtime_execution_mode="live",
-    )
-
-    core.order_state_machine.transition.assert_called_once()
-    call = core.order_state_machine.transition.call_args
-    assert call.args[:2] == ("oid-1", expected_status)
-    assert row["status"] == expected_status
 
 
 def test_wrong_contract_and_multiple_matches_fail_closed():

@@ -997,14 +997,13 @@ class TestFinalIdentityAndRestartRearmRetry:
         assert summary["retry_rows_owned"] == 0
         assert osm.meta_writes == []
 
-    def test_broker_order_id_is_held_until_exact_identity_is_verified(self):
+    def test_broker_order_id_cannot_enter_restart_rearm_retry(self):
         r = _row(meta={"trigger_price": 450.0})
         r["broker_order_id"] = "B-1"
         rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
         summary = rec.recover_all([r])
 
-        assert summary["skipped_not_pending_trigger"] == 0
-        assert summary["ownerless_rows_remaining"] == 1
+        assert summary["skipped_not_pending_trigger"] == 1
         assert summary["retry_rows_owned"] == 0
         assert osm.meta_writes == []
 

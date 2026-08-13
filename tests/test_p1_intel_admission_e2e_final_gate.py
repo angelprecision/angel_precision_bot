@@ -141,52 +141,6 @@ def test_fail_open_verdict_passes_final_gate(reason_code, monkeypatch):
     )
 
 
-def test_vix_advisory_bridge_result_remains_non_authoritative_live(monkeypatch):
-    """A VIX provider failure must stay advisory through the LIVE final gate."""
-    ib = _load_bridge()
-    bridge_result = ib._map_result(
-        {
-            "action": "execute",
-            "approved": True,
-            "score": 40.0,
-            "contracts": 1,
-            "ticker": "AAPL",
-            "reasoning": "VIX provider unavailable",
-            "risk_detail": {
-                "approved": True,
-                "hard_veto": False,
-                "reason_code": "VIX_UNAVAILABLE",
-                "max_contracts": 1,
-                "max_position_usd": 0.0,
-                "account_state_authoritative": False,
-            },
-        },
-        fallback_score=40.0,
-    )
-    verdict = iap.adjudicate_intelligence_result(
-        bridge_result,
-        signal=_signal(),
-        execution_mode="LIVE",
-    )
-
-    assert bridge_result["intel_status"] == "VIX_ADVISORY"
-    assert verdict.allowed is True
-    assert verdict.authoritative is False
-    assert verdict.reason_code == iap.INTEL_VIX_ADVISORY
-
-    mc, _ = _build_mc(paper=False)
-    monkeypatch.setenv("FINAL_ENTRY_INTELLIGENCE_REQUIRED", "1")
-    monkeypatch.setenv("FINAL_ENTRY_INTELLIGENCE_MIN_SCORE", "70.0")
-    decision = _run(
-        mc,
-        intel=bridge_result,
-        intel_verdict=verdict,
-        monkeypatch=monkeypatch,
-    )
-
-    assert decision is None or decision.ok is not False
-
-
 # ---------------------------------------------------------------------------
 # E. Authoritative approval with low score still enforces final gate
 # ---------------------------------------------------------------------------
