@@ -1066,21 +1066,29 @@ def test_postgres_cas_allows_only_one_simultaneous_claimant(
     assert db.read_meta()["entry_efficiency_generation"] == 1
     assert db.read_meta()["entry_efficiency_state"] == WAIT_CONFIRMATION
 
-    # A stale claimant and a replay of the original claimant both miss the
-    # exact durable generation; neither can overwrite the newer state.
-    assert _postgres_efficiency_cas(
-        db.osm,
-        expected_state=WAIT_CONFIRMATION,
-        expected_generation=1,
-        next_state=REARM_FOR_REBREACH,
-        next_generation=2,
-    ) is False
+    # The original request cannot be replayed after the winner advances the
+    # durable generation.  A legitimate next lifecycle transition may use
+    # the current generation, but replaying that transition must also miss.
     assert _postgres_efficiency_cas(
         db.osm,
         expected_state="",
         expected_generation=0,
         next_state=WAIT_CONFIRMATION,
         next_generation=1,
+    ) is False
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+    ) is True
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
     ) is False
     assert db.read_meta()["entry_efficiency_generation"] == 2
 
