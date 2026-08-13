@@ -399,6 +399,11 @@ class TradierBroker(BrokerAdapter):
           - exec_quantity
           - avg_fill_price
           - price (fallback)
+
+        Tradier's transaction_date is an order last-updated timestamp, not an
+        execution timestamp. It is returned for diagnostics but deliberately
+        is not normalized into filled_ts; EXIT finalization must hold unless
+        an adapter-normalized execution-time field is present.
         """
         try:
             j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders/{order_id}")

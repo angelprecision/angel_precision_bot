@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import math
 from typing import Any, Iterable
 
 from ap.db import conn, run_with_retry
@@ -38,6 +39,7 @@ _PARTIAL_RESULT_STATUSES = {
     "PARTIAL_FILL", "PARTIALLY_FILLED", "PARTIAL", "EXIT_PARTIAL_FILL",
 }
 _RECONCILIATION_STALE_ATTEMPT_LEASE = timedelta(minutes=5)
+_VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 
 
 def _parse_reconciler_timestamp(value: Any) -> datetime | None:
@@ -81,17 +83,39 @@ class LifecycleProjection:
 
 
 def _float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
     try:
-        return float(value) if value is not None else default
+        parsed = float(value) if value is not None else default
+        return parsed if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
 
 
 def _int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
     try:
-        return int(value) if value is not None else default
+        parsed = float(value) if value is not None else float(default)
+        return int(parsed) if math.isfinite(parsed) and parsed.is_integer() else default
     except (TypeError, ValueError):
         return default
+
+
+def _resolve_execution_mode(*rows: tuple[str, dict]) -> str:
+    """Require every present lifecycle mode to agree before projection."""
+    values: list[str] = []
+    for label, row in rows:
+        raw = row.get("execution_mode")
+        if raw in (None, ""):
+            continue
+        mode = str(raw).strip().lower()
+        if mode not in _VALID_EXECUTION_MODES:
+            raise LifecycleProjectionError(f"{label}_execution_mode_invalid")
+        values.append(mode)
+    if values and any(mode != values[0] for mode in values[1:]):
+        raise LifecycleProjectionError("execution_mode_conflict")
+    return values[0] if values else "unknown"
 
 
 def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> LifecycleProjection:
@@ -108,7 +132,7 @@ def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> L
     if entry_raw not in (None, "") and entry_ts is None:
         raise LifecycleProjectionError("position_entry_timestamp_missing_or_invalid")
 
-    normalized: list[tuple[Any, int, float]] = []
+    normalized: list[tuple[datetime, Any, int, float]] = []
     for row in fills:
         fill_qty = _int(row.get("filled_qty"))
         fill_price = _float(row.get("fill_price"))
@@ -119,16 +143,19 @@ def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> L
                 raise LifecycleProjectionError("exit_fill_timestamp_missing_or_invalid")
             if entry_ts is not None and fill_ts < entry_ts:
                 raise LifecycleProjectionError("exit_fill_before_entry")
-            normalized.append((fill_ts_raw, fill_qty, fill_price))
-    normalized.sort(key=lambda item: str(item[0] or ""))
+            normalized.append((fill_ts, fill_ts_raw, fill_qty, fill_price))
+    normalized.sort(key=lambda item: item[0])
 
-    exited_qty = sum(item[1] for item in normalized)
+    exited_qty = sum(item[2] for item in normalized)
     if exited_qty <= 0:
         raise LifecycleProjectionError("no_positive_exit_fills")
     if exited_qty > qty:
         raise LifecycleProjectionError(f"exit_overfill:{exited_qty}>{qty}")
 
-    proceeds = sum(fill_qty * fill_price * 100.0 for _, fill_qty, fill_price in normalized)
+    proceeds = sum(
+        fill_qty * fill_price * 100.0
+        for _, _, fill_qty, fill_price in normalized
+    )
     cost = entry_price * exited_qty * 100.0
     realized_pnl = proceeds - cost
     remaining_qty = qty - exited_qty
@@ -138,7 +165,7 @@ def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> L
         weighted_exit_price=round(proceeds / (exited_qty * 100.0), 6),
         realized_pnl=round(realized_pnl, 2),
         realized_pnl_pct=round((realized_pnl / cost * 100.0) if cost > 0 else 0.0, 4),
-        final_fill_ts=normalized[-1][0],
+        final_fill_ts=normalized[-1][1],
         closed=remaining_qty == 0,
     )
 
@@ -249,7 +276,8 @@ def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
     current_local_order_id = str(order.get("local_order_id") or "").strip()
     entry_ts = position.get("entry_ts") or position.get("created_at")
     rows = c.execute(
-        "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status, meta "
+        "SELECT local_order_id, broker_order_id, position_id, execution_mode, "
+        "filled_qty, fill_price, filled_ts, status, meta "
         "FROM orders WHERE client_id=%s AND kind='EXIT' AND UPPER(contract)=UPPER(%s) "
         "AND status IN %s AND COALESCE(filled_qty,0)>0 AND fill_price IS NOT NULL "
         "AND (%s IS NULL OR filled_ts >= %s OR (%s <> '' AND local_order_id=%s)) "
@@ -743,15 +771,17 @@ def _run_reconciliation_attempt(
                         raise LifecycleProjectionError("EXIT_FILL_TIMESTAMP_UNPROVEN")
             projection = project_position_from_exit_fills(position, fills)
             entry_order = _load_entry_order(c, position, order)
+            mode = _resolve_execution_mode(
+                ("position", position),
+                ("entry_order", entry_order),
+                ("exit_order", order),
+                *[("exit_fill", fill) for fill in fills],
+            )
             entry_broker_id = str(entry_order.get("broker_order_id") or position.get("broker_order_id") or "").strip()
             exit_ids = [str(row.get("broker_order_id") or "").strip() for row in fills]
             all_exit_broker_backed = bool(fills) and all(exit_ids)
             exit_ids = [value for value in exit_ids if value]
             final_exit_broker_id = exit_ids[-1] if exit_ids else str(order.get("broker_order_id") or "").strip()
-            mode = str(
-                position.get("execution_mode") or entry_order.get("execution_mode")
-                or order.get("execution_mode") or "unknown"
-            ).strip().lower()
             signal_id = str(
                 position.get("signal_id") or entry_order.get("signal_id")
                 or order.get("signal_id") or ""

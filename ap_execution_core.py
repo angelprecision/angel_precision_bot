@@ -38,6 +38,7 @@ from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.utils                import (
     BROKER_FILL_TIMESTAMP_SOURCE,
+    extract_broker_fill_timestamp_with_source,
     now_utc_iso,
     parse_aware_utc_timestamp,
 )
@@ -51,15 +52,6 @@ except ImportError:
 log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
-_BROKER_FILL_TIMESTAMP_KEYS = (
-    "filled_ts",
-    "filled_at",
-    "fill_ts",
-    "last_fill_date",
-    "transaction_date",
-)
-
-
 def _normalize_execution_mode(value) -> str | None:
     mode = str(value or "").strip().lower()
     return mode if mode in _VALID_EXECUTION_MODES else None
@@ -82,14 +74,8 @@ def _extract_explicit_broker_fill_timestamp(
     raw: Mapping,
 ) -> tuple[str | None, str | None]:
     """Return only an explicit aware broker fill timestamp and its source."""
-    for key in _BROKER_FILL_TIMESTAMP_KEYS:
-        if key not in raw:
-            continue
-        parsed = parse_aware_utc_timestamp(raw.get(key))
-        if parsed is None:
-            return None, None
-        return parsed.isoformat(), BROKER_FILL_TIMESTAMP_SOURCE
-    return None, None
+    parsed, source = extract_broker_fill_timestamp_with_source(raw)
+    return (parsed.isoformat(), source) if parsed is not None else (None, None)
 
 
 def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_flag) -> str | None:

@@ -50,6 +50,7 @@ from ap.utils import (
     now_utc_iso,
     json_dumps,
     json_loads,
+    extract_broker_fill_timestamp_with_source,
     parse_aware_utc_timestamp,
 )
 from ap.logger import get_logger
@@ -125,24 +126,10 @@ def _strict_nonnegative_whole_number(value) -> int | None:
     return int(parsed)
 
 
-_BROKER_FILL_TIMESTAMP_KEYS = (
-    "filled_ts",
-    "filled_at",
-    "fill_ts",
-    "last_fill_date",
-    "transaction_date",
-)
-
-
 def _broker_fill_timestamp_with_source(raw: dict) -> tuple[str | None, str | None]:
     """Return only an explicit aware broker fill time and its producer token."""
-    for key in _BROKER_FILL_TIMESTAMP_KEYS:
-        if key in raw:
-            parsed = parse_aware_utc_timestamp(raw.get(key))
-            if parsed is None:
-                return None, None
-            return parsed.isoformat(), BROKER_FILL_TIMESTAMP_SOURCE
-    return None, None
+    parsed, source = extract_broker_fill_timestamp_with_source(raw)
+    return (parsed.isoformat(), source) if parsed is not None else (None, None)
 
 
 def _broker_fill_timestamp(raw: dict, order: dict) -> str | None:

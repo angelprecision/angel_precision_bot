@@ -88,6 +88,7 @@ from typing import Optional
 
 from ap.utils import (
     BROKER_FILL_TIMESTAMP_SOURCE,
+    extract_broker_fill_timestamp_with_source,
     has_broker_fill_timestamp_provenance,
 )
 
@@ -753,20 +754,7 @@ class APBrokerReconciler:
     ) -> tuple[Optional[datetime], Optional[str]]:
         """Read explicit broker fill time and its producer token only."""
         del order  # Durable ``orders.filled_ts`` is not broker provenance.
-        for key in (
-            "filled_ts",
-            "filled_at",
-            "fill_ts",
-            "last_fill_date",
-            "transaction_date",
-        ):
-            if key in broker_raw:
-                parsed = _parse_reconciler_timestamp(broker_raw.get(key))
-                return (
-                    parsed,
-                    BROKER_FILL_TIMESTAMP_SOURCE if parsed is not None else None,
-                )
-        return None, None
+        return extract_broker_fill_timestamp_with_source(broker_raw)
 
     def _extract_broker_fill_timestamp(
         self, broker_raw: dict, order: dict | None = None
@@ -3787,7 +3775,8 @@ class APBrokerReconciler:
                 with conn() as c:
                     # Re-fetch the row under lock so we use the freshest remaining qty.
                     c.execute(
-                        "SELECT quantity_remaining, qty, "
+                        "SELECT contract, execution_mode, status, "
+                        "quantity_remaining, qty, "
                         "pending_exit_local_order_id, pending_exit_broker_order_id "
                         "FROM positions "
                         "WHERE id = %s AND client_id = %s FOR UPDATE",
@@ -3798,6 +3787,31 @@ class APBrokerReconciler:
                         return None
 
                     _row = dict(row)
+                    # Production rows always contain these selected columns.
+                    # Keep lightweight legacy test doubles/older adapters
+                    # compatible when they omit the newly rechecked fields;
+                    # when present, every field is mandatory and exact.
+                    if all(
+                        key in _row
+                        for key in ("contract", "execution_mode", "status")
+                    ):
+                        locked_contract = self._norm_contract(_row.get("contract"))
+                        locked_mode = _normalize_execution_mode(
+                            _row.get("execution_mode")
+                        )
+                        locked_status = str(_row.get("status") or "").strip().upper()
+                        if (
+                            not locked_contract
+                            or locked_contract != evidence_contract
+                            or locked_mode is None
+                            or locked_mode != evidence_mode
+                            or locked_status not in set(DB_OPEN_POSITION_STATUSES)
+                        ):
+                            return {
+                                "blocked_reason": "RECONCILER_POSITION_IDENTITY_CHANGED",
+                                "broker_order_id": evidence_broker_order_id,
+                                "local_order_id": evidence_local_order_id,
+                            }
                     locked_local_order_id = str(
                         _row.get("pending_exit_local_order_id") or ""
                     ).strip()
@@ -3973,7 +3987,7 @@ class APBrokerReconciler:
                         """,
                         (
                             final_status,
-                            _now,
+                            evidence_filled_ts.isoformat(),
                             exit_px,
                             _pnl_closed,
                             _pnl_pct,

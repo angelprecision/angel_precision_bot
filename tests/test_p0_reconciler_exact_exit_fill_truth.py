@@ -969,7 +969,7 @@ def test_autonomous_recovery_holds_without_exact_qty_and_timestamp(
         "avg_fill_price": 4.79,
     }
     if raw_timestamp is not None:
-        raw["transaction_date"] = raw_timestamp
+        raw["filled_ts"] = raw_timestamp
 
     class _Broker:
         def get_order(self, _broker_id):
@@ -1003,7 +1003,7 @@ def test_autonomous_recovery_exact_fill_forwards_broker_timestamp():
                 "status": "filled",
                 "exec_quantity": 2,
                 "avg_fill_price": 4.79,
-                "transaction_date": fill_ts.isoformat(),
+                "filled_ts": fill_ts.isoformat(),
             }
 
     engine = MagicMock()
@@ -1011,6 +1011,36 @@ def test_autonomous_recovery_exact_fill_forwards_broker_timestamp():
 
     assert action.action == "MARKED_CLOSED"
     assert engine.mark_position_closed.call_args.kwargs["broker_exit_fill_ts"] == fill_ts
+
+
+def test_autonomous_recovery_transaction_date_only_holds_without_close():
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        option_symbol=TARGET_CONTRACT,
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+        pending_exit_qty=2,
+        quantity_remaining=2,
+        opened_at=datetime(2026, 8, 10, 18, 0, tzinfo=timezone.utc),
+    )
+
+    class _Broker:
+        def get_order(self, _broker_id):
+            return {
+                "status": "filled",
+                "exec_quantity": 2,
+                "avg_fill_price": 4.79,
+                "transaction_date": "2026-08-10T19:00:00+00:00",
+            }
+
+    engine = MagicMock()
+    action = recover_exit_position(pos, broker=_Broker(), exit_engine=engine)
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_broker_filled_timestamp_unproven"
+    engine.mark_position_closed.assert_not_called()
 
 
 def test_force_reconcile_filled_undercoverage_holds_without_close():
@@ -1030,7 +1060,7 @@ def test_force_reconcile_filled_undercoverage_holds_without_close():
         "status": "filled",
         "exec_quantity": 1,
         "avg_fill_price": 4.79,
-        "transaction_date": "2026-08-10T19:00:00+00:00",
+        "filled_ts": "2026-08-10T19:00:00+00:00",
     }
     engine._emit_exit_event = MagicMock()
     engine.mark_position_closed = MagicMock()
@@ -1042,6 +1072,38 @@ def test_force_reconcile_filled_undercoverage_holds_without_close():
     engine.note_partial_exit_fill.assert_not_called()
     assert any(
         call.kwargs.get("reason_code") == "FORCE_RECONCILE_FILL_COVERAGE_MISMATCH"
+        for call in engine._emit_exit_event.call_args_list
+    )
+
+
+def test_force_reconcile_partial_fill_does_not_mutate_in_memory_only():
+    from ap_exit_engine import APExitEngine
+
+    pos = SimpleNamespace(
+        position_id=POSITION_ID,
+        ticker="C",
+        pending_exit_local_order_id="exit-local-1",
+        pending_exit_broker_order_id="TR-195",
+        quantity_remaining=2,
+        opened_at=datetime(2026, 8, 10, 18, 0, tzinfo=timezone.utc),
+    )
+    engine = APExitEngine.__new__(APExitEngine)
+    engine.broker = MagicMock()
+    engine.broker.get_order.return_value = {
+        "status": "partially_filled",
+        "exec_quantity": 1,
+        "avg_fill_price": 4.79,
+        "filled_ts": "2026-08-10T19:00:00+00:00",
+    }
+    engine._emit_exit_event = MagicMock()
+    engine.note_partial_exit_fill = MagicMock()
+
+    engine._attempt_quarantine_force_reconcile(pos, 10)
+
+    engine.note_partial_exit_fill.assert_not_called()
+    assert any(
+        call.kwargs.get("reason_code")
+        == "FORCE_RECONCILE_PARTIAL_FILL_HELD_DURABLE_RECONCILIATION_REQUIRED"
         for call in engine._emit_exit_event.call_args_list
     )
 
@@ -1777,6 +1839,72 @@ def test_close_rechecks_remaining_quantity_before_mutating_positions(monkeypatch
     assert summary["positions_alerted"] == 1
     assert any(
         "position_remaining_changed_before_close" in call.args[0]
+        for call in rec._alert.call_args_list
+    )
+
+
+def test_close_holds_when_locked_position_mode_changes_before_mutation(monkeypatch):
+    rec = _reconciler(mode=MODE_LIVE)
+    rec._alert = MagicMock()
+    summary = _empty_summary(CLIENT)
+    updates: list[tuple] = []
+    evidence = _exit_row(mode=MODE_LIVE, filled_qty=2, fill_price=4.79)
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if "FROM ORDERS" in compact:
+                self._row = dict(evidence)
+            elif "FOR UPDATE" in compact:
+                self._row = {
+                    "contract": TARGET_CONTRACT,
+                    "execution_mode": MODE_PAPER,
+                    "status": "OPEN",
+                    "quantity_remaining": 2,
+                    "qty": 2,
+                    "pending_exit_local_order_id": "exit-local-1",
+                    "pending_exit_broker_order_id": "TR-195",
+                }
+            elif compact.startswith("UPDATE POSITIONS"):
+                updates.append((sql, params))
+
+        def fetchone(self):
+            return getattr(self, "_row", None)
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(db_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+
+    rec._execute_reconciler_close(
+        pos=_position(mode=MODE_LIVE),
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=2,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+        summary=summary,
+        exact_exit_fill_qty=2,
+        exact_exit_evidence=evidence,
+    )
+
+    assert updates == []
+    assert any(
+        "RECONCILER_POSITION_IDENTITY_CHANGED" in call.args[0]
         for call in rec._alert.call_args_list
     )
 
@@ -3291,7 +3419,7 @@ def test_exit_intent_recovery_holds_filled_remote_without_explicit_timestamp():
 
 def test_exit_intent_recovery_checks_filled_transition_result_and_source():
     core, osm, local_order_id = _execution_core_exit_intent_fixture(
-        remote_updates={"transaction_date": "2026-08-10T19:00:00+00:00"},
+        remote_updates={"filled_ts": "2026-08-10T19:00:00+00:00"},
     )
     osm.transition.side_effect = [True, False]
 

@@ -49,6 +49,7 @@ from typing import Any
 from ap.utils import (
     BROKER_FILL_TIMESTAMP_SOURCE,
     BROKER_FILL_TIMESTAMP_SOURCE_KEY,
+    extract_broker_fill_timestamp_with_source,
     has_broker_fill_timestamp_provenance,
     parse_aware_utc_timestamp,
 )
@@ -359,16 +360,8 @@ def order_created_at(order: dict) -> datetime | None:
 
 def order_filled_at(order: dict) -> datetime | None:
     # Order lifecycle timestamps do not prove execution time.
-    for key in (
-        "last_fill_date",
-        "filled_at",
-        "filled_ts",
-        "transaction_date",
-    ):
-        parsed = parse_timestamp(order.get(key))
-        if parsed is not None:
-            return parsed
-    return None
+    parsed, _source = extract_broker_fill_timestamp_with_source(order)
+    return parsed
 
 
 def normalize_broker_orders(raw_orders: Any) -> list[dict]:

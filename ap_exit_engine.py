@@ -73,6 +73,7 @@ from ap.exit_thresholds import (
 )
 from ap.utils import (
     BROKER_FILL_TIMESTAMP_SOURCE,
+    extract_broker_fill_timestamp_with_source,
     parse_aware_utc_timestamp,
 )
 
@@ -6469,20 +6470,15 @@ class APExitEngine:
                 _fill_price = _positive_or_none(_v)
                 break
 
-        _fill_ts = None
-        for _tk in (
-            "filled_ts",
-            "filled_at",
-            "fill_ts",
-            "last_fill_date",
-            "transaction_date",
-        ):
-            if _tk in broker_raw:
-                _fill_ts = parse_aware_utc_timestamp(broker_raw.get(_tk))
-                break
+        _fill_ts, _fill_ts_source = extract_broker_fill_timestamp_with_source(
+            broker_raw
+        )
 
         if broker_status in _broker_filled and (
-            _filled_qty is None or _fill_price is None or _fill_ts is None
+            _filled_qty is None
+            or _fill_price is None
+            or _fill_ts is None
+            or _fill_ts_source != BROKER_FILL_TIMESTAMP_SOURCE
         ):
             log.critical(
                 "[%s] QUARANTINE_FORCE_RECONCILE_FILL_TRUTH_INVALID | pos=%s "
@@ -6618,70 +6614,33 @@ class APExitEngine:
             )
 
         elif broker_status == "partially_filled":
-            # Partial fill confirmed — do NOT hard-close. Apply the confirmed
-            # cumulative tranche via note_partial_exit_fill() and let
-            # quantity_remaining drive closure. Only close if the fill exhausts
-            # the remaining position, verified by re-reading state after the write.
-            #
-            # Caution: _filled_qty is treated as cumulative here, consistent with
-            # note_partial_exit_fill()'s per-order watermark model. If the broker
-            # returns incremental quantities on get_order(), this would misapply;
-            # but the field names scanned above are all cumulative-named, which is
-            # the safest available assumption.
+            # This helper has no atomic OSM/order persistence boundary. Do not
+            # advance only the in-memory watermark: a process death here would
+            # lose the partial fill and permit replay or suppression on restart.
+            # The durable fill-monitor/reconciler path must record this evidence.
             log.critical(
-                "[%s] QUARANTINE_FORCE_RECONCILE_PARTIAL_FILL | pos=%s broker=%s | "
-                "broker partial fill confirmed — applying tranche, not hard-closing | "
-                "filled_qty=%s fill_price=%s",
+                "[%s] QUARANTINE_FORCE_RECONCILE_PARTIAL_FILL_HELD | pos=%s broker=%s | "
+                "durable reconciler required | filled_qty=%s fill_price=%s",
                 ticker, position_id or "?", broker_oid, _filled_qty, _fill_price,
             )
             self._emit_exit_event(
                 pos,
                 decision="ALERT",
-                reason_code="FORCE_RECONCILE_PARTIAL_FILL_CONFIRMED",
-                explanation=f"Forced reconcile confirmed partial fill; applying tranche via note_partial_exit_fill.",
+                reason_code="FORCE_RECONCILE_PARTIAL_FILL_HELD_DURABLE_RECONCILIATION_REQUIRED",
+                explanation=(
+                    "Partial broker fill is held until the durable fill-monitor "
+                    "or reconciler path records exact cumulative evidence."
+                ),
                 stage="exit_reconciliation",
                 extra_inputs={
                     "broker_order_id": broker_oid,
                     "broker_status": broker_status,
                     "filled_qty": _filled_qty,
                     "fill_price": _fill_price,
+                    "fill_ts": _fill_ts.isoformat() if _fill_ts else None,
                     "quarantine_age_sec": quarantine_age_sec,
                 },
             )
-            if _filled_qty and _filled_qty > 0:
-                self.note_partial_exit_fill(
-                    position_id,
-                    qty_filled=_filled_qty,
-                    fill_price=_fill_price,
-                    broker_order_id=broker_oid,
-                    local_order_id=pos.pending_exit_local_order_id,
-                    cumulative_filled=_filled_qty,
-                )
-                # Re-read state after the write — only close if the tranche
-                # exhausted the remaining position. get_position() uses the O(1)
-                # dict index so this always reflects post-fill truth, never the
-                # snapshot captured before note_partial_exit_fill() ran.
-               
-            else:
-                # No reliable qty — the broker returned partially_filled but no
-                # usable quantity. Emit alert with full context so dashboards can
-                # distinguish this from unknown-status and no-order-id cases, then
-                # defer to the reconciler which has the fuzzy-match logic to resolve.
-                self._emit_exit_event(
-                    pos,
-                    decision="ALERT",
-                    reason_code="FORCE_RECONCILE_PARTIAL_FILL_QTY_UNKNOWN",
-                    explanation=(
-                        "Partial fill confirmed but qty unknown — reconciler must resolve. "
-                        "Cannot safely apply delta without cumulative quantity."
-                    ),
-                    stage="exit_reconciliation",
-                    extra_inputs={
-                        "broker_order_id": broker_oid,
-                        "broker_status": broker_status,
-                        "quarantine_age_sec": quarantine_age_sec,
-                    },
-                )
 
         elif broker_status in _broker_terminal:
             # Broker confirms terminal (canceled/rejected/expired) — clear in-flight

@@ -4381,9 +4381,9 @@ def admin_flatten_all():
 @_require_admin
 def admin_force_exit_position(position_id: str):
     """
-    Force-close a specific open position from the admin dashboard.
-    Submits IMMEDIATE exit to the exit engine. Also writes proof_trades
-    so the close appears in the ledger.
+    Request an immediate broker EXIT for a specific open position.
+    The normal exit callback stages proof data; the broker-confirmed fill
+    callback is the only path that finalizes proof_trades.
     """
     data      = request.get_json(silent=True) or {}
     client_id = data.get("client_id", "").strip()
@@ -4436,15 +4436,22 @@ def admin_force_exit_position(position_id: str):
             row = dict(row)
             entry_px = float(row.get("avg_fill") or row.get("entry_price") or 0)
             pm = APPositionManager(target_runner.email)
-            pm.close_position_from_exit_fill(
+            closed = pm.close_position_from_exit_fill(
                 position_id=position_id, exit_price=entry_px,
                 filled_qty=int(row.get("qty") or 1),
                 close_source="admin_force_exit", close_confidence="LOW",
                 exit_reason=reason,
             )
+            if not closed:
+                return jsonify({
+                    "ok": False,
+                    "error": "admin_force_exit_held",
+                    "reason": "confirmed_broker_exit_fill_required",
+                    "position_id": position_id,
+                }), 409
             return jsonify({"ok": True, "position_id": position_id,
                             "method": "position_manager_direct",
-                            "warning": "Closed at entry price — update exit_option_price in proof_trades manually."})
+                            "warning": "Closed from a confirmed broker EXIT fill."})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -4461,72 +4468,15 @@ def admin_force_exit_position(position_id: str):
         )
         submitted = ee._submit_exit_decision(pos, decision, kill_active=True)
 
-        # ── PROOF STAGING: admin force exit bypasses _on_position_close ────────
-        # The normal exit path (exit engine → _on_position_close) sets
-        # pos._proof_staged so _finalize_proof can write proof_trades on fill
-        # confirmation. Admin force exit calls _submit_exit_decision directly,
-        # skipping that callback chain. Without this block, the trade closes
-        # but never appears in proof_trades.
-        #
-        # CODEX PATCH: proof is ONLY written when submitted=True.
-        # If _submit_exit_decision returns False (exit_in_flight block, kill-switch
-        # guard, broker reject, or any _can_submit_exit failure) the position is
-        # still open — writing proof here would create a fake closed trade.
+        # _submit_exit_decision invokes the normal on_exit callback, which
+        # stages proof data on the position. Submission is not execution:
+        # proof_trades must be finalized only by on_exit_fill_confirmed after
+        # exact broker fill identity, quantity, price, and timestamp are known.
         if not submitted:
             admin_log.warning(
                 "FORCE_EXIT_PROOF_SKIPPED pos=%s ticker=%s reason=submission_failed_or_not_accepted",
                 position_id, getattr(pos, "ticker", "?"),
             )
-        else:
-            try:
-                _proof_core = getattr(target_runner, "core", None)
-                _proof_obj  = getattr(_proof_core, "proof", None) if _proof_core else None
-                if _proof_obj and hasattr(_proof_obj, "log_trade"):
-                    _ep      = float(getattr(pos, "entry_price",         0) or 0)
-                    _xp      = float(getattr(pos, "current_bid",         0) or
-                                     getattr(pos, "current_option_price", 0) or 0)
-                    _ue      = float(getattr(pos, "underlying_entry",    0) or 0)
-                    _ux      = float(getattr(pos, "current_underlying",  0) or 0)
-                    _qty     = int(getattr(pos, "quantity_remaining",    0) or
-                                   getattr(pos, "quantity",              1))
-                    _sig     = getattr(pos, "signal", {}) or {}
-                    _opt_pnl = round(((_xp - _ep) / _ep * 100) if _ep > 0 and _xp > 0 else 0, 2)
-                    _u_pnl   = round(((_ux - _ue) / _ue * 100) if _ue > 0 and _ux > 0 else 0, 3)
-                    _bb      = float(os.getenv("BREAKEVEN_BAND_PCT", "-2.0"))
-                    _win     = _opt_pnl >= _bb
-                    _proof_obj.log_trade(
-                        ticker             = getattr(pos, "ticker",    "?"),
-                        pattern            = _sig.get("pattern",       ""),
-                        side               = getattr(pos, "side",       ""),
-                        timeframe          = _sig.get("timeframe",     "1d"),
-                        score              = float(_sig.get("score",    0) or 0),
-                        tier               = _sig.get("tier",          ""),
-                        context_score      = float((_sig.get("score_breakdown") or {}).get("real_time_ctx", 0) or 0),
-                        setup_status       = "admin_force_exit",
-                        entry_trigger      = _ue,
-                        entry_option_price = _ep,
-                        exit_option_price  = _xp,
-                        underlying_entry   = _ue,
-                        underlying_exit    = _ux,
-                        contracts          = _qty,
-                        exit_reason        = f"ADMIN FORCE EXIT — {reason}",
-                        option_pnl_pct     = _opt_pnl,
-                        underlying_pnl_pct = _u_pnl,
-                        win                = _win,
-                        spread_pct         = float(_sig.get("spread_pct", 0) or 0),
-                        opened_at          = getattr(pos, "opened_at", None),
-                        position_id        = str(getattr(pos, "position_id", "") or ""),
-                        local_order_id     = str(getattr(pos, "local_order_id", "") or ""),
-                    )
-                    admin_log.info(
-                        "FORCE_EXIT_PROOF_LOGGED pos=%s ticker=%s pnl=%.1f%% win=%s",
-                        position_id, getattr(pos, "ticker", "?"), _opt_pnl, _win,
-                    )
-            except Exception as _proof_exc:
-                admin_log.error(
-                    "FORCE_EXIT_PROOF_FAILED pos=%s err=%s — trade closed but not in proof_trades",
-                    position_id, _proof_exc,
-                )
 
         return jsonify({
             "ok": True, "position_id": position_id,

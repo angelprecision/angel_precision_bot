@@ -98,6 +98,9 @@ class BrokerAdapter:
           - status (any form, fill_monitor normalizes)
           - exec_quantity or filled_quantity or quantity
           - avg_fill_price or price
+          - filled_ts / broker_fill_timestamp only when the adapter has an
+            actual execution-time authority; lifecycle update timestamps such
+            as ``transaction_date`` must remain non-authoritative
         """
         raise NotImplementedError
 
@@ -243,4 +246,3 @@ class SimBroker(BrokerAdapter):
             error=None,
             raw=raw,
         )
-

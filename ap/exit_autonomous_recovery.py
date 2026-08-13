@@ -25,7 +25,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from ap.utils import BROKER_FILL_TIMESTAMP_SOURCE, parse_aware_utc_timestamp
+from ap.utils import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    extract_broker_fill_timestamp_with_source,
+    parse_aware_utc_timestamp,
+)
 
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
@@ -99,21 +103,10 @@ def _filled_qty(raw: dict) -> int:
     return 0
 
 
-_BROKER_FILL_TIMESTAMP_KEYS = (
-    "filled_ts",
-    "filled_at",
-    "fill_ts",
-    "last_fill_date",
-    "transaction_date",
-)
-
-
 def _broker_fill_timestamp(raw: dict) -> datetime | None:
     """Return explicit broker fill time; never manufacture recovery time."""
-    for key in _BROKER_FILL_TIMESTAMP_KEYS:
-        if key in raw:
-            return parse_aware_utc_timestamp(raw.get(key))
-    return None
+    parsed, _source = extract_broker_fill_timestamp_with_source(raw)
+    return parsed
 
 
 def _position_value(pos: Any, name: str, default: Any = None) -> Any:

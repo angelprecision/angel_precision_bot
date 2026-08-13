@@ -1,11 +1,25 @@
 import json
 from datetime import datetime, timezone
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 
 BROKER_FILL_TIMESTAMP_SOURCE = "broker_response"
 BROKER_FILL_TIMESTAMP_SOURCE_KEY = "exit_fill_timestamp_source"
+
+# These are adapter-normalized execution-time fields only.  Provider lifecycle
+# timestamps such as Tradier's ``transaction_date`` are deliberately excluded:
+# an order update is not an execution event and must never authorize EXIT P&L
+# or proof mutation.
+BROKER_FILL_TIMESTAMP_KEYS = (
+    "broker_fill_timestamp",
+    "broker_execution_timestamp",
+    "filled_ts",
+    "filled_at",
+    "fill_ts",
+    "last_fill_date",
+)
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -40,6 +54,34 @@ def parse_aware_utc_timestamp(value):
         return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError, OverflowError, OSError):
         return None
+
+
+def extract_broker_fill_timestamp_with_source(
+    payload: Mapping[str, Any] | None,
+) -> tuple[datetime | None, str | None]:
+    """Resolve one unambiguous, adapter-normalized broker fill timestamp.
+
+    Every supplied candidate is validated.  A malformed candidate or two
+    different candidate instants are ambiguous external authority and return
+    ``(None, None)`` so callers hold before any lifecycle mutation.
+    ``transaction_date`` is intentionally not a candidate; it is an order
+    lifecycle/update timestamp for Tradier, not exact execution time.
+    """
+    if not isinstance(payload, Mapping):
+        return None, None
+
+    candidates: list[datetime] = []
+    for key in BROKER_FILL_TIMESTAMP_KEYS:
+        if key not in payload:
+            continue
+        parsed = parse_aware_utc_timestamp(payload.get(key))
+        if parsed is None:
+            return None, None
+        candidates.append(parsed)
+
+    if not candidates or any(value != candidates[0] for value in candidates[1:]):
+        return None, None
+    return candidates[0], BROKER_FILL_TIMESTAMP_SOURCE
 
 
 def broker_fill_timestamp_source(meta):

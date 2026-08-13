@@ -673,7 +673,7 @@ def test_fill_monitor_orcl_replay_adopts_then_uses_canonical_fill_path(
             "exec_quantity": 4,
             "avg_fill_price": 1.25,
             "quantity": 4,
-            "transaction_date": "2026-08-10T19:00:00+00:00",
+            "filled_ts": "2026-08-10T19:00:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -728,7 +728,7 @@ def test_fill_monitor_recovery_uses_existing_status_reducer(
             "exec_quantity": raw_qty,
             "avg_fill_price": 1.25,
             "quantity": 4,
-            "transaction_date": "2026-08-10T19:00:00+00:00",
+            "filled_ts": "2026-08-10T19:00:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -929,7 +929,7 @@ def test_orcl_replay_uses_real_osm_transition_and_applies_close_once(
             "exec_quantity": 4,
             "avg_fill_price": 1.25,
             "quantity": 4,
-            "transaction_date": "2026-08-10T19:00:00+00:00",
+            "filled_ts": "2026-08-10T19:00:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -981,7 +981,7 @@ def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_positio
             "exec_quantity": 3,
             "avg_fill_price": 1.25,
             "quantity": 3,
-            "transaction_date": "2026-08-10T19:00:00+00:00",
+            "filled_ts": "2026-08-10T19:00:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -1326,7 +1326,7 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                     "exec_quantity": 4,
                     "avg_fill_price": 1.25,
                     "quantity": 4,
-                    "transaction_date": "2026-08-08T13:31:00Z",
+                    "filled_ts": "2026-08-08T13:31:00Z",
                 }
 
             def submit_order(self, *args, **kwargs):

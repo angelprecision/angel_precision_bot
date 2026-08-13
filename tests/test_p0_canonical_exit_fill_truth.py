@@ -23,6 +23,7 @@ from ap.exit_fill_truth_guard import (
     _update_canonical_proof_row,
     _reconciliation_marker_retryable,
     _reconcile_exit_fill,
+    _resolve_execution_mode,
     _run_reconciliation_attempt,
     official_live_eligibility,
     project_position_from_exit_fills,
@@ -88,6 +89,35 @@ def test_partial_googl_exit_does_not_falsely_close_position() -> None:
     assert projection.closed is False
     assert projection.realized_pnl == pytest.approx(290.0)
     assert projection.realized_pnl_pct == pytest.approx(52.7273)
+
+
+def test_projection_orders_fill_instants_in_utc_not_raw_text_order() -> None:
+    projection = project_position_from_exit_fills(
+        _position(qty=2, entry=1.0),
+        [
+            {"filled_ts": "2026-07-16T23:00:00+00:00", "filled_qty": 1, "fill_price": 1.2},
+            {"filled_ts": "2026-07-16T19:30:00-04:00", "filled_qty": 1, "fill_price": 1.3},
+        ],
+    )
+
+    assert projection.final_fill_ts == "2026-07-16T19:30:00-04:00"
+
+
+@pytest.mark.parametrize("bad_qty", [True, 1.5, float("nan"), float("inf")])
+def test_projection_rejects_non_integral_position_quantity(bad_qty) -> None:
+    with pytest.raises(LifecycleProjectionError, match="position_qty_missing_or_invalid"):
+        project_position_from_exit_fills(
+            {"qty": bad_qty, "avg_fill": 1.0},
+            [{"filled_ts": "2026-07-16T18:40:51Z", "filled_qty": 1, "fill_price": 1.2}],
+        )
+
+
+def test_projection_mode_conflict_is_fail_closed() -> None:
+    with pytest.raises(LifecycleProjectionError, match="execution_mode_conflict"):
+        _resolve_execution_mode(
+            ("position", {"execution_mode": "live"}),
+            ("entry_order", {"execution_mode": "paper"}),
+        )
 
 
 def test_exit_overfill_is_quarantined_not_clamped() -> None:

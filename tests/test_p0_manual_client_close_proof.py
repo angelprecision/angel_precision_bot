@@ -150,7 +150,7 @@ def _filled_exit(**overrides):
         "quantity": 2,
         "exec_quantity": 2,
         "avg_fill_price": 0.75,
-        "transaction_date": "2026-07-21T15:57:39.880419Z",
+        "filled_ts": "2026-07-21T15:57:39.880419Z",
     }
     row.update(overrides)
     return row
@@ -242,7 +242,7 @@ def test_manual_close_adopts_exact_fill_then_calls_canonical_finalizer(monkeypat
 
 def test_manual_close_rejects_naive_external_fill_timestamp(monkeypatch):
     evidence, reason = manual_mod.select_external_close_fills(
-        orders=[_filled_exit(transaction_date="2026-07-21T15:57:39")],
+        orders=[_filled_exit(filled_ts="2026-07-21T15:57:39")],
         position=_position(),
         bot_exit_order_ids=set(),
         adopted_fills=[],
@@ -263,6 +263,21 @@ def test_manual_close_rejects_order_update_timestamp_as_fill_time():
         "exec_quantity": 2,
         "avg_fill_price": 0.75,
         "update_date": "2026-07-21T15:57:39+00:00",
+    }
+
+    assert manual_mod._normalize_fill(raw) is None
+
+
+def test_manual_close_rejects_transaction_date_as_fill_time():
+    raw = {
+        "id": "TRANSACTION-DATE-ONLY",
+        "status": "filled",
+        "side": "sell_to_close",
+        "symbol": CONTRACT,
+        "quantity": 2,
+        "exec_quantity": 2,
+        "avg_fill_price": 0.75,
+        "transaction_date": "2026-07-21T15:57:39+00:00",
     }
 
     assert manual_mod._normalize_fill(raw) is None
@@ -360,7 +375,7 @@ def test_stale_same_contract_fill_before_entry_is_rejected(monkeypatch):
     broker = _Broker(
         orders=[
             _filled_exit(
-                transaction_date="2026-07-21T15:20:00Z",
+                filled_ts="2026-07-21T15:20:00Z",
                 avg_fill_price=9.99,
             )
         ]
@@ -383,14 +398,14 @@ def test_multiple_manual_fills_use_quantity_weighted_broker_price(monkeypatch):
                 exec_quantity=1,
                 quantity=1,
                 avg_fill_price=0.74,
-                transaction_date="2026-07-21T15:56:00Z",
+                filled_ts="2026-07-21T15:56:00Z",
             ),
             _filled_exit(
                 id="EXIT-2",
                 exec_quantity=1,
                 quantity=1,
                 avg_fill_price=0.76,
-                transaction_date="2026-07-21T15:57:39Z",
+                filled_ts="2026-07-21T15:57:39Z",
             ),
         ]
     )
@@ -475,14 +490,14 @@ def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_
                 exec_quantity=1,
                 quantity=1,
                 avg_fill_price=0.74,
-                transaction_date="2026-07-21T15:56:00Z",
+                filled_ts="2026-07-21T15:56:00Z",
             ),
             _filled_exit(
                 id="EXIT-2",
                 exec_quantity=1,
                 quantity=1,
                 avg_fill_price=0.76,
-                transaction_date="2026-07-21T15:57:39Z",
+                filled_ts="2026-07-21T15:57:39Z",
             ),
         ]
     )
