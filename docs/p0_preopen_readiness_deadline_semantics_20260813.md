@@ -8,7 +8,21 @@ This bug predates PRs #429, #434, and #445 and existed in the Aug 12 known-flowi
 
 ## Required change
 
-Treat `watching_orphans` as diagnostic/warning information only. Do not add `watching_rows_missing_orders_recommend_new_rescue` to `errors` solely because these rows exist.
+Replace the blanket `watching_orphans` warning with a read-only relevance boundary:
+
+- A timezone-aware WATCHING row strictly older than the previous NYSE session,
+  with no canonical ENTRY/order/position owner, is historical diagnostic debt.
+  It remains visible as a warning and is never replayed.
+- A current-session unresolved row is a BLOCK/HOLD.
+- A prior-session or weekend/holiday-gap row is a BLOCK/HOLD unless exact
+  canonical ownership is proven by the matching ENTRY order, broker/submission/
+  fill evidence, or position.
+- Recent missing mode evidence and any conflicting/invalid mode evidence are a
+  BLOCK/HOLD. Explicit PAPER evidence never authorizes LIVE readiness.
+
+The classifier uses ET session dates and the canonical NYSE holiday calendar;
+missing, naive, malformed, or future timestamps are ambiguous and therefore
+blocking.
 
 Preserve the row/count detail in readiness output for observability.
 
@@ -46,14 +60,15 @@ Tests:
 
 ## Acceptance tests
 
-1. 133 historical WATCHING rows without ENTRY orders, with every real readiness dependency healthy -> `status == OK`; WATCHING rows remain present in details/warnings.
-2. One LIVE `PENDING_TRIGGER` order without watcher ownership -> `status == BLOCKED`.
-3. 133 historical WATCHING rows plus one unowned LIVE `PENDING_TRIGGER` -> BLOCKED due to the unowned pending trigger only.
-4. Zero WATCHING rows and otherwise healthy state -> `status == OK`.
-5. Repeated startup/readiness execution is idempotent and performs no lifecycle mutation.
-6. PAPER behavior remains separately classified and is not promoted into LIVE authority.
-7. Test doubles assert zero broker ENTRY submit/cancel calls.
-8. Test doubles assert zero mutation to orders, positions, proof_trades, or trade_queue lifecycle state from this classification change.
+1. 132 historical WATCHING rows plus one current-session ambiguous row -> LIVE `status == BLOCKED`; only the 132 historical rows are warning debt.
+2. Friday-to-Monday and holiday-gap rows remain blocking until exact ownership is proven.
+3. UTC timestamps are classified by their ET session date.
+4. Recent missing mode and PAPER/LIVE conflict evidence remain HOLD/blocking.
+5. Existing ENTRY, broker/submission/fill, or matching-position evidence is classified under canonical ownership, not orphan debt.
+6. One LIVE `PENDING_TRIGGER` order without watcher ownership -> `status == BLOCKED`.
+7. Zero WATCHING rows and otherwise healthy state -> `status == OK`.
+8. Repeated startup/readiness execution is idempotent and performs no lifecycle mutation.
+9. Test doubles assert zero broker ENTRY submit/cancel calls and zero mutation to orders, positions, proof_trades, or trade_queue lifecycle state.
 
 ## Release gate
 
@@ -62,4 +77,5 @@ HARD HOLD until exact-head CI passes and the final diff is audited for:
 - no queue replay/reset;
 - no client_id/execution_mode loss;
 - no weakening of `PENDING_TRIGGER` watcher ownership;
-- diagnostics still expose WATCHING row IDs/counts.
+- diagnostics still expose WATCHING row IDs/counts;
+- `tests/test_p0_preopen_autonomous_readiness.py` runs in this exact-head P0 workflow.

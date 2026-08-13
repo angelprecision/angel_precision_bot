@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,9 +71,19 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     monkeypatch.setattr(
         pr,
         "_query_client_state",
-        lambda client_id: client_state or {
+        lambda client_id, **kwargs: client_state or {
             "stale_processing_ids": [],
+            "watching_rows": [],
+            "watching_historical_diagnostic_only": [],
             "watching_orphans": [],
+            "watching_owned": [],
+            "watching_blockers": [],
+            "watching_blocker_reasons": [],
+            "watching_classification_counts": {
+                "historical_diagnostic_only": 0,
+                "canonical_owner": 0,
+                "blocking": 0,
+            },
             "pending_trigger_rows": [],
             "watching_count": 0,
         },
@@ -82,6 +92,47 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     monkeypatch.setattr(pr, "_pod_mode", lambda: "live")
     monkeypatch.setattr(pr, "_after_929_et", lambda now=None: True)
     return writes
+
+
+def _watching_row(
+    row_id: int | str,
+    created_ts: datetime,
+    *,
+    signal_id: str | None = None,
+    mode: str | None = None,
+    owner_evidence: list[dict] | None = None,
+    payload: dict | None = None,
+) -> dict:
+    row_payload = dict(payload or {})
+    if mode is not None:
+        row_payload["execution_mode"] = mode
+    return {
+        "id": row_id,
+        "signal_id": signal_id or f"sig-{row_id}",
+        "created_ts": created_ts,
+        "payload": row_payload,
+        "owner_evidence": list(owner_evidence or []),
+    }
+
+
+def _classified_client_state(rows: list[dict], *, mode: str = "live", now: datetime) -> dict:
+    classified = pr._classify_watching_rows(rows, mode, now=now)
+    return {
+        "stale_processing_ids": [],
+        "watching_rows": (
+            classified["historical_diagnostic_only"]
+            + classified["owned"]
+            + classified["blockers"]
+        ),
+        "watching_historical_diagnostic_only": classified["historical_diagnostic_only"],
+        "watching_orphans": classified["historical_diagnostic_only"],
+        "watching_owned": classified["owned"],
+        "watching_blockers": classified["blockers"],
+        "watching_blocker_reasons": classified["blocker_reasons"],
+        "watching_classification_counts": classified["counts"],
+        "pending_trigger_rows": [],
+        "watching_count": len(rows),
+    }
 
 
 def test_all_green_readiness(monkeypatch):
@@ -220,6 +271,7 @@ def test_stale_processing_rows_are_reported(monkeypatch):
 def test_watching_row_with_no_orders_is_diagnostic_only(monkeypatch):
     _stub_common(monkeypatch, client_state={
         "stale_processing_ids": [],
+        "watching_historical_diagnostic_only": [{"id": 41, "signal_id": "sig-41"}],
         "watching_orphans": [{"id": 41, "signal_id": "sig-41"}],
         "pending_trigger_rows": [],
         "watching_count": 1,
@@ -230,58 +282,191 @@ def test_watching_row_with_no_orders_is_diagnostic_only(monkeypatch):
 
     result = pr.run_preopen_autonomous_readiness("paper@example.com", "paper", dry_run=True, runner=runner)
     assert result["status"] == "OK"
-    assert "watching_rows_missing_orders_recommend_new_rescue" in result["warnings"]
-    assert "watching_rows_missing_orders_recommend_new_rescue" not in result["errors"]
+    assert "watching_historical_diagnostic_only" in result["warnings"]
+    assert "watching_historical_diagnostic_only" not in result["errors"]
     assert result["details"]["client_state"]["watching_orphans"][0]["id"] == 41
 
 
-def test_historical_watching_rows_do_not_block_healthy_live_readiness(monkeypatch):
-    historical_orphans = [
-        {"id": row_id, "signal_id": f"sig-{row_id}"}
-        for row_id in range(1, 134)
+def test_132_historical_rows_plus_one_current_ambiguous_row_blocks(monkeypatch):
+    now = datetime(2026, 8, 17, 9, 30, tzinfo=pr.ET)
+    historical_rows = [
+        _watching_row(row_id, datetime(2026, 8, 13, 15, 0, tzinfo=pr.ET))
+        for row_id in range(1, 133)
     ]
-    _stub_common(monkeypatch, client_state={
-        "stale_processing_ids": [],
-        "watching_orphans": historical_orphans,
-        "pending_trigger_rows": [],
-        "watching_count": len(historical_orphans),
-    })
+    current_ambiguous = _watching_row(133, datetime(2026, 8, 17, 9, 0, tzinfo=pr.ET))
+    state = _classified_client_state(historical_rows + [current_ambiguous], now=now)
+    _stub_common(monkeypatch, client_state=state)
     monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
     runner = _Runner(mode="live")
 
     result = pr.run_preopen_autonomous_readiness(
-        "live@example.com", "live", dry_run=True, runner=runner,
+        "live@example.com", "live", dry_run=True, runner=runner, now=now,
     )
 
-    assert result["status"] == "OK"
-    assert result["errors"] == []
-    assert "watching_rows_missing_orders_recommend_new_rescue" in result["warnings"]
-    assert result["details"]["client_state"]["watching_orphans"] == historical_orphans
+    assert result["status"] == "BLOCKED"
+    assert "watching_current_session_unresolved" in result["errors"]
+    assert "watching_mode_evidence_missing" in result["errors"]
+    assert "watching_historical_diagnostic_only" in result["warnings"]
+    assert len(result["details"]["client_state"]["watching_orphans"]) == 132
+    assert len(result["details"]["client_state"]["watching_blockers"]) == 1
+    assert result["details"]["client_state"]["watching_classification_counts"] == {
+        "historical_diagnostic_only": 132,
+        "canonical_owner": 0,
+        "blocking": 1,
+    }
 
 
 def test_historical_watching_rows_do_not_mask_unowned_pending_trigger(monkeypatch):
-    historical_orphans = [
-        {"id": row_id, "signal_id": f"sig-{row_id}"}
-        for row_id in range(1, 134)
+    now = datetime(2026, 8, 17, 9, 30, tzinfo=pr.ET)
+    historical_rows = [
+        _watching_row(row_id, datetime(2026, 8, 13, 15, 0, tzinfo=pr.ET))
+        for row_id in range(1, 133)
     ]
-    _stub_common(monkeypatch, client_state={
-        "stale_processing_ids": [],
-        "watching_orphans": historical_orphans,
-        "pending_trigger_rows": [{"local_order_id": "L-999", "signal_id": "sig-999"}],
-        "watching_count": len(historical_orphans),
-    })
+    state = _classified_client_state(historical_rows, now=now)
+    state["pending_trigger_rows"] = [{"local_order_id": "L-999", "signal_id": "sig-999"}]
+    _stub_common(monkeypatch, client_state=state)
     monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
     runner = _Runner(mode="live", watcher=_Watcher(set()))
 
     result = pr.run_preopen_autonomous_readiness(
-        "live@example.com", "live", dry_run=True, runner=runner,
+        "live@example.com", "live", dry_run=True, runner=runner, now=now,
     )
 
     assert result["status"] == "BLOCKED"
     assert result["errors"] == ["pending_trigger_without_watcher_ownership"]
-    assert "watching_rows_missing_orders_recommend_new_rescue" in result["warnings"]
-    assert len(result["details"]["client_state"]["watching_orphans"]) == 133
+    assert "watching_historical_diagnostic_only" in result["warnings"]
+    assert len(result["details"]["client_state"]["watching_orphans"]) == 132
     assert result["details"]["pending_trigger_without_watcher"][0]["local_order_id"] == "L-999"
+
+
+def test_friday_to_monday_prior_session_is_blocking_without_exact_owner():
+    now = datetime(2026, 8, 17, 9, 30, tzinfo=pr.ET)
+    row = _watching_row(201, datetime(2026, 8, 14, 15, 45, tzinfo=pr.ET))
+
+    classified = pr._classify_watching_rows([row], "live", now=now)
+
+    assert classified["blockers"][0]["session_class"] == "prior_session"
+    assert "watching_prior_session_ambiguous" in classified["blocker_reasons"]
+    assert classified["historical_diagnostic_only"] == []
+
+
+def test_holiday_gap_is_relevant_and_not_historical_debt(monkeypatch):
+    monkeypatch.setattr(
+        pr,
+        "_nyse_is_trading_day",
+        lambda value: value.weekday() < 5 and value.date().isoformat() != "2026-07-03",
+    )
+    now = datetime(2026, 7, 6, 9, 30, tzinfo=pr.ET)
+    holiday_row = _watching_row(202, datetime(2026, 7, 3, 12, 0, tzinfo=pr.ET))
+    prior_row = _watching_row(203, datetime(2026, 7, 2, 12, 0, tzinfo=pr.ET))
+    old_row = _watching_row(204, datetime(2026, 7, 1, 12, 0, tzinfo=pr.ET))
+
+    classified = pr._classify_watching_rows([holiday_row, prior_row, old_row], "live", now=now)
+
+    assert classified["blockers"][0]["session_class"] == "relevant_gap"
+    assert classified["blockers"][1]["session_class"] == "prior_session"
+    assert [row["id"] for row in classified["historical_diagnostic_only"]] == [204]
+
+
+def test_utc_timestamp_is_classified_by_et_session_boundary():
+    now = datetime(2026, 8, 18, 0, 30, tzinfo=timezone.utc)  # Aug 17, 20:30 ET
+    row = _watching_row(
+        205,
+        datetime(2026, 8, 18, 0, 15, tzinfo=timezone.utc),  # Aug 17, 20:15 ET
+    )
+
+    classified = pr._classify_watching_rows([row], "live", now=now)
+
+    assert classified["blockers"][0]["session_class"] == "current_session"
+    assert "watching_current_session_unresolved" in classified["blocker_reasons"]
+
+
+def test_recent_missing_mode_evidence_is_hold():
+    now = datetime(2026, 8, 17, 9, 30, tzinfo=pr.ET)
+    row = _watching_row(206, datetime(2026, 8, 17, 9, 10, tzinfo=pr.ET))
+
+    classified = pr._classify_watching_rows([row], "live", now=now)
+
+    assert "watching_mode_evidence_missing" in classified["blocker_reasons"]
+    assert classified["historical_diagnostic_only"] == []
+
+
+def test_paper_evidence_cannot_authorize_live_readiness():
+    now = datetime(2026, 8, 17, 9, 30, tzinfo=pr.ET)
+    row = _watching_row(
+        207,
+        datetime(2026, 8, 17, 9, 10, tzinfo=pr.ET),
+        mode="paper",
+    )
+
+    classified = pr._classify_watching_rows([row], "live", now=now)
+
+    assert "watching_mode_conflict" in classified["blocker_reasons"]
+    assert classified["historical_diagnostic_only"] == []
+
+
+def test_conflicting_paper_live_evidence_is_hold():
+    now = datetime(2026, 8, 17, 9, 30, tzinfo=pr.ET)
+    row = _watching_row(
+        209,
+        datetime(2026, 8, 17, 9, 10, tzinfo=pr.ET),
+        mode="paper",
+        payload={"mode": "live"},
+    )
+
+    classified = pr._classify_watching_rows([row], "live", now=now)
+
+    assert set(classified["blocker_reasons"]) == {
+        "watching_mode_conflict",
+        "watching_current_session_unresolved",
+    }
+    assert classified["historical_diagnostic_only"] == []
+
+
+def test_entry_broker_fill_and_matching_position_are_canonical_owner():
+    now = datetime(2026, 8, 17, 9, 30, tzinfo=pr.ET)
+    row = _watching_row(
+        208,
+        datetime(2026, 8, 14, 15, 45, tzinfo=pr.ET),
+        signal_id="sig-owner",
+    )
+    order = {
+        "local_order_id": "local-owner",
+        "broker_order_id": "broker-owner",
+        "position_id": "position-owner",
+        "kind": "ENTRY",
+        "status": "FILLED",
+        "signal_id": "sig-owner",
+        "canonical_signal_id": "sig-owner",
+        "execution_mode": "live",
+        "submitted_ts": datetime(2026, 8, 14, 15, 46, tzinfo=pr.ET),
+        "filled_ts": datetime(2026, 8, 14, 15, 47, tzinfo=pr.ET),
+        "plan_id": "plan-owner",
+    }
+    position = {
+        "id": "position-owner",
+        "signal_id": "sig-owner",
+        "plan_id": "plan-owner",
+        "execution_mode": "live",
+        "status": "OPEN",
+    }
+    row["owner_evidence"] = pr._watching_owner_evidence(
+        row,
+        orders=[order],
+        positions=[position],
+    )
+    classified = pr._classify_watching_rows([row], "live", now=now)
+
+    sources = {
+        source
+        for evidence in row["owner_evidence"]
+        for source in evidence["evidence"]
+    }
+    assert {"entry_order", "broker_order", "submission", "fill", "matching_position"} <= sources
+    assert len(classified["owned"]) == 1
+    assert classified["owned"][0]["classification"] == "canonical_owner"
+    assert classified["blockers"] == []
+    assert classified["historical_diagnostic_only"] == []
 
 
 def test_pending_trigger_without_watcher_is_degraded(monkeypatch):

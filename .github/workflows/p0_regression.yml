@@ -192,6 +192,7 @@ jobs:
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             tests/test_p0_shared_ap_signals_retry_idempotency.py \
             tests/test_p0_nonterminal_ownership_poisoning.py \
+            tests/test_p0_preopen_autonomous_readiness.py \
             tests/test_p0_live_readiness_blocked_keys.py \
             tests/test_p0_readiness_deadline_enforcement.py \
             tests/test_p0_startup_readiness_fail_closed.py \
