@@ -628,7 +628,9 @@ class _Broker:
 
     def get_order(self, broker_order_id):
         self.calls.append(str(broker_order_id))
-        return dict(self.raw)
+        payload = dict(self.raw)
+        payload.setdefault("id", broker_order_id)
+        return payload
 
 
 class _RecoveryOSM:
@@ -1314,6 +1316,7 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                 money_path["get"].append(str(broker_order_id))
                 broker_truth_barrier.wait(timeout=10)
                 return {
+                    "id": broker_order_id,
                     "status": "FILLED",
                     "exec_quantity": 4,
                     "avg_fill_price": 1.25,

@@ -110,7 +110,7 @@ ACTIVE_BROKER_STATUSES = {
 TERMINAL_FAILURE_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
 
 UNKNOWN_ERROR_ESCALATE_AFTER = int(os.getenv("FILL_MONITOR_UNKNOWN_ERROR_ESCALATE_AFTER", "3"))
-FILL_ANOMALY_STATUS = os.getenv("FILL_MONITOR_ANOMALY_STATUS", "BROKER_FILL_ANOMALY").strip().upper()
+FILL_ANOMALY_STATUS = "BROKER_FILL_ANOMALY"
 
 _BROKER_STATE_ANOMALY_COUNTS: dict[str, int] = {}
 
@@ -550,6 +550,94 @@ def _broker_quantity_error_result(
         "reason": reason,
         "raw": response_evidence,
     }
+
+
+def _broker_fill_error_result(
+    order: dict,
+    broker_order_id,
+    raw: dict,
+    *,
+    reason: str,
+    context: dict,
+    emit_event: bool = False,
+    explanation: str = "",
+) -> dict:
+    """Return contradictory broker evidence without authorizing mutation."""
+    response_evidence = dict(raw)
+    response_evidence.update(context)
+    payload = {
+        "broker_order_id": broker_order_id,
+        "local_order_id": order.get("local_order_id"),
+        **context,
+    }
+    audit(
+        str(order.get("client_id") or "default"),
+        "CRITICAL",
+        reason,
+        payload,
+    )
+    result = {
+        "status": "ERROR",
+        "filled_qty": 0,
+        "avg_fill": 0.0,
+        "reason": reason,
+        "raw": response_evidence,
+    }
+    if emit_event:
+        emit_fill_event(
+            order,
+            decision="ERROR",
+            reason_code=reason,
+            explanation=explanation,
+            result=result,
+        )
+    return result
+
+
+def _broker_identity_error_result(
+    order: dict,
+    broker_order_id,
+    raw: dict,
+    *,
+    response_order_id,
+) -> dict:
+    return _broker_fill_error_result(
+        order,
+        broker_order_id,
+        raw,
+        reason="BROKER_ORDER_ID_MISMATCH",
+        context={
+            "_broker_order_id_mismatch": True,
+            "requested_broker_order_id": str(broker_order_id or ""),
+            "response_broker_order_id": response_order_id,
+        },
+    )
+
+
+def _broker_status_quantity_conflict_result(
+    order: dict,
+    broker_order_id,
+    raw: dict,
+    *,
+    mapped_status: str,
+    filled_qty: int,
+) -> dict:
+    return _broker_fill_error_result(
+        order,
+        broker_order_id,
+        raw,
+        reason="BROKER_FILL_STATUS_QUANTITY_CONFLICT",
+        context={
+            "_broker_fill_status_quantity_conflict": True,
+            "mapped_status": mapped_status,
+            "filled_qty": filled_qty,
+        },
+        emit_event=True,
+        explanation=(
+            "Broker returned a positive fill quantity with a non-fill status; "
+            "OSM and downstream side effects are blocked pending reconciliation."
+        ),
+    )
 
 
 def _resolve_runtime_execution_mode(
@@ -1082,6 +1170,24 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 "reason": reason,
                 "raw": response_evidence,
             }
+        response_order_ids = [
+            raw.get(key)
+            for key in ("id", "order_id", "broker_order_id")
+            if raw.get(key) is not None
+        ]
+        response_order_id = response_order_ids[0] if response_order_ids else None
+        if not response_order_ids or any(
+            not _has_proven_broker_order_id(response_id)
+            or str(response_id).strip() != str(broker_order_id).strip()
+            for response_id in response_order_ids
+        ):
+            return _broker_identity_error_result(
+                order,
+                broker_order_id,
+                raw,
+                response_order_id=response_order_id,
+            )
+
         status = raw_status.upper()
 
         if kind == "EXIT":
@@ -1136,6 +1242,20 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 )
         else:
             filled_qty = 0
+
+        if filled_qty > 0 and our not in {
+            "FILLED",
+            "PARTIAL_FILL",
+            "EXIT_FILLED",
+            "EXIT_PARTIAL_FILL",
+        }:
+            return _broker_status_quantity_conflict_result(
+                order,
+                broker_order_id,
+                raw,
+                mapped_status=our,
+                filled_qty=filled_qty,
+            )
 
         raw_avg_fill = raw.get("avg_fill_price")
         if raw_avg_fill is None:
@@ -1375,7 +1495,7 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
         except Exception as exc:
             log.warning("[%s] Could not resolve opposite broker id: %s", ticker, exc)
 
-        if not resolved_broker_id:
+        if not _has_proven_broker_order_id(resolved_broker_id):
             msg = f"PAIR_CANCEL_SKIPPED_NO_BROKER_ID | {ticker} | opposite_local={cancel_local_id} | filled_local={filled_local_id}"
             log.warning("[%s] %s", ticker, msg)
             audit(
@@ -1406,7 +1526,25 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
 
         try:
             if hasattr(broker, "cancel_order"):
-                broker.cancel_order(resolved_broker_id)
+                cancel_result = broker.cancel_order(resolved_broker_id)
+                returned_broker_id = (
+                    cancel_result.get("broker_order_id")
+                    if isinstance(cancel_result, dict)
+                    else None
+                )
+                confirmed_cancel_status = (
+                    str(cancel_result.get("status") or "").strip().upper()
+                    if isinstance(cancel_result, dict)
+                    else ""
+                )
+                if (
+                    not isinstance(cancel_result, dict)
+                    or cancel_result.get("ok") is not True
+                    or confirmed_cancel_status not in {"CANCELED", "CANCELLED"}
+                    or not _has_proven_broker_order_id(returned_broker_id)
+                    or str(returned_broker_id).strip() != str(resolved_broker_id).strip()
+                ):
+                    raise RuntimeError(f"broker_cancel_not_confirmed:{cancel_result!r}")
             else:
                 _cancel_with_session(broker, resolved_broker_id)
         except Exception as exc:
@@ -2048,6 +2186,8 @@ def _place_standing_stop_best_effort(
         try:
             stop_pct = float(os.getenv("BROKER_STANDING_STOP_PCT", "0.30"))
         except (TypeError, ValueError):
+            return _outcome("FAILED", detail_reason="invalid_stop_percentage")
+        if not math.isfinite(stop_pct) or not 0 <= stop_pct < 1:
             return _outcome("FAILED", detail_reason="invalid_stop_percentage")
         stop_px = round(entry_price * (1 - stop_pct), 2)
         contract = order.get("contract", "")
@@ -4082,9 +4222,6 @@ def process_pending_order(
     prev_filled = int(order.get("filled_qty") or 0)
     new_filled, overfill_clamped = _sanitize_cumulative_filled(order, result)
 
-    if mapped not in ("UNKNOWN", "ERROR"):
-        _reset_broker_anomaly_count(client_id, local_id, broker_id)
-
     if new_filled < prev_filled:
         log.critical(
             "[%s] Fill regression blocked | order=%s broker=%s prev=%s new=%s",
@@ -4108,6 +4245,47 @@ def process_pending_order(
             reason=f"broker fill regression prev={prev_filled} new={new_filled}",
             mapped=mapped,
         )
+        return
+
+    if overfill_clamped:
+        _mark_broker_fill_anomaly(
+            osm,
+            order,
+            reason=(
+                f"broker cumulative fill exceeds local order quantity: "
+                f"filled={result.get('filled_qty_raw')} qty={order.get('qty')}"
+            ),
+            mapped=mapped,
+        )
+        return
+
+    if mapped not in ("UNKNOWN", "ERROR"):
+        _reset_broker_anomaly_count(client_id, local_id, broker_id)
+
+    if mapped in ("FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL") and str(
+        order.get("status") or ""
+    ).upper() in TERMINAL_FAILURE_STATUSES:
+        reason = f"broker fill conflicts with local terminal status {order.get('status')}"
+        emit_fill_event(
+            order,
+            decision="ERROR",
+            reason_code="BROKER_FILL_LOCAL_TERMINAL_CONFLICT",
+            explanation=reason,
+            result=result,
+        )
+        audit(
+            client_id,
+            "CRITICAL",
+            "BROKER_FILL_LOCAL_TERMINAL_CONFLICT",
+            {
+                "local_order_id": local_id,
+                "broker_order_id": broker_id,
+                "local_status": order.get("status"),
+                "broker_status": mapped,
+                "filled_qty": new_filled,
+            },
+        )
+        _mark_broker_fill_anomaly(osm, order, reason=reason, mapped=mapped)
         return
 
     # ── FILLED / EXIT_FILLED ────────────────────────────────────────────────
@@ -4503,26 +4681,40 @@ def process_pending_order(
             try:
                 current_status = str(order.get("status") or "").upper()
                 if current_status == mapped and current_status in ("PARTIAL_FILL", "EXIT_PARTIAL_FILL"):
-                    osm.apply_fill_update(
+                    update_result = osm.apply_fill_update(
                         local_order_id=local_id,
                         cumulative_filled=new_filled,
                         fill_price=result.get("avg_fill"),
                         broker_order_id=broker_id,
                     )
                 else:
-                    osm.transition(
+                    update_result = osm.transition(
                         local_id,
                         mapped,
                         filled_qty=new_filled,
                         fill_price=result.get("avg_fill"),
                         broker_order_id=broker_id,
                     )
-                partial_applied = True
+                partial_applied = update_result is True
             except Exception as exc:
                 log.error("[%s] OSM partial update %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
             _legacy_update_order_status(local_id, "PARTIAL_FILL", filled_qty=new_filled)
             partial_applied = True
+
+        if not partial_applied:
+            audit(
+                client_id,
+                "CRITICAL",
+                "OSM_PARTIAL_FILL_APPLY_FAILED",
+                {
+                    "local_order_id": local_id,
+                    "broker_order_id": broker_id,
+                    "mapped_status": mapped,
+                    "filled_qty": new_filled,
+                },
+            )
+            return
 
         # Canonical accounting must advance on every confirmed EXIT fill, not
         # only when the broker order becomes terminal.  Stamp the normalized
@@ -4574,18 +4766,34 @@ def process_pending_order(
             extra_context={"terminal_status": mapped},
         )
 
+        terminal_applied = True
         if osm:
             try:
-                osm.transition(
+                terminal_applied = osm.transition(
                     local_id,
                     mapped,
                     broker_order_id=broker_id,
                     last_error=result.get("reason"),
-                )
+                ) is True
             except Exception as exc:
+                terminal_applied = False
                 log.error("[%s] OSM terminal transition %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
             _legacy_update_order_status(local_id, mapped, error=result.get("reason"))
+
+        if not terminal_applied:
+            audit(
+                client_id,
+                "CRITICAL",
+                "OSM_TERMINAL_APPLY_FAILED",
+                {
+                    "local_order_id": local_id,
+                    "broker_order_id": broker_id,
+                    "mapped_status": mapped,
+                    "kind": kind,
+                },
+            )
+            return
 
         # IMPORTANT: no direct positions table mutation here.
         # EXIT failure repair is handled by OSM + exit-engine hooks.
@@ -4725,6 +4933,9 @@ def _sync_exit_price(order: dict, result: dict):
     Runs directly against Supabase proof_trades — no dashboard API hop needed.
     """
     try:
+        if str(result.get("status") or "").strip().upper() != "EXIT_FILLED":
+            return
+
         pos_id      = order.get("position_id")
         avg_fill    = result.get("avg_fill")
         entry_price = float(order.get("entry_price") or order.get("fill_price") or 0)
@@ -4758,32 +4969,7 @@ def _sync_exit_price(order: dict, result: dict):
                         f"UPDATE proof_trades SET {set_clause} WHERE position_id = %s",
                         params,
                     )
-                    primary_rowcount = getattr(cur, "rowcount", getattr(c, "rowcount", 0))
-                    # Fallback: repair ONE unresolved orphan row only.
-                    # Primary position_id match remains the source of truth.
-                    if primary_rowcount == 0 and client_id and ticker:
-                        params2 = [exit_px]
-                        set2 = "exit_option_price = %s"
-                        if opt_pnl_pct is not None:
-                            set2 += ", option_pnl_pct = %s, win = %s"
-                            params2 += [opt_pnl_pct, win]
-                        params2 += [client_id, ticker]
-                        cur2 = c.execute(
-                            f"UPDATE proof_trades SET {set2} "
-                            "WHERE id = ("
-                            "  SELECT id FROM proof_trades "
-                            "  WHERE client_email = %s "
-                            "    AND ticker = %s "
-                            "    AND closed_at >= NOW() - INTERVAL '60 minutes' "
-                            "    AND (position_id IS NULL OR position_id = '') "
-                            "    AND exit_option_price IS NULL "
-                            "  ORDER BY closed_at DESC "
-                            "  LIMIT 1"
-                            ")",
-                            params2,
-                        )
-                        return getattr(cur2, "rowcount", getattr(c, "rowcount", 0))
-                    return primary_rowcount
+                    return getattr(cur, "rowcount", getattr(c, "rowcount", 0))
             updated = run_with_retry(_update_proof) or 0
             if updated:
                 log.info(
@@ -4795,7 +4981,7 @@ def _sync_exit_price(order: dict, result: dict):
             else:
                 log.warning(
                     "[%s] EXIT PRICE SYNC: no eligible row found "
-                    "(primary by position_id=%s and narrowed fallback both empty)",
+                    "(exact position_id=%s did not match)",
                     client_id,
                     pos_id,
                 )

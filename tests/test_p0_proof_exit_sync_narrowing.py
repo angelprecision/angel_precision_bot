@@ -18,18 +18,18 @@ def test_primary_position_id_update_is_preserved():
     assert "WHERE position_id = %s" in body
 
 
-def test_fallback_updates_single_row_via_subquery():
+def test_fallback_updates_are_removed():
     body = _sync_exit_price_body()
-    assert "WHERE id = (" in body
-    assert "SELECT id FROM proof_trades" in body
-    assert "ORDER BY closed_at DESC" in body
-    assert "LIMIT 1" in body
+    assert "WHERE id = (" not in body
+    assert "SELECT id FROM proof_trades" not in body
+    assert "ORDER BY closed_at DESC" not in body
+    assert "LIMIT 1" not in body
 
 
-def test_fallback_only_targets_unresolved_orphans():
+def test_sync_requires_exact_position_identity():
     body = _sync_exit_price_body()
-    assert "(position_id IS NULL OR position_id = '')" in body
-    assert "exit_option_price IS NULL" in body
+    assert "WHERE position_id = %s" in body
+    assert "(position_id IS NULL OR position_id = '')" not in body
 
 
 def test_legacy_loss_filter_removed():
@@ -37,13 +37,18 @@ def test_legacy_loss_filter_removed():
     assert "AND win = FALSE" not in body
 
 
-def test_warning_message_describes_primary_and_fallback_paths():
+def test_warning_message_describes_exact_identity_path():
     body = _sync_exit_price_body()
-    assert "primary by position_id=%s and narrowed fallback both empty" in body
+    assert "(exact position_id=%s did not match)" in body
 
 
 def test_rowcount_uses_execute_result_when_available():
     body = _sync_exit_price_body()
-    assert 'primary_rowcount = getattr(cur, "rowcount", getattr(c, "rowcount", 0))' in body
-    assert 'return getattr(cur2, "rowcount", getattr(c, "rowcount", 0))' in body
-    assert "return primary_rowcount" in body
+    assert 'return getattr(cur, "rowcount", getattr(c, "rowcount", 0))' in body
+    assert "primary_rowcount" not in body
+
+
+def test_direct_sync_only_accepts_terminal_exit_fill():
+    body = _sync_exit_price_body()
+    assert 'result.get("status")' in body
+    assert '!= "EXIT_FILLED"' in body
