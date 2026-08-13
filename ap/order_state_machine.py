@@ -2273,7 +2273,11 @@ class APOrderStateMachine:
                     "        (NOT (COALESCE(meta, '{}'::jsonb) ? 'entry_efficiency_generation') "
                     "         AND COALESCE(meta->>'entry_efficiency_state','')='' "
                     "         AND %s=0) "
-                    "        OR (meta->>'entry_efficiency_generation' ~ '^(0|[1-9][0-9]*)$' "
+                    "        OR (COALESCE(meta->>'entry_efficiency_state','')='' "
+                    "            AND meta->>'entry_efficiency_generation' ~ '^0$' "
+                    "            AND (meta->>'entry_efficiency_generation')::bigint=%s) "
+                    "        OR (COALESCE(meta->>'entry_efficiency_state','')<>'' "
+                    "            AND meta->>'entry_efficiency_generation' ~ '^[1-9][0-9]*$' "
                     "            AND (meta->>'entry_efficiency_generation')::bigint=%s) "
                     "      )",
                     (
@@ -2284,6 +2288,7 @@ class APOrderStateMachine:
                         durable_canonical_signal_id,
                         durable_mode,
                         expected_state_text,
+                        expected_gen,
                         expected_gen,
                         expected_gen,
                     ),

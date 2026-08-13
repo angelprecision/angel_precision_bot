@@ -160,7 +160,13 @@ def parse_entry_efficiency_generation(
     else:
         return None
 
-    return generation if generation >= 0 else None
+    # Generation zero belongs only to the empty initial lifecycle.  Once a
+    # durable state exists, the first legitimate transition has already
+    # advanced the generation to one; accepting stateful zero would let a
+    # corrupt row re-enter the CAS lifecycle as if it were authoritative.
+    if state_present:
+        return generation if generation >= 1 else None
+    return 0 if generation == 0 else None
 
 
 def normalize_strategy_pattern(pattern: Any, timeframe: Any) -> tuple[str, bool]:

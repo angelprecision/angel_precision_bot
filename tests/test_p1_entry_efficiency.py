@@ -150,11 +150,11 @@ def test_entry_efficiency_generation_parser_only_infers_the_initial_absence():
     assert parse_entry_efficiency_generation(state="") == 0
     assert parse_entry_efficiency_generation(state=WAIT_CONFIRMATION) is None
     assert parse_entry_efficiency_generation(0, state="") == 0
-    assert parse_entry_efficiency_generation("0", state=WAIT_CONFIRMATION) == 0
     assert parse_entry_efficiency_generation(7, state=REARM_FOR_REBREACH) == 7
 
-    for raw in (None, "", " ", " 1", "1 ", "01", "-1", "junk", 1.0, True):
-        assert parse_entry_efficiency_generation(raw, state=WAIT_CONFIRMATION) is None
+    for state in (WAIT_CONFIRMATION, REARM_FOR_REBREACH, READY_NOW):
+        for raw in (0, "0", None, "", " ", " 1", "1 ", "01", "-1", "junk", 1.0, True):
+            assert parse_entry_efficiency_generation(raw, state=state) is None
 
 
 @pytest.mark.parametrize(
@@ -408,22 +408,35 @@ def _watch_signal(contract_symbol="", **metadata):
         "execution_mode": "paper",
         "metadata": metadata,
     }
+    if "entry_efficiency_state" in metadata or "entry_efficiency_generation" in metadata:
+        metadata.setdefault("entry_efficiency_local_order_id", "order-efficiency")
+        metadata.setdefault("entry_efficiency_signal_id", "sig-efficiency")
+        metadata.setdefault(
+            "entry_efficiency_canonical_signal_id", "canonical-sig-efficiency"
+        )
+        metadata.setdefault("entry_efficiency_client_id", "jason@example.com")
+        metadata.setdefault("entry_efficiency_execution_mode", "paper")
     if contract_symbol:
         signal["contract_symbol"] = contract_symbol
     return signal
 
 
+def _watched_with_runtime(signal, mode="PAPER"):
+    watched = WatchedSignal(signal, overnight=False)
+    watched._watcher_ref = APEntryWatcher(
+        None, order_state_machine=MagicMock(), mode=mode
+    )
+    return watched
+
+
 def test_watcher_wait_suppresses_repeated_trigger_until_efficiency_due(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
     future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-    watched = WatchedSignal(
-        _watch_signal(
-            entry_efficiency_state="WAIT_CONFIRMATION",
-            entry_efficiency_generation=3,
-            entry_efficiency_next_eval_at=future,
-        ),
-        overnight=False,
-    )
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state="WAIT_CONFIRMATION",
+        entry_efficiency_generation=3,
+        entry_efficiency_next_eval_at=future,
+    ))
 
     assert watched.check(302.79, 302.81, quote_age_ms=1000) == WatchState.PENDING
     assert watched.check(302.79, 302.81, quote_age_ms=1000) == WatchState.PENDING
@@ -435,7 +448,13 @@ def test_watcher_wait_suppresses_repeated_trigger_until_efficiency_due(monkeypat
     assert watched.check(302.79, 302.81, quote_age_ms=1000) == WatchState.TRIGGERED
 
 
-def test_live_stale_efficiency_wait_is_ignored_when_paper_authority_is_enabled(monkeypatch):
+@pytest.mark.parametrize(
+    "runtime_mode, signal_mode",
+    [("LIVE", "paper"), ("PAPER", "live")],
+)
+def test_watcher_runtime_and_signal_mode_mismatch_never_honors_efficiency_wait(
+    monkeypatch, runtime_mode, signal_mode
+):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
     signal = _watch_signal(
         entry_efficiency_state=WAIT_CONFIRMATION,
@@ -444,27 +463,28 @@ def test_live_stale_efficiency_wait_is_ignored_when_paper_authority_is_enabled(m
             datetime.now(timezone.utc) + timedelta(minutes=5)
         ).isoformat(),
     )
-    signal["execution_mode"] = "live"
-    watched = WatchedSignal(signal, overnight=False)
+    signal["execution_mode"] = signal_mode
+    signal["metadata"]["entry_efficiency_execution_mode"] = signal_mode
+    watched = _watched_with_runtime(signal, mode=runtime_mode)
+    watcher = watched._watcher_ref
 
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
     assert watched.breach_count == 2
     assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+    assert watched._entry_efficiency_persist_request is None
+    watcher.order_state_machine.cas_entry_efficiency_state.assert_not_called()
 
 
 def test_paper_stale_efficiency_wait_is_ignored_when_rollout_is_observe_only(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_OBSERVE_ONLY)
-    watched = WatchedSignal(
-        _watch_signal(
-            entry_efficiency_state=WAIT_CONFIRMATION,
-            entry_efficiency_generation=1,
-            entry_efficiency_next_eval_at=(
-                datetime.now(timezone.utc) + timedelta(minutes=5)
-            ).isoformat(),
-        ),
-        overnight=False,
-    )
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    ))
 
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
@@ -474,16 +494,13 @@ def test_paper_stale_efficiency_wait_is_ignored_when_rollout_is_observe_only(mon
 
 def test_paper_stale_efficiency_wait_remains_active_when_authority_is_enabled(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
-    watched = WatchedSignal(
-        _watch_signal(
-            entry_efficiency_state=WAIT_CONFIRMATION,
-            entry_efficiency_generation=1,
-            entry_efficiency_next_eval_at=(
-                datetime.now(timezone.utc) + timedelta(minutes=5)
-            ).isoformat(),
-        ),
-        overnight=False,
-    )
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    ))
 
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
@@ -501,7 +518,7 @@ def test_paper_stale_efficiency_wait_is_ignored_for_unrelated_strategy_scope(mon
         ).isoformat(),
     )
     signal["pattern"] = "1-2"
-    watched = WatchedSignal(signal, overnight=False)
+    watched = _watched_with_runtime(signal)
 
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
@@ -509,27 +526,62 @@ def test_paper_stale_efficiency_wait_is_ignored_for_unrelated_strategy_scope(mon
     assert watched.entry_efficiency_state == WAIT_CONFIRMATION
 
 
-@pytest.mark.parametrize("generation", ["", " ", "-1", "junk"])
+@pytest.mark.parametrize("generation", [0, "0", "", " ", "-1", "junk"])
 def test_watcher_invalid_generation_never_honors_persisted_efficiency_wait(
     monkeypatch, generation
 ):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
-    watched = WatchedSignal(
-        _watch_signal(
-            entry_efficiency_state=WAIT_CONFIRMATION,
-            entry_efficiency_generation=generation,
-            entry_efficiency_next_eval_at=(
-                datetime.now(timezone.utc) + timedelta(minutes=5)
-            ).isoformat(),
-        ),
-        overnight=False,
-    )
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=generation,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    ))
 
     assert watched.entry_efficiency_generation is None
     assert watched.entry_efficiency_generation_valid is False
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
     assert watched.breach_count == 2
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_efficiency_local_order_id", None),
+        ("entry_efficiency_signal_id", "other-signal"),
+        ("entry_efficiency_canonical_signal_id", "other-canonical"),
+        ("entry_efficiency_client_id", "other@example.com"),
+        ("entry_efficiency_execution_mode", "live"),
+        ("entry_efficiency_generation", 2),
+    ],
+)
+def test_watcher_restart_identity_conflict_is_telemetry_only(monkeypatch, field, value):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    signal = _watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    )
+    if value is None:
+        signal["metadata"].pop(field)
+    elif field != "entry_efficiency_generation":
+        signal["metadata"][field] = value
+    watched = _watched_with_runtime(signal, mode="PAPER")
+    watcher = watched._watcher_ref
+    if field == "entry_efficiency_generation":
+        # Model a reconstructed watcher whose in-memory lifecycle watermark
+        # disagrees with the persisted row watermark.
+        watched.entry_efficiency_generation = value
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched._entry_efficiency_persist_request is None
+    watcher.order_state_machine.cas_entry_efficiency_state.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -661,16 +713,13 @@ def test_execution_core_conflicting_identity_stays_on_existing_path(
 
 def test_watcher_pullback_stages_distinct_rearm_cas_request(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
-    watched = WatchedSignal(
-        _watch_signal(
-            entry_efficiency_state="WAIT_CONFIRMATION",
-            entry_efficiency_generation=4,
-            entry_efficiency_next_eval_at=(
-                datetime.now(timezone.utc) - timedelta(seconds=1)
-            ).isoformat(),
-        ),
-        overnight=False,
-    )
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state="WAIT_CONFIRMATION",
+        entry_efficiency_generation=4,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+    ))
 
     assert watched.check(303.10, 303.20, quote_age_ms=1000) == WatchState.PENDING
     request = watched._entry_efficiency_persist_request
@@ -818,17 +867,14 @@ def test_aapl_wait_returns_before_runtime_submit_path(monkeypatch):
 def test_aapl_replay_wait_rearm_rebreach_ready_has_no_first_entry_post(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
     deadline = "2026-08-12T14:21:51+00:00"
-    watched = WatchedSignal(
-        _watch_signal(
-            entry_efficiency_state=WAIT_CONFIRMATION,
-            entry_efficiency_generation=1,
-            entry_efficiency_next_eval_at=(
-                datetime.now(timezone.utc) - timedelta(seconds=1)
-            ).isoformat(),
-            entry_efficiency_deadline_at=deadline,
-        ),
-        overnight=False,
-    )
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        entry_efficiency_deadline_at=deadline,
+    ))
     watched.trigger_crossed_at = FIRST_BREACH
     osm = MagicMock()
     osm.cas_entry_efficiency_state.return_value = True
@@ -1049,6 +1095,27 @@ def test_postgres_cas_accepts_valid_generations_and_rejects_stale_replay(
         next_generation=2,
     ) is True
     assert db.read_meta()["entry_efficiency_generation"] == 2
+
+
+@pytest.mark.parametrize("state", [WAIT_CONFIRMATION, REARM_FOR_REBREACH, READY_NOW])
+def test_postgres_cas_rejects_stateful_zero_generation(
+    postgres_entry_efficiency_db, state
+):
+    db = postgres_entry_efficiency_db
+    meta = {
+        "entry_efficiency_state": state,
+        "entry_efficiency_generation": 0,
+    }
+    db.replace_row(meta=meta)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=state,
+        expected_generation=0,
+        next_state=state,
+        next_generation=1,
+    ) is False
+    assert db.read_meta() == meta
 
 
 def test_postgres_cas_allows_only_one_simultaneous_claimant(
