@@ -77,6 +77,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import threading
@@ -1154,6 +1155,60 @@ class APBrokerReconciler:
                     "expected=%s actual=%s",
                     self.client_id, local_id, self.execution_mode, row_mode,
                 )
+                continue
+
+            _meta = order.get("meta") or {}
+            if isinstance(_meta, str):
+                try:
+                    _meta = json.loads(_meta)
+                except Exception:
+                    _meta = {}
+            if db_status == "PENDING_TRIGGER" and (
+                broker_oid
+                or order.get("submitted_ts")
+                or (
+                    isinstance(_meta, dict)
+                    and str(_meta.get("submit_intent_at") or "").strip()
+                )
+            ):
+                # Evidence-bearing PENDING_TRIGGER rows belong to canonical
+                # broker adoption/reconciliation. Do not send broker FILLED
+                # or terminal truth directly against the pre-broker status;
+                # adoption establishes SUBMITTED and the fill monitor owns
+                # every later broker lifecycle transition.
+                try:
+                    from ap.pending_trigger_restart_recovery import (
+                        PendingTriggerRestartRecovery,
+                        _RowOutcome,
+                    )
+
+                    _ptr = PendingTriggerRestartRecovery(
+                        client_id=self.client_id,
+                        execution_mode=self.execution_mode,
+                        osm=self.osm,
+                        broker=self.broker,
+                        caller_source="ap_reconciler._reconcile_orders",
+                    )
+                    _outcome = _ptr.recover_one_row(dict(order))
+                    if _outcome == _RowOutcome.BROKER_OWNED:
+                        summary["orders_corrected"] += 1
+                    elif _outcome == _RowOutcome.UNRESOLVED:
+                        self._alert(
+                            f"PENDING_TRIGGER_BROKER_EVIDENCE_HELD | {contract} | {local_id}"
+                        )
+                        summary["orders_alerted"] += 1
+                except Exception as exc:
+                    log.error(
+                        "[%s] PENDING_TRIGGER broker-evidence reconciliation failed "
+                        "for %s: %s",
+                        self.client_id,
+                        local_id,
+                        exc,
+                    )
+                    summary.setdefault("errors", []).append(
+                        f"pending_trigger_broker_evidence:{local_id}:{type(exc).__name__}"
+                    )
+                    summary["orders_alerted"] += 1
                 continue
 
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):

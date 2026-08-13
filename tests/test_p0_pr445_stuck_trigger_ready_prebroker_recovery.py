@@ -83,6 +83,7 @@ class _OSM:
         self.meta_calls = []
         self.rearm_calls = []
         self.adopt_calls = []
+        self.retention_calls = []
 
     def get_order(self, local_order_id):
         row = self.rows.get(local_order_id)
@@ -224,6 +225,10 @@ class _OSM:
     def cancel_pending_entry(self, local_order_id, *, reason=""):
         self.cancel_calls.append((local_order_id, reason))
         self.rows[local_order_id]["status"] = "CANCELED"
+        return True
+
+    def retain_recovery_ownership_if_no_watcher(self, local_order_id, **kwargs):
+        self.retention_calls.append((local_order_id, dict(kwargs)))
         return True
 
 
@@ -1067,6 +1072,151 @@ def test_filled_broker_order_stays_submitted_for_canonical_fill_monitor():
     assert "fill_price" not in adopted
     assert len(osm.transition_calls) == 1
     assert osm.transition_calls[0][1] == "SUBMITTED"
+
+
+def test_corrupt_pending_trigger_broker_id_is_adopted_by_order_monitor_without_post():
+    from ap.order_monitor import APOrderMonitor
+
+    row = _row(
+        submit_intent_at="2026-08-12T16:04:00+00:00",
+        broker_submit_key=canonical_broker_submit_key(LOCAL_ORDER_ID),
+    )
+    row["broker_order_id"] = "broker-existing"
+    osm = _OSM(row)
+    broker = MagicMock()
+    broker.list_orders.return_value = [_broker_order(status="working")]
+    monitor = object.__new__(APOrderMonitor)
+    monitor.client_id = CLIENT_ID
+    monitor.client_mode = MODE.upper()
+    monitor.broker = broker
+    monitor.osm = osm
+    monitor.pm = MagicMock()
+    monitor.entry_watcher = _Watcher(MagicMock())
+    monitor.execution_core = None
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(monitor, "_log_pending_trigger_watchdog_seen", MagicMock())
+        monitor._check_pending_trigger_order(
+            order=row,
+            local_id=LOCAL_ORDER_ID,
+            contract=row["contract"],
+            age_secs=6000.0,
+            broker_oid=row["broker_order_id"],
+            submitted_ts=None,
+        )
+    assert osm.rows[LOCAL_ORDER_ID]["status"] == "SUBMITTED"
+    assert osm.rows[LOCAL_ORDER_ID]["broker_order_id"] == "broker-existing"
+    assert osm.rows[LOCAL_ORDER_ID]["meta"]["current_owner"] == "ORDER_MONITOR"
+    assert len(osm.transition_calls) == 1
+    assert osm.transition_calls[0][1] == "SUBMITTED"
+    broker.place_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "broker_overrides",
+    [
+        {"option_symbol": "QQQ260821C00500000"},
+        {"side": "sell_to_open"},
+        {"quantity": "2"},
+    ],
+    ids=["wrong-occ", "wrong-side", "wrong-qty"],
+)
+def test_corrupt_pending_trigger_broker_identity_conflict_holds_without_post(
+    broker_overrides,
+):
+    row = _row(
+        submit_intent_at="2026-08-12T16:05:00+00:00",
+        broker_submit_key=canonical_broker_submit_key(LOCAL_ORDER_ID),
+    )
+    row["broker_order_id"] = "broker-existing"
+    osm = _OSM(row)
+    broker = MagicMock()
+    broker.list_orders.return_value = [_broker_order(**broker_overrides)]
+    recovery = _recovery(row, osm, _Watcher(MagicMock()), broker)
+
+    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
+    assert osm.rows[LOCAL_ORDER_ID]["status"] == "PENDING_TRIGGER"
+    assert osm.transition_calls == []
+    assert osm.cancel_calls == []
+    broker.place_order.assert_not_called()
+
+
+def test_corrupt_pending_trigger_submitted_ts_without_broker_id_is_retained_without_post():
+    row = _row(
+        broker_submit_key=canonical_broker_submit_key(LOCAL_ORDER_ID),
+    )
+    row["submitted_ts"] = "2026-08-12T15:50:00+00:00"
+    osm = _OSM(row)
+    broker = MagicMock()
+    broker.list_orders.return_value = []
+    core = SimpleNamespace(
+        client_id=CLIENT_ID,
+        email=CLIENT_ID,
+        execution_mode=MODE,
+        mode=MODE.upper(),
+        order_state_machine=osm,
+        broker=broker,
+    )
+    core.reconcile_deferred_broker_intent = (
+        APExecutionCore.reconcile_deferred_broker_intent.__get__(core, type(core))
+    )
+    recovery = _recovery(row, osm, _Watcher(MagicMock()), broker, execution_core=core)
+
+    assert recovery.recover_one_row(row) == _RowOutcome.RETRY_OWNED
+    assert osm.rows[LOCAL_ORDER_ID]["status"] == "PENDING_TRIGGER"
+    assert len(osm.retention_calls) == 1
+    assert osm.transition_calls == []
+    assert osm.cancel_calls == []
+    broker.place_order.assert_not_called()
+
+
+def test_corrupt_pending_trigger_broker_adoption_restart_is_idempotent():
+    row = _row(
+        submit_intent_at="2026-08-12T16:07:00+00:00",
+        broker_submit_key=canonical_broker_submit_key(LOCAL_ORDER_ID),
+    )
+    row["broker_order_id"] = "broker-existing"
+    osm = _OSM(row)
+    broker = MagicMock()
+    broker.list_orders.return_value = [_broker_order(status="working")]
+    recovery = _recovery(row, osm, _Watcher(MagicMock()), broker)
+
+    assert recovery.recover_one_row(row) == _RowOutcome.BROKER_OWNED
+    first_transition_count = len(osm.transition_calls)
+    assert recovery.recover_one_row(osm.get_order(LOCAL_ORDER_ID)) == _RowOutcome.SKIPPED
+    assert len(osm.transition_calls) == first_transition_count
+    assert broker.list_orders.call_count == 1
+    broker.place_order.assert_not_called()
+
+
+def test_corrupt_pending_trigger_filled_broker_reality_stays_submitted_for_fill_monitor():
+    row = _row(
+        submit_intent_at="2026-08-12T16:08:00+00:00",
+        broker_submit_key=canonical_broker_submit_key(LOCAL_ORDER_ID),
+    )
+    row["broker_order_id"] = "broker-existing"
+    osm = _OSM(row)
+    broker = MagicMock()
+    broker.list_orders.return_value = [
+        _broker_order(
+            status="filled",
+            create_date="2026-08-12T15:50:00Z",
+            exec_quantity="1",
+            avg_fill_price="2.50",
+            transaction_date="2026-08-12T15:51:00Z",
+        )
+    ]
+    recovery = _recovery(row, osm, _Watcher(MagicMock()), broker)
+
+    assert recovery.recover_one_row(row) == _RowOutcome.BROKER_OWNED
+    adopted = osm.rows[LOCAL_ORDER_ID]
+    assert adopted["status"] == "SUBMITTED"
+    assert adopted["broker_order_id"] == "broker-existing"
+    assert "filled_qty" not in adopted
+    assert "fill_price" not in adopted
+    assert "filled_ts" not in adopted
+    assert adopted["meta"]["current_owner"] == "ORDER_MONITOR"
+    broker.place_order.assert_not_called()
 
 
 @pytest.mark.parametrize(

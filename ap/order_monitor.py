@@ -1305,6 +1305,14 @@ class APOrderMonitor:
         _ownership_error_repr = _ownership_check_error or "None"
 
         if broker_oid:
+            _adopt_attempted, _adopt_succeeded, _adopt_reason = (
+                self._canonical_pending_trigger_rearm(
+                    order,
+                    local_id,
+                    contract,
+                    is_past_eod=False,
+                )
+            )
             self._log_pending_trigger_watchdog_seen(
                 level="critical",
                 contract=contract,
@@ -1315,11 +1323,35 @@ class APOrderMonitor:
                 watcher_owner_state=_owner_state_repr,
                 ownership_check_available=_ownership_check_available,
                 ownership_check_error=_ownership_error_repr,
-                cleanup_action="skip_broker_order_id_present",
+                cleanup_action=(
+                    "broker_ownership_adopted"
+                    if _adopt_succeeded
+                    else "broker_ownership_held"
+                ),
+            )
+            log.critical(
+                "[%s] PENDING_TRIGGER_BROKER_OWNERSHIP | %s | %s | "
+                "broker_order_id=%s | adoption_attempted=%s | "
+                "adoption_succeeded=%s | reason=%s",
+                self.client_id,
+                contract,
+                local_id,
+                broker_oid,
+                _adopt_attempted,
+                _adopt_succeeded,
+                _adopt_reason,
             )
             return
 
         if submitted_ts:
+            _reconcile_attempted, _reconcile_succeeded, _reconcile_reason = (
+                self._canonical_pending_trigger_rearm(
+                    order,
+                    local_id,
+                    contract,
+                    is_past_eod=False,
+                )
+            )
             self._log_pending_trigger_watchdog_seen(
                 level="info",
                 contract=contract,
@@ -1330,7 +1362,23 @@ class APOrderMonitor:
                 watcher_owner_state=_owner_state_repr,
                 ownership_check_available=_ownership_check_available,
                 ownership_check_error=_ownership_error_repr,
-                cleanup_action="skip_submitted_ts_present",
+                cleanup_action=(
+                    "broker_intent_reconciled"
+                    if _reconcile_succeeded
+                    else "broker_intent_retained"
+                ),
+            )
+            log.warning(
+                "[%s] PENDING_TRIGGER_BROKER_INTENT | %s | %s | "
+                "submitted_ts=%s | reconciliation_attempted=%s | "
+                "reconciliation_succeeded=%s | reason=%s",
+                self.client_id,
+                contract,
+                local_id,
+                _submitted_repr,
+                _reconcile_attempted,
+                _reconcile_succeeded,
+                _reconcile_reason,
             )
             return
 
@@ -1750,6 +1798,8 @@ class APOrderMonitor:
                 return (True, True, "canonical_recovery_retry_owned")
             elif _outcome == _RowOutcome.TERMINALIZED:
                 return (True, False, "canonical_recovery_terminalized")
+            elif _outcome == _RowOutcome.BROKER_OWNED:
+                return (True, True, "canonical_recovery_broker_owned")
             elif _outcome == _RowOutcome.SKIPPED:
                 return (False, False, "canonical_recovery_not_pending_trigger")
             else:

@@ -3510,9 +3510,9 @@ class APExecutionCore:
           * ALREADY_RECONCILED — broker_order_id already present; the
             order monitor owns the row.  (Defensive; the recovery load
             filter normally excludes these.)
-          * NOT_IN_CRASH_WINDOW — no submit_intent_at; the row never
-            reached the broker-submit boundary and is safe for the normal
-            resume path.
+          * NOT_IN_CRASH_WINDOW — no submit_intent_at and no submitted_ts;
+            the row never reached the broker-submit boundary and is safe for
+            the normal resume path.
           * RECONCILE_PENDING — broker truth is unavailable or ambiguous.
           * KEEP_WATCHER — inspection could not complete (OSM unavailable,
             row read raised, row missing).
@@ -3590,8 +3590,12 @@ class APExecutionCore:
                 "broker_order_id": broker_order_id,
             }
 
-        # ── No submit intent → not a crash-window row ────────────────
-        if not submit_intent_at:
+        # ── No broker-boundary evidence → not a crash-window row ─────
+        # A legacy/recovered PENDING_TRIGGER row can retain a broker-owned
+        # submitted_ts even when submit_intent_at was never persisted. The
+        # missing broker id makes that state ambiguous, not pre-broker-safe;
+        # query by the durable submit key and retain it on no/uncertain match.
+        if not submit_intent_at and not str(row.get("submitted_ts") or "").strip():
             return {
                 **_base,
                 "disposition": "NOT_IN_CRASH_WINDOW",

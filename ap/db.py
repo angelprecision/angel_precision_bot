@@ -799,6 +799,24 @@ def list_orders(client_id: str | None = None, limit: int = 200,
 def get_open_orders_for_reconcile(client_id: str | None = None,
                                    limit: int = 200,
                                    execution_mode: str | None = None) -> list[dict]:
+    # PENDING_TRIGGER remains excluded for ordinary watcher plans, but an
+    # evidence-bearing row is already broker-owned or broker-ambiguous and
+    # must reach canonical adoption/reconciliation before it can be cleaned
+    # up or handed back to selector recovery.
+    _status_clause = (
+        "AND ("
+        "status IN ("
+        "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
+        "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
+        ") OR ("
+        "status = 'PENDING_TRIGGER' AND ("
+        "  NULLIF(BTRIM(COALESCE(broker_order_id,'')), '') IS NOT NULL"
+        "  OR submitted_ts IS NOT NULL"
+        "  OR NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NOT NULL"
+        ")"
+        ")) "
+    )
+
     def _fn():
         with conn() as c:
             mode = str(execution_mode or "").strip().lower()
@@ -806,26 +824,24 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
                     "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
-                    "AND status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (client_id, mode, limit))
+                    + _status_clause
+                    + "ORDER BY created_ts DESC LIMIT %s",
+                    (client_id, mode, limit),
+                )
             elif client_id:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
-                    "AND status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
+                    + _status_clause
+                    + "ORDER BY created_ts DESC LIMIT %s",
+                    (client_id, limit),
+                )
             else:
                 c.execute(
-                    "SELECT * FROM orders WHERE status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (limit,))
+                    "SELECT * FROM orders WHERE "
+                    + _status_clause.removeprefix("AND ")
+                    + "ORDER BY created_ts DESC LIMIT %s",
+                    (limit,),
+                )
             return c.fetchall()
     return run_with_retry(_fn)
 
@@ -860,9 +876,10 @@ def get_open_orders_with_invalid_execution_mode(client_id: str,
 def get_stale_pending_trigger_orders(client_id: str, older_than_hours: int = 8) -> list[dict]:
     """Find ENTRY orders stuck in PENDING_TRIGGER longer than threshold.
 
-    PENDING_TRIGGER orders have not reached the broker and normally have no
-    broker_order_id, so they should NOT be included in broker polling via
-    get_open_orders_for_reconcile().
+    Ordinary PENDING_TRIGGER watcher plans have not reached the broker and
+    normally have no broker_order_id. Evidence-bearing rows are now included
+    in get_open_orders_for_reconcile() so canonical adoption/reconciliation
+    can own them before any cleanup decision.
 
     This helper exists so reconciler/health/admin tooling can detect leaked
     watcher/queue orders that may reserve capital forever.

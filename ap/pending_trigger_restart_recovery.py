@@ -55,6 +55,7 @@ class _RowOutcome:
     WATCHER_OWNED = "WATCHER_OWNED"
     RETRY_OWNED   = "RETRY_OWNED"
     REARM_OWNED   = "REARM_OWNED"
+    BROKER_OWNED  = "BROKER_OWNED"
     TERMINALIZED  = "TERMINALIZED"
     UNRESOLVED    = "UNRESOLVED"
     SKIPPED       = "SKIPPED"   # NOT_PENDING_TRIGGER (already resolved)
@@ -1187,7 +1188,12 @@ class PendingTriggerRestartRecovery:
         }
 
     def _adopt_existing_broker_order(
-        self, local_oid: str, row: dict, broker_order: dict
+        self,
+        local_oid: str,
+        row: dict,
+        broker_order: dict,
+        *,
+        outcome: str = _RowOutcome.SKIPPED,
     ) -> str:
         """Adopt exact broker ownership and hand fill authority to the monitor."""
         transition = getattr(self.osm, "transition", None)
@@ -1295,7 +1301,7 @@ class PendingTriggerRestartRecovery:
         ):
             self._mark_failure(local_oid, "broker_adoption_durable_identity_missing")
             return _RowOutcome.UNRESOLVED
-        return _RowOutcome.SKIPPED
+        return outcome
 
     def _prebroker_position_truth(
         self, row: dict, *, signal_id: str, local_oid: str
@@ -1900,22 +1906,181 @@ class PendingTriggerRestartRecovery:
             else _RowOutcome.UNRESOLVED
         )
 
+    def _lookup_durable_broker_order(
+        self, row: dict, local_oid: str
+    ) -> tuple[str, Optional[dict], str]:
+        """Verify the broker order named by a corrupt PENDING_TRIGGER row.
+
+        A persisted broker id is ownership evidence, not broker truth.  The
+        order must still be present in the account listing and match the
+        durable OCC/side/quantity identity before the row can cross into the
+        canonical SUBMITTED lifecycle.
+        """
+        if str(row.get("kind") or "").strip().upper() != "ENTRY":
+            return "HOLD", None, "broker_order_kind_not_entry"
+        if str(row.get("local_order_id") or "").strip() != local_oid:
+            return "HOLD", None, "broker_order_local_identity_mismatch"
+        if str(row.get("client_id") or "").strip().lower() != self.client_id.lower():
+            return "HOLD", None, "broker_order_client_identity_mismatch"
+        if str(row.get("execution_mode") or "").strip().lower() != self.execution_mode:
+            return "HOLD", None, "broker_order_mode_identity_mismatch"
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return "HOLD", None, "broker_order_status_not_pending_trigger"
+
+        expected_id = str(row.get("broker_order_id") or "").strip()
+        if not expected_id:
+            return "HOLD", None, "broker_order_id_missing"
+        matches: list[dict] = []
+        get_order = getattr(self.broker, "get_order", None)
+        if callable(get_order):
+            try:
+                direct = get_order(expected_id)
+            except Exception as exc:
+                return "HOLD", None, f"broker_order_lookup_failed:{type(exc).__name__}"
+            if isinstance(direct, dict):
+                direct = dict(direct)
+                direct_id = str(
+                    direct.get("id") or direct.get("order_id") or ""
+                ).strip()
+                if direct_id and direct_id != expected_id:
+                    return "HOLD", None, "broker_order_id_response_mismatch"
+                direct.setdefault("id", expected_id)
+                matches.append(direct)
+
+        if not matches:
+            list_orders = getattr(self.broker, "list_orders", None)
+            if not callable(list_orders):
+                return "HOLD", None, "broker_order_lookup_unavailable"
+            try:
+                broker_orders = list_orders()
+            except Exception as exc:
+                return "HOLD", None, f"broker_order_lookup_failed:{type(exc).__name__}"
+            if not isinstance(broker_orders, list):
+                return "HOLD", None, "broker_order_listing_malformed"
+            for broker_order in broker_orders:
+                if not isinstance(broker_order, dict):
+                    return "HOLD", None, "broker_order_listing_malformed"
+                remote_id = str(
+                    broker_order.get("id") or broker_order.get("order_id") or ""
+                ).strip()
+                if remote_id == expected_id:
+                    matches.append(broker_order)
+        if len(matches) != 1:
+            return "HOLD", None, "broker_order_id_not_found_or_ambiguous"
+
+        remote = matches[0]
+        remote_side = str(remote.get("side") or "").strip().lower().replace("-", "_")
+        if remote_side != "buy_to_open":
+            return "HOLD", None, "broker_order_side_mismatch"
+        expected_qty = _strict_positive_int(
+            row.get("qty")
+            if row.get("qty") is not None
+            else row.get("quantity")
+            if row.get("quantity") is not None
+            else (_strict_recovery_meta(row) or {}).get("selected_qty")
+        )
+        remote_qty = _strict_broker_quantity(remote.get("quantity"))
+        if expected_qty is None or remote_qty != expected_qty:
+            return "HOLD", None, "broker_order_quantity_mismatch"
+
+        contract, contract_reason = _validated_broker_occ_contract(row, remote)
+        if contract is None:
+            return "HOLD", None, contract_reason
+        durable_contract = "".join(str(row.get("contract") or "").upper().split())
+        if durable_contract and not durable_contract.startswith("DEFERRED:"):
+            if (
+                _BROKER_OCC_CONTRACT_RE.fullmatch(durable_contract) is None
+                or durable_contract != contract
+            ):
+                return "HOLD", None, "broker_order_contract_identity_mismatch"
+
+        meta = _strict_recovery_meta(row)
+        if meta is None:
+            return "HOLD", None, "broker_order_metadata_malformed"
+        durable_tag = str(meta.get("broker_submit_key") or "").strip()
+        remote_tag = str(remote.get("tag") or "").strip()
+        if durable_tag and remote_tag:
+            if canonical_broker_submit_key(durable_tag) != remote_tag:
+                return "HOLD", None, "broker_order_submit_tag_mismatch"
+        return "MATCH", remote, "broker_order_identity_verified"
+
+    def _adopt_durable_broker_order(self, row: dict, local_oid: str) -> str:
+        """Adopt a broker-owned PENDING_TRIGGER row without another POST."""
+        disposition, broker_order, reason = self._lookup_durable_broker_order(
+            row, local_oid
+        )
+        if disposition != "MATCH" or not isinstance(broker_order, dict):
+            self._mark_failure(local_oid, f"broker_adoption:{reason}")
+            log.critical(
+                "RESTART_RECOVERY_BROKER_OWNERSHIP_HOLD local=%s reason=%s — "
+                "leaving PENDING_TRIGGER unchanged",
+                local_oid,
+                reason,
+            )
+            return _RowOutcome.UNRESOLVED
+        return self._adopt_existing_broker_order(
+            local_oid,
+            row,
+            broker_order,
+            outcome=_RowOutcome.BROKER_OWNED,
+        )
+
+    def _retain_ambiguous_broker_ownership(
+        self, local_oid: str, *, owner: str, reason: str
+    ) -> str:
+        """Retain ownership when broker evidence cannot be completed."""
+        retain = getattr(self.osm, "retain_recovery_ownership_if_no_watcher", None)
+        if callable(retain):
+            try:
+                if bool(
+                    retain(
+                        local_oid,
+                        recovery_owner=str(owner).strip(),
+                        reason=reason,
+                        recovery_retention_mode=self.execution_mode.upper(),
+                    )
+                ):
+                    self._mark_retry_subtype(local_oid, _RETRY_WATCHER)
+                    return _RowOutcome.RETRY_OWNED
+            except Exception as exc:
+                log.warning(
+                    "RESTART_RECOVERY_BROKER_OWNERSHIP_RETENTION_FAILED "
+                    "local=%s owner=%s reason=%s error=%s",
+                    local_oid,
+                    owner,
+                    reason,
+                    type(exc).__name__,
+                )
+        self._mark_failure(local_oid, f"broker_ownership_retention_failed:{reason}")
+        return _RowOutcome.UNRESOLVED
+
     def _route_durable_submit_intent_if_present(
         self, row: dict, local_oid: str
     ) -> Optional[str]:
-        """Route PENDING_TRIGGER submit-intent rows to broker reconciliation."""
-        meta = _strict_recovery_meta(row)
-        if meta is None or not str(meta.get("submit_intent_at") or "").strip():
-            return None
+        """Route every broker-evidence PENDING_TRIGGER row to an owner."""
         if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
             return None
 
-        # A broker id/timestamp already establishes the accepted boundary; do
-        # not re-enter the pre-broker classifier for an inconsistent row.
-        if str(row.get("broker_order_id") or "").strip() or row.get("submitted_ts"):
-            return _RowOutcome.SKIPPED
+        broker_order_id = str(row.get("broker_order_id") or "").strip()
+        submitted_ts_present = bool(row.get("submitted_ts"))
+        meta = _strict_recovery_meta(row)
+        submit_intent_present = bool(
+            meta is not None and str(meta.get("submit_intent_at") or "").strip()
+        )
+        if broker_order_id:
+            # A durable broker id is already past the pre-broker boundary. It
+            # must be verified and adopted, never reported as an ordinary skip.
+            return self._adopt_durable_broker_order(row, local_oid)
+        if not submitted_ts_present and not submit_intent_present:
+            return None
 
         owner = f"prebroker_recovery:{self.client_id}:{self.execution_mode}:{local_oid}"
+        if meta is None:
+            return self._retain_ambiguous_broker_ownership(
+                local_oid,
+                owner=owner,
+                reason="PENDING_TRIGGER_BROKER_EVIDENCE_METADATA_MALFORMED",
+            )
         return self._consume_reconcile_broker_intent(
             row,
             local_oid,
@@ -2077,7 +2242,10 @@ class PendingTriggerRestartRecovery:
                     != expected_generation
                 )
             )
-            or not after_meta.get("submit_intent_at")
+            or not (
+                str(after_meta.get("submit_intent_at") or "").strip()
+                or str(after.get("submitted_ts") or "").strip()
+            )
         ):
             self._mark_failure(local_oid, "reconcile_broker_intent_state_mismatch")
             return _RowOutcome.UNRESOLVED
@@ -2150,8 +2318,15 @@ class PendingTriggerRestartRecovery:
                         )
                     ):
                         return _RowOutcome.RETRY_OWNED
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning(
+                        "RESTART_RECOVERY_BROKER_INTENT_RETENTION_FAILED "
+                        "local=%s owner=%s reason=%s error=%s",
+                        local_oid,
+                        owner,
+                        reason,
+                        type(exc).__name__,
+                    )
 
         self._mark_failure(
             local_oid,
@@ -3141,6 +3316,7 @@ def _build_summary(
             _RowOutcome.WATCHER_OWNED,
             _RowOutcome.RETRY_OWNED,
             _RowOutcome.REARM_OWNED,
+            _RowOutcome.BROKER_OWNED,
             _RowOutcome.TERMINALIZED,
             _RowOutcome.SKIPPED,
         }
@@ -3162,6 +3338,7 @@ def _build_summary(
             1 for v in retry_subtypes.values() if v == _RETRY_WATCHER
         ),
         "rearm_rows_owned":                 _all.count(_RowOutcome.REARM_OWNED),
+        "broker_owned_count":               _all.count(_RowOutcome.BROKER_OWNED),
         "terminalized":                     _all.count(_RowOutcome.TERMINALIZED),
         "terminalized_count":               _all.count(_RowOutcome.TERMINALIZED),
         "skipped_not_pending_trigger":      _all.count(_RowOutcome.SKIPPED),
@@ -3187,11 +3364,12 @@ def _emit_summary(summary: dict) -> None:
     log.info(
         "PENDING_TRIGGER_RESTART_RECOVERY_SUMMARY "
         "client=%s mode=%s examined=%d "
-        "rearmed=%d retry=%d terminalized=%d skipped=%d "
+        "rearmed=%d retry=%d broker_owned=%d terminalized=%d skipped=%d "
         "unresolved=%d ownerless=%d",
         summary["client_id"], summary["execution_mode"],
         summary["rows_examined"],
         summary["watchers_rearmed"], summary["retry_rows_owned"],
+        summary["broker_owned_count"],
         summary["terminalized"], summary["skipped_not_pending_trigger"],
         summary["unresolved_cleanup_failures"],
         summary["ownerless_rows_remaining"],
