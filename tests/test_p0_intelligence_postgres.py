@@ -62,11 +62,12 @@ def _database(monkeypatch):
     monkeypatch.setattr("ap.intelligence_snapshot_store._run_with_retry", lambda fn: fn())
 
 
-def _enqueue(input_hash):
+def _enqueue(input_hash, *, phase="PRETRIGGER", local_order_id=""):
     from ap.intelligence_snapshot_store import enqueue_intelligence_job
     return enqueue_intelligence_job(
         client_id="client@example.com", execution_mode="PAPER",
-        canonical_signal_id="canon-1", signal_id="signal-1", phase="PRETRIGGER",
+        canonical_signal_id="canon-1", signal_id="signal-1", phase=phase,
+        local_order_id=local_order_id,
         profile_version="profile-1", input_hash=input_hash,
         payload={"signal": {"ticker": "SPY"}},
     )
@@ -136,3 +137,17 @@ def test_real_postgres_expired_owner_cannot_complete():
     with _conn() as c:
         c.execute("SELECT COUNT(*)::int AS count FROM ap_intelligence_snapshots")
         assert c.fetchone()["count"] == 0
+
+
+def test_real_postgres_breach_phase_uses_existing_identity_and_claim_fence():
+    result = _enqueue("breach-hash", phase="BREACH", local_order_id="order-1")
+    assert result["ok"] and result["inserted"]
+    from ap.intelligence_snapshot_store import claim_due_intelligence_jobs
+    claimed = claim_due_intelligence_jobs(
+        claim_owner="breach-owner", client_id="client@example.com",
+        execution_mode="PAPER", limit=1,
+    )
+    assert claimed["ok"] is True
+    assert len(claimed["jobs"]) == 1
+    assert claimed["jobs"][0]["phase"] == "BREACH"
+    assert claimed["jobs"][0]["local_order_id"] == "order-1"

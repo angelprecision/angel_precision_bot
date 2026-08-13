@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -336,3 +337,43 @@ def test_execution_core_split_brain_with_broker_id_preserves_broker_identity(mon
     assert result["broker_order_id"] == "TR-123"
     osm.cancel_pending_entry.assert_not_called()
     osm.expire_pending_entry.assert_not_called()
+
+
+def test_execution_core_freezes_breach_before_existing_submit_path(monkeypatch):
+    core, osm = _execution_core(monkeypatch, {
+        "ok": False,
+        "local_order_id": "oid-1",
+        "reconciliation_required": True,
+        "error": "BROKER_AMBIGUOUS_READ_TIMEOUT_RECONCILIATION_REQUIRED",
+    })
+    captured = {}
+
+    def capture(signal, **kwargs):
+        captured["signal"] = signal
+        captured["kwargs"] = kwargs
+        return {"ok": True, "accepted": True}
+
+    monkeypatch.setattr(
+        "ap.intelligence_context_handoff.enqueue_breach_context_best_effort", capture
+    )
+    watched = _submit_ready_watched_signal()
+    watched.signal["execution_mode"] = "paper"
+    watched.trigger_crossed_at = datetime(2026, 7, 14, 13, 30, tzinfo=timezone.utc)
+    watched.triggered_at = datetime(2026, 7, 14, 13, 30, 2, tzinfo=timezone.utc)
+    watched.breach_price = 600.25
+    watched.first_breach_bid = 600.20
+    watched.first_breach_ask = 600.25
+    watched.last_quote_bid = 600.20
+    watched.last_quote_ask = 600.25
+
+    result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+
+    assert result["disposition"] == "RECONCILE_BROKER_INTENT"
+    assert captured["kwargs"]["local_order_id"] == "oid-1"
+    assert captured["kwargs"]["execution_mode"] == "PAPER"
+    frozen = captured["signal"]
+    assert frozen["trigger_source"] == "watcher_confirmed_breach"
+    assert frozen["trigger_crossed_at"] == "2026-07-14T13:30:00+00:00"
+    assert frozen["underlying_price"] == 600.25
+    assert "_approved_plan" not in frozen
+    assert osm.submit_existing_entry.call_count == 1

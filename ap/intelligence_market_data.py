@@ -228,6 +228,40 @@ def _age_seconds(value: Any, *, now: datetime) -> Optional[int]:
         return None
 
 
+def _parse_as_of(value: Any) -> Optional[datetime]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _frozen_candles_as_of(
+    rows: list[dict[str, Any]], *, as_of: Optional[datetime], bar_minutes: int
+) -> list[dict[str, Any]]:
+    if as_of is None:
+        return list(rows)
+    completed: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            timestamp = datetime.fromisoformat(
+                str(row.get("time") or row.get("timestamp") or "").replace("Z", "+00:00")
+            )
+            if timestamp.tzinfo is None:
+                continue
+            if timestamp.astimezone(timezone.utc) + timedelta(minutes=bar_minutes) <= as_of:
+                completed.append(dict(row))
+        except (TypeError, ValueError):
+            continue
+    return completed
+
+
 def _intraday_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         return {}
@@ -253,43 +287,76 @@ def collect_point_in_time_context(
     signal: dict[str, Any], *, broker: Any = None, phase: str
 ) -> dict[str, Any]:
     """Fetch and normalize evidence for the existing observe-only evaluators."""
+    phase = str(phase or "").upper()
     ticker = str(signal.get("ticker") or signal.get("symbol") or "").strip().upper()
     now_utc = datetime.now(timezone.utc)
+    breach_as_of = _parse_as_of(signal.get("trigger_crossed_at")) if phase == "BREACH" else None
+    evidence_now = breach_as_of or now_utc
     collected_at = now_utc.isoformat()
     errors: list[str] = []
     quote: dict[str, Any] = {}
     daily: list[dict[str, Any]] = []
-    bars_15m: list[dict[str, Any]] = []
+    bars_15m: list[dict[str, Any]] = (
+        extract_candles(signal, "15m") if phase == "BREACH" else []
+    )
+    bars_5m: list[dict[str, Any]] = (
+        extract_candles(signal, "5m") if phase == "BREACH" else []
+    )
+    fetched_15m = False
     market_quote: dict[str, Any] = {}
     sector_quote: dict[str, Any] = {}
-    if broker is not None and ticker:
-        try:
-            quote = _quote(ticker, broker)
-        except Exception as exc:
-            errors.append(f"underlying_quote:{type(exc).__name__}")
+    breach_timestamp_valid = phase != "BREACH" or breach_as_of is not None
+    # BREACH must not turn a later worker run into a future quote/market-state
+    # authority. Its exact quote is frozen by the callback; only historical
+    # bars are requested at the crossed timestamp. PRETRIGGER/PREOPEN retain
+    # their existing current-context behavior.
+    if broker is not None and ticker and breach_timestamp_valid:
+        if phase != "BREACH":
+            try:
+                quote = _quote(ticker, broker)
+            except Exception as exc:
+                errors.append(f"underlying_quote:{type(exc).__name__}")
         try:
             daily = _history(ticker, broker)
         except Exception as exc:
             errors.append(f"daily_history:{type(exc).__name__}")
         try:
             from ap.fvg_telemetry import fetch_15m_bars
-            bars_15m = fetch_15m_bars(ticker, broker)
+            fetched = fetch_15m_bars(
+                ticker, broker, now=evidence_now if phase == "BREACH" else None
+            )
+            if fetched:
+                bars_15m = fetched
+                fetched_15m = True
         except Exception as exc:
             errors.append(f"intraday_history:{type(exc).__name__}")
-        try:
-            market_quote = _quote(str(signal.get("market_symbol") or "SPY"), broker)
-        except Exception as exc:
-            errors.append(f"market_quote:{type(exc).__name__}")
-        sector_symbol = str(signal.get("sector_etf") or "").strip().upper()
-        if sector_symbol:
+        if phase != "BREACH":
             try:
-                sector_quote = _quote(sector_symbol, broker)
+                market_quote = _quote(str(signal.get("market_symbol") or "SPY"), broker)
             except Exception as exc:
-                errors.append(f"sector_quote:{type(exc).__name__}")
+                errors.append(f"market_quote:{type(exc).__name__}")
+            sector_symbol = str(signal.get("sector_etf") or "").strip().upper()
+            if sector_symbol:
+                try:
+                    sector_quote = _quote(sector_symbol, broker)
+                except Exception as exc:
+                    errors.append(f"sector_quote:{type(exc).__name__}")
 
-    candles_1h = _completed_intraday(bars_15m, bucket_minutes=60, now=now_utc) if bars_15m else []
-    candles_4h = _completed_intraday(bars_15m, bucket_minutes=240, now=now_utc) if bars_15m else []
-    today_et = now_utc.astimezone(ET).date().isoformat()
+    bars_15m = (
+        _frozen_candles_as_of(bars_15m, as_of=breach_as_of, bar_minutes=15)
+        if breach_timestamp_valid else []
+    )
+    bars_5m = (
+        _frozen_candles_as_of(bars_5m, as_of=breach_as_of, bar_minutes=5)
+        if breach_timestamp_valid else []
+    )
+    candles_15m = (
+        _completed_intraday(bars_15m, bucket_minutes=15, now=evidence_now)
+        if bars_15m else []
+    )
+    candles_1h = _completed_intraday(bars_15m, bucket_minutes=60, now=evidence_now) if bars_15m else []
+    candles_4h = _completed_intraday(bars_15m, bucket_minutes=240, now=evidence_now) if bars_15m else []
+    today_et = evidence_now.astimezone(ET).date().isoformat()
     completed_daily = [row for row in daily if str(row.get("time") or "")[:10] < today_et]
     metrics = _intraday_metrics(bars_15m)
     observed_price = _quote_price(quote)
@@ -301,14 +368,17 @@ def collect_point_in_time_context(
         "source_timestamp": str(source_timestamp) if observed_price is not None else None,
         "age_seconds": _age_seconds(source_timestamp, now=now_utc) if observed_price is not None else None,
     }
+    candles = {
+        "monthly": _aggregate_calendar(completed_daily, "monthly", now=evidence_now),
+        "weekly": _aggregate_calendar(completed_daily, "weekly", now=evidence_now),
+        "daily": completed_daily,
+        "4h": candles_4h,
+        "1h": candles_1h,
+    }
+    if phase == "BREACH":
+        candles.update({"15m": candles_15m, "5m": bars_5m})
     data_sources = {
-        "candles": {
-            "monthly": _aggregate_calendar(completed_daily, "monthly", now=now_utc),
-            "weekly": _aggregate_calendar(completed_daily, "weekly", now=now_utc),
-            "daily": completed_daily,
-            "4h": candles_4h,
-            "1h": candles_1h,
-        },
+        "candles": candles,
         "trend": {"vwap": metrics.get("vwap"), "current_price": observed_price},
         "volume": {"relative_volume": metrics.get("relative_volume")},
         "market": {
@@ -320,15 +390,29 @@ def collect_point_in_time_context(
             "change_pct": _quote_change_pct(sector_quote),
         },
     }
-    return {
-        "phase": str(phase).upper(), "collected_at": collected_at,
+    intraday_source = (
+        "tradier_timesales_15min" if fetched_15m
+        else "frozen_signal_15m" if phase == "BREACH" and bars_15m else None
+    )
+    result = {
+        "phase": phase, "collected_at": collected_at,
+        "as_of": breach_as_of.isoformat() if breach_as_of else None,
         "data_sources": data_sources, "underlying_observation": observation,
         "errors": errors,
         "provenance": {
             "quote": "tradier_quote" if quote else None,
             "daily": "tradier_history_daily" if daily else None,
-            "intraday": "tradier_timesales_15min" if bars_15m else None,
+            "intraday": intraday_source,
             "market": "tradier_quote" if market_quote else None,
             "sector": "tradier_quote" if sector_quote else None,
         },
     }
+    if phase == "BREACH":
+        result["provenance"].update({
+            "fifteen_minute": (
+                "tradier_timesales_15min" if fetched_15m
+                else "frozen_signal_15m" if candles_15m else None
+            ),
+            "five_minute": "frozen_signal_5min" if bars_5m else None,
+        })
+    return result

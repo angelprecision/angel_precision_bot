@@ -2,13 +2,20 @@
 
 ## Status
 
-**DRAFT / HARD HOLD. IMPLEMENTATION CONTRACT ONLY. DO NOT MERGE OR DEPLOY THIS DOCS-ONLY PR AS A FIX.**
+**DRAFT / HARD HOLD. Observe-only implementation amendment. DO NOT MERGE OR DEPLOY as LIVE authority.**
 
-Base: `main@5284edbdc7af845a634314dc3348cb50f3f846e0`.
+Base: `main@3ac102dab320007409107ad36cc9494897d2799e`.
 
 This is PR 3 in the profitability-intelligence repair stack.
 
 It rebuilds the useful concept from reverted PR #330 on **current main**, but does not reuse or cherry-pick the stale branch. The new implementation must start from the current watcher/execution lifecycle and must remain **observe-only** in its first version.
+
+The implementation amendment is intentionally limited to the existing confirmed-breach
+callback, the bounded intelligence handoff/materializer, and restart backfill. It does
+not change watcher qualification, retry counters, selector/materialization authority,
+broker submission, cancellation, positions, proof trades, or queue lifecycle. Current
+main has no canonical broker-backed 5m source, so BREACH records that component as
+missing unless a frozen 5m field is already present; it is never fabricated from 15m.
 
 ## Objective
 
@@ -185,7 +192,10 @@ This component must be deterministic and point-in-time.
 
 ### 5. 5m confirmation
 
-Add a canonical 5m source specifically for breach quality.
+The current-main implementation does not add a new broker-backed 5m transport.
+At BREACH it consumes only completed frozen 5m bars already present in the
+callback envelope. If they are absent, the component is explicitly `MISSING`.
+It is never fabricated from 15m data or fetched with a later timestamp.
 
 Required examples of positive CALL evidence:
 
@@ -358,6 +368,29 @@ The implementation PR must trace and document the exact current-main call path:
 
 Do not rely on stale #330 line numbers or method assumptions.
 
+### Changed-line caller/downstream trace
+
+| Changed seam | Caller | Validation / state read | Authority | Mutation | Return / downstream consumer |
+|---|---|---|---|---|---|
+| `_on_entry_trigger` BREACH handoff | Confirmed `APEntryWatcher` callback | Existing callback ownership, mode, client, approved plan, and durable order identity | Existing breach gates and selector remain authoritative | Bounded async intelligence enqueue only | Handoff result is telemetry; existing selector/materializer and OSM path continue |
+| `enqueue_breach_context_best_effort` / `enqueue_breach_context` | Execution core or restart recovery | Exact client/mode/signal/canonical/local identity, timestamps, generation, retry fields | Resolved duplicate authorities; ambiguity rejects | Append-only `BREACH` job | Accepted/duplicate/error is consumed by worker; no order consumer |
+| `build_snapshot_kwargs` | Deferred intelligence worker | Claimed job fence plus job-column/payload identity parity and point-in-time signal | Frozen breach timestamp and resolved identity | Builds snapshot payload; completion store remains separate | `complete_job_with_snapshot` writes snapshot before job completion |
+| `collect_point_in_time_context` | BREACH snapshot materializer | Frozen timestamp and completed-bar boundary | Frozen callback quote; historical bars only | No order, broker, position, proof, or queue mutation | Evidence components feed the observe-only snapshot |
+| `recover_missing_intelligence_jobs` | Periodic intelligence worker recovery | Durable pending-trigger order status, no broker id, meta/payload contradiction checks | Order columns/meta plus queue payload | Enqueues missing intelligence job only | Worker claims/materializes or records `breach_errors` |
+
+## Runtime / restart / deferred-materializer parity
+
+The three consumers resolve the same frozen identity and fail closed on the same
+ambiguous authority. The intelligence handoff is never an execution gate.
+
+| Scenario | Execution core | Restart recovery | Deferred materializer |
+|---|---|---|---|
+| Worker env unset | No BREACH handoff; existing entry path unchanged | No BREACH backfill worker runs | No BREACH job is claimed |
+| Valid `PAPER`/`LIVE` | Uppercase mode plus exact client/signal/canonical/local identity is handed off | Same values come from order columns/meta and queue payload | Same job identity is used for the point-in-time snapshot |
+| Conflicting mode, identity, timestamp, generation, or retry authority | Handoff is telemetry-only and cannot gate selector/broker work | No BREACH job is inserted; error is counted | No BREACH evidence is materialized |
+| Ownership loss or missing fence generation | Existing callback retains/returns ownership disposition; no intelligence mutation is required | Durable row is not converted into a new execution authority | No broker or order mutation; only the intelligence job transition may retry/terminalize |
+| Persistence failure | Existing selector/broker path continues | Backfill reports `breach_errors` | Snapshot completion does not mark the job complete |
+
 ## Scope budget
 
 Expected production files:
@@ -405,6 +438,6 @@ Only after that dataset exists should we decide which breach-quality features de
 
 ## Release verdict
 
-Current state: **HARD HOLD — docs only.**
+Current state: **HARD HOLD — observe-only evidence capture only.**
 
 Implementation remains observe-only until holdout evidence demonstrates ranking lift / profitability separation.
