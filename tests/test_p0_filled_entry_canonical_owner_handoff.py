@@ -1024,6 +1024,187 @@ def _patch_process_side_effects(monkeypatch, events):
     monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
 
 
+def test_overfill_is_held_before_osm_or_position_mutation(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {"status": "FILLED", "filled_qty": 2, "avg_fill": 1.46},
+    )
+    transition_calls = []
+    position_calls = []
+
+    class _OSM:
+        def transition(self, *args, **kwargs):
+            transition_calls.append((args, kwargs))
+            return True
+
+        def increment_retry(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *args, **kwargs: position_calls.append((args, kwargs)),
+    )
+
+    fm.process_pending_order(
+        object(),
+        _order(qty=1, status="ACKNOWLEDGED"),
+        osm=_OSM(),
+        pm=SimpleNamespace(),
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
+    )
+
+    assert transition_calls == []
+    assert position_calls == []
+
+
+def test_partial_osm_false_blocks_exit_proof_sync(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {
+            "status": "EXIT_PARTIAL_FILL",
+            "filled_qty": 1,
+            "avg_fill": 1.25,
+        },
+    )
+    sync_calls = []
+
+    class _OSM:
+        def apply_fill_update(self, **_kwargs):
+            return False
+
+        def transition(self, *args, **kwargs):
+            pytest.fail("same-state partial update should use apply_fill_update")
+
+    monkeypatch.setattr(fm, "_sync_exit_price", lambda *args, **kwargs: sync_calls.append(1))
+
+    fm.process_pending_order(
+        object(),
+        _order(
+            kind="EXIT",
+            local_order_id="exit-local-1",
+            broker_order_id="exit-broker-1",
+            position_id="position-1",
+            status="EXIT_PARTIAL_FILL",
+            qty=2,
+            filled_qty=0,
+        ),
+        osm=_OSM(),
+        runtime_execution_mode="live",
+    )
+
+    assert sync_calls == []
+
+
+def test_terminal_osm_false_does_not_release_entry_guards(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {
+            "status": "CANCELED",
+            "filled_qty": 0,
+            "avg_fill": 0.0,
+            "reason": "canceled",
+        },
+    )
+    released = []
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda _order: released.append(1))
+
+    class _OSM:
+        def transition(self, *args, **kwargs):
+            return False
+
+    fm.process_pending_order(
+        object(),
+        _order(status="ACKNOWLEDGED"),
+        osm=_OSM(),
+        runtime_execution_mode="live",
+    )
+
+    assert released == []
+
+
+def test_late_broker_fill_after_local_terminal_status_is_held(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {"status": "FILLED", "filled_qty": 1, "avg_fill": 1.46},
+    )
+    transition_calls = []
+
+    class _OSM:
+        def transition(self, *args, **kwargs):
+            transition_calls.append((args, kwargs))
+            pytest.fail("late fill must not transition a local terminal order")
+
+        def increment_retry(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *args, **kwargs: pytest.fail("late fill must not open a position"),
+    )
+
+    fm.process_pending_order(
+        object(),
+        _order(status="CANCELED"),
+        osm=_OSM(),
+        pm=SimpleNamespace(),
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
+    )
+
+    assert transition_calls == []
+
+
+def test_pair_cancel_false_broker_response_does_not_transition(monkeypatch):
+    from ap import fill_monitor as fm
+    from ap import signal_pair_manager
+
+    class _PairManager:
+        def on_fill(self, **_kwargs):
+            return "opposite-local-1"
+
+    transition_calls = []
+
+    class _OSM:
+        def get_order(self, _local_id):
+            return {"broker_order_id": "opposite-broker-1"}
+
+        def transition(self, *args, **kwargs):
+            transition_calls.append((args, kwargs))
+            return True
+
+    class _Broker:
+        def cancel_order(self, _broker_order_id):
+            return {
+                "ok": False,
+                "status": "unknown",
+                "broker_order_id": "opposite-broker-1",
+            }
+
+    monkeypatch.setattr(signal_pair_manager, "get_pair_manager", lambda: _PairManager())
+    fm._cancel_pair_opposite(
+        _order(direction="CALL"),
+        _Broker(),
+        _OSM(),
+    )
+
+    assert transition_calls == []
+
+
 @pytest.mark.parametrize(
     ("row_mode", "runtime_mode"),
     [
@@ -1102,6 +1283,7 @@ def test_broker_nonfinite_fill_price_holds_before_position_engine_or_broker_muta
     class _Broker:
         def get_order(self, _broker_order_id):
             return {
+                "id": _broker_order_id,
                 "status": "FILLED",
                 "exec_quantity": 1,
                 "avg_fill_price": fill_price,
@@ -1167,6 +1349,7 @@ def test_broker_boolean_fill_price_is_rejected_before_side_effects(
     class _Broker:
         def get_order(self, _broker_order_id):
             return {
+                "id": _broker_order_id,
                 "status": "FILLED",
                 "exec_quantity": 1,
                 "avg_fill_price": fill_price,
@@ -1319,6 +1502,7 @@ def test_malformed_broker_quantity_cannot_authorize_db_only_recovery(
     class _Broker:
         def get_order(self, _broker_order_id):
             return {
+                "id": _broker_order_id,
                 "status": "FILLED",
                 "exec_quantity": malformed_quantity,
                 "avg_fill_price": 1.46,
@@ -1402,6 +1586,7 @@ def test_valid_integral_broker_quantity_remains_fill_truth(monkeypatch, valid_qu
     result = fm.check_order_with_broker(
         SimpleNamespace(
             get_order=lambda _broker_order_id: {
+                "id": _broker_order_id,
                 "status": "FILLED",
                 "exec_quantity": valid_quantity,
                 "avg_fill_price": 1.46,

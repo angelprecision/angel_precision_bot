@@ -628,7 +628,9 @@ class _Broker:
 
     def get_order(self, broker_order_id):
         self.calls.append(str(broker_order_id))
-        return dict(self.raw)
+        payload = dict(self.raw)
+        payload.setdefault("id", broker_order_id)
+        return payload
 
 
 class _RecoveryOSM:

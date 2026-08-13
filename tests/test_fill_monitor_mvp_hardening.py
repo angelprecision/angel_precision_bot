@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 os.environ.setdefault("AP_ENV", "test")
@@ -35,7 +38,9 @@ class _Broker:
         self.session = _Session()
 
     def get_order(self, broker_order_id):
-        return dict(self.raw)
+        payload = dict(self.raw)
+        payload.setdefault("id", broker_order_id)
+        return payload
 
     def get_quote(self, symbol):
         return {"last": 0}
@@ -330,3 +335,76 @@ def test_broker_exit_partial_fill_zero_qty_returns_error_not_exit_partial(monkey
     assert result["filled_qty"] == 0
     assert any(item[0] == "audit" for item in events)
     assert any(item[0] == "event" for item in events)
+
+
+@pytest.mark.parametrize("response_id", [None, "different-broker-order"])
+def test_broker_response_identity_mismatch_is_not_fill_truth(monkeypatch, response_id):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    result = fm.check_order_with_broker(
+        SimpleNamespace(
+            get_order=lambda _broker_order_id: {
+                **({} if response_id is None else {"id": response_id}),
+                "status": "FILLED",
+                "exec_quantity": 1,
+                "avg_fill_price": 1.05,
+            }
+        ),
+        _base_order(direction="CALL", contract="AAPL260626C00195000"),
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_ORDER_ID_MISMATCH"
+    assert result["filled_qty"] == 0
+
+
+def test_broker_fill_anomaly_state_is_not_environment_configurable(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setenv("FILL_MONITOR_ANOMALY_STATUS", "FILLED")
+    assert fm.FILL_ANOMALY_STATUS == "BROKER_FILL_ANOMALY"
+
+
+@pytest.mark.parametrize("raw_status", ["OPEN", "CANCELED", "REJECTED", "EXPIRED"])
+def test_positive_fill_with_non_fill_status_is_held(monkeypatch, raw_status):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    result = fm.check_order_with_broker(
+        SimpleNamespace(
+            get_order=lambda _broker_order_id: {
+                "id": _broker_order_id,
+                "status": raw_status,
+                "exec_quantity": 1,
+                "avg_fill_price": 1.05,
+            }
+        ),
+        _base_order(direction="CALL", contract="AAPL260626C00195000"),
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_FILL_STATUS_QUANTITY_CONFLICT"
+    assert result["filled_qty"] == 0
+
+
+@pytest.mark.parametrize("stop_pct", ["nan", "inf", "-0.1", "1", "2"])
+def test_invalid_standing_stop_percentage_does_not_call_broker(monkeypatch, stop_pct):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setenv("BROKER_STANDING_STOP_PCT", stop_pct)
+    broker_calls = []
+    broker = SimpleNamespace(
+        place_stop_order=lambda **kwargs: broker_calls.append(kwargs),
+    )
+    result = fm._place_standing_stop_best_effort(
+        broker=broker,
+        order=_base_order(),
+        qty=1,
+        entry_price=1.05,
+    )
+
+    assert result["outcome"] == "FAILED"
+    assert broker_calls == []
