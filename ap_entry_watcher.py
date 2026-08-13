@@ -3394,6 +3394,7 @@ class APEntryWatcher:
         recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False,
         materialization_resume: bool = False,
+        entry_efficiency_resume: bool = False,
         registration_provenance_out: Optional[dict] = None,
     ) -> bool:
         """Plan-aware entrypoint called by queue/execution orchestration.
@@ -3436,7 +3437,15 @@ class APEntryWatcher:
         # can suppress its own cancel_pending_entry calls.
         _recovery_rearm    = bool(recovery_rearm)
         _materialization_resume = bool(materialization_resume)
+        _entry_efficiency_resume = bool(entry_efficiency_resume)
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
+        if _entry_efficiency_resume and not _recovery_rearm:
+            log.critical(
+                "[%s] ENTRY_EFFICIENCY_RESUME_REQUIRES_RECOVERY_REARM "
+                "local_order_id=%s",
+                getattr(plan, "ticker", "?"), local_order_id,
+            )
+            return False
         _plan_metadata = getattr(plan, "metadata", None) or {}
         if not isinstance(_plan_metadata, dict):
             _plan_metadata = {}
@@ -3567,6 +3576,8 @@ class APEntryWatcher:
             signal_dict["__recovery_rearm"] = True
         if _materialization_resume:
             signal_dict["__materialization_resume"] = True
+        if _entry_efficiency_resume:
+            signal_dict["__entry_efficiency_resume"] = True
         if _recovery_rearm and _materialization_resume:
             _plan_meta_for_adopt = getattr(plan, "metadata", None) or {}
             _adopt_fn = getattr(
@@ -3609,7 +3620,7 @@ class APEntryWatcher:
                 )
                 return False
 
-        if _recovery_rearm and not _materialization_resume:
+        if _recovery_rearm and not _materialization_resume and not _entry_efficiency_resume:
             try:
                 from ap.pending_trigger_classifier import (
                     PendingTriggerClassification,
@@ -4106,6 +4117,7 @@ class APEntryWatcher:
             and trigger
             and float(trigger or 0) > 0
             and not _materialization_resume
+            and not _entry_efficiency_resume
         ):
             try:
                 _bug_c_quote = self._get_quote(ticker) or {}
@@ -4399,6 +4411,7 @@ class APEntryWatcher:
             signal_dict.pop("__watcher_rearm_pending", None)
             signal_dict.pop("__watcher_rearm_reason", None)
             signal_dict.pop("__recovery_rearm", None)
+            signal_dict.pop("__entry_efficiency_resume", None)
         if not ok:
             # add_signal already logged the audit for locked-path blocks (dedup/opposite/same-side).
             # Attempt a best-effort DB persist here using the full signal context available in watch().

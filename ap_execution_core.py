@@ -73,24 +73,20 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
             signal.get("execution_mode"),
             signal.get("mode"),
         ])
-    if runtime_mode is not None:
-        explicit_values.append(runtime_mode)
-    if paper_flag is not None:
-        if not isinstance(paper_flag, bool):
-            return None
-        explicit_values.append("paper" if paper_flag else "live")
-
-    normalized_values = []
     for raw_value in explicit_values:
-        if raw_value is None or raw_value == "":
+        if not str(raw_value or "").strip():
             continue
         normalized = _normalize_execution_mode(raw_value)
         if normalized is None:
             return None
-        normalized_values.append(normalized)
-    if not normalized_values or len(set(normalized_values)) != 1:
-        return None
-    return normalized_values[0]
+        return normalized
+
+    runtime_normalized = _normalize_execution_mode(runtime_mode)
+    if runtime_normalized is not None:
+        return runtime_normalized
+    if isinstance(paper_flag, bool):
+        return "paper" if paper_flag else "live"
+    return None
 
 
 def _resolve_entry_efficiency_execution_mode(
@@ -108,9 +104,19 @@ def _resolve_entry_efficiency_execution_mode(
     signal_mode = _normalize_execution_mode(signal.get("execution_mode"))
     if signal_mode is None:
         return None
-    if _resolve_submit_execution_mode(
-        approved_plan, signal, runtime_mode, paper_flag
-    ) != signal_mode:
+
+    signal_modes = []
+    for raw_value in (
+        signal.get("execution_mode"),
+        signal.get("mode"),
+    ):
+        if not str(raw_value or "").strip():
+            continue
+        normalized = _normalize_execution_mode(raw_value)
+        if normalized is None:
+            return None
+        signal_modes.append(normalized)
+    if not signal_modes or any(mode != signal_mode for mode in signal_modes):
         return None
 
     plan_modes = []

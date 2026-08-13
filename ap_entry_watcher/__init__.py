@@ -796,6 +796,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def watch(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        entry_efficiency_resume: bool = False,
         registration_provenance_out: dict | None = None,
     ) -> bool:
         current_call = _CALL_RESULT.get()
@@ -806,6 +807,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                entry_efficiency_resume=entry_efficiency_resume,
                 registration_provenance_out=registration_provenance_out,
             )
         token = _CALL_RESULT.set(_CallResult(id(self)))
@@ -816,6 +818,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                entry_efficiency_resume=entry_efficiency_resume,
                 registration_provenance_out=registration_provenance_out,
             )
         finally:
@@ -824,6 +827,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def _watch_impl(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        entry_efficiency_resume: bool = False,
         registration_provenance_out: dict | None = None,
     ) -> bool:
         if registration_provenance_out is not None:
@@ -856,13 +860,15 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             normalized_plan = plan
         except Exception:
             normalized_plan = _SideNormalizedPlan(plan, side)
-        return super().watch(
-            normalized_plan, local_order_id,
-            recovery_rearm=recovery_rearm,
-            no_cancel_on_reject=no_cancel_on_reject,
-            materialization_resume=materialization_resume,
-            registration_provenance_out=registration_provenance_out,
-        )
+        watch_kwargs = {
+            "recovery_rearm": recovery_rearm,
+            "no_cancel_on_reject": no_cancel_on_reject,
+            "materialization_resume": materialization_resume,
+            "registration_provenance_out": registration_provenance_out,
+        }
+        if entry_efficiency_resume:
+            watch_kwargs["entry_efficiency_resume"] = True
+        return super().watch(normalized_plan, local_order_id, **watch_kwargs)
 
     def watch_with_result(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
