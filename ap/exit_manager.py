@@ -344,6 +344,7 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 20.0):
                     contract=pos["contract"],
                     qty=int(pos["qty"]),
                     limit_price=None,
+                    execution_mode=mode,
                 )
 
                 ok, broker_order_id, err = submit_exit_order(broker, pos, reason)

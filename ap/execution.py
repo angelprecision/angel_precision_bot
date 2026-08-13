@@ -1525,6 +1525,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             qty=qty,
             limit_price=float(submit_limit),
             reserved_cost=float(reserved_cost),
+            execution_mode=mode,
             meta=_meta,
         )
 
