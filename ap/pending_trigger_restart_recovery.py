@@ -32,11 +32,23 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from ap.logger import get_logger
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    WatchedSignal,
     recovery_trigger_evidence_identity_is_proven,
 )
-from ap.broker_submit_identity import canonical_broker_submit_key
+from ap_entry_efficiency import (
+    ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+    REARM_FOR_REBREACH,
+    READY_NOW,
+    WAIT_CONFIRMATION,
+    entry_efficiency_identity_is_proven,
+    normalize_strategy_pattern,
+    parse_entry_efficiency_generation,
+    parse_entry_efficiency_state,
+    resolve_entry_efficiency_mode,
+)
 from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
@@ -492,6 +504,63 @@ class PendingTriggerRestartRecovery:
         )
         if _prebroker_inflight_outcome is not None:
             return _prebroker_inflight_outcome
+
+        # PR #436: a durable entry-efficiency WAIT/REARM is a live watcher
+        # lifecycle, not generic trigger-ready residue.  Recognize it before
+        # the shared classifier's STUCK_TRIGGER_READY priority so a process
+        # restart cannot terminalize an opportunity that never owned a broker
+        # order.  Any ambiguity stays unresolved; it must never fall through
+        # to cleanup or the pre-breach retry consumer.
+        _efficiency_restart_proof = self._prove_entry_efficiency_restart_wait(
+            row, local_oid, row_client=row_client, row_mode=row_mode,
+        )
+        if _efficiency_restart_proof["disposition"] == "UNPROVEN":
+            _reason = _efficiency_restart_proof.get("reason") or (
+                "entry_efficiency_restart_identity_unproven"
+            )
+            self._mark_failure(local_oid, f"entry_efficiency_restart:{_reason}")
+            log.critical(
+                "RESTART_RECOVERY_ENTRY_EFFICIENCY_WAIT_UNPROVEN local=%s "
+                "reason=%s — preserving exact row without cleanup",
+                local_oid, _reason,
+            )
+            return _RowOutcome.UNRESOLVED
+        if _efficiency_restart_proof["disposition"] == "PROVEN":
+            return self._resume_entry_efficiency_wait(
+                row,
+                local_oid,
+                _efficiency_restart_proof,
+                watcher_owned=watcher_owned,
+                plan_builder_fn=plan_builder_fn,
+            )
+
+        # READY_NOW is not another wait.  It is the crash window immediately
+        # before the existing selector/materialization/submit continuation.
+        # Only a fresh broker order-list proof of zero ownership may enter that
+        # canonical callback; unavailable or ambiguous broker truth remains a
+        # HOLD and is never terminalized as generic trigger-ready residue.
+        _efficiency_ready_proof = self._prove_entry_efficiency_ready_restart(
+            row, local_oid, row_client=row_client, row_mode=row_mode,
+        )
+        if _efficiency_ready_proof["disposition"] == "UNPROVEN":
+            _reason = _efficiency_ready_proof.get("reason") or (
+                "entry_efficiency_ready_restart_identity_unproven"
+            )
+            self._mark_failure(local_oid, f"entry_efficiency_ready_restart:{_reason}")
+            log.critical(
+                "RESTART_RECOVERY_ENTRY_EFFICIENCY_READY_HOLD local=%s "
+                "reason=%s — preserving exact row without cleanup",
+                local_oid, _reason,
+            )
+            return _RowOutcome.UNRESOLVED
+        if _efficiency_ready_proof["disposition"] == "PROVEN_ZERO_BROKER":
+            return self._resume_entry_efficiency_ready(
+                row,
+                local_oid,
+                _efficiency_ready_proof,
+                watcher_owned=watcher_owned,
+                plan_builder_fn=plan_builder_fn,
+            )
 
         _meta_for_classification = _extract_meta(row)
         _watcher_reason = str(
@@ -1907,7 +1976,13 @@ class PendingTriggerRestartRecovery:
         )
 
     def _lookup_durable_broker_order(
-        self, row: dict, local_oid: str
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        allow_submitted: bool = False,
+        force_order_list: bool = False,
+        require_submit_identity: bool = False,
     ) -> tuple[str, Optional[dict], str]:
         """Verify the broker order named by a corrupt PENDING_TRIGGER row.
 
@@ -1924,7 +1999,19 @@ class PendingTriggerRestartRecovery:
             return "HOLD", None, "broker_order_client_identity_mismatch"
         if str(row.get("execution_mode") or "").strip().lower() != self.execution_mode:
             return "HOLD", None, "broker_order_mode_identity_mismatch"
-        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+        allowed_statuses = {"PENDING_TRIGGER"}
+        if allow_submitted:
+            allowed_statuses.update(
+                {
+                    "SUBMITTED",
+                    "ACK",
+                    "ACKNOWLEDGED",
+                    "PARTIAL",
+                    "PARTIAL_FILL",
+                    "FILLED",
+                }
+            )
+        if str(row.get("status") or "").strip().upper() not in allowed_statuses:
             return "HOLD", None, "broker_order_status_not_pending_trigger"
 
         expected_id = str(row.get("broker_order_id") or "").strip()
@@ -1932,7 +2019,7 @@ class PendingTriggerRestartRecovery:
             return "HOLD", None, "broker_order_id_missing"
         matches: list[dict] = []
         get_order = getattr(self.broker, "get_order", None)
-        if callable(get_order):
+        if callable(get_order) and not force_order_list:
             try:
                 direct = get_order(expected_id)
             except Exception as exc:
@@ -1958,7 +2045,19 @@ class PendingTriggerRestartRecovery:
             if not isinstance(broker_orders, list):
                 return "HOLD", None, "broker_order_listing_malformed"
             for broker_order in broker_orders:
-                if not isinstance(broker_order, dict):
+                if not isinstance(broker_order, dict) or not broker_order:
+                    return "HOLD", None, "broker_order_listing_malformed"
+                if require_submit_identity and not any(
+                    str(broker_order.get(key) or "").strip()
+                    for key in (
+                        "id",
+                        "order_id",
+                        "tag",
+                        "client_order_id",
+                        "local_order_id",
+                        "order_local_id",
+                    )
+                ):
                     return "HOLD", None, "broker_order_listing_malformed"
                 remote_id = str(
                     broker_order.get("id") or broker_order.get("order_id") or ""
@@ -2002,6 +2101,20 @@ class PendingTriggerRestartRecovery:
         if durable_tag and remote_tag:
             if canonical_broker_submit_key(durable_tag) != remote_tag:
                 return "HOLD", None, "broker_order_submit_tag_mismatch"
+        if require_submit_identity:
+            expected_submit_key = canonical_broker_submit_key(local_oid)
+            submit_identity = any(
+                str(remote.get(key) or "").strip()
+                in {expected_submit_key, local_oid}
+                for key in (
+                    "tag",
+                    "client_order_id",
+                    "local_order_id",
+                    "order_local_id",
+                )
+            )
+            if not submit_identity:
+                return "HOLD", None, "broker_order_submit_identity_missing_or_mismatch"
         return "MATCH", remote, "broker_order_identity_verified"
 
     def _adopt_durable_broker_order(self, row: dict, local_oid: str) -> str:
@@ -2533,6 +2646,806 @@ class PendingTriggerRestartRecovery:
             prior_attempt=attempt,
             first_failed_at=proof["restart_rearm_first_failed_at"],
         )
+
+    def _prove_entry_efficiency_ready_restart(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        row_client: str,
+        row_mode: str,
+    ) -> dict:
+        """Prove the separate READY-before-selector crash window.
+
+        READY_NOW is admitted only with fresh authoritative broker order-list
+        truth.  A missing broker capability, transport failure, malformed
+        payload, matching tag, or durable position/submit evidence is a HOLD;
+        none of those states permits cleanup or a second POST.
+        """
+        meta = _extract_meta(row)
+        audit = meta.get("watcher_audit")
+        if not isinstance(audit, dict) or str(audit.get("reason_code") or "") != "trigger_ready":
+            return {"disposition": "NOT_CANDIDATE"}
+        state = parse_entry_efficiency_state(
+            meta.get("entry_efficiency_state"), allow_empty=False
+        )
+        if state != "READY_NOW":
+            if str(meta.get("entry_efficiency_state") or "").strip().upper() == READY_NOW:
+                return {
+                    "disposition": "UNPROVEN",
+                    "reason": "malformed_lifecycle_state",
+                }
+            return {"disposition": "NOT_CANDIDATE"}
+
+        def _fail(reason: str) -> dict:
+            return {"disposition": "UNPROVEN", "reason": reason}
+
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return _fail("status_not_pending_trigger")
+        if str(row.get("kind") or row.get("order_kind") or "").strip().upper() != "ENTRY":
+            return _fail("row_not_entry")
+        if row_mode != "paper" or self.execution_mode != "paper":
+            return _fail("execution_mode_not_paper")
+        if meta.get("entry_efficiency_mode") != ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE:
+            return _fail("rollout_mode_not_paper_authoritative")
+        if meta.get("entry_efficiency_authoritative") is not True:
+            return _fail("durable_authority_flag_missing")
+        if resolve_entry_efficiency_mode() != ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE:
+            return _fail("runtime_rollout_not_paper_authoritative")
+
+        pattern = (
+            row.get("pattern")
+            or meta.get("pattern")
+            or meta.get("entry_efficiency_canonical_pattern")
+            or meta.get("entry_efficiency_pattern_raw")
+        )
+        canonical_pattern, pattern_applies = normalize_strategy_pattern(
+            pattern, row.get("timeframe") or meta.get("timeframe")
+        )
+        if not pattern_applies or canonical_pattern != "2-3-2":
+            return _fail("strategy_scope_not_daily_2_3_2")
+
+        generation_raw = meta.get("entry_efficiency_generation")
+        generation = parse_entry_efficiency_generation(generation_raw, state=state)
+        if generation is None or generation < 1:
+            return _fail("generation_invalid")
+        signal_id = str(row.get("signal_id") or "").strip()
+        canonical_signal_id = str(
+            row.get("canonical_signal_id") or meta.get("canonical_signal_id") or ""
+        ).strip()
+        signal = {
+            "local_order_id": local_oid,
+            "signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": row_client,
+            "execution_mode": row_mode,
+            "metadata": meta,
+        }
+        if not entry_efficiency_identity_is_proven(
+            signal,
+            metadata=meta,
+            runtime_execution_mode="paper",
+            runtime_paper=True,
+            state=state,
+            generation=generation_raw,
+        ):
+            return _fail("exact_efficiency_identity_unproven")
+        trigger_raw = row.get("trigger_crossed_at") or meta.get("trigger_crossed_at")
+        trigger_at = _parse_entry_efficiency_authority_timestamp(trigger_raw)
+        if trigger_at is None:
+            return _fail("trigger_crossed_at_unavailable")
+        if not recovery_trigger_evidence_identity_is_proven(row, local_oid):
+            return _fail("trigger_evidence_identity_unproven")
+
+        def _present(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            return str(value).strip().lower() not in {
+                "", "0", "false", "none", "null",
+            }
+
+        if _present(row.get("broker_order_id")) or _present(row.get("submitted_ts")):
+            return _fail("broker_ownership_present")
+        if _present(row.get("position_id")) or _present(row.get("position")):
+            return _fail("position_ownership_present")
+        forbidden_meta = (
+            "submit_intent_at", "submit_intent", "broker_submit_key",
+            "broker_submit_started_at", "broker_accepted_at", "broker_acceptance",
+            "broker_order_id", "position_id", "position", "position_ref",
+            "materialization_status", "materialization_next_retry_at",
+            "materialization_owner", "materialization_outcome",
+            "watcher_retry_owner", "watcher_retry_next_at",
+            "restart_rearm_status", "restart_rearm_next_at",
+        )
+        if any(_present(meta.get(key)) for key in forbidden_meta):
+            return _fail("broker_position_or_retry_authority_present")
+        for key in (
+            "broker_ready", "split_brain_quarantine", "reconciliation_required",
+            "broker_reconciliation_required",
+        ):
+            if _present(meta.get(key)):
+                return _fail(f"unsafe_meta_flag:{key}")
+
+        position_state, position_reason = self._prebroker_position_truth(
+            row, signal_id=signal_id, local_oid=local_oid
+        )
+        if position_state != "NO_MATCH":
+            return _fail(f"position_authority_{position_reason}")
+
+        list_orders = getattr(self.broker, "list_orders", None)
+        if not callable(list_orders):
+            return _fail("broker_order_list_unavailable")
+        try:
+            broker_orders = list_orders()
+        except Exception as exc:
+            return _fail(f"broker_order_list_failed:{type(exc).__name__}")
+        if not isinstance(broker_orders, (list, tuple)):
+            return _fail("broker_order_list_malformed")
+        submit_key = canonical_broker_submit_key(local_oid)
+        for broker_order in broker_orders:
+            if not isinstance(broker_order, dict) or not broker_order:
+                return _fail("broker_order_list_malformed")
+            if not any(
+                str(broker_order.get(key) or "").strip()
+                for key in (
+                    "id",
+                    "order_id",
+                    "tag",
+                    "client_order_id",
+                    "local_order_id",
+                    "order_local_id",
+                )
+            ):
+                return _fail("broker_order_list_malformed")
+            for key in ("tag", "client_order_id", "local_order_id", "order_local_id"):
+                value = str(broker_order.get(key) or "").strip()
+                if value and value in {submit_key, local_oid}:
+                    return _fail("matching_broker_order_found")
+
+        return {
+            "disposition": "PROVEN_ZERO_BROKER",
+            "state": state,
+            "generation": generation,
+            "deadline_at": _parse_entry_efficiency_authority_timestamp(
+                meta.get("entry_efficiency_deadline_at")
+            ),
+            "next_eval_at": _parse_entry_efficiency_authority_timestamp(
+                meta.get("entry_efficiency_next_eval_at")
+            ),
+            "rearm_pending": False,
+            "trigger_crossed_at": trigger_at,
+            "trigger_crossed_raw": trigger_raw,
+            "canonical_pattern": canonical_pattern,
+        }
+
+    def _fresh_entry_efficiency_restart_quote(
+        self, watcher, ticker: str
+    ) -> Optional[dict]:
+        """Read the same authoritative underlying quote used by watcher polls.
+
+        READY_NOW recovery is a pre-submit handoff, so the synthetic watcher
+        must carry fresh bid/ask/age evidence before the real execution-core
+        callback evaluates it.  Do not use the durable breach price as a
+        quote substitute: it is historical evidence, not current market truth.
+        """
+        get_quote = getattr(watcher, "_get_quote", None)
+        if not callable(get_quote):
+            return None
+        try:
+            raw_quote = get_quote(str(ticker or "").upper())
+        except Exception as exc:
+            log.warning(
+                "RESTART_RECOVERY_ENTRY_EFFICIENCY_READY_QUOTE_FAILED "
+                "ticker=%s error=%s",
+                ticker,
+                type(exc).__name__,
+            )
+            return None
+        if not isinstance(raw_quote, dict):
+            return None
+
+        def _finite(value: Any) -> Optional[float]:
+            if isinstance(value, bool) or value is None or value == "":
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return number if math.isfinite(number) else None
+
+        bid = _finite(raw_quote.get("bid")) or 0.0
+        ask = _finite(raw_quote.get("ask")) or 0.0
+        # This is the same last-only normalization as uninterrupted watcher
+        # polling.  The package watcher already blocks last-only data unless
+        # its explicit WATCHER_ALLOW_LAST_ONLY_TRIGGER policy is enabled.
+        if bid == 0.0 and ask == 0.0:
+            last = _finite(raw_quote.get("last"))
+            if last is not None:
+                bid = ask = last
+
+        raw_age = raw_quote.get("quote_age_ms")
+        if isinstance(raw_age, bool) or raw_age is None:
+            return None
+        coerce_age = getattr(watcher, "_coerce_quote_age_ms", None)
+        try:
+            quote_age_ms = (
+                coerce_age(raw_age)
+                if callable(coerce_age)
+                else int(round(float(raw_age)))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            quote_age_ms is None
+            or isinstance(quote_age_ms, bool)
+            or quote_age_ms < 0
+            or bid <= 0
+            or ask <= 0
+        ):
+            return None
+        return {
+            "bid": bid,
+            "ask": ask,
+            "quote_age_ms": int(quote_age_ms),
+        }
+
+    def _resume_entry_efficiency_ready(
+        self,
+        row: dict,
+        local_oid: str,
+        proof: dict,
+        *,
+        watcher_owned: Optional[bool] = None,
+        plan_builder_fn=None,
+    ) -> str:
+        """Invoke the existing trigger callback after zero-broker proof."""
+        watcher = self.entry_watcher
+        if watcher_owned is True:
+            registry_proof = self._verify_registry_ownership(local_oid, row)
+            if registry_proof is not None and self._verify_entry_efficiency_watcher_lifecycle(
+                registry_proof.get("watcher_obj"), row, proof
+            ):
+                self.last_watcher_registered_by_this_attempt = False
+                self.last_registration_token = None
+                return _RowOutcome.WATCHER_OWNED
+            self._mark_failure(
+                local_oid, "entry_efficiency_ready_restart:owned_watcher_lifecycle_mismatch"
+            )
+            return _RowOutcome.UNRESOLVED
+        callback = getattr(watcher, "on_trigger", None) if watcher is not None else None
+        if not callable(callback):
+            self._mark_failure(local_oid, "entry_efficiency_ready_restart:callback_unavailable")
+            return _RowOutcome.UNRESOLVED
+        plan = _build_plan(row, plan_builder_fn)
+        if plan is None:
+            self._mark_failure(local_oid, "entry_efficiency_ready_restart:plan_build_failed")
+            return _RowOutcome.UNRESOLVED
+        plan_meta = getattr(plan, "metadata", None) or {}
+        if not isinstance(plan_meta, dict):
+            self._mark_failure(local_oid, "entry_efficiency_ready_restart:plan_meta_invalid")
+            return _RowOutcome.UNRESOLVED
+
+        ready_quote = self._fresh_entry_efficiency_restart_quote(
+            watcher, getattr(plan, "ticker", None) or row.get("ticker") or ""
+        )
+        if ready_quote is None:
+            # There is no safe synthetic callback without current quote truth.
+            # Reuse the canonical watcher registration path so the next poll
+            # obtains the quote and owns the durable opportunity.
+            log.warning(
+                "RESTART_RECOVERY_ENTRY_EFFICIENCY_READY_QUOTE_UNAVAILABLE "
+                "local=%s — adopting registered watcher",
+                local_oid,
+            )
+            return self._resume_entry_efficiency_wait(
+                row,
+                local_oid,
+                proof,
+                watcher_owned=False,
+                plan_builder_fn=plan_builder_fn,
+            )
+        signal = {
+            "signal_id": str(getattr(plan, "signal_id", "") or row.get("signal_id") or ""),
+            "canonical_signal_id": str(
+                getattr(plan, "canonical_signal_id", "")
+                or row.get("canonical_signal_id")
+                or plan_meta.get("canonical_signal_id")
+                or ""
+            ),
+            "local_order_id": local_oid,
+            "client_id": str(getattr(plan, "client_id", "") or self.client_id),
+            "client_email": str(getattr(plan, "client_email", "") or self.client_id),
+            "execution_mode": "paper",
+            "ticker": str(getattr(plan, "ticker", "") or row.get("ticker") or "").upper(),
+            "side": str(getattr(plan, "side", "") or row.get("direction") or "").upper(),
+            "entry_price": getattr(plan, "trigger_price", None),
+            "stop_price": getattr(plan, "stop_underlying", None),
+            "target_price": getattr(plan, "target_underlying", None),
+            "pattern": getattr(plan, "pattern", None),
+            "timeframe": getattr(plan, "timeframe", None),
+            "score": getattr(plan, "score", 0),
+            "grade": getattr(plan, "tier", ""),
+            "plan_id": getattr(plan, "plan_id", ""),
+            "trigger_crossed_at": proof.get("trigger_crossed_raw"),
+            "metadata": dict(plan_meta),
+            "_approved_plan": plan,
+        }
+        try:
+            watched = WatchedSignal(signal)
+            watched._watcher_ref = watcher
+            watched.triggered_at = proof.get("trigger_crossed_at")
+            watched.breach_price = float(
+                _extract_meta(row).get("observed_underlying_price")
+                or getattr(plan, "trigger_price", 0)
+                or 0
+            )
+            # These are current authoritative watcher fields.  In particular,
+            # never derive them from breach_price or any other historical row
+            # evidence.
+            watched.last_quote_bid = ready_quote["bid"]
+            watched.last_quote_ask = ready_quote["ask"]
+            watched.last_quote_age_ms = ready_quote["quote_age_ms"]
+            callback(watched)
+        except Exception as exc:
+            log.error(
+                "RESTART_RECOVERY_ENTRY_EFFICIENCY_READY_CALLBACK_RAISED local=%s: %s",
+                local_oid, exc, exc_info=True,
+            )
+            callback_exception = exc
+        else:
+            callback_exception = None
+
+        get_order = getattr(self.osm, "get_order", None)
+        if not callable(get_order):
+            self._mark_failure(local_oid, "entry_efficiency_ready_restart:reread_unavailable")
+            return _RowOutcome.UNRESOLVED
+        try:
+            after = get_order(local_oid)
+        except Exception:
+            self._mark_failure(local_oid, "entry_efficiency_ready_restart:reread_failed")
+            return _RowOutcome.UNRESOLVED
+        if not isinstance(after, dict):
+            self._mark_failure(local_oid, "entry_efficiency_ready_restart:reread_missing")
+            return _RowOutcome.UNRESOLVED
+        after_status = str(after.get("status") or "").strip().upper()
+        after_meta = _extract_meta(after)
+        if after.get("broker_order_id"):
+            ownership, _broker_order, ownership_reason = (
+                self._lookup_durable_broker_order(
+                    after,
+                    local_oid,
+                    allow_submitted=True,
+                    force_order_list=True,
+                    require_submit_identity=True,
+                )
+            )
+            if ownership == "MATCH":
+                return _RowOutcome.SKIPPED
+            self._mark_failure(
+                local_oid,
+                "entry_efficiency_ready_restart:broker_ownership_unresolved"
+                f":{ownership_reason}",
+            )
+            return _RowOutcome.UNRESOLVED
+        if after.get("submitted_ts") or after_meta.get("submit_intent_at"):
+            intent_outcome = self._route_durable_submit_intent_if_present(
+                after, local_oid
+            )
+            if intent_outcome is not None:
+                return intent_outcome
+            self._mark_failure(
+                local_oid,
+                "entry_efficiency_ready_restart:broker_intent_unresolved",
+            )
+            return _RowOutcome.UNRESOLVED
+        if after_status in _TERMINAL_STATUSES:
+            return _RowOutcome.TERMINALIZED
+
+        after_state = parse_entry_efficiency_state(
+            after_meta.get("entry_efficiency_state"), allow_empty=False
+        )
+        if after_state in {WAIT_CONFIRMATION, REARM_FOR_REBREACH}:
+            wait_proof = self._prove_entry_efficiency_restart_wait(
+                after,
+                local_oid,
+                row_client=self.client_id,
+                row_mode=self.execution_mode,
+            )
+            if wait_proof.get("disposition") == "PROVEN":
+                return self._resume_entry_efficiency_wait(
+                    after,
+                    local_oid,
+                    wait_proof,
+                    watcher_owned=False,
+                    plan_builder_fn=plan_builder_fn,
+                )
+            self._mark_failure(
+                local_oid,
+                "entry_efficiency_ready_restart:wait_ownership_unproven",
+            )
+            return _RowOutcome.UNRESOLVED
+
+        if after_state == READY_NOW:
+            # The callback may have returned without a durable transition (or
+            # raised after doing partial work). Re-prove zero broker ownership
+            # before handing the row back to the real watcher registry; a
+            # callback-side POST or intent must remain a HOLD/reconciliation
+            # case, never a duplicate watcher submit.
+            ready_after = self._prove_entry_efficiency_ready_restart(
+                after,
+                local_oid,
+                row_client=self.client_id,
+                row_mode=self.execution_mode,
+            )
+            if ready_after.get("disposition") == "PROVEN_ZERO_BROKER":
+                return self._resume_entry_efficiency_wait(
+                    after,
+                    local_oid,
+                    ready_after,
+                    watcher_owned=False,
+                    plan_builder_fn=plan_builder_fn,
+                )
+
+        self._mark_failure(
+            local_oid,
+            "entry_efficiency_ready_restart:callback_no_durable_outcome"
+            if callback_exception is None
+            else "entry_efficiency_ready_restart:callback_raised",
+        )
+        return _RowOutcome.UNRESOLVED
+
+    def _prove_entry_efficiency_restart_wait(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        row_client: str,
+        row_mode: str,
+    ) -> dict:
+        """Prove the narrow durable #436 WAIT/REARM restart contract.
+
+        This is intentionally a recognizer, not a second scheduler.  It only
+        admits an already-authoritative PAPER daily 2-3-2 lifecycle whose
+        trigger evidence and full identity are durable and whose row still
+        owns no broker/position/materialization authority.  Any malformed or
+        ambiguous candidate returns ``UNPROVEN`` so the caller leaves the row
+        untouched instead of handing it to generic STUCK_TRIGGER_READY or
+        restart-rearm retry handling.
+        """
+        meta = _extract_meta(row)
+        watcher_audit = meta.get("watcher_audit")
+        if not isinstance(watcher_audit, dict):
+            return {"disposition": "NOT_CANDIDATE"}
+        if str(watcher_audit.get("reason_code") or "") != "trigger_ready":
+            return {"disposition": "NOT_CANDIDATE"}
+
+        raw_state = meta.get("entry_efficiency_state")
+        state = parse_entry_efficiency_state(raw_state, allow_empty=False)
+        candidate_states = {WAIT_CONFIRMATION, REARM_FOR_REBREACH}
+        if state not in candidate_states:
+            # A malformed spelling of a WAIT/REARM is still a candidate that
+            # must fail closed. READY_NOW deliberately remains a separate
+            # canonical trigger-ready recovery responsibility.
+            if str(raw_state or "").strip().upper() in candidate_states:
+                return {
+                    "disposition": "UNPROVEN",
+                    "reason": "malformed_lifecycle_state",
+                }
+            return {"disposition": "NOT_CANDIDATE"}
+
+        def _fail(reason: str) -> dict:
+            return {"disposition": "UNPROVEN", "reason": reason}
+
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return _fail("status_not_pending_trigger")
+        if row_mode != "paper" or self.execution_mode != "paper":
+            return _fail("execution_mode_not_paper")
+        if meta.get("entry_efficiency_mode") != ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE:
+            return _fail("rollout_mode_not_paper_authoritative")
+        if meta.get("entry_efficiency_authoritative") is not True:
+            return _fail("durable_authority_flag_missing")
+        if resolve_entry_efficiency_mode() != ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE:
+            return _fail("runtime_rollout_not_paper_authoritative")
+
+        pattern = (
+            row.get("pattern")
+            or meta.get("pattern")
+            or meta.get("entry_efficiency_canonical_pattern")
+            or meta.get("entry_efficiency_pattern_raw")
+        )
+        timeframe = row.get("timeframe") or meta.get("timeframe")
+        canonical_pattern, pattern_applies = normalize_strategy_pattern(
+            pattern, timeframe
+        )
+        if not pattern_applies or canonical_pattern != "2-3-2":
+            return _fail("strategy_scope_not_daily_2_3_2")
+        if meta.get("late_attachment_policy_eligible") is True:
+            return _fail("late_attachment_policy_overlap")
+
+        raw_generation = meta.get("entry_efficiency_generation")
+        generation = parse_entry_efficiency_generation(
+            raw_generation, state=state
+        )
+        if generation is None or generation < 1:
+            return _fail("generation_invalid")
+
+        signal_id = str(row.get("signal_id") or "").strip()
+        canonical_signal_id = str(
+            row.get("canonical_signal_id")
+            or meta.get("canonical_signal_id")
+            or ""
+        ).strip()
+        if not signal_id or not canonical_signal_id or not local_oid or not row_client:
+            return _fail("identity_missing")
+        signal = {
+            "local_order_id": local_oid,
+            "signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": row_client,
+            "execution_mode": row_mode,
+            "metadata": meta,
+        }
+        if not entry_efficiency_identity_is_proven(
+            signal,
+            metadata=meta,
+            runtime_execution_mode="paper",
+            runtime_paper=True,
+            state=state,
+            generation=raw_generation,
+        ):
+            return _fail("exact_efficiency_identity_unproven")
+
+        trigger_crossed_raw = (
+            row.get("trigger_crossed_at") or meta.get("trigger_crossed_at")
+        )
+        trigger_crossed_at = _parse_entry_efficiency_authority_timestamp(
+            trigger_crossed_raw
+        )
+        if trigger_crossed_at is None:
+            return _fail("trigger_crossed_at_unavailable")
+        if not recovery_trigger_evidence_identity_is_proven(row, local_oid):
+            return _fail("trigger_evidence_identity_unproven")
+
+        deadline_raw = meta.get("entry_efficiency_deadline_at")
+        deadline_at = _parse_entry_efficiency_authority_timestamp(deadline_raw)
+        if deadline_at is None:
+            return _fail("deadline_invalid")
+        next_eval_raw = meta.get("entry_efficiency_next_eval_at")
+        next_eval_at = _parse_entry_efficiency_authority_timestamp(next_eval_raw)
+        if state == WAIT_CONFIRMATION and next_eval_at is None:
+            return _fail("wait_next_evaluation_invalid")
+        if next_eval_raw not in (None, "") and next_eval_at is None:
+            return _fail("next_evaluation_invalid")
+        rearm_pending = meta.get("entry_efficiency_rearm_pending")
+        if state == WAIT_CONFIRMATION and rearm_pending is not False:
+            return _fail("wait_rearm_flag_not_false")
+        if state == REARM_FOR_REBREACH and rearm_pending is not True:
+            return _fail("rearm_flag_not_true")
+
+        def _present(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            return str(value).strip().lower() not in {
+                "", "0", "false", "none", "null",
+            }
+
+        if _present(row.get("broker_order_id")) or _present(row.get("submitted_ts")):
+            return _fail("broker_ownership_present")
+        forbidden_meta = (
+            "submit_intent_at",
+            "submit_intent",
+            "broker_submit_key",
+            "broker_submit_started_at",
+            "broker_accepted_at",
+            "broker_acceptance",
+            "broker_order_id",
+            "position_id",
+            "position",
+            "position_ref",
+            "filled_qty",
+            "filled_at",
+            "materialization_status",
+            "materialization_next_retry_at",
+            "materialization_owner",
+            "materialization_outcome",
+            "watcher_retry_owner",
+            "watcher_retry_next_at",
+            "restart_rearm_status",
+            "restart_rearm_next_at",
+        )
+        if any(_present(meta.get(key)) for key in forbidden_meta):
+            return _fail("broker_position_or_retry_authority_present")
+        if _present(row.get("position_id")) or _present(row.get("position")):
+            return _fail("position_ownership_present")
+        for key in (
+            "broker_ready",
+            "split_brain_quarantine",
+            "reconciliation_required",
+            "broker_reconciliation_required",
+        ):
+            if _present(meta.get(key)):
+                return _fail(f"unsafe_meta_flag:{key}")
+
+        row_kind = str(row.get("kind") or row.get("order_kind") or "").strip().upper()
+        if row_kind and row_kind != "ENTRY":
+            return _fail("row_not_entry")
+
+        return {
+            "disposition": "PROVEN",
+            "state": state,
+            "generation": generation,
+            "deadline_at": deadline_at,
+            "next_eval_at": next_eval_at,
+            "trigger_crossed_at": trigger_crossed_at,
+            "trigger_crossed_raw": trigger_crossed_raw,
+            "canonical_pattern": canonical_pattern,
+            "rearm_pending": rearm_pending,
+        }
+
+    def _resume_entry_efficiency_wait(
+        self,
+        row: dict,
+        local_oid: str,
+        proof: dict,
+        *,
+        watcher_owned: Optional[bool],
+        plan_builder_fn=None,
+    ) -> str:
+        """Re-own a proven #436 wait through the existing watcher authority."""
+        if watcher_owned is True:
+            registry_proof = self._verify_registry_ownership(local_oid, row)
+            if registry_proof is None or not self._verify_entry_efficiency_watcher_lifecycle(
+                registry_proof.get("watcher_obj"), row, proof
+            ):
+                self._mark_failure(
+                    local_oid, "entry_efficiency_restart:owned_watcher_lifecycle_mismatch"
+                )
+                return _RowOutcome.UNRESOLVED
+            self.last_watcher_registered_by_this_attempt = False
+            self.last_registration_token = None
+            return _RowOutcome.WATCHER_OWNED
+
+        watcher = self.entry_watcher
+        if watcher is None or not callable(getattr(watcher, "watch", None)):
+            self._mark_failure(
+                local_oid, "entry_efficiency_restart:watcher_unavailable"
+            )
+            return _RowOutcome.UNRESOLVED
+        if watcher_owned is None:
+            self._mark_failure(
+                local_oid, "entry_efficiency_restart:watcher_ownership_unavailable"
+            )
+            return _RowOutcome.UNRESOLVED
+
+        # False means either no registration or a conflicting registration.
+        # Never replace a physically present registration with a different
+        # identity while trying to recover this row.
+        try:
+            for watched in list(getattr(watcher, "_pending", []) or []):
+                if str((getattr(watched, "signal", {}) or {}).get("local_order_id") or "").strip() == local_oid:
+                    self._mark_failure(
+                        local_oid,
+                        "entry_efficiency_restart:physical_watcher_identity_conflict",
+                    )
+                    return _RowOutcome.UNRESOLVED
+        except Exception:
+            self._mark_failure(
+                local_oid, "entry_efficiency_restart:watcher_registry_unavailable"
+            )
+            return _RowOutcome.UNRESOLVED
+
+        plan = _build_plan(row, plan_builder_fn)
+        if plan is None:
+            self._mark_failure(local_oid, "entry_efficiency_restart:plan_build_failed")
+            return _RowOutcome.UNRESOLVED
+        if self.dry_run:
+            self.last_watcher_registered_by_this_attempt = False
+            self.last_registration_token = None
+            return _RowOutcome.WATCHER_OWNED
+
+        provenance = {
+            "created_by_this_call": False,
+            "registration_token": None,
+        }
+        try:
+            armed = bool(
+                watcher.watch(
+                    plan,
+                    local_oid,
+                    recovery_rearm=True,
+                    no_cancel_on_reject=True,
+                    entry_efficiency_resume=True,
+                    registration_provenance_out=provenance,
+                )
+            )
+        except Exception as exc:
+            log.error(
+                "RESTART_RECOVERY_ENTRY_EFFICIENCY_WATCH_RAISED local=%s: %s",
+                local_oid, exc, exc_info=True,
+            )
+            self._mark_failure(local_oid, "entry_efficiency_restart:watch_raised")
+            return _RowOutcome.UNRESOLVED
+        if not armed:
+            self._mark_failure(
+                local_oid, "entry_efficiency_restart:watch_returned_false"
+            )
+            return _RowOutcome.UNRESOLVED
+
+        registry_proof = self._verify_registry_ownership(local_oid, row)
+        if registry_proof is None or not self._verify_entry_efficiency_watcher_lifecycle(
+            registry_proof.get("watcher_obj"), row, proof
+        ):
+            self._mark_failure(
+                local_oid, "entry_efficiency_restart:watcher_lifecycle_not_proven"
+            )
+            return _RowOutcome.UNRESOLVED
+        self.last_watcher_registered_by_this_attempt = bool(
+            provenance.get("created_by_this_call")
+        )
+        self.last_registration_token = (
+            provenance.get("registration_token")
+            if self.last_watcher_registered_by_this_attempt
+            else None
+        )
+        return _RowOutcome.WATCHER_OWNED
+
+    def _verify_entry_efficiency_watcher_lifecycle(
+        self, watched, row: dict, proof: dict
+    ) -> bool:
+        if watched is None:
+            return False
+        signal = getattr(watched, "signal", {}) or {}
+        metadata = signal.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return False
+        state = parse_entry_efficiency_state(
+            metadata.get("entry_efficiency_state"), allow_empty=False
+        )
+        generation = parse_entry_efficiency_generation(
+            metadata.get("entry_efficiency_generation"), state=state
+        )
+        if state != proof.get("state") or generation != proof.get("generation"):
+            return False
+        if not entry_efficiency_identity_is_proven(
+            signal,
+            metadata=metadata,
+            runtime_execution_mode="paper",
+            runtime_paper=True,
+            state=state,
+            generation=generation,
+        ):
+            return False
+        if str(signal.get("pattern") or "") and not normalize_strategy_pattern(
+            signal.get("pattern"), signal.get("timeframe")
+        )[1]:
+            return False
+        watched_deadline = _parse_entry_efficiency_authority_timestamp(
+            getattr(watched, "entry_efficiency_deadline_at", None)
+            or metadata.get("entry_efficiency_deadline_at")
+        )
+        if watched_deadline != proof.get("deadline_at"):
+            return False
+        watched_next = _parse_entry_efficiency_authority_timestamp(
+            getattr(watched, "entry_efficiency_next_eval_at", None)
+            if getattr(watched, "entry_efficiency_next_eval_at", None) is not None
+            else metadata.get("entry_efficiency_next_eval_at")
+        )
+        if watched_next != proof.get("next_eval_at"):
+            return False
+        if bool(getattr(watched, "entry_efficiency_rearm_pending", False)) != bool(
+            proof.get("rearm_pending")
+        ):
+            return False
+        watched_trigger = _parse_entry_efficiency_authority_timestamp(
+            getattr(watched, "trigger_crossed_at", None)
+            or signal.get("trigger_crossed_at")
+            or metadata.get("trigger_crossed_at")
+        )
+        return watched_trigger == proof.get("trigger_crossed_at")
 
     # ── Rearm + post-registration verification ────────────────────────────────
 
@@ -3477,7 +4390,21 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
             metadata=dict(meta),
             score=float(row.get("score") or meta.get("score") or 0),
             tier=row.get("tier") or meta.get("tier") or "",
+            pattern=(
+                row.get("pattern")
+                or meta.get("pattern")
+                or meta.get("entry_efficiency_canonical_pattern")
+                or meta.get("entry_efficiency_pattern_raw")
+                or ""
+            ),
             timeframe=row.get("timeframe") or meta.get("timeframe") or "",
+            strategy_type=row.get("strategy_type") or meta.get("strategy_type") or "",
+            prior_day_high=row.get("prior_day_high") or meta.get("prior_day_high"),
+            prior_day_low=row.get("prior_day_low") or meta.get("prior_day_low"),
+            late_attachment_policy_eligible=bool(
+                row.get("late_attachment_policy_eligible")
+                or meta.get("late_attachment_policy_eligible")
+            ),
             contracts=int(row.get("contracts") or row.get("qty") or meta.get("selected_qty") or 0),
             quantity=int(row.get("quantity") or row.get("qty") or meta.get("selected_qty") or 0),
             contract_symbol=str(
@@ -3804,6 +4731,24 @@ def _parse_iso(raw) -> Optional[datetime]:
         return dt
     except Exception:
         return None
+
+
+def _parse_entry_efficiency_authority_timestamp(raw) -> Optional[datetime]:
+    """Parse a #436 timestamp without guessing the timezone."""
+    if isinstance(raw, datetime):
+        parsed = raw
+    elif raw is None or str(raw).strip() == "":
+        return None
+    else:
+        try:
+            parsed = datetime.fromisoformat(
+                str(raw).strip().replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def _quote_is_fresh(raw: dict) -> bool:

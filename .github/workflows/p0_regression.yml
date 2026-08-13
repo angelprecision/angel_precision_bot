@@ -101,6 +101,7 @@ jobs:
             tests/test_p0_seam2_timing_boundary.py \
             tests/test_p0_selector_retry_taxonomy.py \
             tests/test_p1_selector_identity_assertion_mode_fallback.py \
+            tests/test_p1_entry_efficiency.py \
             tests/test_p1_intelligence_admission_policy.py \
             tests/test_p1_intel_admission_e2e_final_gate.py \
             tests/test_p0_forward_regime_advisory_flow.py \

@@ -36,6 +36,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from ap_canonical_signal import build_canonical_signal_id
+from ap_entry_efficiency import parse_entry_efficiency_generation
 
 # ── Lifecycle + health wiring (defensive — watcher runs standalone if missing) ──
 try:
@@ -1459,6 +1460,7 @@ class APEntryWatcher:
                 "RETRY_WAIT", "KEEP_WATCHER", "TERMINAL_DURABLE",
                 "SUBMITTED", "OWNERSHIP_TRANSFERRED",
                 "RECONCILE_BROKER_INTENT",
+                "ENTRY_EFFICIENCY_WAIT",
             }:
                 claimed_disposition = _raw
                 claimed_next_retry = result.get("next_retry_at")
@@ -1554,6 +1556,27 @@ class APEntryWatcher:
                 return "KEEP_WATCHER", None
             return "RETRY_WAIT", str(next_retry_at)
 
+        def _verify_entry_efficiency_wait() -> tuple[str, str | None]:
+            # Entry-efficiency waiting is a distinct pre-submit owner state.
+            # Do not require RETRY_WAIT materialization metadata and do not
+            # route it through the deferred/#430 retry clock.
+            if status not in {"PENDING_TRIGGER", "CREATED"}:
+                return "KEEP_WATCHER", None
+            if broker_order_id or submitted_ts is not None:
+                return "KEEP_WATCHER", None
+            state = str(meta.get("entry_efficiency_state") or "").upper()
+            if state not in {"WAIT_CONFIRMATION", "REARM_FOR_REBREACH"}:
+                # A CAS failure still has to retain the owner, but it may not
+                # claim a durable efficiency state that was never written.
+                if not (
+                    isinstance(result, dict)
+                    and str(result.get("reason_code") or "").upper()
+                    == "ENTRY_EFFICIENCY_STATE_CAS_FAILED"
+                ):
+                    return "KEEP_WATCHER", None
+            next_eval_at = meta.get("entry_efficiency_next_eval_at") or claimed_next_retry
+            return "ENTRY_EFFICIENCY_WAIT", str(next_eval_at or "") or None
+
         def _verify_ownership_transferred() -> tuple[str, str | None]:
             current_owner = str(
                 meta.get("current_owner")
@@ -1594,6 +1617,8 @@ class APEntryWatcher:
             return _verify_terminal()
         if claimed_disposition == "RETRY_WAIT":
             return _verify_retry()
+        if claimed_disposition == "ENTRY_EFFICIENCY_WAIT":
+            return _verify_entry_efficiency_wait()
         if claimed_disposition == "OWNERSHIP_TRANSFERRED":
             return _verify_ownership_transferred()
         if claimed_disposition == "KEEP_WATCHER":
@@ -3369,6 +3394,7 @@ class APEntryWatcher:
         recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False,
         materialization_resume: bool = False,
+        entry_efficiency_resume: bool = False,
         registration_provenance_out: Optional[dict] = None,
     ) -> bool:
         """Plan-aware entrypoint called by queue/execution orchestration.
@@ -3411,7 +3437,15 @@ class APEntryWatcher:
         # can suppress its own cancel_pending_entry calls.
         _recovery_rearm    = bool(recovery_rearm)
         _materialization_resume = bool(materialization_resume)
+        _entry_efficiency_resume = bool(entry_efficiency_resume)
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
+        if _entry_efficiency_resume and not _recovery_rearm:
+            log.critical(
+                "[%s] ENTRY_EFFICIENCY_RESUME_REQUIRES_RECOVERY_REARM "
+                "local_order_id=%s",
+                getattr(plan, "ticker", "?"), local_order_id,
+            )
+            return False
         _plan_metadata = getattr(plan, "metadata", None) or {}
         if not isinstance(_plan_metadata, dict):
             _plan_metadata = {}
@@ -3542,6 +3576,8 @@ class APEntryWatcher:
             signal_dict["__recovery_rearm"] = True
         if _materialization_resume:
             signal_dict["__materialization_resume"] = True
+        if _entry_efficiency_resume:
+            signal_dict["__entry_efficiency_resume"] = True
         if _recovery_rearm and _materialization_resume:
             _plan_meta_for_adopt = getattr(plan, "metadata", None) or {}
             _adopt_fn = getattr(
@@ -3584,7 +3620,7 @@ class APEntryWatcher:
                 )
                 return False
 
-        if _recovery_rearm and not _materialization_resume:
+        if _recovery_rearm and not _materialization_resume and not _entry_efficiency_resume:
             try:
                 from ap.pending_trigger_classifier import (
                     PendingTriggerClassification,
@@ -4081,6 +4117,7 @@ class APEntryWatcher:
             and trigger
             and float(trigger or 0) > 0
             and not _materialization_resume
+            and not _entry_efficiency_resume
         ):
             try:
                 _bug_c_quote = self._get_quote(ticker) or {}
@@ -4374,6 +4411,7 @@ class APEntryWatcher:
             signal_dict.pop("__watcher_rearm_pending", None)
             signal_dict.pop("__watcher_rearm_reason", None)
             signal_dict.pop("__recovery_rearm", None)
+            signal_dict.pop("__entry_efficiency_resume", None)
         if not ok:
             # add_signal already logged the audit for locked-path blocks (dedup/opposite/same-side).
             # Attempt a best-effort DB persist here using the full signal context available in watch().
@@ -4474,6 +4512,29 @@ class APEntryWatcher:
                     "last_bid": w.last_quote_bid,
                     "last_ask": w.last_quote_ask,
                     "breach_count": w.breach_count,
+                    "entry_efficiency_state": getattr(w, "entry_efficiency_state", ""),
+                    "entry_efficiency_generation": getattr(
+                        w, "entry_efficiency_generation", 0
+                    ),
+                    "entry_efficiency_rearm_pending": getattr(
+                        w, "entry_efficiency_rearm_pending", False
+                    ),
+                    "entry_efficiency_next_eval_at": (
+                        getattr(w, "entry_efficiency_next_eval_at", None).isoformat()
+                        if isinstance(
+                            getattr(w, "entry_efficiency_next_eval_at", None),
+                            datetime,
+                        )
+                        else getattr(w, "entry_efficiency_next_eval_at", None)
+                    ),
+                    "entry_efficiency_deadline_at": (
+                        getattr(w, "entry_efficiency_deadline_at", None).isoformat()
+                        if isinstance(
+                            getattr(w, "entry_efficiency_deadline_at", None),
+                            datetime,
+                        )
+                        else getattr(w, "entry_efficiency_deadline_at", None)
+                    ),
                     "rearm_mode": getattr(w, "rearm_mode", False),
                     "rearm_count": getattr(w, "rearm_count", 0),
                     "rearm_expires_at": (
@@ -5240,6 +5301,7 @@ class APEntryWatcher:
             return
 
         completed = []
+        efficiency_requests = []
         with self._lock:
             for w in active:
                 _retry_not_before = getattr(w, "deferred_retry_not_before", None)
@@ -5269,6 +5331,15 @@ class APEntryWatcher:
                     bid = ask = last
 
                 new_state = w.check(bid, ask, quote_age_ms=_quote_age_ms)
+                _efficiency_request = getattr(
+                    w, "_entry_efficiency_persist_request", None
+                )
+                if isinstance(_efficiency_request, dict):
+                    # The request was staged by check() while self._lock was
+                    # held.  Flush it only after releasing the lock; OSM/CAS
+                    # must never run inside the watcher state lock.
+                    efficiency_requests.append((w, _efficiency_request))
+                    w._entry_efficiency_persist_request = None
                 if new_state == WatchState.TRIGGERED:
                     if open_protect_active and w.ticker in self._open_trigger_tickers:
                         # Per-ticker open protection: this ticker already triggered once
@@ -5304,6 +5375,41 @@ class APEntryWatcher:
             #   check() → classify → callback → verify result → then remove + dedup release
             #   FAILED: enter quarantine (stay in _pending, dedup held, not active)
             pass  # removal now handled per-watcher after callback verification
+
+        for w, request in efficiency_requests:
+            persist = getattr(self, "_persist_entry_efficiency_transition", None)
+            persisted = bool(callable(persist) and persist(w, request))
+            if persisted:
+                continue
+            with self._lock:
+                # A failed CAS is not permission to keep the optimistic local
+                # REARM state. Roll back to the exact prior state and retry
+                # the proof later; no broker callback is created by this path.
+                w.entry_efficiency_state = str(
+                    request.get("rollback_state") or "WAIT_CONFIRMATION"
+                ).upper()
+                w.entry_efficiency_generation = parse_entry_efficiency_generation(
+                    request.get("rollback_generation"),
+                    state=w.entry_efficiency_state,
+                )
+                w.entry_efficiency_generation_valid = (
+                    w.entry_efficiency_generation is not None
+                )
+                w.entry_efficiency_rearm_pending = bool(
+                    request.get("rollback_rearm_pending", False)
+                )
+                w.entry_efficiency_next_eval_at = request.get("rollback_next_eval_at")
+                w._entry_efficiency_persistence_blocked = True
+            log.critical(
+                "ENTRY_EFFICIENCY_STATE_CAS_FAILED ticker=%s local_order_id=%s "
+                "expected=%s/%s next=%s/%s — watcher retained, no submit",
+                w.ticker,
+                str((getattr(w, "signal", {}) or {}).get("local_order_id") or ""),
+                request.get("expected_state"),
+                request.get("expected_generation"),
+                request.get("next_state"),
+                request.get("next_generation"),
+            )
 
         for action, w in completed:
             _sig_id = str(w.signal.get("signal_id", ""))
@@ -5442,6 +5548,49 @@ class APEntryWatcher:
                         _callback_disposition, _callback_next_retry = (
                             self._resolve_trigger_callback_disposition(w, _callback_result)
                         )
+                        if _callback_disposition == "ENTRY_EFFICIENCY_WAIT":
+                            with self._lock:
+                                w.state = WatchState.PENDING
+                                w.deferred_retry_not_before = None
+                                if _callback_next_retry:
+                                    # A future efficiency callback must carry
+                                    # an explicit zone; guessing UTC could
+                                    # bypass the bounded timing policy.
+                                    try:
+                                        w.entry_efficiency_next_eval_at = datetime.fromisoformat(
+                                            str(_callback_next_retry)
+                                        )
+                                        if (
+                                            w.entry_efficiency_next_eval_at.tzinfo is None
+                                            or w.entry_efficiency_next_eval_at.utcoffset() is None
+                                        ):
+                                            raise ValueError(
+                                                "naive_entry_efficiency_next_eval_at"
+                                            )
+                                        w.entry_efficiency_next_eval_at = (
+                                            w.entry_efficiency_next_eval_at.astimezone(
+                                                timezone.utc
+                                            )
+                                        )
+                                    except Exception:
+                                        w.entry_efficiency_next_eval_at = (
+                                            datetime.now(timezone.utc)
+                                            + timedelta(seconds=5)
+                                        )
+                                elif not getattr(w, "entry_efficiency_next_eval_at", None):
+                                    w.entry_efficiency_next_eval_at = (
+                                        datetime.now(timezone.utc)
+                                        + timedelta(seconds=5)
+                                    )
+                            log.warning(
+                                "WATCHER_ENTRY_EFFICIENCY_WAIT "
+                                "ticker=%s signal_id=%s next_eval_at=%s "
+                                "deferred_retry_not_before=None owner_retained=true",
+                                w.ticker,
+                                _sig_id or "?",
+                                getattr(w, "entry_efficiency_next_eval_at", None),
+                            )
+                            continue
                         if _callback_disposition in {"RETRY_WAIT", "KEEP_WATCHER", "RECONCILE_BROKER_INTENT"}:
                             with self._lock:
                                 w.state = WatchState.PENDING

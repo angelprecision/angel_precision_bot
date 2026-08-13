@@ -37,6 +37,15 @@ from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.utils                import now_utc_iso
+from ap_entry_efficiency import (
+    READY_NOW as ENTRY_EFFICIENCY_READY_NOW,
+    REARM_FOR_REBREACH as ENTRY_EFFICIENCY_REARM_FOR_REBREACH,
+    TERMINAL_INVALID as ENTRY_EFFICIENCY_TERMINAL_INVALID,
+    WAIT_CONFIRMATION as ENTRY_EFFICIENCY_WAIT_CONFIRMATION,
+    evaluate_entry_efficiency,
+    entry_efficiency_identity_is_proven,
+    parse_entry_efficiency_generation,
+)
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -78,6 +87,87 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
     if isinstance(paper_flag, bool):
         return "paper" if paper_flag else "live"
     return None
+
+
+def _resolve_entry_efficiency_execution_mode(
+    approved_plan, signal, runtime_mode, paper_flag
+) -> str | None:
+    """Resolve entry-efficiency authority from one exact execution identity.
+
+    Require the durable signal mode, every present plan mode, runtime mode,
+    runtime paper flag, and any other submit identity source to agree. Missing
+    or conflicting identity returns ``None``; the caller must remain on the
+    existing non-efficiency path.
+    """
+    if not isinstance(signal, dict):
+        return None
+    signal_mode = _normalize_execution_mode(signal.get("execution_mode"))
+    if signal_mode is None:
+        return None
+
+    signal_modes = []
+    for raw_value in (
+        signal.get("execution_mode"),
+        signal.get("mode"),
+    ):
+        if not str(raw_value or "").strip():
+            continue
+        normalized = _normalize_execution_mode(raw_value)
+        if normalized is None:
+            return None
+        signal_modes.append(normalized)
+    if not signal_modes or any(mode != signal_mode for mode in signal_modes):
+        return None
+
+    plan_modes = []
+    for raw_value in (
+        getattr(approved_plan, "execution_mode", None),
+        getattr(approved_plan, "mode", None),
+    ):
+        if not str(raw_value or "").strip():
+            continue
+        normalized = _normalize_execution_mode(raw_value)
+        if normalized is None:
+            return None
+        plan_modes.append(normalized)
+    if not plan_modes or any(mode != signal_mode for mode in plan_modes):
+        return None
+
+    runtime_normalized = _normalize_execution_mode(runtime_mode)
+    if runtime_normalized is None or runtime_normalized != signal_mode:
+        return None
+    if not isinstance(paper_flag, bool):
+        return None
+    flag_mode = "paper" if paper_flag else "live"
+    if flag_mode != signal_mode:
+        return None
+    return signal_mode
+
+
+def _parse_datetime_for_efficiency(value) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value is None or str(value).strip() == "":
+        return None
+    else:
+        try:
+            parsed = datetime.fromisoformat(
+                str(value).strip().replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return None
+    # Entry-efficiency deadlines are authority-bearing.  A naive timestamp
+    # cannot establish a session boundary, so reject it instead of guessing
+    # UTC and manufacturing a bounded window.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _efficiency_truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 ET  = ZoneInfo("America/New_York")
 _OCC_CONTRACT_RE = re.compile(r"\d{6}[CP]\d{5,8}")
 
@@ -4521,6 +4611,368 @@ class APExecutionCore:
         except Exception as _eid_exc:
             log.debug("[%s] intelligence early dispatch non-critical: %s", ticker, _eid_exc)
         # ── End early intelligence dispatch ─────────────────────────────────────
+
+        # ── PR #436: bounded entry-efficiency recheck ──────────────────────────
+        # This gate is deliberately before hydration, deferred selection, and
+        # every submit path.  It can retain the existing watcher owner or
+        # terminalize the existing pending row; it never selects a contract or
+        # creates a broker intent.
+        _efficiency_plan_meta = getattr(approved_plan, "metadata", {}) or {}
+        if not isinstance(_efficiency_plan_meta, dict):
+            _efficiency_plan_meta = {}
+        _efficiency_signal_meta = sig.get("metadata") or {}
+        if not isinstance(_efficiency_signal_meta, dict):
+            _efficiency_signal_meta = {}
+        _efficiency_meta = dict(_efficiency_plan_meta)
+        _efficiency_meta.update(_efficiency_signal_meta)
+        # Keep the ordinary submit identity separate from the PAPER-only
+        # entry-efficiency authority identity.  LIVE remains on the existing
+        # submit path even though #436 has no LIVE authority.
+        _resolved_execution_mode = _resolve_submit_execution_mode(
+            approved_plan,
+            sig,
+            getattr(self, "mode", None),
+            getattr(self, "paper", None),
+        )
+        _efficiency_authoritative_execution_mode = _resolve_entry_efficiency_execution_mode(
+            approved_plan,
+            sig,
+            getattr(self, "execution_mode", None),
+            getattr(self, "paper", None),
+        )
+        _efficiency_evaluator_execution_mode = _efficiency_authoritative_execution_mode
+        _efficiency_watched_state = getattr(watched, "entry_efficiency_state", None)
+        _efficiency_prior_state = str(
+            _efficiency_watched_state
+            if _efficiency_watched_state not in (None, "")
+            else _efficiency_meta.get("entry_efficiency_state", "")
+            or ""
+        ).strip().upper()
+        _efficiency_watched_generation = getattr(
+            watched, "entry_efficiency_generation", None
+        )
+        _efficiency_generation_valid = bool(
+            getattr(watched, "entry_efficiency_generation_valid", True)
+        )
+        if _efficiency_generation_valid:
+            if _efficiency_watched_generation is not None:
+                _efficiency_prior_generation = parse_entry_efficiency_generation(
+                    _efficiency_watched_generation,
+                    state=_efficiency_prior_state,
+                )
+            elif "entry_efficiency_generation" in _efficiency_meta:
+                _efficiency_prior_generation = parse_entry_efficiency_generation(
+                    _efficiency_meta["entry_efficiency_generation"],
+                    state=_efficiency_prior_state,
+                )
+            else:
+                _efficiency_prior_generation = parse_entry_efficiency_generation(
+                    state=_efficiency_prior_state,
+                )
+            _efficiency_generation_valid = _efficiency_prior_generation is not None
+        else:
+            _efficiency_prior_generation = None
+        _efficiency_identity_proven = entry_efficiency_identity_is_proven(
+            sig,
+            metadata=_efficiency_meta,
+            runtime_execution_mode=_efficiency_authoritative_execution_mode,
+            runtime_paper=getattr(self, "paper", None),
+            state=_efficiency_prior_state,
+            generation=_efficiency_prior_generation,
+        )
+        _efficiency_first_breach = (
+            getattr(watched, "trigger_crossed_at", None)
+            or sig.get("trigger_crossed_at")
+        )
+        _efficiency_watched_deadline = getattr(
+            watched, "entry_efficiency_deadline_at", None
+        )
+        if not _efficiency_generation_valid or not _efficiency_identity_proven:
+            # A persisted lifecycle without a canonical generation or exact
+            # opportunity identity is telemetry only.  Do not let the
+            # evaluator manufacture authority or expose a CAS path that could
+            # rebind a foreign lifecycle to this row.
+            _efficiency_evaluator_execution_mode = None
+        _efficiency_result = evaluate_entry_efficiency(
+            ticker=ticker,
+            side=getattr(watched, "side", None) or sig.get("side"),
+            pattern=(
+                getattr(approved_plan, "pattern", None)
+                or sig.get("pattern")
+            ),
+            timeframe=(
+                getattr(approved_plan, "timeframe", None)
+                or sig.get("timeframe")
+            ),
+            metadata=_efficiency_meta,
+            execution_mode=_efficiency_evaluator_execution_mode,
+            trigger_price=getattr(watched, "entry_trigger", None),
+            stop_price=getattr(watched, "stop_level", None),
+            target_price=getattr(watched, "target_price", None),
+            bid=getattr(watched, "last_quote_bid", None),
+            ask=getattr(watched, "last_quote_ask", None),
+            quote_age_ms=getattr(watched, "last_quote_age_ms", None),
+            first_breach_at=_efficiency_first_breach,
+            prior_state=_efficiency_prior_state,
+            rearm_pending=_efficiency_truthy(
+                getattr(watched, "entry_efficiency_rearm_pending", None)
+                if getattr(watched, "entry_efficiency_rearm_pending", None) is not None
+                else _efficiency_meta.get("entry_efficiency_rearm_pending")
+            ),
+            prior_deadline_at=(
+                _efficiency_watched_deadline
+                if _efficiency_watched_deadline is not None
+                else _efficiency_meta.get("entry_efficiency_deadline_at")
+            ),
+            mode=None,
+        )
+        _efficiency_identity_patch = {
+            "entry_efficiency_local_order_id": str(queue_local_order_id or ""),
+            "entry_efficiency_signal_id": signal_id,
+            "entry_efficiency_canonical_signal_id": str(
+                sig.get("canonical_signal_id")
+                or _efficiency_meta.get("canonical_signal_id")
+                or ""
+            ),
+            "entry_efficiency_client_id": str(_breach_client_id or "").strip().lower(),
+            "entry_efficiency_execution_mode": str(
+                _resolved_execution_mode or ""
+            ).strip().lower(),
+            "entry_efficiency_rebreach_at": (
+                getattr(watched, "entry_efficiency_rebreach_at", None).isoformat()
+                if isinstance(
+                    getattr(watched, "entry_efficiency_rebreach_at", None),
+                    datetime,
+                )
+                else getattr(watched, "entry_efficiency_rebreach_at", None)
+            ),
+            "entry_efficiency_observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if not _efficiency_result.authoritative:
+            # #436 is PAPER-authoritative only.  A resolved LIVE callback must
+            # not add an observation DB/network write before the existing
+            # hydration, selector, final-gate, and OSM submit sequence.
+            if _resolved_execution_mode != "live":
+                # Observation is best effort by contract.  A telemetry write
+                # can never block or release the existing entry path.
+                try:
+                    _efficiency_observation = {
+                        **_efficiency_result.to_meta(),
+                        **_efficiency_identity_patch,
+                    }
+                    _efficiency_observation["entry_efficiency_observation"] = True
+                    _update_efficiency_meta = getattr(
+                        self.order_state_machine, "update_order_meta", None
+                    )
+                    if callable(_update_efficiency_meta):
+                        _update_efficiency_meta(
+                            queue_local_order_id,
+                            {"entry_efficiency_observation": _efficiency_observation},
+                        )
+                except Exception as _efficiency_observe_exc:
+                    log.debug(
+                        "[%s] entry-efficiency observation persist non-critical: %s",
+                        ticker,
+                        _efficiency_observe_exc,
+                    )
+        else:
+            _efficiency_next_state = _efficiency_result.decision
+            _efficiency_current_state = _efficiency_prior_state
+            _efficiency_patch = {
+                **_efficiency_result.to_meta(),
+                **_efficiency_identity_patch,
+            }
+
+            def _persist_efficiency_transition(next_state: str) -> bool:
+                _cas = getattr(
+                    self.order_state_machine, "cas_entry_efficiency_state", None
+                )
+                if not callable(_cas) or _efficiency_prior_generation is None:
+                    return False
+                try:
+                    return bool(
+                        _cas(
+                            queue_local_order_id,
+                            signal_id=signal_id,
+                            canonical_signal_id=str(
+                                sig.get("canonical_signal_id")
+                                or _efficiency_meta.get("canonical_signal_id")
+                                or ""
+                            ),
+                            client_id=_breach_client_id,
+                            execution_mode=_efficiency_authoritative_execution_mode,
+                            expected_state=_efficiency_current_state,
+                            expected_generation=_efficiency_prior_generation,
+                            next_state=next_state,
+                            next_generation=_efficiency_prior_generation + 1,
+                            meta_patch=_efficiency_patch,
+                        )
+                    )
+                except Exception as _efficiency_cas_exc:
+                    log.critical(
+                        "[%s] entry-efficiency transition CAS exception: %s",
+                        ticker,
+                        _efficiency_cas_exc,
+                    )
+                    return False
+
+            def _apply_efficiency_transition(next_state: str) -> None:
+                _efficiency_patch["entry_efficiency_state"] = next_state
+                _efficiency_patch["entry_efficiency_generation"] = (
+                    _efficiency_prior_generation + 1
+                )
+                _efficiency_signal_meta.update(_efficiency_patch)
+                sig["metadata"] = _efficiency_signal_meta
+                _efficiency_plan_meta.update(_efficiency_patch)
+                try:
+                    approved_plan.metadata = _efficiency_plan_meta
+                except Exception as _efficiency_plan_meta_exc:
+                    log.debug(
+                        "[%s] entry-efficiency plan metadata mirror unavailable: %s",
+                        ticker,
+                        _efficiency_plan_meta_exc,
+                    )
+                watched.entry_efficiency_state = next_state
+                watched.entry_efficiency_generation = _efficiency_prior_generation + 1
+                watched.entry_efficiency_generation_valid = True
+                watched.entry_efficiency_rearm_pending = bool(
+                    _efficiency_result.rearm_pending
+                    if next_state != ENTRY_EFFICIENCY_READY_NOW
+                    else False
+                )
+                _efficiency_patch["entry_efficiency_rearm_pending"] = (
+                    watched.entry_efficiency_rearm_pending
+                )
+                _efficiency_signal_meta["entry_efficiency_rearm_pending"] = (
+                    watched.entry_efficiency_rearm_pending
+                )
+                _efficiency_plan_meta["entry_efficiency_rearm_pending"] = (
+                    watched.entry_efficiency_rearm_pending
+                )
+                watched.entry_efficiency_next_eval_at = (
+                    _parse_datetime_for_efficiency(
+                        _efficiency_result.next_evaluation_at
+                    )
+                )
+                watched.entry_efficiency_deadline_at = (
+                    _parse_datetime_for_efficiency(_efficiency_result.deadline_at)
+                )
+
+            if _efficiency_current_state == ENTRY_EFFICIENCY_TERMINAL_INVALID:
+                _terminal_result = _terminalize_breach_failure(
+                    _efficiency_result.reason_code,
+                    meta_patch=_efficiency_patch,
+                    context_notes=_efficiency_result.detail,
+                )
+                if isinstance(_terminal_result, dict):
+                    return _terminal_result
+                return {
+                    "disposition": "TERMINAL_DURABLE",
+                    "reason_code": _efficiency_result.reason_code,
+                }
+
+            if _efficiency_next_state in {
+                ENTRY_EFFICIENCY_WAIT_CONFIRMATION,
+                ENTRY_EFFICIENCY_REARM_FOR_REBREACH,
+            }:
+                if not _persist_efficiency_transition(_efficiency_next_state):
+                    log.critical(
+                        "[%s] ENTRY_EFFICIENCY_STATE_CAS_FAILED local_order_id=%s "
+                        "state=%s generation=%s — watcher retained, no submit",
+                        ticker,
+                        queue_local_order_id,
+                        _efficiency_next_state,
+                        _efficiency_prior_generation,
+                    )
+                    return {
+                        "disposition": "ENTRY_EFFICIENCY_WAIT",
+                        "reason_code": "ENTRY_EFFICIENCY_STATE_CAS_FAILED",
+                        "retry_after_seconds": 5,
+                        "next_retry_at": (
+                            _efficiency_result.next_evaluation_at
+                            or (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+                        ),
+                    }
+                _apply_efficiency_transition(_efficiency_next_state)
+                return {
+                    "disposition": "ENTRY_EFFICIENCY_WAIT",
+                    "reason_code": _efficiency_result.reason_code,
+                    "next_retry_at": _efficiency_result.next_evaluation_at,
+                    "retry_after_seconds": 5,
+                }
+
+            if _efficiency_next_state == ENTRY_EFFICIENCY_TERMINAL_INVALID:
+                if not _persist_efficiency_transition(_efficiency_next_state):
+                    log.critical(
+                        "[%s] ENTRY_EFFICIENCY_STATE_CAS_FAILED before terminalization "
+                        "local_order_id=%s — watcher retained, no submit",
+                        ticker,
+                        queue_local_order_id,
+                    )
+                    return {
+                        "disposition": "ENTRY_EFFICIENCY_WAIT",
+                        "reason_code": "ENTRY_EFFICIENCY_STATE_CAS_FAILED",
+                        "retry_after_seconds": 5,
+                        "next_retry_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=5)
+                        ).isoformat(),
+                    }
+                _apply_efficiency_transition(_efficiency_next_state)
+                _terminal_result = _terminalize_breach_failure(
+                    _efficiency_result.reason_code,
+                    meta_patch=_efficiency_patch,
+                    context_notes=_efficiency_result.detail,
+                )
+                if isinstance(_terminal_result, dict):
+                    return _terminal_result
+                return {
+                    "disposition": "TERMINAL_DURABLE",
+                    "reason_code": _efficiency_result.reason_code,
+                }
+
+            if _efficiency_current_state in {
+                ENTRY_EFFICIENCY_WAIT_CONFIRMATION,
+                ENTRY_EFFICIENCY_REARM_FOR_REBREACH,
+            }:
+                if not _persist_efficiency_transition(ENTRY_EFFICIENCY_READY_NOW):
+                    log.critical(
+                        "[%s] ENTRY_EFFICIENCY_READY_CAS_FAILED local_order_id=%s "
+                        "— watcher retained, no submit",
+                        ticker,
+                        queue_local_order_id,
+                    )
+                    return {
+                        "disposition": "ENTRY_EFFICIENCY_WAIT",
+                        "reason_code": "ENTRY_EFFICIENCY_STATE_CAS_FAILED",
+                        "retry_after_seconds": 5,
+                        "next_retry_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=5)
+                        ).isoformat(),
+                    }
+                _apply_efficiency_transition(ENTRY_EFFICIENCY_READY_NOW)
+            elif (
+                _efficiency_next_state == ENTRY_EFFICIENCY_READY_NOW
+                and _efficiency_current_state != ENTRY_EFFICIENCY_READY_NOW
+                and _efficiency_result.reason_code != "PATTERN_NOT_IN_SCOPE"
+            ):
+                if not _persist_efficiency_transition(ENTRY_EFFICIENCY_READY_NOW):
+                    log.critical(
+                        "[%s] ENTRY_EFFICIENCY_READY_CAS_FAILED for initial "
+                        "authoritative decision local_order_id=%s — watcher retained",
+                        ticker,
+                        queue_local_order_id,
+                    )
+                    return {
+                        "disposition": "ENTRY_EFFICIENCY_WAIT",
+                        "reason_code": "ENTRY_EFFICIENCY_STATE_CAS_FAILED",
+                        "retry_after_seconds": 5,
+                        "next_retry_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=5)
+                        ).isoformat(),
+                    }
+                _apply_efficiency_transition(ENTRY_EFFICIENCY_READY_NOW)
+        # ── End PR #436 gate ───────────────────────────────────────────────────
 
         _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
             approved_plan=approved_plan,

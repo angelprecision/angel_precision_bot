@@ -1,0 +1,2706 @@
+from __future__ import annotations
+
+import json
+import inspect
+import os
+import uuid
+from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql://test:test@127.0.0.1:5432/test_entry_efficiency",
+)
+os.environ.setdefault("ENCRYPTION_KEY", "ap-entry-efficiency-pr-436-2026")
+
+import ap_execution_core as execution_core_module
+from ap.broker_submit_identity import canonical_broker_submit_key
+from ap_entry_efficiency import (
+    ENTRY_EFFICIENCY_CONFIG_CONFLICT,
+    ENTRY_EFFICIENCY_CONFIG_INVALID,
+    ENTRY_EFFICIENCY_CONFIG_UNSET,
+    ENTRY_EFFICIENCY_CONFIG_VALID,
+    ENTRY_EFFICIENCY_OBSERVE_ONLY,
+    ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+    READY_NOW,
+    REARM_FOR_REBREACH,
+    TERMINAL_INVALID,
+    WAIT_CONFIRMATION,
+    evaluate_entry_efficiency,
+    parse_entry_efficiency_generation,
+    resolve_entry_efficiency_mode,
+    resolve_entry_efficiency_mode_with_reason,
+)
+from ap_entry_watcher import (
+    APEntryWatcher,
+    WatchedSignal,
+    WatchState,
+    _parse_entry_efficiency_at,
+)
+from ap.order_state_machine import APOrderStateMachine
+from ap.pending_trigger_restart_recovery import (
+    PendingTriggerRestartRecovery,
+    _RowOutcome,
+)
+from ap_recovery import APStartupRecovery
+from ap_execution_core import (
+    APExecutionCore,
+    _parse_datetime_for_efficiency,
+    _resolve_entry_efficiency_execution_mode,
+    _resolve_submit_execution_mode,
+)
+
+
+FIRST_BREACH = datetime(2026, 8, 12, 13, 51, 51, tzinfo=timezone.utc)
+
+
+def _decision(**overrides):
+    values = {
+        "ticker": "AAPL",
+        "side": "PUT",
+        "pattern": "2-3",
+        "timeframe": "1d",
+        "metadata": {},
+        "execution_mode": "paper",
+        "trigger_price": 302.80,
+        "stop_price": 304.00,
+        "target_price": 300.0,
+        "bid": 302.79,
+        "ask": 302.81,
+        "quote_age_ms": 1_000,
+        "first_breach_at": FIRST_BREACH,
+        "now": datetime(2026, 8, 12, 13, 52, 30, tzinfo=timezone.utc),
+        "mode": "paper_authoritative",
+    }
+    values.update(overrides)
+    return evaluate_entry_efficiency(**values)
+
+
+def test_targeted_paper_rollout_requires_explicit_promotion_and_fails_closed(monkeypatch):
+    monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+
+    assert resolve_entry_efficiency_mode() == ENTRY_EFFICIENCY_OBSERVE_ONLY
+    assert resolve_entry_efficiency_mode("not-a-mode") == ENTRY_EFFICIENCY_OBSERVE_ONLY
+    assert resolve_entry_efficiency_mode("paper") == ENTRY_EFFICIENCY_OBSERVE_ONLY
+    assert resolve_entry_efficiency_mode("paper_authoritative") == ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE
+    result = _decision(mode=None)
+    assert result.authoritative is False
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.reason_code == "OBSERVE_ONLY"
+    assert result.should_hold is False
+
+
+def test_rollout_aliases_are_consensus_checked_and_report_fail_closed_reason(monkeypatch):
+    monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_UNSET,
+    )
+
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+        ENTRY_EFFICIENCY_CONFIG_VALID,
+    )
+
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", "paper-authoritative")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+        ENTRY_EFFICIENCY_CONFIG_VALID,
+    )
+
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", "observe_only")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_CONFLICT,
+    )
+
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", "not-a-rollout-mode")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_INVALID,
+    )
+
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", " ")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_INVALID,
+    )
+
+    monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", "observe_only")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_VALID,
+    )
+
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    result = _decision(mode=None)
+    assert result.authoritative is False
+    assert result.evidence["rollout_config_reason"] == ENTRY_EFFICIENCY_CONFIG_CONFLICT
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "observe_only")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_VALID,
+    )
+
+
+def test_entry_efficiency_generation_parser_only_infers_the_initial_absence():
+    assert parse_entry_efficiency_generation(state="") == 0
+    assert parse_entry_efficiency_generation(state=WAIT_CONFIRMATION) is None
+    assert parse_entry_efficiency_generation(0, state="") == 0
+    assert parse_entry_efficiency_generation(7, state=REARM_FOR_REBREACH) == 7
+
+    for state in (WAIT_CONFIRMATION, REARM_FOR_REBREACH, READY_NOW):
+        for raw in (0, "0", None, "", " ", " 1", "1 ", "01", "-1", "junk", 1.0, True):
+            assert parse_entry_efficiency_generation(raw, state=state) is None
+
+
+@pytest.mark.parametrize(
+    "plan, signal, runtime_mode, paper_flag",
+    [
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "paper"},
+            "paper",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode="live", mode=None),
+            {"execution_mode": "live"},
+            "live",
+            False,
+        ),
+    ],
+)
+def test_submit_execution_mode_requires_one_consensus_identity(
+    plan, signal, runtime_mode, paper_flag
+):
+    assert _resolve_submit_execution_mode(
+        plan, signal, runtime_mode, paper_flag
+    ) == signal["execution_mode"]
+
+
+@pytest.mark.parametrize(
+    "plan, signal, runtime_mode, paper_flag",
+    [
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "live"},
+            "live",
+            False,
+        ),
+        (
+            SimpleNamespace(execution_mode="paper", mode="live"),
+            {"execution_mode": "paper"},
+            "paper",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "paper", "mode": "live"},
+            "paper",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "paper"},
+            "live",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "paper"},
+            "paper",
+            "true",
+        ),
+        (
+            SimpleNamespace(execution_mode="unknown", mode=None),
+            {"execution_mode": "paper"},
+            "paper",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode=" ", mode=None),
+            {"execution_mode": "paper"},
+            "paper",
+            True,
+        ),
+    ],
+)
+def test_entry_efficiency_execution_mode_conflict_or_malformed_identity_fails_closed(
+    plan, signal, runtime_mode, paper_flag
+):
+    assert _resolve_entry_efficiency_execution_mode(
+        plan, signal, runtime_mode, paper_flag
+    ) is None
+
+
+def test_general_submit_mode_keeps_current_main_precedence():
+    plan = SimpleNamespace(execution_mode="paper", mode=None)
+    signal = {"execution_mode": "live", "mode": "live"}
+
+    # The ordinary submit path keeps the legacy first-valid-source behavior;
+    # entry-efficiency authority is the only strict consensus resolver.
+    assert _resolve_submit_execution_mode(plan, signal, "live", False) == "paper"
+    assert _resolve_submit_execution_mode(
+        SimpleNamespace(execution_mode=" ", mode=None),
+        {"execution_mode": "live"},
+        "live",
+        False,
+    ) == "live"
+
+
+def test_clean_live_submit_mode_is_unchanged_when_efficiency_is_unavailable(monkeypatch):
+    monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    plan = SimpleNamespace(execution_mode=None, mode="live")
+    signal = {
+        "execution_mode": "live",
+        "mode": "live",
+        "local_order_id": "live-clean-order",
+    }
+
+    assert resolve_entry_efficiency_mode() == ENTRY_EFFICIENCY_OBSERVE_ONLY
+    assert _resolve_submit_execution_mode(plan, signal, "live", False) == "live"
+
+
+def test_live_authority_is_reserved_and_cannot_be_enabled_by_environment(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_LIVE_APPROVED", "1")
+    monkeypatch.setenv("ENTRY_EFFICIENCY_LIVE_APPROVED", "true")
+    assert resolve_entry_efficiency_mode("live_authoritative") == "observe_only"
+    result = _decision(execution_mode="live", mode="live_authoritative")
+    assert result.authoritative is False
+    assert result.should_hold is False
+
+
+def test_aapl_opening_daily_raw_pattern_normalizes_and_holds():
+    result = _decision()
+
+    assert result.authoritative is True
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.should_hold is True
+    assert result.pattern_raw == "2-3"
+    assert result.canonical_pattern == "2-3-2"
+    assert result.to_meta()["entry_efficiency_pattern_raw"] == "2-3"
+    assert result.to_meta()["entry_efficiency_canonical_pattern"] == "2-3-2"
+    assert result.breach_was_opening is True
+    assert result.opening_window is True
+    assert result.reason_code == "ENTRY_EFFICIENCY_OPENING_BREACH"
+
+
+def test_clock_alone_after_opening_window_does_not_release_old_breach():
+    result = _decision(now=datetime(2026, 8, 12, 14, 0, tzinfo=timezone.utc))
+
+    assert result.opening_window is False
+    assert result.breach_was_opening is True
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.reason_code == "ENTRY_EFFICIENCY_OPENING_BREACH"
+
+
+def test_pullback_requires_rebreach_and_fresh_rebreach_can_release():
+    pulled_back = _decision(bid=303.10, ask=303.20)
+    assert pulled_back.decision == REARM_FOR_REBREACH
+    assert pulled_back.reason_code == "ENTRY_EFFICIENCY_REARM_REQUIRED"
+
+    rebreached = _decision(
+        bid=302.79,
+        ask=302.81,
+        rearm_pending=True,
+    )
+    assert rebreached.decision == READY_NOW
+    assert rebreached.reason_code == "ENTRY_EFFICIENCY_GENUINE_REBREACH"
+
+
+def test_unproven_rearm_state_cannot_release_on_trigger_relation_alone():
+    result = _decision(
+        prior_state=REARM_FOR_REBREACH,
+        rearm_pending=False,
+        now=datetime(2026, 8, 12, 14, 0, tzinfo=timezone.utc),
+    )
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.reason_code == "ENTRY_EFFICIENCY_REARM_STATE_UNPROVEN"
+
+
+def test_profile_ready_is_ignored_without_direct_rebreach_evidence():
+    result = _decision(
+        now=datetime(2026, 8, 12, 14, 0, tzinfo=timezone.utc),
+        metadata={
+            "breach_profile": {
+                "decision_class": "VALID_SETUP_READY_NOW",
+                "continuation_confirmed": True,
+            }
+        },
+    )
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.reason_code == "ENTRY_EFFICIENCY_OPENING_BREACH"
+    assert result.should_hold is True
+    assert result.evidence["intelligence_metadata_authority"] == "IGNORED"
+    assert result.evidence["untrusted_intelligence_keys"] == ("breach_profile",)
+
+
+def test_profile_ready_without_fresh_continuation_does_not_release_old_breach():
+    result = _decision(
+        now=datetime(2026, 8, 12, 14, 0, tzinfo=timezone.utc),
+        metadata={"breach_profile": {"decision_class": "VALID_SETUP_READY_NOW"}},
+    )
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.reason_code == "ENTRY_EFFICIENCY_OPENING_BREACH"
+
+
+def test_canonical_breach_profile_classes_never_become_timing_authority():
+    baseline = _decision()
+    for decision_class in (
+        "VALID_SETUP_BAD_IMMEDIATE_ENTRY",
+        "VALID_SETUP_WAIT_FOR_REBREACH",
+        "SETUP_INVALID",
+    ):
+        result = _decision(
+            metadata={"breach_profile": {"decision_class": decision_class}},
+        )
+        assert result.decision == baseline.decision
+        assert result.reason_code == baseline.reason_code
+        assert result.evidence["timing_authority_basis"] == "DIRECT_MARKET_EVIDENCE"
+
+
+def test_naive_first_breach_is_rejected_not_reinterpreted_as_utc():
+    result = _decision(
+        first_breach_at="2026-08-12T13:51:51",
+        metadata={"entry_efficiency_first_breach_at": FIRST_BREACH.isoformat()},
+    )
+    assert result.first_breach_at is None
+    assert result.breach_was_opening is False
+    assert result.decision == WAIT_CONFIRMATION
+    assert result.reason_code == "ENTRY_EFFICIENCY_FIRST_BREACH_UNAVAILABLE"
+    assert result.should_hold is True
+
+
+@pytest.mark.parametrize(
+    "parser",
+    [_parse_entry_efficiency_at, _parse_datetime_for_efficiency],
+)
+def test_entry_efficiency_schedule_parsers_reject_naive_timestamps(parser):
+    assert parser("2026-08-12T13:51:51") is None
+    assert parser("2026-08-12T13:51:51+00:00") == FIRST_BREACH
+
+
+def test_durable_deadline_is_not_extended_when_breach_evidence_is_missing():
+    result = _decision(
+        first_breach_at=None,
+        prior_deadline_at="2026-08-12T13:52:00+00:00",
+        now=datetime(2026, 8, 12, 13, 53, tzinfo=timezone.utc),
+    )
+    assert result.decision == TERMINAL_INVALID
+    assert result.reason_code == "ENTRY_EFFICIENCY_WAIT_DEADLINE_EXPIRED"
+
+
+def test_authoritative_rollout_is_scoped_to_daily_232():
+    result = _decision(pattern="1-2")
+    assert result.canonical_pattern == "1-2"
+    assert result.decision == READY_NOW
+    assert result.reason_code == "PATTERN_NOT_IN_SCOPE"
+    assert result.authoritative is False
+    assert result.should_hold is False
+
+
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        ({"bid": 0, "ask": 0, "quote_age_ms": None}, "ENTRY_EFFICIENCY_QUOTE_UNAVAILABLE"),
+        ({"quote_age_ms": 60_001}, "ENTRY_EFFICIENCY_QUOTE_UNAVAILABLE"),
+        ({"ask": 306.1}, "ENTRY_EFFICIENCY_STOP_INVALIDATED"),
+        ({"bid": 299.9, "ask": 300.1}, "ENTRY_EFFICIENCY_TARGET_COMPLETE"),
+    ],
+)
+def test_authoritative_truth_never_releases_stale_or_invalid_setup(overrides, reason):
+    result = _decision(**overrides)
+    assert result.decision in {WAIT_CONFIRMATION, TERMINAL_INVALID}
+    assert result.reason_code == reason
+    if result.decision == TERMINAL_INVALID:
+        assert result.should_hold is False
+
+
+def _watch_signal(contract_symbol="", **metadata):
+    signal = {
+        "signal_id": "sig-efficiency",
+        "canonical_signal_id": "canonical-sig-efficiency",
+        "ticker": "AAPL",
+        "side": "PUT",
+        "entry_price": 302.80,
+        "stop_price": 304.00,
+        "target_price": 300.0,
+        "timeframe": "1d",
+        "pattern": "2-3",
+        "local_order_id": "order-efficiency",
+        "client_id": "jason@example.com",
+        "execution_mode": "paper",
+        "metadata": metadata,
+    }
+    if "entry_efficiency_state" in metadata or "entry_efficiency_generation" in metadata:
+        metadata.setdefault("entry_efficiency_local_order_id", "order-efficiency")
+        metadata.setdefault("entry_efficiency_signal_id", "sig-efficiency")
+        metadata.setdefault(
+            "entry_efficiency_canonical_signal_id", "canonical-sig-efficiency"
+        )
+        metadata.setdefault("entry_efficiency_client_id", "jason@example.com")
+        metadata.setdefault("entry_efficiency_execution_mode", "paper")
+    if contract_symbol:
+        signal["contract_symbol"] = contract_symbol
+    return signal
+
+
+def _watched_with_runtime(signal, mode="PAPER"):
+    watched = WatchedSignal(signal, overnight=False)
+    watched._watcher_ref = APEntryWatcher(
+        None, order_state_machine=MagicMock(), mode=mode
+    )
+    return watched
+
+
+def test_watcher_wait_suppresses_repeated_trigger_until_efficiency_due(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state="WAIT_CONFIRMATION",
+        entry_efficiency_generation=3,
+        entry_efficiency_next_eval_at=future,
+    ))
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1000) == WatchState.PENDING
+    assert watched.breach_count == 0
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+    watched.entry_efficiency_next_eval_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert watched.check(302.79, 302.81, quote_age_ms=1000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1000) == WatchState.TRIGGERED
+
+
+@pytest.mark.parametrize(
+    "runtime_mode, signal_mode",
+    [("LIVE", "paper"), ("PAPER", "live")],
+)
+def test_watcher_runtime_and_signal_mode_mismatch_never_honors_efficiency_wait(
+    monkeypatch, runtime_mode, signal_mode
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    signal = _watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    )
+    signal["execution_mode"] = signal_mode
+    signal["metadata"]["entry_efficiency_execution_mode"] = signal_mode
+    watched = _watched_with_runtime(signal, mode=runtime_mode)
+    watcher = watched._watcher_ref
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+    assert watched._entry_efficiency_persist_request is None
+    watcher.order_state_machine.cas_entry_efficiency_state.assert_not_called()
+
+
+def test_paper_stale_efficiency_wait_is_ignored_when_rollout_is_observe_only(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_OBSERVE_ONLY)
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    ))
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+def test_paper_stale_efficiency_wait_remains_active_when_authority_is_enabled(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    ))
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.breach_count == 0
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+def test_paper_stale_efficiency_wait_is_ignored_for_unrelated_strategy_scope(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    signal = _watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    )
+    signal["pattern"] = "1-2"
+    watched = _watched_with_runtime(signal)
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+@pytest.mark.parametrize("generation", [0, "0", "", " ", "-1", "junk"])
+def test_watcher_invalid_generation_never_honors_persisted_efficiency_wait(
+    monkeypatch, generation
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=generation,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    ))
+
+    assert watched.entry_efficiency_generation is None
+    assert watched.entry_efficiency_generation_valid is False
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_efficiency_local_order_id", None),
+        ("entry_efficiency_signal_id", "other-signal"),
+        ("entry_efficiency_canonical_signal_id", "other-canonical"),
+        ("entry_efficiency_client_id", "other@example.com"),
+        ("entry_efficiency_execution_mode", "live"),
+        ("entry_efficiency_generation", 2),
+    ],
+)
+def test_watcher_restart_identity_conflict_is_telemetry_only(monkeypatch, field, value):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    signal = _watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    )
+    if value is None:
+        signal["metadata"].pop(field)
+    elif field != "entry_efficiency_generation":
+        signal["metadata"][field] = value
+    watched = _watched_with_runtime(signal, mode="PAPER")
+    watcher = watched._watcher_ref
+    if field == "entry_efficiency_generation":
+        # Model a reconstructed watcher whose in-memory lifecycle watermark
+        # disagrees with the persisted row watermark.
+        watched.entry_efficiency_generation = value
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched._entry_efficiency_persist_request is None
+    watcher.order_state_machine.cas_entry_efficiency_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_efficiency_state", " WAIT_CONFIRMATION "),
+        ("entry_efficiency_state", "CORRUPT_STATE"),
+        ("entry_efficiency_local_order_id", " order-efficiency "),
+        ("entry_efficiency_signal_id", " sig-efficiency "),
+        ("entry_efficiency_canonical_signal_id", " canonical-sig-efficiency "),
+        ("entry_efficiency_client_id", " jason@example.com "),
+        ("entry_efficiency_execution_mode", " paper "),
+    ],
+)
+def test_watcher_noncanonical_or_unknown_efficiency_state_is_telemetry_only(
+    monkeypatch, field, value
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    signal = _watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    )
+    signal["metadata"][field] = value
+    watched = _watched_with_runtime(signal, mode="PAPER")
+    watcher = watched._watcher_ref
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched._entry_efficiency_persist_request is None
+    watcher.order_state_machine.cas_entry_efficiency_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "plan_modes, signal_mode, runtime_mode, paper_flag",
+    [
+        (("paper",), "live", "live", False),
+        (("live",), "paper", "paper", True),
+        (("paper", "live"), "paper", "paper", True),
+    ],
+)
+def test_entry_efficiency_execution_identity_conflicts_fail_closed(
+    plan_modes, signal_mode, runtime_mode, paper_flag
+):
+    plan = SimpleNamespace(
+        execution_mode=plan_modes[0],
+        mode=plan_modes[1] if len(plan_modes) > 1 else None,
+    )
+    signal = {"execution_mode": signal_mode}
+
+    assert _resolve_entry_efficiency_execution_mode(
+        plan, signal, runtime_mode, paper_flag
+    ) is None
+
+
+def test_entry_efficiency_execution_identity_requires_exact_paper_agreement():
+    plan = SimpleNamespace(execution_mode="paper", mode=None)
+    signal = {"execution_mode": "paper"}
+
+    assert _resolve_entry_efficiency_execution_mode(
+        plan, signal, "paper", True
+    ) == "paper"
+
+
+@pytest.mark.parametrize(
+    "plan_mode, signal_mode, runtime_mode, paper_flag",
+    [
+        ("paper", "live", "live", False),
+        ("live", "paper", "paper", True),
+    ],
+)
+def test_execution_core_conflicting_identity_stays_on_existing_path(
+    monkeypatch, plan_mode, signal_mode, runtime_mode, paper_flag
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    efficiency_metadata = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat(),
+    }
+    signal = _watch_signal(**efficiency_metadata)
+    signal["execution_mode"] = signal_mode
+    watched = WatchedSignal(signal, overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": "canonical-sig-efficiency",
+        },
+        execution_mode=plan_mode,
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+
+    class ExistingPathReached(RuntimeError):
+        pass
+
+    refresh = MagicMock(side_effect=ExistingPathReached)
+    observed_results = []
+    real_evaluate_entry_efficiency = execution_core_module.evaluate_entry_efficiency
+
+    def _observe_efficiency_result(**kwargs):
+        result = real_evaluate_entry_efficiency(**kwargs)
+        observed_results.append(result)
+        return result
+
+    core = SimpleNamespace(
+        mode=runtime_mode.upper(),
+        paper=paper_flag,
+        execution_mode=runtime_mode,
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _refresh_hydrated_prebreach_plan=refresh,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *a, **k: None,
+        )
+        patcher.setattr(
+            execution_core_module,
+            "evaluate_entry_efficiency",
+            _observe_efficiency_result,
+        )
+        with pytest.raises(ExistingPathReached):
+            APExecutionCore._on_entry_trigger(core, watched)
+
+    assert observed_results
+    assert observed_results[0].authoritative is False
+    assert observed_results[0].decision not in {WAIT_CONFIRMATION, TERMINAL_INVALID}
+    assert _resolve_entry_efficiency_execution_mode(
+        plan, signal, runtime_mode, paper_flag
+    ) is None
+    refresh.assert_called_once()
+    osm.cas_entry_efficiency_state.assert_not_called()
+    osm.submit_existing_entry.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_efficiency_client_id", "foreign@example.com"),
+        ("entry_efficiency_signal_id", "foreign-signal"),
+        ("entry_efficiency_canonical_signal_id", "foreign-canonical"),
+        ("entry_efficiency_local_order_id", "foreign-order"),
+        ("entry_efficiency_execution_mode", "live"),
+        ("entry_efficiency_client_id", " foreign@example.com "),
+        ("entry_efficiency_signal_id", " foreign-signal "),
+        ("entry_efficiency_canonical_signal_id", " foreign-canonical "),
+        ("entry_efficiency_local_order_id", " foreign-order "),
+        ("entry_efficiency_execution_mode", " paper "),
+        ("entry_efficiency_state", " WAIT_CONFIRMATION "),
+        ("entry_efficiency_state", "CORRUPT_STATE"),
+    ],
+)
+def test_execution_core_stateful_efficiency_identity_conflict_stays_on_existing_path(
+    monkeypatch, field, value
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    efficiency_metadata = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat(),
+    }
+    signal = _watch_signal(**efficiency_metadata)
+    signal["metadata"][field] = value
+    watched = WatchedSignal(signal, overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": "canonical-sig-efficiency",
+        },
+        execution_mode="paper",
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+
+    class ExistingPathReached(RuntimeError):
+        pass
+
+    refresh = MagicMock(side_effect=ExistingPathReached)
+    observed_results = []
+    real_evaluate_entry_efficiency = execution_core_module.evaluate_entry_efficiency
+
+    def _observe_efficiency_result(**kwargs):
+        result = real_evaluate_entry_efficiency(**kwargs)
+        observed_results.append(result)
+        return result
+
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _refresh_hydrated_prebreach_plan=refresh,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *a, **k: None,
+        )
+        patcher.setattr(
+            execution_core_module,
+            "evaluate_entry_efficiency",
+            _observe_efficiency_result,
+        )
+        with pytest.raises(ExistingPathReached):
+            APExecutionCore._on_entry_trigger(core, watched)
+
+    assert observed_results
+    assert observed_results[0].authoritative is False
+    assert observed_results[0].decision not in {WAIT_CONFIRMATION, TERMINAL_INVALID}
+    refresh.assert_called_once()
+    osm.cas_entry_efficiency_state.assert_not_called()
+    osm.submit_existing_entry.assert_not_called()
+
+
+def test_execution_core_exact_persisted_efficiency_identity_allows_authoritative_cas(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    efficiency_metadata = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": deadline,
+    }
+    watched = WatchedSignal(_watch_signal(**efficiency_metadata), overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": "canonical-sig-efficiency",
+        },
+        execution_mode="paper",
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = True
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *a, **k: None,
+        )
+        result = APExecutionCore._on_entry_trigger(core, watched)
+
+    assert result["disposition"] == "ENTRY_EFFICIENCY_WAIT"
+    assert result["reason_code"] == "ENTRY_EFFICIENCY_OPENING_BREACH"
+    call = osm.cas_entry_efficiency_state.call_args.kwargs
+    assert call["expected_state"] == WAIT_CONFIRMATION
+    assert call["expected_generation"] == 1
+    assert call["next_state"] == WAIT_CONFIRMATION
+    assert call["next_generation"] == 2
+    assert call["meta_patch"]["entry_efficiency_local_order_id"] == "order-efficiency"
+    assert call["meta_patch"]["entry_efficiency_signal_id"] == "sig-efficiency"
+    assert call["meta_patch"]["entry_efficiency_canonical_signal_id"] == "canonical-sig-efficiency"
+    assert call["meta_patch"]["entry_efficiency_client_id"] == "jason@example.com"
+    assert call["meta_patch"]["entry_efficiency_execution_mode"] == "paper"
+
+
+def test_execution_core_empty_generation_zero_establishes_first_efficiency_identity(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    watched = WatchedSignal(_watch_signal(), overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            "canonical_signal_id": "canonical-sig-efficiency",
+            "entry_efficiency_deadline_at": "2099-08-12T14:21:51+00:00",
+        },
+        execution_mode="paper",
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = True
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *a, **k: None,
+        )
+        result = APExecutionCore._on_entry_trigger(core, watched)
+
+    assert result["disposition"] == "ENTRY_EFFICIENCY_WAIT"
+    call = osm.cas_entry_efficiency_state.call_args.kwargs
+    assert call["expected_state"] == ""
+    assert call["expected_generation"] == 0
+    assert call["next_state"] == WAIT_CONFIRMATION
+    assert call["next_generation"] == 1
+    assert call["meta_patch"]["entry_efficiency_local_order_id"] == "order-efficiency"
+
+
+def test_watcher_pullback_stages_distinct_rearm_cas_request(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state="WAIT_CONFIRMATION",
+        entry_efficiency_generation=4,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+    ))
+
+    assert watched.check(303.10, 303.20, quote_age_ms=1000) == WatchState.PENDING
+    request = watched._entry_efficiency_persist_request
+    assert request["expected_state"] == WAIT_CONFIRMATION
+    assert request["expected_generation"] == 4
+    assert request["next_state"] == REARM_FOR_REBREACH
+    assert getattr(watched, "deferred_retry_not_before", None) is None
+
+
+def test_deferred_callback_verifies_efficiency_state_without_retry_lifecycle():
+    osm = MagicMock()
+    osm.get_order.return_value = {
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": "",
+        "submitted_ts": None,
+        "meta": {
+            "entry_efficiency_state": "WAIT_CONFIRMATION",
+            "entry_efficiency_next_eval_at": "2026-08-12T14:00:00+00:00",
+        },
+    }
+    watcher = APEntryWatcher(None, order_state_machine=osm, mode="PAPER")
+    watched = WatchedSignal(
+        _watch_signal(contract_symbol="DEFERRED:AAPL"),
+        overnight=False,
+    )
+    result = watcher._resolve_trigger_callback_disposition(
+        watched,
+        {
+            "disposition": "ENTRY_EFFICIENCY_WAIT",
+            "reason_code": "ENTRY_EFFICIENCY_OPENING_BREACH",
+            "next_retry_at": "2026-08-12T14:00:00+00:00",
+        },
+    )
+    assert result == ("ENTRY_EFFICIENCY_WAIT", "2026-08-12T14:00:00+00:00")
+
+
+def test_poll_loop_keeps_efficiency_wait_out_of_deferred_retry_clock():
+    osm = MagicMock()
+    osm.update_order_meta.return_value = True
+    watcher = APEntryWatcher(None, order_state_machine=osm, mode="PAPER")
+    watched = WatchedSignal(
+        _watch_signal(
+            contract_symbol="AAPL260821P00304000",
+            entry_efficiency_state="WAIT_CONFIRMATION",
+            entry_efficiency_generation=2,
+            entry_efficiency_next_eval_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        ),
+        overnight=False,
+    )
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    watcher._dedup_set.add(watched.signal_id)
+    watcher._fetch_quotes = lambda tickers: {
+        "AAPL": {"bid": 302.79, "ask": 302.81, "quote_age_ms": 1000}
+    }
+    callback = MagicMock(
+        return_value={
+            "disposition": "ENTRY_EFFICIENCY_WAIT",
+            "reason_code": "ENTRY_EFFICIENCY_CLOCK_NOT_SUFFICIENT",
+            "next_retry_at": (
+                datetime.now(timezone.utc) + timedelta(seconds=30)
+            ).isoformat(),
+        }
+    )
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert callback.call_count == 1
+    assert watched.state == WatchState.PENDING
+    assert watched.deferred_retry_not_before is None
+    assert watched.entry_efficiency_next_eval_at is not None
+
+
+def test_efficiency_gate_is_before_hydration_selector_and_submit():
+    source = inspect.getsource(APExecutionCore._on_entry_trigger)
+    gate = source.index("# ── PR #436: bounded entry-efficiency recheck")
+    assert source.index("_hydration_bridge_applied", gate) > gate
+    assert source.index("self.contract_selector.select", gate) > gate
+    assert source.index("submit_res = self.order_state_machine.submit_existing_entry", gate) > gate
+
+
+def test_aapl_wait_returns_before_runtime_submit_path(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    efficiency_metadata = {
+        "entry_efficiency_state": "WAIT_CONFIRMATION",
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": deadline,
+    }
+    watched = WatchedSignal(_watch_signal(**efficiency_metadata), overnight=False)
+    # AAPL incident shape: 09:51:51 ET, inside the first 30-minute window.
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": "canonical-sig-efficiency",
+        },
+        execution_mode="paper",
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = True
+    osm.submit_existing_entry.return_value = {"ok": True}
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(intelligence_evaluation, "_ensure_intelligence_dispatched", lambda *a, **k: None)
+        result = APExecutionCore._on_entry_trigger(core, watched)
+
+    assert result["disposition"] == "ENTRY_EFFICIENCY_WAIT"
+    assert result["reason_code"] == "ENTRY_EFFICIENCY_OPENING_BREACH"
+    osm.submit_existing_entry.assert_not_called()
+    core.contract_selector.select.assert_not_called()
+    osm.cas_entry_efficiency_state.assert_called_once()
+
+
+def test_paper_cas_failure_retains_registered_watcher_and_never_submits(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    efficiency_metadata = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": deadline,
+    }
+    signal = _watch_signal(**efficiency_metadata)
+    watched = WatchedSignal(signal, overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": signal["canonical_signal_id"],
+        },
+        execution_mode="paper",
+        client_id=signal["client_id"],
+        signal_id=signal["signal_id"],
+        canonical_signal_id=signal["canonical_signal_id"],
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+        side="PUT",
+        ticker="AAPL",
+        trigger_price=302.80,
+        stop_underlying=304.00,
+        target_underlying=300.00,
+        contracts=1,
+    )
+    watched.signal["_approved_plan"] = plan
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = False
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email=signal["client_id"],
+        client_id=signal["client_id"],
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _refresh_hydrated_prebreach_plan=MagicMock(
+            side_effect=AssertionError("CAS failure must retain watcher before hydration")
+        ),
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+    watcher = APEntryWatcher(None, order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    watcher._dedup_set.add(watched.signal_id)
+    watcher._fetch_quotes = lambda _tickers: {
+        "AAPL": {"bid": 302.79, "ask": 302.81, "quote_age_ms": 1_000}
+    }
+    callback_results = []
+
+    from ap import intelligence_evaluation
+
+    def _real_callback(triggered_watched):
+        result = APExecutionCore._on_entry_trigger(core, triggered_watched)
+        callback_results.append(result)
+        return result
+
+    watcher.on_trigger = _real_callback
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *args, **kwargs: None,
+        )
+        watcher._poll_active_signals(open_protect_active=False)
+        watcher._poll_active_signals(open_protect_active=False)
+
+    assert callback_results
+    assert callback_results[0]["disposition"] == "ENTRY_EFFICIENCY_WAIT"
+    assert callback_results[0]["reason_code"] == "ENTRY_EFFICIENCY_STATE_CAS_FAILED"
+    osm.cas_entry_efficiency_state.assert_called_once()
+    osm.submit_existing_entry.assert_not_called()
+    assert watched in watcher._pending
+    assert watched.state == WatchState.PENDING
+    assert watched.deferred_retry_not_before is None
+
+
+def test_aapl_replay_wait_rearm_rebreach_ready_has_no_first_entry_post(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    deadline = "2026-08-12T14:21:51+00:00"
+    watched = _watched_with_runtime(_watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        entry_efficiency_deadline_at=deadline,
+    ))
+    watched.trigger_crossed_at = FIRST_BREACH
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = True
+    watcher = APEntryWatcher(None, order_state_machine=osm, mode="PAPER")
+
+    # Direct market pullback stages the durable WAIT -> REARM CAS; no callback
+    # or broker submit path is entered for the original poor breach.
+    assert watched.check(303.10, 303.20, quote_age_ms=1_000) == WatchState.PENDING
+    request = watched._entry_efficiency_persist_request
+    assert request["expected_state"] == WAIT_CONFIRMATION
+    assert request["next_state"] == REARM_FOR_REBREACH
+    assert watcher._persist_entry_efficiency_transition(watched, request) is True
+    assert watched.entry_efficiency_state == REARM_FOR_REBREACH
+    assert watched.entry_efficiency_rearm_pending is True
+    cas_call = osm.cas_entry_efficiency_state.call_args
+    assert cas_call.args[0] == "order-efficiency"
+    cas_kwargs = cas_call.kwargs
+    assert cas_kwargs["signal_id"] == "sig-efficiency"
+    assert cas_kwargs["canonical_signal_id"] == "canonical-sig-efficiency"
+    assert cas_kwargs["client_id"] == "jason@example.com"
+    assert cas_kwargs["execution_mode"] == "paper"
+    assert cas_kwargs["expected_state"] == WAIT_CONFIRMATION
+    assert cas_kwargs["expected_generation"] == 1
+    assert cas_kwargs["next_state"] == REARM_FOR_REBREACH
+    assert cas_kwargs["next_generation"] == 2
+    assert osm.submit_existing_entry.call_count == 0
+
+    # A fresh direct-market re-breach earns one trigger observation, while the
+    # policy evaluator still owns the authoritative READY decision.
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.entry_efficiency_rebreach_at is not None
+    ready = _decision(
+        prior_state=REARM_FOR_REBREACH,
+        rearm_pending=True,
+        prior_deadline_at=deadline,
+        now=datetime(2026, 8, 12, 14, 1, tzinfo=timezone.utc),
+    )
+    assert ready.decision == READY_NOW
+    assert ready.reason_code == "ENTRY_EFFICIENCY_GENUINE_REBREACH"
+    assert ready.evidence["timing_authority_basis"] == "DIRECT_MARKET_EVIDENCE"
+    assert osm.submit_existing_entry.call_count == 0
+
+
+def test_osm_efficiency_cas_has_exact_entry_identity_and_no_broker_evidence():
+    source = inspect.getsource(APOrderStateMachine.cas_entry_efficiency_state)
+    for required in (
+        "local_order_id=%s",
+        "client_id=%s",
+        "kind='ENTRY'",
+        "signal_id",
+        "execution_mode",
+        "status='PENDING_TRIGGER'",
+        "broker_order_id",
+        "submit_intent_at",
+        "entry_efficiency_generation",
+        "entry_efficiency_local_order_id",
+        "entry_efficiency_signal_id",
+        "entry_efficiency_canonical_signal_id",
+        "entry_efficiency_client_id",
+        "entry_efficiency_execution_mode",
+    ):
+        assert required in source
+    assert "canonical_signal_id" in source
+    assert "broker.submit" not in source
+
+
+@pytest.fixture(scope="module")
+def postgres_entry_efficiency_db():
+    """Exercise the real OSM CAS against PostgreSQL when the service exists."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    dsn = os.getenv("DATABASE_URL", "")
+    if not dsn:
+        pytest.skip("DATABASE_URL is not configured")
+    try:
+        database = psycopg2.connect(dsn, connect_timeout=3)
+    except Exception as exc:
+        if os.getenv("CI"):
+            raise
+        pytest.skip(f"PostgreSQL service unavailable: {exc}")
+
+    database.autocommit = True
+    schema = f"pr436_cas_{uuid.uuid4().hex[:12]}"
+    with database.cursor() as cursor:
+        cursor.execute(f'CREATE SCHEMA "{schema}"')
+        cursor.execute(
+            f'''
+            CREATE TABLE "{schema}".orders (
+                local_order_id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                signal_id TEXT,
+                canonical_signal_id TEXT,
+                execution_mode TEXT,
+                status TEXT,
+                broker_order_id TEXT,
+                submitted_ts TIMESTAMPTZ,
+                meta JSONB,
+                updated_ts TIMESTAMPTZ
+            )
+            '''
+        )
+
+    @contextmanager
+    def _test_conn():
+        # Match the production OSM contract: each CAS claimant gets its own
+        # transaction/connection, allowing PostgreSQL row locking to arbitrate
+        # simultaneous claimants instead of serializing the test in Python.
+        connection = psycopg2.connect(dsn, connect_timeout=3)
+        try:
+            connection.autocommit = False
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET search_path TO "{schema}"')
+                yield cursor
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    patcher = pytest.MonkeyPatch()
+    # cas_entry_efficiency_state resolves ``conn`` from the function's
+    # defining globals.  Patch that exact namespace so the real CAS uses the
+    # temporary schema connection rather than the process-wide production
+    # connection imported during module initialization.
+    patcher.setitem(
+        APOrderStateMachine.cas_entry_efficiency_state.__globals__,
+        "conn",
+        _test_conn,
+    )
+
+    def replace_row(
+        *,
+        meta=None,
+        local_order_id="order-cas",
+        client_id="client-a",
+        signal_id="signal-a",
+        canonical_signal_id="canonical-a",
+        execution_mode="paper",
+        status="PENDING_TRIGGER",
+        broker_order_id="",
+        submitted_ts=None,
+    ):
+        row_meta = {} if meta is None else dict(meta)
+        with database.cursor() as cursor:
+            cursor.execute(f'DELETE FROM "{schema}".orders')
+            cursor.execute(
+                f'''
+                INSERT INTO "{schema}".orders (
+                    local_order_id, client_id, kind, signal_id,
+                    canonical_signal_id, execution_mode, status,
+                    broker_order_id, submitted_ts, meta
+                ) VALUES (%s, %s, 'ENTRY', %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ''',
+                (
+                    local_order_id,
+                    client_id,
+                    signal_id,
+                    canonical_signal_id,
+                    execution_mode,
+                    status,
+                    broker_order_id,
+                    submitted_ts,
+                    json.dumps(row_meta),
+                ),
+            )
+
+    def read_meta():
+        with database.cursor() as cursor:
+            cursor.execute(
+                f'SELECT meta FROM "{schema}".orders WHERE local_order_id=%s',
+                ("order-cas",),
+            )
+            row = cursor.fetchone()
+        return dict(row[0] or {}) if row else {}
+
+    try:
+        yield SimpleNamespace(
+            replace_row=replace_row,
+            read_meta=read_meta,
+            osm=APOrderStateMachine("client-a"),
+        )
+    finally:
+        patcher.undo()
+        with database.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        database.close()
+
+
+def _postgres_efficiency_cas(osm, **overrides):
+    values = {
+        "local_order_id": "order-cas",
+        "signal_id": "signal-a",
+        "canonical_signal_id": "canonical-a",
+        "client_id": "client-a",
+        "execution_mode": "paper",
+        "expected_state": "",
+        "expected_generation": 0,
+        "next_state": WAIT_CONFIRMATION,
+        "next_generation": 1,
+        "meta_patch": {
+            "cas_test": True,
+            "entry_efficiency_local_order_id": "order-cas",
+            "entry_efficiency_signal_id": "signal-a",
+            "entry_efficiency_canonical_signal_id": "canonical-a",
+            "entry_efficiency_client_id": "client-a",
+            "entry_efficiency_execution_mode": "paper",
+        },
+    }
+    values.update(overrides)
+    return osm.cas_entry_efficiency_state(**values)
+
+
+def test_postgres_cas_accepts_valid_generations_and_rejects_stale_replay(
+    postgres_entry_efficiency_db,
+):
+    db = postgres_entry_efficiency_db
+    db.replace_row(meta={})
+
+    assert _postgres_efficiency_cas(db.osm) is True
+    assert db.read_meta()["entry_efficiency_generation"] == 1
+    assert db.read_meta()["entry_efficiency_state"] == WAIT_CONFIRMATION
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+    ) is True
+    assert db.read_meta()["entry_efficiency_generation"] == 2
+
+
+@pytest.mark.parametrize("state", [WAIT_CONFIRMATION, REARM_FOR_REBREACH, READY_NOW])
+def test_postgres_cas_rejects_stateful_zero_generation(
+    postgres_entry_efficiency_db, state
+):
+    db = postgres_entry_efficiency_db
+    meta = {
+        "entry_efficiency_state": state,
+        "entry_efficiency_generation": 0,
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
+    }
+    db.replace_row(meta=meta)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=state,
+        expected_generation=0,
+        next_state=state,
+        next_generation=1,
+    ) is False
+    assert db.read_meta() == meta
+
+
+def test_postgres_cas_allows_only_one_simultaneous_claimant(
+    postgres_entry_efficiency_db,
+):
+    db = postgres_entry_efficiency_db
+    db.replace_row(meta={})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(lambda _claim: _postgres_efficiency_cas(db.osm), range(2))
+        )
+
+    assert sorted(results) == [False, True]
+    assert db.read_meta()["entry_efficiency_generation"] == 1
+    assert db.read_meta()["entry_efficiency_state"] == WAIT_CONFIRMATION
+
+    # The original request cannot be replayed after the winner advances the
+    # durable generation.  A legitimate next lifecycle transition may use
+    # the current generation, but replaying that transition must also miss.
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state="",
+        expected_generation=0,
+        next_state=WAIT_CONFIRMATION,
+        next_generation=1,
+    ) is False
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+    ) is True
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+    ) is False
+    assert db.read_meta()["entry_efficiency_generation"] == 2
+
+
+@pytest.mark.parametrize(
+    "meta, expected_generation",
+    [
+        ({"entry_efficiency_state": WAIT_CONFIRMATION}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": ""}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": " "}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": " 1"}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": "1 "}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": "01"}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": "-1"}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": -1}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": "junk"}, 1),
+        ({"entry_efficiency_state": "", "entry_efficiency_generation": "junk"}, 0),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": 2}, 1),
+    ],
+)
+def test_postgres_cas_rejects_malformed_missing_and_stale_generation(
+    postgres_entry_efficiency_db, meta, expected_generation
+):
+    db = postgres_entry_efficiency_db
+    meta = {
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
+        **meta,
+    }
+    db.replace_row(meta=meta)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=str(meta.get("entry_efficiency_state") or ""),
+        expected_generation=expected_generation,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=expected_generation + 1,
+    ) is False
+    assert db.read_meta() == meta
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_efficiency_local_order_id", "foreign-order"),
+        ("entry_efficiency_signal_id", "foreign-signal"),
+        ("entry_efficiency_canonical_signal_id", "foreign-canonical"),
+        ("entry_efficiency_client_id", "foreign-client"),
+        ("entry_efficiency_execution_mode", "live"),
+        ("entry_efficiency_state", " WAIT_CONFIRMATION "),
+        ("entry_efficiency_state", "CORRUPT_STATE"),
+        ("entry_efficiency_local_order_id", " order-cas "),
+        ("entry_efficiency_signal_id", " signal-a "),
+        ("entry_efficiency_canonical_signal_id", " canonical-a "),
+        ("entry_efficiency_client_id", " client-a "),
+        ("entry_efficiency_execution_mode", " paper "),
+    ],
+)
+def test_postgres_cas_rejects_stateful_efficiency_identity_mismatch(
+    postgres_entry_efficiency_db, field, value
+):
+    db = postgres_entry_efficiency_db
+    meta = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
+    }
+    meta[field] = value
+    db.replace_row(meta=meta)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+    ) is False
+    assert db.read_meta() == meta
+
+
+def test_postgres_cas_rejects_unknown_existing_efficiency_state(
+    postgres_entry_efficiency_db,
+):
+    db = postgres_entry_efficiency_db
+    meta = {
+        "entry_efficiency_state": "CORRUPT_STATE",
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
+    }
+    db.replace_row(meta=meta)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state="CORRUPT_STATE",
+        expected_generation=1,
+        next_state=READY_NOW,
+        next_generation=2,
+    ) is False
+    assert db.read_meta() == meta
+
+
+@pytest.mark.parametrize(
+    "row_updates, call_updates",
+    [
+        ({"client_id": "client-b"}, {}),
+        ({}, {"client_id": "client-b"}),
+        ({"signal_id": "signal-b"}, {}),
+        ({}, {"signal_id": "signal-b"}),
+        ({"canonical_signal_id": "canonical-b"}, {}),
+        ({}, {"canonical_signal_id": "canonical-b"}),
+        ({"execution_mode": "live"}, {}),
+        ({}, {"execution_mode": "live"}),
+        ({"broker_order_id": "broker-1"}, {}),
+        ({"submitted_ts": datetime.now(timezone.utc)}, {}),
+        (
+            {"meta": {"submit_intent_at": "2026-08-12T13:00:00+00:00"}},
+            {},
+        ),
+        ({"status": "SUBMITTED"}, {}),
+    ],
+)
+def test_postgres_cas_refuses_identity_broker_and_status_conflicts(
+    postgres_entry_efficiency_db, row_updates, call_updates
+):
+    db = postgres_entry_efficiency_db
+    row_meta = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
+    }
+    row_kwargs = dict(row_updates)
+    row_meta.update(row_kwargs.pop("meta", {}))
+    db.replace_row(meta=row_meta, **row_kwargs)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+        **call_updates,
+    ) is False
+    assert db.read_meta() == row_meta
+
+
+class _EntryEfficiencyRestartOSM:
+    def __init__(self, row):
+        self.row = dict(row)
+        self.row["meta"] = dict(row.get("meta") or {})
+        self.cancel_calls = []
+        self.meta_writes = []
+
+    def get_order(self, local_order_id):
+        if local_order_id != self.row.get("local_order_id"):
+            return None
+        result = dict(self.row)
+        result["meta"] = dict(self.row.get("meta") or {})
+        return result
+
+    def update_order_meta(self, local_order_id, patch):
+        self.meta_writes.append((local_order_id, dict(patch)))
+        self.row["meta"].update(dict(patch))
+        return True
+
+    def cancel_pending_entry(self, local_order_id, *, reason=""):
+        self.cancel_calls.append((local_order_id, reason))
+        return False
+
+
+def _entry_efficiency_restart_row(*, state=WAIT_CONFIRMATION, generation=3):
+    local_order_id = "restart-efficiency-order"
+    signal_id = "restart-efficiency-signal"
+    canonical_signal_id = "restart-efficiency-canonical"
+    client_id = "jason@example.com"
+    first_breach = datetime.now(timezone.utc) - timedelta(minutes=1)
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=5)
+    next_eval = (
+        datetime.now(timezone.utc) + timedelta(seconds=30)
+        if state == WAIT_CONFIRMATION
+        else None
+    )
+    metadata = {
+        "watcher_audit": {"reason_code": "trigger_ready"},
+        "trigger_crossed_at": first_breach.isoformat(),
+        "trigger_crossed_at_provenance": {
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": "paper",
+            "local_order_id": local_order_id,
+        },
+        "entry_efficiency_state": state,
+        "entry_efficiency_generation": generation,
+        "entry_efficiency_mode": ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+        "entry_efficiency_authoritative": True,
+        "entry_efficiency_local_order_id": local_order_id,
+        "entry_efficiency_signal_id": signal_id,
+        "entry_efficiency_canonical_signal_id": canonical_signal_id,
+        "entry_efficiency_client_id": client_id,
+        "entry_efficiency_execution_mode": "paper",
+        "entry_efficiency_rearm_pending": state == REARM_FOR_REBREACH,
+        "entry_efficiency_next_eval_at": (
+            next_eval.isoformat() if next_eval is not None else None
+        ),
+        "entry_efficiency_deadline_at": deadline.isoformat(),
+        "entry_efficiency_canonical_pattern": "2-3-2",
+        "entry_efficiency_pattern_raw": "2-3",
+    }
+    return {
+        "local_order_id": local_order_id,
+        "signal_id": signal_id,
+        "canonical_signal_id": canonical_signal_id,
+        "client_id": client_id,
+        "client_email": client_id,
+        "execution_mode": "paper",
+        "status": "PENDING_TRIGGER",
+        "kind": "ENTRY",
+        "direction": "PUT",
+        "ticker": "AAPL",
+        "entry_price": 302.80,
+        "stop_price": 304.00,
+        "target_price": 300.00,
+        "pattern": "2-3",
+        "timeframe": "1d",
+        "plan_id": "restart-efficiency-plan",
+        "score": 88,
+        "tier": "A",
+        "trigger_crossed_at": first_breach.isoformat(),
+        "meta": metadata,
+    }
+
+
+@pytest.mark.parametrize("state", [WAIT_CONFIRMATION, REARM_FOR_REBREACH])
+def test_fresh_restart_reowns_exact_entry_efficiency_wait_without_side_effects(
+    monkeypatch, state
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _entry_efficiency_restart_row(state=state)
+    osm = _EntryEfficiencyRestartOSM(row)
+    broker = MagicMock()
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watcher._get_quote = MagicMock(return_value={"bid": 302.79, "ask": 302.81})
+    watcher._get_option_quote = MagicMock(return_value={})
+    quote_check = MagicMock(side_effect=AssertionError("WAIT/REARM must not quote-gate recovery"))
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=quote_check,
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.WATCHER_OWNED
+    assert not quote_check.called
+    assert len(watcher._pending) == 1
+    watched = watcher._pending[0]
+    assert watched.signal["local_order_id"] == row["local_order_id"]
+    assert watched.signal["trigger_crossed_at"] == row["trigger_crossed_at"]
+    assert watched.entry_efficiency_state == state
+    assert watched.entry_efficiency_generation == row["meta"]["entry_efficiency_generation"]
+    assert watched.entry_efficiency_rearm_pending is (state == REARM_FOR_REBREACH)
+    assert watched.entry_efficiency_deadline_at == datetime.fromisoformat(
+        row["meta"]["entry_efficiency_deadline_at"]
+    )
+    assert watched.entry_efficiency_next_eval_at == (
+        datetime.fromisoformat(row["meta"]["entry_efficiency_next_eval_at"])
+        if state == WAIT_CONFIRMATION
+        else None
+    )
+    assert osm.cancel_calls == []
+    assert osm.meta_writes == []
+    watcher._persist_watcher_audit.assert_not_called()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "row_change",
+    [
+        {"meta": {"entry_efficiency_generation": 0}},
+        {"meta": {"entry_efficiency_signal_id": "stale-signal"}},
+    ],
+)
+def test_fresh_restart_stale_efficiency_identity_stays_unresolved_without_cleanup(
+    monkeypatch, row_change
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _entry_efficiency_restart_row()
+    row["meta"].update(row_change["meta"])
+    osm = _EntryEfficiencyRestartOSM(row)
+    watcher = APEntryWatcher(MagicMock(), osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    quote_check = MagicMock(side_effect=AssertionError("unproven lifecycle must not quote-gate"))
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=MagicMock(),
+        quote_check_fn=quote_check,
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.UNRESOLVED
+    assert not quote_check.called
+    assert watcher._pending == []
+    assert osm.cancel_calls == []
+    assert osm.meta_writes == []
+
+
+class _ReadyRestartBroker:
+    def __init__(self):
+        self.orders = []
+        self.post_calls = []
+        self.cfg = SimpleNamespace(base_url="https://paper-broker.test")
+        self.sandbox = True
+
+    def list_orders(self):
+        return list(self.orders)
+
+    def submit_order(self, **payload):
+        self.post_calls.append(dict(payload))
+        broker_order_id = f"broker-{len(self.post_calls)}"
+        self.orders.append(
+            {
+                "id": broker_order_id,
+                "tag": payload.get("tag") or payload.get("client_order_id"),
+                "side": payload.get("side"),
+                "quantity": payload.get("quantity"),
+                "option_symbol": payload.get("contract"),
+                "status": "submitted",
+            }
+        )
+        return {"id": broker_order_id, "status": "SUBMITTED"}
+
+
+class _ReadyRestartSubmitOSM(_EntryEfficiencyRestartOSM):
+    def __init__(self, row, broker):
+        super().__init__(row)
+        self.client_id = row["client_id"]
+        self.execution_mode = row["execution_mode"]
+        self.broker = broker
+        self.submit_calls = []
+
+    def _get_order(self, local_order_id):
+        return self.get_order(local_order_id)
+
+    def submit_existing_entry(self, *, local_order_id, broker, plan, limit_price):
+        self.submit_calls.append(
+            {
+                "local_order_id": local_order_id,
+                "contract": getattr(plan, "contract_symbol", ""),
+                "limit_price": limit_price,
+            }
+        )
+        return APOrderStateMachine.submit_existing_entry(
+            self,
+            local_order_id=local_order_id,
+            broker=broker,
+            plan=plan,
+            limit_price=limit_price,
+        )
+
+    def persist_entry_submit_intent(
+        self,
+        local_order_id,
+        *,
+        current_status,
+        execution_mode,
+        signal_id,
+        contract,
+        qty,
+        limit_price,
+        payload_hash,
+        broker_submit_key,
+    ):
+        assert local_order_id == self.row["local_order_id"]
+        assert str(current_status).upper() == "PENDING_TRIGGER"
+        assert execution_mode == self.row["execution_mode"]
+        assert signal_id == self.row["signal_id"]
+        assert contract == self.row["contract"]
+        assert qty == self.row["qty"]
+        assert limit_price == self.row["limit_price"]
+        self.row["meta"].update(
+            {
+                "lifecycle_state": "SUBMITTING",
+                "submit_intent_at": datetime.now(timezone.utc).isoformat(),
+                "broker_submit_key": broker_submit_key,
+                "broker_submit_payload_hash": payload_hash,
+                "current_owner": f"broker_submit:{broker_submit_key}",
+            }
+        )
+        return True
+
+    def transition(self, local_order_id, status, **fields):
+        assert local_order_id == self.row["local_order_id"]
+        self.row["status"] = str(status)
+        self.row.update(fields)
+        return True
+
+    @staticmethod
+    def _is_broker_accept_status(status):
+        return APOrderStateMachine._is_broker_accept_status(status)
+
+    def _submit_order_with_retry(
+        self, *, broker, base_url, account_id, order_data, local_id, op_label
+    ):
+        assert local_id == self.row["local_order_id"]
+        response = broker.submit_order(
+            tag=order_data["tag"],
+            contract=order_data["option_symbol"],
+            limit_price=order_data["price"],
+            side=order_data["side"],
+            quantity=order_data["quantity"],
+        )
+        return (
+            {
+                "id": response["id"],
+                "status": "open",
+                "tag": order_data["tag"],
+                "side": order_data["side"],
+                "quantity": order_data["quantity"],
+                "option_symbol": order_data["option_symbol"],
+            },
+            None,
+            response["id"],
+            "open",
+        )
+
+    def _emit_transition_event(self, **_kwargs):
+        return None
+
+    def _flag_split_brain_order(self, *_args, **_kwargs):
+        return True
+
+    def cas_entry_efficiency_state(
+        self,
+        local_order_id,
+        *,
+        signal_id,
+        canonical_signal_id,
+        client_id,
+        execution_mode,
+        expected_state,
+        expected_generation,
+        next_state,
+        next_generation,
+        meta_patch,
+    ):
+        meta = self.row["meta"]
+        if (
+            local_order_id != self.row["local_order_id"]
+            or meta.get("entry_efficiency_state") != expected_state
+            or meta.get("entry_efficiency_generation") != expected_generation
+            or signal_id != self.row["signal_id"]
+            or canonical_signal_id != self.row["canonical_signal_id"]
+            or str(client_id).lower() != self.row["client_id"].lower()
+            or execution_mode != self.row["execution_mode"]
+        ):
+            return False
+        meta.update(dict(meta_patch or {}))
+        meta["entry_efficiency_state"] = next_state
+        meta["entry_efficiency_generation"] = next_generation
+        return True
+
+
+def _ready_restart_real_core(monkeypatch, row, osm, broker, *, quote_age_ms=17):
+    """Use the real ExecutionCore callback through the OSM submit boundary."""
+    import ap.execution as execution_module
+
+    monkeypatch.setenv("ENTRY_CUTOFF_ET_HHMM", "2359")
+    monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_MODE", "off")
+    monkeypatch.setattr(
+        execution_module,
+        "_refresh_ask_at_submit",
+        lambda _broker, _contract: (
+            1.02,
+            quote_age_ms,
+            True,
+            "ok",
+            {
+                "submit_bid": 1.00,
+                "submit_ask": 1.02,
+                "submit_last": 1.01,
+                "submit_mid": 1.01,
+                "spread_pct": 0.0198,
+            },
+        ),
+    )
+
+    core = execution_core_module.APExecutionCore.__new__(
+        execution_core_module.APExecutionCore
+    )
+    core.paper = True
+    core.mode = "PAPER"
+    core.execution_mode = "paper"
+    core.email = row["client_id"]
+    core.client_id = row["client_id"]
+    core.client_email = row["client_id"]
+    core.broker = broker
+    core.store = MagicMock()
+    core.order_state_machine = osm
+    core.contract_selector = None
+    core.master_control = None
+    core._max_positions = 10
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._recover_plan_for_revalidation = lambda watched: watched.signal[
+        "_approved_plan"
+    ]
+    core._refresh_hydrated_prebreach_plan = MagicMock(return_value=False)
+    core._alert_degraded = MagicMock()
+    return core
+
+
+def _ready_restart_trade_row():
+    row = _entry_efficiency_restart_row(state=READY_NOW, generation=4)
+    row.update(
+        {
+            "contract": "AAPL260821P00304000",
+            "contract_symbol": "AAPL260821P00304000",
+            "qty": 1,
+            "contracts": 1,
+            "limit_price": 1.04,
+            "reserved_cost": 104.0,
+        }
+    )
+    row["meta"].update(
+        {
+            "selected_contract": row["contract"],
+            "selected_qty": 1,
+            "selected_limit": 1.04,
+        }
+    )
+    return row
+
+
+def _live_ready_callback_shape(row):
+    """Build a preselected LIVE callback with deliberately stale #436 fields."""
+    plan = SimpleNamespace(
+        contract_symbol=row["contract"],
+        execution_price_per_share=row["limit_price"],
+        ask=row["limit_price"],
+        mid=row["limit_price"],
+        affordable_contracts=1,
+        premium_per_contract=row["reserved_cost"],
+        contracts=row["qty"],
+        limit_price=row["limit_price"],
+        side=row["direction"],
+        direction=row["direction"],
+        execution_mode="live",
+        client_id=row["client_id"],
+        signal_id=row["signal_id"],
+        canonical_signal_id=row["canonical_signal_id"],
+        ticker=row["ticker"],
+        trigger_price=row["entry_price"],
+        stop_underlying=row["stop_price"],
+        target_underlying=row["target_price"],
+        pattern=row["pattern"],
+        timeframe=row["timeframe"],
+        metadata=deepcopy(row["meta"]),
+    )
+    signal = _watch_signal()
+    signal.update(
+        {
+            "signal_id": row["signal_id"],
+            "canonical_signal_id": row["canonical_signal_id"],
+            "local_order_id": row["local_order_id"],
+            "client_id": row["client_id"],
+            "client_email": row["client_id"],
+            "execution_mode": "live",
+            "mode": "live",
+            "ticker": row["ticker"],
+            "side": row["direction"],
+            "entry_price": row["entry_price"],
+            "stop_price": row["stop_price"],
+            "target_price": row["target_price"],
+            "trigger_crossed_at": row["trigger_crossed_at"],
+            "metadata": deepcopy(row["meta"]),
+            "_approved_plan": plan,
+        }
+    )
+    watched = WatchedSignal(signal, overnight=False)
+    watched.trigger_crossed_at = datetime.fromisoformat(row["trigger_crossed_at"])
+    # This is the restart-shaped object that exposed the old defect.  LIVE
+    # must not turn these absent #436 quote fields into a wait or a telemetry
+    # write before the existing submit path runs.
+    assert watched.last_quote_bid == 0.0
+    assert watched.last_quote_ask == 0.0
+    assert watched.last_quote_age_ms is None
+    return watched
+
+
+@pytest.mark.parametrize("configured_mode", [None, ENTRY_EFFICIENCY_OBSERVE_ONLY])
+def test_live_real_core_skips_entry_efficiency_observation_and_submits_once(
+    monkeypatch, configured_mode
+):
+    """LIVE uses the current submit path while #436 remains observation-free."""
+    if configured_mode is None:
+        monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
+        monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    else:
+        monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", configured_mode)
+        monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    monkeypatch.setenv("LIVE_CONFIRMATION_REQUIRED", "0")
+
+    row = _ready_restart_trade_row()
+    row["execution_mode"] = "live"
+    # Match the live ask-cross result supplied by the existing submit-quote
+    # fixture so the production OSM does not need a real DB limit-price sync.
+    row["limit_price"] = 1.03
+    row["reserved_cost"] = 103.0
+    # Force the old generation/identity branch that used to blank the nested
+    # execution mode, while retaining known LIVE identity already on the row.
+    row["meta"]["entry_efficiency_generation"] = 0
+    row["meta"]["entry_efficiency_execution_mode"] = "live"
+    row["meta"]["entry_efficiency_observation"] = {
+        "entry_efficiency_local_order_id": row["local_order_id"],
+        "entry_efficiency_signal_id": row["signal_id"],
+        "entry_efficiency_canonical_signal_id": row["canonical_signal_id"],
+        "entry_efficiency_client_id": row["client_id"],
+        "entry_efficiency_execution_mode": "live",
+    }
+    original_observation = deepcopy(row["meta"]["entry_efficiency_observation"])
+
+    broker = _ReadyRestartBroker()
+    broker.get_quote = MagicMock(
+        return_value={"bid": 302.79, "ask": 302.81, "source": "tradier"}
+    )
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    real_update_order_meta = osm.update_order_meta
+
+    def _live_update_order_meta(local_order_id, patch):
+        if isinstance(patch, dict) and "entry_efficiency_observation" in patch:
+            raise AssertionError("LIVE #436 observation writer must not be invoked")
+        return real_update_order_meta(local_order_id, patch)
+
+    osm.update_order_meta = MagicMock(side_effect=_live_update_order_meta)
+    osm.cas_entry_efficiency_state = MagicMock(
+        side_effect=AssertionError("LIVE #436 CAS must not be invoked")
+    )
+    watched = _live_ready_callback_shape(row)
+    core = _ready_restart_real_core(monkeypatch, row, osm, broker)
+    core.paper = False
+    core.mode = "LIVE"
+    core.execution_mode = "live"
+
+    core._on_entry_trigger(watched)
+    core._on_entry_trigger(watched)
+
+    assert len(broker.post_calls) == 1
+    assert osm.row["status"] == "SUBMITTED"
+    assert osm.row["broker_order_id"] == "broker-1"
+    osm.cas_entry_efficiency_state.assert_not_called()
+    assert all(
+        "entry_efficiency_observation" not in patch
+        for _, patch in osm.meta_writes
+    )
+    assert osm.row["execution_mode"] == "live"
+    assert osm.row["meta"]["entry_efficiency_observation"] == original_observation
+    assert (
+        osm.row["meta"]["entry_efficiency_observation"]["entry_efficiency_execution_mode"]
+        == "live"
+    )
+    assert osm.row["meta"]["entry_efficiency_observation"]["entry_efficiency_client_id"] == row[
+        "client_id"
+    ]
+    assert osm.row["meta"]["entry_efficiency_observation"]["entry_efficiency_local_order_id"] == row[
+        "local_order_id"
+    ]
+
+
+def test_fresh_restart_ready_runs_real_core_to_one_osm_broker_post(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watcher._get_quote = MagicMock(
+        return_value={"bid": 302.79, "ask": 302.81, "quote_age_ms": 17}
+    )
+    core = _ready_restart_real_core(monkeypatch, row, osm, broker)
+    watcher.on_trigger = core._on_entry_trigger
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(side_effect=AssertionError("READY recovery owns fresh broker proof")),
+        position_check_fn=lambda _row: [],
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.SKIPPED
+    watcher._get_quote.assert_called_once_with("AAPL")
+    assert len(osm.submit_calls) == 1
+    assert len(broker.post_calls) == 1
+    assert osm.row["status"] == "SUBMITTED"
+    assert osm.row["broker_order_id"] == "broker-1"
+    assert watcher._pending == []
+    assert osm.cancel_calls == []
+    assert watcher._persist_watcher_audit.call_count == 0
+
+
+def test_fresh_restart_ready_matching_canonical_tag_skips_callback_and_second_post(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    broker.orders.append({"tag": canonical_broker_submit_key(row["local_order_id"])})
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    callback = MagicMock()
+    watcher.on_trigger = callback
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("duplicate proof must not use the quote gate")
+        ),
+        position_check_fn=lambda _row: [],
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.UNRESOLVED
+    callback.assert_not_called()
+    assert osm.submit_calls == []
+    assert broker.post_calls == []
+    assert watcher._pending == []
+    assert osm.cancel_calls == []
+
+
+def test_fresh_restart_ready_quote_unavailable_adopts_registered_watcher(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watcher._get_quote = MagicMock(return_value={})
+    callback = MagicMock()
+    watcher.on_trigger = callback
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("READY recovery owns broker proof")
+        ),
+        position_check_fn=lambda _row: [],
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.WATCHER_OWNED
+    callback.assert_not_called()
+    assert len(watcher._pending) == 1
+    registered = watcher._pending[0]
+    assert registered.signal["local_order_id"] == row["local_order_id"]
+    assert registered.entry_efficiency_state == READY_NOW
+    assert registered.entry_efficiency_generation == 4
+    assert row["status"] == "PENDING_TRIGGER"
+    assert row.get("broker_order_id") is None
+    assert broker.post_calls == []
+
+
+def test_fresh_restart_ready_callback_wait_immediately_reowns_registered_watcher(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watcher._get_quote = MagicMock(
+        return_value={"bid": 302.79, "ask": 302.81, "quote_age_ms": 60_001}
+    )
+    core = _ready_restart_real_core(
+        monkeypatch, row, osm, broker, quote_age_ms=60_001
+    )
+    watcher.on_trigger = core._on_entry_trigger
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("READY recovery owns broker proof")
+        ),
+        position_check_fn=lambda _row: [],
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.WATCHER_OWNED
+    assert osm.row["meta"]["entry_efficiency_state"] == WAIT_CONFIRMATION
+    assert osm.row["meta"]["entry_efficiency_generation"] == 5
+    assert len(watcher._pending) == 1
+    registered = watcher._pending[0]
+    assert registered.signal["local_order_id"] == row["local_order_id"]
+    assert registered.entry_efficiency_state == WAIT_CONFIRMATION
+    assert registered.entry_efficiency_generation == 5
+    assert osm.submit_calls == []
+    assert broker.post_calls == []
+
+
+def test_fresh_restart_ready_matching_external_position_holds_before_callback(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    callback = MagicMock()
+    watcher.on_trigger = callback
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("position proof must precede callback")
+        ),
+        position_check_fn=lambda _row: [
+            {
+                "client_id": row["client_id"],
+                "execution_mode": "paper",
+                "signal_id": row["signal_id"],
+                "local_order_id": row["local_order_id"],
+                "position_id": "position-1",
+                "status": "OPEN",
+            }
+        ],
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.UNRESOLVED
+    callback.assert_not_called()
+    assert broker.post_calls == []
+    assert watcher._pending == []
+    assert osm.cancel_calls == []
+    assert osm.meta_writes == []
+
+
+@pytest.mark.parametrize("broker_rows", [[None], [{}]])
+def test_fresh_restart_ready_malformed_broker_rows_hold_before_callback(
+    monkeypatch, broker_rows
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    broker.orders = broker_rows
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    callback = MagicMock()
+    watcher.on_trigger = callback
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("malformed broker truth must hold")
+        ),
+        position_check_fn=lambda _row: [],
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.UNRESOLVED
+    callback.assert_not_called()
+    assert broker.post_calls == []
+    assert watcher._pending == []
+    assert osm.cancel_calls == []
+    assert osm.meta_writes == []
+
+
+@pytest.mark.parametrize("raw_state", ["ready_now", "READY_NOW ", "\tREADY_NOW"])
+def test_fresh_restart_ready_malformed_lifecycle_state_does_not_fall_through(
+    monkeypatch, raw_state
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    row["meta"]["entry_efficiency_state"] = raw_state
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    callback = MagicMock()
+    watcher.on_trigger = callback
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("malformed READY must not use generic quote gate")
+        ),
+        position_check_fn=lambda _row: [],
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.UNRESOLVED
+    callback.assert_not_called()
+    assert broker.post_calls == []
+    assert watcher._pending == []
+    assert osm.cancel_calls == []
+    assert osm.meta_writes == []
+
+
+def test_fresh_restart_ready_does_not_trust_callback_broker_id_without_remote_identity(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watcher._get_quote = MagicMock(
+        return_value={"bid": 302.79, "ask": 302.81, "quote_age_ms": 17}
+    )
+
+    def callback(_watched):
+        osm.row.update(
+            {
+                "broker_order_id": "phantom-broker-order",
+                "submitted_ts": datetime.now(timezone.utc).isoformat(),
+                "status": "SUBMITTED",
+            }
+        )
+
+    watcher.on_trigger = callback
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("READY recovery owns broker proof")
+        ),
+        position_check_fn=lambda _row: [],
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.UNRESOLVED
+    assert broker.post_calls == []
+    assert watcher._pending == []
+    assert recovery._row_failure_reasons[row["local_order_id"]].endswith(
+        "broker_order_id_not_found_or_ambiguous"
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"orders": {"order": [None]}},
+        {"orders": {"order": [{}]}},
+        {"orders": {"order": {}}},
+    ],
+)
+def test_tradier_order_listing_preserves_malformed_rows_as_failure(payload):
+    from ap.brokers.tradier import TradierBroker
+
+    broker = object.__new__(TradierBroker)
+    broker.cfg = SimpleNamespace(
+        base_url="https://paper-broker.test",
+        account_id="paper-account",
+    )
+    broker._get = lambda _path: payload
+
+    with pytest.raises(ValueError, match="TRADIER_ORDERS"):
+        broker.list_orders()
+
+
+class _StartupRecoveryConnection:
+    def __init__(self, row, calls):
+        self.row = row
+        self.calls = calls
+        self.sql = ""
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sql = str(sql)
+        self.calls.append((self.sql, params))
+        self.rowcount = 0
+
+    def fetchall(self):
+        if not self.sql.lstrip().upper().startswith("SELECT"):
+            return []
+        row = deepcopy(self.row)
+        row["meta"] = dict(self.row.get("meta") or {})
+        return [row]
+
+
+def _startup_recovery_efficiency_row(*, state):
+    row = _entry_efficiency_restart_row(state=state)
+    row.update(
+        {
+            "symbol": row["ticker"],
+            "contract": "AAPL260821P00304000",
+            "qty": 1,
+            "limit_price": 2.50,
+            "reserved_cost": 250.0,
+            "trigger_price": row["entry_price"],
+            "stop_underlying": row["stop_price"],
+            "target_underlying": row["target_price"],
+            "broker_order_id": None,
+            "submitted_ts": None,
+            "filled_ts": None,
+            "created_ts": datetime.now(timezone.utc),
+            "_tq_status": "WATCHING",
+            "_tq_last_error": None,
+        }
+    )
+    return row
+
+
+@pytest.mark.parametrize("state", [WAIT_CONFIRMATION, REARM_FOR_REBREACH])
+def test_startup_recovery_reowns_efficiency_wait_from_durable_row(
+    monkeypatch, state
+):
+    """The real startup consumer must preserve WAIT/REARM after process death."""
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _startup_recovery_efficiency_row(state=state)
+    osm = _EntryEfficiencyRestartOSM(row)
+    broker = MagicMock()
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    calls = []
+
+    import ap.db as ap_db
+
+    monkeypatch.setattr(ap_db, "conn", lambda: _StartupRecoveryConnection(row, calls))
+    monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *args, **kwargs: fn())
+
+    recovery = APStartupRecovery(
+        client_id=row["client_id"],
+        broker=broker,
+        osm=osm,
+        pm=object(),
+        master_control=SimpleNamespace(mode="PAPER"),
+        entry_watcher=watcher,
+    )
+    result = {"errors": []}
+    recovery._reseed_watchers(result)
+
+    select_calls = [
+        (sql, params)
+        for sql, params in calls
+        if sql.lstrip().upper().startswith("SELECT")
+        and "FROM orders o" in sql
+    ]
+    assert len(select_calls) == 1
+    sql, params = select_calls[0]
+    assert all(
+        field in sql
+        for field in (
+            "o.client_id",
+            "o.execution_mode",
+            "o.canonical_signal_id",
+            "o.kind",
+            "o.status",
+            "o.qty",
+            "o.broker_order_id",
+            "o.submitted_ts",
+        )
+    )
+    assert "LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s" in sql
+    assert params[0:2] == (row["client_id"], "paper")
+    assert result["pending_trigger_watchers_rearmed"] == 1
+    assert len(watcher._pending) == 1
+    watched = watcher._pending[0]
+    assert watched.signal["local_order_id"] == row["local_order_id"]
+    assert watched.entry_efficiency_state == state
+    assert watched.entry_efficiency_generation == row["meta"][
+        "entry_efficiency_generation"
+    ]
+    assert watched.entry_efficiency_rearm_pending is (state == REARM_FOR_REBREACH)
+    assert osm.cancel_calls == []
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+    assert watcher._persist_watcher_audit.call_count == 0

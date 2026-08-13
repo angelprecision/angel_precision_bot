@@ -422,9 +422,13 @@ class TradierBroker(BrokerAdapter):
         if orders is None:
             return []
         if isinstance(orders, dict):
+            if not orders:
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
             return [orders]
         if isinstance(orders, list):
-            return [order for order in orders if isinstance(order, dict)]
+            if any(not isinstance(order, dict) or not order for order in orders):
+                raise ValueError("TRADIER_ORDERS_ROWS_MALFORMED")
+            return list(orders)
         raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:

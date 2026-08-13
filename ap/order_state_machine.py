@@ -60,6 +60,10 @@ from ap.exit_safety import (
     evaluate_exit_submission_safety,
     resolve_exit_broker_truth,
 )
+from ap_entry_efficiency import (
+    parse_entry_efficiency_generation,
+    parse_entry_efficiency_state,
+)
 try:
     from psycopg2 import errors as pg_errors
 except ImportError:
@@ -2186,6 +2190,144 @@ class APOrderStateMachine:
             log.warning(
                 "[%s] update_order_meta failed for local_order_id=%s: %s",
                 self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def cas_entry_efficiency_state(
+        self,
+        local_order_id: str,
+        *,
+        signal_id: str,
+        canonical_signal_id: str,
+        client_id: str,
+        execution_mode: str,
+        expected_state: str,
+        expected_generation: int,
+        next_state: str,
+        next_generation: int,
+        meta_patch: dict,
+    ) -> bool:
+        """CAS one pre-submit entry-efficiency lifecycle transition.
+
+        This is intentionally narrower than ``update_order_meta``.  It proves
+        the exact entry identity and refuses to touch a row once broker intent,
+        broker ownership, split-brain quarantine, or reconciliation has
+        appeared.  A failed CAS is therefore a safety stop, never permission
+        to continue toward selector or broker work.
+        """
+        local_id = str(local_order_id or "").strip()
+        durable_signal_id = str(signal_id or "").strip()
+        durable_canonical_signal_id = str(canonical_signal_id or "").strip()
+        durable_client_id = str(client_id or "").strip().lower()
+        durable_mode = str(execution_mode or "").strip().lower()
+        expected_state_text = parse_entry_efficiency_state(expected_state)
+        next_state_text = parse_entry_efficiency_state(next_state, allow_empty=False)
+        expected_gen = parse_entry_efficiency_generation(
+            expected_generation,
+            state=expected_state_text,
+        )
+        next_gen = parse_entry_efficiency_generation(
+            next_generation,
+            state=next_state_text,
+        )
+        if (
+            expected_state_text is None
+            or next_state_text is None
+            or not local_id
+            or not durable_signal_id
+            or not durable_canonical_signal_id
+            or not durable_client_id
+            or durable_mode not in {"paper", "live"}
+            or expected_gen is None
+            or next_gen is None
+            or next_gen != expected_gen + 1
+        ):
+            return False
+        try:
+            patch_json = json.dumps(
+                {
+                    **dict(meta_patch or {}),
+                    "entry_efficiency_state": next_state_text,
+                    "entry_efficiency_generation": next_gen,
+                },
+                default=str,
+            )
+        except Exception:
+            return False
+
+        def _fn():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                    "    updated_ts = NOW() "
+                    "WHERE local_order_id=%s "
+                    "  AND client_id=%s "
+                    "  AND kind='ENTRY' "
+                    "  AND COALESCE(signal_id,'')=%s "
+                    "  AND COALESCE(canonical_signal_id, NULLIF(meta->>'canonical_signal_id',''), '')=%s "
+                    "  AND LOWER(COALESCE(execution_mode,''))=%s "
+                    "  AND status='PENDING_TRIGGER' "
+                    "  AND COALESCE(broker_order_id,'')='' "
+                    "  AND submitted_ts IS NULL "
+                    "  AND NULLIF(COALESCE(meta->>'submit_intent_at',''), '') IS NULL "
+                    "  AND LOWER(COALESCE(meta->>'split_brain_quarantine','false')) IN ('false','') "
+                    "  AND LOWER(COALESCE(meta->>'reconciliation_required','false')) IN ('false','') "
+                    "  AND COALESCE(meta->>'entry_efficiency_state','')=%s "
+                    "  AND ( "
+                    "        (NOT (COALESCE(meta, '{}'::jsonb) ? 'entry_efficiency_generation') "
+                    "         AND COALESCE(meta->>'entry_efficiency_state','')='' "
+                    "         AND %s=0) "
+                    "        OR (COALESCE(meta->>'entry_efficiency_state','')='' "
+                    "            AND meta->>'entry_efficiency_generation' ~ '^0$' "
+                    "            AND (meta->>'entry_efficiency_generation')::bigint=%s) "
+                    "        OR (COALESCE(meta->>'entry_efficiency_state','')<>'' "
+                    "            AND COALESCE(meta->>'entry_efficiency_local_order_id','')=%s "
+                    "            AND COALESCE(meta->>'entry_efficiency_signal_id','')=%s "
+                    "            AND COALESCE(meta->>'entry_efficiency_canonical_signal_id','')=%s "
+                    "            AND LOWER(COALESCE(meta->>'entry_efficiency_client_id',''))=%s "
+                    "            AND LOWER(COALESCE(meta->>'entry_efficiency_execution_mode',''))=%s "
+                    "            AND COALESCE(meta->>'entry_efficiency_state','') IN "
+                    "                ('READY_NOW','WAIT_CONFIRMATION','REARM_FOR_REBREACH',"
+                    "                 'TERMINAL_INVALID','EXPIRED') "
+                    "            AND meta->>'entry_efficiency_generation' ~ '^[1-9][0-9]*$' "
+                    "            AND (meta->>'entry_efficiency_generation')::bigint=%s) "
+                    "      )",
+                    (
+                        patch_json,
+                        local_id,
+                        durable_client_id,
+                        durable_signal_id,
+                        durable_canonical_signal_id,
+                        durable_mode,
+                        expected_state_text,
+                        expected_gen,
+                        expected_gen,
+                        local_id,
+                        durable_signal_id,
+                        durable_canonical_signal_id,
+                        durable_client_id,
+                        durable_mode,
+                        expected_gen,
+                    ),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.critical(
+                "[%s] entry-efficiency CAS failed local_order_id=%s signal_id=%s "
+                "expected=%s/%s next=%s/%s error=%s",
+                self.client_id,
+                local_id,
+                durable_signal_id,
+                expected_state,
+                expected_gen,
+                next_state,
+                next_gen,
+                exc,
             )
             return False
 
