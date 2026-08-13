@@ -629,8 +629,11 @@ def run_preopen_autonomous_readiness(
     if client_state.get("stale_processing_ids"):
         errors.append("stale_processing_rows")
 
+    # Historical WATCHING rows without an ENTRY order are diagnostic only.
+    # They remain in client_state for operator visibility, but must not freeze
+    # an otherwise healthy client or authorize any lifecycle replay.
     if client_state.get("watching_orphans"):
-        errors.append("watching_rows_missing_orders_recommend_new_rescue")
+        warnings.append("watching_rows_missing_orders_recommend_new_rescue")
 
     unowned_pending = _pending_trigger_without_watcher(runner, client_state.get("pending_trigger_rows") or [])
     details["pending_trigger_without_watcher"] = unowned_pending

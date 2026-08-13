@@ -217,7 +217,7 @@ def test_stale_processing_rows_are_reported(monkeypatch):
     assert result["details"]["client_state"]["stale_processing_ids"] == [11, 12]
 
 
-def test_watching_row_with_no_orders_recommends_new_rescue(monkeypatch):
+def test_watching_row_with_no_orders_is_diagnostic_only(monkeypatch):
     _stub_common(monkeypatch, client_state={
         "stale_processing_ids": [],
         "watching_orphans": [{"id": 41, "signal_id": "sig-41"}],
@@ -226,10 +226,62 @@ def test_watching_row_with_no_orders_recommends_new_rescue(monkeypatch):
     })
     runner = _Runner(mode="paper")
     monkeypatch.setattr(pr, "_pod_mode", lambda: "paper")
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
 
     result = pr.run_preopen_autonomous_readiness("paper@example.com", "paper", dry_run=True, runner=runner)
-    assert "watching_rows_missing_orders_recommend_new_rescue" in result["errors"]
+    assert result["status"] == "OK"
+    assert "watching_rows_missing_orders_recommend_new_rescue" in result["warnings"]
+    assert "watching_rows_missing_orders_recommend_new_rescue" not in result["errors"]
     assert result["details"]["client_state"]["watching_orphans"][0]["id"] == 41
+
+
+def test_historical_watching_rows_do_not_block_healthy_live_readiness(monkeypatch):
+    historical_orphans = [
+        {"id": row_id, "signal_id": f"sig-{row_id}"}
+        for row_id in range(1, 134)
+    ]
+    _stub_common(monkeypatch, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": historical_orphans,
+        "pending_trigger_rows": [],
+        "watching_count": len(historical_orphans),
+    })
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
+    runner = _Runner(mode="live")
+
+    result = pr.run_preopen_autonomous_readiness(
+        "live@example.com", "live", dry_run=True, runner=runner,
+    )
+
+    assert result["status"] == "OK"
+    assert result["errors"] == []
+    assert "watching_rows_missing_orders_recommend_new_rescue" in result["warnings"]
+    assert result["details"]["client_state"]["watching_orphans"] == historical_orphans
+
+
+def test_historical_watching_rows_do_not_mask_unowned_pending_trigger(monkeypatch):
+    historical_orphans = [
+        {"id": row_id, "signal_id": f"sig-{row_id}"}
+        for row_id in range(1, 134)
+    ]
+    _stub_common(monkeypatch, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": historical_orphans,
+        "pending_trigger_rows": [{"local_order_id": "L-999", "signal_id": "sig-999"}],
+        "watching_count": len(historical_orphans),
+    })
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
+    runner = _Runner(mode="live", watcher=_Watcher(set()))
+
+    result = pr.run_preopen_autonomous_readiness(
+        "live@example.com", "live", dry_run=True, runner=runner,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["errors"] == ["pending_trigger_without_watcher_ownership"]
+    assert "watching_rows_missing_orders_recommend_new_rescue" in result["warnings"]
+    assert len(result["details"]["client_state"]["watching_orphans"]) == 133
+    assert result["details"]["pending_trigger_without_watcher"][0]["local_order_id"] == "L-999"
 
 
 def test_pending_trigger_without_watcher_is_degraded(monkeypatch):
