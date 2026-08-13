@@ -3401,7 +3401,6 @@ def _interpret_position_truth(
     if not positions:
         return "NO_MATCH", "no_matching_position"
 
-    active_statuses = {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"}
     expected_client = str(client_id or "").strip().lower()
     expected_mode = str(execution_mode or "").strip().lower()
     expected_signal = str(signal_id or "").strip()
@@ -3447,9 +3446,11 @@ def _interpret_position_truth(
     position_status = str(position.get("status") or "").strip().upper()
     if not position_status:
         return "HOLD", "matching_position_status_missing"
-    if position_status in active_statuses:
-        return "MATCH", "matching_position_signal_id"
-    return "NO_MATCH", "no_matching_position"
+    # A non-empty exact signal match is already evidence that this logical
+    # opportunity crossed the position boundary.  That remains true for a
+    # historical terminal row such as CLOSED: status is not permission to
+    # reinterpret a non-empty authority result as an empty query result.
+    return "MATCH", "matching_position_signal_id"
 
 
 def _now_iso() -> str:

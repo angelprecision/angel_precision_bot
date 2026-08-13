@@ -1099,6 +1099,41 @@ def test_matching_active_signal_position_holds_without_broker_lookup():
     broker.place_order.assert_not_called()
 
 
+def test_matching_closed_signal_different_local_order_holds_before_broker_lookup():
+    row = _row()
+    osm = _OSM(row)
+    callback = MagicMock()
+    broker = MagicMock()
+    selector = MagicMock()
+    execution_core = SimpleNamespace(contract_selector=selector)
+    recovery = _recovery(
+        row,
+        osm,
+        _Watcher(callback),
+        broker,
+        execution_core=execution_core,
+        positions=[
+            {
+                "client_id": CLIENT_ID,
+                "execution_mode": MODE,
+                "signal_id": SIGNAL_ID,
+                "local_order_id": "older-different-local-order",
+                "status": "CLOSED",
+            }
+        ],
+    )
+
+    assert recovery._prebroker_position_truth(
+        row, signal_id=SIGNAL_ID, local_oid=LOCAL_ORDER_ID
+    ) == ("MATCH", "matching_position_signal_id")
+    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
+    assert osm.claim_calls == []
+    selector.select.assert_not_called()
+    broker.list_orders.assert_not_called()
+    broker.place_order.assert_not_called()
+    callback.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("position", "reason"),
     [
@@ -1259,7 +1294,7 @@ def test_exact_position_query_finds_old_match_beyond_generic_listing_limit(
             ]
             historical_match = (
                 "historical-match",
-                CLIENT_ID,
+                CLIENT_ID.upper(),
                 LOCAL_ORDER_ID,
                 SIGNAL_ID,
                 MODE,
@@ -1291,7 +1326,7 @@ def test_exact_position_query_finds_old_match_beyond_generic_listing_limit(
 
         monkeypatch.setattr(db_module, "conn", _scoped_conn)
         rows = db_module.get_positions_for_entry_identity(
-            client_id=CLIENT_ID,
+            client_id=CLIENT_ID.lower(),
             local_order_id=LOCAL_ORDER_ID,
             signal_id=SIGNAL_ID,
         )

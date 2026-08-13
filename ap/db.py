@@ -711,7 +711,7 @@ def get_positions_for_entry_identity(
                 """
                 SELECT *
                 FROM positions
-                WHERE client_id = %s
+                WHERE LOWER(client_id) = LOWER(%s)
                   AND (
                       local_order_id = %s
                       OR signal_id = %s
