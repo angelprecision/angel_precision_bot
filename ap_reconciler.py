@@ -285,7 +285,6 @@ class APBrokerReconciler:
         interval_sec: int = RECONCILE_INTERVAL_SEC,
         execution_mode: str | None = None,
         supabase_client=None,       # Requirement 1: optional, backward-compatible
-        execution_core=None,        # Canonical broker-intent reconciliation consumer
     ):
         self.broker          = broker
         self.client_id       = client_id
@@ -295,11 +294,6 @@ class APBrokerReconciler:
         self._interval       = interval_sec
         self.execution_mode  = _normalize_execution_mode(execution_mode)
         self.supabase_client = supabase_client  # Requirement 2: stored for proof logging
-        # PENDING_TRIGGER rows with durable submit intent must be handed to the
-        # canonical execution-core reconciler.  Keeping this reference on the
-        # reconciler prevents the restart path from silently losing its broker-
-        # intent consumer and falling back to an unresolved recovery hold.
-        self.execution_core  = execution_core
         self._stop       = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
@@ -1194,7 +1188,6 @@ class APBrokerReconciler:
                         osm=self.osm,
                         broker=self.broker,
                         caller_source="ap_reconciler._reconcile_orders",
-                        execution_core=getattr(self, "execution_core", None),
                     )
                     _outcome = _ptr.recover_one_row(dict(order))
                     if _outcome == _RowOutcome.BROKER_OWNED:
