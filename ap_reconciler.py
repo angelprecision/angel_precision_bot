@@ -285,6 +285,7 @@ class APBrokerReconciler:
         interval_sec: int = RECONCILE_INTERVAL_SEC,
         execution_mode: str | None = None,
         supabase_client=None,       # Requirement 1: optional, backward-compatible
+        execution_core=None,        # canonical broker-intent reconciliation consumer
     ):
         self.broker          = broker
         self.client_id       = client_id
@@ -294,6 +295,7 @@ class APBrokerReconciler:
         self._interval       = interval_sec
         self.execution_mode  = _normalize_execution_mode(execution_mode)
         self.supabase_client = supabase_client  # Requirement 2: stored for proof logging
+        self.execution_core  = execution_core
         self._stop       = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
@@ -1187,6 +1189,7 @@ class APBrokerReconciler:
                         execution_mode=self.execution_mode,
                         osm=self.osm,
                         broker=self.broker,
+                        execution_core=self.execution_core,
                         caller_source="ap_reconciler._reconcile_orders",
                     )
                     _outcome = _ptr.recover_one_row(dict(order))

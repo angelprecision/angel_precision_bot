@@ -43,6 +43,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install morning job runtime dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input python-dotenv
+
       - name: Resolve scheduled job
         id: cfg
         run: |
