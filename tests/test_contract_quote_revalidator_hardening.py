@@ -133,6 +133,30 @@ def test_backward_compatible_fetch_still_returns_normalized_empty_quote():
     assert quote["quote_age_semantics"] == "fetch_latency_not_exchange_age"
 
 
+def test_invalid_direct_quote_is_not_cached_over_a_recovered_feed():
+    class SequencedBroker(StubBroker):
+        def __init__(self):
+            super().__init__(quote={})
+            self.responses = [
+                {"bid": 0.0, "ask": 0.0},
+                {"bid": 1.20, "ask": 1.25},
+            ]
+
+        def get_quote(self, symbol: str):
+            self.calls.append(symbol)
+            return dict(self.responses.pop(0))
+
+    broker = SequencedBroker()
+    first = fetch_direct_option_quote_with_meta(broker, OCC)
+    second = fetch_direct_option_quote_with_meta(broker, OCC)
+
+    assert first["ok"] is True
+    assert first["quote"]["bid"] == 0.0
+    assert second["ok"] is True
+    assert second["quote"]["bid"] == 1.20
+    assert broker.calls == [OCC, OCC]
+
+
 def test_direct_quote_metadata_names_latency_not_exchange_age():
     broker = StubBroker(quote={"bid": 1.20, "ask": 1.25, "last": 1.22})
     quote = fetch_direct_option_quote(broker, OCC)

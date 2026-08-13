@@ -718,10 +718,17 @@ def fetch_direct_option_quote_with_meta(
     latency_ms = int((_now() - t0) * 1000)
     _ctx_add_stage_ms(request_context, "direct_quote", latency_ms)
     quote = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, quote)
 
     if quote.get("_quote_payload_empty"):
         return _empty_quote_failure()
+
+    # Never cache an unusable quote as if it were current market truth.  A
+    # transient provider zero/missing bid-ask response otherwise suppresses a
+    # fresh request for CACHE_TTL seconds and can starve the selector even
+    # after the feed recovers.  Valid quotes remain cached to preserve the
+    # per-request transport/budget behavior.
+    if direct_quote_is_valid(quote):
+        _QUOTE_CACHE[cache_key] = (t0, quote)
 
     return {
         "ok": True,
