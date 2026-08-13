@@ -27,7 +27,9 @@
 #   - /admin/release_after_hours_deferred : status-transition guard, idempotent
 #
 # Each invocation runs the scheduler-agnostic unit of work:
-#     python -m ap.scripts.live_morning_jobs
+#     python ap/scripts/live_morning_jobs.py
+# The file entry point is intentional: importing it as ``ap.scripts...`` first
+# executes ap/__init__.py and pulls in the database-bound trading runtime.
 # which reads MORNING_JOB from env and calls the bot admin endpoints with HMAC.
 #
 # Secrets (set in Render dashboard, NOT committed) — names match the script
@@ -43,7 +45,7 @@ services:
     runtime: python
     schedule: "18 13 * * 1-5"   # 13:18 UTC = 09:18 EDT
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m ap.scripts.live_morning_jobs"
+    startCommand: "python ap/scripts/live_morning_jobs.py"
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: overnight_reeval_batch }
@@ -56,7 +58,7 @@ services:
     runtime: python
     schedule: "18 14 * * 1-5"   # 14:18 UTC = 09:18 EST
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m ap.scripts.live_morning_jobs"
+    startCommand: "python ap/scripts/live_morning_jobs.py"
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: overnight_reeval_batch }
@@ -71,7 +73,7 @@ services:
     runtime: python
     schedule: "26 13 * * 1-5"   # 13:26 UTC = 09:26 EDT
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m ap.scripts.live_morning_jobs"
+    startCommand: "python ap/scripts/live_morning_jobs.py"
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_handoff_primary }
@@ -84,7 +86,7 @@ services:
     runtime: python
     schedule: "26 14 * * 1-5"   # 14:26 UTC = 09:26 EST
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m ap.scripts.live_morning_jobs"
+    startCommand: "python ap/scripts/live_morning_jobs.py"
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_handoff_primary }
@@ -99,7 +101,7 @@ services:
     runtime: python
     schedule: "32 13 * * 1-5"   # 13:32 UTC = 09:32 EDT
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m ap.scripts.live_morning_jobs"
+    startCommand: "python ap/scripts/live_morning_jobs.py"
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_handoff_backup }
@@ -112,7 +114,7 @@ services:
     runtime: python
     schedule: "32 14 * * 1-5"   # 14:32 UTC = 09:32 EST
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m ap.scripts.live_morning_jobs"
+    startCommand: "python ap/scripts/live_morning_jobs.py"
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_handoff_backup }
@@ -127,7 +129,7 @@ services:
     runtime: python
     schedule: "36 13 * * 1-5"   # 13:36 UTC = 09:36 EDT
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m ap.scripts.live_morning_jobs"
+    startCommand: "python ap/scripts/live_morning_jobs.py"
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_recovery }
@@ -140,7 +142,7 @@ services:
     runtime: python
     schedule: "36 14 * * 1-5"   # 14:36 UTC = 09:36 EST
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m ap.scripts.live_morning_jobs"
+    startCommand: "python ap/scripts/live_morning_jobs.py"
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_recovery }
