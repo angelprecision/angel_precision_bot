@@ -4118,6 +4118,55 @@ class APMasterControl:
                 block_reason=block_reason,
             )
 
+        def _budget_authority_context(
+            *,
+            decision: str,
+            prior_contract_cost: float,
+            prior_contracts: int,
+        ) -> dict[str, Any]:
+            """Return the one authoritative budget snapshot for reselection.
+
+            Gate 1 and Gate 2 must expose the same effective contract budget.
+            Keeping the snapshot construction in one local helper prevents the
+            two affordability authorities from drifting apart again.
+            """
+            try:
+                _prior_limit_price = float(getattr(plan, "limit_price", 0) or 0)
+            except (TypeError, ValueError):
+                _prior_limit_price = 0.0
+            return {
+                "decision": str(decision or ""),
+                "source": "master_control.revalidate_exposure",
+                "client_id": str(client_id or ""),
+                "execution_mode": str(execution_mode or "").lower(),
+                "signal_id": str(signal_id or ""),
+                "local_order_id": str(_exclude_local_order_id or ""),
+                "prior_contract": str(getattr(plan, "contract_symbol", "") or ""),
+                "prior_contract_cost": float(prior_contract_cost),
+                "prior_contracts": int(prior_contracts),
+                "prior_limit_price": _prior_limit_price,
+                "authoritative_max_premium": float(
+                    min(float(per_trade_budget), max(0.0, float(remaining_total_capacity)))
+                ),
+                "effective_contract_budget": float(
+                    min(float(per_trade_budget), max(0.0, float(remaining_total_capacity)))
+                ),
+                "budget_at_reselection": float(
+                    min(float(per_trade_budget), max(0.0, float(remaining_total_capacity)))
+                ),
+                "account_equity": float(equity),
+                "max_position_pct": float(self.max_position_pct),
+                "total_capital_cap": float(total_capital_cap),
+                "capital_deployed": float(snap.get("capital_deployed", 0.0) or 0.0),
+                "pending_entry_exposure": float(pending_cap or 0.0),
+                "current_total_exposure": float(current_total_exposure),
+                "per_position_cap": float(per_trade_budget),
+                "remaining_total_capacity": float(remaining_total_capacity),
+                "observed_at": str(snap.get("_snapshot_ts") or ""),
+                "resolved": str(decision or "")
+                != "CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT",
+            }
+
         # ── PR #155 split-cap revalidate_exposure ─────────────────────────────
         # Two independent gates, each with the correct headroom and reason code.
         # Do NOT compare projected_total_exposure to per_trade_budget — that is
@@ -4188,28 +4237,12 @@ class APMasterControl:
                         float(per_trade_budget),
                         max(0.0, float(remaining_total_capacity)),
                     )
-                    _budget_context_g1 = {
-                        "decision": "CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT",
-                        "source": "master_control.revalidate_exposure",
-                        "client_id": str(client_id or ""),
-                        "execution_mode": str(execution_mode or "").lower(),
-                        "signal_id": str(signal_id or ""),
-                        "local_order_id": str(_exclude_local_order_id or ""),
-                        "prior_contract": str(getattr(plan, "contract_symbol", "") or ""),
-                        "prior_contract_cost": float(real_cost),
-                        "authoritative_max_premium": float(_effective_budget_g1),
-                        "effective_contract_budget": float(_effective_budget_g1),
-                        "account_equity": float(equity),
-                        "max_position_pct": float(self.max_position_pct),
-                        "total_capital_cap": float(total_capital_cap),
-                        "capital_deployed": float(snap.get("capital_deployed", 0.0) or 0.0),
-                        "pending_entry_exposure": float(pending_cap or 0.0),
-                        "current_total_exposure": float(current_total_exposure),
-                        "per_position_cap": float(per_trade_budget),
-                        "remaining_total_capacity": float(remaining_total_capacity),
-                        "observed_at": str(snap.get("_snapshot_ts") or ""),
-                        "reselection_attempt": 1,
-                    }
+                    _budget_context_g1 = _budget_authority_context(
+                        decision="CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT",
+                        prior_contract_cost=real_cost,
+                        prior_contracts=_original_qty_g1,
+                    )
+                    _budget_context_g1["reselection_attempt"] = 1
                     reason = (
                         f"ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP "
                         f"client_email={client_id} execution_mode={execution_mode} "
@@ -4302,6 +4335,14 @@ class APMasterControl:
                         if _is_total_cap_reached
                         else "ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY"
                     )
+                    _budget_context_g2 = None
+                    if not _is_total_cap_reached:
+                        _budget_context_g2 = _budget_authority_context(
+                            decision="CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT",
+                            prior_contract_cost=real_cost,
+                            prior_contracts=_original_qty_g2,
+                        )
+                        _budget_context_g2["reselection_attempt"] = 1
                     log.warning(
                         "[%s] TOTAL_EXPOSURE_CAP_BLOCK gate=total_exposure_cap "
                         "projected_total=%.0f total_cap=%.0f remaining=%.0f computed_qty=%d",
@@ -4312,6 +4353,15 @@ class APMasterControl:
                     return self._block(
                         signal_id, ticker, client_id, "blocked_risk", reason,
                         reason_code=reason_code,
+                        meta=(
+                            _budget_context_g2
+                            if _budget_context_g2
+                            and float(
+                                _budget_context_g2.get("effective_contract_budget")
+                                or 0.0
+                            ) > 0.0
+                            else None
+                        ),
                     )
 
         if proj_sector > max_sector:
@@ -4354,7 +4404,18 @@ class APMasterControl:
             proj_ticker,
             max_ticker,
         )
-        return ControlDecision(ok=True, stage="revalidated", signal_id=signal_id, ticker=ticker, client_id=client_id)
+        return ControlDecision(
+            ok=True,
+            stage="revalidated",
+            signal_id=signal_id,
+            ticker=ticker,
+            client_id=client_id,
+            context=_budget_authority_context(
+                decision="AUTHORITATIVE_CONTRACT_BUDGET_RESOLVED",
+                prior_contract_cost=real_cost,
+                prior_contracts=int(getattr(plan, "contracts", 0) or 0),
+            ),
+        )
 
     def _block(self, signal_id, ticker, client_id, stage, reason, reason_code: str = "",
                meta: Optional[dict] = None) -> ControlDecision:

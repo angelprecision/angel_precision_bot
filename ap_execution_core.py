@@ -23,6 +23,7 @@ import time
 import uuid
 import logging
 import threading
+import copy
 from datetime import datetime, timezone, timedelta
 from typing import Mapping, Optional
 from types import MappingProxyType, SimpleNamespace
@@ -1782,8 +1783,14 @@ class APExecutionCore:
         prior_contract = str(context.get("prior_contract") or "").strip()
         try:
             prior_cost = float(context.get("prior_contract_cost") or 0)
+            budget_at_reselection = float(
+                context.get("budget_at_reselection")
+                or context.get("effective_contract_budget")
+                or 0
+            )
         except (TypeError, ValueError):
             prior_cost = 0.0
+            budget_at_reselection = 0.0
         plan_mode = str(
             getattr(plan, "execution_mode", None)
             or getattr(plan, "mode", None)
@@ -1794,8 +1801,15 @@ class APExecutionCore:
             context.get("decision") == "CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT"
             and budget is not None
             and prior_contract
+            and self._is_real_occ_contract(
+                prior_contract,
+                str(getattr(plan, "ticker", "") or ""),
+            )
             and math.isfinite(prior_cost)
-            and prior_cost > budget
+            and prior_cost > 0
+            and math.isfinite(budget_at_reselection)
+            and budget_at_reselection > 0
+            and prior_cost > budget_at_reselection
             and (
                 current_contract == prior_contract
                 or current_contract.upper().startswith("DEFERRED:")
@@ -1826,10 +1840,12 @@ class APExecutionCore:
             sizing = {}
             meta["sizing_context"] = sizing
         sizing.update({
+            "budget": budget,
             "selector_budget": budget,
             "remaining_capacity": budget,
             "max_position_usd": budget,
             "max_affordable_premium": budget / 100.0,
+            "authoritative_max_premium": budget,
         })
         meta.update({
             "budget_reselection": dict(context),
@@ -1850,6 +1866,132 @@ class APExecutionCore:
             "_approved_plan": plan,
         })
         return True
+
+    def _refresh_budget_reselection_context(
+        self,
+        *,
+        plan,
+        sig: dict,
+        context: dict,
+        ticker: str,
+        client_id: str,
+    ) -> tuple[bool, str]:
+        """Refresh current Master Control budget before deferred selection.
+
+        A persisted reselection context is a trigger to re-read authority, not
+        a budget reservation. Probe the original OCC/cost tuple so a later
+        budget increase can authorize it, then apply the fresh effective
+        budget to the deferred plan before consuming selector capacity.
+        """
+        if not self._valid_budget_reselection_context(
+            context,
+            plan=plan,
+            sig=sig,
+            client_id=client_id,
+        ):
+            return False, "AUTHORITATIVE_BUDGET_UNAVAILABLE"
+
+        try:
+            prior_cost = float(context.get("prior_contract_cost") or 0)
+            prior_contract = str(context.get("prior_contract") or "").strip()
+            prior_contracts = int(context.get("prior_contracts") or 0)
+        except (TypeError, ValueError):
+            return False, "AUTHORITATIVE_BUDGET_UNAVAILABLE"
+        if prior_contracts <= 0:
+            try:
+                prior_contracts = int(getattr(plan, "contracts", 0) or 0)
+            except (TypeError, ValueError):
+                prior_contracts = 0
+        if prior_contracts <= 0:
+            prior_contracts = 1
+
+        try:
+            probe = copy.copy(plan)
+            probe.metadata = dict(getattr(plan, "metadata", None) or {})
+            probe.contract_symbol = prior_contract
+            probe.contracts = prior_contracts
+            probe.max_position_usd = prior_cost
+            prior_limit_price = float(context.get("prior_limit_price") or 0)
+            probe.limit_price = (
+                prior_limit_price
+                if prior_limit_price > 0
+                else prior_cost / (prior_contracts * 100.0)
+            )
+            reval = self.master_control.revalidate_exposure(
+                probe,
+                client_id=client_id,
+            )
+        except Exception as exc:
+            log.critical(
+                "[%s] BUDGET_RESELECTION_AUTHORITY_REFRESH_FAILED "
+                "order=%s error=%s",
+                ticker,
+                str(sig.get("local_order_id") or ""),
+                exc,
+            )
+            return False, f"AUTHORITATIVE_BUDGET_REFRESH_ERROR:{type(exc).__name__}"
+
+        authority = getattr(reval, "context", None)
+        if not isinstance(authority, dict):
+            authority = {}
+        reason_code = str(getattr(reval, "reason_code", "") or "")
+        if not getattr(reval, "ok", False) and reason_code not in {
+            "ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP",
+            "ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY",
+        }:
+            return False, reason_code or "AUTHORITATIVE_BUDGET_REFRESH_BLOCKED"
+
+        budget = self._budget_reselection_budget(authority)
+        if budget is None:
+            return False, reason_code or "CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED"
+
+        try:
+            _initial_budget = float(
+                context.get("budget_at_reselection")
+                or context.get("effective_contract_budget")
+                or 0
+            )
+        except (TypeError, ValueError):
+            _initial_budget = 0.0
+        refreshed = dict(context)
+        refreshed.update(authority)
+        refreshed.update({
+            "decision": "CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT",
+            "prior_contract": prior_contract,
+            "prior_contract_cost": prior_cost,
+            "prior_contracts": prior_contracts,
+            "budget_at_reselection": _initial_budget,
+            "resolved": False,
+            "refresh_attempt": int(context.get("refresh_attempt") or 0) + 1,
+            "budget_refresh_reason": (
+                reason_code or "AUTHORITATIVE_CONTRACT_BUDGET_RESOLVED"
+            ),
+        })
+        if not self._apply_budget_reselection_context(
+            plan=plan,
+            sig=sig,
+            context=refreshed,
+            ticker=ticker,
+        ):
+            return False, "CONTRACT_RESELECTION_CONTEXT_APPLY_FAILED"
+
+        update_meta = getattr(self.order_state_machine, "update_order_meta", None)
+        if not callable(update_meta) or not bool(
+            update_meta(
+                str(sig.get("local_order_id") or ""),
+                {
+                    "budget_reselection": refreshed,
+                    "contract_selection_status": (
+                        "CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT"
+                    ),
+                    "contract_deferred": True,
+                    "deferred_breach_selection": True,
+                    "contract_authority_invalidated": True,
+                },
+            )
+        ):
+            return False, "CONTRACT_RESELECTION_DURABLE_WRITE_FAILED"
+        return True, ""
 
     def _recover_plan_for_revalidation(self, watched: WatchedSignal):
         """
@@ -1936,20 +2078,6 @@ class APExecutionCore:
             recovered.metadata.setdefault("local_order_id", local_order_id)
             recovered.metadata.setdefault("signal_id", recovered.signal_id)
             recovered.metadata.setdefault("execution_mode", _recovered_mode)
-            _drift = _order_meta.get("budget_reselection")
-            if isinstance(_drift, dict) and not _drift.get("resolved"):
-                if not self._valid_budget_reselection_context(
-                    _drift,
-                    plan=recovered,
-                    sig=sig,
-                    client_id=str(order.get("client_id") or self.email or ""),
-                ) or not self._apply_budget_reselection_context(
-                    plan=recovered,
-                    sig=sig,
-                    context=_drift,
-                    ticker=str(watched.ticker or ""),
-                ):
-                    return None
             sig["_approved_plan"] = recovered
             log.info(
                 "[%s] Recovered approved plan for breach revalidation from OSM order %s | cost=$%.0f",
@@ -2294,6 +2422,34 @@ class APExecutionCore:
                     or self.email
                     or "default"
                 ).strip()
+                _existing_budget_context = _plan_meta.get("budget_reselection")
+                if (
+                    isinstance(_existing_budget_context, dict)
+                    and not _existing_budget_context.get("resolved")
+                ):
+                    if self._valid_budget_reselection_context(
+                        _existing_budget_context,
+                        plan=approved_plan,
+                        sig=sig,
+                        client_id=_reval_client_id,
+                    ):
+                        # The persisted context is a reselection trigger, not
+                        # today's authority. Do not revalidate the deferred
+                        # placeholder here; the selector-bound refresh probes
+                        # the original OCC/cost tuple immediately before use.
+                        log.info(
+                            "[%s] Budget reselection remains active; deferring "
+                            "fresh authority probe until selector boundary",
+                            ticker,
+                        )
+                        return True
+                    log.critical(
+                        "[%s] AUTHORITATIVE_BUDGET_CONTEXT_INVALID order=%s — "
+                        "blocking before selector/broker work",
+                        ticker,
+                        sig.get("local_order_id") or "",
+                    )
+                    return False
                 reval = self.master_control.revalidate_exposure(
                     approved_plan,
                     client_id=_reval_client_id,
@@ -2303,7 +2459,10 @@ class APExecutionCore:
                     _reason_code = str(getattr(reval, "reason_code", "") or "")
                     _ctx = getattr(reval, "context", None)
                     if (
-                        _reason_code == "ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP"
+                        _reason_code in {
+                            "ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP",
+                            "ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY",
+                        }
                         and self._valid_budget_reselection_context(
                             _ctx,
                             plan=approved_plan,
@@ -5682,6 +5841,34 @@ class APExecutionCore:
                             pass
                 except Exception:
                     pass
+                if _budget_reselection_active:
+                    _refresh_ok, _refresh_reason = (
+                        self._refresh_budget_reselection_context(
+                            plan=approved_plan,
+                            sig=sig,
+                            context=_budget_reselection_context,
+                            ticker=ticker,
+                            client_id=_breach_client_id or "default",
+                        )
+                    )
+                    if not _refresh_ok:
+                        _emit_deferred_outcome(
+                            "BREACH_RISK_CHECK_BLOCKED",
+                            reason=_refresh_reason,
+                        )
+                        return _terminalize_deferred_breach_failure(
+                            _refresh_reason,
+                            extra_meta={
+                                "failure_stage": "budget_reselection_authority_refresh",
+                                "budget_reselection": _budget_reselection_context,
+                            },
+                        )
+                    _budget_reselection_context = dict(
+                        (getattr(approved_plan, "metadata", None) or {}).get(
+                            "budget_reselection"
+                        )
+                        or _budget_reselection_context
+                    )
                 try:
                     _sel = self.contract_selector.select(
                         approved_plan,
