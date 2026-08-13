@@ -3499,8 +3499,13 @@ class APExecutionCore:
         could place a second live order for Jason.
 
         The broker account order list is queried by the durable tag and the
-        result is strongly checked against contract, side and quantity before
-        an existing order is adopted. Ambiguity remains fail-closed.
+        result is strongly checked against the actual OCC contract, side and
+        quantity before an existing order is adopted. Ambiguity remains
+        fail-closed.
+
+        An exact match establishes broker ownership only.  It is deliberately
+        persisted as SUBMITTED; the canonical fill monitor owns every later
+        working/partial/filled/rejected/canceled/expired transition.
 
           * ALREADY_RECONCILED — broker_order_id already present; the
             order monitor owns the row.  (Defensive; the recovery load
@@ -3513,8 +3518,19 @@ class APExecutionCore:
             row read raised, row missing).
 
         This method never POSTs. It only reads broker truth and adopts an exact
-        match through the existing order state machine.
+        match through the existing order state machine.  Broker-reported
+        status is retained as reconciliation evidence, never used as a local
+        lifecycle transition here.
         """
+        # Reuse the strict broker identity and timestamp parsers already used
+        # by PR #445's direct broker-adoption path.  Keep this import local so
+        # the execution-core import graph remains unchanged at module load.
+        from ap.pending_trigger_restart_recovery import (
+            _BROKER_SUBMITTED_TIMESTAMP_FIELDS,
+            _first_broker_timestamp,
+            _validated_broker_occ_contract,
+        )
+
         _owner_label = f"broker_reconciler:{self.client_id or self.email or ''}"
         _base = {
             "local_order_id": local_order_id,
@@ -3592,11 +3608,16 @@ class APExecutionCore:
 
         tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
-        expected_contract = str(row.get("contract") or "")
+        expected_contract = str(row.get("contract") or "").strip().upper()
         expected_qty = int(row.get("qty") or 0)
         strong = [
             o for o in exact_tag
-            if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
+            if str(
+                o.get("option_symbol")
+                or o.get("contract")
+                or o.get("symbol")
+                or ""
+            ).strip().upper() == expected_contract
             and str(o.get("side") or "").lower() == "buy_to_open"
             and int(float(o.get("quantity") or 0)) == expected_qty
         ]
@@ -3616,33 +3637,65 @@ class APExecutionCore:
             }
 
         remote = strong[0]
+        remote_contract, contract_reason = _validated_broker_occ_contract(
+            row, remote
+        )
+        if remote_contract is None or remote_contract != expected_contract:
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": (
+                    "RECONCILE_CONTRACT_IDENTITY_MISMATCH"
+                    if remote_contract is not None
+                    else f"RECONCILE_{contract_reason.upper()}"
+                ),
+            }
+
         remote_id = str(remote.get("id") or remote.get("order_id") or "")
         remote_status = str(remote.get("status") or "").lower().replace("-", "_")
         if not remote_id:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MATCH_MISSING_ORDER_ID"}
-        status_map = {
-            "filled": "FILLED", "partially_filled": "PARTIAL_FILL",
-            "partial_filled": "PARTIAL_FILL", "rejected": "REJECTED",
-            "canceled": "CANCELED", "cancelled": "CANCELED", "expired": "EXPIRED",
-        }
-        local_status = status_map.get(remote_status, "SUBMITTED")
-        # Establish the accepted boundary first so the existing state machine
-        # owns all subsequent fill/terminal transitions.
-        if not osm.transition(local_order_id, "SUBMITTED", broker_order_id=remote_id, submitted_ts=now_utc_iso()):
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
-        if local_status != "SUBMITTED":
-            osm.transition(
-                local_order_id, local_status, broker_order_id=remote_id,
-                filled_qty=remote.get("exec_quantity") or remote.get("filled_quantity"),
-                fill_price=remote.get("avg_fill_price"),
-                last_error=(str(remote.get("reason") or remote.get("message") or "") or None),
+
+        # Broker chronology is optional.  A missing or malformed broker
+        # timestamp remains NULL; reconciliation time is never a substitute.
+        submitted_ts, submitted_ts_source, submitted_ts_malformed = (
+            _first_broker_timestamp(
+                remote,
+                _BROKER_SUBMITTED_TIMESTAMP_FIELDS,
             )
+        )
+        if submitted_ts_malformed:
+            submitted_ts = None
+            submitted_ts_source = None
+
+        # Establish broker ownership at the accepted boundary only.  Never
+        # replay the remote terminal/partial status through this reconciler.
+        if not osm.transition(
+            local_order_id,
+            "SUBMITTED",
+            broker_order_id=remote_id,
+            submitted_ts=submitted_ts,
+        ):
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
         osm.update_order_meta(local_order_id, {
             "reconciled_at": now_utc_iso(), "recovery_classification": "BROKER_ORDER_ADOPTED",
             "broker_reconcile_status": remote_status, "broker_reconcile_response": remote,
-            "current_owner": "ORDER_MONITOR", "lifecycle_state": local_status,
+            "broker_reconcile_contract": remote_contract,
+            "broker_submitted_ts": submitted_ts,
+            "broker_submitted_ts_source": (
+                submitted_ts_source
+                or ("malformed_unusable" if submitted_ts_malformed else "unavailable")
+            ),
+            "current_owner": "ORDER_MONITOR", "lifecycle_state": "SUBMITTED",
         })
-        return {**_base, "disposition": "ALREADY_RECONCILED", "reason_code": "BROKER_ORDER_ADOPTED", "broker_order_id": remote_id, "status": local_status}
+        return {
+            **_base,
+            "disposition": "ALREADY_RECONCILED",
+            "reason_code": "BROKER_ORDER_ADOPTED",
+            "broker_order_id": remote_id,
+            "status": "SUBMITTED",
+            "broker_submitted_ts": submitted_ts,
+        }
 
     def reconcile_exit_broker_intent(
         self,

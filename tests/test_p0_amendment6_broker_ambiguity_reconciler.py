@@ -66,6 +66,30 @@ def _row(**overrides):
     return base
 
 
+def _matching_row(**overrides):
+    row = _row(
+        symbol="SPY",
+        direction="CALL",
+        contract="SPY260821C00500000",
+        qty=1,
+    )
+    row.update(overrides)
+    return row
+
+
+def _matching_broker_order(status="working", **overrides):
+    order = {
+        "id": "TR-9",
+        "tag": "oid-1",
+        "option_symbol": "SPY260821C00500000",
+        "side": "buy_to_open",
+        "quantity": "1",
+        "status": status,
+    }
+    order.update(overrides)
+    return order
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Reconciler classification
 # ═══════════════════════════════════════════════════════════════════════
@@ -113,6 +137,78 @@ def test_old_submit_intent_with_empty_broker_list_stays_fail_closed():
     assert result["disposition"] == "RECONCILE_PENDING"
     assert result["reason_code"] == "RECONCILE_BROKER_NO_MATCH_HELD"
     core.order_state_machine.update_order_meta.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "broker_status",
+    ["filled", "partially_filled", "rejected", "canceled", "expired"],
+)
+def test_exact_broker_status_only_adopts_submitted_for_fill_monitor(broker_status):
+    core = _make_core()
+    row = _matching_row()
+    remote = _matching_broker_order(broker_status)
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.transition.return_value = True
+    core.broker.list_orders.side_effect = None
+    core.broker.list_orders.return_value = [remote]
+
+    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+
+    assert result["disposition"] == "ALREADY_RECONCILED"
+    assert result["status"] == "SUBMITTED"
+    assert result["broker_order_id"] == "TR-9"
+    core.order_state_machine.transition.assert_called_once_with(
+        "oid-1",
+        "SUBMITTED",
+        broker_order_id="TR-9",
+        submitted_ts=None,
+    )
+    patch = core.order_state_machine.update_order_meta.call_args.args[1]
+    assert patch["broker_reconcile_status"] == broker_status
+    assert patch["current_owner"] == "ORDER_MONITOR"
+    assert patch["lifecycle_state"] == "SUBMITTED"
+    assert "filled_qty" not in core.order_state_machine.transition.call_args.kwargs
+    assert "fill_price" not in core.order_state_machine.transition.call_args.kwargs
+
+
+def test_reconciler_preserves_broker_submission_timestamp():
+    core = _make_core()
+    row = _matching_row()
+    remote = _matching_broker_order(
+        "filled",
+        create_date="2026-08-12T15:50:00Z",
+        transaction_date="2026-08-12T15:51:00Z",
+    )
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.transition.return_value = True
+    core.broker.list_orders.side_effect = None
+    core.broker.list_orders.return_value = [remote]
+
+    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+
+    assert result["status"] == "SUBMITTED"
+    assert core.order_state_machine.transition.call_args.kwargs["submitted_ts"] == (
+        "2026-08-12T15:50:00+00:00"
+    )
+    patch = core.order_state_machine.update_order_meta.call_args.args[1]
+    assert patch["broker_submitted_ts"] == "2026-08-12T15:50:00+00:00"
+    assert patch["broker_submitted_ts_source"] == "create_date"
+
+
+def test_reconciler_leaves_submitted_timestamp_null_when_broker_timestamp_unavailable():
+    core = _make_core()
+    row = _matching_row()
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.transition.return_value = True
+    core.broker.list_orders.side_effect = None
+    core.broker.list_orders.return_value = [_matching_broker_order("working")]
+
+    core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+
+    assert core.order_state_machine.transition.call_args.kwargs["submitted_ts"] is None
+    patch = core.order_state_machine.update_order_meta.call_args.args[1]
+    assert patch["broker_submitted_ts"] is None
+    assert patch["broker_submitted_ts_source"] == "unavailable"
 
 
 # ═══════════════════════════════════════════════════════════════════════
