@@ -1976,7 +1976,13 @@ class PendingTriggerRestartRecovery:
         )
 
     def _lookup_durable_broker_order(
-        self, row: dict, local_oid: str
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        allow_submitted: bool = False,
+        force_order_list: bool = False,
+        require_submit_identity: bool = False,
     ) -> tuple[str, Optional[dict], str]:
         """Verify the broker order named by a corrupt PENDING_TRIGGER row.
 
@@ -1993,7 +1999,19 @@ class PendingTriggerRestartRecovery:
             return "HOLD", None, "broker_order_client_identity_mismatch"
         if str(row.get("execution_mode") or "").strip().lower() != self.execution_mode:
             return "HOLD", None, "broker_order_mode_identity_mismatch"
-        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+        allowed_statuses = {"PENDING_TRIGGER"}
+        if allow_submitted:
+            allowed_statuses.update(
+                {
+                    "SUBMITTED",
+                    "ACK",
+                    "ACKNOWLEDGED",
+                    "PARTIAL",
+                    "PARTIAL_FILL",
+                    "FILLED",
+                }
+            )
+        if str(row.get("status") or "").strip().upper() not in allowed_statuses:
             return "HOLD", None, "broker_order_status_not_pending_trigger"
 
         expected_id = str(row.get("broker_order_id") or "").strip()
@@ -2001,7 +2019,7 @@ class PendingTriggerRestartRecovery:
             return "HOLD", None, "broker_order_id_missing"
         matches: list[dict] = []
         get_order = getattr(self.broker, "get_order", None)
-        if callable(get_order):
+        if callable(get_order) and not force_order_list:
             try:
                 direct = get_order(expected_id)
             except Exception as exc:
@@ -2027,7 +2045,19 @@ class PendingTriggerRestartRecovery:
             if not isinstance(broker_orders, list):
                 return "HOLD", None, "broker_order_listing_malformed"
             for broker_order in broker_orders:
-                if not isinstance(broker_order, dict):
+                if not isinstance(broker_order, dict) or not broker_order:
+                    return "HOLD", None, "broker_order_listing_malformed"
+                if require_submit_identity and not any(
+                    str(broker_order.get(key) or "").strip()
+                    for key in (
+                        "id",
+                        "order_id",
+                        "tag",
+                        "client_order_id",
+                        "local_order_id",
+                        "order_local_id",
+                    )
+                ):
                     return "HOLD", None, "broker_order_listing_malformed"
                 remote_id = str(
                     broker_order.get("id") or broker_order.get("order_id") or ""
@@ -2071,6 +2101,20 @@ class PendingTriggerRestartRecovery:
         if durable_tag and remote_tag:
             if canonical_broker_submit_key(durable_tag) != remote_tag:
                 return "HOLD", None, "broker_order_submit_tag_mismatch"
+        if require_submit_identity:
+            expected_submit_key = canonical_broker_submit_key(local_oid)
+            submit_identity = any(
+                str(remote.get(key) or "").strip()
+                in {expected_submit_key, local_oid}
+                for key in (
+                    "tag",
+                    "client_order_id",
+                    "local_order_id",
+                    "order_local_id",
+                )
+            )
+            if not submit_identity:
+                return "HOLD", None, "broker_order_submit_identity_missing_or_mismatch"
         return "MATCH", remote, "broker_order_identity_verified"
 
     def _adopt_durable_broker_order(self, row: dict, local_oid: str) -> str:
@@ -2626,6 +2670,11 @@ class PendingTriggerRestartRecovery:
             meta.get("entry_efficiency_state"), allow_empty=False
         )
         if state != "READY_NOW":
+            if str(meta.get("entry_efficiency_state") or "").strip().upper() == READY_NOW:
+                return {
+                    "disposition": "UNPROVEN",
+                    "reason": "malformed_lifecycle_state",
+                }
             return {"disposition": "NOT_CANDIDATE"}
 
         def _fail(reason: str) -> dict:
@@ -2719,6 +2768,12 @@ class PendingTriggerRestartRecovery:
             if _present(meta.get(key)):
                 return _fail(f"unsafe_meta_flag:{key}")
 
+        position_state, position_reason = self._prebroker_position_truth(
+            row, signal_id=signal_id, local_oid=local_oid
+        )
+        if position_state != "NO_MATCH":
+            return _fail(f"position_authority_{position_reason}")
+
         list_orders = getattr(self.broker, "list_orders", None)
         if not callable(list_orders):
             return _fail("broker_order_list_unavailable")
@@ -2730,8 +2785,20 @@ class PendingTriggerRestartRecovery:
             return _fail("broker_order_list_malformed")
         submit_key = canonical_broker_submit_key(local_oid)
         for broker_order in broker_orders:
-            if not isinstance(broker_order, dict):
-                continue
+            if not isinstance(broker_order, dict) or not broker_order:
+                return _fail("broker_order_list_malformed")
+            if not any(
+                str(broker_order.get(key) or "").strip()
+                for key in (
+                    "id",
+                    "order_id",
+                    "tag",
+                    "client_order_id",
+                    "local_order_id",
+                    "order_local_id",
+                )
+            ):
+                return _fail("broker_order_list_malformed")
             for key in ("tag", "client_order_id", "local_order_id", "order_local_id"):
                 value = str(broker_order.get(key) or "").strip()
                 if value and value in {submit_key, local_oid}:
@@ -2945,7 +3012,23 @@ class PendingTriggerRestartRecovery:
         after_status = str(after.get("status") or "").strip().upper()
         after_meta = _extract_meta(after)
         if after.get("broker_order_id"):
-            return _RowOutcome.SKIPPED
+            ownership, _broker_order, ownership_reason = (
+                self._lookup_durable_broker_order(
+                    after,
+                    local_oid,
+                    allow_submitted=True,
+                    force_order_list=True,
+                    require_submit_identity=True,
+                )
+            )
+            if ownership == "MATCH":
+                return _RowOutcome.SKIPPED
+            self._mark_failure(
+                local_oid,
+                "entry_efficiency_ready_restart:broker_ownership_unresolved"
+                f":{ownership_reason}",
+            )
+            return _RowOutcome.UNRESOLVED
         if after.get("submitted_ts") or after_meta.get("submit_intent_at"):
             intent_outcome = self._route_durable_submit_intent_if_present(
                 after, local_oid
