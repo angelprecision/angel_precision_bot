@@ -30,12 +30,7 @@ import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ap_intelligence.tools.ap_data_tools import (
-    get_prices,
-    get_spy_trend,
-    get_vix,
-    validate_vix_observation,
-)
+from ap_intelligence.tools.ap_data_tools import get_prices, get_spy_trend, get_vix
 from ap_intelligence.ap_mode_config import APModeConfig
 
 
@@ -93,9 +88,6 @@ MAX_LONGS = 5
 MAX_SHORTS = 5
 MAX_SAME_SECTOR_POSITIONS = 2
 
-VIX_POLICY_MIN = 12.0
-VIX_POLICY_MAX = 35.0
-
 # Contract quality hard gates
 CONTRACT_FILTERS = {
     "max_spread_pct":   0.14,    # 14% — risk manager veto (per spec: 10%→14%)
@@ -149,12 +141,6 @@ class RiskResult:
     reason_code: str = ""
     veto_category: str = ""
     hard_veto: bool = False
-    # Gate G may run before a selected OCC contract or canonical account
-    # snapshot exists.  These fields keep that authority boundary explicit in
-    # the result instead of making callers infer it from default values.
-    contract_quality_authoritative: bool = True
-    account_state_authoritative: bool = True
-    authority_diagnostics: dict = field(default_factory=dict)
 
 
 class APRiskManager:
@@ -220,25 +206,10 @@ class APRiskManager:
         daily_volume_options: int = 500,
         dte: int = 1,
         atr_stop_multiple: float = 1.0,  # Number of ATRs to stop distance
-        contract_quality_authoritative: bool = True,
-        account_state_authoritative: bool = True,
-        authority_diagnostics: Optional[dict] = None,
     ) -> RiskResult:
 
-        authority_diagnostics = dict(authority_diagnostics or {})
-        authority_diagnostics.setdefault(
-            "contract_quality_authoritative",
-            bool(contract_quality_authoritative),
-        )
-        authority_diagnostics.setdefault(
-            "account_state_authoritative",
-            bool(account_state_authoritative),
-        )
-
         # ── 0. Daily kill switch ──────────────────────────────
-        if account_state_authoritative and self.daily_pnl < (
-            self.portfolio_value * self.daily_loss_limit_pct
-        ):
+        if self.daily_pnl < (self.portfolio_value * self.daily_loss_limit_pct):
             return self._reject(
                 ticker,
                 direction,
@@ -252,51 +223,14 @@ class APRiskManager:
                 reason_code="DAILY_LOSS_KILL_SWITCH",
                 veto_category="ACCOUNT_SAFETY",
                 hard_veto=True,
-                authority_diagnostics=authority_diagnostics,
-                contract_quality_authoritative=contract_quality_authoritative,
-                account_state_authoritative=account_state_authoritative,
             )
-        if not account_state_authoritative:
-            authority_diagnostics["daily_pnl"] = {
-                "value": self.daily_pnl,
-                "source": "process_local_APRiskManager",
-                "classification": "UNAVAILABLE",
-                "authoritative": False,
-                "reason": "canonical account/day P&L snapshot not supplied",
-            }
 
-        # ── 1. Market regime context + VIX authority/policy gate ─
+        # ── 1. Market regime context + VIX hard gate ───────────
         spy = get_spy_trend()
         vix_data = get_vix()
 
         spy_trend = str((spy or {}).get("trend") or "UNKNOWN").upper()
-        vix_authoritative, vix_value, vix_diagnostics = validate_vix_observation(
-            vix_data
-        )
-        if vix_authoritative:
-            vix_policy_tradeable = (
-                VIX_POLICY_MIN <= vix_value <= VIX_POLICY_MAX
-            )
-            vix_diagnostics.update({
-                "policy_tradeable": vix_policy_tradeable,
-                "policy_min": VIX_POLICY_MIN,
-                "policy_max": VIX_POLICY_MAX,
-                "policy_outcome": (
-                    "VIX_PASS"
-                    if vix_policy_tradeable
-                    else "VIX_POLICY_HARD_CAP"
-                ),
-            })
-        else:
-            vix_policy_tradeable = None
-            vix_diagnostics.update({
-                "policy_tradeable": None,
-                "policy_min": VIX_POLICY_MIN,
-                "policy_max": VIX_POLICY_MAX,
-                "policy_outcome": "VIX_ADVISORY",
-                "reason_code": "VIX_UNAVAILABLE",
-            })
-        authority_diagnostics["vix"] = vix_diagnostics
+        vix_value = (vix_data or {}).get("vix")
 
         # Index tickers are themselves broad-market instruments. Preserve the
         # existing exemption, but still record SPY context in RiskResult.
@@ -337,10 +271,7 @@ class APRiskManager:
                 spy_trend,
             )
 
-        # Only a fresh, provenance-bound observation may produce the hard VIX
-        # policy veto.  Provider failure, malformed data, and stale data are
-        # advisory and must continue through the remaining Gate G checks.
-        if vix_authoritative and not vix_policy_tradeable:
+        if (vix_data or {}).get("tradeable") is not True:
             return self._reject(
                 ticker,
                 direction,
@@ -350,15 +281,12 @@ class APRiskManager:
                 open_interest,
                 daily_volume_options,
                 option_delta,
-                f"VIX={vix_value} outside {VIX_POLICY_MIN:g}-{VIX_POLICY_MAX:g}",
+                f"VIX={vix_value} outside 12-35",
                 spy_trend=spy_trend,
                 vix=vix_value,
                 reason_code="VIX_POLICY_HARD_CAP",
                 veto_category="MARKET_SAFETY",
                 hard_veto=True,
-                authority_diagnostics=authority_diagnostics,
-                contract_quality_authoritative=contract_quality_authoritative,
-                account_state_authoritative=account_state_authoritative,
             )
 
         # ── 2. Contract quality filter (HARD GATE) ────────────
@@ -369,22 +297,7 @@ class APRiskManager:
             delta=option_delta,
             dte=dte,
         )
-        authority_diagnostics["contract_quality"] = {
-            "value": {
-                "passes": cq.passes,
-                "spread_ok": cq.spread_ok,
-                "oi_ok": cq.oi_ok,
-                "volume_ok": cq.volume_ok,
-                "delta_ok": cq.delta_ok,
-                "dte_ok": cq.dte_ok,
-            },
-            "source": "selected_contract" if contract_quality_authoritative else "pipeline_defaults_or_signal_metadata",
-            "classification": "PRODUCTION_EXACT" if contract_quality_authoritative else "ESTIMATED_ADVISORY",
-            "authoritative": bool(contract_quality_authoritative),
-            "reason": cq.rejection_reason or "passed",
-        }
-
-        if not cq.passes and contract_quality_authoritative:
+        if not cq.passes:
             return self._reject(
                 ticker,
                 direction,
@@ -401,80 +314,6 @@ class APRiskManager:
                 reason_code="CONTRACT_QUALITY_FAILED",
                 veto_category="EXECUTION_QUALITY",
                 hard_veto=True,
-                authority_diagnostics=authority_diagnostics,
-                contract_quality_authoritative=contract_quality_authoritative,
-                account_state_authoritative=account_state_authoritative,
-            )
-
-        # Gate G is intentionally not a second account-risk authority.  When
-        # Master Control has not supplied a canonical account snapshot, stop
-        # before the legacy manager's process-local exposure/capital/sizing
-        # calculations.  Keep genuine market safety (VIX) and, when present,
-        # exact selected-contract quality above; everything else is advisory.
-        if not account_state_authoritative:
-            authority_diagnostics["account_state"] = {
-                "value": None,
-                "source": "APRiskManager.process_local_state",
-                "classification": "UNAVAILABLE",
-                "authoritative": False,
-                "reason": "canonical Master Control snapshot is the account-risk authority",
-            }
-            authority_diagnostics["sector_exposure"] = {
-                "value": None,
-                "source": "APRiskManager.open_positions",
-                "classification": "UNAVAILABLE",
-                "authoritative": False,
-                "reason": "process-local portfolio state is not current account truth",
-            }
-            authority_diagnostics["sizing"] = {
-                "value": None,
-                "source": "APRiskManager",
-                "classification": "UNAVAILABLE",
-                "authoritative": False,
-                "reason": "contract cost and account equity are not Gate G authority pre-selector",
-            }
-            _advisory_reason = (
-                f"{regime_reason}; " if regime_reason else ""
-            ) + "account/portfolio risk advisory: canonical snapshot unavailable"
-            if not vix_authoritative:
-                _advisory_reason = (
-                    f"VIX advisory: {vix_diagnostics.get('reason', 'observation unavailable')}; "
-                    + _advisory_reason
-                )
-            return RiskResult(
-                ticker=ticker,
-                approved=True,
-                max_contracts=1,
-                max_position_usd=0.0,
-                risk_dollars=0.0,
-                stop_distance_pct=0.0,
-                expected_loss_per_contract=0.0,
-                volatility_pct=0.0,
-                position_limit_pct=0.0,
-                correlation_multiplier=1.0,
-                sector_multiplier=1.0,
-                contract_quality=cq,
-                spy_trend=spy_trend,
-                vix=vix_value,
-                reason=_advisory_reason,
-                reason_code=(
-                    "VIX_UNAVAILABLE"
-                    if not vix_authoritative
-                    else (
-                        "APPROVED_WITH_REGIME_MISMATCH"
-                        if regime_mismatch
-                        else "ADVISORY_DATA_UNAVAILABLE"
-                    )
-                ),
-                veto_category=(
-                    "DATA_AVAILABILITY"
-                    if not vix_authoritative
-                    else ("MARKET_CONTEXT" if regime_mismatch else "DATA_AVAILABILITY")
-                ),
-                hard_veto=False,
-                contract_quality_authoritative=bool(contract_quality_authoritative),
-                account_state_authoritative=False,
-                authority_diagnostics=authority_diagnostics,
             )
 
         # ── 3. Exposure bucket check ──────────────────────────
@@ -497,9 +336,6 @@ class APRiskManager:
                 reason_code="SECTOR_EXPOSURE_CAP",
                 veto_category="PORTFOLIO_EXPOSURE",
                 hard_veto=True,
-                authority_diagnostics=authority_diagnostics,
-                contract_quality_authoritative=contract_quality_authoritative,
-                account_state_authoritative=account_state_authoritative,
             )
 
         # ── 4. Volatility-adjusted position cap ───────────────
@@ -582,26 +418,7 @@ class APRiskManager:
                 reason_code="INSUFFICIENT_CAPITAL_OR_ZERO_CONTRACTS",
                 veto_category="CAPITAL",
                 hard_veto=True,
-                authority_diagnostics=authority_diagnostics,
-                contract_quality_authoritative=contract_quality_authoritative,
-                account_state_authoritative=account_state_authoritative,
             )
-
-        if not vix_authoritative:
-            approval_reason = (
-                "VIX advisory: "
-                f"{vix_diagnostics.get('reason', 'observation unavailable')}"
-            )
-            approval_reason_code = "VIX_UNAVAILABLE"
-            approval_veto_category = "DATA_AVAILABILITY"
-        else:
-            approval_reason = regime_reason or "APPROVED"
-            approval_reason_code = (
-                "APPROVED_WITH_REGIME_MISMATCH"
-                if regime_mismatch
-                else "APPROVED"
-            )
-            approval_veto_category = "MARKET_CONTEXT" if regime_mismatch else "NONE"
 
         return RiskResult(
             ticker=ticker,
@@ -618,13 +435,18 @@ class APRiskManager:
             contract_quality=cq,
             spy_trend=spy_trend,
             vix=vix_value,
-            reason=approval_reason,
-            reason_code=approval_reason_code,
-            veto_category=approval_veto_category,
+            reason=regime_reason or "APPROVED",
+            reason_code=(
+                "APPROVED_WITH_REGIME_MISMATCH"
+                if regime_mismatch
+                else "APPROVED"
+            ),
+            veto_category=(
+                "MARKET_CONTEXT"
+                if regime_mismatch
+                else "NONE"
+            ),
             hard_veto=False,
-            contract_quality_authoritative=bool(contract_quality_authoritative),
-            account_state_authoritative=bool(account_state_authoritative),
-            authority_diagnostics=authority_diagnostics,
         )
 
     # ────────────────────────────────────────────
@@ -840,9 +662,6 @@ class APRiskManager:
         reason_code: str = "UNCLASSIFIED_RISK_REJECTION",
         veto_category: str = "RISK",
         hard_veto: bool = True,
-        authority_diagnostics: Optional[dict] = None,
-        contract_quality_authoritative: bool = True,
-        account_state_authoritative: bool = True,
     ) -> RiskResult:
         if contract_quality is None:
             contract_quality = self._contract_quality(
@@ -872,7 +691,4 @@ class APRiskManager:
             reason_code=reason_code,
             veto_category=veto_category,
             hard_veto=hard_veto,
-            contract_quality_authoritative=bool(contract_quality_authoritative),
-            account_state_authoritative=bool(account_state_authoritative),
-            authority_diagnostics=dict(authority_diagnostics or {}),
         )

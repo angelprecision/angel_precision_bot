@@ -3,7 +3,7 @@ DB hardening tests — ap/db.py safe support helpers.
 
 Tests:
     1. get_stale_pending_trigger_orders SQL shape
-    2. get_open_orders_for_reconcile includes evidence-bearing PENDING_TRIGGER
+    2. get_open_orders_for_reconcile still excludes PENDING_TRIGGER
     3. DB_RETRY_FAST and DB_RETRY_SLOW constants
     4. insert_order emits DeprecationWarning
 """
@@ -93,19 +93,19 @@ class TestStalePendingTrigger:
 
 
 # ---------------------------------------------------------------------------
-# 2. get_open_orders_for_reconcile includes evidence-bearing PENDING_TRIGGER
+# 2. get_open_orders_for_reconcile still excludes PENDING_TRIGGER
 # ---------------------------------------------------------------------------
-class TestReconcileIncludesBrokerEvidencePendingTrigger:
-    def test_pending_trigger_requires_broker_evidence_in_reconcile_query(self):
-        """Only evidence-bearing PENDING_TRIGGER rows enter broker reconcile."""
+class TestReconcileExcludesPendingTrigger:
+    def test_pending_trigger_not_in_reconcile_status_list(self):
+        """PENDING_TRIGGER must not appear in get_open_orders_for_reconcile SQL."""
         import inspect
         import ap.db as db_module
 
         src = inspect.getsource(db_module.get_open_orders_for_reconcile)
-        assert "PENDING_TRIGGER" in src
-        assert "broker_order_id" in src
-        assert "submitted_ts" in src
-        assert "submit_intent_at" in src
+        assert "PENDING_TRIGGER" not in src, (
+            "get_open_orders_for_reconcile() must NOT include PENDING_TRIGGER — "
+            "those orders have no broker_order_id and must not be broker-polled."
+        )
 
     def test_reconcile_function_exists(self):
         from ap.db import get_open_orders_for_reconcile

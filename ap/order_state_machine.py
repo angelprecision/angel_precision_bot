@@ -1000,9 +1000,6 @@ class APOrderStateMachine:
         submitted_ts=None,
         filled_ts=None,
         position_id=None,
-        contract=None,
-        meta_patch: Optional[dict] = None,
-        expected_contract=None,
         allow_submit_owner_terminalization: bool = False,
     ) -> bool:
         current = self._get_order(local_order_id)
@@ -1043,18 +1040,10 @@ class APOrderStateMachine:
                 )
                 return False
 
-        if meta_patch is not None and not isinstance(meta_patch, dict):
-            log.error(
-                "[%s] transition: meta_patch must be a dict for order=%s",
-                self.client_id,
-                local_order_id,
-            )
-            return False
-
         if old_status == new_status:
             if new_status in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
                 same_state_fill_update = True
-            elif broker_order_id or submitted_ts or contract is not None or meta_patch is not None:
+            elif broker_order_id or submitted_ts:
                 # A same-state broker adoption is not a no-op.  A concurrent
                 # worker may have advanced the lifecycle status without
                 # persisting the broker identity.  Execute the fenced UPDATE so
@@ -1111,30 +1100,12 @@ class APOrderStateMachine:
             updates.append("submitted_ts=%s"); params.append(submitted_ts)
         if position_id:
             updates.append("position_id=%s"); params.append(position_id)
-        if contract is not None:
-            updates.append("contract=%s"); params.append(str(contract))
         if new_status in (OrderStatus.FILLED, OrderStatus.EXIT_FILLED):
             updates.append("filled_ts=%s"); params.append(filled_ts or now_utc_iso())
-        meta_fragments = []
         if kind.upper() == "ENTRY" and OrderStatus.is_terminal(new_status):
-            meta_fragments.append("'{\"selector_recovery_cursor_v1\":null}'::jsonb")
-        if meta_patch is not None:
-            try:
-                meta_patch_json = json.dumps(meta_patch, default=str)
-            except Exception as exc:
-                log.error(
-                    "[%s] transition: meta_patch serialization failed for order=%s: %s",
-                    self.client_id,
-                    local_order_id,
-                    exc,
-                )
-                return False
-            meta_fragments.append("%s::jsonb")
-            params.append(meta_patch_json)
-        if meta_fragments:
             updates.append(
                 "meta=COALESCE(meta, '{}'::jsonb) "
-                + " ".join(f"|| {fragment}" for fragment in meta_fragments)
+                "|| '{\"selector_recovery_cursor_v1\":null}'::jsonb"
             )
         # COMPARE-AND-SWAP: guard the UPDATE on the status we read above.
         # Without this, two concurrent callers (fill_monitor / order_monitor /
@@ -1156,12 +1127,6 @@ class APOrderStateMachine:
             # are the only idempotent acceptance states.
             sql += " AND (broker_order_id IS NULL OR broker_order_id='' OR broker_order_id=%s)"
             params.append(str(broker_order_id))
-        if expected_contract is not None:
-            # A recovery adoption may replace only the deferred placeholder it
-            # proved.  This prevents a stale recovery snapshot from overwriting
-            # a newer materializer contract while the status remains pending.
-            sql += " AND contract=%s"
-            params.append(str(expected_contract))
         if (
             kind.upper() == "ENTRY"
             and old_status in {OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER}
@@ -1201,13 +1166,12 @@ class APOrderStateMachine:
                 latest_row = dict(latest)
                 latest_status = str(latest_row.get("status") or "")
                 if latest_status == new_status:
-                    identity_conflict = None
                     if broker_order_id:
                         latest_broker_id = str(
                             latest_row.get("broker_order_id") or ""
                         ).strip()
                         if latest_broker_id != str(broker_order_id).strip():
-                            identity_conflict = (
+                            reason = (
                                 "transition_broker_identity_unproven:"
                                 f"expected={broker_order_id}:actual={latest_broker_id or 'missing'}"
                             )
@@ -1217,35 +1181,21 @@ class APOrderStateMachine:
                                 self.client_id, local_order_id, new_status,
                                 broker_order_id, latest_broker_id or "missing",
                             )
-                    if (
-                        identity_conflict is None
-                        and contract is not None
-                        and str(latest_row.get("contract") or "").strip()
-                        != str(contract).strip()
-                    ):
-                        identity_conflict = (
-                            "transition_contract_unproven:"
-                            f"expected={contract}:actual={latest_row.get('contract') or 'missing'}"
-                        )
-                        log.critical(
-                            "[%s] OSM CONTRACT CAS MISS | order=%s status=%s "
-                            "expected_contract=%s actual_contract=%s",
-                            self.client_id,
-                            local_order_id,
-                            new_status,
-                            contract,
-                            latest_row.get("contract") or "missing",
-                        )
-                    if identity_conflict is None:
+                        else:
+                            log.info(
+                                "[%s] transition CAS no-op -- %s already advanced "
+                                "to %s with exact broker identity %s",
+                                self.client_id, local_order_id, new_status,
+                                broker_order_id,
+                            )
+                            return True
+                    else:
                         log.info(
-                            "[%s] transition CAS no-op -- %s already advanced to %s "
-                            "with durable identity",
-                            self.client_id,
-                            local_order_id,
-                            new_status,
+                            "[%s] transition CAS no-op -- %s already advanced to %s by "
+                            "a concurrent worker; treating as success",
+                            self.client_id, local_order_id, new_status,
                         )
                         return True
-                    reason = identity_conflict
                 else:
                     reason = (
                         f"transition_cas_conflict:{old_status}->{new_status}"

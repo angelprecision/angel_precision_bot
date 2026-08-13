@@ -108,15 +108,19 @@ class TestBugB_TriggerRetryOwnership:
 
     def test_03_poll_only_removes_done_watchers_upfront(self):
         """
-        Structural proof: completion dispatch happens before any watcher
-        removal. Triggered watchers stay until callback success/exhaustion,
-        and terminal watchers stay until cleanup is verified.
+        Structural proof: the _pending removal filter uses action=='done'
+        (EXPIRED/INVALIDATED only). Triggered watchers stay until callback
+        resolves.
         """
         src = open("ap_entry_watcher.py").read()
-        assert "for action, w in completed:" in src
-        assert "pass  # removal now handled per-watcher after callback verification" in src
-        poll_block = src[src.find("completed = []"):src.find("for action, w in completed:")]
-        assert "self._pending = [_p for _p in self._pending" not in poll_block
+        # This exact line must exist — the surgical fix for Bug B
+        assert (
+            'done_ids = {id(w) for action, w in completed if action == "done"}'
+            in src
+        ), (
+            "Bug B fix missing: done_ids filter must only include action=='done', "
+            "not all completed watchers"
+        )
 
     def test_04_success_path_removes_watcher_explicitly(self):
         """Success path must explicitly remove watcher from _pending
@@ -245,13 +249,11 @@ class TestBugD_DailyValidatorArmedThroughTrigger:
         """Structural: the daily-valid branch calls _is_already_through_trigger
         before setting w.overnight=False."""
         src = open("ap_entry_watcher.py").read()
-        # The daily-valid branch must use the canonical late-attachment
-        # classifier before handing control to the ordinary poll loop.
-        assert "classify_late_attachment as _pt_classify_late_open" in src
-        assert "stop_already_broken_terminal" in src
-        assert "target_already_complete_terminal" in src
-        assert "late_attachment_move_missed_terminal" in src
-        assert "overnight_daily_already_through_trigger" not in src
+        assert "overnight_daily_already_through_trigger" in src, (
+            "Bug D: reason code missing"
+        )
+        # The daily-valid branch must call the helper
+        assert "_is_already_through_trigger" in src
 
     def test_09_valid_untouched_daily_arms_normally(self):
         """When the helper returns False (price still on the correct side of
@@ -610,13 +612,7 @@ class TestBugA_LiveFailsClosed:
         watched.state = ew.WatchState.INVALIDATED
         watched._pending_audit = {"reason_code": ""}
 
-        result = core._on_signal_invalidate(watched)
+        core._on_signal_invalidate(watched)
 
-        # Current LIVE fail-closed behavior quarantines an unclassified
-        # DEFERRED invalidation. It must preserve watcher ownership and avoid
-        # cleanup/cancel mutation until a truthful reason is available.
-        assert result.outcome == "FAILED"
-        assert result.reason_code == "unknown_live_reason:blank_live_invalidation_reason"
-        core._cleanup_pending_entry_order.assert_not_called()
-        core.store.update_status.assert_not_called()
-        assert watched.state == ew.WatchState.INVALIDATED
+        core._cleanup_pending_entry_order.assert_called_once()
+        assert watched.state != ew.WatchState.PENDING

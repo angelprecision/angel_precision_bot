@@ -743,66 +743,6 @@ class APStartupRecovery:
             db_status  = (order.get("status") or "").upper()
             contract   = order.get("contract") or "?"
 
-            # A PENDING_TRIGGER row carrying broker identity or submission
-            # chronology is no longer an ordinary watcher plan. Route it
-            # through the canonical owner-adoption/reconciliation engine so
-            # startup cannot leave a real broker order outside the monitor.
-            _meta = order.get("meta") or {}
-            if isinstance(_meta, str):
-                try:
-                    _meta = json.loads(_meta)
-                except Exception:
-                    _meta = {}
-            _has_broker_evidence = bool(
-                broker_oid
-                or order.get("submitted_ts")
-                or (
-                    isinstance(_meta, dict)
-                    and str(_meta.get("submit_intent_at") or "").strip()
-                )
-            )
-            if db_status == "PENDING_TRIGGER" and _has_broker_evidence:
-                try:
-                    from ap.pending_trigger_restart_recovery import (
-                        PendingTriggerRestartRecovery,
-                        _RowOutcome,
-                    )
-
-                    _ptr = PendingTriggerRestartRecovery(
-                        client_id=self.client_id,
-                        execution_mode=self._execution_mode() or "",
-                        osm=self.osm,
-                        entry_watcher=self.entry_watcher,
-                        broker=self.broker,
-                        execution_core=self.execution_core,
-                        caller_source="ap_recovery._verify_pending_entries",
-                    )
-                    _outcome = _ptr.recover_one_row(dict(order))
-                    if _outcome == _RowOutcome.BROKER_OWNED:
-                        result["entries_corrected"] += 1
-                        log.warning(
-                            "[%s] RECOVERY: adopted broker-owned PENDING_TRIGGER "
-                            "entry %s into SUBMITTED/ORDER_MONITOR",
-                            self.client_id,
-                            local_id,
-                        )
-                    elif _outcome == _RowOutcome.UNRESOLVED:
-                        result.setdefault("errors", []).append(
-                            f"pending_trigger_broker_evidence_unresolved:{local_id}"
-                        )
-                except Exception as exc:
-                    log.error(
-                        "[%s] RECOVERY: PENDING_TRIGGER broker-evidence routing "
-                        "failed for %s: %s",
-                        self.client_id,
-                        local_id,
-                        exc,
-                    )
-                    result.setdefault("errors", []).append(
-                        f"pending_trigger_broker_evidence:{local_id}:{type(exc).__name__}"
-                    )
-                continue
-
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
                 log.warning(
                     "[%s] RECOVERY: entry %s has no broker_order_id (db_status=%s) — "
@@ -3001,7 +2941,6 @@ class APStartupRecovery:
                                     osm=self.osm,
                                     entry_watcher=self.entry_watcher,
                                     broker=self.broker,
-                                    execution_core=self.execution_core,
                                     caller_source=(
                                         "ap_recovery.due_retry.rearm_watcher_required"
                                     ),
@@ -3718,7 +3657,6 @@ class APStartupRecovery:
                         osm=self.osm,
                         entry_watcher=self.entry_watcher,
                         broker=self.broker,
-                        execution_core=self.execution_core,
                         caller_source="ap_recovery._reseed_watchers",
                     )
                     _outcome = _ptr.recover_one_row(
