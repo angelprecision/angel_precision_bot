@@ -1170,17 +1170,16 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 "reason": reason,
                 "raw": response_evidence,
             }
-        response_order_id = next(
-            (
-                raw.get(key)
-                for key in ("id", "order_id", "broker_order_id")
-                if raw.get(key) is not None
-            ),
-            None,
-        )
-        if (
-            not _has_proven_broker_order_id(response_order_id)
-            or str(response_order_id).strip() != str(broker_order_id).strip()
+        response_order_ids = [
+            raw.get(key)
+            for key in ("id", "order_id", "broker_order_id")
+            if raw.get(key) is not None
+        ]
+        response_order_id = response_order_ids[0] if response_order_ids else None
+        if not response_order_ids or any(
+            not _has_proven_broker_order_id(response_id)
+            or str(response_id).strip() != str(broker_order_id).strip()
+            for response_id in response_order_ids
         ):
             return _broker_identity_error_result(
                 order,
@@ -1533,9 +1532,15 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
                     if isinstance(cancel_result, dict)
                     else None
                 )
+                confirmed_cancel_status = (
+                    str(cancel_result.get("status") or "").strip().upper()
+                    if isinstance(cancel_result, dict)
+                    else ""
+                )
                 if (
                     not isinstance(cancel_result, dict)
                     or cancel_result.get("ok") is not True
+                    or confirmed_cancel_status not in {"CANCELED", "CANCELLED"}
                     or not _has_proven_broker_order_id(returned_broker_id)
                     or str(returned_broker_id).strip() != str(resolved_broker_id).strip()
                 ):

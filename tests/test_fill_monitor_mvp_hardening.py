@@ -360,6 +360,29 @@ def test_broker_response_identity_mismatch_is_not_fill_truth(monkeypatch, respon
     assert result["filled_qty"] == 0
 
 
+def test_conflicting_broker_response_identity_aliases_are_not_fill_truth(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    result = fm.check_order_with_broker(
+        SimpleNamespace(
+            get_order=lambda _broker_order_id: {
+                "id": "brk-1",
+                "order_id": "brk-2",
+                "status": "FILLED",
+                "exec_quantity": 1,
+                "avg_fill_price": 1.05,
+            }
+        ),
+        _base_order(direction="CALL", contract="AAPL260626C00195000"),
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_ORDER_ID_MISMATCH"
+    assert result["filled_qty"] == 0
+
+
 def test_broker_fill_anomaly_state_is_not_environment_configurable(monkeypatch):
     from ap import fill_monitor as fm
 

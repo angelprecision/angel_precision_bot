@@ -1205,6 +1205,42 @@ def test_pair_cancel_false_broker_response_does_not_transition(monkeypatch):
     assert transition_calls == []
 
 
+def test_pair_cancel_unconfirmed_status_does_not_transition(monkeypatch):
+    from ap import fill_monitor as fm
+    from ap import signal_pair_manager
+
+    class _PairManager:
+        def on_fill(self, **_kwargs):
+            return "opposite-local-1"
+
+    transition_calls = []
+
+    class _OSM:
+        def get_order(self, _local_id):
+            return {"broker_order_id": "opposite-broker-1"}
+
+        def transition(self, *args, **kwargs):
+            transition_calls.append((args, kwargs))
+            return True
+
+    class _Broker:
+        def cancel_order(self, _broker_order_id):
+            return {
+                "ok": True,
+                "status": "FILLED",
+                "broker_order_id": "opposite-broker-1",
+            }
+
+    monkeypatch.setattr(signal_pair_manager, "get_pair_manager", lambda: _PairManager())
+    fm._cancel_pair_opposite(
+        _order(direction="CALL"),
+        _Broker(),
+        _OSM(),
+    )
+
+    assert transition_calls == []
+
+
 @pytest.mark.parametrize(
     ("row_mode", "runtime_mode"),
     [
