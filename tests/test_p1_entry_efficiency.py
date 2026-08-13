@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 import inspect
 import os
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -16,6 +20,10 @@ os.environ.setdefault("ENCRYPTION_KEY", "ap-entry-efficiency-pr-436-2026")
 
 import ap_execution_core as execution_core_module
 from ap_entry_efficiency import (
+    ENTRY_EFFICIENCY_CONFIG_CONFLICT,
+    ENTRY_EFFICIENCY_CONFIG_INVALID,
+    ENTRY_EFFICIENCY_CONFIG_UNSET,
+    ENTRY_EFFICIENCY_CONFIG_VALID,
     ENTRY_EFFICIENCY_OBSERVE_ONLY,
     ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
     READY_NOW,
@@ -23,7 +31,9 @@ from ap_entry_efficiency import (
     TERMINAL_INVALID,
     WAIT_CONFIRMATION,
     evaluate_entry_efficiency,
+    parse_entry_efficiency_generation,
     resolve_entry_efficiency_mode,
+    resolve_entry_efficiency_mode_with_reason,
 )
 from ap_entry_watcher import (
     APEntryWatcher,
@@ -36,6 +46,7 @@ from ap_execution_core import (
     APExecutionCore,
     _parse_datetime_for_efficiency,
     _resolve_entry_efficiency_execution_mode,
+    _resolve_submit_execution_mode,
 )
 
 
@@ -77,6 +88,153 @@ def test_targeted_paper_rollout_requires_explicit_promotion_and_fails_closed(mon
     assert result.decision == WAIT_CONFIRMATION
     assert result.reason_code == "OBSERVE_ONLY"
     assert result.should_hold is False
+
+
+def test_rollout_aliases_are_consensus_checked_and_report_fail_closed_reason(monkeypatch):
+    monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_UNSET,
+    )
+
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+        ENTRY_EFFICIENCY_CONFIG_VALID,
+    )
+
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", "paper-authoritative")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+        ENTRY_EFFICIENCY_CONFIG_VALID,
+    )
+
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", "observe_only")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_CONFLICT,
+    )
+
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", "not-a-rollout-mode")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_INVALID,
+    )
+
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", " ")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_INVALID,
+    )
+
+    monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
+    monkeypatch.setenv("ENTRY_EFFICIENCY_MODE", "observe_only")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_VALID,
+    )
+
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    result = _decision(mode=None)
+    assert result.authoritative is False
+    assert result.evidence["rollout_config_reason"] == ENTRY_EFFICIENCY_CONFIG_CONFLICT
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "observe_only")
+    assert resolve_entry_efficiency_mode_with_reason() == (
+        ENTRY_EFFICIENCY_OBSERVE_ONLY,
+        ENTRY_EFFICIENCY_CONFIG_VALID,
+    )
+
+
+def test_entry_efficiency_generation_parser_only_infers_the_initial_absence():
+    assert parse_entry_efficiency_generation(state="") == 0
+    assert parse_entry_efficiency_generation(state=WAIT_CONFIRMATION) is None
+    assert parse_entry_efficiency_generation(0, state="") == 0
+    assert parse_entry_efficiency_generation("0", state=WAIT_CONFIRMATION) == 0
+    assert parse_entry_efficiency_generation(7, state=REARM_FOR_REBREACH) == 7
+
+    for raw in (None, "", " ", " 1", "1 ", "01", "-1", "junk", 1.0, True):
+        assert parse_entry_efficiency_generation(raw, state=WAIT_CONFIRMATION) is None
+
+
+@pytest.mark.parametrize(
+    "plan, signal, runtime_mode, paper_flag",
+    [
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "paper"},
+            "paper",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode="live", mode=None),
+            {"execution_mode": "live"},
+            "live",
+            False,
+        ),
+    ],
+)
+def test_submit_execution_mode_requires_one_consensus_identity(
+    plan, signal, runtime_mode, paper_flag
+):
+    assert _resolve_submit_execution_mode(
+        plan, signal, runtime_mode, paper_flag
+    ) == signal["execution_mode"]
+
+
+@pytest.mark.parametrize(
+    "plan, signal, runtime_mode, paper_flag",
+    [
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "live"},
+            "live",
+            False,
+        ),
+        (
+            SimpleNamespace(execution_mode="paper", mode="live"),
+            {"execution_mode": "paper"},
+            "paper",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "paper", "mode": "live"},
+            "paper",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "paper"},
+            "live",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode="paper", mode=None),
+            {"execution_mode": "paper"},
+            "paper",
+            "true",
+        ),
+        (
+            SimpleNamespace(execution_mode="unknown", mode=None),
+            {"execution_mode": "paper"},
+            "paper",
+            True,
+        ),
+        (
+            SimpleNamespace(execution_mode=" ", mode=None),
+            {"execution_mode": "paper"},
+            "paper",
+            True,
+        ),
+    ],
+)
+def test_submit_execution_mode_conflict_or_malformed_identity_fails_closed(
+    plan, signal, runtime_mode, paper_flag
+):
+    assert _resolve_submit_execution_mode(
+        plan, signal, runtime_mode, paper_flag
+    ) is None
 
 
 def test_live_authority_is_reserved_and_cannot_be_enabled_by_environment(monkeypatch):
@@ -349,6 +507,29 @@ def test_paper_stale_efficiency_wait_is_ignored_for_unrelated_strategy_scope(mon
     assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
     assert watched.breach_count == 2
     assert watched.entry_efficiency_state == WAIT_CONFIRMATION
+
+
+@pytest.mark.parametrize("generation", ["", " ", "-1", "junk"])
+def test_watcher_invalid_generation_never_honors_persisted_efficiency_wait(
+    monkeypatch, generation
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    watched = WatchedSignal(
+        _watch_signal(
+            entry_efficiency_state=WAIT_CONFIRMATION,
+            entry_efficiency_generation=generation,
+            entry_efficiency_next_eval_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(),
+        ),
+        overnight=False,
+    )
+
+    assert watched.entry_efficiency_generation is None
+    assert watched.entry_efficiency_generation_valid is False
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
 
 
 @pytest.mark.parametrize(
@@ -708,3 +889,266 @@ def test_osm_efficiency_cas_has_exact_entry_identity_and_no_broker_evidence():
         assert required in source
     assert "canonical_signal_id" in source
     assert "broker.submit" not in source
+
+
+@pytest.fixture(scope="module")
+def postgres_entry_efficiency_db():
+    """Exercise the real OSM CAS against PostgreSQL when the service exists."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    dsn = os.getenv("DATABASE_URL", "")
+    if not dsn:
+        pytest.skip("DATABASE_URL is not configured")
+    try:
+        database = psycopg2.connect(dsn, connect_timeout=3)
+    except Exception as exc:
+        if os.getenv("CI"):
+            raise
+        pytest.skip(f"PostgreSQL service unavailable: {exc}")
+
+    database.autocommit = True
+    schema = f"pr436_cas_{uuid.uuid4().hex[:12]}"
+    with database.cursor() as cursor:
+        cursor.execute(f'CREATE SCHEMA "{schema}"')
+        cursor.execute(
+            f'''
+            CREATE TABLE "{schema}".orders (
+                local_order_id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                signal_id TEXT,
+                canonical_signal_id TEXT,
+                execution_mode TEXT,
+                status TEXT,
+                broker_order_id TEXT,
+                submitted_ts TIMESTAMPTZ,
+                meta JSONB,
+                updated_ts TIMESTAMPTZ
+            )
+            '''
+        )
+
+    import ap.order_state_machine as order_state_machine_module
+
+    @contextmanager
+    def _test_conn():
+        # Match the production OSM contract: each CAS claimant gets its own
+        # transaction/connection, allowing PostgreSQL row locking to arbitrate
+        # simultaneous claimants instead of serializing the test in Python.
+        connection = psycopg2.connect(dsn, connect_timeout=3)
+        try:
+            connection.autocommit = False
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET search_path TO "{schema}"')
+                yield cursor
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(order_state_machine_module, "conn", _test_conn)
+
+    def replace_row(
+        *,
+        meta=None,
+        local_order_id="order-cas",
+        client_id="client-a",
+        signal_id="signal-a",
+        canonical_signal_id="canonical-a",
+        execution_mode="paper",
+        status="PENDING_TRIGGER",
+        broker_order_id="",
+        submitted_ts=None,
+    ):
+        row_meta = {} if meta is None else dict(meta)
+        with database.cursor() as cursor:
+            cursor.execute(f'DELETE FROM "{schema}".orders')
+            cursor.execute(
+                f'''
+                INSERT INTO "{schema}".orders (
+                    local_order_id, client_id, kind, signal_id,
+                    canonical_signal_id, execution_mode, status,
+                    broker_order_id, submitted_ts, meta
+                ) VALUES (%s, %s, 'ENTRY', %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ''',
+                (
+                    local_order_id,
+                    client_id,
+                    signal_id,
+                    canonical_signal_id,
+                    execution_mode,
+                    status,
+                    broker_order_id,
+                    submitted_ts,
+                    json.dumps(row_meta),
+                ),
+            )
+
+    def read_meta():
+        with database.cursor() as cursor:
+            cursor.execute(
+                f'SELECT meta FROM "{schema}".orders WHERE local_order_id=%s',
+                ("order-cas",),
+            )
+            row = cursor.fetchone()
+        return dict(row[0] or {}) if row else {}
+
+    try:
+        yield SimpleNamespace(
+            replace_row=replace_row,
+            read_meta=read_meta,
+            osm=APOrderStateMachine("client-a"),
+        )
+    finally:
+        patcher.undo()
+        with database.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        database.close()
+
+
+def _postgres_efficiency_cas(osm, **overrides):
+    values = {
+        "local_order_id": "order-cas",
+        "signal_id": "signal-a",
+        "canonical_signal_id": "canonical-a",
+        "client_id": "client-a",
+        "execution_mode": "paper",
+        "expected_state": "",
+        "expected_generation": 0,
+        "next_state": WAIT_CONFIRMATION,
+        "next_generation": 1,
+        "meta_patch": {"cas_test": True},
+    }
+    values.update(overrides)
+    return osm.cas_entry_efficiency_state(**values)
+
+
+def test_postgres_cas_accepts_valid_generations_and_rejects_stale_replay(
+    postgres_entry_efficiency_db,
+):
+    db = postgres_entry_efficiency_db
+    db.replace_row(meta={})
+
+    assert _postgres_efficiency_cas(db.osm) is True
+    assert db.read_meta()["entry_efficiency_generation"] == 1
+    assert db.read_meta()["entry_efficiency_state"] == WAIT_CONFIRMATION
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+    ) is True
+    assert db.read_meta()["entry_efficiency_generation"] == 2
+
+
+def test_postgres_cas_allows_only_one_simultaneous_claimant(
+    postgres_entry_efficiency_db,
+):
+    db = postgres_entry_efficiency_db
+    db.replace_row(meta={})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(lambda _claim: _postgres_efficiency_cas(db.osm), range(2))
+        )
+
+    assert sorted(results) == [False, True]
+    assert db.read_meta()["entry_efficiency_generation"] == 1
+    assert db.read_meta()["entry_efficiency_state"] == WAIT_CONFIRMATION
+
+    # A stale claimant and a replay of the original claimant both miss the
+    # exact durable generation; neither can overwrite the newer state.
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+    ) is False
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state="",
+        expected_generation=0,
+        next_state=WAIT_CONFIRMATION,
+        next_generation=1,
+    ) is False
+    assert db.read_meta()["entry_efficiency_generation"] == 2
+
+
+@pytest.mark.parametrize(
+    "meta, expected_generation",
+    [
+        ({"entry_efficiency_state": WAIT_CONFIRMATION}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": ""}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": " "}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": " 1"}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": "1 "}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": "01"}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": "-1"}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": -1}, 1),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": "junk"}, 1),
+        ({"entry_efficiency_state": "", "entry_efficiency_generation": "junk"}, 0),
+        ({"entry_efficiency_state": WAIT_CONFIRMATION, "entry_efficiency_generation": 2}, 1),
+    ],
+)
+def test_postgres_cas_rejects_malformed_missing_and_stale_generation(
+    postgres_entry_efficiency_db, meta, expected_generation
+):
+    db = postgres_entry_efficiency_db
+    db.replace_row(meta=meta)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=str(meta.get("entry_efficiency_state") or ""),
+        expected_generation=expected_generation,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=expected_generation + 1,
+    ) is False
+    assert db.read_meta() == meta
+
+
+@pytest.mark.parametrize(
+    "row_updates, call_updates",
+    [
+        ({"client_id": "client-b"}, {}),
+        ({}, {"client_id": "client-b"}),
+        ({"signal_id": "signal-b"}, {}),
+        ({}, {"signal_id": "signal-b"}),
+        ({"canonical_signal_id": "canonical-b"}, {}),
+        ({}, {"canonical_signal_id": "canonical-b"}),
+        ({"execution_mode": "live"}, {}),
+        ({}, {"execution_mode": "live"}),
+        ({"broker_order_id": "broker-1"}, {}),
+        ({"submitted_ts": datetime.now(timezone.utc)}, {}),
+        (
+            {"meta": {"submit_intent_at": "2026-08-12T13:00:00+00:00"}},
+            {},
+        ),
+        ({"status": "SUBMITTED"}, {}),
+    ],
+)
+def test_postgres_cas_refuses_identity_broker_and_status_conflicts(
+    postgres_entry_efficiency_db, row_updates, call_updates
+):
+    db = postgres_entry_efficiency_db
+    row_meta = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+    }
+    row_kwargs = dict(row_updates)
+    row_meta.update(row_kwargs.pop("meta", {}))
+    db.replace_row(meta=row_meta, **row_kwargs)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+        **call_updates,
+    ) is False
+    assert db.read_meta() == row_meta

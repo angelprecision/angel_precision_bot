@@ -24,6 +24,11 @@ ENTRY_EFFICIENCY_MODES = frozenset({
     ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
 })
 
+ENTRY_EFFICIENCY_CONFIG_UNSET = "CONFIG_UNSET"
+ENTRY_EFFICIENCY_CONFIG_VALID = "CONFIG_VALID"
+ENTRY_EFFICIENCY_CONFIG_INVALID = "CONFIG_INVALID"
+ENTRY_EFFICIENCY_CONFIG_CONFLICT = "CONFIG_CONFLICT"
+
 READY_NOW = "READY_NOW"
 WAIT_CONFIRMATION = "WAIT_CONFIRMATION"
 REARM_FOR_REBREACH = "REARM_FOR_REBREACH"
@@ -45,6 +50,9 @@ _UNTRUSTED_INTELLIGENCE_KEYS = frozenset({
     "genuine_rebreach",
     "reset_confirmed",
 })
+
+_ENTRY_EFFICIENCY_GENERATION_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_ENTRY_EFFICIENCY_GENERATION_MISSING = object()
 
 
 def _safe_float(value: Any) -> float | None:
@@ -76,26 +84,83 @@ def _parse_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def resolve_entry_efficiency_mode(raw: Any = None) -> str:
-    """Resolve the rollout mode fail-closed.
+def _normalize_entry_efficiency_mode(raw: Any) -> str | None:
+    normalized = str(raw or "").strip().lower().replace("-", "_")
+    return normalized if normalized in ENTRY_EFFICIENCY_MODES else None
+
+
+def resolve_entry_efficiency_mode_with_reason(raw: Any = None) -> tuple[str, str]:
+    """Resolve rollout mode and configuration provenance fail-closed.
 
     The targeted PAPER 2-3-2 policy is opt-in through an explicit
     ``paper_authoritative`` mode.  Unset, ``observe_only``, malformed, or
     unsupported configuration fails closed to observation.  LIVE has no
-    authoritative mode in this PR.
+    authoritative mode in this PR.  When environment configuration is used,
+    both supported aliases are parsed independently; a malformed or
+    contradictory alias never gets hidden by first-value-wins resolution.
     """
-    if raw is None:
-        candidate = os.getenv("AP_ENTRY_EFFICIENCY_MODE") or os.getenv(
-            "ENTRY_EFFICIENCY_MODE", ""
-        )
+    if raw is not None:
+        normalized = _normalize_entry_efficiency_mode(raw)
+        if normalized is None:
+            return ENTRY_EFFICIENCY_OBSERVE_ONLY, ENTRY_EFFICIENCY_CONFIG_INVALID
+        return normalized, ENTRY_EFFICIENCY_CONFIG_VALID
+
+    configured: list[str] = []
+    for variable_name in ("AP_ENTRY_EFFICIENCY_MODE", "ENTRY_EFFICIENCY_MODE"):
+        if variable_name not in os.environ:
+            continue
+        candidate = os.environ.get(variable_name)
         if not str(candidate or "").strip():
-            return ENTRY_EFFICIENCY_OBSERVE_ONLY
+            return ENTRY_EFFICIENCY_OBSERVE_ONLY, ENTRY_EFFICIENCY_CONFIG_INVALID
+        normalized = _normalize_entry_efficiency_mode(candidate)
+        if normalized is None:
+            return ENTRY_EFFICIENCY_OBSERVE_ONLY, ENTRY_EFFICIENCY_CONFIG_INVALID
+        configured.append(normalized)
+
+    if not configured:
+        return ENTRY_EFFICIENCY_OBSERVE_ONLY, ENTRY_EFFICIENCY_CONFIG_UNSET
+    if len(set(configured)) != 1:
+        return ENTRY_EFFICIENCY_OBSERVE_ONLY, ENTRY_EFFICIENCY_CONFIG_CONFLICT
+    return configured[0], ENTRY_EFFICIENCY_CONFIG_VALID
+
+
+def resolve_entry_efficiency_mode(raw: Any = None) -> str:
+    """Resolve the rollout mode only, preserving fail-closed semantics."""
+    return resolve_entry_efficiency_mode_with_reason(raw)[0]
+
+
+def parse_entry_efficiency_generation(
+    raw: Any = _ENTRY_EFFICIENCY_GENERATION_MISSING,
+    *,
+    state: Any = "",
+) -> int | None:
+    """Parse one durable lifecycle generation without reconstructing truth.
+
+    The only implicit value permitted is the initial generation ``0`` when no
+    lifecycle state exists and the generation field is absent.  Once a state
+    exists, a generation must be explicitly present and canonical.  Boolean,
+    float, signed, zero-padded, blank, whitespace-padded, and malformed values
+    are rejected rather than coerced into an initial generation.
+    """
+    state_present = bool(str(state or "").strip())
+    if raw is _ENTRY_EFFICIENCY_GENERATION_MISSING:
+        return 0 if not state_present else None
+    if raw is None or isinstance(raw, bool):
+        return None
+
+    if isinstance(raw, int):
+        generation = raw
+    elif isinstance(raw, str):
+        if not _ENTRY_EFFICIENCY_GENERATION_RE.fullmatch(raw):
+            return None
+        try:
+            generation = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
     else:
-        candidate = raw
-    normalized = str(candidate or "").strip().lower().replace("-", "_")
-    if normalized not in ENTRY_EFFICIENCY_MODES:
-        return ENTRY_EFFICIENCY_OBSERVE_ONLY
-    return normalized
+        return None
+
+    return generation if generation >= 0 else None
 
 
 def normalize_strategy_pattern(pattern: Any, timeframe: Any) -> tuple[str, bool]:
@@ -204,7 +269,7 @@ def evaluate_entry_efficiency(
     """
     now_utc = _parse_datetime(now) or datetime.now(timezone.utc)
     metadata_map = dict(metadata or {}) if isinstance(metadata, Mapping) else {}
-    configured_mode = resolve_entry_efficiency_mode(mode)
+    configured_mode, config_reason = resolve_entry_efficiency_mode_with_reason(mode)
     canonical_pattern, applies = normalize_strategy_pattern(pattern, timeframe)
     # Authority is deliberately limited to the explicitly targeted policy;
     # unrelated setups remain telemetry-only even when PAPER rollout is on.
@@ -254,6 +319,7 @@ def evaluate_entry_efficiency(
         "untrusted_intelligence_keys": untrusted_intelligence_keys,
         "intelligence_metadata_authority": "IGNORED",
         "timing_authority_basis": "DIRECT_MARKET_EVIDENCE",
+        "rollout_config_reason": config_reason,
     }
 
     def result(decision: str, reason: str, detail: str) -> EntryEfficiencyResult:

@@ -31,6 +31,7 @@ for _name in dir(_base):
 from ap_entry_efficiency import (
     ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE as _ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
     normalize_strategy_pattern as _normalize_strategy_pattern,
+    parse_entry_efficiency_generation as _parse_entry_efficiency_generation,
     resolve_entry_efficiency_mode as _resolve_entry_efficiency_mode,
 )
 
@@ -166,12 +167,18 @@ class WatchedSignal(_BaseWatchedSignal):
         self.entry_efficiency_state = str(
             metadata.get("entry_efficiency_state") or ""
         ).strip().upper()
-        try:
-            self.entry_efficiency_generation = max(
-                0, int(metadata.get("entry_efficiency_generation") or 0)
+        if "entry_efficiency_generation" in metadata:
+            self.entry_efficiency_generation = _parse_entry_efficiency_generation(
+                metadata["entry_efficiency_generation"],
+                state=self.entry_efficiency_state,
             )
-        except (TypeError, ValueError, OverflowError):
-            self.entry_efficiency_generation = 0
+        else:
+            self.entry_efficiency_generation = _parse_entry_efficiency_generation(
+                state=self.entry_efficiency_state,
+            )
+        self.entry_efficiency_generation_valid = (
+            self.entry_efficiency_generation is not None
+        )
         self.entry_efficiency_rearm_pending = bool(
             _entry_efficiency_truthy(metadata.get("entry_efficiency_rearm_pending"))
         )
@@ -189,7 +196,14 @@ class WatchedSignal(_BaseWatchedSignal):
 
     def _stage_entry_efficiency_rearm(self, *, bid: float, ask: float) -> None:
         expected_state = str(self.entry_efficiency_state or "WAIT_CONFIRMATION").upper()
-        expected_generation = int(getattr(self, "entry_efficiency_generation", 0) or 0)
+        expected_generation = _parse_entry_efficiency_generation(
+            getattr(self, "entry_efficiency_generation", None),
+            state=expected_state,
+        )
+        if expected_generation is None:
+            self._entry_efficiency_persist_request = None
+            self._entry_efficiency_persistence_blocked = True
+            return
         now = _datetime.now(_timezone.utc)
         next_at = now + _timedelta(seconds=5)
         self.entry_efficiency_state = "REARM_FOR_REBREACH"
@@ -229,6 +243,9 @@ class WatchedSignal(_BaseWatchedSignal):
             efficiency_mode == _ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE
             and execution_mode == "paper"
             and pattern_applies
+            and bool(
+                getattr(self, "entry_efficiency_generation_valid", False)
+            )
         )
         if not efficiency_behavior_enabled:
             return super().check(bid, ask, quote_age_ms=quote_age_ms)
@@ -237,7 +254,12 @@ class WatchedSignal(_BaseWatchedSignal):
         if prior_state not in _ENTRY_EFFICIENCY_WAIT_STATES:
             return super().check(bid, ask, quote_age_ms=quote_age_ms)
 
-        prior_generation = int(getattr(self, "entry_efficiency_generation", 0) or 0)
+        prior_generation = _parse_entry_efficiency_generation(
+            getattr(self, "entry_efficiency_generation", None),
+            state=prior_state,
+        )
+        if prior_generation is None:
+            return super().check(bid, ask, quote_age_ms=quote_age_ms)
         prior_rearm = bool(getattr(self, "entry_efficiency_rearm_pending", False))
         prior_next = getattr(self, "entry_efficiency_next_eval_at", None)
         prior_crossed = getattr(self, "trigger_crossed_at", None)
@@ -346,6 +368,22 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             or ""
         ).strip()
         patch = dict(request.get("patch") or {})
+        expected_state = str(request.get("expected_state") or "").upper()
+        next_state = str(request.get("next_state") or "").upper()
+        expected_generation = _parse_entry_efficiency_generation(
+            request.get("expected_generation"),
+            state=expected_state,
+        )
+        next_generation = _parse_entry_efficiency_generation(
+            request.get("next_generation"),
+            state=next_state,
+        )
+        if (
+            expected_generation is None
+            or next_generation is None
+            or next_generation != expected_generation + 1
+        ):
+            return False
         try:
             ok = bool(cas(
                 local_order_id,
@@ -353,24 +391,23 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 canonical_signal_id=canonical_signal_id,
                 client_id=client_id,
                 execution_mode=execution_mode,
-                expected_state=request.get("expected_state", ""),
-                expected_generation=int(request.get("expected_generation") or 0),
-                next_state=str(request.get("next_state") or ""),
-                next_generation=int(request.get("next_generation") or 0),
+                expected_state=expected_state,
+                expected_generation=expected_generation,
+                next_state=next_state,
+                next_generation=next_generation,
                 meta_patch=patch,
             ))
         except Exception:
             ok = False
         if not ok:
             return False
-        next_state = str(request.get("next_state") or "").upper()
-        next_generation = int(request.get("next_generation") or 0)
         metadata.update(patch)
         metadata["entry_efficiency_state"] = next_state
         metadata["entry_efficiency_generation"] = next_generation
         signal["metadata"] = metadata
         watched.entry_efficiency_state = next_state
         watched.entry_efficiency_generation = next_generation
+        watched.entry_efficiency_generation_valid = True
         watched.entry_efficiency_rearm_pending = bool(
             _entry_efficiency_truthy(metadata.get("entry_efficiency_rearm_pending"))
         )

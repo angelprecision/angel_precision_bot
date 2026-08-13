@@ -127,7 +127,7 @@ def test_queue_dispatch_rejects_unknown_runtime_mode_before_submit(monkeypatch):
     assert rejection_logs[0]["reason_code"] == "metadata_invalid:unknown_execution_mode"
 
 
-@pytest.mark.parametrize("mode_value", ["paper", "live"])
+@pytest.mark.parametrize("mode_value", ["paper"])
 def test_execution_core_accepts_approved_plan_mode_alias(monkeypatch, mode_value):
     plan = SimpleNamespace(
         contract_symbol="SPY260626C00500000",

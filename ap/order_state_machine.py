@@ -60,6 +60,7 @@ from ap.exit_safety import (
     evaluate_exit_submission_safety,
     resolve_exit_broker_truth,
 )
+from ap_entry_efficiency import parse_entry_efficiency_generation
 try:
     from psycopg2 import errors as pg_errors
 except ImportError:
@@ -2216,18 +2217,24 @@ class APOrderStateMachine:
         durable_canonical_signal_id = str(canonical_signal_id or "").strip()
         durable_client_id = str(client_id or "").strip().lower()
         durable_mode = str(execution_mode or "").strip().lower()
-        try:
-            expected_gen = int(expected_generation)
-            next_gen = int(next_generation)
-        except (TypeError, ValueError, OverflowError):
-            return False
+        expected_state_text = str(expected_state or "").strip().upper()
+        next_state_text = str(next_state or "").strip().upper()
+        expected_gen = parse_entry_efficiency_generation(
+            expected_generation,
+            state=expected_state_text,
+        )
+        next_gen = parse_entry_efficiency_generation(
+            next_generation,
+            state=next_state_text,
+        )
         if (
             not local_id
             or not durable_signal_id
             or not durable_canonical_signal_id
             or not durable_client_id
             or durable_mode not in {"paper", "live"}
-            or expected_gen < 0
+            or expected_gen is None
+            or next_gen is None
             or next_gen != expected_gen + 1
         ):
             return False
@@ -2235,7 +2242,7 @@ class APOrderStateMachine:
             patch_json = json.dumps(
                 {
                     **dict(meta_patch or {}),
-                    "entry_efficiency_state": str(next_state or ""),
+                    "entry_efficiency_state": next_state_text,
                     "entry_efficiency_generation": next_gen,
                 },
                 default=str,
@@ -2262,11 +2269,13 @@ class APOrderStateMachine:
                     "  AND LOWER(COALESCE(meta->>'split_brain_quarantine','false')) IN ('false','') "
                     "  AND LOWER(COALESCE(meta->>'reconciliation_required','false')) IN ('false','') "
                     "  AND COALESCE(meta->>'entry_efficiency_state','')=%s "
-                    "  AND CASE "
-                    "        WHEN COALESCE(meta->>'entry_efficiency_generation','') ~ '^[0-9]+$' "
-                    "        THEN (meta->>'entry_efficiency_generation')::int "
-                    "        ELSE 0 "
-                    "      END=%s",
+                    "  AND ( "
+                    "        (NOT (COALESCE(meta, '{}'::jsonb) ? 'entry_efficiency_generation') "
+                    "         AND COALESCE(meta->>'entry_efficiency_state','')='' "
+                    "         AND %s=0) "
+                    "        OR (meta->>'entry_efficiency_generation' ~ '^(0|[1-9][0-9]*)$' "
+                    "            AND (meta->>'entry_efficiency_generation')::bigint=%s) "
+                    "      )",
                     (
                         patch_json,
                         local_id,
@@ -2274,7 +2283,8 @@ class APOrderStateMachine:
                         durable_signal_id,
                         durable_canonical_signal_id,
                         durable_mode,
-                        str(expected_state or ""),
+                        expected_state_text,
+                        expected_gen,
                         expected_gen,
                     ),
                 )

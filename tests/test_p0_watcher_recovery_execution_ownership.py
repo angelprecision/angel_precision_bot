@@ -277,6 +277,11 @@ def _execution_core(monkeypatch, submit_result: dict):
 
 def _submit_ready_watched_signal() -> WatchedSignal:
     watched = _watched_signal()
+    # This helper exercises the normal PAPER submit path.  Keep the durable
+    # signal identity aligned with the approved PAPER plan so the consensus
+    # execution-mode resolver is testing a proven identity rather than the
+    # legacy first-value-wins fallback.
+    watched.signal["execution_mode"] = "paper"
     watched.signal["contract_symbol"] = "SPY260717C00600000"
     watched.signal["contract_deferred"] = False
     watched.signal["_approved_plan"] = SimpleNamespace(

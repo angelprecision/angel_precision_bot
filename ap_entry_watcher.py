@@ -36,6 +36,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from ap_canonical_signal import build_canonical_signal_id
+from ap_entry_efficiency import parse_entry_efficiency_generation
 
 # ── Lifecycle + health wiring (defensive — watcher runs standalone if missing) ──
 try:
@@ -5374,12 +5375,13 @@ class APEntryWatcher:
                 w.entry_efficiency_state = str(
                     request.get("rollback_state") or "WAIT_CONFIRMATION"
                 ).upper()
-                try:
-                    w.entry_efficiency_generation = int(
-                        request.get("rollback_generation") or 0
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    w.entry_efficiency_generation = 0
+                w.entry_efficiency_generation = parse_entry_efficiency_generation(
+                    request.get("rollback_generation"),
+                    state=w.entry_efficiency_state,
+                )
+                w.entry_efficiency_generation_valid = (
+                    w.entry_efficiency_generation is not None
+                )
                 w.entry_efficiency_rearm_pending = bool(
                     request.get("rollback_rearm_pending", False)
                 )

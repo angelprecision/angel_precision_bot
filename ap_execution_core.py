@@ -43,7 +43,7 @@ from ap_entry_efficiency import (
     TERMINAL_INVALID as ENTRY_EFFICIENCY_TERMINAL_INVALID,
     WAIT_CONFIRMATION as ENTRY_EFFICIENCY_WAIT_CONFIRMATION,
     evaluate_entry_efficiency,
-    resolve_entry_efficiency_mode,
+    parse_entry_efficiency_generation,
 )
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
@@ -72,20 +72,24 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
             signal.get("execution_mode"),
             signal.get("mode"),
         ])
+    if runtime_mode is not None:
+        explicit_values.append(runtime_mode)
+    if paper_flag is not None:
+        if not isinstance(paper_flag, bool):
+            return None
+        explicit_values.append("paper" if paper_flag else "live")
+
+    normalized_values = []
     for raw_value in explicit_values:
-        if not str(raw_value or "").strip():
+        if raw_value is None or raw_value == "":
             continue
         normalized = _normalize_execution_mode(raw_value)
         if normalized is None:
             return None
-        return normalized
-
-    runtime_normalized = _normalize_execution_mode(runtime_mode)
-    if runtime_normalized is not None:
-        return runtime_normalized
-    if isinstance(paper_flag, bool):
-        return "paper" if paper_flag else "live"
-    return None
+        normalized_values.append(normalized)
+    if not normalized_values or len(set(normalized_values)) != 1:
+        return None
+    return normalized_values[0]
 
 
 def _resolve_entry_efficiency_execution_mode(
@@ -93,17 +97,19 @@ def _resolve_entry_efficiency_execution_mode(
 ) -> str | None:
     """Resolve entry-efficiency authority from one exact execution identity.
 
-    The generic submit resolver intentionally selects the first usable value
-    for legacy submit paths. That is not safe for #436: a stale PAPER plan
-    must never promote a LIVE signal into PAPER timing authority. Require the
-    durable signal mode, every present plan mode, runtime mode, and the runtime
-    paper flag to agree. Missing or conflicting identity returns ``None``;
-    the caller must remain on the existing non-efficiency path.
+    Require the durable signal mode, every present plan mode, runtime mode,
+    runtime paper flag, and any other submit identity source to agree. Missing
+    or conflicting identity returns ``None``; the caller must remain on the
+    existing non-efficiency path.
     """
     if not isinstance(signal, dict):
         return None
     signal_mode = _normalize_execution_mode(signal.get("execution_mode"))
     if signal_mode is None:
+        return None
+    if _resolve_submit_execution_mode(
+        approved_plan, signal, runtime_mode, paper_flag
+    ) != signal_mode:
         return None
 
     plan_modes = []
@@ -4628,22 +4634,27 @@ class APExecutionCore:
         _efficiency_watched_generation = getattr(
             watched, "entry_efficiency_generation", None
         )
-        _efficiency_generation_raw = (
-            _efficiency_watched_generation
-            if _efficiency_watched_generation is not None
-            else _efficiency_meta.get("entry_efficiency_generation")
+        _efficiency_generation_valid = bool(
+            getattr(watched, "entry_efficiency_generation_valid", True)
         )
-        try:
-            _efficiency_prior_generation = max(
-                0,
-                int(
-                    _efficiency_generation_raw
-                    if _efficiency_generation_raw is not None
-                    else 0
-                ),
-            )
-        except (TypeError, ValueError, OverflowError):
-            _efficiency_prior_generation = 0
+        if _efficiency_generation_valid:
+            if _efficiency_watched_generation is not None:
+                _efficiency_prior_generation = parse_entry_efficiency_generation(
+                    _efficiency_watched_generation,
+                    state=_efficiency_prior_state,
+                )
+            elif "entry_efficiency_generation" in _efficiency_meta:
+                _efficiency_prior_generation = parse_entry_efficiency_generation(
+                    _efficiency_meta["entry_efficiency_generation"],
+                    state=_efficiency_prior_state,
+                )
+            else:
+                _efficiency_prior_generation = parse_entry_efficiency_generation(
+                    state=_efficiency_prior_state,
+                )
+            _efficiency_generation_valid = _efficiency_prior_generation is not None
+        else:
+            _efficiency_prior_generation = None
         _efficiency_first_breach = (
             getattr(watched, "trigger_crossed_at", None)
             or sig.get("trigger_crossed_at")
@@ -4651,7 +4662,11 @@ class APExecutionCore:
         _efficiency_watched_deadline = getattr(
             watched, "entry_efficiency_deadline_at", None
         )
-        _efficiency_mode = resolve_entry_efficiency_mode()
+        if not _efficiency_generation_valid:
+            # A persisted lifecycle state without a canonical generation is
+            # telemetry only.  Do not let the evaluator manufacture generation
+            # zero and do not expose a CAS/WAIT/TERMINAL path to the caller.
+            _efficiency_execution_mode = None
         _efficiency_result = evaluate_entry_efficiency(
             ticker=ticker,
             side=getattr(watched, "side", None) or sig.get("side"),
@@ -4683,7 +4698,7 @@ class APExecutionCore:
                 if _efficiency_watched_deadline is not None
                 else _efficiency_meta.get("entry_efficiency_deadline_at")
             ),
-            mode=_efficiency_mode,
+            mode=None,
         )
         _efficiency_identity_patch = {
             "entry_efficiency_local_order_id": str(queue_local_order_id or ""),
@@ -4743,7 +4758,7 @@ class APExecutionCore:
                 _cas = getattr(
                     self.order_state_machine, "cas_entry_efficiency_state", None
                 )
-                if not callable(_cas):
+                if not callable(_cas) or _efficiency_prior_generation is None:
                     return False
                 try:
                     return bool(
@@ -4790,6 +4805,7 @@ class APExecutionCore:
                     )
                 watched.entry_efficiency_state = next_state
                 watched.entry_efficiency_generation = _efficiency_prior_generation + 1
+                watched.entry_efficiency_generation_valid = True
                 watched.entry_efficiency_rearm_pending = bool(
                     _efficiency_result.rearm_pending
                     if next_state != ENTRY_EFFICIENCY_READY_NOW
