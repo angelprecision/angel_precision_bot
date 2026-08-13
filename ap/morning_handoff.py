@@ -891,6 +891,88 @@ def _resolve_runner(client_id: str):
         return _active_runners.get(client_id)
 
 
+def _runtime_authority_conflicts(
+    *,
+    client_id: str,
+    execution_mode: str,
+    runner,
+    master_control,
+    core,
+    osm,
+) -> list[str]:
+    """Return every missing or conflicting handoff runtime identity.
+
+    The handoff owns queue fan-out while startup recovery owns watcher and
+    pending-entry recovery.  Both must operate on the same client and mode;
+    otherwise a PAPER handoff can invoke LIVE recovery (or a LIVE handoff can
+    reset PAPER queue rows).  Production runners expose all of these fields,
+    so missing authority is fail-closed rather than inferred from another
+    object.
+    """
+
+    expected_client = str(client_id or "").strip().lower()
+    expected_mode = _normalize_mode(execution_mode)
+    conflicts: list[str] = []
+
+    def _check(name: str, raw, *, normalize, expected: str):
+        value = normalize(raw)
+        if not value:
+            conflicts.append(f"{name}_missing")
+        elif value != expected:
+            conflicts.append(f"{name}_mismatch")
+
+    def _normalize_client(raw) -> str:
+        return str(raw or "").strip().lower()
+
+    def _normalize_runtime_mode(raw) -> str:
+        value = _normalize_mode(raw)
+        return value if value in {"paper", "live"} else ""
+
+    _check(
+        "runner_client_id",
+        getattr(runner, "email", None),
+        normalize=_normalize_client,
+        expected=expected_client,
+    )
+    _check(
+        "runner_execution_mode",
+        getattr(runner, "mode", None),
+        normalize=_normalize_runtime_mode,
+        expected=expected_mode,
+    )
+    _check(
+        "master_control_client_id",
+        getattr(master_control, "client_id", None),
+        normalize=_normalize_client,
+        expected=expected_client,
+    )
+    _check(
+        "master_control_execution_mode",
+        getattr(master_control, "mode", None),
+        normalize=_normalize_runtime_mode,
+        expected=expected_mode,
+    )
+    _check(
+        "osm_client_id",
+        getattr(osm, "client_id", None),
+        normalize=_normalize_client,
+        expected=expected_client,
+    )
+
+    for name, raw in (
+        ("core_client_id", getattr(core, "client_id", None)),
+        ("core_client_email", getattr(core, "client_email", None)),
+    ):
+        _check(name, raw, normalize=_normalize_client, expected=expected_client)
+    for name, raw in (
+        ("core_execution_mode", getattr(core, "mode", None)),
+        ("core_execution_mode_alias", getattr(core, "execution_mode", None)),
+    ):
+        _check(name, raw, normalize=_normalize_runtime_mode, expected=expected_mode)
+
+    return conflicts
+
+
 def _expected_clients_by_mode() -> dict[str, list[str]]:
     from client_runner import _active_runners, _registry_lock
 
@@ -1061,6 +1143,45 @@ def run_morning_handoff_audit(
     runner = runner or _resolve_runner(client_id)
     core = getattr(runner, "core", None) if runner is not None else None
     entry_watcher = getattr(core, "entry_watcher", None) if core else None
+    if runner is not None:
+        _authority_osm = getattr(runner, "order_state_machine", None)
+        _authority_mc = getattr(runner, "master_control", None)
+        _authority_conflicts = _runtime_authority_conflicts(
+            client_id=client_id,
+            execution_mode=mode,
+            runner=runner,
+            master_control=_authority_mc,
+            core=core,
+            osm=_authority_osm,
+        )
+        if _authority_conflicts:
+            _authority_error = "runtime_authority_mismatch:" + ",".join(
+                _authority_conflicts
+            )
+            log.critical(
+                "CLIENT_HANDOFF_BLOCKED client_id=%s execution_mode=%s stage=%s "
+                "reason=%s — no queue fan-out, watcher recovery, or handoff "
+                "lock mutation permitted",
+                client_id,
+                mode,
+                stage,
+                _authority_error,
+            )
+            return {
+                "ok": False,
+                "error": _authority_error,
+                "client_id": client_id,
+                "execution_mode": mode,
+                "stage": stage,
+                "trading_date": trading_date,
+                "authority_conflicts": _authority_conflicts,
+                "summary": {
+                    "client_id": client_id,
+                    "execution_mode": mode,
+                    "errors": [_authority_error],
+                    "authority_conflicts": _authority_conflicts,
+                },
+            }
 
     autonomy_ctx = _autonomy_runtime_context(mode)
     log.info(

@@ -3389,6 +3389,15 @@ class APStartupRecovery:
         # STARTUP_WATCHER_RESEED_LOOKBACK_HOURS.
         _lookback_hours = int(os.getenv("STARTUP_WATCHER_RESEED_LOOKBACK_HOURS", "48"))
         cutoff_utc = (now_et.astimezone(timezone.utc) - timedelta(hours=_lookback_hours)).isoformat()
+        recovery_mode = self._execution_mode()
+        if recovery_mode not in {"PAPER", "LIVE"}:
+            log.critical(
+                "[%s] RECOVERY_BLOCKED unknown_execution_mode — watcher reseed skipped",
+                self.client_id,
+            )
+            result.setdefault("errors", []).append("recovery_unknown_execution_mode")
+            return
+        recovery_mode_sql = recovery_mode.lower()
 
         def _reset():
             # PR #143: tag rescued rows in payload.recovery_rescue so the
@@ -3443,11 +3452,19 @@ class APStartupRecovery:
                 c.execute(
                     """
                     SELECT o.local_order_id,
+                           o.client_id,
+                           o.execution_mode,
                            o.signal_id,
+                           o.canonical_signal_id,
                            o.plan_id,
+                           o.kind,
+                           o.status,
                            o.symbol,
                            o.contract,
                            o.direction,
+                           o.qty,
+                           o.limit_price,
+                           o.reserved_cost,
                            o.score,
                            o.tier,
                            o.trigger_price,
@@ -3455,6 +3472,10 @@ class APStartupRecovery:
                            o.target_underlying,
                            o.pattern,
                            o.timeframe,
+                           o.broker_order_id,
+                           o.submitted_ts,
+                           o.filled_ts,
+                           o.created_ts,
                            o.meta,
                            tq.status     AS _tq_status,
                            tq.last_error AS _tq_last_error
@@ -3468,6 +3489,7 @@ class APStartupRecovery:
                              LIMIT 1
                     ) tq ON TRUE
                     WHERE o.client_id = %s
+                      AND LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s
                       AND o.kind = 'ENTRY'
                       AND o.status = 'PENDING_TRIGGER'
                       AND o.created_ts >= %s
@@ -3489,7 +3511,7 @@ class APStartupRecovery:
                       )
                     ORDER BY o.created_ts ASC
                     """,
-                    (self.client_id, cutoff_utc),
+                    (self.client_id, recovery_mode_sql, cutoff_utc),
                 )
                 return c.fetchall()
 
@@ -3504,15 +3526,10 @@ class APStartupRecovery:
         # selector — it can only reattach watcher ownership to current-
         # session WATCHING/PENDING_TRIGGER rows.
         #
-        # Detection: read mc.mode (canonical mode source per execution_core
-        # PR-B / FIX-3). Default to PAPER on lookup failure to preserve PR
-        # #143 paper behavior — never silently fall into LIVE replay if mc
-        # is mis-shaped.
-        _mc_mode = "PAPER"
-        try:
-            _mc_mode = str(getattr(self.mc, "mode", "PAPER") or "PAPER").upper()
-        except Exception:
-            _mc_mode = "PAPER"
+        # Detection: use the already validated recovery mode. Unknown or
+        # malformed mode was rejected above; never default to PAPER because a
+        # malformed master-control object could otherwise reset queue rows.
+        _mc_mode = recovery_mode
         _is_live = (_mc_mode == "LIVE")
 
         # ── P0 amendment (PR #294): readiness-aware reseed gate ────────────

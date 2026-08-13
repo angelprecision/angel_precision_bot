@@ -8,6 +8,12 @@ from ap import morning_handoff
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+class _RuntimeIdentity:
+    def __init__(self, client_id: str, mode: str):
+        self.client_id = client_id
+        self.mode = mode.lower()
+
+
 def test_startup_source_calls_only_unified_morning_handoff_once():
     src = (REPO_ROOT / "client_runner.py").read_text()
     run_idx = src.find("self._run_startup_morning_handoff()")
@@ -106,7 +112,7 @@ def test_duplicate_same_stage_success_is_skipped(monkeypatch):
         execution_mode="live",
         stage="post_overnight_reeval",
         dry_run=False,
-        runner=object(),
+        runner=None,
     )
     assert result["ok"] is True
     assert result["skipped"] is True
@@ -149,11 +155,17 @@ def test_live_startup_success_lock_still_runs_recovery(monkeypatch):
         broker = object()
         exit_eng = object()
         entry_watcher = type("_Watcher", (), {"has_order": lambda self, local_order_id: True})()
+        client_id = "jason@example.com"
+        client_email = "jason@example.com"
+        mode = "LIVE"
+        execution_mode = "LIVE"
 
     class _Runner:
-        order_state_machine = object()
+        email = "jason@example.com"
+        mode = "LIVE"
+        order_state_machine = _RuntimeIdentity("jason@example.com", "live")
         position_manager = object()
-        master_control = object()
+        master_control = _RuntimeIdentity("jason@example.com", "live")
         core = _Core()
 
     result = morning_handoff.run_morning_handoff_audit(
@@ -196,11 +208,17 @@ def _run_handoff_with_recovery_payload(monkeypatch, *, before: dict, recovery_pa
         broker = object()
         exit_eng = object()
         entry_watcher = object()
+        client_id = "jason@example.com"
+        client_email = "jason@example.com"
+        mode = "LIVE"
+        execution_mode = "LIVE"
 
     class _Runner:
-        order_state_machine = object()
+        email = "jason@example.com"
+        mode = "LIVE"
+        order_state_machine = _RuntimeIdentity("jason@example.com", "live")
         position_manager = object()
-        master_control = object()
+        master_control = _RuntimeIdentity("jason@example.com", "live")
         core = _Core()
 
     return morning_handoff.run_morning_handoff_audit(
@@ -333,11 +351,17 @@ def test_startup_same_day_restart_does_not_skip_when_watcher_ownership_missing(m
         broker = object()
         exit_eng = object()
         entry_watcher = type("_Watcher", (), {"has_order": lambda self, local_order_id: False})()
+        client_id = "paper@example.com"
+        client_email = "paper@example.com"
+        mode = "PAPER"
+        execution_mode = "PAPER"
 
     class _Runner:
-        order_state_machine = object()
+        email = "paper@example.com"
+        mode = "PAPER"
+        order_state_machine = _RuntimeIdentity("paper@example.com", "paper")
         position_manager = object()
-        master_control = object()
+        master_control = _RuntimeIdentity("paper@example.com", "paper")
         core = _Core()
 
     result = morning_handoff.run_morning_handoff_audit(
@@ -412,11 +436,17 @@ def test_paper_startup_success_lock_without_orders_still_enqueues_and_reseeds(mo
         broker = object()
         exit_eng = object()
         entry_watcher = object()
+        client_id = "paper@example.com"
+        client_email = "paper@example.com"
+        mode = "PAPER"
+        execution_mode = "PAPER"
 
     class _Runner:
-        order_state_machine = object()
+        email = "paper@example.com"
+        mode = "PAPER"
+        order_state_machine = _RuntimeIdentity("paper@example.com", "paper")
         position_manager = object()
-        master_control = object()
+        master_control = _RuntimeIdentity("paper@example.com", "paper")
         core = _Core()
 
     result = morning_handoff.run_morning_handoff_audit(
@@ -448,11 +478,17 @@ def test_missing_osm_is_safe_and_non_crashing(monkeypatch):
         broker = object()
         exit_eng = object()
         entry_watcher = object()
+        client_id = "paper@example.com"
+        client_email = "paper@example.com"
+        mode = "PAPER"
+        execution_mode = "PAPER"
 
     class _Runner:
+        email = "paper@example.com"
+        mode = "PAPER"
         order_state_machine = None
         position_manager = object()
-        master_control = object()
+        master_control = _RuntimeIdentity("paper@example.com", "paper")
         core = _Core()
 
     result = morning_handoff.run_morning_handoff_audit(
@@ -463,5 +499,65 @@ def test_missing_osm_is_safe_and_non_crashing(monkeypatch):
         runner=_Runner(),
     )
     assert result["ok"] is False
-    assert "order_state_machine_missing" in result["warnings"]
-    assert writes[-1]["status"] == "failed"
+    assert "runtime_authority_mismatch:osm_client_id_missing" in result["error"]
+    assert writes == []
+
+
+def test_conflicting_handoff_and_runner_modes_block_before_any_mutation(monkeypatch):
+    writes = []
+    enqueue_calls = []
+    monkeypatch.setattr(morning_handoff, "_load_handoff_run_lock", lambda **kwargs: None)
+    monkeypatch.setattr(
+        morning_handoff,
+        "_upsert_handoff_run_lock",
+        lambda **kwargs: writes.append(kwargs),
+    )
+    monkeypatch.setattr(
+        morning_handoff,
+        "enqueue_watching_signals_to_trade_queue",
+        lambda **kwargs: enqueue_calls.append(kwargs),
+    )
+
+    class _Core:
+        broker = object()
+        exit_eng = object()
+        entry_watcher = object()
+        client_id = "jason@example.com"
+        client_email = "jason@example.com"
+        mode = "LIVE"
+        execution_mode = "LIVE"
+
+    class _Runner:
+        email = "jason@example.com"
+        mode = "LIVE"
+        order_state_machine = _RuntimeIdentity("jason@example.com", "live")
+        position_manager = object()
+        master_control = _RuntimeIdentity("jason@example.com", "live")
+        core = _Core()
+
+    result = morning_handoff.run_morning_handoff_audit(
+        client_id="jason@example.com",
+        execution_mode="paper",
+        stage="startup",
+        dry_run=False,
+        runner=_Runner(),
+    )
+
+    assert result["ok"] is False
+    assert "runner_execution_mode_mismatch" in result["authority_conflicts"]
+    assert "master_control_execution_mode_mismatch" in result["authority_conflicts"]
+    assert writes == []
+    assert enqueue_calls == []
+
+
+def test_reseed_query_carries_canonical_restart_identity_fields():
+    src = (REPO_ROOT / "ap_recovery.py").read_text()
+    assert "o.client_id" in src
+    assert "o.execution_mode" in src
+    assert "o.canonical_signal_id" in src
+    assert "o.kind" in src
+    assert "o.status" in src
+    assert "o.contract" in src
+    assert "o.qty" in src
+    assert "o.broker_order_id" in src
+    assert "LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s" in src

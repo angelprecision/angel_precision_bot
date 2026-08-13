@@ -138,6 +138,8 @@ jobs:
             tests/test_p0_setup_lifecycle_owner.py \
             tests/test_p0_autonomous_startup_scheduler_contract.py \
             tests/test_p0_autonomous_morning_handoff.py \
+            tests/test_p0_morning_handoff_restart_integration.py \
+            tests/test_pr183_paper_signal_to_trade_queue_handoff.py \
             tests/test_p0_overnight_reeval_retry_liveness.py \
             tests/test_p0_overnight_mixed_inventory_watcher_first.py \
             tests/test_p0_late_attachment_continuation.py \

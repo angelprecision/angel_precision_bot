@@ -543,6 +543,15 @@ def _run_handoff_audit(
     fake_runner.core.entry_watcher = MagicMock()
     fake_runner.core.broker     = MagicMock()
     fake_runner.core.exit_eng   = MagicMock()
+    fake_runner.email = JOSE_EMAIL
+    fake_runner.mode = mode.upper()
+    fake_runner.order_state_machine.client_id = JOSE_EMAIL
+    fake_runner.master_control.client_id = JOSE_EMAIL
+    fake_runner.master_control.mode = mode.lower()
+    fake_runner.core.client_id = JOSE_EMAIL
+    fake_runner.core.client_email = JOSE_EMAIL
+    fake_runner.core.mode = mode.upper()
+    fake_runner.core.execution_mode = mode.upper()
 
     def _fake_recovery_reseed(result_dict):
         if recovery_error:
