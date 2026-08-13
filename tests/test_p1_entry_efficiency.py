@@ -927,8 +927,6 @@ def postgres_entry_efficiency_db():
             '''
         )
 
-    import ap.order_state_machine as order_state_machine_module
-
     @contextmanager
     def _test_conn():
         # Match the production OSM contract: each CAS claimant gets its own
@@ -948,7 +946,15 @@ def postgres_entry_efficiency_db():
             connection.close()
 
     patcher = pytest.MonkeyPatch()
-    patcher.setattr(order_state_machine_module, "conn", _test_conn)
+    # cas_entry_efficiency_state resolves ``conn`` from the function's
+    # defining globals.  Patch that exact namespace so the real CAS uses the
+    # temporary schema connection rather than the process-wide production
+    # connection imported during module initialization.
+    patcher.setitem(
+        APOrderStateMachine.cas_entry_efficiency_state.__globals__,
+        "conn",
+        _test_conn,
+    )
 
     def replace_row(
         *,

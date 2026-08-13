@@ -247,9 +247,13 @@ def test_previous_day_marker_rejected():
 
 
 def test_within_5min_future_accepted():
-    ts = (datetime.now(timezone.utc) + timedelta(minutes=4)).isoformat()
+    # Pin the clock away from the Eastern midnight boundary.  Building the
+    # timestamp from the real clock made this test cross trading dates in CI
+    # when UTC was just before 04:00.
+    now = datetime(2026, 8, 12, 18, 0, tzinfo=timezone.utc)
+    ts = (now + timedelta(minutes=4)).isoformat()
     assert queue._is_current_session_paper_recovery(
-        payload=_marker(ts_override=ts), execution_mode="PAPER"
+        payload=_marker(ts_override=ts), execution_mode="PAPER", now=now
     )
 
 
