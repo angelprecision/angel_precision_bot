@@ -4625,12 +4625,22 @@ class APExecutionCore:
             _efficiency_signal_meta = {}
         _efficiency_meta = dict(_efficiency_plan_meta)
         _efficiency_meta.update(_efficiency_signal_meta)
-        _efficiency_execution_mode = _resolve_entry_efficiency_execution_mode(
+        # Keep the ordinary submit identity separate from the PAPER-only
+        # entry-efficiency authority identity.  LIVE remains on the existing
+        # submit path even though #436 has no LIVE authority.
+        _resolved_execution_mode = _resolve_submit_execution_mode(
+            approved_plan,
+            sig,
+            getattr(self, "mode", None),
+            getattr(self, "paper", None),
+        )
+        _efficiency_authoritative_execution_mode = _resolve_entry_efficiency_execution_mode(
             approved_plan,
             sig,
             getattr(self, "execution_mode", None),
             getattr(self, "paper", None),
         )
+        _efficiency_evaluator_execution_mode = _efficiency_authoritative_execution_mode
         _efficiency_watched_state = getattr(watched, "entry_efficiency_state", None)
         _efficiency_prior_state = str(
             _efficiency_watched_state
@@ -4665,7 +4675,7 @@ class APExecutionCore:
         _efficiency_identity_proven = entry_efficiency_identity_is_proven(
             sig,
             metadata=_efficiency_meta,
-            runtime_execution_mode=_efficiency_execution_mode,
+            runtime_execution_mode=_efficiency_authoritative_execution_mode,
             runtime_paper=getattr(self, "paper", None),
             state=_efficiency_prior_state,
             generation=_efficiency_prior_generation,
@@ -4682,7 +4692,7 @@ class APExecutionCore:
             # opportunity identity is telemetry only.  Do not let the
             # evaluator manufacture authority or expose a CAS path that could
             # rebind a foreign lifecycle to this row.
-            _efficiency_execution_mode = None
+            _efficiency_evaluator_execution_mode = None
         _efficiency_result = evaluate_entry_efficiency(
             ticker=ticker,
             side=getattr(watched, "side", None) or sig.get("side"),
@@ -4695,7 +4705,7 @@ class APExecutionCore:
                 or sig.get("timeframe")
             ),
             metadata=_efficiency_meta,
-            execution_mode=_efficiency_execution_mode,
+            execution_mode=_efficiency_evaluator_execution_mode,
             trigger_price=getattr(watched, "entry_trigger", None),
             stop_price=getattr(watched, "stop_level", None),
             target_price=getattr(watched, "target_price", None),
@@ -4726,7 +4736,7 @@ class APExecutionCore:
             ),
             "entry_efficiency_client_id": str(_breach_client_id or "").strip().lower(),
             "entry_efficiency_execution_mode": str(
-                _efficiency_execution_mode or ""
+                _resolved_execution_mode or ""
             ).strip().lower(),
             "entry_efficiency_rebreach_at": (
                 getattr(watched, "entry_efficiency_rebreach_at", None).isoformat()
@@ -4740,28 +4750,32 @@ class APExecutionCore:
         }
 
         if not _efficiency_result.authoritative:
-            # Observation is best effort by contract.  A telemetry write can
-            # never block or release the existing entry path.
-            try:
-                _efficiency_observation = {
-                    **_efficiency_result.to_meta(),
-                    **_efficiency_identity_patch,
-                }
-                _efficiency_observation["entry_efficiency_observation"] = True
-                _update_efficiency_meta = getattr(
-                    self.order_state_machine, "update_order_meta", None
-                )
-                if callable(_update_efficiency_meta):
-                    _update_efficiency_meta(
-                        queue_local_order_id,
-                        {"entry_efficiency_observation": _efficiency_observation},
+            # #436 is PAPER-authoritative only.  A resolved LIVE callback must
+            # not add an observation DB/network write before the existing
+            # hydration, selector, final-gate, and OSM submit sequence.
+            if _resolved_execution_mode != "live":
+                # Observation is best effort by contract.  A telemetry write
+                # can never block or release the existing entry path.
+                try:
+                    _efficiency_observation = {
+                        **_efficiency_result.to_meta(),
+                        **_efficiency_identity_patch,
+                    }
+                    _efficiency_observation["entry_efficiency_observation"] = True
+                    _update_efficiency_meta = getattr(
+                        self.order_state_machine, "update_order_meta", None
                     )
-            except Exception as _efficiency_observe_exc:
-                log.debug(
-                    "[%s] entry-efficiency observation persist non-critical: %s",
-                    ticker,
-                    _efficiency_observe_exc,
-                )
+                    if callable(_update_efficiency_meta):
+                        _update_efficiency_meta(
+                            queue_local_order_id,
+                            {"entry_efficiency_observation": _efficiency_observation},
+                        )
+                except Exception as _efficiency_observe_exc:
+                    log.debug(
+                        "[%s] entry-efficiency observation persist non-critical: %s",
+                        ticker,
+                        _efficiency_observe_exc,
+                    )
         else:
             _efficiency_next_state = _efficiency_result.decision
             _efficiency_current_state = _efficiency_prior_state
@@ -4787,7 +4801,7 @@ class APExecutionCore:
                                 or ""
                             ),
                             client_id=_breach_client_id,
-                            execution_mode=_efficiency_execution_mode,
+                            execution_mode=_efficiency_authoritative_execution_mode,
                             expected_state=_efficiency_current_state,
                             expected_generation=_efficiency_prior_generation,
                             next_state=next_state,

@@ -1163,6 +1163,95 @@ def test_aapl_wait_returns_before_runtime_submit_path(monkeypatch):
     osm.cas_entry_efficiency_state.assert_called_once()
 
 
+def test_paper_cas_failure_retains_registered_watcher_and_never_submits(monkeypatch):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    efficiency_metadata = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": deadline,
+    }
+    signal = _watch_signal(**efficiency_metadata)
+    watched = WatchedSignal(signal, overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": signal["canonical_signal_id"],
+        },
+        execution_mode="paper",
+        client_id=signal["client_id"],
+        signal_id=signal["signal_id"],
+        canonical_signal_id=signal["canonical_signal_id"],
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+        side="PUT",
+        ticker="AAPL",
+        trigger_price=302.80,
+        stop_underlying=304.00,
+        target_underlying=300.00,
+        contracts=1,
+    )
+    watched.signal["_approved_plan"] = plan
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = False
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email=signal["client_id"],
+        client_id=signal["client_id"],
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _refresh_hydrated_prebreach_plan=MagicMock(
+            side_effect=AssertionError("CAS failure must retain watcher before hydration")
+        ),
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+    watcher = APEntryWatcher(None, order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    watcher._dedup_set.add(watched.signal_id)
+    watcher._fetch_quotes = lambda _tickers: {
+        "AAPL": {"bid": 302.79, "ask": 302.81, "quote_age_ms": 1_000}
+    }
+    callback_results = []
+
+    from ap import intelligence_evaluation
+
+    def _real_callback(triggered_watched):
+        result = APExecutionCore._on_entry_trigger(core, triggered_watched)
+        callback_results.append(result)
+        return result
+
+    watcher.on_trigger = _real_callback
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *args, **kwargs: None,
+        )
+        watcher._poll_active_signals(open_protect_active=False)
+        watcher._poll_active_signals(open_protect_active=False)
+
+    assert callback_results
+    assert callback_results[0]["disposition"] == "ENTRY_EFFICIENCY_WAIT"
+    assert callback_results[0]["reason_code"] == "ENTRY_EFFICIENCY_STATE_CAS_FAILED"
+    osm.cas_entry_efficiency_state.assert_called_once()
+    osm.submit_existing_entry.assert_not_called()
+    assert watched in watcher._pending
+    assert watched.state == WatchState.PENDING
+    assert watched.deferred_retry_not_before is None
+
+
 def test_aapl_replay_wait_rearm_rebreach_ready_has_no_first_entry_post(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
     deadline = "2026-08-12T14:21:51+00:00"
@@ -2027,6 +2116,141 @@ def _ready_restart_trade_row():
         }
     )
     return row
+
+
+def _live_ready_callback_shape(row):
+    """Build a preselected LIVE callback with deliberately stale #436 fields."""
+    plan = SimpleNamespace(
+        contract_symbol=row["contract"],
+        execution_price_per_share=row["limit_price"],
+        ask=row["limit_price"],
+        mid=row["limit_price"],
+        affordable_contracts=1,
+        premium_per_contract=row["reserved_cost"],
+        contracts=row["qty"],
+        limit_price=row["limit_price"],
+        side=row["direction"],
+        direction=row["direction"],
+        execution_mode="live",
+        client_id=row["client_id"],
+        signal_id=row["signal_id"],
+        canonical_signal_id=row["canonical_signal_id"],
+        ticker=row["ticker"],
+        trigger_price=row["entry_price"],
+        stop_underlying=row["stop_price"],
+        target_underlying=row["target_price"],
+        pattern=row["pattern"],
+        timeframe=row["timeframe"],
+        metadata=deepcopy(row["meta"]),
+    )
+    signal = _watch_signal()
+    signal.update(
+        {
+            "signal_id": row["signal_id"],
+            "canonical_signal_id": row["canonical_signal_id"],
+            "local_order_id": row["local_order_id"],
+            "client_id": row["client_id"],
+            "client_email": row["client_id"],
+            "execution_mode": "live",
+            "mode": "live",
+            "ticker": row["ticker"],
+            "side": row["direction"],
+            "entry_price": row["entry_price"],
+            "stop_price": row["stop_price"],
+            "target_price": row["target_price"],
+            "trigger_crossed_at": row["trigger_crossed_at"],
+            "metadata": deepcopy(row["meta"]),
+            "_approved_plan": plan,
+        }
+    )
+    watched = WatchedSignal(signal, overnight=False)
+    watched.trigger_crossed_at = datetime.fromisoformat(row["trigger_crossed_at"])
+    # This is the restart-shaped object that exposed the old defect.  LIVE
+    # must not turn these absent #436 quote fields into a wait or a telemetry
+    # write before the existing submit path runs.
+    assert watched.last_quote_bid == 0.0
+    assert watched.last_quote_ask == 0.0
+    assert watched.last_quote_age_ms is None
+    return watched
+
+
+@pytest.mark.parametrize("configured_mode", [None, ENTRY_EFFICIENCY_OBSERVE_ONLY])
+def test_live_real_core_skips_entry_efficiency_observation_and_submits_once(
+    monkeypatch, configured_mode
+):
+    """LIVE uses the current submit path while #436 remains observation-free."""
+    if configured_mode is None:
+        monkeypatch.delenv("AP_ENTRY_EFFICIENCY_MODE", raising=False)
+        monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    else:
+        monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", configured_mode)
+        monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    monkeypatch.setenv("LIVE_CONFIRMATION_REQUIRED", "0")
+
+    row = _ready_restart_trade_row()
+    row["execution_mode"] = "live"
+    # Match the live ask-cross result supplied by the existing submit-quote
+    # fixture so the production OSM does not need a real DB limit-price sync.
+    row["limit_price"] = 1.03
+    row["reserved_cost"] = 103.0
+    # Force the old generation/identity branch that used to blank the nested
+    # execution mode, while retaining known LIVE identity already on the row.
+    row["meta"]["entry_efficiency_generation"] = 0
+    row["meta"]["entry_efficiency_execution_mode"] = "live"
+    row["meta"]["entry_efficiency_observation"] = {
+        "entry_efficiency_local_order_id": row["local_order_id"],
+        "entry_efficiency_signal_id": row["signal_id"],
+        "entry_efficiency_canonical_signal_id": row["canonical_signal_id"],
+        "entry_efficiency_client_id": row["client_id"],
+        "entry_efficiency_execution_mode": "live",
+    }
+    original_observation = deepcopy(row["meta"]["entry_efficiency_observation"])
+
+    broker = _ReadyRestartBroker()
+    broker.get_quote = MagicMock(
+        return_value={"bid": 302.79, "ask": 302.81, "source": "tradier"}
+    )
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    real_update_order_meta = osm.update_order_meta
+
+    def _live_update_order_meta(local_order_id, patch):
+        if isinstance(patch, dict) and "entry_efficiency_observation" in patch:
+            raise AssertionError("LIVE #436 observation writer must not be invoked")
+        return real_update_order_meta(local_order_id, patch)
+
+    osm.update_order_meta = MagicMock(side_effect=_live_update_order_meta)
+    osm.cas_entry_efficiency_state = MagicMock(
+        side_effect=AssertionError("LIVE #436 CAS must not be invoked")
+    )
+    watched = _live_ready_callback_shape(row)
+    core = _ready_restart_real_core(monkeypatch, row, osm, broker)
+    core.paper = False
+    core.mode = "LIVE"
+    core.execution_mode = "live"
+
+    core._on_entry_trigger(watched)
+    core._on_entry_trigger(watched)
+
+    assert len(broker.post_calls) == 1
+    assert osm.row["status"] == "SUBMITTED"
+    assert osm.row["broker_order_id"] == "broker-1"
+    osm.cas_entry_efficiency_state.assert_not_called()
+    assert all(
+        "entry_efficiency_observation" not in patch
+        for _, patch in osm.meta_writes
+    )
+    assert osm.row["execution_mode"] == "live"
+    assert osm.row["meta"]["entry_efficiency_observation"] == original_observation
+    assert (
+        osm.row["meta"]["entry_efficiency_observation"]["entry_efficiency_execution_mode"]
+        == "live"
+    )
+    assert osm.row["meta"]["entry_efficiency_observation"]["entry_efficiency_client_id"] == row[
+        "client_id"
+    ]
+    assert osm.row["meta"]["entry_efficiency_observation"]["entry_efficiency_local_order_id"] == row[
+        "local_order_id"
+    ]
 
 
 def test_fresh_restart_ready_runs_real_core_to_one_osm_broker_post(monkeypatch):
