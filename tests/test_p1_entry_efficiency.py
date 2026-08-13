@@ -20,6 +20,7 @@ os.environ.setdefault(
 os.environ.setdefault("ENCRYPTION_KEY", "ap-entry-efficiency-pr-436-2026")
 
 import ap_execution_core as execution_core_module
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap_entry_efficiency import (
     ENTRY_EFFICIENCY_CONFIG_CONFLICT,
     ENTRY_EFFICIENCY_CONFIG_INVALID,
@@ -1802,19 +1803,177 @@ def test_fresh_restart_stale_efficiency_identity_stays_unresolved_without_cleanu
     assert osm.meta_writes == []
 
 
-def test_fresh_restart_ready_uses_zero_broker_proof_then_existing_callback(
-    monkeypatch,
-):
+class _ReadyRestartBroker:
+    def __init__(self):
+        self.orders = []
+        self.post_calls = []
+        self.cfg = SimpleNamespace(base_url="https://paper-broker.test")
+        self.sandbox = True
+
+    def list_orders(self):
+        return list(self.orders)
+
+    def submit_order(self, **payload):
+        self.post_calls.append(dict(payload))
+        broker_order_id = f"broker-{len(self.post_calls)}"
+        self.orders.append(
+            {
+                "id": broker_order_id,
+                "tag": payload.get("tag") or payload.get("client_order_id"),
+            }
+        )
+        return {"id": broker_order_id, "status": "SUBMITTED"}
+
+
+class _ReadyRestartSubmitOSM(_EntryEfficiencyRestartOSM):
+    def __init__(self, row, broker):
+        super().__init__(row)
+        self.broker = broker
+        self.submit_calls = []
+
+    def submit_existing_entry(self, *, local_order_id, broker, plan, limit_price):
+        self.submit_calls.append(
+            {
+                "local_order_id": local_order_id,
+                "contract": getattr(plan, "contract_symbol", ""),
+                "limit_price": limit_price,
+            }
+        )
+        if self.row.get("broker_order_id") or self.row.get("submitted_ts"):
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "error": "already_submitted",
+            }
+        response = broker.submit_order(
+            tag=canonical_broker_submit_key(local_order_id),
+            contract=getattr(plan, "contract_symbol", ""),
+            limit_price=limit_price,
+        )
+        self.row["broker_order_id"] = response["id"]
+        self.row["submitted_ts"] = datetime.now(timezone.utc).isoformat()
+        self.row["status"] = "SUBMITTED"
+        return {
+            "ok": True,
+            "local_order_id": local_order_id,
+            "broker_order_id": response["id"],
+            "status": "SUBMITTED",
+        }
+
+    def cas_entry_efficiency_state(
+        self,
+        local_order_id,
+        *,
+        signal_id,
+        canonical_signal_id,
+        client_id,
+        execution_mode,
+        expected_state,
+        expected_generation,
+        next_state,
+        next_generation,
+        meta_patch,
+    ):
+        meta = self.row["meta"]
+        if (
+            local_order_id != self.row["local_order_id"]
+            or meta.get("entry_efficiency_state") != expected_state
+            or meta.get("entry_efficiency_generation") != expected_generation
+            or signal_id != self.row["signal_id"]
+            or canonical_signal_id != self.row["canonical_signal_id"]
+            or str(client_id).lower() != self.row["client_id"].lower()
+            or execution_mode != self.row["execution_mode"]
+        ):
+            return False
+        meta.update(dict(meta_patch or {}))
+        meta["entry_efficiency_state"] = next_state
+        meta["entry_efficiency_generation"] = next_generation
+        return True
+
+
+def _ready_restart_real_core(monkeypatch, row, osm, broker, *, quote_age_ms=17):
+    """Use the real ExecutionCore callback through the OSM submit boundary."""
+    import ap.execution as execution_module
+
+    monkeypatch.setenv("ENTRY_CUTOFF_ET_HHMM", "2359")
+    monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_MODE", "off")
+    monkeypatch.setattr(
+        execution_module,
+        "_refresh_ask_at_submit",
+        lambda _broker, _contract: (
+            1.02,
+            quote_age_ms,
+            True,
+            "ok",
+            {
+                "submit_bid": 1.00,
+                "submit_ask": 1.02,
+                "submit_last": 1.01,
+                "submit_mid": 1.01,
+                "spread_pct": 0.0198,
+            },
+        ),
+    )
+
+    core = execution_core_module.APExecutionCore.__new__(
+        execution_core_module.APExecutionCore
+    )
+    core.paper = True
+    core.mode = "PAPER"
+    core.execution_mode = "paper"
+    core.email = row["client_id"]
+    core.client_id = row["client_id"]
+    core.client_email = row["client_id"]
+    core.broker = broker
+    core.store = MagicMock()
+    core.order_state_machine = osm
+    core.contract_selector = None
+    core.master_control = None
+    core._max_positions = 10
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._recover_plan_for_revalidation = lambda watched: watched.signal[
+        "_approved_plan"
+    ]
+    core._refresh_hydrated_prebreach_plan = MagicMock(return_value=False)
+    core._alert_degraded = MagicMock()
+    return core
+
+
+def _ready_restart_trade_row():
+    row = _entry_efficiency_restart_row(state=READY_NOW, generation=4)
+    row.update(
+        {
+            "contract": "AAPL260821P00304000",
+            "contract_symbol": "AAPL260821P00304000",
+            "qty": 1,
+            "contracts": 1,
+            "limit_price": 1.00,
+            "reserved_cost": 100.0,
+        }
+    )
+    row["meta"].update(
+        {
+            "selected_contract": row["contract"],
+            "selected_qty": 1,
+            "selected_limit": 1.00,
+        }
+    )
+    return row
+
+
+def test_fresh_restart_ready_runs_real_core_to_one_osm_broker_post(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
     monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
-    row = _entry_efficiency_restart_row(state=READY_NOW, generation=4)
-    osm = _EntryEfficiencyRestartOSM(row)
-    broker = MagicMock()
-    broker.list_orders.return_value = []
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
     watcher = APEntryWatcher(broker, osm, mode="PAPER")
     watcher._persist_watcher_audit = MagicMock()
-    callback = MagicMock()
-    watcher.on_trigger = callback
+    watcher._get_quote = MagicMock(
+        return_value={"bid": 302.79, "ask": 302.81, "quote_age_ms": 17}
+    )
+    core = _ready_restart_real_core(monkeypatch, row, osm, broker)
+    watcher.on_trigger = core._on_entry_trigger
     recovery = PendingTriggerRestartRecovery(
         client_id=row["client_id"],
         execution_mode="paper",
@@ -1826,17 +1985,129 @@ def test_fresh_restart_ready_uses_zero_broker_proof_then_existing_callback(
 
     outcome = recovery.recover_one_row(row)
 
-    assert outcome == _RowOutcome.UNRESOLVED
-    broker.list_orders.assert_called_once_with()
-    callback.assert_called_once()
-    callback_watched = callback.call_args.args[0]
-    assert callback_watched.signal["local_order_id"] == row["local_order_id"]
-    assert callback_watched.signal["metadata"]["entry_efficiency_state"] == READY_NOW
+    assert outcome == _RowOutcome.SKIPPED
+    watcher._get_quote.assert_called_once_with("AAPL")
+    assert len(osm.submit_calls) == 1
+    assert len(broker.post_calls) == 1
+    assert osm.row["status"] == "SUBMITTED"
+    assert osm.row["broker_order_id"] == "broker-1"
     assert watcher._pending == []
     assert osm.cancel_calls == []
-    assert osm.meta_writes == []
-    watcher._persist_watcher_audit.assert_not_called()
-    broker.submit_order.assert_not_called()
+    assert watcher._persist_watcher_audit.call_count == 0
+
+
+def test_fresh_restart_ready_matching_canonical_tag_skips_callback_and_second_post(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    broker.orders.append({"tag": canonical_broker_submit_key(row["local_order_id"])})
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    callback = MagicMock()
+    watcher.on_trigger = callback
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("duplicate proof must not use the quote gate")
+        ),
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.UNRESOLVED
+    callback.assert_not_called()
+    assert osm.submit_calls == []
+    assert broker.post_calls == []
+    assert watcher._pending == []
+    assert osm.cancel_calls == []
+
+
+def test_fresh_restart_ready_quote_unavailable_adopts_registered_watcher(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watcher._get_quote = MagicMock(return_value={})
+    callback = MagicMock()
+    watcher.on_trigger = callback
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("READY recovery owns broker proof")
+        ),
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.WATCHER_OWNED
+    callback.assert_not_called()
+    assert len(watcher._pending) == 1
+    registered = watcher._pending[0]
+    assert registered.signal["local_order_id"] == row["local_order_id"]
+    assert registered.entry_efficiency_state == READY_NOW
+    assert registered.entry_efficiency_generation == 4
+    assert row["status"] == "PENDING_TRIGGER"
+    assert row.get("broker_order_id") is None
+    assert broker.post_calls == []
+
+
+def test_fresh_restart_ready_callback_wait_immediately_reowns_registered_watcher(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _ready_restart_trade_row()
+    broker = _ReadyRestartBroker()
+    osm = _ReadyRestartSubmitOSM(row, broker)
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    watcher._get_quote = MagicMock(
+        return_value={"bid": 302.79, "ask": 302.81, "quote_age_ms": 60_001}
+    )
+    core = _ready_restart_real_core(
+        monkeypatch, row, osm, broker, quote_age_ms=60_001
+    )
+    watcher.on_trigger = core._on_entry_trigger
+    recovery = PendingTriggerRestartRecovery(
+        client_id=row["client_id"],
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=broker,
+        quote_check_fn=MagicMock(
+            side_effect=AssertionError("READY recovery owns broker proof")
+        ),
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == _RowOutcome.WATCHER_OWNED
+    assert osm.row["meta"]["entry_efficiency_state"] == WAIT_CONFIRMATION
+    assert osm.row["meta"]["entry_efficiency_generation"] == 5
+    assert len(watcher._pending) == 1
+    registered = watcher._pending[0]
+    assert registered.signal["local_order_id"] == row["local_order_id"]
+    assert registered.entry_efficiency_state == WAIT_CONFIRMATION
+    assert registered.entry_efficiency_generation == 5
+    assert osm.submit_calls == []
+    assert broker.post_calls == []
 
 
 class _StartupRecoveryConnection:

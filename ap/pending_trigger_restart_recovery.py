@@ -41,6 +41,7 @@ from ap_entry_watcher import (
 from ap_entry_efficiency import (
     ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
     REARM_FOR_REBREACH,
+    READY_NOW,
     WAIT_CONFIRMATION,
     entry_efficiency_identity_is_proven,
     normalize_strategy_pattern,
@@ -557,6 +558,7 @@ class PendingTriggerRestartRecovery:
                 row,
                 local_oid,
                 _efficiency_ready_proof,
+                watcher_owned=watcher_owned,
                 plan_builder_fn=plan_builder_fn,
             )
 
@@ -2739,9 +2741,87 @@ class PendingTriggerRestartRecovery:
             "disposition": "PROVEN_ZERO_BROKER",
             "state": state,
             "generation": generation,
+            "deadline_at": _parse_entry_efficiency_authority_timestamp(
+                meta.get("entry_efficiency_deadline_at")
+            ),
+            "next_eval_at": _parse_entry_efficiency_authority_timestamp(
+                meta.get("entry_efficiency_next_eval_at")
+            ),
+            "rearm_pending": False,
             "trigger_crossed_at": trigger_at,
             "trigger_crossed_raw": trigger_raw,
             "canonical_pattern": canonical_pattern,
+        }
+
+    def _fresh_entry_efficiency_restart_quote(
+        self, watcher, ticker: str
+    ) -> Optional[dict]:
+        """Read the same authoritative underlying quote used by watcher polls.
+
+        READY_NOW recovery is a pre-submit handoff, so the synthetic watcher
+        must carry fresh bid/ask/age evidence before the real execution-core
+        callback evaluates it.  Do not use the durable breach price as a
+        quote substitute: it is historical evidence, not current market truth.
+        """
+        get_quote = getattr(watcher, "_get_quote", None)
+        if not callable(get_quote):
+            return None
+        try:
+            raw_quote = get_quote(str(ticker or "").upper())
+        except Exception as exc:
+            log.warning(
+                "RESTART_RECOVERY_ENTRY_EFFICIENCY_READY_QUOTE_FAILED "
+                "ticker=%s error=%s",
+                ticker,
+                type(exc).__name__,
+            )
+            return None
+        if not isinstance(raw_quote, dict):
+            return None
+
+        def _finite(value: Any) -> Optional[float]:
+            if isinstance(value, bool) or value is None or value == "":
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return number if math.isfinite(number) else None
+
+        bid = _finite(raw_quote.get("bid")) or 0.0
+        ask = _finite(raw_quote.get("ask")) or 0.0
+        # This is the same last-only normalization as uninterrupted watcher
+        # polling.  The package watcher already blocks last-only data unless
+        # its explicit WATCHER_ALLOW_LAST_ONLY_TRIGGER policy is enabled.
+        if bid == 0.0 and ask == 0.0:
+            last = _finite(raw_quote.get("last"))
+            if last is not None:
+                bid = ask = last
+
+        raw_age = raw_quote.get("quote_age_ms")
+        if isinstance(raw_age, bool) or raw_age is None:
+            return None
+        coerce_age = getattr(watcher, "_coerce_quote_age_ms", None)
+        try:
+            quote_age_ms = (
+                coerce_age(raw_age)
+                if callable(coerce_age)
+                else int(round(float(raw_age)))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            quote_age_ms is None
+            or isinstance(quote_age_ms, bool)
+            or quote_age_ms < 0
+            or bid <= 0
+            or ask <= 0
+        ):
+            return None
+        return {
+            "bid": bid,
+            "ask": ask,
+            "quote_age_ms": int(quote_age_ms),
         }
 
     def _resume_entry_efficiency_ready(
@@ -2750,10 +2830,23 @@ class PendingTriggerRestartRecovery:
         local_oid: str,
         proof: dict,
         *,
+        watcher_owned: Optional[bool] = None,
         plan_builder_fn=None,
     ) -> str:
         """Invoke the existing trigger callback after zero-broker proof."""
         watcher = self.entry_watcher
+        if watcher_owned is True:
+            registry_proof = self._verify_registry_ownership(local_oid, row)
+            if registry_proof is not None and self._verify_entry_efficiency_watcher_lifecycle(
+                registry_proof.get("watcher_obj"), row, proof
+            ):
+                self.last_watcher_registered_by_this_attempt = False
+                self.last_registration_token = None
+                return _RowOutcome.WATCHER_OWNED
+            self._mark_failure(
+                local_oid, "entry_efficiency_ready_restart:owned_watcher_lifecycle_mismatch"
+            )
+            return _RowOutcome.UNRESOLVED
         callback = getattr(watcher, "on_trigger", None) if watcher is not None else None
         if not callable(callback):
             self._mark_failure(local_oid, "entry_efficiency_ready_restart:callback_unavailable")
@@ -2766,6 +2859,26 @@ class PendingTriggerRestartRecovery:
         if not isinstance(plan_meta, dict):
             self._mark_failure(local_oid, "entry_efficiency_ready_restart:plan_meta_invalid")
             return _RowOutcome.UNRESOLVED
+
+        ready_quote = self._fresh_entry_efficiency_restart_quote(
+            watcher, getattr(plan, "ticker", None) or row.get("ticker") or ""
+        )
+        if ready_quote is None:
+            # There is no safe synthetic callback without current quote truth.
+            # Reuse the canonical watcher registration path so the next poll
+            # obtains the quote and owns the durable opportunity.
+            log.warning(
+                "RESTART_RECOVERY_ENTRY_EFFICIENCY_READY_QUOTE_UNAVAILABLE "
+                "local=%s — adopting registered watcher",
+                local_oid,
+            )
+            return self._resume_entry_efficiency_wait(
+                row,
+                local_oid,
+                proof,
+                watcher_owned=False,
+                plan_builder_fn=plan_builder_fn,
+            )
         signal = {
             "signal_id": str(getattr(plan, "signal_id", "") or row.get("signal_id") or ""),
             "canonical_signal_id": str(
@@ -2794,20 +2907,28 @@ class PendingTriggerRestartRecovery:
         }
         try:
             watched = WatchedSignal(signal)
+            watched._watcher_ref = watcher
             watched.triggered_at = proof.get("trigger_crossed_at")
             watched.breach_price = float(
-                (row.get("meta") or {}).get("observed_underlying_price")
+                _extract_meta(row).get("observed_underlying_price")
                 or getattr(plan, "trigger_price", 0)
                 or 0
             )
+            # These are current authoritative watcher fields.  In particular,
+            # never derive them from breach_price or any other historical row
+            # evidence.
+            watched.last_quote_bid = ready_quote["bid"]
+            watched.last_quote_ask = ready_quote["ask"]
+            watched.last_quote_age_ms = ready_quote["quote_age_ms"]
             callback(watched)
         except Exception as exc:
             log.error(
                 "RESTART_RECOVERY_ENTRY_EFFICIENCY_READY_CALLBACK_RAISED local=%s: %s",
                 local_oid, exc, exc_info=True,
             )
-            self._mark_failure(local_oid, "entry_efficiency_ready_restart:callback_raised")
-            return _RowOutcome.UNRESOLVED
+            callback_exception = exc
+        else:
+            callback_exception = None
 
         get_order = getattr(self.osm, "get_order", None)
         if not callable(get_order):
@@ -2823,14 +2944,73 @@ class PendingTriggerRestartRecovery:
             return _RowOutcome.UNRESOLVED
         after_status = str(after.get("status") or "").strip().upper()
         after_meta = _extract_meta(after)
-        if after.get("broker_order_id") or after.get("submitted_ts"):
+        if after.get("broker_order_id"):
             return _RowOutcome.SKIPPED
+        if after.get("submitted_ts") or after_meta.get("submit_intent_at"):
+            intent_outcome = self._route_durable_submit_intent_if_present(
+                after, local_oid
+            )
+            if intent_outcome is not None:
+                return intent_outcome
+            self._mark_failure(
+                local_oid,
+                "entry_efficiency_ready_restart:broker_intent_unresolved",
+            )
+            return _RowOutcome.UNRESOLVED
         if after_status in _TERMINAL_STATUSES:
             return _RowOutcome.TERMINALIZED
-        if str(after_meta.get("entry_efficiency_state") or "") != "READY_NOW":
-            self._mark_failure(local_oid, "entry_efficiency_ready_restart:durable_outcome_missing")
+
+        after_state = parse_entry_efficiency_state(
+            after_meta.get("entry_efficiency_state"), allow_empty=False
+        )
+        if after_state in {WAIT_CONFIRMATION, REARM_FOR_REBREACH}:
+            wait_proof = self._prove_entry_efficiency_restart_wait(
+                after,
+                local_oid,
+                row_client=self.client_id,
+                row_mode=self.execution_mode,
+            )
+            if wait_proof.get("disposition") == "PROVEN":
+                return self._resume_entry_efficiency_wait(
+                    after,
+                    local_oid,
+                    wait_proof,
+                    watcher_owned=False,
+                    plan_builder_fn=plan_builder_fn,
+                )
+            self._mark_failure(
+                local_oid,
+                "entry_efficiency_ready_restart:wait_ownership_unproven",
+            )
             return _RowOutcome.UNRESOLVED
-        self._mark_failure(local_oid, "entry_efficiency_ready_restart:callback_left_row_pending")
+
+        if after_state == READY_NOW:
+            # The callback may have returned without a durable transition (or
+            # raised after doing partial work). Re-prove zero broker ownership
+            # before handing the row back to the real watcher registry; a
+            # callback-side POST or intent must remain a HOLD/reconciliation
+            # case, never a duplicate watcher submit.
+            ready_after = self._prove_entry_efficiency_ready_restart(
+                after,
+                local_oid,
+                row_client=self.client_id,
+                row_mode=self.execution_mode,
+            )
+            if ready_after.get("disposition") == "PROVEN_ZERO_BROKER":
+                return self._resume_entry_efficiency_wait(
+                    after,
+                    local_oid,
+                    ready_after,
+                    watcher_owned=False,
+                    plan_builder_fn=plan_builder_fn,
+                )
+
+        self._mark_failure(
+            local_oid,
+            "entry_efficiency_ready_restart:callback_no_durable_outcome"
+            if callback_exception is None
+            else "entry_efficiency_ready_restart:callback_raised",
+        )
         return _RowOutcome.UNRESOLVED
 
     def _prove_entry_efficiency_restart_wait(
