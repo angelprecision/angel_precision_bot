@@ -158,6 +158,7 @@ def test_reconciled_filled_order_hands_off_once_to_fill_monitor_and_position_own
 
     order = {**row, "meta": dict(row.get("meta") or {}), "filled_qty": 0}
     core.broker.get_order.return_value = {
+        "id": "TR-9",
         "status": "filled",
         "exec_quantity": 1,
         "avg_fill_price": 2.08,
@@ -251,6 +252,7 @@ def test_reconciled_nonfilled_statuses_are_consumed_by_canonical_monitor(
     assert result["status"] == "SUBMITTED"
     order = {**row, "meta": dict(row.get("meta") or {}), "filled_qty": 0}
     core.broker.get_order.return_value = {
+        "id": "TR-9",
         "status": broker_status,
         **remote_fields,
     }
