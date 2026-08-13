@@ -4,6 +4,7 @@ import json
 import inspect
 import os
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,7 @@ from ap.pending_trigger_restart_recovery import (
     PendingTriggerRestartRecovery,
     _RowOutcome,
 )
+from ap_recovery import APStartupRecovery
 from ap_execution_core import (
     APExecutionCore,
     _parse_datetime_for_efficiency,
@@ -1835,3 +1837,120 @@ def test_fresh_restart_ready_uses_zero_broker_proof_then_existing_callback(
     assert osm.meta_writes == []
     watcher._persist_watcher_audit.assert_not_called()
     broker.submit_order.assert_not_called()
+
+
+class _StartupRecoveryConnection:
+    def __init__(self, row, calls):
+        self.row = row
+        self.calls = calls
+        self.sql = ""
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sql = str(sql)
+        self.calls.append((self.sql, params))
+        self.rowcount = 0
+
+    def fetchall(self):
+        if not self.sql.lstrip().upper().startswith("SELECT"):
+            return []
+        row = deepcopy(self.row)
+        row["meta"] = dict(self.row.get("meta") or {})
+        return [row]
+
+
+def _startup_recovery_efficiency_row(*, state):
+    row = _entry_efficiency_restart_row(state=state)
+    row.update(
+        {
+            "symbol": row["ticker"],
+            "contract": "AAPL260821P00304000",
+            "qty": 1,
+            "limit_price": 2.50,
+            "reserved_cost": 250.0,
+            "trigger_price": row["entry_price"],
+            "stop_underlying": row["stop_price"],
+            "target_underlying": row["target_price"],
+            "broker_order_id": None,
+            "submitted_ts": None,
+            "filled_ts": None,
+            "created_ts": datetime.now(timezone.utc),
+            "_tq_status": "WATCHING",
+            "_tq_last_error": None,
+        }
+    )
+    return row
+
+
+@pytest.mark.parametrize("state", [WAIT_CONFIRMATION, REARM_FOR_REBREACH])
+def test_startup_recovery_reowns_efficiency_wait_from_durable_row(
+    monkeypatch, state
+):
+    """The real startup consumer must preserve WAIT/REARM after process death."""
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", "paper_authoritative")
+    monkeypatch.delenv("ENTRY_EFFICIENCY_MODE", raising=False)
+    row = _startup_recovery_efficiency_row(state=state)
+    osm = _EntryEfficiencyRestartOSM(row)
+    broker = MagicMock()
+    watcher = APEntryWatcher(broker, osm, mode="PAPER")
+    watcher._persist_watcher_audit = MagicMock()
+    calls = []
+
+    import ap.db as ap_db
+
+    monkeypatch.setattr(ap_db, "conn", lambda: _StartupRecoveryConnection(row, calls))
+    monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *args, **kwargs: fn())
+
+    recovery = APStartupRecovery(
+        client_id=row["client_id"],
+        broker=broker,
+        osm=osm,
+        pm=object(),
+        master_control=SimpleNamespace(mode="PAPER"),
+        entry_watcher=watcher,
+    )
+    result = {"errors": []}
+    recovery._reseed_watchers(result)
+
+    select_calls = [
+        (sql, params)
+        for sql, params in calls
+        if sql.lstrip().upper().startswith("SELECT")
+        and "FROM orders o" in sql
+    ]
+    assert len(select_calls) == 1
+    sql, params = select_calls[0]
+    assert all(
+        field in sql
+        for field in (
+            "o.client_id",
+            "o.execution_mode",
+            "o.canonical_signal_id",
+            "o.kind",
+            "o.status",
+            "o.qty",
+            "o.broker_order_id",
+            "o.submitted_ts",
+        )
+    )
+    assert "LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s" in sql
+    assert params[0:2] == (row["client_id"], "paper")
+    assert result["pending_trigger_watchers_rearmed"] == 1
+    assert len(watcher._pending) == 1
+    watched = watcher._pending[0]
+    assert watched.signal["local_order_id"] == row["local_order_id"]
+    assert watched.entry_efficiency_state == state
+    assert watched.entry_efficiency_generation == row["meta"][
+        "entry_efficiency_generation"
+    ]
+    assert watched.entry_efficiency_rearm_pending is (state == REARM_FOR_REBREACH)
+    assert osm.cancel_calls == []
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+    assert watcher._persist_watcher_audit.call_count == 0
