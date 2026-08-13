@@ -306,6 +306,7 @@ def insert_order(
     limit_price: float | None = None,
     broker_order_id: str | None = None,
     direction: str | None = None,
+    execution_mode: str | None = None,
     reserved_cost: float | None = None,
     meta: dict | None = None,
 ):
@@ -318,6 +319,11 @@ def insert_order(
     )
     ts = now_utc_iso()
     import json as _json
+    _execution_mode = str(execution_mode or "").strip().lower()
+    if _execution_mode not in {"live", "paper"}:
+        # Keep the authoritative column fail-closed. In particular, do not
+        # infer order ownership from arbitrary JSON metadata.
+        _execution_mode = None
     meta_json = _json.dumps(meta or {})
     def _fn():
         with conn() as c:
@@ -325,14 +331,16 @@ def insert_order(
                 """
                 INSERT INTO orders (
                     client_id, local_order_id, broker_order_id, position_id,
-                    kind, status, symbol, contract, direction, reserved_cost,
+                    kind, status, symbol, contract, direction, execution_mode,
+                    reserved_cost,
                     qty, limit_price, filled_qty, retries, last_error,
                     created_ts, updated_ts, meta
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                 ON CONFLICT (local_order_id) DO NOTHING
                 """,
                 (client_id, local_order_id, broker_order_id, position_id,
-                 kind, status, symbol, contract, direction, reserved_cost,
+                 kind, status, symbol, contract, direction, _execution_mode,
+                 reserved_cost,
                  int(qty), limit_price, 0, 0, None, ts, ts, meta_json),
             )
     return run_with_retry(_fn)
@@ -397,7 +405,10 @@ def get_client_state(client_id: str = "default") -> dict:
                     "client_id": client_id, "current_equity": 0.0,
                     "starting_equity_today": 0.0, "realized_pnl_today": 0.0,
                     "trades_taken_today": 0, "daily_stop_hit": 0,
-                    "kill_switch": False, "mode": "PAPER", "day_key": None,
+                    # A missing state row has no execution identity. Callers
+                    # may choose an operational fallback, but must not use it
+                    # as durable order authority.
+                    "kill_switch": False, "mode": None, "day_key": None,
                 }
             return row
     return run_with_retry(_fn)
