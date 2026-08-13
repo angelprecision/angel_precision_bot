@@ -9762,8 +9762,15 @@ class APExecutionCore:
 
         True for TERMINAL or ALREADY_BREACHED classifications — these mean
         the underlying thesis is broken and a DEFERRED contract cannot be
-        kept alive.  RETRYABLE/REARMABLE are NOT real underlying invalidation.
+        kept alive.  ``arm_below_stop`` is the one context-sensitive reason:
+        an eligible arm is admitted directly into the explicit rearm state,
+        while this callback only receives the rejected/invalidation path.
+        Treat that callback reason as real so a DEFERRED row cannot be
+        resurrected after a below-stop rejection.
         """
+        _reason = str(reason_code or "").strip().lower()
+        if _reason == "arm_below_stop":
+            return True
         try:
             from ap.pending_trigger_classifier import (
                 classify_watcher_reason, WatcherInvalidationClass,
