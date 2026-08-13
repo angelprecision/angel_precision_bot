@@ -60,7 +60,10 @@ from ap.exit_safety import (
     evaluate_exit_submission_safety,
     resolve_exit_broker_truth,
 )
-from ap_entry_efficiency import parse_entry_efficiency_generation
+from ap_entry_efficiency import (
+    parse_entry_efficiency_generation,
+    parse_entry_efficiency_state,
+)
 try:
     from psycopg2 import errors as pg_errors
 except ImportError:
@@ -2217,8 +2220,8 @@ class APOrderStateMachine:
         durable_canonical_signal_id = str(canonical_signal_id or "").strip()
         durable_client_id = str(client_id or "").strip().lower()
         durable_mode = str(execution_mode or "").strip().lower()
-        expected_state_text = str(expected_state or "").strip().upper()
-        next_state_text = str(next_state or "").strip().upper()
+        expected_state_text = parse_entry_efficiency_state(expected_state)
+        next_state_text = parse_entry_efficiency_state(next_state, allow_empty=False)
         expected_gen = parse_entry_efficiency_generation(
             expected_generation,
             state=expected_state_text,
@@ -2228,7 +2231,9 @@ class APOrderStateMachine:
             state=next_state_text,
         )
         if (
-            not local_id
+            expected_state_text is None
+            or next_state_text is None
+            or not local_id
             or not durable_signal_id
             or not durable_canonical_signal_id
             or not durable_client_id
@@ -2282,6 +2287,9 @@ class APOrderStateMachine:
                     "            AND COALESCE(meta->>'entry_efficiency_canonical_signal_id','')=%s "
                     "            AND LOWER(COALESCE(meta->>'entry_efficiency_client_id',''))=%s "
                     "            AND LOWER(COALESCE(meta->>'entry_efficiency_execution_mode',''))=%s "
+                    "            AND COALESCE(meta->>'entry_efficiency_state','') IN "
+                    "                ('READY_NOW','WAIT_CONFIRMATION','REARM_FOR_REBREACH',"
+                    "                 'TERMINAL_INVALID','EXPIRED') "
                     "            AND meta->>'entry_efficiency_generation' ~ '^[1-9][0-9]*$' "
                     "            AND (meta->>'entry_efficiency_generation')::bigint=%s) "
                     "      )",

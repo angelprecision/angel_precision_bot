@@ -33,6 +33,13 @@ READY_NOW = "READY_NOW"
 WAIT_CONFIRMATION = "WAIT_CONFIRMATION"
 REARM_FOR_REBREACH = "REARM_FOR_REBREACH"
 TERMINAL_INVALID = "TERMINAL_INVALID"
+ENTRY_EFFICIENCY_LIFECYCLE_STATES = frozenset({
+    READY_NOW,
+    WAIT_CONFIRMATION,
+    REARM_FOR_REBREACH,
+    TERMINAL_INVALID,
+    "EXPIRED",
+})
 
 ENTRY_EFFICIENCY_IDENTITY_FIELDS = (
     "local_order_id",
@@ -61,6 +68,32 @@ _UNTRUSTED_INTELLIGENCE_KEYS = frozenset({
 
 _ENTRY_EFFICIENCY_GENERATION_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _ENTRY_EFFICIENCY_GENERATION_MISSING = object()
+
+
+def parse_entry_efficiency_state(
+    raw: Any = "", *, allow_empty: bool = True
+) -> str | None:
+    """Parse one canonical persisted lifecycle state without coercion."""
+    if raw is None:
+        return "" if allow_empty else None
+    if not isinstance(raw, str):
+        return None
+    if raw == "":
+        return "" if allow_empty else None
+    if raw != raw.strip() or raw != raw.upper():
+        return None
+    return raw if raw in ENTRY_EFFICIENCY_LIFECYCLE_STATES else None
+
+
+def _parse_persisted_identity_text(raw: Any, *, lower: bool = False) -> str | None:
+    """Require a durable identity value to be present in canonical form."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        return None
+    if raw != raw.strip():
+        return None
+    return raw.lower() if lower else raw
 
 
 def _safe_float(value: Any) -> float | None:
@@ -213,9 +246,11 @@ def entry_efficiency_identity_is_proven(
     if signal_mode != "paper" or runtime_mode != "paper" or runtime_paper is not True:
         return False
 
-    persisted_state = str(
-        persisted_metadata.get("entry_efficiency_state") or ""
-    ).strip().upper()
+    persisted_state = parse_entry_efficiency_state(
+        persisted_metadata.get("entry_efficiency_state")
+    )
+    if persisted_state is None:
+        return False
     effective_state = (
         persisted_state if state is None else str(state or "").strip().upper()
     )
@@ -261,20 +296,22 @@ def entry_efficiency_identity_is_proven(
         "execution_mode": signal_mode,
     }
     persisted = {
-        "local_order_id": str(
-            persisted_metadata.get("entry_efficiency_local_order_id") or ""
-        ).strip(),
-        "signal_id": str(
-            persisted_metadata.get("entry_efficiency_signal_id") or ""
-        ).strip(),
-        "canonical_signal_id": str(
-            persisted_metadata.get("entry_efficiency_canonical_signal_id") or ""
-        ).strip(),
-        "client_id": str(
-            persisted_metadata.get("entry_efficiency_client_id") or ""
-        ).strip().lower(),
+        "local_order_id": _parse_persisted_identity_text(
+            persisted_metadata.get("entry_efficiency_local_order_id")
+        ),
+        "signal_id": _parse_persisted_identity_text(
+            persisted_metadata.get("entry_efficiency_signal_id")
+        ),
+        "canonical_signal_id": _parse_persisted_identity_text(
+            persisted_metadata.get("entry_efficiency_canonical_signal_id")
+        ),
+        "client_id": _parse_persisted_identity_text(
+            persisted_metadata.get("entry_efficiency_client_id"), lower=True
+        ),
         "execution_mode": _normalize_entry_efficiency_execution_mode(
-            persisted_metadata.get("entry_efficiency_execution_mode")
+            _parse_persisted_identity_text(
+                persisted_metadata.get("entry_efficiency_execution_mode")
+            )
         ),
     }
     if any(not expected[field] for field in ENTRY_EFFICIENCY_IDENTITY_FIELDS):
@@ -583,6 +620,7 @@ __all__ = [
     "EntryEfficiencyResult",
     "ENTRY_EFFICIENCY_MODES",
     "ENTRY_EFFICIENCY_IDENTITY_FIELDS",
+    "ENTRY_EFFICIENCY_LIFECYCLE_STATES",
     "ENTRY_EFFICIENCY_OBSERVE_ONLY",
     "ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE",
     "READY_NOW",
@@ -592,5 +630,6 @@ __all__ = [
     "evaluate_entry_efficiency",
     "entry_efficiency_identity_is_proven",
     "normalize_strategy_pattern",
+    "parse_entry_efficiency_state",
     "resolve_entry_efficiency_mode",
 ]

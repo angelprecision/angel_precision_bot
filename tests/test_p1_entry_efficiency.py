@@ -585,6 +585,40 @@ def test_watcher_restart_identity_conflict_is_telemetry_only(monkeypatch, field,
 
 
 @pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_efficiency_state", " WAIT_CONFIRMATION "),
+        ("entry_efficiency_state", "CORRUPT_STATE"),
+        ("entry_efficiency_local_order_id", " order-efficiency "),
+        ("entry_efficiency_signal_id", " sig-efficiency "),
+        ("entry_efficiency_canonical_signal_id", " canonical-sig-efficiency "),
+        ("entry_efficiency_client_id", " jason@example.com "),
+        ("entry_efficiency_execution_mode", " paper "),
+    ],
+)
+def test_watcher_noncanonical_or_unknown_efficiency_state_is_telemetry_only(
+    monkeypatch, field, value
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    signal = _watch_signal(
+        entry_efficiency_state=WAIT_CONFIRMATION,
+        entry_efficiency_generation=1,
+        entry_efficiency_next_eval_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    )
+    signal["metadata"][field] = value
+    watched = _watched_with_runtime(signal, mode="PAPER")
+    watcher = watched._watcher_ref
+
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.PENDING
+    assert watched.check(302.79, 302.81, quote_age_ms=1_000) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched._entry_efficiency_persist_request is None
+    watcher.order_state_machine.cas_entry_efficiency_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "plan_modes, signal_mode, runtime_mode, paper_flag",
     [
         (("paper",), "live", "live", False),
@@ -719,6 +753,13 @@ def test_execution_core_conflicting_identity_stays_on_existing_path(
         ("entry_efficiency_canonical_signal_id", "foreign-canonical"),
         ("entry_efficiency_local_order_id", "foreign-order"),
         ("entry_efficiency_execution_mode", "live"),
+        ("entry_efficiency_client_id", " foreign@example.com "),
+        ("entry_efficiency_signal_id", " foreign-signal "),
+        ("entry_efficiency_canonical_signal_id", " foreign-canonical "),
+        ("entry_efficiency_local_order_id", " foreign-order "),
+        ("entry_efficiency_execution_mode", " paper "),
+        ("entry_efficiency_state", " WAIT_CONFIRMATION "),
+        ("entry_efficiency_state", "CORRUPT_STATE"),
     ],
 )
 def test_execution_core_stateful_efficiency_identity_conflict_stays_on_existing_path(
@@ -1447,6 +1488,13 @@ def test_postgres_cas_rejects_malformed_missing_and_stale_generation(
         ("entry_efficiency_canonical_signal_id", "foreign-canonical"),
         ("entry_efficiency_client_id", "foreign-client"),
         ("entry_efficiency_execution_mode", "live"),
+        ("entry_efficiency_state", " WAIT_CONFIRMATION "),
+        ("entry_efficiency_state", "CORRUPT_STATE"),
+        ("entry_efficiency_local_order_id", " order-cas "),
+        ("entry_efficiency_signal_id", " signal-a "),
+        ("entry_efficiency_canonical_signal_id", " canonical-a "),
+        ("entry_efficiency_client_id", " client-a "),
+        ("entry_efficiency_execution_mode", " paper "),
     ],
 )
 def test_postgres_cas_rejects_stateful_efficiency_identity_mismatch(
@@ -1470,6 +1518,31 @@ def test_postgres_cas_rejects_stateful_efficiency_identity_mismatch(
         expected_state=WAIT_CONFIRMATION,
         expected_generation=1,
         next_state=REARM_FOR_REBREACH,
+        next_generation=2,
+    ) is False
+    assert db.read_meta() == meta
+
+
+def test_postgres_cas_rejects_unknown_existing_efficiency_state(
+    postgres_entry_efficiency_db,
+):
+    db = postgres_entry_efficiency_db
+    meta = {
+        "entry_efficiency_state": "CORRUPT_STATE",
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
+    }
+    db.replace_row(meta=meta)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state="CORRUPT_STATE",
+        expected_generation=1,
+        next_state=READY_NOW,
         next_generation=2,
     ) is False
     assert db.read_meta() == meta
