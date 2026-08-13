@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
@@ -12,17 +13,40 @@ from zoneinfo import ZoneInfo
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ap.morning_jobs import (
-    DEFAULT_LIVE_CLIENT,
-    DEFAULT_PAPER_CLIENTS,
-    MORNING_HANDOFF_BACKUP_JOB,
-    MORNING_HANDOFF_PRIMARY_JOB,
-    MORNING_RECOVERY_JOB,
-    OVERNIGHT_REEVAL_BATCH_JOB,
-    build_job_calls,
-    call_admin_endpoint,
-    should_run_now,
-)
+
+def _load_standalone_morning_jobs():
+    """Load the HTTP job helpers without importing the DB-bound ``ap`` package.
+
+    This runner only calls the bot's signed HTTP control-plane endpoints.  A
+    normal ``from ap.morning_jobs`` import first executes ``ap/__init__.py``,
+    which installs trading safety guards and requires a database URL.  That
+    makes scheduled jobs fail before they can make their HTTP call when the
+    runner has no database configured.  ``ap/morning_jobs.py`` is intentionally
+    stdlib-only, so load that file directly and keep the trading runtime out of
+    this process.
+    """
+
+    helper_path = Path(__file__).resolve().parents[1] / "morning_jobs.py"
+    module_name = "_ap_standalone_morning_jobs"
+    spec = importlib.util.spec_from_file_location(module_name, helper_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"unable to load morning job helpers from {helper_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_MORNING_JOBS = _load_standalone_morning_jobs()
+DEFAULT_LIVE_CLIENT = _MORNING_JOBS.DEFAULT_LIVE_CLIENT
+DEFAULT_PAPER_CLIENTS = _MORNING_JOBS.DEFAULT_PAPER_CLIENTS
+MORNING_HANDOFF_BACKUP_JOB = _MORNING_JOBS.MORNING_HANDOFF_BACKUP_JOB
+MORNING_HANDOFF_PRIMARY_JOB = _MORNING_JOBS.MORNING_HANDOFF_PRIMARY_JOB
+MORNING_RECOVERY_JOB = _MORNING_JOBS.MORNING_RECOVERY_JOB
+OVERNIGHT_REEVAL_BATCH_JOB = _MORNING_JOBS.OVERNIGHT_REEVAL_BATCH_JOB
+build_job_calls = _MORNING_JOBS.build_job_calls
+call_admin_endpoint = _MORNING_JOBS.call_admin_endpoint
+should_run_now = _MORNING_JOBS.should_run_now
 
 
 logging.basicConfig(

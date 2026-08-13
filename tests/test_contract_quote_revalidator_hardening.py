@@ -18,10 +18,12 @@ from ap.contract_quote_revalidator import (
     fetch_direct_option_quote_with_meta,
     final_quote_check_before_submit,
     revalidate_with_direct_quote,
+    direct_quote_is_valid,
     REASON_DIRECT_QUOTE_AUTH_FAILED,
     REASON_DIRECT_QUOTE_FETCH_TIMEOUT,
     REASON_DIRECT_QUOTE_RATE_LIMITED,
     REASON_DIRECT_QUOTE_SERVER_ERROR,
+    REASON_FINAL_CONTRACT_QUOTE_INVALID,
     REASON_FINAL_CONTRACT_UNAFFORDABLE,
 )
 
@@ -131,6 +133,121 @@ def test_backward_compatible_fetch_still_returns_normalized_empty_quote():
     assert quote["bid"] is None
     assert quote["ask"] is None
     assert quote["quote_age_semantics"] == "fetch_latency_not_exchange_age"
+
+
+def test_invalid_direct_quote_is_not_cached_over_a_recovered_feed():
+    class SequencedBroker(StubBroker):
+        def __init__(self):
+            super().__init__(quote={})
+            self.responses = [
+                {"bid": 0.0, "ask": 0.0},
+                {"bid": 1.20, "ask": 1.25},
+            ]
+
+        def get_quote(self, symbol: str):
+            self.calls.append(symbol)
+            return dict(self.responses.pop(0))
+
+    broker = SequencedBroker()
+    first = fetch_direct_option_quote_with_meta(broker, OCC)
+    second = fetch_direct_option_quote_with_meta(broker, OCC)
+
+    assert first["ok"] is True
+    assert first["quote"]["bid"] == 0.0
+    assert second["ok"] is True
+    assert second["quote"]["bid"] == 1.20
+    assert broker.calls == [OCC, OCC]
+
+
+@pytest.mark.parametrize(
+    "invalid_quote",
+    [
+        {"bid": float("nan"), "ask": 1.25},
+        {"bid": 1.20, "ask": float("nan")},
+        {"bid": float("inf"), "ask": float("inf")},
+        {"bid": True, "ask": True},
+        {"bid": 10**10000, "ask": 10**10000},
+    ],
+)
+def test_nonfinite_boolean_and_overflow_quotes_are_invalid(invalid_quote):
+    assert direct_quote_is_valid(invalid_quote) is False
+
+
+@pytest.mark.parametrize(
+    "invalid_quote",
+    [
+        {"bid": float("nan"), "ask": 1.25},
+        {"bid": 1.20, "ask": float("nan")},
+        {"bid": float("inf"), "ask": float("inf")},
+        {"bid": True, "ask": True},
+        {"bid": 10**10000, "ask": 10**10000},
+    ],
+)
+def test_malformed_direct_quote_is_not_cached(invalid_quote):
+    class SequencedBroker(StubBroker):
+        def __init__(self):
+            super().__init__(quote={})
+            self.responses = [invalid_quote, {"bid": 1.20, "ask": 1.25}]
+
+        def get_quote(self, symbol: str):
+            self.calls.append(symbol)
+            return dict(self.responses.pop(0))
+
+    broker = SequencedBroker()
+    first = fetch_direct_option_quote_with_meta(broker, OCC)
+    second = fetch_direct_option_quote_with_meta(broker, OCC)
+
+    assert first["ok"] is True
+    assert direct_quote_is_valid(first["quote"]) is False
+    assert second["quote"]["bid"] == 1.20
+    assert broker.calls == [OCC, OCC]
+
+
+def test_legacy_fetch_does_not_cache_malformed_direct_quote():
+    class SequencedBroker(StubBroker):
+        def __init__(self):
+            super().__init__(quote={})
+            self.responses = [
+                {"bid": float("nan"), "ask": 1.25},
+                {"bid": 1.20, "ask": 1.25},
+            ]
+
+        def get_quote(self, symbol: str):
+            self.calls.append(symbol)
+            return dict(self.responses.pop(0))
+
+    broker = SequencedBroker()
+    first = fetch_direct_option_quote(broker, OCC)
+    second = fetch_direct_option_quote(broker, OCC)
+
+    assert first["bid"] is None
+    assert second["bid"] == 1.20
+    assert broker.calls == [OCC, OCC]
+
+
+@pytest.mark.parametrize(
+    "invalid_quote",
+    [
+        {"bid": float("nan"), "ask": 1.25},
+        {"bid": 1.20, "ask": float("nan")},
+        {"bid": True, "ask": True},
+    ],
+)
+def test_final_quote_gate_rejects_malformed_direct_quote(invalid_quote):
+    broker = StubBroker(quote=invalid_quote)
+    result = final_quote_check_before_submit(
+        broker,
+        OCC,
+        max_spread_pct=0.50,
+        min_premium=10.0,
+        max_premium=350.0,
+        budget_usd=1000.0,
+        qty=1,
+        is_live=True,
+    )
+
+    assert result["ok"] is False
+    assert result["reason_code"] == REASON_FINAL_CONTRACT_QUOTE_INVALID
 
 
 def test_direct_quote_metadata_names_latency_not_exchange_age():

@@ -106,6 +106,7 @@ jobs:
             tests/test_p0_forward_regime_advisory_flow.py \
             tests/test_p0_gate_g_production_shape.py \
             tests/test_p0_selector_direct_quote_budget_authority.py \
+            tests/test_contract_quote_revalidator_hardening.py \
             tests/test_p0_selector_terminal_truth_ranked_quotes_current_main.py \
             tests/test_p0_trigger_anchored_strike_selection.py \
             tests/test_p0_selector_recovery_capacity_and_validity.py \
@@ -130,6 +131,8 @@ jobs:
             tests/test_p0_intelligence_postgres.py \
             tests/test_p0_pending_trigger_restart_recovery.py \
             tests/test_p0_pr445_stuck_trigger_ready_prebroker_recovery.py \
+            tests/test_p0_reconciler_execution_core_wiring.py \
+            tests/test_p0_scheduled_job_dependencies.py \
             tests/test_entry_watcher_audit.py \
             tests/test_p0_watcher_invalidation_ownership.py \
             tests/test_p0_watcher_rollback_exact_registration_identity.py \
