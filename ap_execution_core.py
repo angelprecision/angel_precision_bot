@@ -43,6 +43,7 @@ from ap_entry_efficiency import (
     TERMINAL_INVALID as ENTRY_EFFICIENCY_TERMINAL_INVALID,
     WAIT_CONFIRMATION as ENTRY_EFFICIENCY_WAIT_CONFIRMATION,
     evaluate_entry_efficiency,
+    entry_efficiency_identity_is_proven,
     parse_entry_efficiency_generation,
 )
 
@@ -4655,6 +4656,14 @@ class APExecutionCore:
             _efficiency_generation_valid = _efficiency_prior_generation is not None
         else:
             _efficiency_prior_generation = None
+        _efficiency_identity_proven = entry_efficiency_identity_is_proven(
+            sig,
+            metadata=_efficiency_meta,
+            runtime_execution_mode=_efficiency_execution_mode,
+            runtime_paper=getattr(self, "paper", None),
+            state=_efficiency_prior_state,
+            generation=_efficiency_prior_generation,
+        )
         _efficiency_first_breach = (
             getattr(watched, "trigger_crossed_at", None)
             or sig.get("trigger_crossed_at")
@@ -4662,10 +4671,11 @@ class APExecutionCore:
         _efficiency_watched_deadline = getattr(
             watched, "entry_efficiency_deadline_at", None
         )
-        if not _efficiency_generation_valid:
-            # A persisted lifecycle state without a canonical generation is
-            # telemetry only.  Do not let the evaluator manufacture generation
-            # zero and do not expose a CAS/WAIT/TERMINAL path to the caller.
+        if not _efficiency_generation_valid or not _efficiency_identity_proven:
+            # A persisted lifecycle without a canonical generation or exact
+            # opportunity identity is telemetry only.  Do not let the
+            # evaluator manufacture authority or expose a CAS path that could
+            # rebind a foreign lifecycle to this row.
             _efficiency_execution_mode = None
         _efficiency_result = evaluate_entry_efficiency(
             ticker=ticker,

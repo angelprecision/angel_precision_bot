@@ -30,6 +30,7 @@ for _name in dir(_base):
 
 from ap_entry_efficiency import (
     ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE as _ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE,
+    entry_efficiency_identity_is_proven as _entry_efficiency_identity_is_proven,
     normalize_strategy_pattern as _normalize_strategy_pattern,
     parse_entry_efficiency_generation as _parse_entry_efficiency_generation,
     resolve_entry_efficiency_mode as _resolve_entry_efficiency_mode,
@@ -48,13 +49,6 @@ _ENTRY_EFFICIENCY_WAIT_STATES = frozenset({
     "WAIT_CONFIRMATION",
     "REARM_FOR_REBREACH",
 })
-_ENTRY_EFFICIENCY_IDENTITY_FIELDS = (
-    "local_order_id",
-    "signal_id",
-    "canonical_signal_id",
-    "client_id",
-    "execution_mode",
-)
 
 
 def _parse_entry_efficiency_at(value: _Any) -> _datetime | None:
@@ -129,74 +123,6 @@ def _entry_efficiency_runtime_mode(watched: _Any) -> str | None:
     if not values or len(set(values)) != 1:
         return None
     return values[0]
-
-
-def _entry_efficiency_identity_is_proven(watched: _Any) -> bool:
-    """Require durable efficiency identity to match the reconstructed signal."""
-    signal = getattr(watched, "signal", {}) or {}
-    metadata = signal.get("metadata") or {}
-    if not isinstance(metadata, dict):
-        return False
-
-    signal_mode = _normalize_execution_mode(signal.get("execution_mode"))
-    runtime_mode = _entry_efficiency_runtime_mode(watched)
-    if signal_mode != "paper" or runtime_mode != "paper":
-        return False
-
-    expected = {
-        "local_order_id": str(signal.get("local_order_id") or "").strip(),
-        "signal_id": str(
-            getattr(watched, "signal_id", None) or signal.get("signal_id") or ""
-        ).strip(),
-        "canonical_signal_id": str(
-            signal.get("canonical_signal_id")
-            or metadata.get("canonical_signal_id")
-            or ""
-        ).strip(),
-        "client_id": str(
-            signal.get("client_id")
-            or signal.get("client_email")
-            or metadata.get("client_id")
-            or metadata.get("client_email")
-            or ""
-        ).strip().lower(),
-        "execution_mode": signal_mode,
-    }
-    persisted = {
-        "local_order_id": str(
-            metadata.get("entry_efficiency_local_order_id") or ""
-        ).strip(),
-        "signal_id": str(metadata.get("entry_efficiency_signal_id") or "").strip(),
-        "canonical_signal_id": str(
-            metadata.get("entry_efficiency_canonical_signal_id") or ""
-        ).strip(),
-        "client_id": str(
-            metadata.get("entry_efficiency_client_id") or ""
-        ).strip().lower(),
-        "execution_mode": _normalize_execution_mode(
-            metadata.get("entry_efficiency_execution_mode")
-        ),
-    }
-    if any(not expected[field] for field in _ENTRY_EFFICIENCY_IDENTITY_FIELDS):
-        return False
-    if any(not persisted[field] for field in _ENTRY_EFFICIENCY_IDENTITY_FIELDS):
-        return False
-    if any(
-        persisted[field] != expected[field]
-        for field in _ENTRY_EFFICIENCY_IDENTITY_FIELDS
-    ):
-        return False
-
-    if "entry_efficiency_generation" not in metadata:
-        return False
-    generation = _parse_entry_efficiency_generation(
-        metadata.get("entry_efficiency_generation"),
-        state=getattr(watched, "entry_efficiency_state", ""),
-    )
-    return (
-        generation is not None
-        and generation == getattr(watched, "entry_efficiency_generation", None)
-    )
 
 
 @_dataclass(frozen=True)
@@ -351,6 +277,12 @@ class WatchedSignal(_BaseWatchedSignal):
         execution_mode = str(
             signal.get("execution_mode") or ""
         ).strip().lower()
+        prior_state = str(getattr(self, "entry_efficiency_state", "") or "").upper()
+        prior_generation = _parse_entry_efficiency_generation(
+            getattr(self, "entry_efficiency_generation", None),
+            state=prior_state,
+        )
+        runtime_mode = _entry_efficiency_runtime_mode(self)
         _, pattern_applies = _normalize_strategy_pattern(
             signal.get("pattern"), signal.get("timeframe")
         )
@@ -361,20 +293,22 @@ class WatchedSignal(_BaseWatchedSignal):
             and bool(
                 getattr(self, "entry_efficiency_generation_valid", False)
             )
-            and _entry_efficiency_runtime_mode(self) == "paper"
-            and _entry_efficiency_identity_is_proven(self)
+            and runtime_mode == "paper"
+            and _entry_efficiency_identity_is_proven(
+                signal,
+                metadata=signal.get("metadata"),
+                runtime_execution_mode=runtime_mode,
+                runtime_paper=True,
+                state=prior_state,
+                generation=prior_generation,
+            )
         )
         if not efficiency_behavior_enabled:
             return super().check(bid, ask, quote_age_ms=quote_age_ms)
 
-        prior_state = str(getattr(self, "entry_efficiency_state", "") or "").upper()
         if prior_state not in _ENTRY_EFFICIENCY_WAIT_STATES:
             return super().check(bid, ask, quote_age_ms=quote_age_ms)
 
-        prior_generation = _parse_entry_efficiency_generation(
-            getattr(self, "entry_efficiency_generation", None),
-            state=prior_state,
-        )
         if prior_generation is None:
             return super().check(bid, ask, quote_age_ms=quote_age_ms)
         prior_rearm = bool(getattr(self, "entry_efficiency_rearm_pending", False))

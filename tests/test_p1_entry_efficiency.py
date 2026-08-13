@@ -711,6 +711,228 @@ def test_execution_core_conflicting_identity_stays_on_existing_path(
     osm.submit_existing_entry.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_efficiency_client_id", "foreign@example.com"),
+        ("entry_efficiency_signal_id", "foreign-signal"),
+        ("entry_efficiency_canonical_signal_id", "foreign-canonical"),
+        ("entry_efficiency_local_order_id", "foreign-order"),
+        ("entry_efficiency_execution_mode", "live"),
+    ],
+)
+def test_execution_core_stateful_efficiency_identity_conflict_stays_on_existing_path(
+    monkeypatch, field, value
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    efficiency_metadata = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat(),
+    }
+    signal = _watch_signal(**efficiency_metadata)
+    signal["metadata"][field] = value
+    watched = WatchedSignal(signal, overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": "canonical-sig-efficiency",
+        },
+        execution_mode="paper",
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+
+    class ExistingPathReached(RuntimeError):
+        pass
+
+    refresh = MagicMock(side_effect=ExistingPathReached)
+    observed_results = []
+    real_evaluate_entry_efficiency = execution_core_module.evaluate_entry_efficiency
+
+    def _observe_efficiency_result(**kwargs):
+        result = real_evaluate_entry_efficiency(**kwargs)
+        observed_results.append(result)
+        return result
+
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _refresh_hydrated_prebreach_plan=refresh,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *a, **k: None,
+        )
+        patcher.setattr(
+            execution_core_module,
+            "evaluate_entry_efficiency",
+            _observe_efficiency_result,
+        )
+        with pytest.raises(ExistingPathReached):
+            APExecutionCore._on_entry_trigger(core, watched)
+
+    assert observed_results
+    assert observed_results[0].authoritative is False
+    assert observed_results[0].decision not in {WAIT_CONFIRMATION, TERMINAL_INVALID}
+    refresh.assert_called_once()
+    osm.cas_entry_efficiency_state.assert_not_called()
+    osm.submit_existing_entry.assert_not_called()
+
+
+def test_execution_core_exact_persisted_efficiency_identity_allows_authoritative_cas(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    efficiency_metadata = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_next_eval_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        "entry_efficiency_deadline_at": deadline,
+    }
+    watched = WatchedSignal(_watch_signal(**efficiency_metadata), overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            **efficiency_metadata,
+            "canonical_signal_id": "canonical-sig-efficiency",
+        },
+        execution_mode="paper",
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = True
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *a, **k: None,
+        )
+        result = APExecutionCore._on_entry_trigger(core, watched)
+
+    assert result["disposition"] == "ENTRY_EFFICIENCY_WAIT"
+    assert result["reason_code"] == "ENTRY_EFFICIENCY_OPENING_BREACH"
+    call = osm.cas_entry_efficiency_state.call_args.kwargs
+    assert call["expected_state"] == WAIT_CONFIRMATION
+    assert call["expected_generation"] == 1
+    assert call["next_state"] == WAIT_CONFIRMATION
+    assert call["next_generation"] == 2
+    assert call["meta_patch"]["entry_efficiency_local_order_id"] == "order-efficiency"
+    assert call["meta_patch"]["entry_efficiency_signal_id"] == "sig-efficiency"
+    assert call["meta_patch"]["entry_efficiency_canonical_signal_id"] == "canonical-sig-efficiency"
+    assert call["meta_patch"]["entry_efficiency_client_id"] == "jason@example.com"
+    assert call["meta_patch"]["entry_efficiency_execution_mode"] == "paper"
+
+
+def test_execution_core_empty_generation_zero_establishes_first_efficiency_identity(
+    monkeypatch,
+):
+    monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
+    watched = WatchedSignal(_watch_signal(), overnight=False)
+    watched.trigger_crossed_at = FIRST_BREACH
+    watched.last_quote_bid = 302.79
+    watched.last_quote_ask = 302.81
+    watched.last_quote_age_ms = 1_000
+
+    plan = SimpleNamespace(
+        metadata={
+            "canonical_signal_id": "canonical-sig-efficiency",
+            "entry_efficiency_deadline_at": "2099-08-12T14:21:51+00:00",
+        },
+        execution_mode="paper",
+        client_id="jason@example.com",
+        pattern="2-3",
+        timeframe="1d",
+        contract_symbol="AAPL260821P00304000",
+    )
+    osm = MagicMock()
+    osm.cas_entry_efficiency_state.return_value = True
+    core = SimpleNamespace(
+        mode="PAPER",
+        paper=True,
+        execution_mode="paper",
+        email="jason@example.com",
+        client_id="jason@example.com",
+        order_state_machine=osm,
+        store=MagicMock(),
+        contract_selector=MagicMock(),
+        _breach_risk_check=lambda _watched: True,
+        _recover_plan_for_revalidation=lambda _watched: plan,
+        _emit_breach_diag=lambda *args, **kwargs: None,
+    )
+
+    from ap import intelligence_evaluation
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            intelligence_evaluation,
+            "_ensure_intelligence_dispatched",
+            lambda *a, **k: None,
+        )
+        result = APExecutionCore._on_entry_trigger(core, watched)
+
+    assert result["disposition"] == "ENTRY_EFFICIENCY_WAIT"
+    call = osm.cas_entry_efficiency_state.call_args.kwargs
+    assert call["expected_state"] == ""
+    assert call["expected_generation"] == 0
+    assert call["next_state"] == WAIT_CONFIRMATION
+    assert call["next_generation"] == 1
+    assert call["meta_patch"]["entry_efficiency_local_order_id"] == "order-efficiency"
+
+
 def test_watcher_pullback_stages_distinct_rearm_cas_request(monkeypatch):
     monkeypatch.setenv("AP_ENTRY_EFFICIENCY_MODE", ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE)
     watched = _watched_with_runtime(_watch_signal(
@@ -931,6 +1153,11 @@ def test_osm_efficiency_cas_has_exact_entry_identity_and_no_broker_evidence():
         "broker_order_id",
         "submit_intent_at",
         "entry_efficiency_generation",
+        "entry_efficiency_local_order_id",
+        "entry_efficiency_signal_id",
+        "entry_efficiency_canonical_signal_id",
+        "entry_efficiency_client_id",
+        "entry_efficiency_execution_mode",
     ):
         assert required in source
     assert "canonical_signal_id" in source
@@ -1071,7 +1298,14 @@ def _postgres_efficiency_cas(osm, **overrides):
         "expected_generation": 0,
         "next_state": WAIT_CONFIRMATION,
         "next_generation": 1,
-        "meta_patch": {"cas_test": True},
+        "meta_patch": {
+            "cas_test": True,
+            "entry_efficiency_local_order_id": "order-cas",
+            "entry_efficiency_signal_id": "signal-a",
+            "entry_efficiency_canonical_signal_id": "canonical-a",
+            "entry_efficiency_client_id": "client-a",
+            "entry_efficiency_execution_mode": "paper",
+        },
     }
     values.update(overrides)
     return osm.cas_entry_efficiency_state(**values)
@@ -1105,6 +1339,11 @@ def test_postgres_cas_rejects_stateful_zero_generation(
     meta = {
         "entry_efficiency_state": state,
         "entry_efficiency_generation": 0,
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
     }
     db.replace_row(meta=meta)
 
@@ -1180,6 +1419,14 @@ def test_postgres_cas_rejects_malformed_missing_and_stale_generation(
     postgres_entry_efficiency_db, meta, expected_generation
 ):
     db = postgres_entry_efficiency_db
+    meta = {
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
+        **meta,
+    }
     db.replace_row(meta=meta)
 
     assert _postgres_efficiency_cas(
@@ -1188,6 +1435,42 @@ def test_postgres_cas_rejects_malformed_missing_and_stale_generation(
         expected_generation=expected_generation,
         next_state=REARM_FOR_REBREACH,
         next_generation=expected_generation + 1,
+    ) is False
+    assert db.read_meta() == meta
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("entry_efficiency_local_order_id", "foreign-order"),
+        ("entry_efficiency_signal_id", "foreign-signal"),
+        ("entry_efficiency_canonical_signal_id", "foreign-canonical"),
+        ("entry_efficiency_client_id", "foreign-client"),
+        ("entry_efficiency_execution_mode", "live"),
+    ],
+)
+def test_postgres_cas_rejects_stateful_efficiency_identity_mismatch(
+    postgres_entry_efficiency_db, field, value
+):
+    db = postgres_entry_efficiency_db
+    meta = {
+        "entry_efficiency_state": WAIT_CONFIRMATION,
+        "entry_efficiency_generation": 1,
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
+    }
+    meta[field] = value
+    db.replace_row(meta=meta)
+
+    assert _postgres_efficiency_cas(
+        db.osm,
+        expected_state=WAIT_CONFIRMATION,
+        expected_generation=1,
+        next_state=REARM_FOR_REBREACH,
+        next_generation=2,
     ) is False
     assert db.read_meta() == meta
 
@@ -1219,6 +1502,11 @@ def test_postgres_cas_refuses_identity_broker_and_status_conflicts(
     row_meta = {
         "entry_efficiency_state": WAIT_CONFIRMATION,
         "entry_efficiency_generation": 1,
+        "entry_efficiency_local_order_id": "order-cas",
+        "entry_efficiency_signal_id": "signal-a",
+        "entry_efficiency_canonical_signal_id": "canonical-a",
+        "entry_efficiency_client_id": "client-a",
+        "entry_efficiency_execution_mode": "paper",
     }
     row_kwargs = dict(row_updates)
     row_meta.update(row_kwargs.pop("meta", {}))

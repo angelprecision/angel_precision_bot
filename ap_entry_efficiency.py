@@ -34,6 +34,14 @@ WAIT_CONFIRMATION = "WAIT_CONFIRMATION"
 REARM_FOR_REBREACH = "REARM_FOR_REBREACH"
 TERMINAL_INVALID = "TERMINAL_INVALID"
 
+ENTRY_EFFICIENCY_IDENTITY_FIELDS = (
+    "local_order_id",
+    "signal_id",
+    "canonical_signal_id",
+    "client_id",
+    "execution_mode",
+)
+
 _DAILY_TIMEFRAMES = frozenset({"1d", "d", "day", "daily"})
 _UNTRUSTED_INTELLIGENCE_KEYS = frozenset({
     "breach_profile",
@@ -167,6 +175,116 @@ def parse_entry_efficiency_generation(
     if state_present:
         return generation if generation >= 1 else None
     return 0 if generation == 0 else None
+
+
+def _normalize_entry_efficiency_execution_mode(raw: Any) -> str | None:
+    normalized = str(raw or "").strip().lower()
+    return normalized if normalized in {"paper", "live"} else None
+
+
+def entry_efficiency_identity_is_proven(
+    signal: Mapping[str, Any] | None,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    runtime_execution_mode: Any = None,
+    runtime_paper: Any = None,
+    state: Any = None,
+    generation: Any = _ENTRY_EFFICIENCY_GENERATION_MISSING,
+) -> bool:
+    """Prove persisted efficiency identity before honoring a lifecycle state.
+
+    A non-empty lifecycle must be bound to the reconstructed opportunity and
+    to the current PAPER runtime.  The empty initial lifecycle at generation
+    zero is intentionally allowed to establish those durable identity fields
+    on its first authoritative CAS transition.
+    """
+    if not isinstance(signal, Mapping):
+        return False
+    persisted_metadata = metadata if metadata is not None else signal.get("metadata")
+    if not isinstance(persisted_metadata, Mapping):
+        return False
+
+    signal_mode = _normalize_entry_efficiency_execution_mode(
+        signal.get("execution_mode")
+    )
+    runtime_mode = _normalize_entry_efficiency_execution_mode(
+        runtime_execution_mode
+    )
+    if signal_mode != "paper" or runtime_mode != "paper" or runtime_paper is not True:
+        return False
+
+    persisted_state = str(
+        persisted_metadata.get("entry_efficiency_state") or ""
+    ).strip().upper()
+    effective_state = (
+        persisted_state if state is None else str(state or "").strip().upper()
+    )
+    if state is not None and effective_state != persisted_state:
+        return False
+
+    persisted_generation = parse_entry_efficiency_generation(
+        persisted_metadata.get(
+            "entry_efficiency_generation", _ENTRY_EFFICIENCY_GENERATION_MISSING
+        ),
+        state=effective_state,
+    )
+    if persisted_generation is None:
+        return False
+    observed_generation = (
+        persisted_generation
+        if generation is _ENTRY_EFFICIENCY_GENERATION_MISSING
+        else parse_entry_efficiency_generation(generation, state=effective_state)
+    )
+    if observed_generation is None or observed_generation != persisted_generation:
+        return False
+
+    # No lifecycle state exists yet; generation zero is the only valid initial
+    # state and the first authoritative transition may establish identity.
+    if not effective_state:
+        return persisted_generation == 0 and observed_generation == 0
+
+    expected = {
+        "local_order_id": str(signal.get("local_order_id") or "").strip(),
+        "signal_id": str(signal.get("signal_id") or "").strip(),
+        "canonical_signal_id": str(
+            signal.get("canonical_signal_id")
+            or persisted_metadata.get("canonical_signal_id")
+            or ""
+        ).strip(),
+        "client_id": str(
+            signal.get("client_id")
+            or signal.get("client_email")
+            or persisted_metadata.get("client_id")
+            or persisted_metadata.get("client_email")
+            or ""
+        ).strip().lower(),
+        "execution_mode": signal_mode,
+    }
+    persisted = {
+        "local_order_id": str(
+            persisted_metadata.get("entry_efficiency_local_order_id") or ""
+        ).strip(),
+        "signal_id": str(
+            persisted_metadata.get("entry_efficiency_signal_id") or ""
+        ).strip(),
+        "canonical_signal_id": str(
+            persisted_metadata.get("entry_efficiency_canonical_signal_id") or ""
+        ).strip(),
+        "client_id": str(
+            persisted_metadata.get("entry_efficiency_client_id") or ""
+        ).strip().lower(),
+        "execution_mode": _normalize_entry_efficiency_execution_mode(
+            persisted_metadata.get("entry_efficiency_execution_mode")
+        ),
+    }
+    if any(not expected[field] for field in ENTRY_EFFICIENCY_IDENTITY_FIELDS):
+        return False
+    if any(not persisted[field] for field in ENTRY_EFFICIENCY_IDENTITY_FIELDS):
+        return False
+    return all(
+        persisted[field] == expected[field]
+        for field in ENTRY_EFFICIENCY_IDENTITY_FIELDS
+    )
 
 
 def normalize_strategy_pattern(pattern: Any, timeframe: Any) -> tuple[str, bool]:
@@ -464,6 +582,7 @@ def evaluate_entry_efficiency(
 __all__ = [
     "EntryEfficiencyResult",
     "ENTRY_EFFICIENCY_MODES",
+    "ENTRY_EFFICIENCY_IDENTITY_FIELDS",
     "ENTRY_EFFICIENCY_OBSERVE_ONLY",
     "ENTRY_EFFICIENCY_PAPER_AUTHORITATIVE",
     "READY_NOW",
@@ -471,6 +590,7 @@ __all__ = [
     "TERMINAL_INVALID",
     "WAIT_CONFIRMATION",
     "evaluate_entry_efficiency",
+    "entry_efficiency_identity_is_proven",
     "normalize_strategy_pattern",
     "resolve_entry_efficiency_mode",
 ]

@@ -2277,6 +2277,11 @@ class APOrderStateMachine:
                     "            AND meta->>'entry_efficiency_generation' ~ '^0$' "
                     "            AND (meta->>'entry_efficiency_generation')::bigint=%s) "
                     "        OR (COALESCE(meta->>'entry_efficiency_state','')<>'' "
+                    "            AND COALESCE(meta->>'entry_efficiency_local_order_id','')=%s "
+                    "            AND COALESCE(meta->>'entry_efficiency_signal_id','')=%s "
+                    "            AND COALESCE(meta->>'entry_efficiency_canonical_signal_id','')=%s "
+                    "            AND LOWER(COALESCE(meta->>'entry_efficiency_client_id',''))=%s "
+                    "            AND LOWER(COALESCE(meta->>'entry_efficiency_execution_mode',''))=%s "
                     "            AND meta->>'entry_efficiency_generation' ~ '^[1-9][0-9]*$' "
                     "            AND (meta->>'entry_efficiency_generation')::bigint=%s) "
                     "      )",
@@ -2290,6 +2295,11 @@ class APOrderStateMachine:
                         expected_state_text,
                         expected_gen,
                         expected_gen,
+                        local_id,
+                        durable_signal_id,
+                        durable_canonical_signal_id,
+                        durable_client_id,
+                        durable_mode,
                         expected_gen,
                     ),
                 )
