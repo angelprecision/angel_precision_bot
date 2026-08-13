@@ -2,7 +2,7 @@
 
 ## Status
 
-**DRAFT / HARD HOLD — SPEC ONLY. DO NOT MERGE OR DEPLOY AS AN IMPLEMENTATION.**
+**DRAFT / HARD HOLD — IMPLEMENTATION IN PROGRESS. DO NOT MERGE OR DEPLOY.**
 
 This PR records a production-proven LIVE entry-conversion defect from 2026-08-12. The implementation must be rebuilt against then-current `main`, must reproduce the incident before changing production behavior, and must remain Draft/HARD HOLD until exact-head tests and independent money-path review are attached.
 

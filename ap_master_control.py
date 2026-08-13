@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -418,6 +419,7 @@ class ControlDecision:
     signal_id: str = ""
     ticker: str = ""
     client_id: str = "default"
+    context: dict[str, Any] = field(default_factory=dict)
 
 
 def _serialize_setup_cache_evaluation(func):
@@ -3979,7 +3981,24 @@ class APMasterControl:
                     )
                 plan.contracts = 1
 
-        real_cost = float(plan.max_position_usd)
+        _raw_real_cost = getattr(plan, "max_position_usd", None)
+        try:
+            real_cost = float(_raw_real_cost)
+        except (TypeError, ValueError):
+            real_cost = float("nan")
+        if (
+            isinstance(_raw_real_cost, bool)
+            or not math.isfinite(real_cost)
+            or real_cost <= 0
+        ):
+            return self._block(
+                plan.signal_id,
+                ticker,
+                client_id,
+                "blocked_risk",
+                "invalid_contract_cost_live_blocked",
+                reason_code="INVALID_POSITION_BUDGET",
+            )
         # PR E FIX-3 (reader-side patch): take atomic snapshot of
         # (account_equity, max_daily_loss) under _equity_lock.
         # revalidate_exposure uses equity for capital / sector / ticker
@@ -4165,6 +4184,32 @@ class APMasterControl:
                     )
                 else:
                     _bd_g1 = self._get_pending_capital_breakdown(snap, client_id) or {}
+                    _effective_budget_g1 = min(
+                        float(per_trade_budget),
+                        max(0.0, float(remaining_total_capacity)),
+                    )
+                    _budget_context_g1 = {
+                        "decision": "CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT",
+                        "source": "master_control.revalidate_exposure",
+                        "client_id": str(client_id or ""),
+                        "execution_mode": str(execution_mode or "").lower(),
+                        "signal_id": str(signal_id or ""),
+                        "local_order_id": str(_exclude_local_order_id or ""),
+                        "prior_contract": str(getattr(plan, "contract_symbol", "") or ""),
+                        "prior_contract_cost": float(real_cost),
+                        "authoritative_max_premium": float(_effective_budget_g1),
+                        "effective_contract_budget": float(_effective_budget_g1),
+                        "account_equity": float(equity),
+                        "max_position_pct": float(self.max_position_pct),
+                        "total_capital_cap": float(total_capital_cap),
+                        "capital_deployed": float(snap.get("capital_deployed", 0.0) or 0.0),
+                        "pending_entry_exposure": float(pending_cap or 0.0),
+                        "current_total_exposure": float(current_total_exposure),
+                        "per_position_cap": float(per_trade_budget),
+                        "remaining_total_capacity": float(remaining_total_capacity),
+                        "observed_at": str(snap.get("_snapshot_ts") or ""),
+                        "reselection_attempt": 1,
+                    }
                     reason = (
                         f"ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP "
                         f"client_email={client_id} execution_mode={execution_mode} "
@@ -4188,6 +4233,7 @@ class APMasterControl:
                     return self._block(
                         signal_id, ticker, client_id, "blocked_risk", reason,
                         reason_code="ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP",
+                        meta=_budget_context_g1 if _effective_budget_g1 > 0 else None,
                     )
 
         # ── Gate 2: total exposure cap ──────────────────────────────────────
@@ -4386,7 +4432,16 @@ class APMasterControl:
                 )
         except Exception:
             pass
-        return ControlDecision(ok=False, stage=stage, reason=reason, reason_code=reason_code, signal_id=signal_id, ticker=ticker, client_id=client_id)
+        return ControlDecision(
+            ok=False,
+            stage=stage,
+            reason=reason,
+            reason_code=reason_code,
+            signal_id=signal_id,
+            ticker=ticker,
+            client_id=client_id,
+            context=dict(meta or {}),
+        )
 
     def _reason_code_from_block(self, stage: str, reason: str) -> str:
         r = (reason or "").lower()

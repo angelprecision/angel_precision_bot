@@ -47,6 +47,11 @@ except ImportError:
 log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+_BUDGET_RESELECTION_RETRYABLE_REASONS = frozenset({
+    "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+    "NO_AFFORDABLE_CONTRACT",
+    "FINAL_CONTRACT_UNAFFORDABLE",
+})
 
 
 def _normalize_execution_mode(value) -> str | None:
@@ -939,10 +944,15 @@ def _classify_deferred_breach_retry_decision(
     past_cutoff: bool,
     retry_enabled: bool,
     ladder_retryable: bool = False,
+    budget_reselection: bool = False,
 ) -> dict:
     _reason_code = str(reason_code or "").strip() or "BREACH_SELECTOR_RETURNED_NONE"
     _retryable_reason = (
         _reason_code in RETRYABLE_BREACH_SELECTOR_REASONS or bool(ladder_retryable)
+        or (
+            bool(budget_reselection)
+            and _reason_code in _BUDGET_RESELECTION_RETRYABLE_REASONS
+        )
     )
     if (
         _retryable_reason
@@ -1744,6 +1754,103 @@ class APExecutionCore:
         pending_entries = self._current_pending_entry_count()
         return max(0, int(self._max_positions) - open_count - pending_entries)
 
+    @staticmethod
+    def _budget_reselection_budget(context: object) -> float | None:
+        if not isinstance(context, dict):
+            return None
+        try:
+            budget = float(
+                context.get("effective_contract_budget")
+                or context.get("authoritative_max_premium")
+            )
+        except (TypeError, ValueError):
+            return None
+        return budget if math.isfinite(budget) and budget > 0 else None
+
+    def _valid_budget_reselection_context(
+        self,
+        context: object,
+        *,
+        plan,
+        sig: dict,
+        client_id: str,
+    ) -> bool:
+        if not isinstance(context, dict) or context.get("resolved"):
+            return False
+        budget = self._budget_reselection_budget(context)
+        current_contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        prior_contract = str(context.get("prior_contract") or "").strip()
+        try:
+            prior_cost = float(context.get("prior_contract_cost") or 0)
+        except (TypeError, ValueError):
+            prior_cost = 0.0
+        plan_mode = str(
+            getattr(plan, "execution_mode", None)
+            or getattr(plan, "mode", None)
+            or getattr(self, "mode", None)
+            or ""
+        ).strip().lower()
+        return bool(
+            context.get("decision") == "CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT"
+            and budget is not None
+            and prior_contract
+            and math.isfinite(prior_cost)
+            and prior_cost > budget
+            and (
+                current_contract == prior_contract
+                or current_contract.upper().startswith("DEFERRED:")
+            )
+            and str(context.get("client_id") or "").strip().lower()
+            == str(client_id or "").strip().lower()
+            and str(context.get("signal_id") or "").strip()
+            == str(sig.get("signal_id") or "").strip()
+            and str(context.get("local_order_id") or "").strip()
+            == str(sig.get("local_order_id") or "").strip()
+            and str(context.get("execution_mode") or "").strip().lower()
+            in {"live", "paper"}
+            and plan_mode == str(context.get("execution_mode") or "").strip().lower()
+        )
+
+    def _apply_budget_reselection_context(
+        self, *, plan, sig: dict, context: dict, ticker: str
+    ) -> bool:
+        budget = self._budget_reselection_budget(context)
+        if budget is None:
+            return False
+        meta = getattr(plan, "metadata", None)
+        if not isinstance(meta, dict):
+            meta = {}
+            plan.metadata = meta
+        sizing = meta.setdefault("sizing_context", {})
+        if not isinstance(sizing, dict):
+            sizing = {}
+            meta["sizing_context"] = sizing
+        sizing.update({
+            "selector_budget": budget,
+            "remaining_capacity": budget,
+            "max_position_usd": budget,
+            "max_affordable_premium": budget / 100.0,
+        })
+        meta.update({
+            "budget_reselection": dict(context),
+            "contract_deferred": True,
+            "deferred_breach_selection": True,
+            "selection_context": "budget_reselection",
+            "contract_authority_invalidated": True,
+        })
+        plan.contract_symbol = f"DEFERRED:{ticker}"
+        plan.limit_price = 0.01
+        plan.max_position_usd = budget
+        sig.update({
+            "_budget_reselection_context": dict(context),
+            "contract_deferred": True,
+            "contract_symbol": plan.contract_symbol,
+            "limit_price": 0.01,
+            "reserved_cost": budget,
+            "_approved_plan": plan,
+        })
+        return True
+
     def _recover_plan_for_revalidation(self, watched: WatchedSignal):
         """
         Recover a minimal ApprovedExecutionPlan-like object for breach-time
@@ -1826,6 +1933,23 @@ class APExecutionCore:
                 limit_price=limit_price if limit_price > 0 else None,
                 metadata=dict(_order_meta),
             )
+            recovered.metadata.setdefault("local_order_id", local_order_id)
+            recovered.metadata.setdefault("signal_id", recovered.signal_id)
+            recovered.metadata.setdefault("execution_mode", _recovered_mode)
+            _drift = _order_meta.get("budget_reselection")
+            if isinstance(_drift, dict) and not _drift.get("resolved"):
+                if not self._valid_budget_reselection_context(
+                    _drift,
+                    plan=recovered,
+                    sig=sig,
+                    client_id=str(order.get("client_id") or self.email or ""),
+                ) or not self._apply_budget_reselection_context(
+                    plan=recovered,
+                    sig=sig,
+                    context=_drift,
+                    ticker=str(watched.ticker or ""),
+                ):
+                    return None
             sig["_approved_plan"] = recovered
             log.info(
                 "[%s] Recovered approved plan for breach revalidation from OSM order %s | cost=$%.0f",
@@ -2155,12 +2279,84 @@ class APExecutionCore:
 
         if approved_plan is not None and self.master_control is not None:
             try:
+                _plan_meta = getattr(approved_plan, "metadata", None)
+                if not isinstance(_plan_meta, dict):
+                    _plan_meta = {}
+                    approved_plan.metadata = _plan_meta
+                _plan_meta.setdefault(
+                    "local_order_id", str(sig.get("local_order_id") or "")
+                )
+                _plan_meta.setdefault("signal_id", signal_id)
+                _reval_client_id = str(
+                    sig.get("client_id")
+                    or sig.get("client_email")
+                    or getattr(approved_plan, "client_id", None)
+                    or self.email
+                    or "default"
+                ).strip()
                 reval = self.master_control.revalidate_exposure(
                     approved_plan,
-                    client_id=self.email or "default",
+                    client_id=_reval_client_id,
                 )
                 if not getattr(reval, "ok", False):
                     reason = getattr(reval, "reason", "revalidation_failed")
+                    _reason_code = str(getattr(reval, "reason_code", "") or "")
+                    _ctx = getattr(reval, "context", None)
+                    if (
+                        _reason_code == "ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP"
+                        and self._valid_budget_reselection_context(
+                            _ctx,
+                            plan=approved_plan,
+                            sig=sig,
+                            client_id=_reval_client_id,
+                        )
+                    ):
+                        _drift = dict(_ctx)
+                        _drift["resolved"] = False
+                        self._apply_budget_reselection_context(
+                            plan=approved_plan,
+                            sig=sig,
+                            context=_drift,
+                            ticker=ticker,
+                        )
+                        _update_meta = getattr(
+                            self.order_state_machine, "update_order_meta", None
+                        )
+                        if callable(_update_meta) and bool(
+                            _update_meta(
+                                str(sig.get("local_order_id") or ""),
+                                {
+                                    "budget_reselection": _drift,
+                                    "contract_selection_status": "CONTRACT_RESELECT_REQUIRED_BUDGET_DRIFT",
+                                    "contract_deferred": True,
+                                    "deferred_breach_selection": True,
+                                    "contract_authority_invalidated": True,
+                                },
+                            )
+                        ):
+                            if signal_id:
+                                self.store.update_signal_fields(signal_id, {
+                                    "context_notes": (
+                                        "contract_reselection_required_budget_drift"
+                                    ),
+                                })
+                            self._emit_breach_diag(
+                                "CONTRACT_RESELECTION_REQUIRED_BUDGET_DRIFT",
+                                watched=watched,
+                                reason="authoritative_budget_below_selected_contract",
+                                positions_open=open_count,
+                                pending_entries=pending_entries,
+                                max_positions=self._max_positions,
+                                mc_block_reason=str(reason),
+                                level="info",
+                            )
+                            return True
+                        log.critical(
+                            "[%s] CONTRACT_RESELECTION_DURABLE_WRITE_FAILED "
+                            "order=%s — blocking before selector/broker work",
+                            ticker,
+                            sig.get("local_order_id") or "",
+                        )
                     log.info("[%s] Breach exposure revalidation blocked: %s", ticker, reason)
                     if signal_id:
                         self.store.update_signal_fields(signal_id, {
@@ -4522,12 +4718,45 @@ class APExecutionCore:
             log.debug("[%s] intelligence early dispatch non-critical: %s", ticker, _eid_exc)
         # ── End early intelligence dispatch ─────────────────────────────────────
 
-        _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
-            approved_plan=approved_plan,
-            sig=sig,
-            local_order_id=queue_local_order_id,
-            ticker=ticker,
+        _budget_reselection_context = (
+            (getattr(approved_plan, "metadata", None) or {}).get(
+                "budget_reselection"
+            )
+            if isinstance(getattr(approved_plan, "metadata", None), dict)
+            else None
         )
+        if isinstance(_budget_reselection_context, dict):
+            if (
+                not _budget_reselection_context.get("resolved")
+                and not self._valid_budget_reselection_context(
+                    _budget_reselection_context,
+                    plan=approved_plan,
+                    sig=sig,
+                    client_id=_breach_client_id,
+                )
+            ):
+                _terminalize_breach_failure(
+                    "AUTHORITATIVE_BUDGET_UNAVAILABLE",
+                    cleanup_action="expire",
+                    meta_patch={
+                        "contract_selection_status": "AUTHORITATIVE_BUDGET_UNAVAILABLE",
+                        "budget_reselection": _budget_reselection_context,
+                    },
+                    context_notes="AUTHORITATIVE_BUDGET_UNAVAILABLE",
+                )
+                return
+        _budget_reselection_active = bool(
+            isinstance(_budget_reselection_context, dict)
+            and not _budget_reselection_context.get("resolved")
+        )
+        _hydration_bridge_applied = False
+        if not _budget_reselection_active:
+            _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
+                approved_plan=approved_plan,
+                sig=sig,
+                local_order_id=queue_local_order_id,
+                ticker=ticker,
+            )
         _hydrated_master_control = getattr(self, "master_control", None)
         if _hydration_bridge_applied:
             if _hydrated_master_control is None:
@@ -6037,9 +6266,39 @@ class APExecutionCore:
                         past_cutoff=_past_cutoff_a,
                         retry_enabled=_retry_enabled_a,
                         ladder_retryable=_ladder_exhaustion_is_retryable,
+                        budget_reselection=_budget_reselection_active,
                     )
 
                     if _decision_a["action"] == "retry_schedule":
+                        if (
+                            _budget_reselection_active
+                            and _obs_rc_a in _BUDGET_RESELECTION_RETRYABLE_REASONS
+                        ):
+                            _wait_drift = dict(_budget_reselection_context or {})
+                            _wait_drift.update({
+                                "wait_reason": _obs_rc_a,
+                                "wait_attempt": _this_attempt_a,
+                                "waiting_for": "AFFORDABLE_QUALITY_CONTRACT",
+                            })
+                            _budget_reselection_context = _wait_drift
+                            _wait_meta = getattr(
+                                self.order_state_machine, "update_order_meta", None
+                            )
+                            if not callable(_wait_meta) or not bool(_wait_meta(
+                                str(queue_local_order_id or ""), {
+                                    "budget_reselection": _wait_drift,
+                                    "contract_selection_status": (
+                                        "WAITING_FOR_AFFORDABLE_QUALITY_CONTRACT"
+                                    ),
+                                }
+                            )):
+                                return {
+                                    "disposition": "KEEP_WATCHER",
+                                    "reason_code": (
+                                        "WAIT_FOR_AFFORDABLE_CONTRACT_DURABLE_WRITE_FAILED"
+                                    ),
+                                    "retry_after_seconds": 5,
+                                }
                         log.warning(
                             "[%s] DEFERRED_BREACH_SELECTOR_RETRYABLE "
                             "attempt=%d/%d reason=%s delay=%ds cutoff=%d now=%d — rearming",
@@ -6168,6 +6427,11 @@ class APExecutionCore:
                         if _decision_a["retryable_reason"]
                         else "CONTRACT_SELECTION_QUALITY_REJECT"
                     )
+                    if (
+                        _budget_reselection_active
+                        and _obs_rc_a in _BUDGET_RESELECTION_RETRYABLE_REASONS
+                    ):
+                        _cs_status_a = "NO_AFFORDABLE_QUALITY_CONTRACT_TERMINAL"
 
                     log.critical(
                         "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
@@ -6662,6 +6926,88 @@ class APExecutionCore:
                     ticker, _cs_err,
                 )
                 return
+
+        if (
+            _budget_reselection_active
+            and _deferred
+            and self._is_real_occ_contract(
+                str(getattr(approved_plan, "contract_symbol", "") or ""),
+                ticker,
+            )
+        ):
+            try:
+                _final_reval = self.master_control.revalidate_exposure(
+                    approved_plan,
+                    client_id=_breach_client_id or "default",
+                )
+            except Exception as _final_reval_exc:
+                return _terminalize_deferred_breach_failure(
+                    f"budget_reselection_final_revalidation_error:{_final_reval_exc}",
+                    extra_meta={
+                        "failure_stage": "budget_reselection_final_revalidation",
+                        "budget_reselection": _budget_reselection_context,
+                    },
+                )
+            if not getattr(_final_reval, "ok", False):
+                _final_reason = str(
+                    getattr(_final_reval, "reason_code", "")
+                    or "BUDGET_RESELECTION_FINAL_REVALIDATION_BLOCKED"
+                )
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=f"budget_reselection_final_revalidation_blocked:{_final_reason}",
+                    contract=str(getattr(approved_plan, "contract_symbol", "") or ""),
+                )
+                return _terminalize_deferred_breach_failure(
+                    f"budget_reselection_final_revalidation_blocked:{_final_reason}",
+                    extra_meta={
+                        "failure_stage": "budget_reselection_final_revalidation",
+                        "budget_reselection": _budget_reselection_context,
+                    },
+                )
+            _resolved_drift = dict(_budget_reselection_context or {})
+            _resolved_drift.update({
+                "resolved": True,
+                "selected_contract": str(
+                    getattr(approved_plan, "contract_symbol", "") or ""
+                ),
+                "selected_contract_cost": float(
+                    getattr(approved_plan, "max_position_usd", 0) or 0
+                ),
+                "selected_at": datetime.now(timezone.utc).isoformat(),
+            })
+            _budget_reselection_context = _resolved_drift
+            _meta_selected = getattr(approved_plan, "metadata", None)
+            if isinstance(_meta_selected, dict):
+                _meta_selected.update({
+                    "budget_reselection": _resolved_drift,
+                    "contract_reselection_status": "CONTRACT_SELECTED_AFFORDABLE",
+                    "contract_deferred": False,
+                    "deferred_breach_selection": False,
+                })
+            sig["_budget_reselection_context"] = _resolved_drift
+            sig["contract_deferred"] = False
+            _persist_resolved = getattr(
+                self.order_state_machine, "update_order_meta", None
+            )
+            if not callable(_persist_resolved) or not bool(
+                _persist_resolved(
+                    str(queue_local_order_id or ""),
+                    {
+                        "budget_reselection": _resolved_drift,
+                        "contract_reselection_status": "CONTRACT_SELECTED_AFFORDABLE",
+                        "contract_selection_status": "CONTRACT_SELECTED_AFFORDABLE",
+                        "contract_deferred": False,
+                        "deferred_breach_selection": False,
+                    },
+                )
+            ):
+                return _terminalize_deferred_breach_failure(
+                    "CONTRACT_RESELECTION_DURABLE_SELECTION_WRITE_FAILED",
+                    extra_meta={
+                        "failure_stage": "budget_reselection_selection_persist",
+                    },
+                )
 
         # 4) Require the approved plan to carry a valid limit price (used as
         #    the drift baseline — the actual submit limit is re-anchored to the
