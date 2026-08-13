@@ -3413,6 +3413,7 @@ class ClientRunner(threading.Thread):
             contract_selector=getattr(self.core, "contract_selector", None),
             client_mode=self.mode,   # PR66: pass PAPER/LIVE so max-age splits correctly
             data_broker=data_broker,
+            execution_core=self.core,
         )
         self.order_monitor.start()
 

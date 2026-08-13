@@ -104,6 +104,20 @@ def test_crash_window_query_failure_returns_reconcile_pending():
     assert result["broker_submit_key"] == "oid-1"
 
 
+def test_malformed_broker_listing_returns_reconcile_pending():
+    core = _make_core()
+    core.broker.list_orders.side_effect = None
+    core.broker.list_orders.return_value = None
+    core.order_state_machine.get_order.return_value = _row()
+
+    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["reason_code"] == "RECONCILE_BROKER_LISTING_MALFORMED"
+    core.order_state_machine.transition.assert_not_called()
+    core.order_state_machine.update_order_meta.assert_not_called()
+
+
 def test_broker_order_present_returns_already_reconciled():
     core = _make_core()
     core.order_state_machine.get_order.return_value = _row(broker_order_id="TR-99")
@@ -193,6 +207,28 @@ def test_reconciler_preserves_broker_submission_timestamp():
     patch = core.order_state_machine.update_order_meta.call_args.args[1]
     assert patch["broker_submitted_ts"] == "2026-08-12T15:50:00+00:00"
     assert patch["broker_submitted_ts_source"] == "create_date"
+
+
+def test_reconciler_holds_conflicting_broker_submission_timestamps():
+    core = _make_core()
+    row = _matching_row()
+    remote = _matching_broker_order(
+        "working",
+        submitted_at="2026-08-12T15:51:00Z",
+        create_date="2026-08-12T15:50:00Z",
+    )
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.transition.return_value = True
+    core.broker.list_orders.side_effect = None
+    core.broker.list_orders.return_value = [remote]
+
+    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+
+    assert result["status"] == "SUBMITTED"
+    assert core.order_state_machine.transition.call_args.kwargs["submitted_ts"] is None
+    patch = core.order_state_machine.update_order_meta.call_args.args[1]
+    assert patch["broker_submitted_ts"] is None
+    assert patch["broker_submitted_ts_source"] == "malformed_unusable"
 
 
 @pytest.mark.parametrize("malformed_quantity", ["1.9", True, "nan"])

@@ -457,6 +457,7 @@ class APOrderMonitor:
         # whether a valid mode was explicitly wired by the caller.
         client_mode: str | None = None,
         data_broker=None,
+        execution_core=None,
     ):
         self.client_id   = client_id
         self.broker      = broker
@@ -467,6 +468,7 @@ class APOrderMonitor:
         self.contract_selector = contract_selector
         self.alert_fn    = alert_fn
         self.data_broker = data_broker or getattr(broker, "data_broker", None)
+        self.execution_core = execution_core
         raw_recovery_mode = str(client_mode or "").strip().lower()
         self._broker_owned_exit_recovery_mode = (
             raw_recovery_mode if raw_recovery_mode in {"live", "paper"} else ""
@@ -1736,6 +1738,7 @@ class APOrderMonitor:
                 osm=getattr(self, "osm", None),
                 entry_watcher=getattr(self, "entry_watcher", None),
                 broker=getattr(self, "broker", None),
+                execution_core=getattr(self, "execution_core", None),
                 is_past_eod=is_past_eod,
                 caller_source="ap.order_monitor._canonical_pending_trigger_rearm",
             )

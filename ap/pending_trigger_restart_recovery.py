@@ -186,24 +186,41 @@ def _validated_broker_occ_contract(
     if match is None:  # pragma: no cover - guarded by the loop above
         return None, "broker_contract_missing_or_invalid"
 
-    row_ticker = "".join(
-        str(
-            row.get("ticker")
-            or row.get("symbol")
-            or row.get("underlying")
-            or (_strict_recovery_meta(row) or {}).get("ticker")
-            or ""
-        ).upper().split()
-    )
+    meta = _strict_recovery_meta(row)
+    if meta is None:
+        return None, "broker_contract_metadata_malformed"
+
+    row_tickers = [
+        "".join(str(row.get(field_name) or "").upper().split())
+        for field_name in ("ticker", "symbol", "underlying")
+        if str(row.get(field_name) or "").strip()
+    ]
+    meta_tickers = [
+        "".join(str(meta.get(field_name) or "").upper().split())
+        for field_name in ("ticker", "symbol", "underlying")
+        if str(meta.get(field_name) or "").strip()
+    ]
+    ticker_authorities = set(row_tickers + meta_tickers)
+    if len(ticker_authorities) > 1:
+        return None, "broker_contract_underlying_conflict"
+    row_ticker = next(iter(ticker_authorities), "")
     if not row_ticker or match.group("root") != row_ticker:
         return None, "broker_contract_underlying_mismatch"
 
-    direction = str(
-        row.get("direction")
-        or row.get("side")
-        or (_strict_recovery_meta(row) or {}).get("side")
-        or ""
-    ).strip().upper()
+    row_directions = [
+        str(row.get(field_name) or "").strip().upper()
+        for field_name in ("direction", "side")
+        if str(row.get(field_name) or "").strip()
+    ]
+    meta_directions = [
+        str(meta.get(field_name) or "").strip().upper()
+        for field_name in ("direction", "side")
+        if str(meta.get(field_name) or "").strip()
+    ]
+    direction_authorities = set(row_directions + meta_directions)
+    if len(direction_authorities) > 1:
+        return None, "broker_contract_direction_conflict"
+    direction = next(iter(direction_authorities), "")
     expected_right = {"CALL": "C", "PUT": "P"}.get(direction)
     if expected_right is None or match.group("right") != expected_right:
         return None, "broker_contract_direction_mismatch"
@@ -394,6 +411,15 @@ class PendingTriggerRestartRecovery:
                 durable_mode=row_mode,
             )
             return _RowOutcome.UNRESOLVED
+
+        # A durable submit intent means broker ownership is ambiguous.  It is
+        # stronger than trigger classification and must be reconciled before
+        # any watcher, retry, selector, or terminal-cleanup path can run.
+        _submit_intent_outcome = self._route_durable_submit_intent_if_present(
+            row, local_oid
+        )
+        if _submit_intent_outcome is not None:
+            return _submit_intent_outcome
 
         def _reject_unproven_trigger_evidence() -> str:
             self._mark_failure(
@@ -1213,7 +1239,10 @@ class PendingTriggerRestartRecovery:
                 or ("malformed_unusable" if submitted_ts_malformed else "unavailable")
             ),
             "broker_filled_ts": filled_ts,
-            "broker_filled_ts_source": filled_ts_source or "unavailable",
+            "broker_filled_ts_source": (
+                filled_ts_source
+                or ("malformed_unusable" if filled_ts_malformed else "unavailable")
+            ),
             "current_owner": "ORDER_MONITOR",
             "lifecycle_state": "SUBMITTED",
         }
@@ -1871,6 +1900,32 @@ class PendingTriggerRestartRecovery:
             else _RowOutcome.UNRESOLVED
         )
 
+    def _route_durable_submit_intent_if_present(
+        self, row: dict, local_oid: str
+    ) -> Optional[str]:
+        """Route PENDING_TRIGGER submit-intent rows to broker reconciliation."""
+        meta = _strict_recovery_meta(row)
+        if meta is None or not str(meta.get("submit_intent_at") or "").strip():
+            return None
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return None
+
+        # A broker id/timestamp already establishes the accepted boundary; do
+        # not re-enter the pre-broker classifier for an inconsistent row.
+        if str(row.get("broker_order_id") or "").strip() or row.get("submitted_ts"):
+            return _RowOutcome.SKIPPED
+
+        owner = f"prebroker_recovery:{self.client_id}:{self.execution_mode}:{local_oid}"
+        return self._consume_reconcile_broker_intent(
+            row,
+            local_oid,
+            after=row,
+            callback_result={"disposition": "RECONCILE_BROKER_INTENT"},
+            owner=owner,
+            generation=None,
+            require_generation=False,
+        )
+
     def _evict_just_registered_watcher(
         self,
         local_oid: str,
@@ -2002,20 +2057,26 @@ class PendingTriggerRestartRecovery:
         after: dict,
         callback_result: dict,
         owner: str,
-        generation: int,
+        generation: Optional[int],
+        require_generation: bool = True,
     ) -> str:
         """Consume the callback's broker-intent handoff exactly once."""
         after_meta = _strict_recovery_meta(after)
         expected_generation = _strict_generation(generation)
         if (
             after_meta is None
-            or expected_generation is None
             or str(after.get("local_order_id") or "").strip() != local_oid
             or str(after.get("client_id") or "").strip().lower() != self.client_id.lower()
             or str(after.get("execution_mode") or "").strip().lower() != self.execution_mode
             or str(after.get("signal_id") or "").strip() != str(row.get("signal_id") or "").strip()
-            or _strict_generation(after_meta.get("materialization_generation"))
-            != expected_generation
+            or (
+                require_generation
+                and (
+                    expected_generation is None
+                    or _strict_generation(after_meta.get("materialization_generation"))
+                    != expected_generation
+                )
+            )
             or not after_meta.get("submit_intent_at")
         ):
             self._mark_failure(local_oid, "reconcile_broker_intent_state_mismatch")
@@ -3357,9 +3418,10 @@ def _first_broker_timestamp(
     payload: dict,
     field_names: tuple[str, ...],
 ) -> tuple[Optional[str], Optional[str], bool]:
-    """Return the first exact timestamp, its source, and malformed state."""
+    """Return one unambiguous broker timestamp, its source, and unusable state."""
     if not isinstance(payload, dict):
         return None, None, True
+    parsed_values: list[tuple[str, datetime]] = []
     for field_name in field_names:
         if field_name not in payload:
             continue
@@ -3369,8 +3431,13 @@ def _first_broker_timestamp(
         parsed = _parse_timezone_aware(raw)
         if parsed is None:
             return None, field_name, True
-        return parsed.astimezone(timezone.utc).isoformat(), field_name, False
-    return None, None, False
+        parsed_values.append((field_name, parsed.astimezone(timezone.utc)))
+    if not parsed_values:
+        return None, None, False
+    first_field, first_value = parsed_values[0]
+    if any(value != first_value for _, value in parsed_values[1:]):
+        return None, "conflicting_sources", True
+    return first_value.isoformat(), first_field, False
 
 
 def _interpret_position_truth(

@@ -19,6 +19,7 @@ from ap.pending_trigger_classifier import (
 from ap.pending_trigger_restart_recovery import (
     PendingTriggerRestartRecovery,
     _RowOutcome,
+    _first_broker_timestamp,
 )
 from ap_execution_core import APExecutionCore
 
@@ -736,6 +737,52 @@ def test_reconcile_broker_intent_is_consumed_without_manufacturing_fill_ownershi
     assert broker.list_orders.call_count == 2
 
 
+def test_order_monitor_routes_submit_intent_to_reconciler_before_ptr_cleanup():
+    from ap.order_monitor import APOrderMonitor
+
+    row = _row(
+        submit_intent_at="2026-08-12T16:03:00+00:00",
+        broker_submit_key=canonical_broker_submit_key(LOCAL_ORDER_ID),
+    )
+    osm = _OSM(row)
+    osm.retain_recovery_ownership_if_no_watcher = MagicMock(return_value=True)
+    broker = MagicMock()
+    core = SimpleNamespace(
+        client_id=CLIENT_ID,
+        execution_mode=MODE,
+        order_state_machine=osm,
+        broker=broker,
+        reconcile_deferred_broker_intent=MagicMock(
+            return_value={
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD",
+            }
+        ),
+    )
+    monitor = APOrderMonitor(
+        client_id=CLIENT_ID,
+        broker=broker,
+        order_state_machine=osm,
+        position_manager=MagicMock(),
+        entry_watcher=_Watcher(MagicMock()),
+        client_mode="PAPER",
+        execution_core=core,
+    )
+
+    attempted, succeeded, reason = monitor._canonical_pending_trigger_rearm(
+        row, LOCAL_ORDER_ID, "DEFERRED:SPY"
+    )
+
+    assert (attempted, succeeded) == (True, True)
+    assert reason == "canonical_recovery_retry_owned"
+    core.reconcile_deferred_broker_intent.assert_called_once_with(
+        local_order_id=LOCAL_ORDER_ID
+    )
+    assert osm.cancel_calls == []
+    assert osm.transition_calls == []
+    assert osm.meta_calls == []
+
+
 def test_due_retry_reconcile_disposition_reaches_existing_broker_reconciler():
     row = _row()
     row["symbol"] = "SPY"
@@ -883,6 +930,45 @@ def test_exact_tag_without_matching_occ_contract_holds_without_mutation(option_s
     assert osm.rows[LOCAL_ORDER_ID]["status"] == "PENDING_TRIGGER"
     assert osm.rows[LOCAL_ORDER_ID]["contract"] == "DEFERRED:SPY"
     assert osm.rows[LOCAL_ORDER_ID]["broker_order_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("meta_field", "meta_value", "reason"),
+    [
+        ("side", "PUT", "broker_contract_direction_conflict"),
+        ("ticker", "QQQ", "broker_contract_underlying_conflict"),
+    ],
+)
+def test_conflicting_row_and_meta_contract_authorities_hold(
+    meta_field, meta_value, reason
+):
+    row = _row()
+    row["meta"][meta_field] = meta_value
+    osm = _OSM(row)
+    broker = MagicMock()
+    broker.list_orders.return_value = [_broker_order()]
+    recovery = _recovery(row, osm, _Watcher(MagicMock()), broker)
+
+    proof = recovery._prove_stuck_trigger_ready_prebroker(row, LOCAL_ORDER_ID)
+
+    assert proof == {"disposition": "HOLD", "reason_code": reason}
+    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
+    assert osm.cancel_calls == []
+    assert osm.transition_calls == []
+
+
+def test_conflicting_broker_timestamps_are_unusable():
+    timestamp, source, unusable = _first_broker_timestamp(
+        {
+            "create_date": "2026-08-12T15:50:00Z",
+            "submitted_at": "2026-08-12T15:51:00Z",
+        },
+        ("submitted_at", "create_date"),
+    )
+
+    assert timestamp is None
+    assert source == "conflicting_sources"
+    assert unusable is True
 
 
 def test_broker_adoption_preserves_actual_creation_time_and_repeated_pass_is_idempotent():

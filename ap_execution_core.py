@@ -3606,6 +3606,12 @@ class APExecutionCore:
             broker_orders = list_orders()
         except Exception as exc:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}"}
+        if not isinstance(broker_orders, list):
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_BROKER_LISTING_MALFORMED",
+            }
 
         tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
