@@ -3528,6 +3528,7 @@ class APExecutionCore:
         from ap.pending_trigger_restart_recovery import (
             _BROKER_SUBMITTED_TIMESTAMP_FIELDS,
             _first_broker_timestamp,
+            _strict_broker_quantity,
             _validated_broker_occ_contract,
         )
 
@@ -3609,7 +3610,25 @@ class APExecutionCore:
         tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
         expected_contract = str(row.get("contract") or "").strip().upper()
-        expected_qty = int(row.get("qty") or 0)
+        if exact_tag:
+            expected_qty = _strict_broker_quantity(row.get("qty"))
+            if expected_qty is None:
+                return {
+                    **_base,
+                    "disposition": "RECONCILE_PENDING",
+                    "reason_code": "RECONCILE_DURABLE_QUANTITY_INVALID",
+                }
+            if any(
+                _strict_broker_quantity(order.get("quantity")) is None
+                for order in exact_tag
+            ):
+                return {
+                    **_base,
+                    "disposition": "RECONCILE_PENDING",
+                    "reason_code": "RECONCILE_BROKER_QUANTITY_INVALID",
+                }
+        else:
+            expected_qty = None
         strong = [
             o for o in exact_tag
             if str(
@@ -3619,7 +3638,7 @@ class APExecutionCore:
                 or ""
             ).strip().upper() == expected_contract
             and str(o.get("side") or "").lower() == "buy_to_open"
-            and int(float(o.get("quantity") or 0)) == expected_qty
+            and _strict_broker_quantity(o.get("quantity")) == expected_qty
         ]
         if len(exact_tag) > 1 or len(strong) > 1:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}

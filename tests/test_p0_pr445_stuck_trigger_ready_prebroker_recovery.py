@@ -285,6 +285,7 @@ def _recovery(
     positions=None,
     position_check_fn=None,
     execution_core=None,
+    caller_source="unknown",
 ):
     if position_check_fn is None:
         position_check_fn = (
@@ -299,6 +300,7 @@ def _recovery(
         quote_check_fn=lambda *args: False,
         position_check_fn=position_check_fn,
         execution_core=execution_core,
+        caller_source=caller_source,
     )
 
 
@@ -645,6 +647,36 @@ def test_rearm_watcher_required_is_handed_to_exact_generation_watcher_adoption()
     assert len(watcher.watch_calls) == 1
     assert len(osm.adopt_calls) == 1
     broker.list_orders.assert_called_once_with()
+
+
+def test_due_retry_rearm_watcher_required_consumes_historical_trigger_audit():
+    row = _row()
+    osm = _OSM(row)
+    owner = f"prebroker_recovery:{CLIENT_ID}:{MODE}:{LOCAL_ORDER_ID}"
+    assert osm.rearm_deferred_materialization_direction_reversal(
+        LOCAL_ORDER_ID,
+        owner=owner,
+        watcher_token="",
+        generation=1,
+        signal_id=SIGNAL_ID,
+        execution_mode=MODE,
+        market_truth_audit={"reason": "CALL_NO_LONGER_ABOVE_TRIGGER"},
+    )
+
+    watcher = _RecoveryWatcher(MagicMock())
+    broker = MagicMock()
+    recovery = _recovery(
+        osm.get_order(LOCAL_ORDER_ID),
+        osm,
+        watcher,
+        broker,
+        caller_source="ap_recovery.due_retry.rearm_watcher_required",
+    )
+
+    assert recovery.recover_one_row(osm.get_order(LOCAL_ORDER_ID)) == _RowOutcome.WATCHER_OWNED
+    assert len(watcher.watch_calls) == 1
+    assert osm.cancel_calls == []
+    assert osm.rows[LOCAL_ORDER_ID]["status"] == "PENDING_TRIGGER"
 
 
 def test_reconcile_broker_intent_is_consumed_without_manufacturing_fill_ownership():

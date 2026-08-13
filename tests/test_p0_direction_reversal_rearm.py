@@ -524,6 +524,7 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
         **retry_wait_row,
         "kind": "ENTRY",
         "meta": {
+            "watcher_audit": {"reason_code": "trigger_ready"},
             "lifecycle_state": "",
             "materialization_status": "",
             "materialization_in_flight": False,

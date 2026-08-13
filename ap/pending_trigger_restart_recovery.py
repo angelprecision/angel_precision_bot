@@ -1607,15 +1607,11 @@ class PendingTriggerRestartRecovery:
         if meta is None or meta.get("direction_reversal_rearm_requires_watcher") is not True:
             return None
 
-        # APStartupRecovery's due-retry adapter already owns the callback
-        # disposition and its quote-gated retry policy.  Leave that narrow
-        # caller on its established path; this durable-state bridge is for
-        # the orphan/reseed and direct recovery consumers that otherwise fall
-        # back into the stale trigger_ready classifier.
-        if self.caller_source.startswith(
-            "ap_recovery.due_retry.rearm_watcher_required"
-        ):
-            return None
+        # APStartupRecovery has already validated the callback's exact
+        # generation and identity before calling this engine, but it does not
+        # itself register the watcher.  Consume the durable disposition here
+        # so the due-retry path cannot fall through to the historical
+        # trigger_ready classifier after active trigger evidence was cleared.
 
         status = str(row.get("status") or "").strip().upper()
         if status != "PENDING_TRIGGER":

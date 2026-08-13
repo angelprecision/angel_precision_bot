@@ -195,6 +195,25 @@ def test_reconciler_preserves_broker_submission_timestamp():
     assert patch["broker_submitted_ts_source"] == "create_date"
 
 
+@pytest.mark.parametrize("malformed_quantity", ["1.9", True, "nan"])
+def test_reconciler_rejects_malformed_broker_quantity_without_adoption(
+    malformed_quantity,
+):
+    core = _make_core()
+    row = _matching_row()
+    remote = _matching_broker_order(quantity=malformed_quantity)
+    core.order_state_machine.get_order.return_value = row
+    core.broker.list_orders.side_effect = None
+    core.broker.list_orders.return_value = [remote]
+
+    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["reason_code"] == "RECONCILE_BROKER_QUANTITY_INVALID"
+    core.order_state_machine.transition.assert_not_called()
+    core.order_state_machine.update_order_meta.assert_not_called()
+
+
 def test_reconciler_leaves_submitted_timestamp_null_when_broker_timestamp_unavailable():
     core = _make_core()
     row = _matching_row()
