@@ -317,6 +317,56 @@ def _time_gate_allows_execution(symbol: str) -> tuple[bool, str]:
     return True, ""
 
 
+_CANONICAL_EXECUTION_MODES = frozenset({"live", "paper"})
+
+
+def _canonical_execution_mode(value) -> str | None:
+    mode = str(value or "").strip().lower()
+    return mode if mode in _CANONICAL_EXECUTION_MODES else None
+
+
+def _resolve_legacy_entry_execution_mode(
+    broker,
+    state: dict | None,
+    signal_payload: dict | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve durable mode for the legacy ENTRY compatibility path.
+
+    ``process_signal`` may retain a PAPER fallback for operational-only
+    branches, but that fallback is not an execution identity. Durable ENTRY
+    authority requires an explicit canonical client-state mode, a known
+    execution broker mode, and agreement between every explicitly supplied
+    mode source. Any missing, malformed, or conflicting source holds.
+    """
+    state_mode = _canonical_execution_mode((state or {}).get("mode"))
+    if state_mode is None:
+        return None, "EXECUTION_MODE_UNPROVEN"
+
+    try:
+        from ap.authorization import broker_live_mode_known, execution_mode_for_broker
+
+        if not broker_live_mode_known(broker):
+            return None, "EXECUTION_MODE_UNPROVEN"
+        broker_mode = _canonical_execution_mode(execution_mode_for_broker(broker))
+    except Exception:
+        broker_mode = None
+    if broker_mode is None:
+        return None, "EXECUTION_MODE_UNPROVEN"
+
+    if state_mode != broker_mode:
+        return None, "EXECUTION_MODE_CONFLICT"
+
+    payload = signal_payload or {}
+    if "execution_mode" in payload:
+        payload_mode = _canonical_execution_mode(payload.get("execution_mode"))
+        if payload_mode is None:
+            return None, "EXECUTION_MODE_UNPROVEN"
+        if payload_mode != state_mode:
+            return None, "EXECUTION_MODE_CONFLICT"
+
+    return state_mode, None
+
+
 # ── EXISTING HELPERS ──────────────────────────────────────────────────────────
 
 def _get_equity_for_client(broker, st: dict, client_cfg: dict) -> float:
@@ -890,11 +940,32 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             return {"ok": False, "error": "client_inactive"}
 
         st = get_client_state(client_id)
+        # ``mode`` is retained as an operational compatibility value for the
+        # legacy branches below. It is deliberately separate from the durable
+        # execution identity resolved from explicit evidence.
         mode = (st.get("mode") or "PAPER").upper()
         if st.get("kill_switch"):
             return {"ok": False, "error": "kill_switch_active"}
         if mode == "READ_ONLY":
             return {"ok": False, "error": "read_only_mode"}
+
+        durable_execution_mode, execution_mode_reason = (
+            _resolve_legacy_entry_execution_mode(broker, st, signal_payload)
+        )
+        if durable_execution_mode is None:
+            log.error(
+                "[%s] LEGACY_ENTRY_EXECUTION_MODE_HOLD reason=%s "
+                "state_mode=%s broker=%s",
+                client_id,
+                execution_mode_reason,
+                st.get("mode"),
+                type(broker).__name__,
+            )
+            return {
+                "ok": False,
+                "error": str(execution_mode_reason or "EXECUTION_MODE_UNPROVEN").lower(),
+                "reason_code": execution_mode_reason or "EXECUTION_MODE_UNPROVEN",
+            }
 
         # P1 ENTRY FIX (2026-05-21): systemic LOST_HANDOFF halt.
         # If the order monitor detected 3+ LOST_HANDOFF_30S events within 5 min
@@ -1508,11 +1579,9 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         ):
             if _retry_key in signal_payload:
                 _meta[_retry_key] = signal_payload.get(_retry_key)
-        _retry_execution_mode = str(
-            signal_payload.get("execution_mode") or ""
-        ).strip().lower()
-        if _retry_execution_mode in {"live", "paper"}:
-            _meta["execution_mode"] = _retry_execution_mode
+        # Keep the metadata mirror aligned with the same independently proven
+        # mode written to the authoritative top-level column.
+        _meta["execution_mode"] = durable_execution_mode
         insert_order(
             client_id=client_id,
             local_order_id=local_order_id,
@@ -1525,7 +1594,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             qty=qty,
             limit_price=float(submit_limit),
             reserved_cost=float(reserved_cost),
-            execution_mode=mode,
+            execution_mode=durable_execution_mode,
             meta=_meta,
         )
 
@@ -1535,6 +1604,37 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             release_equity(client_id, reserved_cost)
             release_symbol_lock(client_id, symbol)
             return {"ok": False, "error": "killed_before_submit"}
+
+        revalidated_mode, revalidation_reason = _resolve_legacy_entry_execution_mode(
+            broker, st2, signal_payload
+        )
+        if revalidated_mode != durable_execution_mode:
+            update_order(
+                local_order_id,
+                status="CANCELED",
+                last_error=(
+                    f"execution_mode_revalidation:{revalidation_reason or 'mismatch'}"
+                ),
+            )
+            release_equity(client_id, reserved_cost)
+            release_symbol_lock(client_id, symbol)
+            reserved = False
+            locked = False
+            log.error(
+                "[%s] LEGACY_ENTRY_EXECUTION_MODE_REVALIDATION_HOLD "
+                "local_order_id=%s initial=%s current=%s reason=%s",
+                client_id,
+                local_order_id,
+                durable_execution_mode,
+                revalidated_mode,
+                revalidation_reason,
+            )
+            return {
+                "ok": False,
+                "error": str(revalidation_reason or "EXECUTION_MODE_CONFLICT").lower(),
+                "reason_code": revalidation_reason or "EXECUTION_MODE_CONFLICT",
+                "local_order_id": local_order_id,
+            }
 
         block_reason = _final_submit_block_reason(contract, float(submit_limit), signal_payload)
         if block_reason:

@@ -405,7 +405,10 @@ def get_client_state(client_id: str = "default") -> dict:
                     "client_id": client_id, "current_equity": 0.0,
                     "starting_equity_today": 0.0, "realized_pnl_today": 0.0,
                     "trades_taken_today": 0, "daily_stop_hit": 0,
-                    "kill_switch": False, "mode": "PAPER", "day_key": None,
+                    # A missing state row has no execution identity. Callers
+                    # may choose an operational fallback, but must not use it
+                    # as durable order authority.
+                    "kill_switch": False, "mode": None, "day_key": None,
                 }
             return row
     return run_with_retry(_fn)

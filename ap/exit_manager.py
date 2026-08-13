@@ -28,6 +28,28 @@ MAX_EXIT_ATTEMPTS       = 3
 MIN_EXIT_RETRY_SECONDS  = 60
 
 
+def _canonical_execution_mode(value) -> str | None:
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"live", "paper"} else None
+
+
+def _resolve_legacy_exit_execution_mode(
+    position: dict | None,
+    state: dict | None,
+) -> tuple[str | None, str | None]:
+    """Require EXIT identity from the position and matching client state."""
+    position_mode = _canonical_execution_mode((position or {}).get("execution_mode"))
+    if position_mode is None:
+        return None, "POSITION_EXECUTION_MODE_UNPROVEN"
+
+    state_mode = _canonical_execution_mode((state or {}).get("mode"))
+    if state_mode is None:
+        return None, "EXECUTION_MODE_UNPROVEN"
+    if state_mode != position_mode:
+        return None, "EXECUTION_MODE_CONFLICT"
+    return position_mode, None
+
+
 def audit(level: str, event: str, payload: dict, client_id: str = ""):
     with conn() as c:
         run_with_retry(lambda: c.execute(
@@ -299,6 +321,21 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 20.0):
 
                 position_id = pos["id"]
 
+                exit_execution_mode, exit_mode_reason = _resolve_legacy_exit_execution_mode(
+                    pos, state
+                )
+                if exit_execution_mode is None:
+                    log.error(
+                        "[%s] LEGACY_EXIT_EXECUTION_MODE_HOLD position_id=%s "
+                        "position_mode=%s state_mode=%s reason=%s",
+                        client_id,
+                        position_id,
+                        pos.get("execution_mode"),
+                        state.get("mode"),
+                        exit_mode_reason,
+                    )
+                    continue
+
                 # FIX: Paper/sim mode bypasses fill check
                 if not position_entry_filled(position_id, mode):
                     log.warning(f"⚠️ Position {position_id} has no FILLED entry — skipping (LIVE mode only check)")
@@ -344,7 +381,7 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 20.0):
                     contract=pos["contract"],
                     qty=int(pos["qty"]),
                     limit_price=None,
-                    execution_mode=mode,
+                    execution_mode=exit_execution_mode,
                 )
 
                 ok, broker_order_id, err = submit_exit_order(broker, pos, reason)
