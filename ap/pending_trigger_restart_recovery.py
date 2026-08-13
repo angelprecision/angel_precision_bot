@@ -1271,7 +1271,13 @@ class PendingTriggerRestartRecovery:
     def _prebroker_position_truth(
         self, row: dict, *, signal_id: str, local_oid: str
     ) -> tuple[str, str]:
-        """Return MATCH/NO_MATCH/HOLD for an exact persisted position proof."""
+        """Return MATCH/NO_MATCH/HOLD for exact persisted position proof.
+
+        The production fallback is an exact client + local-order-or-signal
+        query, never a bounded client-wide listing.  A reader result that is
+        unavailable, malformed, or cannot prove exact mode/identity is HOLD;
+        only an explicitly successful empty result is NO_MATCH.
+        """
         if str(row.get("position_id") or "").strip():
             return "MATCH", "matching_position_id_present"
         meta = _strict_recovery_meta(row) or {}
@@ -1312,12 +1318,18 @@ class PendingTriggerRestartRecovery:
                 local_order_id=local_oid,
             )
 
-        # The production OSM does not own a position reader. Use the canonical
-        # client-scoped DB reader when no narrower injected/OSM reader exists.
+        # The production OSM does not own a position reader. Use the exact
+        # client + local_order_id/signal_id authority query when no narrower
+        # injected/OSM reader exists. Do not substitute list_positions(): its
+        # dashboard-oriented limit can hide an older matching position.
         try:
-            from ap.db import list_positions
+            from ap.db import get_positions_for_entry_identity
 
-            raw_positions = list_positions(client_id=self.client_id)
+            raw_positions = get_positions_for_entry_identity(
+                client_id=self.client_id,
+                local_order_id=local_oid,
+                signal_id=signal_id,
+            )
         except Exception as exc:
             return "HOLD", f"position_lookup_failed:{type(exc).__name__}"
         return _interpret_position_truth(
@@ -3373,11 +3385,16 @@ def _interpret_position_truth(
     signal_id: str,
     local_order_id: str,
 ) -> tuple[str, str]:
-    """Interpret a client-scoped position reader without guessing ownership."""
+    """Interpret exact position-reader output without guessing ownership.
+
+    ``[]`` is the only successful zero-result shape.  ``None``, ``False``,
+    ``True``, and every other unknown shape mean the authority read did not
+    prove anything and therefore remain HOLD.
+    """
     if raw_positions is None or raw_positions is False:
-        return "NO_MATCH", "no_matching_position"
+        return "HOLD", "position_reader_unavailable_or_unproven"
     if raw_positions is True:
-        return "MATCH", "matching_position_reader_proof"
+        return "HOLD", "position_reader_response_unrecognized"
     if isinstance(raw_positions, dict):
         positions = [raw_positions]
     elif isinstance(raw_positions, list):
@@ -3385,33 +3402,57 @@ def _interpret_position_truth(
     else:
         return "HOLD", "position_listing_malformed"
 
+    if not positions:
+        return "NO_MATCH", "no_matching_position"
+
     active_statuses = {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"}
     expected_client = str(client_id or "").strip().lower()
     expected_mode = str(execution_mode or "").strip().lower()
+    expected_signal = str(signal_id or "").strip()
+    expected_local = str(local_order_id or "").strip()
+    if not expected_client or not expected_mode or not expected_signal or not expected_local:
+        return "HOLD", "position_identity_context_unproven"
+
+    matches = []
     for position in positions:
-        if not isinstance(position, dict):
+        if not isinstance(position, dict) or not position:
             return "HOLD", "position_listing_malformed"
         position_client = str(
             position.get("client_id") or position.get("client_email") or ""
         ).strip().lower()
-        if position_client and position_client != expected_client:
-            continue
+        if not position_client:
+            return "HOLD", "matching_position_client_id_missing"
+        if position_client != expected_client:
+            return "HOLD", "matching_position_client_id_conflict"
         position_local = str(position.get("local_order_id") or "").strip()
         position_signal = str(position.get("signal_id") or "").strip()
-        exact_local = bool(position_local and position_local == local_order_id)
-        exact_signal = bool(position_signal and position_signal == signal_id)
+        exact_local = bool(position_local and position_local == expected_local)
+        exact_signal = bool(position_signal and position_signal == expected_signal)
         if not exact_local and not exact_signal:
-            continue
-        position_mode = str(position.get("execution_mode") or "").strip().lower()
-        if position_mode and position_mode != expected_mode:
+            return "HOLD", "position_identity_mismatch"
+        raw_mode = position.get("execution_mode")
+        if raw_mode is None or not str(raw_mode).strip():
+            return "HOLD", "matching_position_execution_mode_missing"
+        position_mode = str(raw_mode).strip().lower()
+        if position_mode not in {"live", "paper"}:
+            return "HOLD", "matching_position_execution_mode_malformed"
+        if position_mode != expected_mode:
             return "HOLD", "matching_position_execution_mode_conflict"
-        if exact_local:
-            return "MATCH", "matching_position_local_order_id"
-        position_status = str(position.get("status") or "").strip().upper()
-        if not position_status:
-            return "HOLD", "matching_position_status_missing"
-        if position_status in active_statuses:
-            return "MATCH", "matching_position_signal_id"
+        matches.append((position, exact_local, exact_signal))
+
+    if len(matches) > 1:
+        return "HOLD", "multiple_conflicting_position_matches"
+    if not matches:
+        return "NO_MATCH", "no_matching_position"
+
+    position, exact_local, _exact_signal = matches[0]
+    if exact_local:
+        return "MATCH", "matching_position_local_order_id"
+    position_status = str(position.get("status") or "").strip().upper()
+    if not position_status:
+        return "HOLD", "matching_position_status_missing"
+    if position_status in active_statuses:
+        return "MATCH", "matching_position_signal_id"
     return "NO_MATCH", "no_matching_position"
 
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 
@@ -274,7 +276,20 @@ class _RecoveryWatcher(_Watcher):
         return True
 
 
-def _recovery(row, osm, watcher, broker, *, positions=None, execution_core=None):
+def _recovery(
+    row,
+    osm,
+    watcher,
+    broker,
+    *,
+    positions=None,
+    position_check_fn=None,
+    execution_core=None,
+):
+    if position_check_fn is None:
+        position_check_fn = (
+            (lambda _row: [] if positions is None else positions)
+        )
     return PendingTriggerRestartRecovery(
         client_id=CLIENT_ID,
         execution_mode=MODE,
@@ -282,7 +297,7 @@ def _recovery(row, osm, watcher, broker, *, positions=None, execution_core=None)
         entry_watcher=watcher,
         broker=broker,
         quote_check_fn=lambda *args: False,
-        position_check_fn=lambda _row: positions or [],
+        position_check_fn=position_check_fn,
         execution_core=execution_core,
     )
 
@@ -1000,7 +1015,267 @@ def test_matching_position_holds_without_broker_lookup():
     assert osm.claim_calls == []
     assert osm.cancel_calls == []
     broker.list_orders.assert_not_called()
+    broker.place_order.assert_not_called()
     callback.assert_not_called()
+
+
+def test_matching_closed_local_order_position_still_holds_without_broker_lookup():
+    row = _row()
+    osm = _OSM(row)
+    broker = MagicMock()
+    recovery = _recovery(
+        row,
+        osm,
+        _Watcher(MagicMock()),
+        broker,
+        positions=[
+            {
+                "client_id": CLIENT_ID,
+                "execution_mode": MODE,
+                "local_order_id": LOCAL_ORDER_ID,
+                "status": "CLOSED",
+            }
+        ],
+    )
+
+    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
+    broker.list_orders.assert_not_called()
+    broker.place_order.assert_not_called()
+
+
+def test_matching_active_signal_position_holds_without_broker_lookup():
+    row = _row()
+    osm = _OSM(row)
+    broker = MagicMock()
+    recovery = _recovery(
+        row,
+        osm,
+        _Watcher(MagicMock()),
+        broker,
+        positions=[
+            {
+                "client_id": CLIENT_ID,
+                "execution_mode": MODE,
+                "signal_id": SIGNAL_ID,
+                "status": "OPEN",
+            }
+        ],
+    )
+
+    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
+    broker.list_orders.assert_not_called()
+    broker.place_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("position", "reason"),
+    [
+        (
+            {
+                "client_id": CLIENT_ID,
+                "execution_mode": "live",
+                "local_order_id": LOCAL_ORDER_ID,
+                "status": "OPEN",
+            },
+            "matching_position_execution_mode_conflict",
+        ),
+        (
+            {
+                "client_id": CLIENT_ID,
+                "local_order_id": LOCAL_ORDER_ID,
+                "status": "OPEN",
+            },
+            "matching_position_execution_mode_missing",
+        ),
+    ],
+    ids=["wrong-mode", "missing-mode"],
+)
+def test_matching_position_mode_conflict_or_absence_holds(
+    position, reason
+):
+    row = _row()
+    recovery = _recovery(
+        row,
+        _OSM(row),
+        _Watcher(MagicMock()),
+        MagicMock(),
+        positions=[position],
+    )
+
+    assert recovery._prebroker_position_truth(
+        row, signal_id=SIGNAL_ID, local_oid=LOCAL_ORDER_ID
+    ) == ("HOLD", reason)
+
+
+def test_duplicate_conflicting_position_identities_hold():
+    row = _row()
+    recovery = _recovery(
+        row,
+        _OSM(row),
+        _Watcher(MagicMock()),
+        MagicMock(),
+        positions=[
+            {
+                "client_id": CLIENT_ID,
+                "execution_mode": MODE,
+                "local_order_id": LOCAL_ORDER_ID,
+                "status": "CLOSED",
+            },
+            {
+                "client_id": CLIENT_ID,
+                "execution_mode": MODE,
+                "signal_id": SIGNAL_ID,
+                "status": "OPEN",
+            },
+        ],
+    )
+
+    assert recovery._prebroker_position_truth(
+        row, signal_id=SIGNAL_ID, local_oid=LOCAL_ORDER_ID
+    ) == ("HOLD", "multiple_conflicting_position_matches")
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        pytest.param(
+            lambda _row: (_ for _ in ()).throw(TimeoutError("db unavailable")),
+            id="query-raises",
+        ),
+        pytest.param(lambda _row: None, id="query-none"),
+        pytest.param(lambda _row: False, id="query-false"),
+        pytest.param(lambda _row: True, id="query-unknown-boolean"),
+        pytest.param(lambda _row: 7, id="query-unknown-shape"),
+        pytest.param(lambda _row: {"not": "a position row"}, id="query-malformed"),
+    ],
+)
+def test_position_authority_unavailable_or_malformed_holds_before_broker(
+    reader,
+):
+    row = _row()
+    osm = _OSM(row)
+    broker = MagicMock()
+    recovery = _recovery(
+        row,
+        osm,
+        _Watcher(MagicMock()),
+        broker,
+        position_check_fn=reader,
+    )
+
+    assert recovery.recover_one_row(row) == _RowOutcome.UNRESOLVED
+    broker.list_orders.assert_not_called()
+    assert osm.claim_calls == []
+
+
+def test_explicit_empty_position_query_is_no_match_and_can_reach_broker_proof():
+    row = _row()
+    recovery = _recovery(
+        row,
+        _OSM(row),
+        _Watcher(MagicMock()),
+        MagicMock(),
+        positions=[],
+    )
+
+    assert recovery._prebroker_position_truth(
+        row, signal_id=SIGNAL_ID, local_oid=LOCAL_ORDER_ID
+    ) == ("NO_MATCH", "no_matching_position")
+
+
+def test_exact_position_query_finds_old_match_beyond_generic_listing_limit(
+    monkeypatch,
+):
+    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "").strip()
+    if not database_url:
+        pytest.skip("disposable PostgreSQL URL not configured")
+    psycopg2 = pytest.importorskip("psycopg2")
+    import psycopg2.extras
+
+    import ap.db as db_module
+
+    schema = f"pr445_position_identity_{uuid4().hex[:12]}"
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(
+                f'''
+                CREATE TABLE "{schema}".positions (
+                    id TEXT PRIMARY KEY,
+                    client_id TEXT,
+                    local_order_id TEXT,
+                    signal_id TEXT,
+                    execution_mode TEXT,
+                    status TEXT,
+                    entry_ts TIMESTAMPTZ
+                )
+                '''
+            )
+            recent_rows = [
+                (
+                    f"recent-{index}",
+                    CLIENT_ID,
+                    f"other-local-{index}",
+                    f"other-signal-{index}",
+                    MODE,
+                    "CLOSED",
+                    datetime.now(timezone.utc) - timedelta(minutes=index),
+                )
+                for index in range(201)
+            ]
+            historical_match = (
+                "historical-match",
+                CLIENT_ID,
+                LOCAL_ORDER_ID,
+                SIGNAL_ID,
+                MODE,
+                "CLOSED",
+                datetime.now(timezone.utc) - timedelta(days=365),
+            )
+            cursor.executemany(
+                f'''
+                INSERT INTO "{schema}".positions
+                    (id, client_id, local_order_id, signal_id,
+                     execution_mode, status, entry_ts)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ''',
+                recent_rows + [historical_match],
+            )
+
+        @contextmanager
+        def _scoped_conn():
+            connection = psycopg2.connect(database_url)
+            connection.autocommit = True
+            try:
+                with connection.cursor(
+                    cursor_factory=psycopg2.extras.RealDictCursor
+                ) as cursor:
+                    cursor.execute(f'SET search_path TO "{schema}"')
+                    yield cursor
+            finally:
+                connection.close()
+
+        monkeypatch.setattr(db_module, "conn", _scoped_conn)
+        rows = db_module.get_positions_for_entry_identity(
+            client_id=CLIENT_ID,
+            local_order_id=LOCAL_ORDER_ID,
+            signal_id=SIGNAL_ID,
+        )
+        assert [row["id"] for row in rows] == ["historical-match"]
+        recovery = PendingTriggerRestartRecovery(
+            client_id=CLIENT_ID,
+            execution_mode=MODE,
+            osm=SimpleNamespace(),
+        )
+        assert recovery._prebroker_position_truth(
+            _row(), signal_id=SIGNAL_ID, local_oid=LOCAL_ORDER_ID
+        ) == ("MATCH", "matching_position_local_order_id")
+    finally:
+        with admin.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        admin.close()
 
 
 def test_missing_or_malformed_trigger_proof_never_terminalizes():

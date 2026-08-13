@@ -685,6 +685,45 @@ def list_positions(client_id: str | None = None, limit: int = 200,
     return run_with_retry(_fn)
 
 
+def get_positions_for_entry_identity(
+    *, client_id: str, local_order_id: str, signal_id: str
+) -> list[dict]:
+    """Read only positions exact-bound to one ENTRY identity.
+
+    This is an authority query, not a dashboard listing.  It intentionally
+    has no generic row limit: a matching historical position must not vanish
+    behind the newest-N positions for the client.  Execution mode remains in
+    the returned rows so the caller can classify a missing or conflicting mode
+    as HOLD rather than laundering it through the query predicate.
+    """
+    _client_id = str(client_id or "").strip()
+    _local_order_id = str(local_order_id or "").strip()
+    _signal_id = str(signal_id or "").strip()
+    if not _client_id or not _local_order_id or not _signal_id:
+        raise ValueError(
+            "get_positions_for_entry_identity requires client_id, "
+            "local_order_id, and signal_id"
+        )
+
+    def _fn():
+        with conn() as c:
+            c.execute(
+                """
+                SELECT *
+                FROM positions
+                WHERE client_id = %s
+                  AND (
+                      local_order_id = %s
+                      OR signal_id = %s
+                  )
+                """,
+                (_client_id, _local_order_id, _signal_id),
+            )
+            return c.fetchall()
+
+    return run_with_retry(_fn)
+
+
 # =========================================================================
 # ORDER QUERY HELPERS
 # =========================================================================
