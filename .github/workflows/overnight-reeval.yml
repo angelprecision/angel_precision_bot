@@ -49,6 +49,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install runtime dependencies
+        run: python3 -m pip install -r requirements.txt
+
       - name: Resolve scheduled batch
         id: cfg
         run: |
