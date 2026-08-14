@@ -198,6 +198,102 @@ def test_canonical_manual_close_uses_broker_fill_not_current_quote(monkeypatch):
     assert mutations == []
 
 
+def test_historical_exit_for_other_position_cannot_mutate_current_position(monkeypatch):
+    """A stale exit for another OCC contract is not close evidence.
+
+    This is the production-shaped jose case: the active PEP CALL remains
+    open, while the broker order feed contains an older PEP PUT exit with a
+    different contract, direction, quantity, and position history. The
+    detector must hold without touching local economics/proof/status/qty or
+    calling any broker mutation method.
+    """
+    position = _position(
+        id="current-position",
+        client_id="jose",
+        contract="PEP260821C00141000",
+        underlying="PEP",
+        side="CALL",
+        direction="CALL",
+        qty=11,
+        quantity_remaining=11,
+        entry_price=1.47,
+        avg_fill=1.47,
+        entry_ts="2026-08-14T17:31:02Z",
+        opened_at="2026-08-14T17:31:02Z",
+        execution_mode="paper",
+        realized_pnl=0.0,
+        realized_pnl_pct=0.0,
+        exit_price=None,
+    )
+    historical_exit = {
+        "id": "old-position",
+        "status": "filled",
+        "side": "sell_to_close",
+        "option_symbol": "PEP260731P00135000",
+        "exec_quantity": 7,
+        "avg_fill_price": 1.93,
+        "last_fill_date": "2026-07-23T14:09:24Z",
+        "updated_at": "2026-08-14T16:36:23Z",
+    }
+    mutations: list[str] = []
+
+    class _ReadOnlyBroker:
+        cfg = SimpleNamespace(account_id="ACCOUNT-JOSE")
+
+        def list_positions_authoritative(self):
+            return []
+
+        def _get(self, path):
+            if "/orders" in path:
+                return {"orders": {"order": [historical_exit]}}
+            raise AssertionError(f"unexpected broker read: {path}")
+
+        def __getattr__(self, name):
+            if name in {
+                "place_order", "submit_order", "buy_option", "sell_option", "cancel_order",
+            }:
+                def _mutating(*args, **kwargs):
+                    mutations.append(name)
+                    raise AssertionError(f"broker mutation is forbidden: {name}")
+                return _mutating
+            raise AttributeError(name)
+
+    finalizer = MagicMock(return_value=True)
+    adoption_calls: list[dict] = []
+    mark_closed = MagicMock()
+    runner = SimpleNamespace(
+        email="jose",
+        mode="PAPER",
+        broker=_ReadOnlyBroker(),
+        position_manager=SimpleNamespace(close_position_from_exit_fill=finalizer),
+        core=SimpleNamespace(exit_eng=SimpleNamespace(mark_position_closed=mark_closed)),
+        _last_manual_close_check_ts=0.0,
+    )
+
+    monkeypatch.setattr(manual_mod, "MANUAL_CLOSE_INTERVAL_SEC", 0)
+    monkeypatch.setattr(
+        manual_mod,
+        "load_manual_close_state",
+        lambda client_id, mode: ([position], set(), {}),
+    )
+    monkeypatch.setattr(manual_mod, "load_terminal_recovery_candidates", lambda *_: [])
+    monkeypatch.setattr(
+        manual_mod,
+        "adopt_external_exit_fills",
+        lambda **kwargs: adoption_calls.append(kwargs),
+    )
+    monkeypatch.setattr(manual_mod, "_evict_exit_engine", mark_closed)
+
+    before = dict(position)
+    manual_mod.detect_manual_closes(runner)
+
+    assert position == before
+    assert finalizer.call_count == 0
+    assert adoption_calls == []
+    assert mark_closed.call_count == 0
+    assert mutations == []
+
+
 @pytest.mark.parametrize(
     ("order", "reason"),
     [
