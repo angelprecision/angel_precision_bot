@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -113,32 +114,35 @@ class PerformanceTracker:
         return outcome
 
     def _persist(self, outcome: TradeOutcome) -> None:
-        """Retain local compatibility statistics without creating a P&L authority.
-
-        No durable P&L table is written here.  The canonical executed outcome
-        is ``proof_trades`` and is written by the proof
-        lifecycle, not by this legacy compatibility tracker.  Deliberately do
-        not touch a database or Supabase client here; repeated missing-table
-        errors would be both noisy and misleading.
-        """
-        log.debug(
-            "PERFORMANCE_TRACKER_LOCAL_ONLY client=%s position=%s "
-            "canonical_outcome_authority=proof_trades",
-            outcome.client_id,
-            outcome.position_id,
-        )
+        payload = asdict(outcome)
+        try:
+            from ap.db import conn, run_with_retry
+            def _insert():
+                with conn() as c:
+                    c.execute(
+                        """
+                        INSERT INTO trade_performance
+                        (client_id, position_id, signal_id, ticker, side, pattern, timeframe, strategy_type, contracts, entry_price, exit_price, quantity_closed, realized_pnl, pnl_pct, win, close_reason, opened_at, closed_at, metadata)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                        """,
+                        (outcome.client_id, outcome.position_id, outcome.signal_id, outcome.ticker, outcome.side, outcome.pattern, outcome.timeframe, outcome.strategy_type, outcome.contracts, outcome.entry_price, outcome.exit_price, outcome.quantity_closed, outcome.realized_pnl, outcome.pnl_pct, outcome.win, outcome.close_reason, outcome.opened_at or None, outcome.closed_at, json.dumps(outcome.metadata)),
+                    )
+            run_with_retry(_insert)
+            return
+        except Exception as e:
+            log.debug("trade_performance DB insert failed: %s", e)
+        if self.sb:
+            try:
+                self.sb.table("trade_performance").insert(payload).execute()
+            except Exception as e:
+                log.debug("trade_performance Supabase insert failed: %s", e)
 
     def _record_intel_outcome(self, outcome: TradeOutcome) -> None:
-        # This path historically sent ticker/signal/P&L guesses into the
-        # intelligence plane.  Keep the method for callers that expect it,
-        # but make the legacy bridge an explicit no-op with zero training
-        # mutation.  Exact proof binding runs only in the background evidence
-        # plane through ap.intelligence_outcome_binding.
-        log.info(
-            "LEGACY_FUZZY_OUTCOME_BINDING_DISABLED client=%s position=%s",
-            outcome.client_id,
-            outcome.position_id,
-        )
+        try:
+            from intelligence_bridge import record_trade_outcome
+            record_trade_outcome(outcome.ticker, outcome.signal_id, outcome.pnl_pct)
+        except Exception as e:
+            log.debug("intelligence outcome bridge failed: %s", e)
 
     def stats(self, trades: Optional[list[TradeOutcome]] = None) -> dict[str, Any]:
         rows = trades if trades is not None else self.trades

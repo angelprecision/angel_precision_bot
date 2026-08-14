@@ -49,8 +49,8 @@ def _normalize_direction(value: Any) -> str:
 
 
 def _normalize_mode(value: Any) -> str:
-    raw = str(value or "").strip().upper()
-    return raw if raw in {"LIVE", "PAPER"} else ""
+    raw = str(value or "").strip()
+    return raw or "PAPER"
 
 
 def _as_datetime(value: Any) -> datetime | None:
@@ -172,16 +172,7 @@ def track_counterfactual_signal(
         return False
 
     direction = _normalize_direction(sig.get("side") or sig.get("direction"))
-    supplied_mode = execution_mode if execution_mode not in (None, "") else sig.get("execution_mode")
-    mode = _normalize_mode(supplied_mode)
-    if not mode:
-        log.warning(
-            "COUNTERFACTUAL_INSERT_REJECTED reason_code=EXECUTION_MODE_UNPROVEN "
-            "client_id=%s signal_id=%s",
-            client_id,
-            signal_id,
-        )
-        return False
+    mode = _normalize_mode(execution_mode or sig.get("execution_mode"))
     canonical_signal_id = str(sig.get("canonical_signal_id") or "").strip() or None
     entry_ref, target_ref, stop_ref, missing_levels = _extract_levels(sig)
     resolution = RESOLUTION_UNAVAILABLE if missing_levels else None
