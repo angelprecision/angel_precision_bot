@@ -95,6 +95,10 @@ The intended production change is **`ap_reconciler.py` only**.
 
 Reuse `ap/manual_close_reconciliation.py` as an existing library. Modify it only if Codex proves a concrete incompatibility that makes safe reuse impossible. If any change to that file is proposed, document the exact incompatibility first and keep the change minimal.
 
+## Proven incompatibility amendment
+
+The exact-path audit proved three reuse blockers in the current helper/finalizer seam: broker quantities/prices were coerced before strict validation; fill chronology could fall back to `transaction_date`/update timestamps or accept naive values; and the finalizer did not recheck external ownership or exact remaining quantity under its row lock. The amendment therefore keeps the existing architecture but adds only the corresponding fail-closed scalar, timestamp-provenance, durable-metadata, and locked-CAS guardrails in `ap/manual_close_reconciliation.py` and `ap/position_manager.py`.
+
 Expected test scope: one new focused regression module, plus minimal updates to existing reconciler/manual-close tests if required.
 
 Do not touch unless a directly proven compile/test requirement makes it unavoidable:
@@ -584,7 +588,8 @@ This repair is complete only when all statements below are true:
 The ideal final diff is boring:
 
 - `ap_reconciler.py`: remove synthetic price authority, reuse exact broker-truth/manual-close machinery, route exact fill into canonical finalizer, HOLD on ambiguity;
-- one focused regression test file;
+- minimal helper/finalizer guardrails for proven scalar, timestamp, and ownership incompatibilities;
+- focused regressions covering the incident path and those guardrails;
 - one CI line adding that regression to P0.
 
 That is the whole repair. If the diff starts spreading across subsystems, stop and justify every additional production file before continuing.

@@ -193,6 +193,7 @@ def test_canonical_manual_close_uses_broker_fill_not_current_quote(monkeypatch):
     assert finalized[0]["exit_price"] == pytest.approx(0.99)
     assert finalized[0]["filled_qty"] == 3
     assert finalized[0]["broker_order_id"] == "broker-exit-1"
+    assert finalized[0]["external_close"] is True
     assert len(adopted) == 1
     assert mutations == []
 
@@ -211,6 +212,55 @@ def test_non_exact_external_evidence_holds(order, reason):
     evidence, actual_reason = _select(_position(), [order])
     assert evidence is None
     assert actual_reason == reason
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        _broker_order(qty=2.5),
+        _broker_order(qty=True),
+        _broker_order(price=True),
+        _broker_order(price=float("inf")),
+    ],
+)
+def test_malformed_external_scalars_hold_before_evidence(order):
+    evidence, reason = _select(_position(), [order])
+    assert evidence is None
+    assert reason == "no_exact_external_filled_exit_order"
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        {
+            **_broker_order(),
+            "last_fill_date": None,
+            "transaction_date": "2025-01-02T14:59:00Z",
+        },
+        {
+            **_broker_order(),
+            "last_fill_date": "2025-01-02T14:59:00",
+        },
+        {
+            **_broker_order(),
+            "last_fill_date": None,
+            "update_date": "2025-01-02T14:59:00Z",
+        },
+    ],
+)
+def test_unsafe_or_naive_timestamp_cannot_prove_external_fill(order):
+    evidence, reason = _select(_position(), [order])
+    assert evidence is None
+    assert reason == "no_exact_external_filled_exit_order"
+
+
+def test_external_fill_carries_broker_timestamp_provenance():
+    evidence, reason = _select(_position(), [_broker_order()])
+    assert reason == "exact_external_broker_fill"
+    assert evidence is not None
+    fill = evidence["fills"][0]
+    assert fill["fill_timestamp_source"] == "broker_response"
+    assert fill["fill_timestamp_key"] == "last_fill_date"
 
 
 def test_weighted_multi_fill_preserves_all_broker_ids():
@@ -253,6 +303,8 @@ def test_previously_adopted_fill_is_not_re_adopted_and_remains_exact():
         "filled_qty": 3,
         "fill_price": 0.99,
         "filled_at": datetime(2025, 1, 2, 14, 59, tzinfo=timezone.utc),
+        "fill_timestamp_source": manual_mod.BROKER_FILL_TIMESTAMP_SOURCE,
+        "fill_timestamp_key": "last_fill_date",
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
         "db_contract": CONTRACT,

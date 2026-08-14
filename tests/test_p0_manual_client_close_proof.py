@@ -148,10 +148,24 @@ def _filled_exit(**overrides):
         "quantity": 2,
         "exec_quantity": 2,
         "avg_fill_price": 0.75,
-        "transaction_date": "2026-07-21T15:57:39.880419Z",
+        "last_fill_date": "2026-07-21T15:57:39.880419Z",
     }
     row.update(overrides)
     return row
+
+
+def _fill_provenance():
+    return {
+        "fill_timestamp_source": manual_mod.BROKER_FILL_TIMESTAMP_SOURCE,
+        "fill_timestamp_key": "last_fill_date",
+    }
+
+
+def _exit_metadata():
+    return {
+        "exit_fill_timestamp_source": manual_mod.BROKER_FILL_TIMESTAMP_SOURCE,
+        "exit_fill_timestamp_key": "last_fill_date",
+    }
 
 
 def _runner(*, broker, pm):
@@ -329,7 +343,7 @@ def test_stale_same_contract_fill_before_entry_is_rejected(monkeypatch):
     broker = _Broker(
         orders=[
             _filled_exit(
-                transaction_date="2026-07-21T15:20:00Z",
+                last_fill_date="2026-07-21T15:20:00Z",
                 avg_fill_price=9.99,
             )
         ]
@@ -352,14 +366,14 @@ def test_multiple_manual_fills_use_quantity_weighted_broker_price(monkeypatch):
                 exec_quantity=1,
                 quantity=1,
                 avg_fill_price=0.74,
-                transaction_date="2026-07-21T15:56:00Z",
+                last_fill_date="2026-07-21T15:56:00Z",
             ),
             _filled_exit(
                 id="EXIT-2",
                 exec_quantity=1,
                 quantity=1,
                 avg_fill_price=0.76,
-                transaction_date="2026-07-21T15:57:39Z",
+                last_fill_date="2026-07-21T15:57:39Z",
             ),
         ]
     )
@@ -444,14 +458,14 @@ def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_
                 exec_quantity=1,
                 quantity=1,
                 avg_fill_price=0.74,
-                transaction_date="2026-07-21T15:56:00Z",
+                last_fill_date="2026-07-21T15:56:00Z",
             ),
             _filled_exit(
                 id="EXIT-2",
                 exec_quantity=1,
                 quantity=1,
                 avg_fill_price=0.76,
-                transaction_date="2026-07-21T15:57:39Z",
+                last_fill_date="2026-07-21T15:57:39Z",
             ),
         ]
     )
@@ -465,6 +479,7 @@ def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_
         "filled_qty": 1,
         "fill_price": 0.74,
         "filled_at": datetime(2026, 7, 21, 15, 56, 0, tzinfo=timezone.utc),
+        **_fill_provenance(),
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
@@ -661,6 +676,8 @@ def test_external_fill_adoption_writes_real_exit_lifecycle_shape(monkeypatch):
     assert row["execution_mode"] == "live"
     assert row["meta"]["external_broker_order"] is True
     assert row["meta"]["adopted_without_submit"] is True
+    assert row["meta"]["exit_fill_timestamp_source"] == "broker_response"
+    assert row["meta"]["exit_fill_timestamp_key"] == "last_fill_date"
 
 
 def test_external_fill_adoption_is_idempotent_for_exact_existing_row(monkeypatch):
@@ -680,6 +697,7 @@ def test_external_fill_adoption_is_idempotent_for_exact_existing_row(monkeypatch
             "filled_qty": 2,
             "fill_price": 0.75,
             "filled_ts": filled_at,
+            "meta": _exit_metadata(),
             "execution_mode": "live",
         }
     ]
@@ -694,6 +712,7 @@ def test_external_fill_adoption_is_idempotent_for_exact_existing_row(monkeypatch
                 "filled_qty": 2,
                 "fill_price": 0.75,
                 "filled_at": filled_at,
+                **_fill_provenance(),
                 "raw_status": "filled",
                 "raw_side": "sell_to_close",
             }
@@ -728,6 +747,7 @@ def test_external_fill_adoption_rejects_existing_mode_or_position_mismatch(monke
             "filled_qty": 2,
             "fill_price": 0.75,
             "filled_ts": filled_at,
+            "meta": _exit_metadata(),
             "execution_mode": "paper",
         }
     ]
@@ -742,6 +762,7 @@ def test_external_fill_adoption_rejects_existing_mode_or_position_mismatch(monke
                 "filled_qty": 2,
                 "fill_price": 0.75,
                 "filled_at": filled_at,
+                **_fill_provenance(),
                 "raw_status": "filled",
                 "raw_side": "sell_to_close",
             }
@@ -783,6 +804,7 @@ def test_cross_session_recovery_empty_broker_orders_finalizes_from_durable_rows(
         "filled_qty": 2,
         "fill_price": 0.75,
         "filled_at": filled_at,
+        **_fill_provenance(),
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
@@ -1062,6 +1084,7 @@ def test_atomic_adoption_rollback_on_second_fill_insert_failure(monkeypatch):
                 "filled_qty": 1,
                 "fill_price": 0.74,
                 "filled_at": filled_at,
+                **_fill_provenance(),
                 "created_at": None,
                 "raw_status": "filled",
                 "raw_side": "sell_to_close",
@@ -1071,6 +1094,7 @@ def test_atomic_adoption_rollback_on_second_fill_insert_failure(monkeypatch):
                 "filled_qty": 1,
                 "fill_price": 0.76,
                 "filled_at": filled_at,
+                **_fill_provenance(),
                 "created_at": None,
                 "raw_status": "filled",
                 "raw_side": "sell_to_close",
@@ -1279,6 +1303,7 @@ def test_durable_recovery_succeeds_when_broker_orders_endpoint_raises(monkeypatc
         "filled_qty": 2,
         "fill_price": 0.75,
         "filled_at": filled_at,
+        **_fill_provenance(),
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
@@ -1333,6 +1358,7 @@ def test_pass1_does_not_finalize_when_broker_still_holds_position(monkeypatch):
         "filled_qty": 2,
         "fill_price": 0.75,
         "filled_at": filled_at,
+        **_fill_provenance(),
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -2166,6 +2167,7 @@ class APPositionManager:
         close_source: str = "broker_exit_fill",
         close_confidence: str = "HIGH",
         exit_reason: str = "exit_filled",
+        external_close: bool = False,
     ) -> bool:
         """
         Canonical broker-truth position finalizer.
@@ -2181,15 +2183,34 @@ class APPositionManager:
           - APOrderStateMachine.transition() when EXIT_FILLED succeeds
           - APBrokerReconciler._heal_exit_filled_positions_from_orders() as backup
         """
+        if isinstance(exit_price, bool) or isinstance(filled_qty, bool):
+            log.warning(
+                "[%s] close_position_from_exit_fill blocked non-scalar input | "
+                "pos=%s exit_price=%r filled_qty=%r",
+                self.client_id, position_id, exit_price, filled_qty,
+            )
+            return False
         try:
-            exit_px  = float(exit_price or 0)
-            fill_qty = int(filled_qty or 0)
+            exit_px = float(exit_price)
+            qty_numeric = float(filled_qty)
         except Exception:
             log.error(
                 "[%s] close_position_from_exit_fill invalid inputs | pos=%s exit_price=%r filled_qty=%r",
                 self.client_id, position_id, exit_price, filled_qty,
             )
             return False
+        if (
+            not math.isfinite(exit_px)
+            or not math.isfinite(qty_numeric)
+            or not qty_numeric.is_integer()
+        ):
+            log.warning(
+                "[%s] close_position_from_exit_fill blocked malformed scalar | "
+                "pos=%s exit_price=%r filled_qty=%r",
+                self.client_id, position_id, exit_price, filled_qty,
+            )
+            return False
+        fill_qty = int(qty_numeric)
 
         if not position_id or exit_px <= 0 or fill_qty <= 0:
             log.warning(
@@ -2293,6 +2314,18 @@ class APPositionManager:
                     return False, "nonterminal_position_has_zero_remaining"
                 # ── End canonical state classification ────────────────────────
 
+                if external_close and (
+                    bool(pos.get("exit_in_flight"))
+                    or str(pos.get("pending_exit_broker_order_id") or "").strip()
+                    or str(pos.get("pending_exit_local_order_id") or "").strip()
+                ):
+                    log.info(
+                        "[%s] external close blocked by current exit owner | "
+                        "pos=%s",
+                        self.client_id, position_id,
+                    )
+                    return False, "external_close_exit_owner_present"
+
                 avg_fill = float(pos.get("avg_fill") or pos.get("entry_price") or 0)
                 qty      = int(pos.get("qty") or 0)
                 current_remaining = pos.get("quantity_remaining")
@@ -2302,6 +2335,14 @@ class APPositionManager:
 
                 if avg_fill <= 0 or qty <= 0:
                     return False, "invalid_position_cost_basis"
+
+                if external_close and fill_qty != current_remaining:
+                    log.info(
+                        "[%s] external close quantity changed under lock | "
+                        "pos=%s evidence_qty=%s current_remaining=%s",
+                        self.client_id, position_id, fill_qty, current_remaining,
+                    )
+                    return False, "external_close_qty_changed"
 
                 # current_remaining is guaranteed > 0 here (idempotency guard
                 # handled the zero-remaining case above).
