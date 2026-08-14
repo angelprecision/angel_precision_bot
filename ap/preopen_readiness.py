@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,7 +14,6 @@ ET = ZoneInfo("America/New_York")
 _TABLE_READY = False
 
 PROCESSING_STALE_MINUTES = int(os.getenv("PREOPEN_PROCESSING_STALE_MINUTES", "10"))
-WATCHING_ORPHAN_GRACE_MINUTES = int(os.getenv("PREOPEN_WATCHING_ORPHAN_GRACE_MINUTES", "5"))
 PENDING_TRIGGER_LOOKBACK_HOURS = int(os.getenv("STARTUP_WATCHER_RESEED_LOOKBACK_HOURS", "48"))
 READINESS_ENFORCEMENT_START_HOUR_ET = int(os.getenv("PREOPEN_READINESS_START_HOUR_ET", "9"))
 READINESS_ENFORCEMENT_START_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_START_MINUTE_ET", "0"))
@@ -49,6 +48,526 @@ def _nyse_is_trading_day(dt: datetime) -> bool:
         return bool(_nyse(dt.date()))
     except Exception:
         return dt.weekday() < 5  # legacy fallback
+
+
+def _authoritative_nyse_is_trading_day(dt: datetime) -> bool | None:
+    """Return canonical NYSE truth, or ``None`` when it is unavailable.
+
+    The ordinary helper above retains its legacy weekday fallback for callers
+    that only need a best-effort market-day hint.  WATCHING relevance is an
+    authority decision, so it must not use that fallback to demote lifecycle
+    debt into historical diagnostics.
+    """
+    try:
+        from ap.flatline_alarm import is_trading_day as _nyse
+        result = _nyse(dt.date())
+        if result is None:
+            return None
+        return bool(result)
+    except Exception:
+        return None
+
+
+def _parse_aware_timestamp(value: Any) -> datetime | None:
+    """Parse only an unambiguous, timezone-aware timestamp."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        return value.astimezone(ET)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(ET)
+
+
+def _previous_trading_date(now: datetime | None = None) -> date | None:
+    """Return the previous NYSE session date, including holiday gaps."""
+    current = _now_et(now).date()
+    candidate = current - timedelta(days=1)
+    for _ in range(31):
+        probe = datetime(candidate.year, candidate.month, candidate.day, tzinfo=ET)
+        authoritative = _authoritative_nyse_is_trading_day(probe)
+        if authoritative is None:
+            return None
+        if authoritative:
+            return candidate
+        candidate -= timedelta(days=1)
+    return None
+
+
+def _watching_session_class(created_at: Any, now: datetime | None = None) -> str:
+    """Classify a WATCHING row by its ET session relevance.
+
+    A missing, naive, malformed, or future timestamp is deliberately
+    ambiguous.  It must never be promoted to historical diagnostic debt.
+    """
+    current = _now_et(now)
+    parsed = _parse_aware_timestamp(created_at)
+    if parsed is None or parsed > current:
+        return "ambiguous"
+
+    row_date = parsed.date()
+    if row_date == current.date():
+        return "current_session"
+
+    previous = _previous_trading_date(current)
+    if previous is None:
+        return "ambiguous"
+    if row_date == previous:
+        return "prior_session"
+    if previous < row_date < current.date():
+        return "relevant_gap"
+    if row_date < previous:
+        return "historical"
+    return "ambiguous"
+
+
+def _payload_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+_WATCHING_IDENTITY_FIELDS = (
+    "signal_id",
+    "canonical_signal_id",
+    "local_order_id",
+    "broker_order_id",
+    "position_id",
+    "plan_id",
+)
+_WATCHING_DERIVED_IDENTITY_FIELDS = ("canonical_identity",)
+_WATCHING_STRONG_IDENTITY_FIELDS = frozenset({
+    "local_order_id",
+    "broker_order_id",
+    "position_id",
+})
+_WATCHING_ORDER_AUTHORIZED_STATUSES = frozenset({
+    "CREATED",
+    "PENDING_TRIGGER",
+    "SUBMITTED",
+    "ACKNOWLEDGED",
+    "PARTIAL_FILL",
+    "FILLED",
+})
+_WATCHING_ORDER_TERMINAL_STATUSES = frozenset({
+    "CANCELED",
+    "CANCELLED",
+    "REJECTED",
+    "EXPIRED",
+    "ERROR",
+})
+_WATCHING_POSITION_AUTHORIZED_STATUSES = frozenset({
+    "OPEN",
+    "CLOSING",
+    "PARTIAL",
+    "ACTIVE",
+})
+_WATCHING_POSITION_TERMINAL_STATUSES = frozenset({
+    "CLOSED",
+    "CLOSED_REPAIR",
+    "EXPIRED",
+    "STOPPED",
+    "TAKEN_PROFIT",
+    "ERROR",
+    "CANCELED",
+    "CANCELLED",
+})
+
+
+def _identity_token(value: Any) -> str:
+    return str(value).strip().casefold() if value is not None else ""
+
+
+def _signal_aliases(value: Any) -> set[str]:
+    """Return exact signal identity plus the deployed REEVAL aliases."""
+    raw = _identity_token(value)
+    if not raw:
+        return set()
+    aliases = {raw}
+    parts = raw.split(":")
+    if len(parts) >= 2 and parts[0] == "reeval" and parts[1]:
+        aliases.add(parts[1])
+        aliases.add(f"reeval:{parts[1]}")
+    return aliases
+
+
+def _source_identity_value(
+    source: dict,
+    field: str,
+    *,
+    position: bool = False,
+    position_row: bool = False,
+) -> Any:
+    if field == "position_id" and position and position_row:
+        return source.get("position_id") or source.get("id")
+    return source.get(field)
+
+
+def _identity_profile(row: dict, *, position: bool = False) -> dict:
+    """Build identity channels and detect internal queue/payload conflicts."""
+    payload = _payload_dict(row.get("payload"))
+    sources: list[tuple[str, dict]] = [("row", row)]
+    if payload:
+        sources.append(("payload", payload))
+
+    values: dict[str, set[str]] = {
+        field: set()
+        for field in (*_WATCHING_IDENTITY_FIELDS, *_WATCHING_DERIVED_IDENTITY_FIELDS)
+    }
+    source_values: dict[str, list[tuple[str, set[str]]]] = {
+        field: []
+        for field in (*_WATCHING_IDENTITY_FIELDS, *_WATCHING_DERIVED_IDENTITY_FIELDS)
+    }
+    conflicts: list[str] = []
+
+    for source_name, source in sources:
+        source_signal = _signal_aliases(source.get("signal_id"))
+        source_canonical = _signal_aliases(source.get("canonical_signal_id"))
+        if source_signal and source_canonical and not source_signal.intersection(source_canonical):
+            conflicts.append("signal_id/canonical_signal_id")
+        source_canonical_identity = source_signal | source_canonical
+        if source_canonical_identity:
+            source_values["canonical_identity"].append(
+                (source_name, source_canonical_identity)
+            )
+            values["canonical_identity"].update(source_canonical_identity)
+
+        for field in _WATCHING_IDENTITY_FIELDS:
+            if field == "signal_id":
+                tokens = source_signal
+            elif field == "canonical_signal_id":
+                tokens = source_canonical
+            else:
+                token = _identity_token(
+                    _source_identity_value(
+                        source,
+                        field,
+                        position=position,
+                        position_row=position and source_name == "row",
+                    )
+                )
+                tokens = {token} if token else set()
+            if tokens:
+                source_values[field].append((source_name, tokens))
+                values[field].update(tokens)
+
+    for field, entries in source_values.items():
+        if len(entries) < 2:
+            continue
+        common = set(entries[0][1])
+        for _, tokens in entries[1:]:
+            common.intersection_update(tokens)
+        if not common:
+            if field in {"signal_id", "canonical_signal_id", "canonical_identity"}:
+                conflicts.append("queue_top_level_payload_signal_identity")
+            else:
+                conflicts.append(f"queue_top_level_payload_{field}")
+
+    return {
+        "values": values,
+        "conflicts": list(dict.fromkeys(conflicts)),
+    }
+
+
+def _compare_identity_profiles(left: dict, right: dict) -> dict:
+    """Compare only like-for-like identity channels; never cross-match tokens."""
+    if left.get("conflicts") or right.get("conflicts"):
+        return {
+            "identity_class": "conflicting",
+            "identity_conflicts": list(dict.fromkeys(
+                list(left.get("conflicts") or []) + list(right.get("conflicts") or [])
+            )),
+            "matched_fields": [],
+        }
+
+    matched_fields: list[str] = []
+    conflicts: list[str] = []
+    left_values = left.get("values") or {}
+    right_values = right.get("values") or {}
+    for field in _WATCHING_IDENTITY_FIELDS:
+        left_tokens = set(left_values.get(field) or ())
+        right_tokens = set(right_values.get(field) or ())
+        if not left_tokens or not right_tokens:
+            continue
+        if left_tokens.intersection(right_tokens):
+            matched_fields.append(field)
+        else:
+            conflicts.append(field)
+
+    if conflicts:
+        return {
+            "identity_class": "conflicting",
+            "identity_conflicts": conflicts,
+            "matched_fields": matched_fields,
+        }
+    left_canonical = set(left_values.get("canonical_identity") or ())
+    right_canonical = set(right_values.get("canonical_identity") or ())
+    if left_canonical and right_canonical and left_canonical.intersection(right_canonical):
+        matched_fields.append("canonical_identity")
+    if not matched_fields:
+        return {
+            "identity_class": "none",
+            "identity_conflicts": [],
+            "matched_fields": [],
+        }
+    if _WATCHING_STRONG_IDENTITY_FIELDS.intersection(matched_fields):
+        identity_class = "exact"
+    else:
+        identity_class = "weak"
+    return {
+        "identity_class": identity_class,
+        "identity_conflicts": [],
+        "matched_fields": matched_fields,
+    }
+
+
+def _order_lifecycle_class(order: dict) -> str:
+    status = str(order.get("status") or "").strip().upper()
+    if status in _WATCHING_ORDER_AUTHORIZED_STATUSES:
+        return "authorized"
+    if status in _WATCHING_ORDER_TERMINAL_STATUSES:
+        return "terminal"
+    return "ambiguous"
+
+
+def _position_lifecycle_class(position: dict) -> str:
+    status = str(position.get("status") or "").strip().upper()
+    if status in _WATCHING_POSITION_AUTHORIZED_STATUSES:
+        return "authorized"
+    if status in _WATCHING_POSITION_TERMINAL_STATUSES:
+        return "terminal"
+    return "ambiguous"
+
+
+def _watching_owner_evidence(
+    row: dict,
+    *,
+    orders: list[dict] | None = None,
+    positions: list[dict] | None = None,
+) -> list[dict]:
+    """Return identity-compared, lifecycle-qualified owner evidence."""
+    row_profile = _identity_profile(row)
+    evidence: list[dict] = []
+
+    if row_profile["conflicts"]:
+        evidence.append({
+            "owner_type": "identity_conflict",
+            "identity_class": "conflicting",
+            "identity_conflicts": row_profile["conflicts"],
+            "matched_fields": [],
+            "lifecycle_class": "ambiguous",
+            "evidence": [],
+        })
+
+    for order in orders or []:
+        if str(order.get("kind") or "").strip().upper() != "ENTRY":
+            continue
+        comparison = _compare_identity_profiles(row_profile, _identity_profile(order))
+        if comparison["identity_class"] == "none":
+            continue
+        sources = ["entry_order"]
+        if str(order.get("broker_order_id") or "").strip():
+            sources.append("broker_order")
+        if order.get("submitted_ts"):
+            sources.append("submission")
+        if order.get("filled_ts"):
+            sources.append("fill")
+        evidence.append({
+            "owner_type": "entry_order",
+            **comparison,
+            "lifecycle_class": _order_lifecycle_class(order),
+            "evidence": sources,
+            "local_order_id": order.get("local_order_id"),
+            "broker_order_id": order.get("broker_order_id"),
+            "position_id": order.get("position_id"),
+            "signal_id": order.get("signal_id"),
+            "canonical_signal_id": order.get("canonical_signal_id"),
+            "plan_id": order.get("plan_id"),
+            "execution_mode": order.get("execution_mode"),
+            "status": order.get("status"),
+            "submitted_ts": order.get("submitted_ts"),
+            "filled_ts": order.get("filled_ts"),
+        })
+
+    for position in positions or []:
+        comparison = _compare_identity_profiles(
+            row_profile,
+            _identity_profile(position, position=True),
+        )
+        if comparison["identity_class"] == "none":
+            continue
+        evidence.append({
+            "owner_type": "matching_position",
+            **comparison,
+            "lifecycle_class": _position_lifecycle_class(position),
+            "evidence": ["matching_position"],
+            "position_id": position.get("id"),
+            "signal_id": position.get("signal_id"),
+            "plan_id": position.get("plan_id"),
+            "execution_mode": position.get("execution_mode"),
+            "status": position.get("status"),
+        })
+    return evidence
+
+
+def _mode_evidence(row: dict) -> list[str]:
+    payload = _payload_dict(row.get("payload"))
+    values: list[str] = []
+    for source in (row, payload):
+        for key in ("execution_mode", "mode"):
+            raw = source.get(key)
+            if raw is not None and str(raw).strip():
+                values.append(_normalize_mode(raw))
+    owner_modes, _ = _owner_mode_evidence(row)
+    values.extend(owner_modes)
+    return values
+
+
+def _owner_mode_evidence(row: dict) -> tuple[list[str], bool]:
+    values: list[str] = []
+    missing = False
+    for owner in row.get("owner_evidence") or []:
+        raw = owner.get("execution_mode")
+        if raw is None or not str(raw).strip():
+            missing = True
+        else:
+            values.append(_normalize_mode(raw))
+    return values, missing
+
+
+def _classify_watching_rows(
+    rows: list[dict] | None,
+    execution_mode: str,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Separate old diagnostic debt from current or ambiguous authority."""
+    requested_mode = _normalize_mode(execution_mode)
+    historical: list[dict] = []
+    owned: list[dict] = []
+    blockers: list[dict] = []
+    blocker_reasons: list[str] = []
+
+    for source in rows or []:
+        row = dict(source or {})
+        row["payload"] = _payload_dict(row.get("payload"))
+        row["session_class"] = _watching_session_class(
+            row.get("created_ts") or row.get("created_at"),
+            now,
+        )
+        row["owner_evidence"] = list(row.get("owner_evidence") or [])
+        modes = _mode_evidence(row)
+        unique_modes = set(modes)
+        invalid_mode = any(mode not in {"live", "paper"} for mode in unique_modes)
+        mode_conflict = invalid_mode or len(unique_modes) > 1
+        _, owner_mode_missing = _owner_mode_evidence(row)
+        session = row["session_class"]
+
+        identity_conflict = bool(_identity_profile(row).get("conflicts"))
+        identity_insufficient = any(
+            evidence.get("identity_class") == "weak"
+            for evidence in row["owner_evidence"]
+        )
+        owner_identity_conflict = any(
+            evidence.get("identity_class") == "conflicting"
+            for evidence in row["owner_evidence"]
+        )
+        exact_authorized = [
+            evidence
+            for evidence in row["owner_evidence"]
+            if evidence.get("identity_class") == "exact"
+            and evidence.get("lifecycle_class") == "authorized"
+        ]
+        exact_terminal = [
+            evidence
+            for evidence in row["owner_evidence"]
+            if evidence.get("identity_class") == "exact"
+            and evidence.get("lifecycle_class") == "terminal"
+        ]
+        exact_lifecycle_ambiguous = [
+            evidence
+            for evidence in row["owner_evidence"]
+            if evidence.get("identity_class") == "exact"
+            and evidence.get("lifecycle_class") == "ambiguous"
+        ]
+        owner_present = bool(exact_authorized)
+
+        session_reason = {
+            "current_session": "watching_current_session_unresolved",
+            "prior_session": "watching_prior_session_ambiguous",
+            "historical": "watching_relevance_ambiguous",
+            "relevant_gap": "watching_relevance_ambiguous",
+            "ambiguous": "watching_relevance_ambiguous",
+        }.get(session, "watching_relevance_ambiguous")
+
+        reasons: list[str] = []
+        if identity_conflict or owner_identity_conflict:
+            reasons.append("watching_owner_identity_conflict")
+        if mode_conflict:
+            reasons.append("watching_mode_conflict")
+        elif owner_present and (not modes or owner_mode_missing):
+            reasons.append("watching_mode_evidence_missing")
+        elif owner_present and unique_modes != {requested_mode}:
+            reasons.append("watching_mode_conflict")
+
+        if not owner_present and session != "historical":
+            reasons.insert(0, session_reason)
+            if not modes:
+                reasons.append("watching_mode_evidence_missing")
+            elif unique_modes != {requested_mode} and "watching_mode_conflict" not in reasons:
+                reasons.append("watching_mode_conflict")
+            if identity_insufficient:
+                reasons.append("watching_owner_identity_insufficient")
+            if exact_terminal or exact_lifecycle_ambiguous:
+                reasons.append("watching_terminal_owner_evidence")
+
+        if owner_present and (exact_terminal or exact_lifecycle_ambiguous):
+            reasons.append("watching_terminal_owner_evidence")
+
+        if not reasons and session == "historical" and not owner_present:
+            row["classification"] = "historical_diagnostic_only"
+            historical.append(row)
+            continue
+        if not reasons and owner_present:
+            row["classification"] = "canonical_owner"
+            owned.append(row)
+            continue
+        if not reasons:
+            reasons.append(session_reason)
+
+        row["classification"] = reasons[0]
+        row["blocker_reasons"] = list(dict.fromkeys(reasons))
+        blockers.append(row)
+        for reason in row["blocker_reasons"]:
+            if reason not in blocker_reasons:
+                blocker_reasons.append(reason)
+
+    return {
+        "historical_diagnostic_only": historical,
+        "owned": owned,
+        "blockers": blockers,
+        "blocker_reasons": blocker_reasons,
+        "counts": {
+            "historical_diagnostic_only": len(historical),
+            "canonical_owner": len(owned),
+            "blocking": len(blockers),
+        },
+    }
 
 
 def _after_929_et(now: datetime | None = None) -> bool:
@@ -367,16 +886,28 @@ def _post_overnight_reeval_success_exists(client_id: str, execution_mode: str, t
     return False
 
 
-def _query_client_state(client_id: str) -> dict:
+def _query_client_state(
+    client_id: str,
+    *,
+    execution_mode: str | None = None,
+    now: datetime | None = None,
+) -> dict:
     from ap.db import conn, run_with_retry
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = _now_et(now).astimezone(timezone.utc)
     processing_cutoff = now_utc - timedelta(minutes=PROCESSING_STALE_MINUTES)
-    watching_cutoff = now_utc - timedelta(minutes=WATCHING_ORPHAN_GRACE_MINUTES)
     pending_cutoff = now_utc - timedelta(hours=PENDING_TRIGGER_LOOKBACK_HOURS)
 
     def _load():
         with conn() as c:
+            def _rows_as_dict() -> list[dict]:
+                rows = c.fetchall() or []
+                columns = [d[0] for d in getattr(c, "description", [])]
+                return [
+                    dict(row) if isinstance(row, dict) else dict(zip(columns, row))
+                    for row in rows
+                ]
+
             c.execute(
                 """
                 SELECT id
@@ -392,28 +923,54 @@ def _query_client_state(client_id: str) -> dict:
 
             c.execute(
                 """
-                SELECT q.id, q.signal_id
+                SELECT q.id, q.signal_id, q.created_ts, q.payload
                 FROM trade_queue q
                 WHERE q.client_id = %s
                   AND q.status = 'WATCHING'
-                  AND q.created_ts < %s
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM orders o
-                      WHERE o.client_id = q.client_id
-                        AND COALESCE(o.signal_id, '') = COALESCE(q.signal_id, '')
-                        AND o.kind = 'ENTRY'
-                  )
                 ORDER BY q.id
                 """,
-                (client_id, watching_cutoff),
+                (client_id,),
             )
-            watching_orphans = []
-            for row in (c.fetchall() or []):
-                if isinstance(row, dict):
-                    watching_orphans.append({"id": row.get("id"), "signal_id": row.get("signal_id")})
-                else:
-                    watching_orphans.append({"id": row[0], "signal_id": row[1]})
+            watching_rows = _rows_as_dict()
+
+            orders: list[dict] = []
+            positions: list[dict] = []
+            if watching_rows:
+                c.execute(
+                    """
+                    SELECT local_order_id, broker_order_id, position_id,
+                           kind, status, signal_id, canonical_signal_id,
+                           execution_mode, submitted_ts, filled_ts, plan_id
+                    FROM orders
+                    WHERE client_id = %s
+                    ORDER BY created_ts DESC
+                    """,
+                    (client_id,),
+                )
+                orders = _rows_as_dict()
+
+                c.execute(
+                    """
+                    SELECT id, signal_id, plan_id, execution_mode, status
+                    FROM positions
+                    WHERE client_id = %s
+                    ORDER BY entry_ts DESC NULLS LAST
+                    """,
+                    (client_id,),
+                )
+                positions = _rows_as_dict()
+
+            for row in watching_rows:
+                row["owner_evidence"] = _watching_owner_evidence(
+                    row,
+                    orders=orders,
+                    positions=positions,
+                )
+            classified = _classify_watching_rows(
+                watching_rows,
+                execution_mode or "",
+                now=now,
+            )
 
             c.execute(
                 """
@@ -451,14 +1008,34 @@ def _query_client_state(client_id: str) -> dict:
 
             return {
                 "stale_processing_ids": stale_processing,
-                "watching_orphans": watching_orphans,
+                "watching_rows": (
+                    classified["historical_diagnostic_only"]
+                    + classified["owned"]
+                    + classified["blockers"]
+                ),
+                "watching_historical_diagnostic_only": classified["historical_diagnostic_only"],
+                "watching_orphans": classified["historical_diagnostic_only"],
+                "watching_owned": classified["owned"],
+                "watching_blockers": classified["blockers"],
+                "watching_blocker_reasons": classified["blocker_reasons"],
+                "watching_classification_counts": classified["counts"],
                 "pending_trigger_rows": pending_trigger,
                 "watching_count": int(watching_count or 0),
             }
 
     return run_with_retry(_load) or {
         "stale_processing_ids": [],
+        "watching_rows": [],
+        "watching_historical_diagnostic_only": [],
         "watching_orphans": [],
+        "watching_owned": [],
+        "watching_blockers": [],
+        "watching_blocker_reasons": [],
+        "watching_classification_counts": {
+            "historical_diagnostic_only": 0,
+            "canonical_owner": 0,
+            "blocking": 0,
+        },
         "pending_trigger_rows": [],
         "watching_count": 0,
     }
@@ -623,14 +1200,27 @@ def run_preopen_autonomous_readiness(
     if selector_identity["quote_source"] == "unknown" or not selector_identity["tradier_base_url"]:
         errors.append("selector_quote_identity_unresolved")
 
-    client_state = _query_client_state(client_id)
+    client_state = _query_client_state(
+        client_id,
+        execution_mode=mode,
+        now=now,
+    )
     details["client_state"] = client_state
 
     if client_state.get("stale_processing_ids"):
         errors.append("stale_processing_rows")
 
-    if client_state.get("watching_orphans"):
-        errors.append("watching_rows_missing_orders_recommend_new_rescue")
+    if client_state.get("watching_historical_diagnostic_only"):
+        warnings.append("watching_historical_diagnostic_only")
+    watching_blocker_reasons = list(client_state.get("watching_blocker_reasons") or [])
+    if not watching_blocker_reasons:
+        for row in client_state.get("watching_blockers") or []:
+            for reason in row.get("blocker_reasons") or []:
+                if reason not in watching_blocker_reasons:
+                    watching_blocker_reasons.append(reason)
+    for reason in watching_blocker_reasons:
+        if reason not in errors:
+            errors.append(reason)
 
     unowned_pending = _pending_trigger_without_watcher(runner, client_state.get("pending_trigger_rows") or [])
     details["pending_trigger_without_watcher"] = unowned_pending
@@ -687,6 +1277,14 @@ def run_preopen_autonomous_readiness(
         "runner_not_alive",
         "overnight_reeval_missing",
         "pending_trigger_without_watcher_ownership",
+        "watching_current_session_unresolved",
+        "watching_prior_session_ambiguous",
+        "watching_relevance_ambiguous",
+        "watching_mode_evidence_missing",
+        "watching_mode_conflict",
+        "watching_owner_identity_conflict",
+        "watching_owner_identity_insufficient",
+        "watching_terminal_owner_evidence",
     }
     if mode == "live" and any(err in blocked_keys for err in errors):
         status = "BLOCKED"
