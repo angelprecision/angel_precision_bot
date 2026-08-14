@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import math
 import os
 import re
 import time
@@ -1393,6 +1394,243 @@ def _open_position_safe(
     return position_id
 
 
+def _bind_filled_entry_durable_identity(
+    *,
+    position_id: str,
+    order: dict,
+    result: dict,
+) -> tuple[bool, str]:
+    """Atomically close the exact filled ENTRY-to-position identity seam.
+
+    The fill handoff has the strongest execution identity.  It may backfill
+    only missing durable links after both exact rows have been locked and all
+    identity conflicts have passed validation.  A successful return is backed
+    by a post-write reread from the same transaction.
+    """
+    def _text(value) -> str:
+        return str(value or "").strip()
+
+    def _blank(value) -> bool:
+        return value is None or _text(value) == ""
+
+    def _positive_integral(value) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                return None
+            integer = int(numeric)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return integer if numeric > 0 and numeric == integer else None
+
+    def _proven_broker_id(value) -> bool:
+        if isinstance(value, bool):
+            return False
+        token = _text(value)
+        return token.upper() not in {
+            "", "0", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "UNDEFINED",
+            "NIL", "TRUE", "FALSE",
+        }
+
+    def _exact(value, expected: str) -> bool:
+        return value is not None and str(value) == expected
+
+    position_id = _text(position_id)
+    client_id = _text(order.get("client_id"))
+    local_order_id = _text(order.get("local_order_id"))
+    broker_order_id = _text(order.get("broker_order_id"))
+    execution_mode = order.get("execution_mode")
+    contract = _text(order.get("contract"))
+    kind = _text(order.get("kind"))
+    result_filled_qty = _positive_integral(result.get("filled_qty"))
+    durable_order_filled_qty = _positive_integral(order.get("filled_qty"))
+
+    if not position_id:
+        return False, "position_id_missing"
+    if not client_id:
+        return False, "client_id_missing"
+    if not local_order_id:
+        return False, "local_order_id_missing"
+    if not _proven_broker_id(order.get("broker_order_id")):
+        return False, "broker_order_id_missing_or_placeholder"
+    if execution_mode not in {"live", "paper"}:
+        return False, "execution_mode_missing_or_noncanonical"
+    if not contract:
+        return False, "contract_missing"
+    if kind != "ENTRY":
+        return False, "kind_not_ENTRY"
+    if not _blank(order.get("position_id")) and _text(order.get("position_id")) != position_id:
+        return False, "order_position_id_conflict"
+    if result_filled_qty is None and durable_order_filled_qty is None:
+        return False, "filled_qty_missing_or_invalid"
+
+    def _transaction():
+        with conn() as c:
+            c.execute(
+                """
+                SELECT *
+                  FROM orders
+                 WHERE client_id=%s
+                   AND local_order_id=%s
+                 FOR UPDATE
+                """,
+                (client_id, local_order_id),
+            )
+            entry_row = c.fetchone()
+            if not entry_row:
+                return False, "entry_row_missing"
+            entry_row = dict(entry_row)
+
+            c.execute(
+                """
+                SELECT *
+                  FROM positions
+                 WHERE id=%s
+                   AND client_id=%s
+                 FOR UPDATE
+                """,
+                (position_id, client_id),
+            )
+            position_row = c.fetchone()
+            if not position_row:
+                return False, "position_row_missing"
+            position_row = dict(position_row)
+
+            if not _exact(entry_row.get("client_id"), client_id):
+                return False, "entry_client_conflict"
+            if _text(entry_row.get("local_order_id")) != local_order_id:
+                return False, "entry_local_order_id_conflict"
+            if _text(entry_row.get("kind")) != "ENTRY":
+                return False, "entry_kind_conflict"
+            if _text(entry_row.get("status")).upper() != "FILLED":
+                return False, "entry_status_not_FILLED"
+            if entry_row.get("execution_mode") != execution_mode:
+                return False, "entry_execution_mode_conflict"
+            if _text(entry_row.get("contract")) != contract:
+                return False, "entry_contract_conflict"
+            if not _proven_broker_id(entry_row.get("broker_order_id")):
+                return False, "entry_broker_order_id_missing_or_placeholder"
+            if _text(entry_row.get("broker_order_id")) != broker_order_id:
+                return False, "entry_broker_order_id_conflict"
+            if _positive_integral(entry_row.get("filled_qty")) is None:
+                return False, "entry_filled_qty_invalid"
+            if not _blank(entry_row.get("position_id")) and _text(entry_row.get("position_id")) != position_id:
+                return False, "entry_position_id_conflict"
+
+            if not _exact(position_row.get("id"), position_id):
+                return False, "position_id_conflict"
+            if not _exact(position_row.get("client_id"), client_id):
+                return False, "position_client_conflict"
+            if position_row.get("execution_mode") != execution_mode:
+                return False, "position_execution_mode_conflict"
+            if _text(position_row.get("contract")) != contract:
+                return False, "position_contract_conflict"
+            if _text(position_row.get("status")).upper() not in {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"}:
+                return False, "position_not_active"
+
+            for field in ("signal_id", "plan_id"):
+                entry_value = entry_row.get(field)
+                position_value = position_row.get(field)
+                if not _blank(entry_value) and not _blank(position_value):
+                    if str(entry_value) != str(position_value):
+                        return False, f"position_{field}_conflict"
+                order_value = order.get(field)
+                if not _blank(order_value) and not _blank(entry_value):
+                    if str(order_value) != str(entry_value):
+                        return False, f"order_{field}_conflict"
+                if not _blank(order_value) and not _blank(position_value):
+                    if str(order_value) != str(position_value):
+                        return False, f"order_position_{field}_conflict"
+
+            if not _blank(position_row.get("local_order_id")) and _text(position_row.get("local_order_id")) != local_order_id:
+                return False, "position_local_order_id_conflict"
+            if not _blank(position_row.get("broker_order_id")) and _text(position_row.get("broker_order_id")) != broker_order_id:
+                return False, "position_broker_order_id_conflict"
+
+            position_updates = []
+            position_params = []
+            if _blank(position_row.get("local_order_id")):
+                position_updates.append("local_order_id=%s")
+                position_params.append(local_order_id)
+            if _blank(position_row.get("broker_order_id")):
+                position_updates.append("broker_order_id=%s")
+                position_params.append(broker_order_id)
+            if position_updates:
+                position_updates.append("updated_at=NOW()")
+                c.execute(
+                    f"UPDATE positions SET {', '.join(position_updates)} WHERE id=%s AND client_id=%s",
+                    tuple(position_params + [position_id, client_id]),
+                )
+
+            if _blank(entry_row.get("position_id")):
+                c.execute(
+                    """
+                    UPDATE orders
+                       SET position_id=%s,
+                           updated_ts=NOW()
+                     WHERE client_id=%s
+                       AND local_order_id=%s
+                       AND (position_id IS NULL OR BTRIM(position_id)='')
+                    """,
+                    (position_id, client_id, local_order_id),
+                )
+
+            c.execute(
+                """
+                SELECT *
+                  FROM orders
+                 WHERE client_id=%s
+                   AND local_order_id=%s
+                 FOR UPDATE
+                """,
+                (client_id, local_order_id),
+            )
+            bound_entry = c.fetchone()
+            c.execute(
+                """
+                SELECT *
+                  FROM positions
+                 WHERE id=%s
+                   AND client_id=%s
+                 FOR UPDATE
+                """,
+                (position_id, client_id),
+            )
+            bound_position = c.fetchone()
+            if not bound_entry or not bound_position:
+                raise RuntimeError("postcondition_failed:row_missing_after_bind")
+            bound_entry = dict(bound_entry)
+            bound_position = dict(bound_position)
+
+            postconditions = (
+                _exact(bound_position.get("id"), position_id),
+                _exact(bound_position.get("client_id"), client_id),
+                bound_position.get("execution_mode") == execution_mode,
+                _text(bound_position.get("contract")) == contract,
+                _text(bound_position.get("local_order_id")) == local_order_id,
+                _text(bound_position.get("broker_order_id")) == broker_order_id,
+                _text(bound_entry.get("client_id")) == client_id,
+                _text(bound_entry.get("local_order_id")) == local_order_id,
+                _text(bound_entry.get("broker_order_id")) == broker_order_id,
+                _text(bound_entry.get("position_id")) == position_id,
+            )
+            if not all(postconditions):
+                raise RuntimeError("postcondition_failed:identity_reread_mismatch")
+            return True, "BOUND"
+
+    try:
+        return run_with_retry(_transaction)
+    except Exception as exc:
+        reason = str(exc) or type(exc).__name__
+        log.error(
+            "[%s] FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED local=%s position=%s reason=%s",
+            client_id, local_order_id, position_id, reason,
+        )
+        return False, reason
+
+
 def _place_standing_stop_best_effort(
     *,
     broker: BrokerAdapter,
@@ -1832,7 +2070,7 @@ def _emit_seed_failure_diagnostic(
     )
 
 
-def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, signal_id: str):
+def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, signal_id: str) -> tuple[bool, str]:
     """Seed the exit engine after confirmed ENTRY fill without faking live quote state.
 
     PR #235 (hardening #2): resolve side from order/OCC — fail-closed on
@@ -1845,7 +2083,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     exits and proof rows were never attributed to the canonical fill.
     """
     if not exit_engine or not position_id:
-        return
+        return False, "ENGINE_OR_POSITION_MISSING"
 
     # Resolve canonical side up front — used by both the ManagedPosition
     # constructor and the mp.signal dict below.  Emit critical + skip if
@@ -1853,7 +2091,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     _side, _side_source = _resolve_order_option_side(order)
     if not _side:
         _emit_side_unresolved(order, reason_code="EXIT_ENGINE_SEED_SIDE_UNRESOLVED")
-        return
+        return False, "SIDE_UNRESOLVED"
 
     # ── Repair 4: canonical adoption of broker-repair position ───────────────
     # Before creating a new position, check whether the exit engine is already
@@ -1911,7 +2149,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 "Canonical adoption execution mode could not be proven"
             ),
         )
-        return
+        return False, _base_reason
 
     _adopt_fn = getattr(exit_engine, "adopt_canonical_position_identity", None)
     if callable(_adopt_fn) and _contract_for_adopt and position_id:
@@ -1969,7 +2207,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                     "[%s] _seed_exit_engine: %s contract=%s position_id=%s",
                     order.get("client_id"), _disposition, _contract_for_adopt, position_id,
                 )
-                return
+                return True, _disposition
             elif _disposition == "NO_REPAIR_FOUND":
                 pass  # fall through to normal seed
             elif _disposition and _disposition.startswith("RETRY_"):
@@ -2005,9 +2243,9 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                     ),
                     extra_payload={"adoption_disposition": _disposition},
                 )
-                return
+                return False, f"ADOPTION_{_disposition}"
             elif _adopted is True:  # legacy bool path
-                return
+                return True, "ADOPTED"
             elif _adopted is False:  # legacy bool — no repair found, seed normally
                 pass
         except Exception as _adopt_err:
@@ -2043,12 +2281,12 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                     "exception_type": type(_adopt_err).__name__,
                 },
             )
-            return
+            return False, "ADOPTION_ERROR"
 
     try:
         getter = getattr(exit_engine, "get_position", None)
         if callable(getter) and getter(position_id):
-            return
+            return True, "ALREADY_CANONICAL"
     except Exception as _ee_err:
         log.warning("Exit engine position check failed for %s: %s", position_id, _ee_err)
 
@@ -2070,7 +2308,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     try:
         if hasattr(exit_engine, "seed_position"):
             exit_engine.seed_position(position_id, _seed_order, result)
-            return
+            return True, "SEEDED"
     except Exception as exc:
         log.debug("exit_engine.seed_position failed; trying add_position path: %s", exc)
 
@@ -2152,8 +2390,10 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             ticker,
             getattr(mp, "current_underlying", None),
         )
+        return True, "SEEDED"
     except Exception as exc:
         log.error("[%s] exit_engine.add_position failed: %s", order.get("client_id"), exc)
+        return False, "SEED_FAILED"
 
 
 # =============================================================================
@@ -2419,45 +2659,42 @@ def process_pending_order(
                     entry_price=price,
                 )
 
-                _seed_exit_engine(exit_engine, position_id, order, result, signal_id)
+                bind_ok, bind_reason = _bind_filled_entry_durable_identity(
+                    position_id=position_id,
+                    order=order,
+                    result=result,
+                )
+                if not bind_ok:
+                    _record_position_create_failure(
+                        order,
+                        "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED",
+                    )
+                    log.critical(
+                        "[%s] filled_entry_identity_bind_failed order=%s position=%s reason=%s",
+                        client_id, local_id, position_id, bind_reason,
+                    )
+                else:
+                    seed_ok, seed_reason = _seed_exit_engine(
+                        exit_engine, position_id, order, result, signal_id
+                    )
+                    if not seed_ok:
+                        _record_position_create_failure(
+                            order,
+                            "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                        )
+                        log.critical(
+                            "[%s] filled_entry_canonical_owner_unproven order=%s position=%s reason=%s",
+                            client_id, local_id, position_id, seed_reason,
+                        )
 
-                # Write position_id back to orders row.
-                # osm.transition above was called without position_id because the
-                # position didn't exist yet — _open_position_safe created it after.
-                # Without this write the orders row has position_id=null forever.
                 log.info(
                     "[%s] order_filled_detected order=%s contract=%s qty=%d "
-                    "position_link_result=%s",
+                    "position_identity_result=%s",
                     client_id, local_id,
                     order.get("contract") or order.get("symbol"),
                     int(new_filled or 0),
-                    "success" if position_id else "MISSING",
+                    "success" if bind_ok else "FAILED",
                 )
-                if position_id:
-                    try:
-                        from ap.db import conn as _fm_conn, run_with_retry as _fm_retry
-                        def _link_back():
-                            with _fm_conn() as c:
-                                c.execute(
-                                    "UPDATE orders "
-                                    "SET position_id=%s, updated_ts=NOW() "
-                                    "WHERE client_id=%s AND local_order_id=%s "
-                                    "AND (position_id IS NULL OR position_id='')",
-                                    (position_id, client_id, local_id),
-                                )
-                        _fm_retry(_link_back)
-                        log.info(
-                            "[%s] order_position_link_success order=%s position=%s "
-                            "contract=%s",
-                            client_id, local_id, position_id,
-                            order.get("contract") or order.get("symbol"),
-                        )
-                    except Exception as _link_err:
-                        log.error(
-                            "[%s] order_position_link_failed order=%s position=%s "
-                            "err=%s",
-                            client_id, local_id, position_id, _link_err,
-                        )
 
                 if not position_id:
                     log.critical(
