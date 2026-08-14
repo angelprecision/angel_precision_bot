@@ -16,6 +16,10 @@ import json
 import sys
 from datetime import datetime, timezone
 
+from ap.contract_selector import (
+    _direct_quote_budget_effective_limits,
+    _resolve_direct_quote_budget_config,
+)
 from ap.db import conn
 from ap.logger import get_logger
 from ap_canonical_signal import build_canonical_signal_id
@@ -415,6 +419,22 @@ def run_preflight() -> dict:
         max_attempts = None
         max_attempts_conflict = str(exc)
 
+    budget_cfg = _resolve_direct_quote_budget_config()
+    ordinary_effective_limit, deferred_effective_limit = (
+        _direct_quote_budget_effective_limits(budget_cfg)
+    )
+    selector_direct_quote_budget = {
+        "canonical_value": budget_cfg.canonical_value,
+        "direct_recovery_alias": budget_cfg.direct_recovery_value,
+        "contract_revalidate_alias": budget_cfg.contract_revalidate_value,
+        "source": budget_cfg.source,
+        "ordinary_effective_limit": ordinary_effective_limit,
+        "deferred_effective_limit": deferred_effective_limit,
+        "conflict": bool(budget_cfg.conflict),
+        "conflict_detail": budget_cfg.conflict_detail,
+        "invalid_explicit_keys": list(budget_cfg.invalid_explicit_keys),
+    }
+
     rows = _fetch_candidate_rows()
     classified = [_classify_row(row) for row in rows]
     unsafe = [result for result in classified if not result["safe"]]
@@ -423,6 +443,7 @@ def run_preflight() -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "resolved_max_attempts": max_attempts,
         "max_attempts_config_conflict": max_attempts_conflict,
+        "selector_direct_quote_budget": selector_direct_quote_budget,
         "candidate_row_count": len(classified),
         "unsafe_row_count": len(unsafe),
         "rows": classified,
@@ -442,10 +463,13 @@ def main() -> int:
     # candidates remain before deployment" -- a row can be individually
     # well-formed (safe=true) and still represent an in-flight
     # deferred-recovery candidate that must not be present at deploy time.
+    selector_budget = result.get("selector_direct_quote_budget") or {}
     return 2 if (
         result["candidate_row_count"] > 0
         or result["unsafe_row_count"] > 0
         or result.get("max_attempts_config_conflict") is not None
+        or bool(selector_budget.get("conflict"))
+        or bool(selector_budget.get("invalid_explicit_keys"))
     ) else 0
 
 
