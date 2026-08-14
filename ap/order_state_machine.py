@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -2185,6 +2186,97 @@ class APOrderStateMachine:
         except Exception as exc:
             log.warning(
                 "[%s] update_order_meta failed for local_order_id=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def reconcile_terminal_fill(
+        self,
+        local_order_id: str,
+        *,
+        cumulative_filled: int,
+        fill_price=None,
+        broker_order_id=None,
+        filled_ts=None,
+    ) -> bool:
+        """Persist broker fill economics while keeping a terminal status fixed.
+
+        A broker can confirm execution after a local CANCELED/REJECTED/
+        EXPIRED/ERROR transition.  ``transition`` deliberately rejects that
+        lifecycle move, so late-fill repair needs this separate, identity-
+        fenced field update.  It never changes ``status`` and never accepts a
+        cumulative-fill regression or contradictory broker identity.
+        """
+        current = self._get_order(local_order_id)
+        if not current:
+            return False
+        current = dict(current)
+        old_status = str(current.get("status") or "")
+        if not OrderStatus.is_terminal(old_status):
+            log.warning(
+                "[%s] terminal fill reconciliation blocked for active order=%s status=%s",
+                self.client_id, local_order_id, old_status,
+            )
+            return False
+
+        incoming = self._safe_int(cumulative_filled, None)
+        previous = self._safe_int(current.get("filled_qty"), 0)
+        if incoming is None or incoming <= 0 or incoming < previous:
+            return False
+
+        normalized_price = None
+        if fill_price is not None:
+            try:
+                normalized_price = float(fill_price)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if not math.isfinite(normalized_price) or normalized_price <= 0:
+                return False
+
+        requested_broker_id = str(broker_order_id or "").strip()
+
+        def _fn():
+            with conn() as c:
+                assignments = [
+                    "filled_qty=GREATEST(COALESCE(filled_qty,0),%s)",
+                    "updated_ts=NOW()",
+                ]
+                params = [incoming]
+                if normalized_price is not None:
+                    assignments.insert(1, "fill_price=%s")
+                    params.insert(1, normalized_price)
+                if filled_ts is not None:
+                    assignments.insert(2, "filled_ts=COALESCE(filled_ts,%s)")
+                    params.insert(2, filled_ts)
+                if requested_broker_id:
+                    assignments.insert(
+                        1,
+                        "broker_order_id=CASE WHEN COALESCE(broker_order_id,'')='' "
+                        "THEN %s ELSE broker_order_id END",
+                    )
+                    params.insert(1, requested_broker_id)
+
+                where = (
+                    "local_order_id=%s AND client_id=%s AND status=%s"
+                )
+                params.extend([local_order_id, self.client_id, old_status])
+                if requested_broker_id:
+                    where += (
+                        " AND (broker_order_id IS NULL OR broker_order_id='' "
+                        "OR broker_order_id=%s)"
+                    )
+                    params.append(requested_broker_id)
+                cur = c.execute(
+                    f"UPDATE orders SET {', '.join(assignments)} WHERE {where}",
+                    tuple(params),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            return bool(run_with_retry(_fn) == 1)
+        except Exception as exc:
+            log.warning(
+                "[%s] terminal fill reconciliation failed for order=%s: %s",
                 self.client_id, local_order_id, exc,
             )
             return False

@@ -433,12 +433,58 @@ def test_pending_sql_attests_the_same_retry_prefix_constants(monkeypatch):
     assert fm.get_pending_orders("jason@example.com") == []
     assert "last_error" in captured["sql"]
     assert "canonical_owner_handoff_entry_handoff_proven" in captured["sql"]
-    assert "status IN ('CANCELED', 'REJECTED', 'EXPIRED')" in captured["sql"]
+    assert "status IN ('CANCELED', 'REJECTED', 'EXPIRED', 'ERROR')" in captured["sql"]
     assert "updated_ts >= NOW() - INTERVAL '1 hour'" in captured["sql"]
     assert "UPPER(BTRIM(broker_order_id)) NOT IN" in captured["sql"]
     assert tuple(
         f"{prefix}%" for prefix in fm._CANONICAL_OWNER_HANDOFF_RETRY_ERROR_PREFIXES
     ) == tuple(captured["params"][1:])
+
+
+def test_terminal_fill_reconciliation_updates_economics_without_status_transition(
+    monkeypatch,
+):
+    from ap import order_state_machine as osm_module
+    from ap.order_state_machine import APOrderStateMachine
+
+    row = {
+        "client_id": "jason@example.com",
+        "local_order_id": "entry-local-1",
+        "broker_order_id": "entry-broker-1",
+        "status": "CANCELED",
+        "filled_qty": 0,
+        "fill_price": None,
+    }
+    captured = {}
+
+    class _Cursor:
+        rowcount = 1
+
+    class _Connection:
+        def execute(self, sql, params):
+            captured["sql"] = sql
+            captured["params"] = params
+            return _Cursor()
+
+    @contextmanager
+    def _conn():
+        yield _Connection()
+
+    monkeypatch.setattr(osm_module, "conn", _conn)
+    monkeypatch.setattr(osm_module, "run_with_retry", lambda fn: fn())
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = "jason@example.com"
+    osm._get_order = lambda _local_id: dict(row)
+
+    assert osm.reconcile_terminal_fill(
+        "entry-local-1",
+        cumulative_filled=1,
+        fill_price=1.46,
+        broker_order_id="entry-broker-1",
+    ) is True
+    assert "status=" not in captured["sql"].split("WHERE", 1)[0]
+    assert "status=%s" in captured["sql"]
+    assert row["status"] == "CANCELED"
 
 
 def test_open_position_safe_does_not_replay_terminal_position():
@@ -1135,8 +1181,9 @@ def test_terminal_osm_false_does_not_release_entry_guards(monkeypatch):
     assert released == []
 
 
+@pytest.mark.parametrize("terminal_status", ["CANCELED", "ERROR"])
 def test_late_broker_fill_after_local_terminal_status_reaches_reconciliation(
-    monkeypatch,
+    monkeypatch, terminal_status,
 ):
     from ap import fill_monitor as fm
 
@@ -1167,7 +1214,7 @@ def test_late_broker_fill_after_local_terminal_status_reaches_reconciliation(
 
     fm.process_pending_order(
         object(),
-        _order(status="CANCELED"),
+        _order(status=terminal_status),
         osm=_OSM(),
         pm=SimpleNamespace(),
         exit_engine=SimpleNamespace(),
@@ -1192,6 +1239,7 @@ def test_late_entry_fill_materializes_position_without_terminal_transition(monke
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
     open_calls = []
     marker_calls = []
+    terminal_fill_calls = []
     monkeypatch.setattr(
         fm,
         "_open_position_safe",
@@ -1211,6 +1259,10 @@ def test_late_entry_fill_materializes_position_without_terminal_transition(monke
         def transition(self, *_args, **_kwargs):
             pytest.fail("late fill must preserve the local terminal status")
 
+        def reconcile_terminal_fill(self, *args, **kwargs):
+            terminal_fill_calls.append((args, kwargs))
+            return True
+
         def update_order_meta(self, local_order_id, patch):
             marker_calls.append((local_order_id, patch))
             return True
@@ -1225,6 +1277,7 @@ def test_late_entry_fill_materializes_position_without_terminal_transition(monke
     )
 
     assert len(open_calls) == 1
+    assert terminal_fill_calls[0][1]["cumulative_filled"] == 1
     assert marker_calls[0][1]["late_fill_reconciliation"]["status"] == "RECONCILED"
 
 

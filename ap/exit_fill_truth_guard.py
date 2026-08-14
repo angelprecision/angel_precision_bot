@@ -230,7 +230,7 @@ def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
     rows = c.execute(
         "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status "
         "FROM orders WHERE client_id=%s AND kind='EXIT' AND UPPER(contract)=UPPER(%s) "
-        "AND (status IN %s OR status IN ('CANCELED','REJECTED','EXPIRED')) "
+        "AND (status IN %s OR status IN ('CANCELED','REJECTED','EXPIRED','ERROR')) "
         "AND COALESCE(filled_qty,0)>0 AND fill_price IS NOT NULL "
         "AND (%s IS NULL OR filled_ts >= %s OR (%s <> '' AND local_order_id=%s)) "
         "AND (position_id::text=%s OR (%s<>'' AND local_order_id=%s)) "
@@ -703,7 +703,7 @@ def _run_reconciliation_attempt(
             if current_fill_price <= 0:
                 current_fill_price = _float(result.get("fill_price"))
             if (
-                current_status.upper() in {"CANCELED", "REJECTED", "EXPIRED"}
+                current_status.upper() in {"CANCELED", "REJECTED", "EXPIRED", "ERROR"}
                 and current_filled_qty > 0
                 and current_fill_price > 0
             ):

@@ -381,6 +381,58 @@ def test_broker_unavailable_without_response_id_preserves_reason_taxonomy(monkey
     assert fm._broker_poll_unavailable_for_durable_filled_recovery(result)
 
 
+@pytest.mark.parametrize(
+    ("error", "failure_class", "reason_prefix"),
+    [
+        (TimeoutError("read timed out"), "TIMEOUT", "BROKER_READ_TIMEOUT_AMBIGUOUS"),
+        (ConnectionError("network reset"), "NETWORK", "BROKER_CONN_ERROR"),
+        (PermissionError("unauthorized"), "AUTH", "BROKER_AUTH_ERROR"),
+    ],
+)
+def test_broker_get_exception_is_unavailable_not_identity_mismatch(
+    monkeypatch, error, failure_class, reason_prefix
+):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+
+    class _BrokerGetFailure:
+        def get_order(self, _broker_order_id):
+            raise error
+
+    result = fm.check_order_with_broker(
+        _BrokerGetFailure(),
+        _base_order(direction="CALL", contract="AAPL260626C00195000"),
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["reason"].startswith(reason_prefix)
+    assert result["raw"]["_broker_get_failed"] is True
+    assert result["raw"]["_broker_response_unavailable"] is True
+    assert result["raw"]["_broker_read_failure_class"] == failure_class
+    assert "_broker_order_id_mismatch" not in result["raw"]
+    assert fm._broker_poll_unavailable_for_durable_filled_recovery(result)
+
+
+def test_unknown_broker_get_exception_does_not_authorize_db_only_recovery(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+
+    class _BrokerGetFailure:
+        def get_order(self, _broker_order_id):
+            raise ValueError("adapter payload parser failed")
+
+    result = fm.check_order_with_broker(
+        _BrokerGetFailure(),
+        _base_order(direction="CALL", contract="AAPL260626C00195000"),
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["raw"]["_broker_read_failure_class"] == "UNAVAILABLE"
+    assert not fm._broker_poll_unavailable_for_durable_filled_recovery(result)
+
+
 def test_successful_broker_response_without_id_is_missing_identity_not_mismatch(monkeypatch):
     from ap import fill_monitor as fm
 

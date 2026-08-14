@@ -108,6 +108,10 @@ ACTIVE_BROKER_STATUSES = {
 }
 
 TERMINAL_FAILURE_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
+# A local ERROR is terminal in OSM too.  It must remain pollable for a broker
+# fill discovered after the local failure path, while FILLED/EXIT_FILLED keep
+# their existing canonical handoff/duplicate-fill handling.
+LOCAL_TERMINAL_FILL_STATUSES = TERMINAL_FAILURE_STATUSES | {"ERROR"}
 
 UNKNOWN_ERROR_ESCALATE_AFTER = int(os.getenv("FILL_MONITOR_UNKNOWN_ERROR_ESCALATE_AFTER", "3"))
 FILL_ANOMALY_STATUS = "BROKER_FILL_ANOMALY"
@@ -314,7 +318,7 @@ def get_pending_orders(client_id: str) -> list[dict]:
                       )
                     )
                     OR (
-                      status IN ('CANCELED', 'REJECTED', 'EXPIRED')
+                      status IN ('CANCELED', 'REJECTED', 'EXPIRED', 'ERROR')
                       AND updated_ts >= NOW() - INTERVAL '1 hour'
                     )
                   )
@@ -459,8 +463,14 @@ def _broker_poll_unavailable_for_durable_filled_recovery(result: dict) -> bool:
     if mapped == "ERROR":
         if raw.get("_broker_order_id_mismatch") or raw.get(
             "_malformed_broker_response"
-        ):
+        ) or raw.get("_broker_internal_error"):
             return False
+        if raw.get("_broker_get_failed"):
+            return raw.get("_broker_read_failure_class") in {
+                "TIMEOUT",
+                "NETWORK",
+                "AUTH",
+            }
         if raw.get("_broker_response_unavailable"):
             return True
         if raw.get("_broker_response_missing_id"):
@@ -626,6 +636,108 @@ def _broker_identity_error_result(
     )
 
 
+def _broker_read_failure_class(value, *, status_code=None) -> str:
+    """Classify a failed broker read without turning it into identity proof."""
+    text = str(
+        getattr(value, "reason_code", None)
+        or getattr(value, "code", None)
+        or value
+        or ""
+    ).strip().lower()
+    type_name = type(value).__name__.strip().lower() if value is not None else ""
+
+    try:
+        import requests
+
+        if isinstance(value, requests.exceptions.Timeout):
+            return "TIMEOUT"
+        if isinstance(value, requests.exceptions.ConnectionError):
+            return "NETWORK"
+        if isinstance(value, requests.exceptions.HTTPError):
+            response_status = getattr(
+                getattr(value, "response", None), "status_code", status_code
+            )
+            if response_status in (401, 403):
+                return "AUTH"
+            return "NETWORK"
+    except Exception:
+        pass
+
+    try:
+        numeric_status = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        numeric_status = None
+    if numeric_status in (401, 403):
+        return "AUTH"
+    if numeric_status in (408, 429) or (
+        numeric_status is not None and 500 <= numeric_status < 600
+    ):
+        return "NETWORK"
+    if re.search(r"\b(401|403)\b", text):
+        return "AUTH"
+    if re.search(r"\b(408|429|5\d{2})\b", text):
+        return "NETWORK"
+
+    if isinstance(value, PermissionError) or any(
+        token in f"{type_name} {text}"
+        for token in ("unauthoriz", "forbidden", "permission", "auth")
+    ):
+        return "AUTH"
+    if isinstance(value, (TimeoutError,)) or any(
+        token in f"{type_name} {text}"
+        for token in ("timeout", "timed out", "readtimeout")
+    ):
+        return "TIMEOUT"
+    if any(
+        token in f"{type_name} {text}"
+        for token in ("connection", "network", "dns", "socket", "reset")
+    ):
+        return "NETWORK"
+    return "UNAVAILABLE"
+
+
+def _broker_get_failure_result(
+    order: dict,
+    broker_order_id,
+    exc: Exception,
+) -> dict:
+    """Represent a failed GET as unavailable broker truth, never ID mismatch."""
+    failure_class = _broker_read_failure_class(exc)
+    reason_code = {
+        "TIMEOUT": "BROKER_READ_TIMEOUT_AMBIGUOUS",
+        "NETWORK": "BROKER_CONN_ERROR",
+        "AUTH": "BROKER_AUTH_ERROR",
+        "UNAVAILABLE": "BROKER_ORDER_READ_UNAVAILABLE",
+    }[failure_class]
+    detail = str(exc).strip()
+    reason = f"{reason_code}:{detail}" if detail else reason_code
+    response_evidence = {
+        "_broker_get_failed": True,
+        "_broker_response_unavailable": True,
+        "_broker_read_failure_class": failure_class,
+        "exception_type": type(exc).__name__,
+        "requested_broker_order_id": str(broker_order_id or ""),
+    }
+    audit(
+        str(order.get("client_id") or "default"),
+        "ERROR",
+        reason_code,
+        {
+            "broker_order_id": broker_order_id,
+            "local_order_id": order.get("local_order_id"),
+            "failure_class": failure_class,
+            "exception_type": type(exc).__name__,
+        },
+    )
+    return {
+        "status": "ERROR",
+        "filled_qty": 0,
+        "avg_fill": 0.0,
+        "reason": reason,
+        "raw": response_evidence,
+    }
+
+
 def _broker_response_without_identity_result(
     order: dict,
     broker_order_id,
@@ -646,6 +758,11 @@ def _broker_response_without_identity_result(
             "requested_broker_order_id": str(broker_order_id or ""),
         }
     )
+    if unavailable:
+        response_evidence["_broker_read_failure_class"] = _broker_read_failure_class(
+            raw.get("reason"),
+            status_code=raw.get("status_code") or raw.get("http_status_code"),
+        )
     if unavailable:
         return {
             "status": "ERROR",
@@ -1183,8 +1300,12 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 
     kind = (order.get("kind") or "ENTRY").upper()
 
+    raw = None
     try:
-        raw = broker.get_order(broker_order_id)
+        try:
+            raw = broker.get_order(broker_order_id)
+        except Exception as exc:
+            return _broker_get_failure_result(order, broker_order_id, exc)
         raw_status = raw.get("status") if isinstance(raw, dict) else None
         if (
             not isinstance(raw, dict)
@@ -1469,6 +1590,13 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         return result
 
     except Exception as e:
+        response_evidence = dict(raw) if isinstance(raw, dict) else {}
+        response_evidence.update(
+            {
+                "_broker_internal_error": True,
+                "exception_type": type(e).__name__,
+            }
+        )
         audit(
             str(order.get("client_id") or "default"),
             "ERROR",
@@ -1479,7 +1607,13 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 "local_order_id": order.get("local_order_id"),
             },
         )
-        return {"status": "ERROR", "filled_qty": 0, "avg_fill": 0.0, "reason": str(e), "raw": {}}
+        return {
+            "status": "ERROR",
+            "filled_qty": 0,
+            "avg_fill": 0.0,
+            "reason": "FILL_CHECK_FAILED",
+            "raw": response_evidence,
+        }
 
 
 # =============================================================================
@@ -4199,6 +4333,50 @@ def _persist_late_fill_marker(
         return False
 
 
+def _persist_terminal_fill_economics(
+    osm,
+    order: dict,
+    result: dict,
+    *,
+    filled_qty: int,
+) -> bool:
+    """Persist late-fill economics without asking OSM to change status."""
+    reconciler = getattr(osm, "reconcile_terminal_fill", None)
+    if not callable(reconciler):
+        # Test doubles and the explicitly opt-in legacy path may not expose
+        # the OSM helper.  Production requires OSM, where the helper is part of
+        # the lifecycle authority; do not manufacture a second DB writer here.
+        return True
+    raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+    filled_ts = (
+        result.get("filled_ts")
+        or raw.get("filled_ts")
+        or raw.get("execution_ts")
+        or raw.get("execution_time")
+    )
+    try:
+        return bool(
+            reconciler(
+                order.get("local_order_id"),
+                cumulative_filled=int(filled_qty or 0),
+                fill_price=result.get("avg_fill"),
+                broker_order_id=(
+                    result.get("broker_order_id")
+                    or order.get("broker_order_id")
+                ),
+                filled_ts=filled_ts,
+            )
+        )
+    except Exception as exc:
+        log.error(
+            "[%s] late-fill economics persistence failed | local=%s error=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+            exc,
+        )
+        return False
+
+
 def _reconcile_entry_fill_economics(
     broker,
     order: dict,
@@ -4359,6 +4537,20 @@ def _reconcile_late_broker_fill(
     """Dedicated broker-fill recovery for rows already terminalized locally."""
     if _late_fill_already_reconciled(order, filled_qty):
         return True
+
+    if not _persist_terminal_fill_economics(
+        osm,
+        order,
+        result,
+        filled_qty=filled_qty,
+    ):
+        audit(str(order.get("client_id") or "default"), "CRITICAL",
+              "BROKER_LATE_FILL_ECONOMICS_PERSIST_FAILED", {
+                  "local_order_id": order.get("local_order_id"),
+                  "broker_order_id": order.get("broker_order_id"),
+                  "kind": kind, "filled_qty": filled_qty,
+              })
+        return False
 
     if kind == "ENTRY":
         reconciled, position_id = _reconcile_entry_fill_economics(
@@ -4691,7 +4883,7 @@ def process_pending_order(
 
     if mapped in ("FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL") and str(
         order.get("status") or ""
-    ).upper() in TERMINAL_FAILURE_STATUSES:
+    ).upper() in LOCAL_TERMINAL_FILL_STATUSES:
         _reconcile_late_broker_fill(
             broker,
             order,
@@ -4707,7 +4899,7 @@ def process_pending_order(
         return
 
     if (
-        str(order.get("status") or "").upper() in TERMINAL_FAILURE_STATUSES
+        str(order.get("status") or "").upper() in LOCAL_TERMINAL_FILL_STATUSES
         and mapped not in ("UNKNOWN", "ERROR")
     ):
         audit(
@@ -5134,7 +5326,11 @@ def process_pending_order(
             except Exception as exc:
                 log.error("[%s] OSM partial update %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
-            _legacy_update_order_status(local_id, "PARTIAL_FILL", filled_qty=new_filled)
+            _legacy_update_order_status(
+                local_id,
+                mapped,
+                filled_qty=new_filled,
+            )
             partial_applied = True
 
         if not partial_applied:
