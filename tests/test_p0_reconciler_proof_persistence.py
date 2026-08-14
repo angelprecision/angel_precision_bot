@@ -537,31 +537,24 @@ class TestPnlUnits:
 # =============================================================================
 
 class TestPartialCloseBehavior:
-    def test_partial_close_does_not_write_proof_row(self):
+    def test_reconciler_ghost_path_has_no_synthetic_close_authority(self):
         """
-        Partial reconciler closes (quantity_remaining > 0 / status != CLOSED)
-        must not generate a proof_trades row. This matches the existing
-        PARTIAL_RECONCILER_CLOSE guard in the reconciler.
+        Broker-flat exposure evidence must not be converted into realized
+        economics by the legacy reconciler path. Canonical manual-close
+        reconciliation owns exact external EXIT adoption/finalization.
         """
-        sb = _InsertCapture()
-
-        # The proof write block is only reached when final_status == "CLOSED".
-        # For partial closes, the reconciler returns early — we simulate by
-        # confirming the proof path is never called when status != CLOSED.
-        # This test validates the guard exists in the actual reconciler source.
-        import ap_reconciler as _r
         src = open(_REPO / "ap_reconciler.py").read()
 
-        # The guard must be present
-        assert "PARTIAL_RECONCILER_CLOSE" in src, (
-            "Partial-close guard (PARTIAL_RECONCILER_CLOSE) missing from ap_reconciler.py"
+        assert "def _execute_reconciler_close" not in src, (
+            "legacy reconciler close writer must not remain as an authority"
         )
-        assert "skipping proof_trade" in src or "skipping proof" in src, (
-            "Partial-close guard must skip proof_trade"
+        assert "_current_px = self._get_current_option_price(contract)" not in src, (
+            "current option mark must not become reconciler exit truth"
         )
-
-        # No proof inserts should happen for partial-close simulation
-        assert len(sb.inserts) == 0
+        assert "exit_px = entry_px" not in src, (
+            "entry price must not become reconciler exit truth"
+        )
+        assert "RECONCILER_BROKER_FLAT_EXIT_FILL_UNRESOLVED" in src
 
 
 # =============================================================================
