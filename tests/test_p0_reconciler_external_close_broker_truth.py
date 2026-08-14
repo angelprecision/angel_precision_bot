@@ -295,6 +295,85 @@ def test_historical_exit_for_other_position_cannot_mutate_current_position(monke
 
 
 @pytest.mark.parametrize(
+    "bad_contract",
+    ["AAPL250102X00100000", "AAPL250102C0010000", "not-an-occ-symbol"],
+)
+def test_malformed_direct_order_contract_cannot_be_exact_exit_evidence(bad_contract):
+    evidence, reason = _select(
+        _position(),
+        [_broker_order(contract=bad_contract)],
+    )
+
+    assert evidence is None
+    assert reason == "no_exact_external_filled_exit_order"
+
+
+def test_malformed_position_contract_is_rejected_before_matching():
+    evidence, reason = _select(
+        _position(contract="not-an-occ-symbol"),
+        [_broker_order(contract="not-an-occ-symbol")],
+    )
+
+    assert evidence is None
+    assert reason == "position_contract_invalid"
+
+
+def test_reconciler_healer_skips_adopted_external_exit_rows(monkeypatch):
+    """The row-at-a-time backup path cannot overwrite weighted external truth."""
+    import ap.db as db_mod
+    import ap.position_manager as pm_mod
+
+    external_row = {
+        "local_order_id": "external-exit:client@example.com:broker-a",
+        "position_id": "position-460",
+        "fill_price": 0.90,
+        "filled_qty": 1,
+        "filled_ts": "2025-01-02T14:58:00+00:00",
+        "broker_order_id": "broker-a",
+        "meta": {"external_broker_order": True},
+    }
+    executed_sql: list[str] = []
+
+    class _Cursor:
+        def execute(self, sql, params=None):
+            executed_sql.append(" ".join(str(sql).split()))
+
+        def fetchall(self):
+            return [external_row]
+
+    class _Conn:
+        def __enter__(self):
+            return _Cursor()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    finalizer = MagicMock()
+    monkeypatch.setattr(db_mod, "conn", lambda: _Conn())
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        pm_mod,
+        "APPositionManager",
+        lambda client_id: SimpleNamespace(close_position_from_exit_fill=finalizer),
+    )
+
+    rec = APBrokerReconciler(
+        broker=MagicMock(),
+        client_id=CLIENT,
+        osm=MagicMock(),
+        pm=MagicMock(),
+        execution_mode="live",
+    )
+    rec._heal_exit_filled_positions_from_orders(_empty_summary(CLIENT))
+
+    finalizer.assert_not_called()
+    assert executed_sql
+    query = executed_sql[0].lower()
+    assert "not like 'external-exit:%'" in query
+    assert "external_broker_order" in query
+
+
+@pytest.mark.parametrize(
     ("order", "reason"),
     [
         (_broker_order(contract=WRONG_CONTRACT), "no_exact_external_filled_exit_order"),

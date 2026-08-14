@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -32,6 +33,7 @@ from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.position_manager")
 ET = ZoneInfo("America/New_York")
+_OCC_CONTRACT_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2230,6 +2232,17 @@ class APPositionManager:
                 pos = c.fetchone()
                 if not pos:
                     return False, "position_not_found"
+
+                if external_close and not _OCC_CONTRACT_RE.fullmatch(
+                    _normalize_proof_contract(pos.get("contract"))
+                ):
+                    log.critical(
+                        "[%s] external close blocked invalid OCC contract | pos=%s contract=%r",
+                        self.client_id,
+                        position_id,
+                        pos.get("contract"),
+                    )
+                    return False, "external_close_contract_invalid"
 
                 # ── Canonical state classification under FOR UPDATE (PR #386) ─
                 # The row lock is the ONLY correct serialization point. Any

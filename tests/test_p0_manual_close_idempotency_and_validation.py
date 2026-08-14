@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -292,6 +292,26 @@ def test_external_finalizer_rechecks_remaining_quantity_under_lock(monkeypatch):
     )
 
 
+def test_external_finalizer_rejects_invalid_occ_contract_under_lock(monkeypatch):
+    cursor = _install_pm_db(
+        monkeypatch,
+        {POSITION_ID: _open_position(contract="not-an-occ-symbol")},
+    )
+    apm = _APM(CLIENT)
+
+    ok = apm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=0.90,
+        filled_qty=2,
+        external_close=True,
+    )
+
+    assert ok is False
+    assert not any(
+        sql.startswith("UPDATE positions SET") for sql, _ in cursor._sql_history
+    )
+
+
 def test_closed_repair_stopped_taken_profit_are_terminal_classified(monkeypatch):
     for status in ("CLOSED_REPAIR", "STOPPED", "TAKEN_PROFIT"):
         row = _open_position(status=status, quantity_remaining=0,
@@ -507,6 +527,15 @@ def test_durable_fill_stale_timestamp_is_rejected():
     valid = manual_mod._validate_durable_fills(
         [_fill(filled_at=datetime(2026, 7, 21, 15, 0, 0, tzinfo=timezone.utc))],
         position=_pos(entry_ts="2026-07-21T15:26:58+00:00"),
+        detected_at=DETECTED_AT,
+    )
+    assert valid == []
+
+
+def test_durable_fill_far_future_timestamp_is_rejected():
+    valid = manual_mod._validate_durable_fills(
+        [_fill(filled_at=DETECTED_AT + timedelta(seconds=301))],
+        position=_pos(),
         detected_at=DETECTED_AT,
     )
     assert valid == []

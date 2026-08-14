@@ -95,6 +95,11 @@ def normalize_contract(value: Any) -> str:
     return str(value or "").upper().replace(" ", "").strip()
 
 
+def is_valid_occ_contract(value: Any) -> bool:
+    """Return True only for a normalized, complete OCC option symbol."""
+    return bool(OCC_RE.fullmatch(normalize_contract(value)))
+
+
 def position_direction(position: dict) -> str:
     return str(
         position.get("side") or position.get("direction") or ""
@@ -393,17 +398,17 @@ def order_legs(order: dict) -> list[dict]:
 def order_contract(order: dict) -> str:
     for key in ("option_symbol", "contract"):
         contract = normalize_contract(order.get(key))
-        if contract:
+        if is_valid_occ_contract(contract):
             return contract
 
     for leg in order_legs(order):
         for key in ("option_symbol", "contract", "symbol"):
             contract = normalize_contract(leg.get(key))
-            if contract and OCC_RE.fullmatch(contract):
+            if is_valid_occ_contract(contract):
                 return contract
 
     symbol = normalize_contract(order.get("symbol"))
-    return symbol if OCC_RE.fullmatch(symbol) else ""
+    return symbol if is_valid_occ_contract(symbol) else ""
 
 
 def order_side(order: dict) -> str:
@@ -564,6 +569,14 @@ def _validate_durable_fills(
     )
     position_id = str(position.get("id") or "").strip()
 
+    if not is_valid_occ_contract(pos_contract):
+        log.warning(
+            "[%s] MANUAL_CLOSE_DURABLE_FILL_POSITION_CONTRACT_INVALID "
+            "pos=%s contract=%r — rejected",
+            client_id, position_id, pos_contract,
+        )
+        return []
+
     # Position direction validity is a precondition — if the position row
     # itself lacks a valid CALL/PUT direction we cannot prove alignment for
     # any fill.  Reject the entire durable set for this position.
@@ -646,6 +659,13 @@ def _validate_durable_fills(
                 client_id, position_id, bid,
             )
             continue
+        if not is_valid_occ_contract(db_contract):
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_CONTRACT_INVALID pos=%s "
+                "broker_id=%s contract=%r — rejected",
+                client_id, position_id, bid, db_contract,
+            )
+            continue
         if db_contract != pos_contract:
             log.warning(
                 "[%s] MANUAL_CLOSE_DURABLE_FILL_CONTRACT_MISMATCH pos=%s "
@@ -672,6 +692,13 @@ def _validate_durable_fills(
                 "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_STALE pos=%s "
                 "broker_id=%s fill_ts=%s entry_ts=%s — rejected",
                 client_id, position_id, bid, filled_at, opened_at,
+            )
+            continue
+        if (filled_at - detected_at).total_seconds() > MANUAL_CLOSE_FUTURE_SKEW_SEC:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_FUTURE pos=%s "
+                "broker_id=%s fill_ts=%s detected_at=%s — rejected",
+                client_id, position_id, bid, filled_at, detected_at,
             )
             continue
         valid.append(f)
@@ -714,6 +741,8 @@ def select_external_close_fills(
 
     if not contract:
         return None, "position_contract_missing"
+    if not is_valid_occ_contract(contract):
+        return None, "position_contract_invalid"
     if opened_at is None:
         return None, "position_opened_at_missing"
     if required_qty <= 0:
@@ -1066,6 +1095,8 @@ def _row_matches_expected(
         and str(row.get("position_id") or "").strip() == str(position.get("id") or "").strip()
         and str(row.get("kind") or "").upper().strip() == "EXIT"
         and str(row.get("status") or "").upper().strip() in DURABLE_EXIT_FILLED_STATUSES
+        and is_valid_occ_contract(expected_contract)
+        and is_valid_occ_contract(row.get("contract"))
         and normalize_contract(row.get("contract")) == expected_contract
         and str(row.get("direction") or "").upper().strip() == expected_side
         and str(row.get("broker_order_id") or "").strip() == fill["broker_order_id"]
@@ -1105,7 +1136,7 @@ def adopt_external_exit_fills(
     if (
         not client_id
         or not position_id
-        or not contract
+        or not is_valid_occ_contract(contract)
         or direction not in {"CALL", "PUT"}
         or execution_mode not in VALID_EXECUTION_MODES
     ):
@@ -1586,7 +1617,7 @@ def detect_manual_closes(self) -> None:
     for position in active_positions:
         position_id = str(position.get("id") or "").strip()
         contract = normalize_contract(position.get("contract"))
-        if not position_id or not contract:
+        if not position_id or not is_valid_occ_contract(contract):
             continue
         if not _check_fences(position, position_id, contract):
             continue
@@ -1723,7 +1754,7 @@ def detect_manual_closes(self) -> None:
     for position in missing_positions:
         position_id = str(position.get("id") or "").strip()
         contract = normalize_contract(position.get("contract"))
-        if not position_id or not contract:
+        if not position_id or not is_valid_occ_contract(contract):
             continue
         if not _check_fences(position, position_id, contract):
             continue

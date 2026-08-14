@@ -988,9 +988,13 @@ class APBrokerReconciler:
 
     def _heal_exit_filled_positions_from_orders(self, summary: dict) -> None:
         """
-        Backup fill-truth repair. If any EXIT order is EXIT_FILLED with a confirmed
-        fill_price, but the linked position is still missing exit_price / realized_pnl
-        / realized_pnl_pct, finalize the position from the order row.
+        Backup fill-truth repair. If any bot-owned EXIT order is EXIT_FILLED with a
+        confirmed fill_price, but the linked position is still missing exit_price /
+        realized_pnl / realized_pnl_pct, finalize the position from the order row.
+
+        External/manual EXIT rows are deliberately excluded. The manual-close
+        reconciler owns those rows and must finalize their complete weighted
+        fill aggregate under the external-close quantity/ownership fence.
 
         Catches: manual exits, restart gaps, fill monitor delays, OSM misses.
         Production rule: orders table receives broker truth first.
@@ -1017,6 +1021,8 @@ class APBrokerReconciler:
                         WHERE o.client_id = %s
                           AND o.kind = 'EXIT'
                           AND o.status = 'EXIT_FILLED'
+                          AND COALESCE(o.local_order_id, '') NOT LIKE 'external-exit:%'
+                          AND LOWER(COALESCE(o.meta->>'external_broker_order', 'false')) <> 'true'
                           AND o.fill_price IS NOT NULL
                           AND COALESCE(o.filled_qty, 0) > 0
                           AND p.avg_fill IS NOT NULL
@@ -1035,13 +1041,29 @@ class APBrokerReconciler:
                     return c.fetchall()
 
             rows = run_with_retry(_fn) or []
+            # Keep a second, application-level fence for legacy rows or test
+            # doubles that do not apply the SQL predicate. Every adopted
+            # external row uses this local-order prefix; metadata is retained
+            # as a defensive marker for any older row shape.
+            filtered_rows = []
+            for row in rows:
+                row = dict(row) if not isinstance(row, dict) else row
+                local_order_id = str(row.get("local_order_id") or "").strip()
+                meta = row.get("meta")
+                external_marker = (
+                    isinstance(meta, dict)
+                    and str(meta.get("external_broker_order") or "").lower() == "true"
+                )
+                if local_order_id.startswith("external-exit:") or external_marker:
+                    continue
+                filtered_rows.append(row)
+            rows = filtered_rows
             if not rows:
                 return
 
             pm = APPositionManager(self.client_id)
             healed = 0
             for row in rows:
-                row = dict(row) if not isinstance(row, dict) else row
                 ok = pm.close_position_from_exit_fill(
                     position_id=str(row["position_id"]),
                     exit_price=float(row["fill_price"]),
