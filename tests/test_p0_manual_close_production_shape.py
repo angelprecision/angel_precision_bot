@@ -118,6 +118,8 @@ def test_jason_production_position_shape_uses_direction_when_side_is_null(monkey
                 "filled_qty": 2,
                 "fill_price": 0.75,
                 "filled_at": filled_at,
+                "fill_timestamp_source": manual_mod.BROKER_FILL_TIMESTAMP_SOURCE,
+                "fill_timestamp_key": "last_fill_date",
                 "raw_status": "filled",
                 "raw_side": "sell_to_close",
             }

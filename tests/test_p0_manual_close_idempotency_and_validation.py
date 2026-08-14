@@ -27,7 +27,9 @@ from __future__ import annotations
 import os
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/test")
 
@@ -214,6 +216,102 @@ def test_nonterminal_status_with_zero_remaining_refuses_mutation(monkeypatch):
     assert getattr(apm, "_terminal_proof_calls", []) == []
 
 
+@pytest.mark.parametrize(
+    ("exit_price", "filled_qty"),
+    [
+        (True, 2),
+        (0.90, True),
+        (0.90, 2.5),
+        (float("nan"), 2),
+        (float("inf"), 2),
+    ],
+)
+def test_finalizer_rejects_malformed_external_scalars_before_db_mutation(
+    monkeypatch, exit_price, filled_qty,
+):
+    cursor = _install_pm_db(monkeypatch, {POSITION_ID: _open_position()})
+    apm = _APM(CLIENT)
+
+    ok = apm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=exit_price,
+        filled_qty=filled_qty,
+        external_close=True,
+    )
+
+    assert ok is False
+    assert not any(
+        sql.startswith("UPDATE positions SET") for sql, _ in cursor._sql_history
+    )
+
+
+@pytest.mark.parametrize(
+    "owner_fields",
+    [
+        {"exit_in_flight": True},
+        {"pending_exit_broker_order_id": "bot-exit-460"},
+        {"pending_exit_local_order_id": "local-exit-460"},
+    ],
+)
+def test_external_finalizer_rechecks_current_exit_owner_under_lock(
+    monkeypatch, owner_fields,
+):
+    cursor = _install_pm_db(monkeypatch, {POSITION_ID: _open_position(**owner_fields)})
+    apm = _APM(CLIENT)
+
+    ok = apm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=0.90,
+        filled_qty=2,
+        external_close=True,
+    )
+
+    assert ok is False
+    assert not any(
+        sql.startswith("UPDATE positions SET") for sql, _ in cursor._sql_history
+    )
+
+
+def test_external_finalizer_rechecks_remaining_quantity_under_lock(monkeypatch):
+    cursor = _install_pm_db(
+        monkeypatch,
+        {POSITION_ID: _open_position(quantity_remaining=1)},
+    )
+    apm = _APM(CLIENT)
+
+    ok = apm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=0.90,
+        filled_qty=2,
+        external_close=True,
+    )
+
+    assert ok is False
+    assert not any(
+        sql.startswith("UPDATE positions SET") for sql, _ in cursor._sql_history
+    )
+
+
+def test_external_finalizer_rejects_invalid_occ_contract_under_lock(monkeypatch):
+    cursor = _install_pm_db(
+        monkeypatch,
+        {POSITION_ID: _open_position(contract="not-an-occ-symbol")},
+    )
+    apm = _APM(CLIENT)
+
+    ok = apm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=0.90,
+        filled_qty=2,
+        external_close=True,
+    )
+
+    assert ok is False
+    assert not any(
+        sql.startswith("UPDATE positions SET") for sql, _ in cursor._sql_history
+    )
+
+
 def test_closed_repair_stopped_taken_profit_are_terminal_classified(monkeypatch):
     for status in ("CLOSED_REPAIR", "STOPPED", "TAKEN_PROFIT"):
         row = _open_position(status=status, quantity_remaining=0,
@@ -292,6 +390,8 @@ def _fill(**overrides):
         "filled_qty": 2,
         "fill_price": 0.75,
         "filled_at": datetime(2026, 7, 21, 15, 57, 39, tzinfo=timezone.utc),
+        "fill_timestamp_source": manual_mod.BROKER_FILL_TIMESTAMP_SOURCE,
+        "fill_timestamp_key": "last_fill_date",
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
@@ -405,10 +505,46 @@ def test_durable_fill_valid_row_is_accepted():
     assert valid[0]["broker_order_id"] == "BROK-1"
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"fill_timestamp_source": ""},
+        {"fill_timestamp_source": "broker_response", "fill_timestamp_key": "update_date"},
+        {"filled_at": datetime(2026, 7, 21, 15, 57, 39)},
+    ],
+)
+def test_durable_fill_requires_broker_timestamp_provenance(overrides):
+    valid = manual_mod._validate_durable_fills(
+        [_fill(**overrides)],
+        position=_pos(),
+        detected_at=DETECTED_AT,
+    )
+    assert valid == []
+
+
+def test_durable_fill_transaction_date_provenance_is_accepted():
+    valid = manual_mod._validate_durable_fills(
+        [_fill(fill_timestamp_source="broker_response", fill_timestamp_key="transaction_date")],
+        position=_pos(),
+        detected_at=DETECTED_AT,
+    )
+    assert len(valid) == 1
+    assert valid[0]["fill_timestamp_key"] == "transaction_date"
+
+
 def test_durable_fill_stale_timestamp_is_rejected():
     valid = manual_mod._validate_durable_fills(
         [_fill(filled_at=datetime(2026, 7, 21, 15, 0, 0, tzinfo=timezone.utc))],
         position=_pos(entry_ts="2026-07-21T15:26:58+00:00"),
+        detected_at=DETECTED_AT,
+    )
+    assert valid == []
+
+
+def test_durable_fill_far_future_timestamp_is_rejected():
+    valid = manual_mod._validate_durable_fills(
+        [_fill(filled_at=DETECTED_AT + timedelta(seconds=301))],
+        position=_pos(),
         detected_at=DETECTED_AT,
     )
     assert valid == []

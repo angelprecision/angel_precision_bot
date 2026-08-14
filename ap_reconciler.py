@@ -28,7 +28,7 @@ Checks:
 
   Positions:
     E. DB OPEN/CLOSING → broker position missing
-       → evidence-based close only after filled exit evidence or three-pass ghost confirm
+       → exposure/discrepancy evidence only; canonical manual-close reconciliation owns close
     F. DB qty vs broker qty mismatch
        → alert
     G. Broker OPEN → DB missing
@@ -151,9 +151,9 @@ DB_OPEN_STATUSES = frozenset({
 # for legacy rows produced by earlier schema versions.
 DB_OPEN_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
 
-# P0-PARTIAL-CLOSE: Status transitions for the reconciler auto-close path.
-# A position is only CLOSED when quantity_remaining reaches 0.
-# Anything with remaining qty must stay managed.
+# P0-PARTIAL-CLOSE: Retained status-repair fence for legacy CLOSED rows that
+# still claim quantity. Broker-flat reconciliation itself is HOLD-only; exact
+# external EXIT finalization belongs to the canonical manual-close reconciler.
 _RECONCILER_CLOSED_WITH_REMAINING_REPAIR_STATUSES = frozenset({"CLOSED", "CLOSED_REPAIR"})
 
 BROKER_FILLED   = frozenset({"filled", "partially_filled"})
@@ -226,12 +226,16 @@ def _empty_summary(client_id: str, run: int = 0) -> dict:
     Return a zeroed summary dict with all standard keys present.
     Used for both real runs and skip-path returns so callers never KeyError.
 
-    P0-PARTIAL-CLOSE diagnostic counters (added):
+    Legacy P0-PARTIAL-CLOSE diagnostic counters are retained for summary-shape
+    compatibility. The broker-flat path is now HOLD-only; canonical manual-close
+    reconciliation owns exact external EXIT finalization.
+
+    Diagnostic counters (retained):
       closed_positions_with_remaining_qty_count   — total CLOSED rows w/ qty_remaining>0 seen
       closed_positions_with_remaining_qty_recent  — those seen in this specific pass
       broker_positions_hidden_by_closed_status_count — broker-live but DB-CLOSED, caught by repair
-      reconciler_partial_close_preserved_count    — auto-close attempts downgraded to PARTIAL
-      reconciler_full_close_count                 — auto-closes that legitimately set CLOSED
+      reconciler_partial_close_preserved_count    — legacy auto-close counter, always zero here
+      reconciler_full_close_count                 — legacy auto-close counter, always zero here
     """
     return {
         "run":                 run,
@@ -984,9 +988,13 @@ class APBrokerReconciler:
 
     def _heal_exit_filled_positions_from_orders(self, summary: dict) -> None:
         """
-        Backup fill-truth repair. If any EXIT order is EXIT_FILLED with a confirmed
-        fill_price, but the linked position is still missing exit_price / realized_pnl
-        / realized_pnl_pct, finalize the position from the order row.
+        Backup fill-truth repair. If any bot-owned EXIT order is EXIT_FILLED with a
+        confirmed fill_price, but the linked position is still missing exit_price /
+        realized_pnl / realized_pnl_pct, finalize the position from the order row.
+
+        External/manual EXIT rows are deliberately excluded. The manual-close
+        reconciler owns those rows and must finalize their complete weighted
+        fill aggregate under the external-close quantity/ownership fence.
 
         Catches: manual exits, restart gaps, fill monitor delays, OSM misses.
         Production rule: orders table receives broker truth first.
@@ -1013,6 +1021,8 @@ class APBrokerReconciler:
                         WHERE o.client_id = %s
                           AND o.kind = 'EXIT'
                           AND o.status = 'EXIT_FILLED'
+                          AND COALESCE(o.local_order_id, '') NOT LIKE 'external-exit:%'
+                          AND LOWER(COALESCE(o.meta->>'external_broker_order', 'false')) <> 'true'
                           AND o.fill_price IS NOT NULL
                           AND COALESCE(o.filled_qty, 0) > 0
                           AND p.avg_fill IS NOT NULL
@@ -1031,13 +1041,29 @@ class APBrokerReconciler:
                     return c.fetchall()
 
             rows = run_with_retry(_fn) or []
+            # Keep a second, application-level fence for legacy rows or test
+            # doubles that do not apply the SQL predicate. Every adopted
+            # external row uses this local-order prefix; metadata is retained
+            # as a defensive marker for any older row shape.
+            filtered_rows = []
+            for row in rows:
+                row = dict(row) if not isinstance(row, dict) else row
+                local_order_id = str(row.get("local_order_id") or "").strip()
+                meta = row.get("meta")
+                external_marker = (
+                    isinstance(meta, dict)
+                    and str(meta.get("external_broker_order") or "").lower() == "true"
+                )
+                if local_order_id.startswith("external-exit:") or external_marker:
+                    continue
+                filtered_rows.append(row)
+            rows = filtered_rows
             if not rows:
                 return
 
             pm = APPositionManager(self.client_id)
             healed = 0
             for row in rows:
-                row = dict(row) if not isinstance(row, dict) else row
                 ok = pm.close_position_from_exit_fill(
                     position_id=str(row["position_id"]),
                     exit_price=float(row["fill_price"]),
@@ -2928,7 +2954,13 @@ class APBrokerReconciler:
             return []
 
     def _get_recent_exit_fill(self, contract: str, underlying: str) -> Optional[dict]:
-        """Look up the most recent filled EXIT order for this contract."""
+        """Read recent local EXIT evidence for missing-id order recovery only.
+
+        This contract-level lookup is intentionally not position-close authority.
+        Broker-flat position reconciliation must defer to the canonical manual-close
+        reconciler, which proves exact position, mode, OCC, side, quantity, price,
+        timestamp, and broker-order identity before finalization.
+        """
         try:
             from ap.db import conn, run_with_retry
 
@@ -2971,7 +3003,8 @@ class APBrokerReconciler:
 
         Policy:
           1. Match DB positions by exact contract symbol first.
-          2. Auto-close DB positions only with filled exit evidence or three-pass ghost confirm.
+          2. Use broker-flat observations only as discrepancy evidence. The canonical
+             manual-close reconciler owns exact external EXIT adoption/finalization.
           3. Import broker-open positions missing from DB so restarts cannot orphan trades.
 
         FIX-7: db_underlyings removed — it was constructed and passed to
@@ -3089,401 +3122,50 @@ class APBrokerReconciler:
         entry_px: float,
         summary: dict,
     ) -> None:
-        pos_id    = pos.get("id") or pos.get("position_id")
-        exit_fill = self._get_recent_exit_fill(contract, underlying)
-
-        if exit_fill and float(exit_fill.get("fill_price") or 0) > 0:
-            exit_px          = float(exit_fill["fill_price"])
-            close_confidence = "HIGH"
-            log.info(
-                "[%s] RECONCILE_CLOSE_EVIDENCE | %s | filled exit found @ $%.4f",
-                self.client_id, contract, exit_px,
-            )
-        else:
-            pos_id_str       = str(pos_id or "")
-            active_exit      = self._active_exit_order_exists(position_id=pos_id_str) if pos_id_str else None
-            broker_open_exit = self._broker_open_exit_exists_for_contract(contract)
-            if active_exit or broker_open_exit:
-                self._ghost_tracker.pop(contract, None)
-                self._alert(
-                    f"GHOST_CLOSE_BLOCKED_ACTIVE_EXIT | {contract} | pos={pos_id_str or '?'} | "
-                    "broker position missing but active local/broker exit evidence exists; keeping DB OPEN"
-                )
-                summary["positions_alerted"] += 1
-                return
-
-            pass_count = int(self._ghost_tracker.get(self._norm_contract(contract), 0)) + 1
-            if not self._mark_ghost_seen(contract):
-                log.warning(
-                    "[%s] GHOST_PASS_%d | %s | broker has no position — waiting for stronger evidence",
-                    self.client_id, pass_count, contract,
-                )
-                summary["positions_alerted"] += 1
-                return
-            _current_px = self._get_current_option_price(contract)
-            if _current_px > 0:
-                exit_px          = _current_px
-                close_confidence = "MEDIUM_THREE_PASS_CURRENT_MARK"
-                log.warning(
-                    "[%s] GHOST_PASS_3 | %s | no broker position, no active exit — "
-                    "auto-closing at current mark $%.4f",
-                    self.client_id, contract, _current_px,
-                )
-            else:
-                exit_px          = entry_px
-                close_confidence = "MEDIUM_THREE_PASS_NO_EXIT_EVIDENCE"
-                log.warning(
-                    "[%s] GHOST_PASS_3 | %s | no broker position, no active exit, "
-                    "no live quote — auto-closing at entry price (P&L = $0)",
-                    self.client_id, contract,
-                )
-
-        # Lifecycle visibility: ghost/autoclose is a major data-correction event.
-        # Record it before the DB row is changed so a future trace can explain
-        # exactly why the reconciler decided broker truth required closing DB truth.
-        self._record_reconciler_rejection(
-            signal_id=str(pos_id or f"ghost:{contract}"),
-            ticker=self._norm_underlying(underlying or contract),
-            category_name="DATA",
-            severity_name="WARNING",
-            reason_code="BROKER_POSITION_MISSING_THREE_PASS_CONFIRM",
-            human_reason="broker position missing after three-pass confirmation; reconciler auto-closing DB position",
-            contract=contract,
-            pos_id=pos_id,
-            db_qty=db_qty,
-            entry_px=entry_px,
-            exit_px=exit_px,
-            close_confidence=close_confidence,
-            client_id=self.client_id,
-        )
-
-        self._execute_reconciler_close(
-            pos=pos,
-            contract=contract,
-            underlying=underlying,
-            db_qty=db_qty,
-            entry_px=entry_px,
-            exit_px=exit_px,
-            close_confidence=close_confidence,
-            summary=summary,
-            side=side if "side" in dir() else (pos.get("side") or pos.get("direction") or "CALL"),
-        )
-
-    def _execute_reconciler_close(
-        self,
-        *,
-        pos: dict,
-        contract: str,
-        underlying: str,
-        db_qty: int,
-        entry_px: float,
-        exit_px: float,
-        close_confidence: str,
-        summary: dict,
-        side: str = "CALL",
-    ) -> None:
-        """
-        P0-PARTIAL-CLOSE: Extracted auto-close DB write.
-        Called by _handle_db_position_missing_at_broker after three-pass ghost
-        confirmation. The ONLY place that writes RECONCILER_AUTO_CLOSE to positions.
-
-        Rule: status=CLOSED iff quantity_remaining becomes 0.
-              Otherwise status=PARTIAL (broker is flat but prior scale-outs exist).
-        """
         pos_id = pos.get("id") or pos.get("position_id")
-        pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
-        pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
-
-        try:
-            from ap.db import conn, run_with_retry as _rwr
-
-            _now = datetime.now(timezone.utc).isoformat()
-
-            # ── P0-PARTIAL-CLOSE SAFETY: fetch current quantity_remaining ─────
-            # The reconciler only knows db_qty (original entry quantity).
-            # quantity_remaining reflects any prior scale-outs.  We must
-            # honour that value: if broker is flat (no position) we close the
-            # remaining contracts, but we do NOT set status=CLOSED unless
-            # that reduces quantity_remaining to 0.
-            #
-            # Rule:
-            #   remaining_after_close = max(0, current_remaining - db_qty_to_close)
-            #   if remaining_after_close <= 0 → status = 'CLOSED'
-            #   else                          → status = 'PARTIAL'   (keep managed)
-            #
-            # We use db_qty as the "quantity to close" because the caller
-            # confirmed broker has zero contracts for this position.
-
-            def _close():
-                with conn() as c:
-                    # Re-fetch the row under lock so we use the freshest remaining qty.
-                    c.execute(
-                        "SELECT quantity_remaining, qty FROM positions "
-                        "WHERE id = %s AND client_id = %s FOR UPDATE",
-                        (pos_id, self.client_id),
-                    )
-                    row = c.fetchone()
-                    if not row:
-                        return None
-
-                    _row = dict(row)
-                    _stored_remaining = _row.get("quantity_remaining")
-                    _stored_qty       = int(_row.get("qty") or db_qty or 0)
-
-                    # Resolve current remaining; fall back to full qty if null
-                    if _stored_remaining is None:
-                        current_remaining = _stored_qty
-                    else:
-                        current_remaining = int(_stored_remaining)
-
-                    # How many contracts does this auto-close account for?
-                    # Broker says zero — so we close whatever is remaining.
-                    close_qty         = current_remaining  # all that's left, per broker
-                    new_remaining     = 0                   # broker is flat
-
-                    # ── SAFETY RULE: qty_remaining > 0 → cannot be CLOSED ────
-                    if new_remaining <= 0:
-                        final_status = "CLOSED"
-                    else:
-                        # Should not happen (close_qty = current_remaining above),
-                        # but belt-and-suspenders: never hide live exposure.
-                        final_status = "PARTIAL"
-                        log.warning(
-                            "[%s] P0-PARTIAL-CLOSE-GUARD | %s | pos=%s | "
-                            "new_remaining=%d > 0 after auto-close attempt — "
-                            "setting PARTIAL instead of CLOSED",
-                            self.client_id, contract, pos_id, new_remaining,
-                        )
-
-                    # Recompute P&L using the contracts actually being closed
-                    _pnl_closed   = round((exit_px - entry_px) * max(close_qty, 1) * 100, 2)
-                    _pnl_pct      = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
-
-                    c.execute(
-                        """
-                        UPDATE positions
-                        SET    status             = %s,
-                               exit_ts            = %s,
-                               exit_price         = %s,
-                               realized_pnl       = %s,
-                               realized_pnl_pct   = %s,
-                               quantity_remaining = %s,
-                               close_source       = %s,
-                               close_confidence   = %s
-                        WHERE  id = %s AND client_id = %s
-                        """,
-                        (
-                            final_status,
-                            _now,
-                            exit_px,
-                            _pnl_closed,
-                            _pnl_pct,
-                            new_remaining,
-                            "RECONCILER_AUTO_CLOSE",
-                            close_confidence,
-                            pos_id,
-                            self.client_id,
-                        ),
-                    )
-                    return {
-                        "final_status":   final_status,
-                        "close_qty":      close_qty,
-                        "new_remaining":  new_remaining,
-                        "pnl_dollars":    _pnl_closed,
-                        "pnl_pct":        _pnl_pct,
-                    }
-
-            _result = _rwr(_close)
-        except Exception as e:
-            log.error("[%s] RECONCILE close DB write failed %s: %s",
-                      self.client_id, pos_id, e)
+        pos_id_str = str(pos_id or "")
+        active_exit      = self._active_exit_order_exists(position_id=pos_id_str) if pos_id_str else None
+        broker_open_exit = self._broker_open_exit_exists_for_contract(contract)
+        if active_exit or broker_open_exit:
+            self._ghost_tracker.pop(contract, None)
+            self._alert(
+                f"GHOST_CLOSE_BLOCKED_ACTIVE_EXIT | {contract} | pos={pos_id_str or '?'} | "
+                "broker position missing but active local/broker exit evidence exists; keeping DB OPEN"
+            )
             summary["positions_alerted"] += 1
             return
 
-        if _result is None:
-            log.warning("[%s] RECONCILE close: pos %s not found during lock-fetch", self.client_id, pos_id)
+        pass_count = int(self._ghost_tracker.get(self._norm_contract(contract), 0)) + 1
+        if not self._mark_ghost_seen(contract):
+            log.warning(
+                "[%s] GHOST_PASS_%d | %s | broker has no position — waiting for stronger evidence",
+                self.client_id, pass_count, contract,
+            )
             summary["positions_alerted"] += 1
             return
 
-        final_status  = _result["final_status"]
-        close_qty     = _result["close_qty"]
-        new_remaining = _result["new_remaining"]
-        pnl_dollars   = _result["pnl_dollars"]
-        pnl_pct       = _result["pnl_pct"]
-
-        # Update diagnostic counters
-        if final_status == "CLOSED":
-            summary["reconciler_full_close_count"] = \
-                int(summary.get("reconciler_full_close_count", 0)) + 1
-        else:
-            summary["reconciler_partial_close_preserved_count"] = \
-                int(summary.get("reconciler_partial_close_preserved_count", 0)) + 1
-
-        # Only notify exit engine if position is truly fully closed
-        _ee = getattr(self, "exit_engine", None)
-        if _ee and final_status == "CLOSED":
-            try:
-                _ee.mark_position_closed(str(pos_id), reason="reconciler_auto_close")
-            except Exception as _e:
-                log.warning("reconciler_mark_position_closed_failed: %s", _e)
-
-        self._ghost_tracker.pop(contract, None)
-        log.info(
-            "[%s] FINALIZED TRADE | %s | pos=%s | entry=%.4f exit=%.4f "
-            "closed_qty=%d remaining=%d pnl=$%.2f (%.1f%%) "
-            "status=%s source=RECONCILER confidence=%s",
-            self.client_id, contract, pos_id, entry_px, exit_px,
-            close_qty, new_remaining, pnl_dollars, pnl_pct,
-            final_status, close_confidence,
+        # Broker-flat truth proves exposure is gone, not the realized EXIT price.
+        # The runner's canonical manual-close reconciler performs the read-only
+        # broker-order selection, durable external EXIT adoption, weighted-fill
+        # calculation, and position/proof finalization. This reconciler must
+        # remain a HOLD-only discrepancy observer so it cannot race that owner.
+        reason_code = "RECONCILER_BROKER_FLAT_EXIT_FILL_UNRESOLVED"
+        log.error(
+            "[%s] %s | contract=%s position_id=%s db_qty=%s entry_px=%s "
+            "— canonical manual-close reconciliation must establish exact broker EXIT truth",
+            self.client_id,
+            reason_code,
+            contract,
+            pos_id_str or "?",
+            db_qty,
+            entry_px,
         )
-        summary["positions_corrected"] += 1
-
-        # ── Auto-log to proof_trades only on full close ───────────────────────
-        # Partial reconciler closes should not generate a proof_trade because the
-        # position is still open and will produce a final proof entry on full exit.
-        if final_status != "CLOSED":
-            log.info(
-                "[%s] PARTIAL_RECONCILER_CLOSE skipping proof_trade | %s | remaining=%d",
-                self.client_id, contract, new_remaining,
-            )
-            return
-
-        # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
-        # Without this, any position closed outside the exit engine (manual broker
-        # close, overnight expiry, emergency flatten) is invisible in the trade ledger.
-        _proof_write_failed = False
-        try:
-            from ap_proof_logger import APProofLogger as _APProofLogger
-
-            if not self.supabase_client:
-                # Missing client → operator-visible error, never silently discard.
-                log.error(
-                    "[%s] RECONCILER_PROOF_WRITE_BLOCKED contract=%s position_id=%s "
-                    "reason=missing_supabase_client",
-                    self.client_id, contract, pos_id,
-                )
-                _proof_write_failed = True
-            else:
-                _local_order_id = str(pos.get("local_order_id") or "")
-                _pos_id_str     = str(pos_id or "")
-
-                # ── Idempotency: three-state lookup ───────────────────────────
-                # IDEMPOTENCY_EXISTS  — existing row confirmed → skip, no failure
-                # IDEMPOTENCY_CLEAR   — no existing row       → proceed with insert
-                # IDEMPOTENCY_UNKNOWN — lookup failed          → block insert, log error
-                _IDEM_EXISTS  = "EXISTS"
-                _IDEM_CLEAR   = "CLEAR"
-                _IDEM_UNKNOWN = "UNKNOWN"
-                _idem_state   = _IDEM_UNKNOWN   # default: treat uncertainty as block
-                _idem_err_str = None
-
-                try:
-                    _existing = (
-                        self.supabase_client
-                        .table("proof_trades")
-                        .select("id")
-                        .eq("position_id", _pos_id_str)
-                        .limit(1)
-                        .execute()
-                    )
-                    _existing_rows = (_existing.data or []) if _existing else []
-                    if not _existing_rows and _local_order_id:
-                        _existing2 = (
-                            self.supabase_client
-                            .table("proof_trades")
-                            .select("id")
-                            .eq("local_order_id", _local_order_id)
-                            .limit(1)
-                            .execute()
-                        )
-                        _existing_rows = (_existing2.data or []) if _existing2 else []
-                    _idem_state = _IDEM_EXISTS if _existing_rows else _IDEM_CLEAR
-                except Exception as _idem_exc:
-                    _idem_state   = _IDEM_UNKNOWN
-                    _idem_err_str = str(_idem_exc)
-
-                if _idem_state == _IDEM_EXISTS:
-                    log.info(
-                        "[%s] RECONCILER_PROOF_ALREADY_EXISTS contract=%s position_id=%s "
-                        "local_order_id=%s — skipping duplicate insert",
-                        self.client_id, contract, _pos_id_str, _local_order_id,
-                    )
-                    # safe no-op — not a write failure
-
-                elif _idem_state == _IDEM_UNKNOWN:
-                    # Lookup failed → do NOT insert (fail closed, not open).
-                    log.error(
-                        "[%s] RECONCILER_PROOF_IDEMPOTENCY_UNVERIFIED contract=%s "
-                        "position_id=%s local_order_id=%s client=%s "
-                        "error=%s — insert blocked to prevent duplicates",
-                        self.client_id, contract, _pos_id_str, _local_order_id,
-                        self.client_id, _idem_err_str,
-                    )
-                    _proof_write_failed = True
-
-                else:
-                    # IDEMPOTENCY_CLEAR — proceed with proof insert
-                    _proof = _APProofLogger(
-                        supabase_client=self.supabase_client,
-                        client_email=self.client_id,
-                        mode=self.execution_mode or "unknown",
-                    )
-                    _proof_result = _proof.log_trade(
-                        ticker             = self._norm_underlying(underlying or contract),
-                        pattern            = "",
-                        side               = side or "CALL",
-                        timeframe          = "1d",
-                        score              = 0,
-                        tier               = "A",
-                        context_score      = 0,
-                        setup_status       = "reconciler_auto_close",
-                        entry_trigger      = entry_px,
-                        entry_option_price = entry_px,
-                        exit_option_price  = exit_px,
-                        underlying_entry   = 0.0,
-                        underlying_exit    = 0.0,
-                        contracts          = close_qty or 1,
-                        exit_reason        = f"RECONCILER_AUTO_CLOSE | {close_confidence} | broker_position_missing",
-                        option_pnl_pct     = pnl_pct,
-                        underlying_pnl_pct = 0.0,
-                        win                = exit_px > entry_px,
-                        spread_pct         = 0.0,
-                        chain_grade        = "",
-                        synthetic_entry    = False,
-                        position_id        = _pos_id_str,
-                        local_order_id     = _local_order_id,
-                        execution_mode     = self.execution_mode or "",
-                    )
-                    # Check confirmed persistence — never emit PROOF_LOGGED on cache-only write.
-                    if _proof_result.get("_proof_persisted") is True:
-                        log.info(
-                            "[%s] RECONCILER_PROOF_LOGGED contract=%s position_id=%s pnl=%.1f%%",
-                            self.client_id, contract, _pos_id_str, pnl_pct,
-                        )
-                    else:
-                        _proof_write_failed = True
-                        log.error(
-                            "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
-                            "error=%s (non-fatal — position close is complete)",
-                            self.client_id, contract, _pos_id_str,
-                            _proof_result.get("_proof_persistence_error") or "persistence_not_confirmed",
-                        )
-
-        except Exception as _proof_err:
-            _proof_write_failed = True
-            log.error(
-                "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
-                "error=%s (non-fatal — position close is complete)",
-                self.client_id, contract, pos_id, _proof_err,
-            )
-        if _proof_write_failed:
-            summary.setdefault("proof_write_failures", 0)
-            summary["proof_write_failures"] += 1
-        try:
-            from ap_proof_logger import funnel as _funnel_r
-            _funnel_r.inc("reconciler_corrections")
-        except Exception:
-            pass
+        self._alert(
+            f"{reason_code} | {contract} | pos={pos_id_str or '?'} | "
+            "broker flat after three-pass confirmation; no realized economics mutated"
+        )
+        summary.setdefault("errors", []).append(reason_code)
+        summary["positions_alerted"] += 1
 
     def _import_broker_positions_missing_from_db(
         self,

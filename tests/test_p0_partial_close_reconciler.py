@@ -1,19 +1,19 @@
 """
 tests/test_p0_partial_close_reconciler.py
 
-P0: Reconciler Prematurely Marking Partial Positions CLOSED
-============================================================
+P0: Reconciler Broker-Flat HOLD and Closed-Row Repair
+======================================================
 
 Tests cover every acceptance criterion:
-  1. Reconciler auto-close never sets CLOSED when quantity_remaining > 0
-  2. RECONCILER_AUTO_CLOSE partial positions preserved as PARTIAL
+  1. Broker-flat exposure evidence never writes quote/entry economics
+  2. Active EXIT ownership still blocks ghost takeover
   3. Admin/operator dashboard query includes all active broker exposure
   4. Exit engine _load_db_position_row finds PARTIAL rows
   5. get_active_positions includes PARTIAL/ACTIVE and qty_remaining > 0 guard
   6. Broker-flat repair zeroes quantity_remaining, keeps CLOSED
   7. Broker-live repair restores status to PARTIAL/OPEN
   8. Broker-unavailable: status not touched, flagged for manual review
-  9. Diagnostic counters increment correctly
+  9. Diagnostic counters retain their summary shape
  10. No scanner/signal/entry/sizing/submit behavior changes
 """
 
@@ -21,8 +21,12 @@ from __future__ import annotations
 
 import types
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
+
+if not os.getenv("DATABASE_URL"):
+    os.environ["DATABASE_URL"] = "postgresql://test:test@127.0.0.1:5432/test"
 
 # ── Repo-relative import path (invariant: never sys.path hacks) ───────────────
 import sys
@@ -77,254 +81,6 @@ def _make_broker_pos(contract: str, qty: int) -> dict:
     return {"symbol": contract, "quantity": qty, "cost_basis": 1.50}
 
 
-# =============================================================================
-# 1. Reconciler auto-close: PARTIAL when quantity_remaining > 0
-# =============================================================================
-
-class TestReconcilerAutoClosePartialGuard(unittest.TestCase):
-    """
-    Core bug: _handle_auto_close_ghost must not set status=CLOSED when
-    the position has remaining contracts.  Validates the quantity_remaining
-    re-fetch under lock and status decision tree.
-    """
-
-    def _build_reconciler_stub(self):
-        """Build a minimal APBrokerReconciler with DB wired to a mock."""
-        from ap_reconciler import APBrokerReconciler, _empty_summary
-
-        broker = MagicMock()
-        osm    = MagicMock()
-        pm     = MagicMock()
-        rec    = APBrokerReconciler(broker=broker, client_id="jasoncosby1@gmail.com",
-                                    osm=osm, pm=pm, execution_mode="paper")
-        return rec, _empty_summary("jasoncosby1@gmail.com")
-
-    def test_quantity_remaining_zeroed_when_broker_is_flat(self):
-        """
-        Core P0 bug fix: when quantity_remaining=5 and broker is flat (ghost confirm),
-        reconciler must set quantity_remaining=0 (not leave it at 5).
-
-        Before fix: status=CLOSED, quantity_remaining=5  ← INVALID (the bug)
-        After fix:  status=CLOSED, quantity_remaining=0  ← CORRECT
-        """
-        from ap_reconciler import APBrokerReconciler, _empty_summary
-
-        rec, summary = self._build_reconciler_stub()
-
-        # Simulate DB returning a row with remaining qty = 5, full qty = 7
-        db_row = {"quantity_remaining": 5, "qty": 7}
-        written = {}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            sql_up = sql.strip().upper()
-            if "FOR UPDATE" in sql_up:
-                cursor.fetchone.return_value = db_row
-            elif sql_up.startswith("UPDATE POSITIONS"):
-                # Capture what status was written
-                # params order: status, exit_ts, exit_price, pnl, pnl_pct,
-                #               quantity_remaining, close_source, confidence, id, client
-                written["status"]             = params[0]
-                written["quantity_remaining"] = params[5]
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
-        pos = _make_pos(qty=7, quantity_remaining=5, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="PG260620C00155000",
-                underlying="PG",
-                db_qty=7,
-                entry_px=1.50,
-                exit_px=0.10,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
-
-        # P0 FIX: broker is flat → ALL remaining contracts gone → qty_remaining=0
-        # Before fix: status=CLOSED but quantity_remaining=5 (left unchanged) — invalid state
-        # After fix:  status=CLOSED and quantity_remaining=0                  — correct
-        self.assertEqual(written.get("quantity_remaining"), 0,
-                         "P0 FIX: quantity_remaining must be zeroed when broker is flat")
-        self.assertEqual(written.get("status"), "CLOSED",
-                         "CLOSED is correct when broker is flat and remaining reaches 0")
-        self.assertEqual(summary["reconciler_full_close_count"], 1)
-
-    def test_fully_closed_position_gets_CLOSED(self):
-        """
-        When quantity_remaining=0 (all contracts exited), status must be CLOSED.
-        """
-        from ap_reconciler import APBrokerReconciler, _empty_summary
-
-        rec, summary = self._build_reconciler_stub()
-        db_row = {"quantity_remaining": 0, "qty": 7}
-        written = {}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            elif sql.strip().upper().startswith("UPDATE POSITIONS"):
-                written["status"]             = params[0]
-                written["quantity_remaining"] = params[5]
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
-        pos = _make_pos(qty=7, quantity_remaining=0, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="PG260620C00155000",
-                underlying="PG",
-                db_qty=7,
-                entry_px=1.50,
-                exit_px=0.10,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
-
-        self.assertEqual(written.get("status"), "CLOSED")
-        self.assertEqual(summary["reconciler_full_close_count"], 1)
-        self.assertEqual(summary["reconciler_partial_close_preserved_count"], 0)
-
-    def test_null_quantity_remaining_treated_as_full_qty(self):
-        """
-        If quantity_remaining is NULL (legacy row), fall back to qty and still
-        produce CLOSED (broker is flat, nothing remains).
-        """
-        from ap_reconciler import APBrokerReconciler, _empty_summary
-
-        rec, summary = self._build_reconciler_stub()
-        db_row = {"quantity_remaining": None, "qty": 5}
-        written = {}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            elif sql.strip().upper().startswith("UPDATE POSITIONS"):
-                written["status"] = params[0]
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
-        pos = _make_pos(qty=5, quantity_remaining=None, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="AAPL260620C00200000",
-                underlying="AAPL",
-                db_qty=5,
-                entry_px=2.00,
-                exit_px=0.05,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
-
-        # NULL → full qty → close_qty = full_qty → new_remaining = 0 → CLOSED
-        self.assertEqual(written.get("status"), "CLOSED")
-
-    def test_exit_engine_notified_on_full_broker_flat_close(self):
-        """
-        mark_position_closed MUST be called when broker is flat and all
-        remaining contracts are closed (new_remaining=0 → status=CLOSED).
-        """
-        from ap_reconciler import APBrokerReconciler, _empty_summary
-
-        rec, summary = self._build_reconciler_stub()
-        mock_ee = MagicMock()
-        rec.exit_engine = mock_ee
-
-        # qty_remaining=3 → broker flat → close_qty=3 → new_remaining=0 → CLOSED
-        db_row = {"quantity_remaining": 3, "qty": 5}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
-        pos = _make_pos(qty=5, quantity_remaining=3, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="AAPL260620C00200000",
-                underlying="AAPL",
-                db_qty=5,
-                entry_px=2.00,
-                exit_px=0.05,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
-
-        # broker-flat, all remaining closed → CLOSED → exit engine notified
-        mock_ee.mark_position_closed.assert_called_once()
-
-    def test_exit_engine_notified_on_full_close(self):
-        """mark_position_closed IS called when quantity_remaining reaches 0."""
-        from ap_reconciler import APBrokerReconciler, _empty_summary
-
-        rec, summary = self._build_reconciler_stub()
-        mock_ee = MagicMock()
-        rec.exit_engine = mock_ee
-
-        db_row = {"quantity_remaining": 0, "qty": 5}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            return cursor
-
-        fake_conn_ctx = MagicMock()
-        fake_conn_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_conn_ctx.__exit__  = MagicMock(return_value=False)
-
-        pos = _make_pos(qty=5, quantity_remaining=0, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_conn_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="AAPL260620C00200000",
-                underlying="AAPL",
-                db_qty=5,
-                entry_px=2.00,
-                exit_px=0.05,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
-
-        mock_ee.mark_position_closed.assert_called_once()
-
-
-# =============================================================================
 # 2. _repair_closed_positions_with_remaining_qty
 # =============================================================================
 
@@ -634,51 +390,16 @@ class TestRunOnceWiresRepair(unittest.TestCase):
 
 
 # =============================================================================
-# 8. proof_trade NOT logged for partial reconciler close
+# 8. proof_trade is not written by broker-flat reconciler HOLD
 # =============================================================================
 
 class TestPartialCloseSkipsProofTrade(unittest.TestCase):
 
-    def test_proof_logger_not_called_on_partial(self):
-        from ap_reconciler import APBrokerReconciler, _empty_summary
-
-        broker = MagicMock()
-        rec    = APBrokerReconciler(broker=broker, client_id="jasoncosby1@gmail.com",
-                                    osm=MagicMock(), pm=MagicMock(), execution_mode="paper")
-        summary = _empty_summary("jasoncosby1@gmail.com")
-
-        db_row = {"quantity_remaining": 3, "qty": 5}
-
-        def _fake_execute(sql, params=None):
-            cursor = MagicMock()
-            if "FOR UPDATE" in sql.upper():
-                cursor.fetchone.return_value = db_row
-            return cursor
-
-        fake_ctx = MagicMock()
-        fake_ctx.__enter__ = lambda s: MagicMock(execute=_fake_execute)
-        fake_ctx.__exit__  = MagicMock(return_value=False)
-
-        mock_proof = MagicMock()
-
-        pos = _make_pos(qty=5, quantity_remaining=3, status="OPEN")
-
-        with patch("ap.db.conn", return_value=fake_ctx), \
-             patch("ap.db.run_with_retry", side_effect=lambda fn: fn()), \
-             patch("ap_reconciler.APProofLogger", return_value=mock_proof, create=True):
-            rec._execute_reconciler_close(
-                pos=pos,
-                contract="BA260620C00180000",
-                underlying="BA",
-                db_qty=5,
-                entry_px=1.80,
-                exit_px=0.05,
-                close_confidence="HIGH",
-                summary=summary,
-                side="CALL",
-            )
-
-        mock_proof.log_trade.assert_not_called()
+    def test_reconciler_has_no_independent_proof_writer(self):
+        src = (_REPO / "ap_reconciler.py").read_text()
+        self.assertNotIn("def _execute_reconciler_close", src)
+        self.assertNotIn("APProofLogger", src)
+        self.assertIn("RECONCILER_BROKER_FLAT_EXIT_FILL_UNRESOLVED", src)
 
 
 # =============================================================================
