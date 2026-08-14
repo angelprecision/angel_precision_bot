@@ -525,3 +525,562 @@ def test_all_pass_audit_failure_does_not_cancel_valid_broker_submit(monkeypatch)
 
     broker.session.post.assert_called_once()
     assert row["status"] == "SUBMITTED"
+
+
+class _FinalGateDeferredOSM:
+    """Small durable-row model for the final-gate reversal replay."""
+
+    def __init__(self, row):
+        self.row = row
+        self.client_id = row["client_id"]
+        self.execution_mode = row["execution_mode"]
+        self.copyback_contracts = []
+        self.rearm_calls = []
+        self.submit_calls = 0
+
+    def _copy_row(self):
+        return {**self.row, "meta": dict(self.row.get("meta") or {})}
+
+    def get_order(self, _local_order_id):
+        return self._copy_row()
+
+    _get_order = get_order
+
+    def update_order_meta(self, _local_order_id, patch):
+        self.row["meta"].update(dict(patch or {}))
+        return True
+
+    def claim_deferred_materialization(self, local_order_id, **kwargs):
+        self.row["meta"].update(
+            {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": kwargs["owner"],
+                "watcher_token": kwargs["owner"],
+                "current_owner": kwargs["owner"],
+                "materialization_generation": kwargs["generation"],
+                "materialization_lease_until": kwargs["lease_until"],
+                "trigger_crossed_at": kwargs["trigger_crossed_at"],
+                "trigger_price": kwargs["trigger_price"],
+                "observed_underlying_price": kwargs["observed_underlying_price"],
+                "signal_id": kwargs["signal_id"],
+                "local_order_id": local_order_id,
+                "client_id": self.client_id,
+                "execution_mode": kwargs["execution_mode"],
+                "broker_ready": False,
+            }
+        )
+        return True
+
+    def persist_selector_recovery_cursor(self, _local_order_id, *, cursor, **_kwargs):
+        self.row["meta"]["selector_recovery_cursor_v1"] = dict(cursor or {})
+        return True
+
+    def persist_deferred_broker_ready(self, local_order_id, **kwargs):
+        self.copyback_contracts.append(kwargs["contract"])
+        self.row.update(
+            {
+                "contract": kwargs["contract"],
+                "limit_price": kwargs["limit_price"],
+                "qty": kwargs["qty"],
+                "reserved_cost": kwargs["reserved_cost"],
+                "contract_selection_status": "CONTRACT_SELECTED",
+            }
+        )
+        self.row["meta"].update(
+            {
+                **dict(kwargs.get("selector_meta") or {}),
+                "contract_deferred": False,
+                "lifecycle_state": "BROKER_READY",
+                "materialization_status": "SELECTED",
+                "materialization_in_flight": False,
+                "materialization_owner": kwargs["owner"],
+                "current_owner": kwargs["owner"],
+                "materialization_generation": kwargs["generation"],
+                "broker_ready": True,
+                "selected_contract": kwargs["contract"],
+                "selected_limit": kwargs["limit_price"],
+                "selected_qty": kwargs["qty"],
+                "selected_reserved_cost": kwargs["reserved_cost"],
+                "selector_recovery_cursor_v1": None,
+                "signal_id": kwargs["signal_id"],
+                "local_order_id": local_order_id,
+                "client_id": self.client_id,
+                "execution_mode": kwargs["execution_mode"],
+            }
+        )
+        return True
+
+    def rearm_deferred_materialization_direction_reversal(
+        self,
+        local_order_id,
+        *,
+        owner,
+        watcher_token,
+        generation,
+        signal_id,
+        execution_mode,
+        market_truth_audit,
+    ):
+        current_meta = self.row["meta"]
+        if (
+            current_meta.get("materialization_owner") != owner
+            or int(current_meta.get("materialization_generation") or 0) != generation
+            or current_meta.get("signal_id") != signal_id
+            or current_meta.get("execution_mode") != execution_mode
+        ):
+            return False
+        self.rearm_calls.append(
+            {
+                "local_order_id": local_order_id,
+                "owner": owner,
+                "watcher_token": watcher_token,
+                "generation": generation,
+                "signal_id": signal_id,
+                "execution_mode": execution_mode,
+            }
+        )
+        self.row.update(
+            {
+                "contract": f"DEFERRED:{self.row['symbol']}",
+                "limit_price": 0,
+                "qty": 0,
+                "reserved_cost": 0,
+                "contract_selection_status": "DEFERRED_REARM",
+            }
+        )
+        self.row["meta"].update(
+            {
+                "lifecycle_state": "",
+                "materialization_status": "",
+                "materialization_in_flight": False,
+                "materialization_owner": "",
+                "materialization_lease_until": "",
+                "current_owner": watcher_token,
+                "watcher_token": watcher_token,
+                "watcher_generation": generation,
+                "broker_ready": False,
+                "contract_deferred": True,
+                "contract_selection_status": "REARM_REQUIRED",
+                "contract_symbol": "",
+                "selected_contract": "",
+                "selected_limit": 0,
+                "selected_qty": 0,
+                "selected_reserved_cost": 0,
+                "limit_price": 0,
+                "contracts": 0,
+                "retry_attempt": 0,
+                "breach_attempt_count": 0,
+                "materialization_attempts": 0,
+                "selector_recovery_cursor_v1": None,
+                "final_market_truth_status": "REARM_DIRECTION_REVERSAL",
+                "final_market_truth": dict(market_truth_audit or {}),
+            }
+        )
+        for key in (
+            "trigger_crossed_at",
+            "trigger_crossed_at_provenance",
+            "triggered_at",
+            "trigger_confirmed_at",
+            "last_confirmed_trigger_at",
+            "original_trigger_crossed_at",
+            "first_breach_bid",
+            "first_breach_ask",
+            "last_trigger_confirmation_quote",
+        ):
+            self.row["meta"].pop(key, None)
+        return True
+
+    def submit_existing_entry(self, *, local_order_id, broker, **_kwargs):
+        self.submit_calls += 1
+        if self.row["meta"].get("broker_ready") is not True:
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": None,
+                "error": "MATERIALIZATION_DURABLE_STATE_MISMATCH:broker_ready",
+            }
+        broker.session.post(local_order_id, self.row["contract"])
+        self.row["status"] = "SUBMITTED"
+        self.row["broker_order_id"] = "TR-FINAL-REARM-1"
+        self.row["meta"].update(
+            {
+                "lifecycle_state": "SUBMITTED",
+                "broker_ready": False,
+                "broker_order_id": "TR-FINAL-REARM-1",
+            }
+        )
+        return {
+            "ok": True,
+            "local_order_id": local_order_id,
+            "broker_order_id": "TR-FINAL-REARM-1",
+            "status": "SUBMITTED",
+        }
+
+
+@pytest.mark.parametrize(
+    ("side", "stop", "target", "final_quote", "contract"),
+    [
+        (
+            "CALL",
+            94.0,
+            105.0,
+            {"bid": 95.11, "ask": 95.14, "source": "tradier"},
+            "CVS260821C00095000",
+        ),
+        (
+            "PUT",
+            96.0,
+            85.0,
+            {"bid": 95.16, "ask": 95.19, "source": "tradier"},
+            "CVS260821P00095000",
+        ),
+    ],
+)
+def test_final_live_market_reversal_rearms_then_requires_fresh_rebreach(
+    monkeypatch, side, stop, target, final_quote, contract
+):
+    """The post-copyback final gate must rearm, then a later breach may submit once."""
+    from ap_entry_watcher import WatchState, WatchedSignal
+    import ap_execution_core as core_module
+
+    ticker = "CVS"
+    client_id = "jasoncosby1@gmail.com"
+    local_order_id = f"L-FINAL-REARM-{side}"
+    signal_id = f"sig-final-rearm-{side.lower()}"
+    canonical_signal_id = f"canonical-final-rearm-{side.lower()}"
+    owner = f"watcher-token-{side.lower()}"
+    trigger = 95.15
+    row = {
+        "local_order_id": local_order_id,
+        "client_id": client_id,
+        "execution_mode": "live",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "symbol": ticker,
+        "ticker": ticker,
+        "contract": f"DEFERRED:{ticker}",
+        "qty": 0,
+        "limit_price": 0,
+        "reserved_cost": 0,
+        "signal_id": signal_id,
+        "direction": side,
+        "trigger_price": trigger,
+        "stop_price": stop,
+        "target_price": target,
+        "underlying_entry": trigger,
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "contract_selection_status": "DEFERRED",
+        "meta": {
+            "contract_deferred": True,
+            "broker_ready": False,
+            "lifecycle_state": "",
+            "materialization_generation": 7,
+            "retry_attempt": 0,
+            "breach_attempt_count": 0,
+            "materialization_attempts": 0,
+        },
+    }
+    plan = SimpleNamespace(
+        plan_id=f"plan-final-rearm-{side.lower()}",
+        contract_symbol=f"DEFERRED:{ticker}",
+        execution_price_per_share=1.25,
+        ask=1.25,
+        mid=1.225,
+        affordable_contracts=1,
+        premium_per_contract=125.0,
+        contracts=1,
+        max_position_usd=250.0,
+        limit_price=1.25,
+        side=side,
+        direction=side,
+        execution_mode="live",
+        client_id=client_id,
+        signal_id=signal_id,
+        ticker=ticker,
+        trigger_price=trigger,
+        stop_underlying=stop,
+        target_underlying=target,
+        metadata={
+            "contract_deferred": True,
+            "canonical_signal_id": canonical_signal_id,
+        },
+    )
+    watched = WatchedSignal(
+        {
+            "ticker": ticker,
+            "side": side,
+            "entry_price": trigger,
+            "stop_price": stop,
+            "target_price": target,
+            "signal_id": signal_id,
+            "local_order_id": local_order_id,
+            "client_id": client_id,
+            "execution_mode": "live",
+            "watcher_token": owner,
+            "canonical_signal_id": canonical_signal_id,
+        }
+    )
+    first_breach_quote = (
+        (95.16, 95.18) if side == "CALL" else (95.12, 95.14)
+    )
+    assert watched.check(*first_breach_quote) == WatchState.PENDING
+    assert watched.check(*first_breach_quote) == WatchState.TRIGGERED
+
+    osm = _FinalGateDeferredOSM(row)
+    selector = MagicMock()
+    selector.select.return_value = SimpleNamespace(
+        contract_symbol=contract,
+        execution_price_per_share=1.25,
+        affordable_contracts=1,
+        premium_per_contract=125.0,
+        bid=1.20,
+        ask=1.25,
+        mid=1.225,
+        pricing_basis="ask",
+        expiration_date="2026-08-21",
+        strike=95.0,
+        option_type=side,
+        dte=8,
+        delta=0.5,
+        open_interest=1000,
+        volume=100,
+        candidate_audit={"candidates_considered": 1},
+    )
+    selector.get_last_failure.return_value = None
+    selector.get_last_dte_ladder_audit.return_value = {}
+    selector.data_broker = MagicMock()
+    selector.data_broker.get_quote.return_value = final_quote
+
+    broker = SimpleNamespace(
+        cfg=SimpleNamespace(
+            base_url="https://api.tradier.com",
+            account_id="LIVE-ACCOUNT",
+        ),
+        base_url="https://api.tradier.com",
+        account_id="LIVE-ACCOUNT",
+        get_quote=MagicMock(return_value=final_quote),
+        session=MagicMock(),
+    )
+    core = core_module.APExecutionCore.__new__(core_module.APExecutionCore)
+    core.paper = False
+    core.mode = core.execution_mode = "LIVE"
+    core.client_id = core.email = client_id
+    core.broker = broker
+    core.store = MagicMock()
+    core.position_manager = MagicMock()
+    core.position_manager.snapshot.return_value = {
+        "open_count": 0,
+        "pending_entries": 0,
+    }
+    core._max_positions = 5
+    core.contract_selector = selector
+    core.order_state_machine = osm
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._recover_plan_for_revalidation = MagicMock(return_value=plan)
+    core._refresh_hydrated_prebreach_plan = MagicMock(return_value=False)
+    core._cleanup_pending_entry_order = MagicMock(
+        side_effect=AssertionError("market reversal must rearm, not cleanup")
+    )
+
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
+        1.25,
+        5,
+        True,
+        "",
+        {
+            "submit_bid": 1.20,
+            "submit_ask": 1.25,
+            "submit_last": 1.23,
+            "submit_mid": 1.225,
+            "spread_pct": 0.04,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "ap.execution", fake_execution)
+    monkeypatch.setenv("LIVE_CONFIRMATION_REQUIRED", "0")
+    monkeypatch.setenv("ENTRY_CUTOFF_ET_HHMM", "2359")
+    monkeypatch.setenv("SELECTOR_DURABLE_RECOVERY_CURSOR_ENABLED", "1")
+    monkeypatch.setenv("INTELLIGENCE_EVIDENCE_ENABLED", "0")
+    monkeypatch.setenv("DEFERRED_SMALL_ACCOUNT_FALLBACK", "0")
+
+    first_result = core_module.APExecutionCore._on_entry_trigger(core, watched)
+
+    assert first_result["disposition"] == "KEEP_WATCHER"
+    assert first_result["reason_code"] == "REARM_DIRECTION_REVERSAL"
+    assert first_result["expected_client_id"] == client_id
+    assert first_result["expected_execution_mode"] == "live"
+    assert first_result["expected_signal_id"] == signal_id
+    assert first_result["expected_canonical_signal_id"] == canonical_signal_id
+    assert first_result["expected_generation"] == 8
+    assert selector.select.call_count == 1
+    assert osm.copyback_contracts == [contract]
+    assert osm.rearm_calls == [
+        {
+            "local_order_id": local_order_id,
+            "owner": owner,
+            "watcher_token": owner,
+            "generation": 8,
+            "signal_id": signal_id,
+            "execution_mode": "live",
+        }
+    ]
+    assert broker.get_quote.call_count == 1
+    assert broker.session.post.call_count == 0
+    assert osm.submit_calls == 0
+    assert row["status"] == "PENDING_TRIGGER"
+    assert row["broker_order_id"] is None
+    assert row["contract"] == f"DEFERRED:{ticker}"
+    assert row["limit_price"] == 0
+    assert row["qty"] == 0
+    assert row["reserved_cost"] == 0
+    assert row["contract_selection_status"] == "DEFERRED_REARM"
+    assert row["meta"]["broker_ready"] is False
+    assert row["meta"]["contract_deferred"] is True
+    assert row["meta"]["lifecycle_state"] == ""
+    assert row["meta"]["materialization_generation"] == 8
+    assert row["meta"]["selector_recovery_cursor_v1"] is None
+    assert row["meta"]["selected_contract"] == ""
+    assert row["meta"]["selected_limit"] == 0
+    assert row["meta"]["selected_qty"] == 0
+    assert row["meta"]["final_market_truth_status"] == "REARM_DIRECTION_REVERSAL"
+    assert row["meta"]["final_market_truth"]["reason_code"] in {
+        "CALL_NO_LONGER_ABOVE_TRIGGER",
+        "PUT_NO_LONGER_BELOW_TRIGGER",
+    }
+    assert core.position_manager.mock_calls == []
+    assert not any("proof" in str(call).lower() for call in core.store.mock_calls)
+    assert watched.trigger_price is None
+    assert watched.trigger_crossed_at is None
+    assert watched.breach_count == 0
+    assert watched.signal["signal_id"] == signal_id
+    assert watched.signal["local_order_id"] == local_order_id
+    assert watched.signal["client_id"] == client_id
+    assert watched.signal["execution_mode"] == "live"
+    assert watched.signal["canonical_signal_id"] == canonical_signal_id
+    assert watched.signal["contract_symbol"] == f"DEFERRED:{ticker}"
+    assert watched.signal["contract_deferred"] is True
+    assert plan.contract_symbol == f"DEFERRED:{ticker}"
+    assert plan.limit_price == 0
+    assert plan.contracts == 0
+
+    # The old materialized OCC cannot be submitted from the reset row, even
+    # if a caller still presents the pre-reversal plan object.
+    stale_submit = osm.submit_existing_entry(
+        local_order_id=local_order_id,
+        broker=broker,
+        plan=plan,
+        limit_price=1.25,
+    )
+    assert stale_submit["ok"] is False
+    assert "MATERIALIZATION_DURABLE_STATE_MISMATCH" in stale_submit["error"]
+    assert broker.session.post.call_count == 0
+
+    # The watcher loop changes the callback result back to PENDING.  A single
+    # observation of the old reversal quote cannot fire again; two fresh
+    # direction-confirming polls are required before the core is re-entered.
+    watched.state = WatchState.PENDING
+    pretrigger_bid_ask = (
+        (95.11, 95.14) if side == "CALL" else (95.16, 95.19)
+    )
+    assert watched.check(*pretrigger_bid_ask) == WatchState.PENDING
+    assert selector.select.call_count == 1
+    assert watched.check(*first_breach_quote) == WatchState.PENDING
+    assert watched.check(*first_breach_quote) == WatchState.TRIGGERED
+    assert selector.select.call_count == 1
+
+    # Feed the now-confirmed fresh breach through the full callback again.
+    broker.get_quote.reset_mock()
+    broker.get_quote.return_value = {
+        "bid": first_breach_quote[0],
+        "ask": first_breach_quote[1],
+        "source": "tradier",
+    }
+    core_module.APExecutionCore._on_entry_trigger(core, watched)
+
+    assert core._breach_risk_check.call_count == 2
+    assert selector.select.call_count == 2
+    assert broker.session.post.call_count == 1
+    assert osm.submit_calls == 2  # one stale-row guard, one current submit
+    assert row["status"] == "SUBMITTED"
+    assert row["broker_order_id"] == "TR-FINAL-REARM-1"
+    assert row["meta"]["materialization_generation"] == 9
+
+
+@pytest.mark.parametrize(
+    ("side", "bid", "ask", "stop", "target", "reason"),
+    [
+        ("CALL", 93.8, 94.2, 95.0, 110.0, GateOutcome.CALL_STOP_ALREADY_BROKEN),
+        ("PUT", 96.2, 96.5, 96.0, 85.0, GateOutcome.PUT_STOP_ALREADY_BROKEN),
+        ("CALL", 105.1, 105.3, 95.0, 105.0, GateOutcome.TARGET_ALREADY_INVALID),
+        ("PUT", 84.7, 84.9, 96.0, 85.0, GateOutcome.TARGET_ALREADY_INVALID),
+        (
+            "CALL",
+            104.6,
+            104.8,
+            95.0,
+            105.0,
+            GateOutcome.REMAINING_OPPORTUNITY_TOO_SMALL,
+        ),
+    ],
+)
+def test_final_market_terminal_geometry_does_not_classify_as_rearm(
+    side, bid, ask, stop, target, reason
+):
+    from ap.live_submit_gates import MarketTruthAuthority, classify_market_truth
+
+    result = _fresh_sync(
+        side=side,
+        trigger_price=95.15,
+        stop_price=stop,
+        target_price=target,
+        current_bid=bid,
+        current_ask=ask,
+    )
+
+    assert result.passed is False
+    assert result.reason_code == reason
+    assert classify_market_truth(result) == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+
+
+@pytest.mark.parametrize("generation", [True, 0, -1, 1.5, "1.5", "bad", None])
+def test_final_rearm_rejects_malformed_generation_without_sql(monkeypatch, generation):
+    import ap.order_state_machine as osm_mod
+    from ap.order_state_machine import APOrderStateMachine
+
+    class _NoSqlCursor:
+        rowcount = 1
+        executed = False
+
+        def execute(self, *_args):
+            self.executed = True
+            return self
+
+    class _NoSqlConn:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def __enter__(self):
+            return self.cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    cursor = _NoSqlCursor()
+    monkeypatch.setattr(osm_mod, "conn", lambda: _NoSqlConn(cursor))
+    monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn: fn())
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = "jasoncosby1@gmail.com"
+
+    assert osm.rearm_deferred_materialization_direction_reversal(
+        "order-1",
+        owner="watcher-token",
+        watcher_token="watcher-token",
+        generation=generation,
+        signal_id="sig-1",
+        execution_mode="live",
+        market_truth_audit={"reason": "CALL_NO_LONGER_ABOVE_TRIGGER"},
+    ) is False
+    assert cursor.executed is False
