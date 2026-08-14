@@ -300,15 +300,57 @@ def test_ticker_only_contract_is_not_an_exact_occ_identity(monkeypatch):
     assert db.mutations == 0
 
 
+def test_occ_validation_rejects_non_occ_prefix_with_valid_looking_suffix(monkeypatch):
+    malformed_contract = "BROKENPEP260821C00141000"
+    db = _MemoryDB(
+        _order(contract=malformed_contract),
+        _position(contract=malformed_contract),
+    )
+    monkeypatch.setattr(fm, "conn", db.conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda fn: fn())
+
+    outcome = fm._bind_filled_entry_durable_identity(
+        position_id=POSITION_ID,
+        order=_order(contract=malformed_contract),
+        result=_result(),
+    )
+
+    assert outcome == (False, "contract_not_exact_OCC")
+    assert db.statements == []
+    assert db.mutations == 0
+
+
+def _owner(
+    *,
+    position_id=POSITION_ID,
+    client_id=CLIENT,
+    execution_mode=MODE,
+    option_symbol=CONTRACT,
+):
+    return SimpleNamespace(
+        position_id=position_id,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        option_symbol=option_symbol,
+    )
+
+
 class _SeedEngine:
-    def __init__(self, *, raises=False):
+    def __init__(self, *, raises=False, owners=None, materialize_owner=True):
         self.raises = raises
         self.seed_calls = 0
+        self.owners = list(owners or [])
+        self.materialize_owner = materialize_owner
 
     def seed_position(self, position_id, order, result):
         self.seed_calls += 1
         if self.raises:
             raise RuntimeError("seed failed")
+        if self.materialize_owner:
+            self.owners.append(_owner())
+
+    def active_positions(self):
+        return list(self.owners)
 
 
 def test_seed_result_reports_existing_success_and_failure(monkeypatch):
@@ -325,8 +367,42 @@ def test_seed_result_reports_existing_success_and_failure(monkeypatch):
     assert failure.seed_calls == 1
 
 
+def test_seed_success_requires_exact_canonical_behavior_active_owner(monkeypatch):
+    engine = _SeedEngine(materialize_owner=False)
+
+    assert fm._seed_exit_engine(
+        engine, POSITION_ID, _order(), _result(), SIGNAL_ID
+    ) == (False, "OWNER_COUNT_0")
+    assert engine.seed_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("owners", "reason"),
+    [
+        ([_owner(position_id="broker-repair-1")], "BROKER_REPAIR_OWNER_PRESENT"),
+        ([_owner(position_id="foreign-position")], "CANONICAL_OWNER_MISSING"),
+        ([_owner(client_id="other@example.com")], "OWNER_COUNT_0"),
+        ([_owner(execution_mode="paper")], "OWNER_COUNT_0"),
+        ([_owner(option_symbol="PEP260821P00141000")], "OWNER_COUNT_0"),
+        (
+            [_owner(), _owner(position_id="duplicate-position")],
+            "OWNER_COUNT_2",
+        ),
+    ],
+)
+def test_seed_postcondition_rejects_noncanonical_or_ambiguous_owner(owners, reason):
+    engine = _SeedEngine(owners=owners, materialize_owner=False)
+
+    assert fm._seed_exit_engine(
+        engine, POSITION_ID, _order(), _result(), SIGNAL_ID
+    ) == (False, reason)
+
+
 def test_adoption_success_is_truthful(monkeypatch):
     class _AdoptEngine:
+        def active_positions(self):
+            return [_owner()]
+
         def adopt_canonical_position_identity(self, **kwargs):
             return SimpleNamespace(disposition="ADOPTED")
 

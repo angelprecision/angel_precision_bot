@@ -1459,7 +1459,7 @@ def _bind_filled_entry_durable_identity(
         return False, "execution_mode_missing_or_noncanonical"
     if not contract:
         return False, "contract_missing"
-    if not re.search(r"\d{6}[CP]\d{8}$", contract):
+    if not re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract):
         return False, "contract_not_exact_OCC"
     if kind != "ENTRY":
         return False, "kind_not_ENTRY"
@@ -2072,6 +2072,114 @@ def _emit_seed_failure_diagnostic(
     )
 
 
+def _verify_canonical_exit_owner(
+    *,
+    exit_engine,
+    position_id: str,
+    order: dict,
+    expected_contract: str,
+    expected_mode: str,
+) -> tuple[bool, str]:
+    """Prove the exact behavior-active canonical owner after seeding.
+
+    This is intentionally read-only.  A successful seed/adoption call is not
+    enough: the engine must expose exactly one behavior-active owner in the
+    exact client/mode/OCC domain, with the canonical durable position_id, and
+    no broker-repair owner in that domain.
+    """
+    _position_id = str(position_id) if position_id is not None else ""
+    _client_id = str(order.get("client_id")) if order.get("client_id") is not None else ""
+    _contract = str(expected_contract) if expected_contract is not None else ""
+    _mode = str(expected_mode) if expected_mode is not None else ""
+    if (
+        not _position_id
+        or not _client_id
+        or not _contract
+        or _mode not in {"live", "paper"}
+    ):
+        return False, "OWNER_POSTCONDITION_INPUT_UNPROVEN"
+
+    _active_fn = getattr(exit_engine, "active_positions", None)
+    if not callable(_active_fn):
+        return False, "OWNER_LOOKUP_UNAVAILABLE"
+
+    try:
+        _actives = list(_active_fn() or [])
+    except Exception as _err:
+        log.critical(
+            "[%s] canonical owner postcondition lookup failed for %s: %s",
+            _client_id, _position_id, _err,
+        )
+        return False, "OWNER_LOOKUP_FAILED"
+
+    _domain_ids = []
+    for _owner in _actives:
+        _owner_client = (
+            str(getattr(_owner, "client_id"))
+            if getattr(_owner, "client_id", None) is not None
+            else ""
+        )
+        _owner_mode = (
+            str(getattr(_owner, "execution_mode"))
+            if getattr(_owner, "execution_mode", None) is not None
+            else ""
+        )
+        _owner_contract = str(
+            getattr(_owner, "option_symbol", "")
+            if getattr(_owner, "option_symbol", None) is not None
+            else getattr(_owner, "contract", "")
+        )
+        if (
+            _owner_client == _client_id
+            and _owner_mode == _mode
+            and _owner_contract == _contract
+        ):
+            _domain_ids.append(
+                str(getattr(_owner, "position_id"))
+                if getattr(_owner, "position_id", None) is not None
+                else ""
+            )
+
+    if any(_owner_id.startswith("broker-repair-") for _owner_id in _domain_ids):
+        return False, "BROKER_REPAIR_OWNER_PRESENT"
+    if len(_domain_ids) != 1:
+        return False, f"OWNER_COUNT_{len(_domain_ids)}"
+    if _domain_ids[0] != _position_id:
+        return False, "CANONICAL_OWNER_MISSING"
+    return True, "CANONICAL_OWNER_PROVEN"
+
+
+def _verified_seed_success(
+    *,
+    exit_engine,
+    position_id: str,
+    order: dict,
+    expected_contract: str,
+    expected_mode: str,
+    success_reason: str,
+) -> tuple[bool, str]:
+    """Return seed success only after the canonical-owner postcondition."""
+    _owner_ok, _owner_reason = _verify_canonical_exit_owner(
+        exit_engine=exit_engine,
+        position_id=position_id,
+        order=order,
+        expected_contract=expected_contract,
+        expected_mode=expected_mode,
+    )
+    if not _owner_ok:
+        log.critical(
+            "[%s] exit-engine seed returned success without canonical owner: "
+            "position_id=%s contract=%s mode=%s reason=%s",
+            order.get("client_id"),
+            position_id,
+            expected_contract,
+            expected_mode,
+            _owner_reason,
+        )
+        return False, _owner_reason
+    return True, success_reason
+
+
 def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, signal_id: str) -> tuple[bool, str]:
     """Seed the exit engine after confirmed ENTRY fill without faking live quote state.
 
@@ -2209,7 +2317,14 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                     "[%s] _seed_exit_engine: %s contract=%s position_id=%s",
                     order.get("client_id"), _disposition, _contract_for_adopt, position_id,
                 )
-                return True, _disposition
+                return _verified_seed_success(
+                    exit_engine=exit_engine,
+                    position_id=position_id,
+                    order=order,
+                    expected_contract=_contract_for_adopt,
+                    expected_mode=_resolved_mode,
+                    success_reason=_disposition,
+                )
             elif _disposition == "NO_REPAIR_FOUND":
                 pass  # fall through to normal seed
             elif _disposition and _disposition.startswith("RETRY_"):
@@ -2247,7 +2362,14 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 )
                 return False, f"ADOPTION_{_disposition}"
             elif _adopted is True:  # legacy bool path
-                return True, "ADOPTED"
+                return _verified_seed_success(
+                    exit_engine=exit_engine,
+                    position_id=position_id,
+                    order=order,
+                    expected_contract=_contract_for_adopt,
+                    expected_mode=_resolved_mode,
+                    success_reason="ADOPTED",
+                )
             elif _adopted is False:  # legacy bool — no repair found, seed normally
                 pass
         except Exception as _adopt_err:
@@ -2288,7 +2410,14 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     try:
         getter = getattr(exit_engine, "get_position", None)
         if callable(getter) and getter(position_id):
-            return True, "ALREADY_CANONICAL"
+            return _verified_seed_success(
+                exit_engine=exit_engine,
+                position_id=position_id,
+                order=order,
+                expected_contract=_contract_for_adopt,
+                expected_mode=_resolved_mode,
+                success_reason="ALREADY_CANONICAL",
+            )
     except Exception as _ee_err:
         log.warning("Exit engine position check failed for %s: %s", position_id, _ee_err)
 
@@ -2310,7 +2439,14 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     try:
         if hasattr(exit_engine, "seed_position"):
             exit_engine.seed_position(position_id, _seed_order, result)
-            return True, "SEEDED"
+            return _verified_seed_success(
+                exit_engine=exit_engine,
+                position_id=position_id,
+                order=_seed_order,
+                expected_contract=_contract_for_adopt,
+                expected_mode=_resolved_mode,
+                success_reason="SEEDED",
+            )
     except Exception as exc:
         log.debug("exit_engine.seed_position failed; trying add_position path: %s", exc)
 
@@ -2392,7 +2528,14 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             ticker,
             getattr(mp, "current_underlying", None),
         )
-        return True, "SEEDED"
+        return _verified_seed_success(
+            exit_engine=exit_engine,
+            position_id=position_id,
+            order=_seed_order,
+            expected_contract=_contract_for_adopt,
+            expected_mode=_resolved_mode,
+            success_reason="SEEDED",
+        )
     except Exception as exc:
         log.error("[%s] exit_engine.add_position failed: %s", order.get("client_id"), exc)
         return False, "SEED_FAILED"
