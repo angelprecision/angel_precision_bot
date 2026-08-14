@@ -44,6 +44,7 @@ PR: hotfix/p0-direct-option-quote-revalidation
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 import logging
@@ -522,12 +523,20 @@ def _empty_quote_failure() -> dict:
     }
 
 
+def _strict_quote_float(value) -> Optional[float]:
+    """Return a finite numeric quote scalar, rejecting malformed truth."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _normalize_quote(raw: dict, fetched_at: float, latency_ms: int) -> dict:
     def _f(v):
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
+        return _strict_quote_float(v)
 
     def _i(v):
         try:
@@ -718,10 +727,15 @@ def fetch_direct_option_quote_with_meta(
     latency_ms = int((_now() - t0) * 1000)
     _ctx_add_stage_ms(request_context, "direct_quote", latency_ms)
     quote = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, quote)
 
     if quote.get("_quote_payload_empty"):
         return _empty_quote_failure()
+
+    # Never cache an unusable quote as if it were current market truth. A
+    # transient zero/missing/invalid bid-ask response otherwise suppresses a
+    # healthy retry for CACHE_TTL seconds and can starve the selector.
+    if direct_quote_is_valid(quote):
+        _QUOTE_CACHE[cache_key] = (t0, quote)
 
     return {
         "ok": True,
@@ -775,28 +789,26 @@ def fetch_direct_option_quote(
 
     latency_ms = int((_now() - t0) * 1000)
     out = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, out)
+    if direct_quote_is_valid(out):
+        _QUOTE_CACHE[cache_key] = (t0, out)
     return out
 
 
 def direct_quote_is_valid(quote: Optional[dict]) -> bool:
     """
-    Hard validity check for a direct quote: bid > 0 AND ask > 0 AND ask >= bid.
+    Hard validity check for a direct quote: finite bid/ask > 0 and ask >= bid.
     """
     if not quote:
         return False
     bid = quote.get("bid")
     ask = quote.get("ask")
-    if bid is None or ask is None:
+    bid_f = _strict_quote_float(bid)
+    ask_f = _strict_quote_float(ask)
+    if bid_f is None or ask_f is None:
         return False
-    try:
-        if float(bid) <= 0 or float(ask) <= 0:
-            return False
-        if float(ask) < float(bid):
-            return False
-    except (TypeError, ValueError):
+    if bid_f <= 0 or ask_f <= 0:
         return False
-    return True
+    return ask_f >= bid_f
 
 
 def revalidate_with_direct_quote(
