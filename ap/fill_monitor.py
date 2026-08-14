@@ -1459,6 +1459,8 @@ def _bind_filled_entry_durable_identity(
         return False, "execution_mode_missing_or_noncanonical"
     if not contract:
         return False, "contract_missing"
+    if not re.search(r"\d{6}[CP]\d{8}$", contract):
+        return False, "contract_not_exact_OCC"
     if kind != "ENTRY":
         return False, "kind_not_ENTRY"
     if not _blank(order.get("position_id")) and _text(order.get("position_id")) != position_id:

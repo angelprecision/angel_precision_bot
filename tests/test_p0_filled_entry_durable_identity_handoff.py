@@ -284,6 +284,22 @@ def test_required_input_identity_is_fail_closed(monkeypatch, field, value):
     assert db.mutations == 0
 
 
+def test_ticker_only_contract_is_not_an_exact_occ_identity(monkeypatch):
+    db = _MemoryDB(_order(contract="PEP"), _position(contract="PEP"))
+    monkeypatch.setattr(fm, "conn", db.conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda fn: fn())
+
+    outcome = fm._bind_filled_entry_durable_identity(
+        position_id=POSITION_ID,
+        order=_order(contract="PEP"),
+        result=_result(),
+    )
+
+    assert outcome == (False, "contract_not_exact_OCC")
+    assert db.statements == []
+    assert db.mutations == 0
+
+
 class _SeedEngine:
     def __init__(self, *, raises=False):
         self.raises = raises
