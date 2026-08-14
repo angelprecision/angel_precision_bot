@@ -370,6 +370,19 @@ class APOrderStateMachine:
             return default
 
     @staticmethod
+    def _strict_exit_quantity(value, *, missing_default=None):
+        """Parse exit fill quantities without accepting coercible garbage."""
+        if value is None or value == "":
+            return missing_default
+        if isinstance(value, bool):
+            return None
+        if type(value) is int:
+            return value if value >= 0 else None
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    @staticmethod
     def _call_exit_engine(exit_engine, method_name: str, *args, **kwargs):
         """
         Call an exit engine hook method with graceful signature fallback.
@@ -1828,9 +1841,17 @@ class APOrderStateMachine:
 
             _local_id    = local_order_id or current.get("local_order_id")
             _broker_id   = broker_order_id or current.get("broker_order_id")
-            _order_qty   = self._safe_int(current.get("qty"), 0)
-            _prev_filled = self._safe_int(current.get("filled_qty"), 0)
-            _cum_filled  = self._safe_int(filled_qty, None)  # FIX-E: None means "not provided"
+            _order_qty   = self._strict_exit_quantity(current.get("qty"), missing_default=0)
+            _prev_filled = self._strict_exit_quantity(current.get("filled_qty"), missing_default=0)
+            _cum_filled  = self._strict_exit_quantity(filled_qty, missing_default=None)
+
+            if _order_qty is None or _prev_filled is None:
+                log.critical(
+                    "[%s] INVALID EXIT QUANTITY AUTHORITY | order=%s pos=%s qty=%r filled=%r",
+                    self.client_id, _local_id, _pos_id,
+                    current.get("qty"), current.get("filled_qty"),
+                )
+                return
 
             if _cum_filled is not None and _cum_filled < _prev_filled:
                 log.critical(
@@ -1868,10 +1889,11 @@ class APOrderStateMachine:
 
             # ── EXIT_PARTIAL_FILL ───────────────────────────────────────────
             if new_status == OrderStatus.EXIT_PARTIAL_FILL:
-                if _cum_filled is None:
+                if _cum_filled is None or _order_qty <= 0 or _cum_filled > _order_qty:
                     log.warning(
-                        "[%s] EXIT_PARTIAL_FILL missing filled_qty | order=%s pos=%s -- not applying",
-                        self.client_id, _local_id, _pos_id,
+                        "[%s] EXIT_PARTIAL_FILL quantity authority invalid | order=%s pos=%s "
+                        "qty=%s cumulative=%s -- not applying",
+                        self.client_id, _local_id, _pos_id, _order_qty, _cum_filled,
                     )
                     return
                 _delta = max(0, _cum_filled - _prev_filled)
@@ -1882,27 +1904,28 @@ class APOrderStateMachine:
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         cumulative_filled=_cum_filled,
+                        prior_cumulative_filled=_prev_filled,
                     )
                 return
 
             # ── EXIT_FILLED ─────────────────────────────────────────────────
             if new_status == OrderStatus.EXIT_FILLED:
-                if _cum_filled is None or _cum_filled <= 0:
-                    _cum_filled = _order_qty
-
-                # FIX-H: zero qty → quarantine, not clear
-                if _cum_filled <= 0:
+                if _cum_filled is None or _cum_filled <= 0 or _cum_filled > _order_qty:
                     log.critical(
-                        "[%s] EXIT_FILLED with zero/unknown quantity -- QUARANTINING | "
-                        "order=%s pos=%s | broker fill data unreliable",
-                        self.client_id, _local_id, _pos_id,
+                        "[%s] EXIT_FILLED with invalid quantity -- QUARANTINING | "
+                        "order=%s pos=%s qty=%s cumulative=%s | broker fill data unreliable",
+                        self.client_id, _local_id, _pos_id, _order_qty, _cum_filled,
                     )
                     self._call_exit_engine(
                         _ee, "set_pending_exit_order", _pos_id,
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         qty=0,
-                        reason="EXIT_FILLED_ZERO_QTY_QUARANTINE",
+                        reason=(
+                            "EXIT_FILLED_ZERO_QTY_QUARANTINE"
+                            if _cum_filled in (None, 0)
+                            else "EXIT_FILLED_QTY_OUT_OF_BOUNDS_QUARANTINE"
+                        ),
                         identity_quarantine=True,
                     )
                     return
@@ -2136,6 +2159,123 @@ class APOrderStateMachine:
             log.warning(
                 "[%s] update_order_meta failed for local_order_id=%s: %s",
                 self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def persist_stale_exit_cancel_attempt(
+        self,
+        local_order_id: str,
+        broker_order_id: str,
+        attempt: int,
+        execution_mode: str = "",
+    ) -> bool:
+        """Atomically advance the exact stale-exit cancel-attempt fence.
+
+        The stale-exit recovery path must persist its next generation before
+        issuing a broker DELETE.  A plain ``update_order_meta`` merge is not
+        sufficient because two monitor/recovery workers can read the same
+        attempt and then write out of order.  Lock the exact OSM row, reject
+        malformed or mismatched existing markers, and update only when the
+        proposed attempt is strictly greater than the durable one.
+
+        ``False`` is fail-closed: the caller must not issue a broker cancel.
+        The caller must supply the runner's exact LIVE/PAPER mode; both the
+        row lock and the conditional update fence that mode.
+        """
+        local_id = str(local_order_id or "").strip()
+        broker_id = str(broker_order_id or "").strip()
+        mode = str(execution_mode or "").strip().lower()
+        if mode not in {"live", "paper"}:
+            return False
+        if isinstance(attempt, bool):
+            return False
+        if isinstance(attempt, int):
+            attempt_i = attempt
+        elif isinstance(attempt, str) and attempt.strip().isdigit():
+            attempt_i = int(attempt.strip())
+        else:
+            return False
+        if not local_id or not broker_id or attempt_i <= 0:
+            return False
+
+        import json as _json_local
+
+        patch = {
+            "stale_exit_cancel_liveness": {
+                "broker_order_id": broker_id,
+                "attempt": attempt_i,
+                "updated_at": now_utc_iso(),
+            }
+        }
+        try:
+            patch_json = _json_local.dumps(patch, default=str)
+        except Exception:
+            return False
+
+        def _fn():
+            with conn() as c:
+                row = c.execute(
+                    "SELECT broker_order_id, execution_mode, meta FROM orders "
+                    "WHERE local_order_id=%s AND client_id=%s "
+                    "  AND LOWER(COALESCE(execution_mode, ''))=%s FOR UPDATE",
+                    (local_id, self.client_id, mode),
+                ).fetchone()
+                if not row:
+                    return 0
+                if str(row.get("broker_order_id") or "").strip() != broker_id:
+                    return 0
+                if str(row.get("execution_mode") or "").strip().lower() != mode:
+                    return 0
+
+                raw_meta = row.get("meta") or {}
+                if isinstance(raw_meta, str):
+                    try:
+                        raw_meta = _json_local.loads(raw_meta) if raw_meta.strip() else {}
+                    except Exception:
+                        return 0
+                if not isinstance(raw_meta, dict):
+                    return 0
+
+                marker = raw_meta.get("stale_exit_cancel_liveness")
+                if marker is not None:
+                    if not isinstance(marker, dict):
+                        return 0
+                    if str(marker.get("broker_order_id") or "").strip() != broker_id:
+                        return 0
+                    raw_attempt = marker.get("attempt")
+                    if isinstance(raw_attempt, bool):
+                        return 0
+                    if isinstance(raw_attempt, int):
+                        existing_attempt = raw_attempt
+                    elif isinstance(raw_attempt, str) and raw_attempt.strip().isdigit():
+                        existing_attempt = int(raw_attempt.strip())
+                    else:
+                        return 0
+                    if existing_attempt < 0 or existing_attempt >= attempt_i:
+                        return 0
+
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                    "    updated_ts = NOW() "
+                    "WHERE local_order_id=%s AND client_id=%s "
+                    "  AND broker_order_id=%s "
+                    "  AND LOWER(COALESCE(execution_mode, ''))=%s",
+                    (patch_json, local_id, self.client_id, broker_id, mode),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] monotonic stale-exit cancel-attempt persist failed "
+                "for local_order_id=%s broker_order_id=%s: %s",
+                self.client_id,
+                local_id,
+                broker_id,
+                exc,
             )
             return False
 
@@ -6996,17 +7136,12 @@ class APOrderStateMachine:
                 return None
             if row.get("quantity_remaining") is not None:
                 return int(row.get("quantity_remaining") or 0)
-            # Fallback: quantity_remaining is NULL in DB.
-            # This is correct on first fill (before any scale-out), but if it fires
-            # after a scale-out it means DB is not being updated — partial close will
-            # be silently treated as full close on the next fill.
             log.critical(
-                "[%s] _get_position_remaining_from_db: quantity_remaining is NULL for pos=%s "
-                "falling back to qty=%s — if this fires after a scale-out, "
-                "quantity_remaining is not being updated in DB",
-                self.client_id, position_id, row.get("qty"),
+                "[%s] _get_position_remaining_from_db: quantity_remaining is missing or malformed "
+                "for pos=%s; refusing qty fallback",
+                self.client_id, position_id,
             )
-            return int(row.get("qty") or 0)
+            return None
         except Exception:
             return None
 

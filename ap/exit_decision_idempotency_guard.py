@@ -1778,6 +1778,18 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
         ).strip()
         position_id = str(getattr(pos, "position_id", "") or "")
         remaining_qty = _int(getattr(pos, "quantity_remaining", 0), 0) or 0
+        # PR #423: apply the broker-confirmed partial-fill remainder cap before
+        # this outer wrapper records/validates requested_qty. The core submit
+        # seam applies the same helper again for unwrapped callers; this keeps
+        # durable claim and broker-truth fences aligned with the replacement.
+        try:
+            from ap_exit_engine import _cap_exit_decision_to_replacement_remainder
+            _cap_exit_decision_to_replacement_remainder(pos, decision)
+        except Exception as _cap_err:
+            log.debug(
+                "replacement remainder cap unavailable at idempotency wrapper: %s",
+                _cap_err,
+            )
         raw_requested_qty = getattr(decision, "quantity", None)
         requested_qty = _strict_positive_int(raw_requested_qty)
         if _decision_should_act(decision) and requested_qty is None:

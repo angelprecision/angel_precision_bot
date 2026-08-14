@@ -119,7 +119,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
         "execution_mode", "meta",
         "exit_in_flight", "pending_exit_qty",
         "pending_exit_local_order_id", "pending_exit_broker_order_id",
-        "quantity_remaining", "contracts_exited",
+        "quantity_remaining", "contracts_exited", "meta",
     }),
     # Core order lifecycle columns referenced verbatim across OSM, exit
     # guards, reconciler, and the durable-generation reader.

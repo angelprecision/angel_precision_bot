@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -49,6 +50,21 @@ def _to_float(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def _strict_position_quantity(value: Any) -> Optional[int]:
+    """Parse an option position quantity without whitespace/coercion loss."""
+    if value is None or isinstance(value, bool):
+        return None
+    if type(value) is int:
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        if value != value.strip() or not value.isdigit():
+            return None
+        return int(value)
+    if type(value) is float and math.isfinite(value) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
 
 
 class TradierBroker(BrokerAdapter):
@@ -417,14 +433,24 @@ class TradierBroker(BrokerAdapter):
         broker query before deciding that a new POST is safe.
         """
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
-        node = j.get("orders") if isinstance(j, dict) else None
-        orders = node.get("order") if isinstance(node, dict) else node
-        if orders is None:
+        if not isinstance(j, dict) or "orders" not in j:
+            raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        node = j["orders"]
+        if node is None or node == "null":
+            return []
+        if not isinstance(node, dict) or "order" not in node:
+            raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        orders = node["order"]
+        if orders is None or orders == "null":
             return []
         if isinstance(orders, dict):
-            return [orders]
+            if not orders:
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+            return [dict(orders)]
         if isinstance(orders, list):
-            return [order for order in orders if isinstance(order, dict)]
+            if any(not isinstance(order, dict) or not order for order in orders):
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+            return [dict(order) for order in orders]
         raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
@@ -469,30 +495,58 @@ class TradierBroker(BrokerAdapter):
         """
         Return open positions from Tradier account.
         Returns list of dicts with: symbol, quantity, cost_basis, side
-        Returns [] if no positions or on error.
+        Returns [] only when the positions query succeeds and the account is
+        flat. Provider/transport failures are propagated so recovery callers
+        cannot mistake unavailable truth for broker-flat truth.
         """
         try:
             resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
-            positions = resp.get("positions", {})
-            if not positions or positions == "null":
+            if not isinstance(resp, dict) or "positions" not in resp:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            positions = resp["positions"]
+            if positions is None or positions == "null":
                 return []
-            pos_list = positions.get("position", [])
+            if not isinstance(positions, dict) or "position" not in positions:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            pos_list = positions["position"]
+            if pos_list is None or pos_list == "null":
+                return []
             if isinstance(pos_list, dict):
+                if not pos_list:
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
                 pos_list = [pos_list]
+            if not isinstance(pos_list, list) or any(
+                not isinstance(p, dict) or not p for p in pos_list
+            ):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
             result = []
             for p in pos_list:
+                symbol = p.get("symbol")
+                quantity = p.get("quantity")
+                if (
+                    "symbol" not in p
+                    or not isinstance(symbol, str)
+                    or not symbol.strip()
+                    or "quantity" not in p
+                    or quantity is None
+                    or isinstance(quantity, bool)
+                ):
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+                parsed_quantity = _strict_position_quantity(quantity)
+                if parsed_quantity is None:
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
                 result.append({
-                    "symbol":     p.get("symbol", ""),
-                    "quantity":   float(p.get("quantity", 0)),
+                    "symbol":     symbol,
+                    "quantity":   float(parsed_quantity),
                     "cost_basis": float(p.get("cost_basis", 0)),
                     "side":       (lambda sym: (
                         "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
                         "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
                         "CALL" if "C" in sym else "PUT"
-                    ))(str(p.get("symbol", ""))),
+                    ))(symbol),
                     "raw":        p,
                 })
             return result
         except Exception as e:
             log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
-            return []
+            raise

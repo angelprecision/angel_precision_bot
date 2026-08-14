@@ -68,6 +68,26 @@ jobs:
             | grep -qx 2
           dropdb -h localhost -U postgres position_mode_migration_test
 
+      - name: Validate PR #423 positions authority migration
+        env:
+          PGPASSWORD: postgres
+        run: |
+          createdb -h localhost -U postgres pr423_positions_authority_test
+          trap 'dropdb -h localhost -U postgres pr423_positions_authority_test || true' EXIT
+          psql -h localhost -U postgres -d pr423_positions_authority_test -v ON_ERROR_STOP=1 -c \
+            "CREATE TABLE public.positions (id text PRIMARY KEY, client_id text NOT NULL, execution_mode text NOT NULL, contract text NOT NULL, status text NOT NULL, qty integer NOT NULL, quantity_remaining integer NOT NULL, updated_at timestamptz NOT NULL DEFAULT NOW()); INSERT INTO public.positions (id, client_id, execution_mode, contract, status, qty, quantity_remaining) VALUES ('pr423-position','client-pr423','paper','AVGO260814C00350000','OPEN',5,5);"
+          psql -h localhost -U postgres -d pr423_positions_authority_test \
+            --single-transaction -v ON_ERROR_STOP=1 \
+            -f migrations/20260811_positions_exit_retry_liveness_authority.sql
+          psql -h localhost -U postgres -d pr423_positions_authority_test \
+            -tAc "SELECT (data_type='jsonb' AND udt_name='jsonb' AND is_nullable='NO' AND column_default IS NOT NULL) FROM information_schema.columns WHERE table_schema='public' AND table_name='positions' AND column_name='meta'" \
+            | grep -qx t
+          psql -h localhost -U postgres -d pr423_positions_authority_test \
+            -tAc "SELECT qty::text || ':' || quantity_remaining::text || ':' || status FROM public.positions WHERE id='pr423-position'" \
+            | grep -qx '5:5:OPEN'
+          dropdb -h localhost -U postgres pr423_positions_authority_test
+          trap - EXIT
+
       - name: Run P0 plus cohesion tests
         env:
           # PR #388 CI fix: PGSSLMODE=disable so ap.db never tries SSL
@@ -123,6 +143,15 @@ jobs:
             tests/test_p0_broker_owned_exit_recovery_preflight.py \
             tests/test_p0_post_cancel_entry_retry_liveness.py \
             tests/test_phase9_retry_wire_in.py \
+            tests/test_p0_exit_retry_liveness_order_monitor.py \
+            tests/test_p0_exit_retry_liveness_exit_engine.py \
+            tests/test_p0_exit_retry_liveness_autonomous_recovery.py \
+            tests/test_p0_exit_retry_liveness_avgo_replay.py \
+            tests/test_p0_exit_retry_liveness_production_shape.py \
+            tests/test_p0_exit_retry_liveness_restart.py \
+            tests/test_p0_exit_retry_liveness_postgres.py \
+            tests/test_p0_exit_retry_liveness_startup.py \
+            tests/test_p0_exit_retry_liveness_preflight.py \
             tests/test_fill_monitor_mvp_hardening.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \

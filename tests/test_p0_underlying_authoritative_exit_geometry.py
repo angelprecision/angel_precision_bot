@@ -39,6 +39,10 @@ CONFIRM_SECONDS = 30.0
 def _deterministic_confirmation_window(monkeypatch):
     """Keep the replay clock deterministic without changing loss thresholds."""
     monkeypatch.setenv("UNDERLYING_STOP_CONFIRM_SECONDS", str(CONFIRM_SECONDS))
+    # PR #403 tests the native underlying-stop geometry.  When this module is
+    # collected after a package import that installs the optional touched-profit
+    # lifecycle wrapper, keep that unrelated wrapper out of the geometry replay.
+    monkeypatch.setenv("TOUCHED_PROFIT_BREACH_CONFIRMATION_ENABLED", "0")
 
 
 def _timestamp(now_utc: datetime, age_seconds: float = 2.0) -> datetime:
@@ -782,7 +786,15 @@ def test_confirmed_technical_stop_uses_post_425_broker_owned_handoff(monkeypatch
         lambda generation_key, **kwargs: updates.append((generation_key, kwargs)),
     )
 
-    wrapped = guard.wrap_submit(APExitEngine._submit_exit_decision)
+    # In a full-suite process the lifecycle installer may already have wrapped
+    # the production submit seam.  Apply this test's durable-claim wrapper to
+    # the original seam exactly once, matching the isolated-module behavior.
+    submit_original = getattr(
+        APExitEngine,
+        guard._ORIGINAL_SUBMIT_ATTR,
+        APExitEngine._submit_exit_decision,
+    )
+    wrapped = guard.wrap_submit(submit_original)
     quantity_before = pos.quantity_remaining
     proof_before = (pos._proof_staged, pos._proof_finalized, pos.proof_logged)
 

@@ -35,7 +35,9 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from enum import Enum
 from typing import Optional
 
 from ap.broker_submit_identity import canonical_broker_submit_key
@@ -46,6 +48,107 @@ from ap.utils import now_utc_iso
 log = logging.getLogger("ap.order_monitor")
 
 _OCC_SIDE_RE = re.compile(r"\d{6}([CP])")
+
+
+def _strict_cumulative_quantity(value) -> Optional[int]:
+    """Parse broker cumulative quantity without coercing malformed truth."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if type(value) is int:
+        return value if value >= 0 else None
+    if type(value) is float:
+        if math.isfinite(value) and value.is_integer() and value >= 0:
+            return int(value)
+        return None
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _strict_broker_status(raw_status) -> Optional[str]:
+    """Normalize broker status only when duplicate authorities agree."""
+    if isinstance(raw_status, dict):
+        values = []
+        for key in ("status", "order_status"):
+            if key not in raw_status:
+                continue
+            value = raw_status.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return None
+            values.append(value.strip().lower())
+        if not values or len(values) == 2 and values[0] != values[1]:
+            return None
+        raw_status = values[0]
+
+    if raw_status is None:
+        return None
+    status = str(raw_status).strip().lower()
+    if not status:
+        return None
+    aliases = {
+        "cancelled": "canceled",
+        "partial_fill": "partially_filled",
+        "partial_filled": "partially_filled",
+    }
+    return aliases.get(status, status)
+
+
+class NewerExitLookupState(str, Enum):
+    """Authority states for the position-reopen replacement lookup."""
+
+    FOUND = "FOUND"
+    AUTHORITATIVE_NONE = "AUTHORITATIVE_NONE"
+    UNAVAILABLE = "UNAVAILABLE"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+@dataclass(frozen=True)
+class NewerExitLookup:
+    """Tri/four-state result; absence is authoritative only when proven."""
+
+    state: NewerExitLookupState
+    rows: tuple[dict, ...] = ()
+    error: str = ""
+    count: Optional[int] = None
+
+    @classmethod
+    def found(cls, row: dict) -> "NewerExitLookup":
+        return cls(NewerExitLookupState.FOUND, (dict(row),), count=1)
+
+    @classmethod
+    def authoritative_none(cls) -> "NewerExitLookup":
+        return cls(NewerExitLookupState.AUTHORITATIVE_NONE, (), count=0)
+
+    @classmethod
+    def unavailable(cls, error: str) -> "NewerExitLookup":
+        return cls(NewerExitLookupState.UNAVAILABLE, (), error=str(error or ""), count=None)
+
+    @classmethod
+    def ambiguous(cls, rows: list[dict]) -> "NewerExitLookup":
+        normalized = tuple(dict(row) for row in rows)
+        return cls(NewerExitLookupState.AMBIGUOUS, normalized, count=len(normalized))
+
+    @property
+    def row(self) -> Optional[dict]:
+        return self.rows[0] if self.state is NewerExitLookupState.FOUND else None
+
+    def diagnostic(self) -> dict:
+        identities = [
+            {
+                "local_order_id": str(row.get("local_order_id") or ""),
+                "broker_order_id": str(row.get("broker_order_id") or ""),
+                "status": str(row.get("status") or ""),
+            }
+            for row in self.rows
+        ]
+        result = {
+            "lookup_state": self.state.value,
+            "replacement_count": self.count,
+            "replacement_identities": identities,
+        }
+        if self.error:
+            result["error"] = self.error
+        return result
 
 # ── Shared broker order-status cache ─────────────────────────────────────────
 # fill_monitor and order_monitor both call broker.get_order(broker_order_id)
@@ -172,6 +275,18 @@ PAPER_ENTRY_MARKET_FALLBACK_MAX_SPREAD_PCT = float(os.getenv("PAPER_ENTRY_MARKET
 TIMEOUT_EXIT_PENDING  = int(os.getenv("ORDER_TIMEOUT_EXIT_PENDING",  "45"))    # 45s — exit = account risk
 TIMEOUT_EXIT_ACK      = int(os.getenv("ORDER_TIMEOUT_EXIT_ACK",      "90"))    # 90s — acked but no fill
 
+# PR #423 amendment: a cancel request is not proof that the broker accepted
+# the DELETE.  Keep one exact-order cancellation owner, but permit a bounded
+# re-cancel after a later fresh live-order proof.  The default delay matches
+# the faster exit-monitor cadence, so sequential poll cycles cannot race a
+# single cancel while a lost transport does not strand the order forever.
+STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS = max(
+    0, int(os.getenv("ORDER_STALE_EXIT_CANCEL_RETRY_AFTER", "15"))
+)
+STALE_EXIT_CANCEL_MAX_ATTEMPTS = max(
+    1, int(os.getenv("ORDER_STALE_EXIT_CANCEL_MAX_ATTEMPTS", "2"))
+)
+
 POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds (entry checks)
 # H4: exits run on this faster cadence (account risk). Keep >= a few seconds
 # to avoid hammering the broker; 15s + 45s timeout => hung exit caught fast.
@@ -250,6 +365,20 @@ ORDER_MONITOR_CAN_ACT = ORDER_MONITOR_MODE in {"active", "actor", "enforce", "en
 # Stale ENTRY cancels are always allowed even in watchdog mode. An unfilled
 # buy-to-open is not a position — leaving it to fill late is the actual risk.
 ALLOW_ENTRY_CANCEL_IN_WATCHDOG = os.getenv("ALLOW_ENTRY_CANCEL_IN_WATCHDOG", "1").strip() == "1"
+
+# PR #423: narrow stale-EXIT watchdog exception. This restores a previously
+# intended exit-liveness mechanism (2026-08-07 AVGO PAPER incident: a stale
+# working 2-lot SELL_TO_CLOSE sat unfilled indefinitely under watchdog mode,
+# later blocking a full-position flatten because the broker still reserved
+# those contracts). This flag authorizes ONLY stale-EXIT cancel/replacement
+# recovery — it does not enable generic watchdog order mutation, stale-ENTRY
+# cancellation (see ALLOW_ENTRY_CANCEL_IN_WATCHDOG above), position
+# reopening, or any other broker mutation. Default is ENABLED because this
+# is restoration of intended safety/liveness behavior, not a new
+# experimental feature.
+ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG = os.getenv(
+    "ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # PHASE 5 WIRE-IN (2026-05-23):
 # After an ENTRY cancel is broker-confirmed, the monitor consults
@@ -477,6 +606,14 @@ class APOrderMonitor:
         self.client_mode = str(client_mode or "LIVE").strip().upper()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # PR #423: one-owner stale-EXIT cancel guard. Keyed by exact
+        # broker_order_id. It prevents overlapping cycles from issuing
+        # duplicate cancels, while the separate bounded-attempt counter lets a
+        # later fresh WORKING proof issue one exact-identity re-cancel after a
+        # lost/failed transport. Both are cleared once terminal broker proof
+        # is obtained for that exact broker_order_id.
+        self._stale_exit_cancel_inflight: dict[str, datetime] = {}
+        self._stale_exit_cancel_attempts: dict[str, int] = {}
 
         self.run_id           = os.getenv("AP_RUN_ID", "unknown")
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
@@ -488,6 +625,8 @@ class APOrderMonitor:
             "timeout_partial_fill":   TIMEOUT_PARTIAL_FILL,
             "timeout_exit_pending":   TIMEOUT_EXIT_PENDING,
             "timeout_exit_ack":       TIMEOUT_EXIT_ACK,
+            "stale_exit_cancel_retry_after_seconds": STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS,
+            "stale_exit_cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
             "poll_interval":          POLL_INTERVAL,
             "order_monitor_mode":     ORDER_MONITOR_MODE,
             "enable_missed_move_cancel": ENABLE_MISSED_MOVE_CANCEL,
@@ -496,6 +635,7 @@ class APOrderMonitor:
             "missed_move_price_mult": float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.07")),
             "entry_limit_max_age_seconds": ENTRY_LIMIT_MAX_AGE_SECONDS,
             "allow_entry_cancel_in_watchdog": ALLOW_ENTRY_CANCEL_IN_WATCHDOG,
+            "allow_stale_exit_recovery_in_watchdog": ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG,
             "pending_trigger_cleanup_enabled": PENDING_TRIGGER_CLEANUP_ENABLED,
             "pending_trigger_max_age_seconds": PENDING_TRIGGER_MAX_AGE_SECONDS,
             "pending_trigger_cleanup_dry_run": PENDING_TRIGGER_CLEANUP_DRY_RUN,
@@ -2659,8 +2799,44 @@ class APOrderMonitor:
                             broker_order_id=broker_oid,
                             reason="acknowledged exit broker status lookup failed or was unknown",
                         )
-                    elif broker_status:
+                    elif self._is_filled_status(broker_status) or self._is_terminal_failure_status(
+                        broker_status
+                    ):
                         self._advance_from_broker_status(local_id, broker_status, contract)
+                    elif self._is_live_stale_exit_broker_status(broker_status):
+                        # A live broker acknowledgement is exactly the stale
+                        # working-exit path.  Passing it through
+                        # _advance_from_broker_status() alone is insufficient:
+                        # statuses such as WORKING/ACCEPTED/QUEUED are not
+                        # lifecycle transitions, and OPEN maps back to the
+                        # current EXIT_ACKNOWLEDGED state.  Route every
+                        # recognized live proof through the exact cancel/
+                        # replacement owner instead.
+                        self._handle_stale_exit(
+                            local_id, status, contract, age_secs,
+                            position_id=position_id,
+                            reason=(
+                                f"EXIT_ACKNOWLEDGED for {age_secs:.0f}s > {TIMEOUT_EXIT_ACK}s "
+                                f"— broker status={self._normalize_broker_status(broker_status)} "
+                                "still live — ESCALATING"
+                            ),
+                        )
+                    elif broker_status:
+                        # Do not let a truthy but unrecognized broker string
+                        # authorize a cancel.  Unknown broker truth remains a
+                        # fail-closed hold until a recognized live or terminal
+                        # proof is available.
+                        self._hold_on_unknown_broker_status(
+                            local_id,
+                            status,
+                            contract,
+                            position_id=position_id,
+                            broker_order_id=broker_oid,
+                            reason=(
+                                "acknowledged exit broker status was not a recognized "
+                                f"live or terminal state: {broker_status!r}"
+                            ),
+                        )
                     else:
                         self._handle_stale_exit(
                             local_id, status, contract, age_secs,
@@ -2673,25 +2849,18 @@ class APOrderMonitor:
 
             elif status == "EXIT_PARTIAL_FILL":
                 if age_secs > TIMEOUT_PARTIAL_FILL:
-                    # INTENTIONALLY PASSIVE — exit partial fills are NOT auto-retried.
-                    # The filled portion is closed; auto-retrying the remainder risks
-                    # double-exit on already-closed contracts.
-                    # Policy: alert at CRITICAL level, require manual review.
-                    self._emit_order_event(
-                        local_order_id=local_id,
-                        stage="order_monitor",
-                        decision="ALERT",
-                        reason_code="PARTIAL_FILL_STALLED",
-                        explanation=f"EXIT_PARTIAL_FILL stalled for {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s",
-                        contract=contract,
+                    # A durable partial-fill row still owns an exact broker
+                    # order identity.  It must enter the same stale-exit
+                    # owner so only the broker-unfilled remainder can be
+                    # canceled/replaced; alert-only handling strands that
+                    # remainder indefinitely.
+                    self._handle_stale_exit(
+                        local_id, status, contract, age_secs,
                         position_id=position_id,
-                        inputs={"status": status, "age_secs": age_secs},
-                        thresholds={"timeout_partial_fill": TIMEOUT_PARTIAL_FILL},
-                    )
-                    self._alert(
-                        f"🚨 EXIT PARTIAL_FILL STALLED | {self.client_id} | {contract} "
-                        f"| {local_id} | {age_secs:.0f}s | pos={position_id} "
-                        f"| MANUAL INTERVENTION REQUIRED"
+                        reason=(
+                            f"EXIT_PARTIAL_FILL for {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s "
+                            "— recovering only the broker-unfilled remainder"
+                        ),
                     )
 
     def _check_stale_entry_cancel(
@@ -5093,7 +5262,11 @@ class APOrderMonitor:
             f"| {local_order_id} | pos={position_id} | {reason}"
         )
 
-        if not ORDER_MONITOR_CAN_ACT:
+        # PR #423: narrow stale-EXIT watchdog exception. Global watchdog
+        # passivity is otherwise unchanged — this authorizes ONLY the exact
+        # stale-EXIT recovery path below, never generic order mutation.
+        _stale_exit_authorized = ORDER_MONITOR_CAN_ACT or ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG
+        if not _stale_exit_authorized:
             self._alert(
                 f"[WATCHDOG ONLY] Stale exit detected; no cancel/clear/reopen attempted | "
                 f"{self.client_id} | {contract} | {local_order_id} | pos={position_id} | {reason}"
@@ -5103,15 +5276,235 @@ class APOrderMonitor:
                 self.client_id, local_order_id, status, position_id,
             )
             return
+        if not ORDER_MONITOR_CAN_ACT:
+            log.warning(
+                "[%s] WATCHDOG STALE-EXIT RECOVERY EXCEPTION ACTIVE — performing ONLY "
+                "exact stale EXIT recovery (cancel/replace); no other watchdog mutation "
+                "authorized | order=%s status=%s pos=%s",
+                self.client_id, local_order_id, status, position_id,
+            )
 
+        # ── Exact broker order identity is mandatory ────────────────────────
         broker_oid = self._get_broker_order_id(local_order_id)
-        broker_status = self._query_broker_order(broker_oid)
+        if not broker_oid:
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="ALERT",
+                reason_code="STALE_EXIT_BROKER_ID_UNPROVEN",
+                explanation=(
+                    "Stale-exit recovery blocked: no exact durable broker_order_id "
+                    "resolved for this local order. No fuzzy contract/side/qty lookup "
+                    "is permitted."
+                ),
+                contract=contract,
+                position_id=position_id,
+                inputs={"status": status, "age_secs": age_secs},
+            )
+            self._alert(
+                f"STALE_EXIT_BROKER_ID_UNPROVEN | {self.client_id} | {contract} "
+                f"| {local_order_id} | pos={position_id} — cannot cancel without exact broker order id"
+            )
+            log.error(
+                "[%s] STALE_EXIT_BROKER_ID_UNPROVEN — refusing fuzzy cancel | order=%s pos=%s",
+                self.client_id, local_order_id, position_id,
+            )
+            return
 
-        broker_owned_recovery = _is_broker_ownership_adopted_row(
-            self.osm.get_order(local_order_id) or {}
-        )
-        if broker_owned_recovery and _requires_broker_owned_exit_fence(
-            broker_status
+        # The first cancel is authorized only by a fresh recognized live
+        # snapshot. Do not let cached/unknown status fall through to DELETE
+        # merely because the durable broker identity is known.
+        broker_status = self._query_broker_order(broker_oid, bypass_cache=True)
+        _partial_remainder_qty = 0
+        _stale_order_row = self.osm.get_order(local_order_id) or {}
+        _expected_execution_mode = str(
+            _stale_order_row.get("execution_mode")
+            or getattr(self, "_broker_owned_exit_recovery_mode", "")
+        ).strip().lower()
+
+        # ── Broker fill truth wins before cancel ────────────────────────────
+        # A full fill still wins immediately.  A partial fill is first routed
+        # through the canonical OSM/fill hook so durable quantity truth is
+        # advanced, then this exact stale-order seam may cancel only the
+        # broker-unfilled remainder.  This helper never mutates position
+        # quantity directly.
+        if self._is_executed_status(broker_status):
+            if self._normalize_broker_status(broker_status) == "partially_filled":
+                _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                    local_order_id, broker_oid, contract,
+                )
+                if _partial_remainder_qty is None:
+                    # Preserve the existing fill-truth-wins behavior when the
+                    # payload does not contain exact cumulative fill data.
+                    self._advance_from_broker_status(local_order_id, broker_status, contract)
+                    self._clear_stale_exit_cancel_state(broker_oid)
+                    return
+                if _partial_remainder_qty <= 0:
+                    self._clear_stale_exit_cancel_state(broker_oid)
+                    return
+                log.info(
+                    "[%s] Exit partially filled; canceling only broker-unfilled remainder | "
+                    "order=%s remainder=%s",
+                    self.client_id, local_order_id, _partial_remainder_qty,
+                )
+            else:
+                log.info(
+                    f"[{self.client_id}] Exit actually filled at broker — "
+                    f"advancing state machine: {local_order_id}"
+                )
+                self._advance_from_broker_status(local_order_id, broker_status, contract)
+                self._clear_stale_exit_cancel_state(broker_oid)
+                return
+
+        def _cancel_and_prove():
+            """Issue one exact cancel and require a fresh raw broker proof."""
+            cancel_result = None
+            try:
+                cancel_result = self._cancel_broker_order(broker_oid)
+            except Exception as e:
+                log.warning(f"[{self.client_id}] Exit broker cancel failed: {e}")
+            cancel_response_status = self._extract_broker_status(cancel_result)
+            try:
+                confirmed_payload = self._query_broker_order_payload(broker_oid)
+            except Exception as e:
+                log.warning(f"[{self.client_id}] Post-cancel broker GET failed: {e}")
+                confirmed_payload = None
+            confirmed_status = self._extract_broker_status(confirmed_payload)
+            return cancel_response_status, confirmed_status, confirmed_payload
+
+        def _handle_late_fill(confirmed, confirmed_payload=None) -> bool:
+            """Apply fresh fill truth; return True when the caller must stop."""
+            nonlocal _partial_remainder_qty
+
+            # A terminal cancel payload can still carry a cumulative fill
+            # earned during the DELETE race. Reconcile that raw quantity
+            # before accepting CANCELED or staging replacement authority.
+            if (
+                confirmed_payload
+                and self._is_terminal_cancel_status(confirmed_payload)
+                and any(
+                    key in confirmed_payload
+                    for key in ("exec_quantity", "filled_quantity", "filled_qty")
+                )
+            ):
+                cumulative_raw = next(
+                    (
+                        confirmed_payload.get(key)
+                        for key in ("exec_quantity", "filled_quantity", "filled_qty")
+                        if key in confirmed_payload
+                    ),
+                    None,
+                )
+                cumulative_filled = _strict_cumulative_quantity(cumulative_raw)
+                if cumulative_filled is None or cumulative_filled < 0:
+                    self._hold_on_unknown_broker_status(
+                        local_order_id,
+                        status,
+                        contract,
+                        position_id=position_id,
+                        broker_order_id=broker_oid,
+                        reason="terminal cancel payload cumulative fill was invalid",
+                    )
+                    return True
+                _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                    local_order_id,
+                    broker_oid,
+                    contract,
+                    raw_payload=confirmed_payload,
+                )
+                if _partial_remainder_qty is None:
+                    self._hold_on_unknown_broker_status(
+                        local_order_id,
+                        status,
+                        contract,
+                        position_id=position_id,
+                        broker_order_id=broker_oid,
+                        reason="terminal cancel cumulative fill could not be durably applied",
+                    )
+                    return True
+                if _partial_remainder_qty <= 0:
+                    self._clear_stale_exit_cancel_state(broker_oid)
+                    return True
+                return False
+
+            if not self._is_executed_status(confirmed):
+                return False
+            if self._normalize_broker_status(confirmed) == "partially_filled":
+                _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                    local_order_id,
+                    broker_oid,
+                    contract,
+                    raw_payload=confirmed_payload,
+                )
+                if _partial_remainder_qty is None:
+                    self._advance_from_broker_status(local_order_id, confirmed, contract)
+                    self._clear_stale_exit_cancel_state(broker_oid)
+                    return True
+                if _partial_remainder_qty <= 0:
+                    self._clear_stale_exit_cancel_state(broker_oid)
+                    return True
+                return False
+            log.info(
+                "[%s] Late-fill race — broker filled during cancel window | order=%s",
+                self.client_id, local_order_id,
+            )
+            self._advance_from_broker_status(local_order_id, confirmed, contract)
+            self._clear_stale_exit_cancel_state(broker_oid)
+            return True
+
+        _now = datetime.now(timezone.utc)
+
+        # The in-memory maps prevent overlapping poll cycles from issuing a
+        # duplicate DELETE, but they cannot survive a monitor/process restart.
+        # Restore the exact broker-order attempt fence from OSM metadata before
+        # allowing any further cancel attempt.  Import locally to keep the
+        # recovery module independent of monitor construction/import order.
+        _durable_cancel_attempt = 0
+        _durable_cancel_updated_at = None
+        try:
+            from ap.exit_autonomous_recovery import _read_stale_exit_cancel_liveness
+
+            _durable_liveness = _read_stale_exit_cancel_liveness(
+                self.osm, local_order_id, broker_oid, order=_stale_order_row,
+            )
+            _durable_cancel_attempt = max(
+                0, int(_durable_liveness.get("attempt", 0) or 0)
+            )
+            _updated_at = str(_durable_liveness.get("updated_at") or "").strip()
+            if _updated_at:
+                _durable_cancel_updated_at = datetime.fromisoformat(
+                    _updated_at.replace("Z", "+00:00")
+                )
+                if _durable_cancel_updated_at.tzinfo is None:
+                    _durable_cancel_updated_at = _durable_cancel_updated_at.replace(
+                        tzinfo=timezone.utc
+                    )
+                else:
+                    _durable_cancel_updated_at = _durable_cancel_updated_at.astimezone(
+                        timezone.utc
+                    )
+        except Exception as _durable_liveness_error:
+            log.warning(
+                "[%s] durable stale-exit cancel-attempt read failed; refusing restart reset | "
+                "order=%s broker=%s error=%s",
+                self.client_id, local_order_id, broker_oid, _durable_liveness_error,
+            )
+
+        if _durable_cancel_attempt > 0:
+            self._stale_exit_cancel_attempts[broker_oid] = max(
+                _durable_cancel_attempt,
+                int(self._stale_exit_cancel_attempts.get(broker_oid, 0) or 0),
+            )
+            self._stale_exit_cancel_inflight.setdefault(
+                broker_oid, _durable_cancel_updated_at or _now,
+            )
+
+        # A first DELETE is permitted only when this invocation has a fresh,
+        # recognized live proof. If a prior durable/in-memory cancel attempt
+        # exists, the bounded retry branch below performs its own fresh proof.
+        if (
+            not self._stale_exit_cancel_inflight.get(broker_oid)
+            and not self._is_live_stale_exit_broker_status(broker_status)
         ):
             self._hold_on_unknown_broker_status(
                 local_order_id,
@@ -5119,85 +5512,437 @@ class APOrderMonitor:
                 contract,
                 position_id=position_id,
                 broker_order_id=broker_oid,
-                reason="stale exit broker status lookup failed or was unknown",
+                reason=(
+                    "fresh pre-cancel broker lookup did not establish a "
+                    "recognized live state"
+                ),
             )
             return
 
-        if self._is_executed_status(broker_status):
-            log.info(
-                f"[{self.client_id}] Exit actually filled at broker — "
-                f"advancing state machine: {local_order_id}"
-            )
-            self._advance_from_broker_status(local_order_id, broker_status, contract)
-            return
+        def _persist_cancel_attempt(attempt: int) -> bool:
+            """Persist the bounded generation before issuing broker DELETE."""
+            try:
+                from ap.exit_autonomous_recovery import _persist_stale_exit_cancel_attempt
 
-        cancel_result = None
-        try:
-            cancel_result = self._cancel_broker_order(broker_oid)
-        except Exception as e:
-            log.warning(f"[{self.client_id}] Exit broker cancel failed: {e}")
-
-        confirmed_status = self._extract_broker_status(cancel_result)
-        is_confirmed_canceled = self._is_terminal_cancel_status(confirmed_status)
-
-        if not is_confirmed_canceled:
-            self._emit_order_event(
-                local_order_id=local_order_id,
-                stage="order_monitor",
-                decision="ALERT",
-                reason_code="MANUAL_INTERVENTION_REQUIRED",
-                explanation="Exit order stuck and cancel not broker-confirmed",
-                contract=contract,
-                position_id=position_id,
-                inputs={"confirmed_status": confirmed_status},
-            )
-            self._alert(
-                f"Exit cancel sent but NOT broker-confirmed | {self.client_id} | "
-                f"{contract} | {local_order_id} | broker_status={confirmed_status or 'unknown'}"
-            )
-
-        if is_confirmed_canceled:
-            self.osm.transition(local_order_id, "CANCELED", last_error=reason)
-
-            if position_id and self.exit_engine:
-                try:
-                    self.exit_engine.clear_exit_in_flight(position_id)
-                    log.warning(
-                        "[%s] clear_exit_in_flight(%s) called — "
-                        "exit engine will retry within 8s",
-                        self.client_id, position_id,
+                persisted = bool(
+                    _persist_stale_exit_cancel_attempt(
+                        self.osm,
+                        local_order_id,
+                        broker_oid,
+                        attempt,
+                        execution_mode=_expected_execution_mode,
                     )
-                except Exception as _cef:
-                    log.error(
-                        "[%s] clear_exit_in_flight failed for pos=%s: %s",
-                        self.client_id, position_id, _cef,
-                    )
-
-            if position_id and self.pm:
-                self._guarded_revert_position_open_after_exit_cancel(
-                    position_id=position_id,
-                    canceled_exit_order_id=local_order_id,
-                    contract=contract,
-                    reason=reason,
                 )
+            except Exception as _persist_error:
+                log.error(
+                    "[%s] durable stale-exit cancel-attempt write failed | order=%s "
+                    "broker=%s attempt=%s error=%s",
+                    self.client_id, local_order_id, broker_oid, attempt, _persist_error,
+                )
+                persisted = False
+            if not persisted:
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="ALERT",
+                    reason_code="EXIT_CANCEL_ATTEMPT_DURABILITY_UNCONFIRMED",
+                    explanation=(
+                        "The exact stale-exit cancel attempt could not be durably "
+                        "recorded; no broker DELETE was issued."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "broker_order_id": broker_oid,
+                        "cancel_attempt": attempt,
+                        "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                    },
+                )
+                self._alert(
+                    f"EXIT CANCEL ATTEMPT DURABILITY UNCONFIRMED — cancel blocked | "
+                    f"{self.client_id} | {contract} | {local_order_id} | broker={broker_oid}"
+                )
+            return persisted
+
+        # ── Bounded exact-identity cancel owner ─────────────────────────────
+        # A second poll cycle observing the same stale exit before the first
+        # cancel's terminal proof has landed must first obtain a fresh broker
+        # proof.  A recognized live proof can authorize one later re-cancel,
+        # but only up to the explicit bound; unknown status never authorizes a
+        # DELETE and terminal proof is still required before replacement.
+        _inflight_since = self._stale_exit_cancel_inflight.get(broker_oid)
+        if _inflight_since is not None:
+            _inflight_age = max(0.0, (_now - _inflight_since).total_seconds())
+            _cancel_attempt = int(self._stale_exit_cancel_attempts.get(broker_oid, 1) or 1)
+            # The initial fresh GET above is itself the retry authorization
+            # proof. Reuse it so a second GET cannot consume a newer broker
+            # transition before the bounded retry decision is made.
+            _recheck_status = broker_status
+            if _handle_late_fill(_recheck_status):
+                return
+            if self._is_terminal_cancel_status(_recheck_status):
+                confirmed_status = _recheck_status
+                is_confirmed_canceled = True
+            elif not self._is_live_stale_exit_broker_status(_recheck_status):
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="HOLD",
+                    reason_code="EXIT_CANCEL_NOT_CONFIRMED_REPLACEMENT_BLOCKED",
+                    explanation=(
+                        "Prior cancel request remains unproven and the fresh broker "
+                        "lookup did not establish a recognized live state."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "broker_order_id": broker_oid,
+                        "inflight_age_sec": _inflight_age,
+                        "cancel_attempt": _cancel_attempt,
+                        "post_cancel_get_status": _recheck_status,
+                    },
+                )
+                return
+            elif _cancel_attempt >= STALE_EXIT_CANCEL_MAX_ATTEMPTS:
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="ALERT",
+                    reason_code="EXIT_CANCEL_RETRY_EXHAUSTED_REPLACEMENT_BLOCKED",
+                    explanation=(
+                        "Bounded exact-identity cancel attempts are exhausted while "
+                        "fresh broker truth still shows the old exit live."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "broker_order_id": broker_oid,
+                        "cancel_attempt": _cancel_attempt,
+                        "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                        "inflight_age_sec": _inflight_age,
+                        "post_cancel_get_status": _recheck_status,
+                    },
+                )
+                self._alert(
+                    f"STALE EXIT CANCEL RETRIES EXHAUSTED — replacement blocked | "
+                    f"{self.client_id} | {contract} | {local_order_id} | "
+                    f"broker={broker_oid}"
+                )
+                return
+            elif _inflight_age < STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS:
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="HOLD",
+                    reason_code="EXIT_CANCEL_NOT_CONFIRMED_REPLACEMENT_BLOCKED",
+                    explanation=(
+                        "Fresh broker truth still shows the exact exit live, but the "
+                        "bounded re-cancel interval has not elapsed."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "broker_order_id": broker_oid,
+                        "cancel_attempt": _cancel_attempt,
+                        "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                        "inflight_age_sec": _inflight_age,
+                        "retry_after_sec": STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS,
+                        "post_cancel_get_status": _recheck_status,
+                    },
+                )
+                return
+            else:
+                _next_cancel_attempt = _cancel_attempt + 1
+                if not _persist_cancel_attempt(_next_cancel_attempt):
+                    return
+                _cancel_attempt = _next_cancel_attempt
+                self._stale_exit_cancel_attempts[broker_oid] = _cancel_attempt
+                self._stale_exit_cancel_inflight[broker_oid] = _now
+                log.warning(
+                    "[%s] STALE_EXIT_CANCEL_RETRY — fresh exact WORKING proof "
+                    "authorizes bounded re-cancel | order=%s broker_oid=%s attempt=%s/%s",
+                    self.client_id, local_order_id, broker_oid,
+                    _cancel_attempt, STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                )
+                (
+                    _cancel_response_status,
+                    confirmed_status,
+                    confirmed_payload,
+                ) = _cancel_and_prove()
+                is_confirmed_canceled = self._is_terminal_cancel_status(confirmed_status)
+                if _handle_late_fill(confirmed_status, confirmed_payload):
+                    return
+                if not is_confirmed_canceled:
+                    self._emit_order_event(
+                        local_order_id=local_order_id,
+                        stage="order_monitor",
+                        decision="ALERT",
+                        reason_code="EXIT_CANCEL_NOT_CONFIRMED_REPLACEMENT_BLOCKED",
+                        explanation=(
+                            "Retried exit cancel was not independently broker-confirmed "
+                            "via a fresh post-cancel GET; replacement remains blocked."
+                        ),
+                        contract=contract,
+                        position_id=position_id,
+                        inputs={
+                            "cancel_response_status": _cancel_response_status,
+                            "post_cancel_get_status": confirmed_status,
+                            "cancel_attempt": _cancel_attempt,
+                            "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                        },
+                    )
+                    return
         else:
+            if not _persist_cancel_attempt(1):
+                return
+            self._stale_exit_cancel_inflight[broker_oid] = _now
+            self._stale_exit_cancel_attempts[broker_oid] = 1
+            (
+                _cancel_response_status,
+                confirmed_status,
+                confirmed_payload,
+            ) = _cancel_and_prove()
+            is_confirmed_canceled = self._is_terminal_cancel_status(confirmed_status)
+            if _handle_late_fill(confirmed_status, confirmed_payload):
+                return
+            if not is_confirmed_canceled:
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="ALERT",
+                    reason_code="EXIT_CANCEL_NOT_CONFIRMED_REPLACEMENT_BLOCKED",
+                    explanation=(
+                        "Exit order cancel requested but NOT independently broker-confirmed "
+                        "via fresh post-cancel GET. Old exit ownership remains protective; "
+                        "replacement is blocked."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "cancel_response_status": _cancel_response_status,
+                        "post_cancel_get_status": confirmed_status,
+                        "cancel_attempt": 1,
+                        "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                    },
+                )
+                self._alert(
+                    f"Exit cancel sent but NOT independently broker-confirmed | {self.client_id} | "
+                    f"{contract} | {local_order_id} | post_cancel_status={confirmed_status or 'unknown'}"
+                )
+                return
+
+        # ── Broker-confirmed cancellation ───────────────────────────────────
+        # Keep the exact cancellation state until the durable OSM handoff also
+        # succeeds; a broker terminal status alone is not enough to authorize
+        # a replacement generation.
+
+        # Mark replacement authority BEFORE OSM enters CANCELED.  The real
+        # OSM terminal hook clears the old pending identity synchronously; if
+        # the grant is recorded afterward, identity fencing correctly rejects
+        # it as an unidentified/stale generation.  This is only a staged
+        # grant: the generation is committed after the durable transition
+        # returns success.
+        _fence_methods = (
+            getattr(self.exit_engine, "mark_exit_replacement_safe", None),
+            getattr(self.exit_engine, "finalize_exit_replacement_safe", None),
+            getattr(self.exit_engine, "revoke_exit_replacement_safe", None),
+        ) if position_id and self.exit_engine else ()
+        _replacement_fence_supported = bool(_fence_methods) and all(
+            callable(_method) for _method in _fence_methods
+        )
+        _replacement_staged = False
+        if position_id:
+            if not self.exit_engine or not _replacement_fence_supported:
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="ALERT",
+                    reason_code="EXIT_REPLACEMENT_DURABILITY_FENCE_UNAVAILABLE",
+                    explanation=(
+                        "Broker cancellation is proven, but the exit engine is absent "
+                        "or has no durable replacement handoff fence; replacement remains blocked."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={"broker_order_id": broker_oid},
+                )
+                return
+            try:
+                _replacement_staged = bool(
+                    self.exit_engine.mark_exit_replacement_safe(
+                        position_id,
+                        reason="order_monitor_stale_exit_broker_confirmed_cancel",
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_oid,
+                        replacement_qty=_partial_remainder_qty,
+                        defer_attempt=True,
+                    )
+                )
+            except Exception as _mrs_e:
+                log.error(
+                    "[%s] staged mark_exit_replacement_safe failed for pos=%s: %s",
+                    self.client_id, position_id, _mrs_e,
+                )
+            if not _replacement_staged:
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="ALERT",
+                    reason_code="EXIT_REPLACEMENT_GRANT_NOT_STAGED",
+                    explanation=(
+                        "Exact broker cancellation is proven, but replacement authority "
+                        "could not be staged in the exit engine."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={"broker_order_id": broker_oid},
+                )
+                return
+
+        try:
+            _osm_transition_ok = bool(
+                self.osm.transition(
+                    local_order_id,
+                    "CANCELED",
+                    broker_order_id=broker_oid,
+                    position_id=position_id,
+                    last_error=reason,
+                )
+            )
+        except Exception as _osm_transition_error:
             log.error(
-                f"[{self.client_id}] Exit order could not be canceled — "
-                f"MANUAL INTERVENTION REQUIRED | {local_order_id}"
+                "[%s] durable OSM CANCELED transition raised for order=%s: %s",
+                self.client_id, local_order_id, _osm_transition_error,
+            )
+            _osm_transition_ok = False
+
+        # A false CAS result may still mean another worker already committed
+        # the exact terminal cancellation.  Re-read the exact row before
+        # deciding whether the staged grant can survive; never treat a failed
+        # transition as durable by default.
+        _durable_osm_cancel = _osm_transition_ok
+        if not _durable_osm_cancel:
+            try:
+                _durable_row = self.osm.get_order(local_order_id) or {}
+            except Exception as _osm_read_error:
+                log.error(
+                    "[%s] OSM re-read failed after CANCELED transition miss | order=%s: %s",
+                    self.client_id, local_order_id, _osm_read_error,
+                )
+                _durable_row = {}
+            _durable_local_id = str(_durable_row.get("local_order_id") or "").strip()
+            _durable_broker_id = str(_durable_row.get("broker_order_id") or "").strip()
+            _durable_position_id = str(_durable_row.get("position_id") or "").strip()
+            _durable_status = str(_durable_row.get("status") or "").strip().upper()
+            _durable_osm_cancel = (
+                _durable_local_id == str(local_order_id).strip()
+                and _durable_broker_id == str(broker_oid).strip()
+                and (not position_id or _durable_position_id == str(position_id).strip())
+                and _durable_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+            )
+
+        if not _durable_osm_cancel:
+            if _replacement_staged:
+                try:
+                    self.exit_engine.revoke_exit_replacement_safe(
+                        position_id,
+                        reason="osm_cancel_transition_not_durable",
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_oid,
+                    )
+                except Exception as _revoke_error:
+                    log.error(
+                        "[%s] replacement grant revoke failed for pos=%s: %s",
+                        self.client_id, position_id, _revoke_error,
+                    )
+            # Keep the exact broker cancel owner alive so the next cycle can
+            # re-read terminal truth or retry the OSM CAS; no replacement and
+            # no generic clear are authorized from this branch.
+            self._stale_exit_cancel_inflight.setdefault(broker_oid, _now)
+            self._stale_exit_cancel_attempts.setdefault(
+                broker_oid,
+                int(self._stale_exit_cancel_attempts.get(broker_oid, 1) or 1),
             )
             self._emit_order_event(
                 local_order_id=local_order_id,
                 stage="order_monitor",
                 decision="ALERT",
-                reason_code="MANUAL_INTERVENTION_REQUIRED",
-                explanation="Exit order stuck — cancel not broker-confirmed, manual action required",
+                reason_code="EXIT_OSM_CANCEL_DURABILITY_UNCONFIRMED",
+                explanation=(
+                    "Broker cancellation is terminal, but exact durable OSM CANCELED "
+                    "state was not proven; replacement and clear remain blocked."
+                ),
                 contract=contract,
                 position_id=position_id,
-                inputs={"confirmed_status": confirmed_status, "age_secs": age_secs},
+                inputs={
+                    "broker_order_id": broker_oid,
+                    "osm_transition_ok": _osm_transition_ok,
+                },
             )
-            self._alert(
-                f"MANUAL INTERVENTION REQUIRED | {self.client_id} | {contract} "
-                f"| Exit order {local_order_id} stuck and cannot be canceled"
+            return
+
+        if _replacement_staged:
+            try:
+                _replacement_finalized = bool(
+                    self.exit_engine.finalize_exit_replacement_safe(
+                        position_id,
+                        reason="osm_cancel_durable_success",
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_oid,
+                    )
+                )
+            except Exception as _finalize_error:
+                log.error(
+                    "[%s] replacement grant finalize failed for pos=%s: %s",
+                    self.client_id, position_id, _finalize_error,
+                )
+                _replacement_finalized = False
+            if not _replacement_finalized:
+                # The exact OSM terminal row is already durable.  Keep the
+                # STAGED lifecycle for restart/recovery; revoking it here
+                # would recreate the forgotten-replacement crash hole.
+                log.critical(
+                    "[%s] replacement lifecycle remains STAGED after finalize persistence miss | pos=%s",
+                    self.client_id, position_id,
+                )
+                self._stale_exit_cancel_inflight.setdefault(broker_oid, _now)
+                return
+
+        self._clear_stale_exit_cancel_state(broker_oid)
+
+        if position_id and self.exit_engine:
+            try:
+                # Pass the exact identity through the real APExitEngine
+                # guard; a position with pending identity must never accept
+                # a blank clear call.
+                self.exit_engine.clear_exit_in_flight(
+                    position_id,
+                    reason=reason,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_oid,
+                )
+                log.warning(
+                    "[%s] clear_exit_in_flight(%s) called with exact identity — "
+                    "exit engine will retry within 8s",
+                    self.client_id, position_id,
+                )
+            except Exception as _cef:
+                log.error(
+                    "[%s] clear_exit_in_flight failed for pos=%s: %s",
+                    self.client_id, position_id, _cef,
+                )
+
+        # In watchdog mode this stale-exit seam owns only broker order
+        # cancellation and replacement authorization.  It must not call the
+        # generic position reopen fallback, which can mutate durable economic
+        # state without a fill-sized proof. Actor mode retains its existing
+        # guarded reopen behavior.
+        if position_id and self.pm and ORDER_MONITOR_CAN_ACT:
+            self._guarded_revert_position_open_after_exit_cancel(
+                position_id=position_id,
+                canceled_exit_order_id=local_order_id,
+                contract=contract,
+                reason=reason,
             )
 
     def _guarded_revert_position_open_after_exit_cancel(
@@ -5227,11 +5972,18 @@ class APOrderMonitor:
             return False
 
         try:
-            replacement = self._get_newer_active_exit_order(
+            lookup = self._get_newer_active_exit_order(
                 position_id=position_id,
                 canceled_exit_order_id=canceled_exit_order_id,
             )
-            if replacement:
+            # A test double or legacy override that returns None is not an
+            # authoritative empty result.  Treat every non-typed result as
+            # unavailable so it cannot authorize a money-path mutation.
+            if not isinstance(lookup, NewerExitLookup):
+                lookup = NewerExitLookup.unavailable("invalid_lookup_result")
+
+            if lookup.state is NewerExitLookupState.FOUND:
+                replacement = lookup.row or {}
                 repl_id = replacement.get("local_order_id")
                 repl_status = replacement.get("status")
                 log.warning(
@@ -5255,6 +6007,40 @@ class APOrderMonitor:
                         "replacement_exit_order_id": repl_id,
                         "replacement_status": repl_status,
                     },
+                )
+                return False
+
+            if lookup.state is not NewerExitLookupState.AUTHORITATIVE_NONE:
+                diagnostic = lookup.diagnostic()
+                reason_code = (
+                    "POSITION_REOPEN_HOLD_REPLACEMENT_LOOKUP_AMBIGUOUS"
+                    if lookup.state is NewerExitLookupState.AMBIGUOUS
+                    else "POSITION_REOPEN_HOLD_REPLACEMENT_LOOKUP_UNAVAILABLE"
+                )
+                log.error(
+                    "[%s] Position reopen HOLD after stale exit cancel — replacement "
+                    "ownership is not authoritative | pos=%s old_exit=%s diagnostic=%s",
+                    self.client_id, position_id, canceled_exit_order_id, diagnostic,
+                )
+                self._emit_order_event(
+                    local_order_id=canceled_exit_order_id,
+                    stage="order_monitor",
+                    decision="HOLD",
+                    reason_code=reason_code,
+                    explanation=(
+                        "Position reopen held because newer EXIT replacement ownership "
+                        "is unavailable or ambiguous; no position mutation is authorized"
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "canceled_exit_order_id": canceled_exit_order_id,
+                        **diagnostic,
+                    },
+                )
+                self._alert(
+                    f"POSITION REOPEN HOLD — replacement ownership {lookup.state.value.lower()} | "
+                    f"{self.client_id} | {contract} | pos={position_id}"
                 )
                 return False
 
@@ -5317,10 +6103,10 @@ class APOrderMonitor:
         *,
         position_id: str,
         canceled_exit_order_id: str,
-    ) -> Optional[dict]:
-        """Return a newer active replacement EXIT order for this position, if any."""
+    ) -> NewerExitLookup:
+        """Resolve replacement ownership without collapsing query failure to none."""
         if not position_id or not canceled_exit_order_id:
-            return None
+            return NewerExitLookup.unavailable("missing_position_or_canceled_exit_identity")
 
         def _fn():
             with conn() as c:
@@ -5332,7 +6118,6 @@ class APOrderMonitor:
                         WHERE client_id=%s
                           AND local_order_id=%s
                           AND kind='EXIT'
-                        LIMIT 1
                     )
                     SELECT local_order_id, broker_order_id, status, created_ts, submitted_ts
                     FROM orders
@@ -5348,28 +6133,36 @@ class APOrderMonitor:
                           (SELECT created_ts FROM canceled) IS NULL
                           OR created_ts >= (SELECT created_ts FROM canceled)
                       )
-                    ORDER BY created_ts DESC
-                    LIMIT 1
+                    ORDER BY created_ts DESC, local_order_id ASC
                     """,
                     (
                         self.client_id, canceled_exit_order_id,
                         self.client_id, position_id, canceled_exit_order_id,
                     ),
                 )
-                return c.fetchone()
+                return c.fetchall()
 
         try:
-            row = run_with_retry(_fn)
-            return dict(row) if row else None
+            rows = run_with_retry(_fn)
+            if rows is None:
+                return NewerExitLookup.unavailable("query_returned_no_row_set")
+            normalized_rows = [dict(row) for row in rows]
+            if not normalized_rows:
+                return NewerExitLookup.authoritative_none()
+            if len(normalized_rows) == 1:
+                return NewerExitLookup.found(normalized_rows[0])
+            return NewerExitLookup.ambiguous(normalized_rows)
         except Exception as e:
             log.error(
                 "[%s] Failed checking newer replacement exit | pos=%s old_exit=%s: %s — "
-                "assuming no replacement; proceeding with position reopen",
+                "replacement ownership unavailable; holding position reopen",
                 self.client_id, position_id, canceled_exit_order_id, e,
             )
-            return None  # safe: caller proceeds with position reopen on None
+            return NewerExitLookup.unavailable(type(e).__name__)
 
-    def _query_broker_order(self, broker_order_id: Optional[str]) -> Optional[str]:
+    def _query_broker_order(
+        self, broker_order_id: Optional[str], *, bypass_cache: bool = False,
+    ) -> Optional[str]:
         if not broker_order_id or not self.broker:
             return None
         def _fetch():
@@ -5377,9 +6170,14 @@ class APOrderMonitor:
                 if hasattr(self.broker, "get_order"):
                     result = self.broker.get_order(broker_order_id)
                     if isinstance(result, dict):
-                        return str(
-                            result.get("status") or result.get("order_status") or ""
-                        ).lower()
+                        status = _strict_broker_status(result)
+                        if status is None:
+                            log.warning(
+                                "[%s] Broker order %s returned conflicting or missing status authority",
+                                self.client_id,
+                                broker_order_id,
+                            )
+                        return status
                 if hasattr(self.broker, "order_status"):
                     result = self.broker.order_status(broker_order_id)
                     return str(result).lower() if result else None
@@ -5394,6 +6192,23 @@ class APOrderMonitor:
                 except Exception:
                     pass
             return None
+        # PR #423: the shared _BROKER_STATUS_CACHE has an 8s TTL, intended to
+        # dedupe fill_monitor/order_monitor polling the same order within a
+        # few seconds. A post-cancel terminal-proof query must NEVER read a
+        # cached pre-cancel status silently — that would defeat the entire
+        # point of "cancel response is not terminal proof" by substituting
+        # a different stale read. Explicitly invalidate this order's cache
+        # entry and force a live fetch whenever fresh proof is required.
+        if bypass_cache:
+            with _BROKER_STATUS_CACHE_LOCK:
+                _BROKER_STATUS_CACHE.pop(broker_order_id, None)
+            status = _fetch()
+            if status is not None:
+                with _BROKER_STATUS_CACHE_LOCK:
+                    _BROKER_STATUS_CACHE[broker_order_id] = (
+                        status, time.monotonic() + _BROKER_STATUS_CACHE_TTL,
+                    )
+            return status
         return _cached_broker_order_status(broker_order_id, _fetch)
 
     def _cancel_broker_order(self, broker_order_id: Optional[str]):
@@ -5406,7 +6221,7 @@ class APOrderMonitor:
                 log.info(f"[{self.client_id}] Broker cancel requested: {broker_order_id} → {result}")
 
             if isinstance(result, dict):
-                status = str(result.get("status") or result.get("order_status") or "").strip().lower()
+                status = _strict_broker_status(result)
                 if status:
                     return result
 
@@ -5428,23 +6243,35 @@ class APOrderMonitor:
                 pass
         return None
 
+    def _clear_stale_exit_cancel_state(self, broker_order_id: str) -> None:
+        """Forget cancellation ownership only after terminal broker proof."""
+        broker_order_id = str(broker_order_id or "")
+        if not broker_order_id:
+            return
+        self._stale_exit_cancel_inflight.pop(broker_order_id, None)
+        self._stale_exit_cancel_attempts.pop(broker_order_id, None)
+
+    def _is_live_stale_exit_broker_status(self, raw_status) -> bool:
+        """Return True only for a fresh, recognized live-order state."""
+        status = self._normalize_broker_status(raw_status)
+        return status in (
+            "pending", "open", "working", "accepted", "ack", "acked",
+            "new", "submitted", "held", "hold", "calculated", "ok", "queued",
+            # A partial fill can still leave the exact old broker order live;
+            # the cancel owner must be allowed to target only its remaining
+            # cumulative-unfilled quantity.
+            "partially_filled",
+        )
+
     def _normalize_broker_status(self, raw_status) -> str:
-        if raw_status is None:
-            return ""
-        if isinstance(raw_status, dict):
-            raw_status = raw_status.get("status") or raw_status.get("order_status") or ""
-        s = str(raw_status).strip().lower()
-        if not s:
-            return ""
-        aliases = {
-            "cancelled": "canceled",
-            "partial_fill": "partially_filled",
-            "partial_filled": "partially_filled",
-        }
-        return aliases.get(s, s)
+        return _strict_broker_status(raw_status) or ""
 
     def _is_terminal_cancel_status(self, raw_status) -> bool:
-        return self._normalize_broker_status(raw_status) in {"canceled", "expired"}
+        return self._normalize_broker_status(raw_status) in {
+            "canceled",
+            "expired",
+            "rejected",
+        }
 
     def _is_terminal_failure_status(self, raw_status) -> bool:
         return self._normalize_broker_status(raw_status) in {
@@ -5592,7 +6419,12 @@ class APOrderMonitor:
             _pos_id = (order or {}).get("position_id")
             if _pos_id and self.exit_engine:
                 try:
-                    self.exit_engine.clear_exit_in_flight(_pos_id)
+                    self.exit_engine.clear_exit_in_flight(
+                        _pos_id,
+                        reason=f"broker_terminal_status={s}",
+                        local_order_id=(order or {}).get("local_order_id") or local_order_id,
+                        broker_order_id=(order or {}).get("broker_order_id") or "",
+                    )
                     log.warning(
                         "[%s] clear_exit_in_flight(%s) from broker status=%s — "
                         "exit engine will retry",
@@ -5606,7 +6438,7 @@ class APOrderMonitor:
             # Revert position to OPEN so the exit engine can re-submit.
             # Without this, the position stays CLOSING and the exit engine
             # never re-submits even after clearing in-flight.
-            if _pos_id and self.pm:
+            if _pos_id and self.pm and ORDER_MONITOR_CAN_ACT:
                 try:
                     self._guarded_revert_position_open_after_exit_cancel(
                         position_id=_pos_id,
@@ -5619,6 +6451,499 @@ class APOrderMonitor:
                         "[%s] _guarded_revert failed after broker terminal exit status=%s pos=%s: %s",
                         self.client_id, s, _pos_id, _e3,
                     )
+
+    def _query_broker_order_payload(self, broker_order_id: Optional[str]) -> Optional[dict]:
+        """Fetch the exact broker payload needed for cumulative fill truth.
+
+        ``_query_broker_order`` intentionally returns only normalized status
+        and is cached for polling.  Partial-fill recovery needs the raw
+        cumulative quantity and average fill, so it performs a direct read
+        without reusing that status-only cache.
+        """
+        if not broker_order_id or not self.broker:
+            return None
+        try:
+            if hasattr(self.broker, "get_order"):
+                raw = self.broker.get_order(broker_order_id)
+                if isinstance(raw, dict):
+                    return dict(raw)
+            if hasattr(self.broker, "order_status"):
+                raw = self.broker.order_status(broker_order_id)
+                if raw:
+                    return {"status": raw}
+        except Exception as exc:
+            log.warning(
+                "[%s] exact broker fill payload lookup failed | broker_order_id=%s: %s",
+                self.client_id, broker_order_id, exc,
+            )
+        return None
+
+    def _reconcile_replayed_exit_fill(
+        self,
+        *,
+        order: dict,
+        local_order_id: str,
+        broker_order_id: str,
+        contract: str,
+        cumulative_filled: int,
+        previous_filled: int,
+    ) -> bool:
+        """Prove the position-side watermark before accepting cumulative fill truth.
+
+        A durable OSM watermark is not proof that the position quantity was
+        consumed before a process died. Newly advanced and equal cumulative
+        broker truth are therefore routed through the row-locked exit-fill
+        bridge before the monitor can hand off a replacement or clear the old
+        generation.
+        """
+        if cumulative_filled <= 0:
+            return True
+
+        position_id = str(order.get("position_id") or "").strip()
+        reconciler = getattr(self.exit_engine, "reconcile_exit_fill_consumption", None)
+        result = None
+        if not position_id or not callable(reconciler):
+            reason = "position identity or durable fill bridge unavailable"
+        else:
+            try:
+                result = reconciler(
+                    position_id,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    cumulative_filled_qty=cumulative_filled,
+                    prior_cumulative_filled=previous_filled,
+                )
+                reason = "durable position fill consumption was not confirmed"
+            except Exception as exc:
+                reason = f"durable position fill replay raised {type(exc).__name__}"
+                log.error(
+                    "[%s] exit fill durability bridge failed | local=%s broker=%s: %s",
+                    self.client_id, local_order_id, broker_order_id, exc,
+                )
+
+        if (
+            not isinstance(result, dict)
+            or result.get("ok") is not True
+            or type(result.get("applied_cumulative_qty")) is not int
+            or result.get("applied_cumulative_qty") != cumulative_filled
+            or type(result.get("quantity_remaining")) is not int
+            or result.get("quantity_remaining") < 0
+        ):
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="HOLD",
+                reason_code="EXIT_FILL_POSITION_DURABILITY_UNCONFIRMED",
+                explanation=(
+                    "A broker cumulative fill was not independently confirmed in the "
+                    "position-side fill watermark after OSM processing; "
+                    "replacement and terminal cleanup remain blocked."
+                ),
+                contract=contract,
+                position_id=position_id or order.get("position_id"),
+                inputs={
+                    "broker_order_id": broker_order_id,
+                    "cumulative_filled": cumulative_filled,
+                    "previous_filled": previous_filled,
+                    "bridge_reason": reason,
+                    "durability_result": result,
+                },
+            )
+            return False
+        return True
+
+    def _apply_broker_partial_exit_fill(
+        self,
+        local_order_id: str,
+        broker_order_id: str,
+        contract: str,
+        raw_payload: Optional[dict] = None,
+    ) -> Optional[int]:
+        """Apply broker cumulative partial fill through the canonical OSM hook.
+
+        Returns the durable unfilled remainder, zero when no remainder should
+        be canceled, or ``None`` when exact fill/quantity proof is unavailable.
+        The order monitor never mutates position quantity directly.
+        """
+        order = dict(self.osm.get_order(local_order_id) or {})
+        if str(order.get("kind") or "").upper() != "EXIT":
+            return None
+        raw = (
+            dict(raw_payload)
+            if isinstance(raw_payload, dict)
+            else self._query_broker_order_payload(broker_order_id)
+        )
+        if not raw:
+            return None
+        raw_status = self._normalize_broker_status(raw)
+        if raw_status != "partially_filled":
+            # The status-only poll can report PARTIALLY_FILLED immediately
+            # before this raw payload read observes a terminal transition.
+            # Do not return zero and silently discard that newer truth: route
+            # a filled payload through the canonical full-fill OSM hook when
+            # exact cumulative quantity is present, otherwise preserve the
+            # existing status-level reconciliation fallback.
+            if raw_status in {
+                "filled", "canceled", "expired", "rejected",
+            }:
+                if raw_payload is not None and raw_status in {
+                    "canceled", "expired", "rejected"
+                }:
+                    cumulative_raw = next(
+                        (
+                            raw.get(key)
+                            for key in ("exec_quantity", "filled_quantity", "filled_qty")
+                            if key in raw
+                        ),
+                        None,
+                    )
+                    if any(key in raw for key in ("exec_quantity", "filled_quantity", "filled_qty")):
+                        cumulative_filled = _strict_cumulative_quantity(cumulative_raw)
+                        requested_qty = _strict_cumulative_quantity(
+                            order.get("qty") if order.get("qty") is not None else order.get("quantity")
+                        )
+                        previous_raw = order.get("filled_qty")
+                        previous_filled = (
+                            0 if previous_raw in (None, "")
+                            else _strict_cumulative_quantity(previous_raw)
+                        )
+                        if cumulative_filled is None or requested_qty is None or previous_filled is None:
+                            log.warning(
+                                "[%s] terminal cancel payload has invalid cumulative fill "
+                                "| local=%s cumulative=%s",
+                                self.client_id, local_order_id, cumulative_raw,
+                            )
+                            return None
+                        if (
+                            requested_qty <= 0
+                            or cumulative_filled < previous_filled
+                            or cumulative_filled > requested_qty
+                        ):
+                            log.warning(
+                                "[%s] terminal cancel payload cumulative fill is outside "
+                                "durable order bounds | local=%s cumulative=%s previous=%s requested=%s",
+                                self.client_id,
+                                local_order_id,
+                                cumulative_filled,
+                                previous_filled,
+                                requested_qty,
+                            )
+                            return None
+                        if cumulative_filled == requested_qty:
+                            raw_status = "filled"
+                        elif cumulative_filled > previous_filled:
+                            # Reuse the canonical partial-fill path below so
+                            # CANCELED+exec_quantity cannot lose the late fill.
+                            raw_status = "partially_filled"
+                        else:
+                            # The durable partial fill already accounts for this
+                            # cumulative broker truth. Prove the position-side
+                            # watermark before preserving its remainder for the
+                            # staged replacement handoff.
+                            if not self._reconcile_replayed_exit_fill(
+                                order=order,
+                                local_order_id=local_order_id,
+                                broker_order_id=broker_order_id,
+                                contract=contract,
+                                cumulative_filled=cumulative_filled,
+                                previous_filled=previous_filled,
+                            ):
+                                return None
+                            return max(0, requested_qty - previous_filled)
+
+                if raw_status == "filled":
+                    cumulative_raw = None
+                    for key in ("exec_quantity", "filled_quantity", "filled_qty"):
+                        if key in raw and raw.get(key) is not None:
+                            cumulative_raw = raw.get(key)
+                            break
+                    cumulative_filled = _strict_cumulative_quantity(cumulative_raw)
+                    requested_raw = (
+                        order.get("qty")
+                        if order.get("qty") is not None
+                        else order.get("quantity")
+                    )
+                    requested_qty = _strict_cumulative_quantity(requested_raw)
+                    previous_raw = order.get("filled_qty")
+                    previous_filled = (
+                        0
+                        if previous_raw in (None, "")
+                        else _strict_cumulative_quantity(previous_raw)
+                    )
+
+                    if (
+                        cumulative_filled is None
+                        or requested_qty is None
+                        or previous_filled is None
+                        or requested_qty <= 0
+                        or cumulative_filled <= 0
+                        or cumulative_filled < previous_filled
+                        or cumulative_filled > requested_qty
+                    ):
+                        self._emit_order_event(
+                            local_order_id=local_order_id,
+                            stage="order_monitor",
+                            decision="HOLD",
+                            reason_code="BROKER_FILLED_QTY_INVALID",
+                            explanation=(
+                                "Broker FILLED status carried malformed, regressed, "
+                                "or out-of-bounds cumulative quantity; no terminal "
+                                "economic transition was applied."
+                            ),
+                            contract=contract,
+                            position_id=order.get("position_id"),
+                            inputs={
+                                "broker_order_id": broker_order_id,
+                                "cumulative_filled": cumulative_raw,
+                                "previous_filled": previous_raw,
+                                "requested_qty": requested_raw,
+                            },
+                        )
+                        return None
+
+                    fill_price = raw.get("avg_fill_price")
+                    if fill_price is None:
+                        fill_price = raw.get("avg_fill")
+                    if fill_price is None:
+                        fill_price = raw.get("price")
+
+                    if cumulative_filled == requested_qty:
+                        # Keep the exit row active while the position-side
+                        # watermark is proven.  EXIT_FILLED is terminal, so a
+                        # direct transition would strand recovery if the
+                        # post-transition exit hook never runs.
+                        current_status = str(order.get("status") or "").strip().upper()
+                        if (
+                            current_status != "EXIT_PARTIAL_FILL"
+                            or cumulative_filled > previous_filled
+                        ):
+                            try:
+                                if (
+                                    current_status == "EXIT_PARTIAL_FILL"
+                                    and callable(getattr(self.osm, "apply_fill_update", None))
+                                ):
+                                    ok = self.osm.apply_fill_update(
+                                        local_order_id=local_order_id,
+                                        cumulative_filled=cumulative_filled,
+                                        fill_price=fill_price,
+                                        broker_order_id=broker_order_id,
+                                    )
+                                else:
+                                    ok = self.osm.transition(
+                                        local_order_id,
+                                        "EXIT_PARTIAL_FILL",
+                                        filled_qty=cumulative_filled,
+                                        fill_price=fill_price,
+                                        broker_order_id=broker_order_id,
+                                    )
+                                if ok is False:
+                                    return None
+                            except Exception as exc:
+                                log.error(
+                                    "[%s] canonical OSM active full-fill apply failed | local=%s: %s",
+                                    self.client_id, local_order_id, exc,
+                                )
+                                return None
+
+                        active_order = dict(self.osm.get_order(local_order_id) or {})
+                        active_status = str(active_order.get("status") or "").strip().upper()
+                        active_filled = _strict_cumulative_quantity(active_order.get("filled_qty"))
+                        if (
+                            active_status != "EXIT_PARTIAL_FILL"
+                            or active_filled is None
+                            or active_filled < cumulative_filled
+                        ):
+                            self._emit_order_event(
+                                local_order_id=local_order_id,
+                                stage="order_monitor",
+                                decision="HOLD",
+                                reason_code="BROKER_FILLED_ACTIVE_OSM_UNCONFIRMED",
+                                explanation=(
+                                    "Broker terminal fill was not durably recorded in the "
+                                    "active EXIT_PARTIAL_FILL state; terminalization remains blocked."
+                                ),
+                                contract=contract,
+                                position_id=order.get("position_id"),
+                                inputs={
+                                    "broker_order_id": broker_order_id,
+                                    "cumulative_filled": cumulative_filled,
+                                    "active_status": active_status,
+                                    "active_filled": active_order.get("filled_qty"),
+                                },
+                            )
+                            return None
+
+                        if not self._reconcile_replayed_exit_fill(
+                            order=order,
+                            local_order_id=local_order_id,
+                            broker_order_id=broker_order_id,
+                            contract=contract,
+                            cumulative_filled=cumulative_filled,
+                            previous_filled=previous_filled,
+                        ):
+                            return None
+                        try:
+                            ok = self.osm.transition(
+                                local_order_id,
+                                "EXIT_FILLED",
+                                filled_qty=cumulative_filled,
+                                fill_price=fill_price,
+                                broker_order_id=broker_order_id,
+                            )
+                            if ok is False:
+                                return None
+                        except Exception as exc:
+                            log.error(
+                                "[%s] canonical OSM full-fill apply failed | local=%s: %s",
+                                self.client_id, local_order_id, exc,
+                            )
+                            return None
+                        return 0
+
+                    if cumulative_filled > previous_filled:
+                        # A terminal broker status can race a partial-fill
+                        # payload. Reuse the strict cumulative parser and the
+                        # canonical partial path; never terminalize a request
+                        # whose broker cumulative fill is still below qty.
+                        raw_status = "partially_filled"
+                    else:
+                        # The durable order already contains this cumulative
+                        # truth. Prove the position-side watermark before
+                        # preserving only its exact unfilled remainder.
+                        if not self._reconcile_replayed_exit_fill(
+                            order=order,
+                            local_order_id=local_order_id,
+                            broker_order_id=broker_order_id,
+                            contract=contract,
+                            cumulative_filled=cumulative_filled,
+                            previous_filled=previous_filled,
+                        ):
+                            return None
+                        return max(0, requested_qty - previous_filled)
+
+                if raw_status != "partially_filled":
+                    self._advance_from_broker_status(local_order_id, raw_status, contract)
+                    return 0
+
+            if raw_status != "partially_filled":
+                # A non-terminal regression/alias is not safe to reinterpret as
+                # a partial fill. Returning None makes the caller hold rather
+                # than issuing a cancel from contradictory broker truth.
+                log.warning(
+                    "[%s] partial-fill payload changed status before OSM apply | local=%s status=%s",
+                    self.client_id, local_order_id, raw_status or "unknown",
+                )
+                return None
+
+        cumulative_raw = None
+        for key in ("exec_quantity", "filled_quantity", "filled_qty"):
+            if key in raw and raw.get(key) is not None:
+                cumulative_raw = raw.get(key)
+                break
+        cumulative_filled = _strict_cumulative_quantity(cumulative_raw)
+        requested_qty = _strict_cumulative_quantity(
+            order.get("qty") if order.get("qty") is not None else order.get("quantity")
+        )
+        previous_raw = order.get("filled_qty")
+        previous_filled = 0 if previous_raw in (None, "") else _strict_cumulative_quantity(previous_raw)
+        if cumulative_filled is None or requested_qty is None or previous_filled is None:
+            cumulative_filled = 0
+            requested_qty = 0
+            previous_filled = 0
+
+        if cumulative_filled <= 0 or requested_qty <= 0:
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="HOLD",
+                reason_code="BROKER_PARTIAL_FILL_QTY_UNPROVEN",
+                explanation=(
+                    "Broker reported PARTIALLY_FILLED but exact positive cumulative "
+                    "fill quantity or requested quantity was unavailable."
+                ),
+                contract=contract,
+                position_id=order.get("position_id"),
+                inputs={
+                    "broker_order_id": broker_order_id,
+                    "cumulative_filled": cumulative_raw,
+                    "requested_qty": order.get("qty") or order.get("quantity"),
+                },
+            )
+            return None
+        if cumulative_filled < previous_filled or cumulative_filled > requested_qty:
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="HOLD",
+                reason_code="BROKER_PARTIAL_FILL_QTY_INVALID",
+                explanation="Broker cumulative partial fill regressed or exceeded order quantity.",
+                contract=contract,
+                position_id=order.get("position_id"),
+                inputs={
+                    "broker_order_id": broker_order_id,
+                    "cumulative_filled": cumulative_filled,
+                    "previous_filled": previous_filled,
+                    "requested_qty": requested_qty,
+                },
+            )
+            return None
+
+        fill_price = raw.get("avg_fill_price")
+        if fill_price is None:
+            fill_price = raw.get("avg_fill")
+        if fill_price is None:
+            fill_price = raw.get("price")
+        current_status = str(order.get("status") or "").strip().upper()
+        try:
+            if cumulative_filled > previous_filled:
+                if current_status == "EXIT_PARTIAL_FILL" and hasattr(self.osm, "apply_fill_update"):
+                    ok = self.osm.apply_fill_update(
+                        local_order_id=local_order_id,
+                        cumulative_filled=cumulative_filled,
+                        fill_price=fill_price,
+                        broker_order_id=broker_order_id,
+                    )
+                else:
+                    ok = self.osm.transition(
+                        local_order_id,
+                        "EXIT_PARTIAL_FILL",
+                        filled_qty=cumulative_filled,
+                        fill_price=fill_price,
+                        broker_order_id=broker_order_id,
+                    )
+                if ok is False:
+                    return None
+        except Exception as exc:
+            log.error(
+                "[%s] canonical OSM partial-fill apply failed | local=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return None
+
+        updated = dict(self.osm.get_order(local_order_id) or {})
+        durable_filled = _strict_cumulative_quantity(updated.get("filled_qty"))
+        durable_qty = _strict_cumulative_quantity(updated.get("qty"))
+        if (
+            durable_filled is None
+            or durable_qty is None
+            or durable_filled < cumulative_filled
+            or durable_qty <= 0
+        ):
+            return None
+        # OSM persistence is not proof that the position-side cumulative
+        # watermark consumed this fill.  Require the idempotent durable bridge
+        # for newly advanced fills as well as equal-watermark replays before a
+        # positive remainder can authorize replacement.
+        if not self._reconcile_replayed_exit_fill(
+            order=order,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            contract=contract,
+            cumulative_filled=cumulative_filled,
+            previous_filled=previous_filled,
+        ):
+            return None
+        return max(0, durable_qty - durable_filled)
 
     def _get_broker_order_id(self, local_order_id: str) -> Optional[str]:
         try:

@@ -963,6 +963,213 @@ class APStartupRecovery:
         row = run_with_retry(_load)
         return dict(row) if row else None
 
+    def _reconcile_terminal_exit_fill_before_reopen(
+        self,
+        position: dict,
+        exit_order: dict,
+        broker_raw: dict,
+    ) -> tuple[bool, str, dict]:
+        """Prove and consume a terminal downtime EXIT before reopening.
+
+        Terminal broker states are not proof that an EXIT consumed zero
+        contracts.  The broker snapshot, durable OSM generation, hydrated
+        runtime position, and position-side cumulative watermark must all
+        agree before the terminal transition can clear the exit or reopen the
+        position.  Fill arithmetic belongs to the canonical autonomous
+        recovery bridge; this method only supplies startup's exact identities
+        and enforces the ordering fence.
+        """
+        from ap.exit_autonomous_recovery import (
+            _BROKER_ORDER_QTY_KEYS,
+            _exact_osm_exit_generation,
+            _norm_contract,
+            _reconcile_terminal_late_fill,
+            _strict_quantity_group,
+            _status,
+            _terminal_cumulative_fill_authority,
+            _validate_broker_order_payload,
+        )
+
+        position_id = str(position.get("id") or "").strip()
+        local_id = str(exit_order.get("local_order_id") or "").strip()
+        broker_id = str(exit_order.get("broker_order_id") or "").strip()
+        contract = str(
+            position.get("contract")
+            or position.get("option_symbol")
+            or ""
+        ).strip()
+        order_contract = str(
+            exit_order.get("contract")
+            or exit_order.get("option_symbol")
+            or ""
+        ).strip()
+        if not position_id or not local_id or not broker_id or not contract:
+            return False, "startup_terminal_exit_identity_missing", {}
+        if not order_contract or _norm_contract(order_contract) != _norm_contract(contract):
+            return False, "startup_terminal_exit_contract_identity_mismatch", {
+                "position_contract": contract,
+                "order_contract": order_contract,
+            }
+
+        try:
+            exact_broker = _validate_broker_order_payload(
+                broker_raw,
+                expected_broker_order_id=broker_id,
+                expected_contract=contract,
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            return False, "startup_terminal_exit_broker_authority_malformed", {
+                "error": type(exc).__name__,
+            }
+
+        broker_status = _status(exact_broker)
+        if broker_status not in {"canceled", "cancelled", "expired", "rejected"}:
+            return False, "startup_terminal_exit_status_not_terminal", {
+                "broker_status": broker_status,
+            }
+
+        position_client = str(position.get("client_id") or "").strip().lower()
+        if not position_client or position_client != self.client_id:
+            return False, "startup_terminal_exit_client_identity_mismatch", {
+                "position_client_id": position_client,
+                "recovery_client_id": self.client_id,
+            }
+
+        position_mode_raw = str(position.get("execution_mode") or "").strip()
+        recovery_mode = self._execution_mode()
+        if (
+            not position_mode_raw
+            or recovery_mode is None
+            or _normalize_execution_mode(position_mode_raw) != recovery_mode
+        ):
+            return False, "startup_terminal_exit_execution_mode_mismatch", {
+                "position_execution_mode": position_mode_raw,
+                "recovery_execution_mode": recovery_mode,
+            }
+
+        osm_row, requested_qty, osm_reason = _exact_osm_exit_generation(
+            self.osm,
+            local_id=local_id,
+            broker_id=broker_id,
+            position_id=position_id,
+            client_id=position_client,
+            execution_mode=recovery_mode.lower(),
+        )
+        if osm_row is None or requested_qty is None:
+            return False, "startup_terminal_exit_osm_generation_unavailable", {
+                "error": osm_reason,
+            }
+        try:
+            broker_order_qty = _strict_quantity_group(
+                exact_broker,
+                _BROKER_ORDER_QTY_KEYS,
+                field_name="order quantity",
+            )
+        except (TypeError, ValueError, OverflowError):
+            broker_order_qty = None
+        if broker_order_qty is None or broker_order_qty != requested_qty:
+            return False, "startup_terminal_exit_order_quantity_mismatch", {
+                "broker_order_qty": broker_order_qty,
+                "osm_requested_qty": requested_qty,
+            }
+        osm_contract = str(
+            osm_row.get("contract")
+            or osm_row.get("option_symbol")
+            or ""
+        ).strip()
+        if not osm_contract or _norm_contract(osm_contract) != _norm_contract(contract):
+            return False, "startup_terminal_exit_osm_contract_identity_mismatch", {
+                "position_contract": contract,
+                "osm_contract": osm_contract,
+            }
+
+        exit_engine = self.exit_engine
+        get_position = getattr(exit_engine, "get_position", None) if exit_engine else None
+        if not callable(get_position):
+            return False, "startup_terminal_exit_runtime_position_lookup_unavailable", {}
+
+        seed_from_db = getattr(exit_engine, "seed_from_db", None)
+        if callable(seed_from_db):
+            try:
+                try:
+                    seed_from_db(self.pm)
+                except TypeError:
+                    # Keep the legacy test/double seam; production's
+                    # APExitEngine requires the position manager argument.
+                    seed_from_db()
+            except Exception as exc:
+                return False, "startup_terminal_exit_runtime_hydration_failed", {
+                    "error": type(exc).__name__,
+                }
+
+        runtime_position = get_position(position_id)
+        if runtime_position is None:
+            return False, "startup_terminal_exit_runtime_position_unavailable", {}
+        runtime_id = str(
+            getattr(runtime_position, "position_id", "")
+            or getattr(runtime_position, "id", "")
+            or ""
+        ).strip()
+        runtime_client = str(getattr(runtime_position, "client_id", "") or "").strip().lower()
+        runtime_mode = _normalize_execution_mode(
+            getattr(runtime_position, "execution_mode", None)
+        )
+        runtime_contract = _norm_contract(
+            getattr(runtime_position, "option_symbol", "")
+            or getattr(runtime_position, "contract", "")
+        )
+        if (
+            runtime_id != position_id
+            or runtime_client != position_client
+            or runtime_mode != recovery_mode
+            or runtime_contract != _norm_contract(contract)
+        ):
+            return False, "startup_terminal_exit_runtime_identity_mismatch", {
+                "runtime_position_id": runtime_id,
+                "runtime_client_id": runtime_client,
+                "runtime_execution_mode": runtime_mode,
+                "runtime_contract": runtime_contract,
+            }
+
+        broker_qty, fill_source = _terminal_cumulative_fill_authority(
+            exact_broker,
+            osm_row,
+        )
+        if broker_qty is None:
+            return False, "startup_terminal_exit_cumulative_fill_unavailable", {
+                "error": fill_source,
+            }
+        if fill_source == "durable_osm":
+            return False, "startup_terminal_exit_broker_cumulative_unavailable", {
+                "error": fill_source,
+            }
+
+        reconciled, reconcile_reason, reconcile_details = _reconcile_terminal_late_fill(
+            pos=runtime_position,
+            exit_engine=exit_engine,
+            osm=self.osm,
+            local_id=local_id,
+            broker_id=broker_id,
+            position_id=position_id,
+            terminal_row=osm_row,
+            requested_qty=requested_qty,
+            broker_qty=broker_qty,
+        )
+        if not reconciled:
+            return False, "startup_terminal_exit_fill_bridge_failed", {
+                "error": reconcile_reason,
+                "fill_source": fill_source,
+                **reconcile_details,
+            }
+
+        return True, "startup_terminal_exit_fill_bridge_reconciled", {
+            "broker_status": broker_status,
+            "terminal_cumulative_qty": broker_qty,
+            "fill_source": fill_source,
+            "requested_qty": requested_qty,
+            **reconcile_details,
+        }
+
     def _reconcile_stale_exit_generation_claims(self, result: dict) -> None:
         from ap.db import conn, run_with_retry
         from ap.exit_decision_idempotency_guard import (
@@ -1136,23 +1343,70 @@ class APStartupRecovery:
                 continue
 
             if broker_status in BROKER_TERMINAL:
+                result["exit_fill_reconciliations_attempted"] = (
+                    result.get("exit_fill_reconciliations_attempted", 0) + 1
+                )
                 try:
-                    self.osm.transition(
-                        local_id, BROKER_TO_OSM.get(broker_status, "CANCELED"),
+                    bridge_ok, bridge_reason, bridge_details = (
+                        self._reconcile_terminal_exit_fill_before_reopen(
+                            pos,
+                            exit_order,
+                            broker_raw,
+                        )
+                    )
+                except Exception as exc:
+                    bridge_ok = False
+                    bridge_reason = "startup_terminal_exit_bridge_exception"
+                    bridge_details = {"error": type(exc).__name__}
+                if not bridge_ok:
+                    result["exit_fill_reconciliations_quarantined"] = (
+                        result.get("exit_fill_reconciliations_quarantined", 0) + 1
+                    )
+                    msg = (
+                        f"STARTUP_TERMINAL_EXIT_HOLD local={local_id} "
+                        f"broker={broker_oid} pos={pos_id} reason={bridge_reason} "
+                        f"details={bridge_details}"
+                    )
+                    log.critical("[%s] %s", self.client_id, msg)
+                    result.setdefault("errors", []).append(msg)
+                    continue
+
+                result["exit_fill_reconciliations_reconciled"] = (
+                    result.get("exit_fill_reconciliations_reconciled", 0) + 1
+                )
+                try:
+                    terminalized = self.osm.transition(
+                        local_id,
+                        BROKER_TO_OSM.get(broker_status, "CANCELED"),
+                        broker_order_id=broker_oid,
+                        filled_qty=bridge_details["terminal_cumulative_qty"],
+                        position_id=pos_id,
                         last_error=f"recovery: broker_status={broker_status}",
                     )
-                    # Revert position
+                    if not terminalized:
+                        raise RuntimeError("terminal_exit_osm_transition_unconfirmed")
+
+                    # Reopen only after the exact broker/OSM/runtime/position
+                    # fill bridge has been proven and the OSM terminal CAS won.
                     from ap.db import conn as _conn, run_with_retry
 
                     def _revert(pid=pos_id):
                         with _conn() as c:
-                            c.execute(
+                            cursor = c.execute(
                                 "UPDATE positions SET status='OPEN', exit_reason=NULL, "
-                                "updated_ts=NOW() WHERE id=%s AND client_id=%s",
+                                "updated_ts=NOW() WHERE id=%s AND client_id=%s "
+                                "AND status='CLOSING'",
                                 (pid, self.client_id),
                             )
+                            return getattr(
+                                cursor,
+                                "rowcount",
+                                getattr(c, "rowcount", None),
+                            )
 
-                    run_with_retry(_revert)
+                    reopened = run_with_retry(_revert)
+                    if reopened != 1:
+                        raise RuntimeError("terminal_exit_position_reopen_unconfirmed")
                     log.warning(
                         "[%s] RECOVERY: exit was canceled during downtime | "
                         "pos=%s %s reverted to OPEN — EXIT MUST BE RETRIED",

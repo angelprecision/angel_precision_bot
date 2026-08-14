@@ -8722,12 +8722,37 @@ class APExecutionCore:
             log.debug("[%s] _on_position_close called but pos.closed=True — skipping", pos.ticker)
             return
 
-        with self._pos_lock:
-            self._position_count = max(0, self._position_count - 1)
+        # A stale-exit replacement grant may authorize only the old broker
+        # tranche's unfilled remainder (for example, 2 of a 7-contract
+        # position). The caller still arrives through ``on_exit`` because
+        # the original decision was not SCALE_OUT, but this callback is not a
+        # full-position close for bookkeeping or terminal-proof purposes.
+        try:
+            _replacement_qty = int(getattr(pos, "pending_exit_replace_qty", 0) or 0)
+            _remaining_before_close = int(getattr(pos, "quantity_remaining", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            _replacement_qty = 0
+            _remaining_before_close = 0
+        _is_partial_replacement = bool(
+            isinstance(getattr(pos, "exit_retry_liveness", {}), dict)
+            and getattr(pos, "exit_retry_liveness", {}).get("state") == "REPLACEMENT_PENDING"
+            and getattr(pos, "pending_exit_replace_allowed", False)
+            and 0 < _replacement_qty < _remaining_before_close
+        )
 
-        sector = getattr(pos, "signal", {}).get("correlation_bucket", "OTHER")
-        with self._sector_lock:
-            self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
+        if not _is_partial_replacement:
+            with self._pos_lock:
+                self._position_count = max(0, self._position_count - 1)
+
+            sector = getattr(pos, "signal", {}).get("correlation_bucket", "OTHER")
+            with self._sector_lock:
+                self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
+        else:
+            log.info(
+                "[%s] PARTIAL_REPLACEMENT_CONTINUATION — preserving full-position "
+                "bookkeeping/proof context | replacement_qty=%s remaining_qty=%s",
+                pos.ticker, _replacement_qty, _remaining_before_close,
+            )
 
         # ── EXIT SUBMISSION ─────────────────────────────────────────────────
         sig = getattr(pos, "signal", {})
@@ -8976,6 +9001,14 @@ class APExecutionCore:
             _decision_exit_qty = getattr(decision, "quantity", None)
             _reserved_exit_qty = getattr(decision, "reserved_exit_quantity", None)
             _remaining_exit_qty = getattr(pos, "quantity_remaining", None)
+            _replacement_cap = (
+                int(getattr(pos, "pending_exit_replace_qty", 0) or 0)
+                if getattr(pos, "pending_exit_replace_allowed", False)
+                else 0
+            )
+            _expected_exit_qty = (
+                _replacement_cap if _replacement_cap > 0 else _remaining_exit_qty
+            )
             _decision_reserved_local_id = str(
                 getattr(decision, "reserved_local_order_id", "") or ""
             ).strip()
@@ -8988,12 +9021,14 @@ class APExecutionCore:
                 or _decision_exit_qty <= 0
                 or type(_remaining_exit_qty) is not int
                 or _remaining_exit_qty <= 0
-                or _decision_exit_qty != _remaining_exit_qty
+                or type(_expected_exit_qty) is not int
+                or _expected_exit_qty <= 0
+                or _decision_exit_qty != _expected_exit_qty
                 or (
                     _reserved_exit_qty is not None
                     and (
                         type(_reserved_exit_qty) is not int
-                        or _reserved_exit_qty != _decision_exit_qty
+                        or _reserved_exit_qty != _expected_exit_qty
                     )
                 )
                 or (
@@ -9003,11 +9038,13 @@ class APExecutionCore:
                 )
             ):
                 log.critical(
-                    "[%s] CLOSE BLOCKED — exact reserved exit identity mismatch | decision_qty=%r reserved_qty=%r remaining_qty=%r decision_local=%s position_local=%s",
+                    "[%s] CLOSE BLOCKED — exact reserved exit identity mismatch | decision_qty=%r reserved_qty=%r remaining_qty=%r expected_qty=%r replacement_cap=%r decision_local=%s position_local=%s",
                     pos.ticker,
                     _decision_exit_qty,
                     _reserved_exit_qty,
                     _remaining_exit_qty,
+                    _expected_exit_qty,
+                    _replacement_cap,
                     _decision_reserved_local_id,
                     _position_reserved_local_id,
                 )
@@ -9058,6 +9095,13 @@ class APExecutionCore:
                 f"cannot submit sell_to_close through production authority | {decision.reason}"
             )
             return
+
+        if _is_partial_replacement:
+            # This broker POST owns only a replacement tranche. Leave the
+            # full-close cooldown, integrity marker, and terminal proof
+            # staging untouched until the remaining position is actually
+            # closed by a later broker-confirmed generation.
+            return exit_res
 
         # Always compute option P&L from option prices — never from pos.entry_price
         # which can be seeded from avg_fill (which sometimes stored underlying price).
@@ -9967,6 +10011,26 @@ class APExecutionCore:
                 getattr(pos, "ticker", "?"),
             )
             return
+        try:
+            _fill_probe = float(actual_fill_price or 0)
+        except (TypeError, ValueError, OverflowError):
+            _fill_probe = 0.0
+        if _fill_probe != _fill_probe or _fill_probe in (float("inf"), float("-inf")):
+            _fill_probe = 0.0
+        if getattr(pos, "exit_economics_pending", False) and _fill_probe <= 0:
+            # Broker-flat recovery is valid exposure truth, not price truth.
+            # Keep the staged proof open for an exact fill reconciliation and
+            # never substitute the submit-time estimate for realized economics.
+            pos.exit_economics_status = "PENDING_EXIT_ECONOMICS"
+            staged["economic_status"] = "PENDING_EXIT_ECONOMICS"
+            log.critical(
+                "[PENDING_EXIT_ECONOMICS] %s | broker-flat close has no authoritative exit fill price; proof/P&L held",
+                staged.get("ticker", getattr(pos, "ticker", "?")),
+            )
+            return
+        if _fill_probe > 0 and getattr(pos, "exit_economics_pending", False):
+            pos.exit_economics_pending = False
+            pos.exit_economics_status = ""
         pos._proof_finalized = True  # type: ignore[attr-defined]
 
         # Use actual fill price; fall back to estimated if broker returns 0/None

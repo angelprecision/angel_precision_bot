@@ -1006,6 +1006,37 @@ def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_positio
     osm._finalize_position_from_exit_order.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "filled_qty",
+    [None, True, 1.5, " 1 ", 0, 5],
+    ids=["missing", "boolean", "fractional", "whitespace", "zero", "over_order_qty"],
+)
+def test_osm_exit_filled_malformed_quantity_quarantines_without_position_mutation(
+    fake_osm_db, monkeypatch, filled_qty
+):
+    """EXIT_FILLED must not infer quantity or mutate the position from bad data."""
+    _, osm = fake_osm_db
+    engine = _CanonicalExitEngine(quantity_remaining=4)
+    monkeypatch.setitem(osm_module._exit_engine_registry, "tradefluence", engine)
+    osm._handle_exit_engine_hooks = APOrderStateMachine._handle_exit_engine_hooks.__get__(
+        osm, APOrderStateMachine
+    )
+
+    osm._handle_exit_engine_hooks(
+        current=_row(status="EXIT_FILLED", broker_order_id="36661364"),
+        new_status=OrderStatus.EXIT_FILLED,
+        position_id="position-orcl-1",
+        filled_qty=filled_qty,
+        fill_price=1.25,
+        broker_order_id="36661364",
+        local_order_id="exit-orcl-1",
+    )
+
+    assert engine.closed_calls == []
+    assert engine.partial_calls == []
+    assert engine.position.quantity_remaining == 4
+
+
 def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypatch):
     """Two full reducers race one recovered EXIT; Postgres permits one economy."""
     from contextlib import contextmanager
@@ -1617,6 +1648,36 @@ class _MonitorOSM:
 
     def get_order(self, local_order_id):
         return dict(self.order) if local_order_id == self.order["local_order_id"] else None
+
+    def update_order_meta(self, local_order_id, meta_patch):
+        if local_order_id != self.order["local_order_id"]:
+            return False
+        self.order.setdefault("meta", {}).update(dict(meta_patch or {}))
+        return True
+
+    def persist_stale_exit_cancel_attempt(self, local_order_id, broker_order_id, attempt):
+        if (
+            local_order_id != self.order["local_order_id"]
+            or broker_order_id != self.order.get("broker_order_id")
+        ):
+            return False
+        marker_key = "stale_exit_cancel_liveness"
+        marker = self.order.setdefault("meta", {}).get(marker_key)
+        if marker is not None:
+            if not isinstance(marker, dict) or marker.get("broker_order_id") != broker_order_id:
+                return False
+            try:
+                existing_attempt = int(marker["attempt"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            if existing_attempt < 0 or existing_attempt >= int(attempt):
+                return False
+        self.order["meta"][marker_key] = {
+            "broker_order_id": broker_order_id,
+            "attempt": int(attempt),
+            "updated_at": "test",
+        }
+        return True
 
     def adopt_broker_owned_exit_request(self, local_order_id, **kwargs):
         self.adopt_calls.append((local_order_id, kwargs))
@@ -2327,7 +2388,13 @@ def test_actor_mode_stale_open_exit_keeps_existing_cancel_logic_reachable(monkey
     order = _row(status="EXIT_SUBMITTED", broker_order_id="36661364")
     osm = _MonitorOSM(order)
     monitor = _monitor(order, osm, _Broker({"status": "OPEN"}))
-    monitor._query_broker_order = MagicMock(return_value="open")
+    # _check_exit_orders performs the first read, stale recovery performs a
+    # second fresh pre-cancel read, and the raw payload is the independent
+    # post-cancel terminal proof required by PR #423.
+    monitor._query_broker_order = MagicMock(side_effect=["open", "open"])
+    monitor._query_broker_order_payload = MagicMock(
+        return_value={"status": "canceled", "exec_quantity": 0}
+    )
     monitor._cancel_broker_order = MagicMock(return_value={"status": "canceled"})
     monitor._guarded_revert_position_open_after_exit_cancel = MagicMock()
     monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
@@ -2352,6 +2419,7 @@ def test_watchdog_mode_stale_open_exit_alerts_without_cancel(monkeypatch):
     monitor._cancel_broker_order = MagicMock()
     monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
     monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", False)
+    monkeypatch.setattr(om, "ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG", False)
 
     monitor._check_exit_orders()
 
