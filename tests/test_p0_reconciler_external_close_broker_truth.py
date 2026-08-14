@@ -234,11 +234,6 @@ def test_malformed_external_scalars_hold_before_evidence(order):
     [
         {
             **_broker_order(),
-            "last_fill_date": None,
-            "transaction_date": "2025-01-02T14:59:00Z",
-        },
-        {
-            **_broker_order(),
             "last_fill_date": "2025-01-02T14:59:00",
         },
         {
@@ -246,9 +241,35 @@ def test_malformed_external_scalars_hold_before_evidence(order):
             "last_fill_date": None,
             "update_date": "2025-01-02T14:59:00Z",
         },
+        {
+            **_broker_order(),
+            "last_fill_date": None,
+            "transaction_date": "2025-01-02T14:59:00",
+        },
     ],
 )
 def test_unsafe_or_naive_timestamp_cannot_prove_external_fill(order):
+    evidence, reason = _select(_position(), [order])
+    assert evidence is None
+    assert reason == "no_exact_external_filled_exit_order"
+
+
+def test_tradier_transaction_date_supports_exact_final_fill():
+    order = _broker_order()
+    order["last_fill_date"] = None
+    order["transaction_date"] = "2025-01-02T14:59:00Z"
+    evidence, reason = _select(_position(), [order])
+    assert reason == "exact_external_broker_fill"
+    assert evidence is not None
+    fill = evidence["fills"][0]
+    assert fill["fill_timestamp_source"] == "broker_response"
+    assert fill["fill_timestamp_key"] == "transaction_date"
+
+
+def test_transaction_date_does_not_authorize_partial_order():
+    order = _broker_order(status="partially_filled")
+    order["last_fill_date"] = None
+    order["transaction_date"] = "2025-01-02T14:59:00Z"
     evidence, reason = _select(_position(), [order])
     assert evidence is None
     assert reason == "no_exact_external_filled_exit_order"
