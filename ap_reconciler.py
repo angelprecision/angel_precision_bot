@@ -77,6 +77,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import threading
@@ -284,6 +285,7 @@ class APBrokerReconciler:
         interval_sec: int = RECONCILE_INTERVAL_SEC,
         execution_mode: str | None = None,
         supabase_client=None,       # Requirement 1: optional, backward-compatible
+        execution_core=None,        # Canonical broker-intent reconciliation consumer
     ):
         self.broker          = broker
         self.client_id       = client_id
@@ -293,6 +295,7 @@ class APBrokerReconciler:
         self._interval       = interval_sec
         self.execution_mode  = _normalize_execution_mode(execution_mode)
         self.supabase_client = supabase_client  # Requirement 2: stored for proof logging
+        self.execution_core  = execution_core
         self._stop       = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
@@ -1156,6 +1159,16 @@ class APBrokerReconciler:
                 )
                 continue
 
+            # A durable submit-intent marker means the process may have
+            # crashed after broker acceptance but before broker_order_id was
+            # persisted.  Route this evidence-bearing PENDING_TRIGGER row to
+            # the canonical read/adopt reconciler before any normal broker
+            # status handling.  Ambiguous truth is retained and never
+            # resubmitted or terminalized.
+            if db_status == "PENDING_TRIGGER" and self._has_submit_intent_evidence(order):
+                self._reconcile_pending_trigger_broker_intent(order, summary)
+                continue
+
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
                 self._handle_order_without_broker_id(order, summary)
                 continue
@@ -1230,6 +1243,90 @@ class APBrokerReconciler:
                     )
 
         self._check_ghost_fills(summary)
+
+    @staticmethod
+    def _has_submit_intent_evidence(order: dict) -> bool:
+        """Return true only for a PENDING_TRIGGER row with broker evidence."""
+        if not isinstance(order, dict):
+            return False
+        if str(order.get("broker_order_id") or "").strip():
+            return True
+        if order.get("submitted_ts"):
+            return True
+        meta = order.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        return bool(
+            isinstance(meta, dict)
+            and str(meta.get("submit_intent_at") or "").strip()
+        )
+
+    def _retain_pending_trigger_recovery_ownership(
+        self, local_order_id: str, *, reason: str
+    ) -> bool:
+        """Retain an ambiguous pre-broker row without overwriting a watcher."""
+        retain = getattr(self.osm, "retain_recovery_ownership_if_no_watcher", None)
+        if not callable(retain):
+            return False
+        try:
+            return bool(
+                retain(
+                    local_order_id,
+                    recovery_owner=(
+                        f"prebroker_recovery:{self.client_id}:"
+                        f"{self.execution_mode}:{local_order_id}"
+                    ),
+                    reason=str(reason or "broker_intent_reconciliation_pending"),
+                    recovery_retention_mode=str(self.execution_mode or "").upper(),
+                )
+            )
+        except Exception as exc:
+            log.error(
+                "[%s] pending-trigger recovery retention failed local=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
+    def _reconcile_pending_trigger_broker_intent(
+        self, order: dict, summary: dict
+    ) -> None:
+        """Consume broker-intent truth without granting a new submit path."""
+        local_id = str(order.get("local_order_id") or order.get("id") or "").strip()
+        consumer = getattr(self.execution_core, "reconcile_deferred_broker_intent", None)
+        if not local_id or not callable(consumer):
+            reason = "broker_intent_reconciler_unavailable"
+            self._retain_pending_trigger_recovery_ownership(local_id, reason=reason)
+            self._alert(f"PENDING_TRIGGER_BROKER_EVIDENCE_HELD | {local_id} | {reason}")
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            return
+
+        try:
+            result = consumer(local_order_id=local_id) or {}
+        except Exception as exc:
+            reason = f"broker_intent_reconciler_raised:{type(exc).__name__}"
+            self._retain_pending_trigger_recovery_ownership(local_id, reason=reason)
+            self._alert(f"PENDING_TRIGGER_BROKER_EVIDENCE_HELD | {local_id} | {reason}")
+            summary.setdefault("errors", []).append(reason)
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            return
+
+        disposition = str(result.get("disposition") or "").strip().upper()
+        if disposition == "ALREADY_RECONCILED":
+            summary["orders_corrected"] = int(summary.get("orders_corrected", 0)) + 1
+            return
+
+        reason = str(result.get("reason_code") or "broker_intent_reconciliation_pending")
+        # NOT_IN_CRASH_WINDOW contradicts the durable evidence that selected
+        # this row.  It must not authorize a replacement POST; retain it for
+        # the next exact-truth pass just like every other unresolved result.
+        self._retain_pending_trigger_recovery_ownership(local_id, reason=reason)
+        self._alert(f"PENDING_TRIGGER_BROKER_EVIDENCE_HELD | {local_id} | {reason}")
+        summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
 
     def _resolve_missing_id_exit_truth(self, order: dict, summary: dict, *, reason: str = "") -> bool:
         """Resolve an EXIT order that has no broker_order_id into exactly one safe endpoint.

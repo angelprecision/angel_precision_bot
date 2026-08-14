@@ -93,19 +93,21 @@ class TestStalePendingTrigger:
 
 
 # ---------------------------------------------------------------------------
-# 2. get_open_orders_for_reconcile still excludes PENDING_TRIGGER
+# 2. get_open_orders_for_reconcile includes only evidence-bearing PENDING_TRIGGER
 # ---------------------------------------------------------------------------
-class TestReconcileExcludesPendingTrigger:
-    def test_pending_trigger_not_in_reconcile_status_list(self):
-        """PENDING_TRIGGER must not appear in get_open_orders_for_reconcile SQL."""
+class TestReconcileEvidenceBearingPendingTrigger:
+    def test_pending_trigger_requires_broker_intent_evidence(self):
+        """Only broker-evidence-bearing PENDING_TRIGGER rows enter reconciliation."""
         import inspect
         import ap.db as db_module
 
         src = inspect.getsource(db_module.get_open_orders_for_reconcile)
-        assert "PENDING_TRIGGER" not in src, (
-            "get_open_orders_for_reconcile() must NOT include PENDING_TRIGGER — "
-            "those orders have no broker_order_id and must not be broker-polled."
-        )
+        assert "PENDING_TRIGGER" in src
+        assert "kind = 'ENTRY'" in src
+        assert "broker_order_id" in src
+        assert "submitted_ts" in src
+        assert "submit_intent_at" in src
+        assert "execution_mode" in src
 
     def test_reconcile_function_exists(self):
         from ap.db import get_open_orders_for_reconcile

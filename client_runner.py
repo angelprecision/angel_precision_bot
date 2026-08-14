@@ -4220,6 +4220,7 @@ class ClientRunner(threading.Thread):
                 pm=self.position_manager,
                 execution_mode=str(self.mode).strip().lower(),
                 supabase_client=getattr(self, "supabase", None),  # Requirement 3
+                execution_core=getattr(self, "core", None),
             )
             self.reconciler.exit_engine = exit_eng
             # P0-3: give reconciler master_control reference so it can self-

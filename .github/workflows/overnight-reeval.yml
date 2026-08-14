@@ -49,6 +49,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install runtime dependencies
+        run: python3 -m pip install -r requirements.txt
+
       - name: Resolve scheduled batch
         id: cfg
         run: |
@@ -73,4 +76,4 @@ jobs:
           MORNING_JOB_TIMEOUT_SECONDS: "180"
           MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "45"
         run: |
-          python3 -m ap.scripts.live_morning_jobs
+          python3 ap/scripts/live_morning_jobs.py

@@ -262,14 +262,14 @@ def test_network_exception_returns_failure_without_crashing():
     assert "network down" in str(result["body"])
 
 
-def test_workflow_is_backup_only_and_uses_module_invocation():
+def test_workflow_is_backup_only_and_uses_standalone_runner():
     workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
     assert "50 13 * * 1-5" in workflow
     assert "50 14 * * 1-5" in workflow
     assert "18 13 * * 1-5" not in workflow
     assert "26 13 * * 1-5" not in workflow
-    assert "python3 -m ap.scripts.live_morning_jobs" in workflow
-    assert "python3 ap/scripts/live_morning_jobs.py" not in workflow
+    assert "python3 ap/scripts/live_morning_jobs.py" in workflow
+    assert "python3 -m ap.scripts.live_morning_jobs" not in workflow
 
 
 def test_render_blueprint_defines_primary_render_cron_jobs():
@@ -286,7 +286,8 @@ def test_render_blueprint_defines_primary_render_cron_jobs():
         "40 14 * * 1-5",
     ):
         assert expr in blueprint
-    assert "startCommand: \"python -m ap.scripts.live_morning_jobs\"" in blueprint
+    assert "startCommand: \"python ap/scripts/live_morning_jobs.py\"" in blueprint
+    assert "startCommand: \"python -m ap.scripts.live_morning_jobs\"" not in blueprint
 
 
 

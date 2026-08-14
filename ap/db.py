@@ -767,25 +767,43 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
                     "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
-                    "AND status IN ("
+                    "AND (status IN ("
                     "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
                     "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
+                    ") OR ("
+                    "  status = 'PENDING_TRIGGER' AND kind = 'ENTRY' AND ("
+                    "    NULLIF(BTRIM(COALESCE(broker_order_id,'')), '') IS NOT NULL"
+                    "    OR submitted_ts IS NOT NULL"
+                    "    OR NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NOT NULL"
+                    "  )"
+                    ")) "
                     "ORDER BY created_ts DESC LIMIT %s", (client_id, mode, limit))
             elif client_id:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
-                    "AND status IN ("
+                    "AND (status IN ("
                     "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
                     "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
+                    ") OR ("
+                    "  status = 'PENDING_TRIGGER' AND kind = 'ENTRY' AND ("
+                    "    NULLIF(BTRIM(COALESCE(broker_order_id,'')), '') IS NOT NULL"
+                    "    OR submitted_ts IS NOT NULL"
+                    "    OR NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NOT NULL"
+                    "  )"
+                    ")) "
                     "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
             else:
                 c.execute(
-                    "SELECT * FROM orders WHERE status IN ("
+                    "SELECT * FROM orders WHERE (status IN ("
                     "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
                     "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
+                    ") OR ("
+                    "  status = 'PENDING_TRIGGER' AND kind = 'ENTRY' AND ("
+                    "    NULLIF(BTRIM(COALESCE(broker_order_id,'')), '') IS NOT NULL"
+                    "    OR submitted_ts IS NOT NULL"
+                    "    OR NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NOT NULL"
+                    "  )"
+                    ")) "
                     "ORDER BY created_ts DESC LIMIT %s", (limit,))
             return c.fetchall()
     return run_with_retry(_fn)
@@ -821,9 +839,11 @@ def get_open_orders_with_invalid_execution_mode(client_id: str,
 def get_stale_pending_trigger_orders(client_id: str, older_than_hours: int = 8) -> list[dict]:
     """Find ENTRY orders stuck in PENDING_TRIGGER longer than threshold.
 
-    PENDING_TRIGGER orders have not reached the broker and normally have no
-    broker_order_id, so they should NOT be included in broker polling via
-    get_open_orders_for_reconcile().
+    PENDING_TRIGGER orders normally have no broker ownership and remain
+    outside broker polling. Evidence-bearing rows with a durable broker id,
+    submitted timestamp, or submit-intent marker are the exception: they must
+    reach the canonical broker-intent reconciler so an ambiguous crash window
+    cannot fall into a second submit or age-only cleanup.
 
     This helper exists so reconciler/health/admin tooling can detect leaked
     watcher/queue orders that may reserve capital forever.
