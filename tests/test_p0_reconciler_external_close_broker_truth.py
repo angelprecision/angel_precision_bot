@@ -78,14 +78,37 @@ def _broker_order(
     }
 
 
+def _tradier_order(
+    order_id: str = "123456",
+    *,
+    contract: str = CONTRACT,
+    side: str = "sell_to_close",
+    status: str = "filled",
+    qty: float = 1.0,
+    price: float = 1.52,
+    transaction_date: str = "2025-01-02T14:59:00.000Z",
+) -> dict:
+    """Raw documented Tradier order shape (no adapter-added fill timestamp)."""
+    return {
+        "id": order_id,
+        "status": status,
+        "side": side,
+        "option_symbol": contract,
+        "exec_quantity": qty,
+        "avg_fill_price": price,
+        "transaction_date": transaction_date,
+    }
+
+
 def _select(position: dict, orders: list[dict], *, bot_ids: set[str] | None = None,
-            adopted_fills: list[dict] | None = None):
+            adopted_fills: list[dict] | None = None,
+            detected_at: datetime = DETECTED_AT):
     return manual_mod.select_external_close_fills(
         orders=orders,
         position=position,
         bot_exit_order_ids=bot_ids or set(),
         adopted_fills=adopted_fills,
-        detected_at=DETECTED_AT,
+        detected_at=detected_at,
     )
 
 
@@ -132,7 +155,7 @@ def test_reconciler_three_pass_flat_is_hold_only(quote):
 def test_canonical_manual_close_uses_broker_fill_not_current_quote(monkeypatch):
     """The existing canonical detector finalizes at the exact broker fill."""
     position = _position()
-    broker_order = _broker_order(price=0.99, qty=3)
+    broker_order = _tradier_order(price=1.52, qty=3)
     finalized: list[dict] = []
     adopted: list[dict] = []
     mutations: list[str] = []
@@ -190,12 +213,48 @@ def test_canonical_manual_close_uses_broker_fill_not_current_quote(monkeypatch):
     manual_mod.detect_manual_closes(runner)
 
     assert len(finalized) == 1
-    assert finalized[0]["exit_price"] == pytest.approx(0.99)
+    assert finalized[0]["exit_price"] == pytest.approx(1.52)
     assert finalized[0]["filled_qty"] == 3
-    assert finalized[0]["broker_order_id"] == "broker-exit-1"
+    assert finalized[0]["broker_order_id"] == "123456"
     assert finalized[0]["external_close"] is True
     assert len(adopted) == 1
     assert mutations == []
+
+
+def test_tradier_filled_transaction_date_is_final_fill_evidence():
+    """The raw Tradier order shape supplies the accepted final-fill timestamp."""
+    position = _position(
+        contract="PEP260821C00141000",
+        underlying="PEP",
+        entry_ts="2026-08-14T17:31:02Z",
+        opened_at="2026-08-14T17:31:02Z",
+        qty=1,
+        quantity_remaining=1,
+        avg_fill=1.47,
+        entry_price=1.47,
+    )
+    order = {
+        "id": "123456",
+        "status": "filled",
+        "side": "sell_to_close",
+        "option_symbol": "PEP260821C00141000",
+        "exec_quantity": 1.0,
+        "avg_fill_price": 1.52,
+        "transaction_date": "2026-08-14T17:45:00.000Z",
+    }
+
+    evidence, reason = _select(
+        position,
+        [order],
+        detected_at=datetime(2026, 8, 14, 17, 46, tzinfo=timezone.utc),
+    )
+
+    assert reason == "exact_external_broker_fill"
+    assert evidence is not None
+    assert evidence["fill_price"] == pytest.approx(1.52)
+    assert evidence["filled_qty"] == 1
+    assert evidence["filled_ts"] == "2026-08-14T17:45:00+00:00"
+    assert evidence["fills"][0]["fill_timestamp_key"] == "transaction_date"
 
 
 def test_historical_exit_for_other_position_cannot_mutate_current_position(monkeypatch):
@@ -419,7 +478,7 @@ def test_malformed_external_scalars_hold_before_evidence(order):
         {
             **_broker_order(),
             "last_fill_date": None,
-            "transaction_date": "2025-01-02T14:59:00Z",
+            "transaction_date": "2025-01-02T14:59:00",
         },
     ],
 )
@@ -427,6 +486,26 @@ def test_unsafe_or_naive_timestamp_cannot_prove_external_fill(order):
     evidence, reason = _select(_position(), [order])
     assert evidence is None
     assert reason == "no_exact_external_filled_exit_order"
+
+
+@pytest.mark.parametrize(
+    ("order", "expected_reason"),
+    [
+        (_tradier_order(status="working"), "no_exact_external_filled_exit_order"),
+        (_tradier_order(contract=WRONG_CONTRACT), "no_exact_external_filled_exit_order"),
+        (_tradier_order(side="buy_to_open"), "no_exact_external_filled_exit_order"),
+        (_tradier_order(qty=2.0), "external_fill_qty_ambiguous:2/3"),
+        (
+            _tradier_order(transaction_date="2025-01-02T13:59:00.000Z"),
+            "no_exact_external_filled_exit_order",
+        ),
+    ],
+)
+def test_transaction_date_still_requires_exact_terminal_fill(order, expected_reason):
+    evidence, reason = _select(_position(), [order])
+
+    assert evidence is None
+    assert reason == expected_reason
 
 
 def test_external_fill_carries_broker_timestamp_provenance():

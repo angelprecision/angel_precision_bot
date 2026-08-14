@@ -73,6 +73,7 @@ BROKER_FILL_TIMESTAMP_KEYS = (
     "filled_at",
     "filled_ts",
     "fill_ts",
+    "transaction_date",
 )
 
 
@@ -474,6 +475,12 @@ def _broker_fill_timestamp(order: dict) -> tuple[datetime | None, str | None]:
     for key in BROKER_FILL_TIMESTAMP_KEYS:
         raw = order.get(key)
         if raw is None or raw == "":
+            continue
+        # Tradier documents transaction_date as the order's last-updated time,
+        # so it is fill authority only for a terminal FILLED order. Never use
+        # it for working/partial/lifecycle-only rows, and never fall back to
+        # update_date or updated_at.
+        if key == "transaction_date" and order_status(order) != "filled":
             continue
         parsed = parse_broker_fill_timestamp(raw)
         if parsed is None:

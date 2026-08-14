@@ -509,7 +509,6 @@ def test_durable_fill_valid_row_is_accepted():
     "overrides",
     [
         {"fill_timestamp_source": ""},
-        {"fill_timestamp_source": "broker_response", "fill_timestamp_key": "transaction_date"},
         {"fill_timestamp_source": "broker_response", "fill_timestamp_key": "update_date"},
         {"filled_at": datetime(2026, 7, 21, 15, 57, 39)},
     ],
@@ -521,6 +520,16 @@ def test_durable_fill_requires_broker_timestamp_provenance(overrides):
         detected_at=DETECTED_AT,
     )
     assert valid == []
+
+
+def test_durable_fill_transaction_date_provenance_is_accepted():
+    valid = manual_mod._validate_durable_fills(
+        [_fill(fill_timestamp_source="broker_response", fill_timestamp_key="transaction_date")],
+        position=_pos(),
+        detected_at=DETECTED_AT,
+    )
+    assert len(valid) == 1
+    assert valid[0]["fill_timestamp_key"] == "transaction_date"
 
 
 def test_durable_fill_stale_timestamp_is_rejected():
