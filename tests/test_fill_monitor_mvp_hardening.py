@@ -337,7 +337,7 @@ def test_broker_exit_partial_fill_zero_qty_returns_error_not_exit_partial(monkey
     assert any(item[0] == "event" for item in events)
 
 
-@pytest.mark.parametrize("response_id", [None, "different-broker-order"])
+@pytest.mark.parametrize("response_id", ["different-broker-order"])
 def test_broker_response_identity_mismatch_is_not_fill_truth(monkeypatch, response_id):
     from ap import fill_monitor as fm
 
@@ -358,6 +358,49 @@ def test_broker_response_identity_mismatch_is_not_fill_truth(monkeypatch, respon
     assert result["status"] == "ERROR"
     assert result["reason"] == "BROKER_ORDER_ID_MISMATCH"
     assert result["filled_qty"] == 0
+
+
+def test_broker_unavailable_without_response_id_preserves_reason_taxonomy(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    result = fm.check_order_with_broker(
+        SimpleNamespace(
+            get_order=lambda _broker_order_id: {
+                "status": "ERROR",
+                "reason": "timeout",
+            }
+        ),
+        _base_order(direction="CALL", contract="AAPL260626C00195000"),
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "timeout"
+    assert result["raw"]["_broker_response_unavailable"] is True
+    assert "_broker_order_id_mismatch" not in result["raw"]
+    assert fm._broker_poll_unavailable_for_durable_filled_recovery(result)
+
+
+def test_successful_broker_response_without_id_is_missing_identity_not_mismatch(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    result = fm.check_order_with_broker(
+        SimpleNamespace(
+            get_order=lambda _broker_order_id: {
+                "status": "FILLED",
+                "exec_quantity": 1,
+                "avg_fill_price": 1.05,
+            }
+        ),
+        _base_order(direction="CALL", contract="AAPL260626C00195000"),
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_RESPONSE_MISSING_ID"
+    assert result["filled_qty"] == 0
+    assert "_broker_order_id_mismatch" not in result["raw"]
+    assert not fm._broker_poll_unavailable_for_durable_filled_recovery(result)
 
 
 def test_conflicting_broker_response_identity_aliases_are_not_fill_truth(monkeypatch):
@@ -390,8 +433,8 @@ def test_broker_fill_anomaly_state_is_not_environment_configurable(monkeypatch):
     assert fm.FILL_ANOMALY_STATUS == "BROKER_FILL_ANOMALY"
 
 
-@pytest.mark.parametrize("raw_status", ["OPEN", "CANCELED", "REJECTED", "EXPIRED"])
-def test_positive_fill_with_non_fill_status_is_held(monkeypatch, raw_status):
+@pytest.mark.parametrize("raw_status", ["CANCELED", "REJECTED", "EXPIRED"])
+def test_terminal_broker_status_preserves_positive_cumulative_fill(monkeypatch, raw_status):
     from ap import fill_monitor as fm
 
     monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
@@ -408,9 +451,62 @@ def test_positive_fill_with_non_fill_status_is_held(monkeypatch, raw_status):
         _base_order(direction="CALL", contract="AAPL260626C00195000"),
     )
 
+    assert result["status"] == "FILLED"
+    assert result["filled_qty"] == 1
+    assert "terminal_remainder_status" not in result
+
+
+def test_active_broker_status_with_positive_fill_remains_held(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    result = fm.check_order_with_broker(
+        SimpleNamespace(
+            get_order=lambda _broker_order_id: {
+                "id": _broker_order_id,
+                "status": "OPEN",
+                "exec_quantity": 1,
+                "avg_fill_price": 1.05,
+            }
+        ),
+        _base_order(direction="CALL", contract="AAPL260626C00195000"),
+    )
+
     assert result["status"] == "ERROR"
     assert result["reason"] == "BROKER_FILL_STATUS_QUANTITY_CONFLICT"
     assert result["filled_qty"] == 0
+
+
+@pytest.mark.parametrize("kind", ["ENTRY", "EXIT"])
+def test_terminal_broker_status_maps_partial_cumulative_fill_and_remainder(
+    monkeypatch, kind
+):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    result = fm.check_order_with_broker(
+        SimpleNamespace(
+            get_order=lambda _broker_order_id: {
+                "id": _broker_order_id,
+                "status": "CANCELED",
+                "exec_quantity": 1,
+                "avg_fill_price": 1.05,
+            }
+        ),
+        _base_order(
+            kind=kind,
+            direction="CALL",
+            contract="AAPL260626C00195000",
+            qty=2,
+        ),
+    )
+
+    assert result["status"] == ("PARTIAL_FILL" if kind == "ENTRY" else "EXIT_PARTIAL_FILL")
+    assert result["filled_qty"] == 1
+    assert result["terminal_remainder_status"] == "CANCELED"
+    assert result["terminal_remainder_qty"] == 1
 
 
 @pytest.mark.parametrize("stop_pct", ["nan", "inf", "-0.1", "1", "2"])

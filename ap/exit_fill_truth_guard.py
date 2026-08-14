@@ -230,7 +230,8 @@ def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
     rows = c.execute(
         "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status "
         "FROM orders WHERE client_id=%s AND kind='EXIT' AND UPPER(contract)=UPPER(%s) "
-        "AND status IN %s AND COALESCE(filled_qty,0)>0 AND fill_price IS NOT NULL "
+        "AND (status IN %s OR status IN ('CANCELED','REJECTED','EXPIRED')) "
+        "AND COALESCE(filled_qty,0)>0 AND fill_price IS NOT NULL "
         "AND (%s IS NULL OR filled_ts >= %s OR (%s <> '' AND local_order_id=%s)) "
         "AND (position_id::text=%s OR (%s<>'' AND local_order_id=%s)) "
         "ORDER BY filled_ts ASC NULLS LAST, created_ts ASC",
@@ -694,6 +695,39 @@ def _run_reconciliation_attempt(
 
     def _tx() -> dict:
         with conn() as c:
+            current_status = str(order.get("status") or "")
+            current_filled_qty = _int(
+                result.get("filled_qty"), _int(order.get("filled_qty"))
+            )
+            current_fill_price = _float(result.get("avg_fill"))
+            if current_fill_price <= 0:
+                current_fill_price = _float(result.get("fill_price"))
+            if (
+                current_status.upper() in {"CANCELED", "REJECTED", "EXPIRED"}
+                and current_filled_qty > 0
+                and current_fill_price > 0
+            ):
+                c.execute(
+                    "UPDATE orders SET filled_qty=GREATEST(COALESCE(filled_qty,0),%s), "
+                    "fill_price=%s, filled_ts=COALESCE(filled_ts,%s,NOW()), updated_ts=NOW() "
+                    "WHERE client_id=%s AND local_order_id=%s AND kind='EXIT' "
+                    "AND status=%s AND broker_order_id=%s "
+                    "AND COALESCE(filled_qty,0)<=%s",
+                    (
+                        current_filled_qty,
+                        current_fill_price,
+                        result.get("filled_ts"),
+                        str(order.get("client_id") or "").strip(),
+                        str(order.get("local_order_id") or "").strip(),
+                        current_status,
+                        str(
+                            result.get("broker_order_id")
+                            or order.get("broker_order_id")
+                            or ""
+                        ).strip(),
+                        current_filled_qty,
+                    ),
+                )
             position = _resolve_position(c, order, fill_ts)
             if not position:
                 raise ReconciliationIdentityError("CANONICAL_POSITION_UNRESOLVED")

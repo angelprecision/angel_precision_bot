@@ -313,6 +313,10 @@ def get_pending_orders(client_id: str) -> list[dict]:
                         OR last_error LIKE %s
                       )
                     )
+                    OR (
+                      status IN ('CANCELED', 'REJECTED', 'EXPIRED')
+                      AND updated_ts >= NOW() - INTERVAL '1 hour'
+                    )
                   )
                   AND broker_order_id IS NOT NULL
                   AND broker_order_id != ''
@@ -453,6 +457,14 @@ def _broker_poll_unavailable_for_durable_filled_recovery(result: dict) -> bool:
     if mapped == "UNKNOWN":
         return not raw_status or raw_status in {"UNKNOWN", "UNAVAILABLE", "ERROR"}
     if mapped == "ERROR":
+        if raw.get("_broker_order_id_mismatch") or raw.get(
+            "_malformed_broker_response"
+        ):
+            return False
+        if raw.get("_broker_response_unavailable"):
+            return True
+        if raw.get("_broker_response_missing_id"):
+            return False
         return not raw and reason not in {
             "BROKER_FILLED_ZERO_QTY",
             "FILLED_ORDER_SIDE_UNRESOLVED",
@@ -611,6 +623,43 @@ def _broker_identity_error_result(
             "requested_broker_order_id": str(broker_order_id or ""),
             "response_broker_order_id": response_order_id,
         },
+    )
+
+
+def _broker_response_without_identity_result(
+    order: dict,
+    broker_order_id,
+    raw: dict,
+    *,
+    status: str,
+) -> dict:
+    """Preserve broker transport/error truth when no concrete ID was returned."""
+    raw_status = str(status or "").strip().upper()
+    broker_reason = str(raw.get("reason") or raw_status or "").strip()
+    unavailable = raw_status in {"ERROR", "UNKNOWN", "UNAVAILABLE", "TIMEOUT"}
+    reason = broker_reason if unavailable and broker_reason else "BROKER_RESPONSE_MISSING_ID"
+    response_evidence = dict(raw)
+    response_evidence.update(
+        {
+            "_broker_response_unavailable": unavailable,
+            "_broker_response_missing_id": True,
+            "requested_broker_order_id": str(broker_order_id or ""),
+        }
+    )
+    if unavailable:
+        return {
+            "status": "ERROR",
+            "filled_qty": 0,
+            "avg_fill": 0.0,
+            "reason": reason,
+            "raw": response_evidence,
+        }
+    return _broker_fill_error_result(
+        order,
+        broker_order_id,
+        response_evidence,
+        reason=reason,
+        context={"_broker_response_missing_id": True},
     )
 
 
@@ -1173,12 +1222,19 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         response_order_ids = [
             raw.get(key)
             for key in ("id", "order_id", "broker_order_id")
-            if raw.get(key) is not None
+            if _has_proven_broker_order_id(raw.get(key))
         ]
         response_order_id = response_order_ids[0] if response_order_ids else None
-        if not response_order_ids or any(
-            not _has_proven_broker_order_id(response_id)
-            or str(response_id).strip() != str(broker_order_id).strip()
+        status = raw_status.upper()
+        if not response_order_ids:
+            return _broker_response_without_identity_result(
+                order,
+                broker_order_id,
+                raw,
+                status=status,
+            )
+        if any(
+            str(response_id).strip() != str(broker_order_id).strip()
             for response_id in response_order_ids
         ):
             return _broker_identity_error_result(
@@ -1187,8 +1243,6 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 raw,
                 response_order_id=response_order_id,
             )
-
-        status = raw_status.upper()
 
         if kind == "EXIT":
             status_map = {
@@ -1243,6 +1297,32 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         else:
             filled_qty = 0
 
+        terminal_remainder_status = None
+        terminal_remainder_qty = 0
+        if filled_qty > 0 and our in TERMINAL_FAILURE_STATUSES:
+            local_order_qty = _validated_broker_quantity(order.get("qty"))
+            if local_order_qty is None or local_order_qty <= 0:
+                unproven_result = _broker_fill_error_result(
+                    order,
+                    broker_order_id,
+                    raw,
+                    reason="BROKER_TERMINAL_FILL_REMAINDER_UNPROVEN",
+                    context={
+                        "_broker_terminal_fill_remainder_unproven": True,
+                        "terminal_status": our,
+                        "filled_qty": filled_qty,
+                        "order_qty": order.get("qty"),
+                    },
+                )
+                unproven_result["filled_qty"] = filled_qty
+                return unproven_result
+            if filled_qty >= local_order_qty:
+                our = "EXIT_FILLED" if kind == "EXIT" else "FILLED"
+            else:
+                terminal_remainder_status = our
+                terminal_remainder_qty = local_order_qty - filled_qty
+                our = "EXIT_PARTIAL_FILL" if kind == "EXIT" else "PARTIAL_FILL"
+
         if filled_qty > 0 and our not in {
             "FILLED",
             "PARTIAL_FILL",
@@ -1282,6 +1362,14 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             "reason": raw.get("reason") or status,
             "raw": raw,
         }
+        if terminal_remainder_status:
+            result.update(
+                {
+                    "terminal_remainder_status": terminal_remainder_status,
+                    "terminal_remainder_qty": terminal_remainder_qty,
+                    "terminal_remainder_reason": raw.get("reason") or status,
+                }
+            )
 
         # A broker fill with a non-finite or otherwise invalid price is not
         # executable truth. Hold before OSM/PM/exit-engine/broker side effects
@@ -4067,6 +4155,345 @@ def _mark_broker_fill_anomaly(osm, order: dict, *, reason: str, mapped: str | No
         )
         return False
 
+
+def _late_fill_already_reconciled(order: dict, filled_qty: int) -> bool:
+    marker = _canonical_handoff_meta(order).get("late_fill_reconciliation")
+    marker = marker if isinstance(marker, dict) else {}
+    if str(marker.get("status") or "").strip().upper() != "RECONCILED":
+        return False
+    try:
+        return int(marker.get("filled_qty") or 0) >= int(filled_qty or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _persist_late_fill_marker(
+    osm,
+    order: dict,
+    *,
+    status: str,
+    filled_qty: int,
+    avg_fill,
+    outcome: str,
+    position_id: str = "",
+    reason: str = "",
+) -> bool:
+    updater = getattr(osm, "update_order_meta", None)
+    if not callable(updater):
+        return False
+    try:
+        return updater(order.get("local_order_id"), {
+            "late_fill_reconciliation": {
+                "status": outcome,
+                "broker_status": status,
+                "filled_qty": int(filled_qty or 0),
+                "fill_price": avg_fill,
+                "position_id": str(position_id or ""),
+                "reason": str(reason or ""),
+                "recorded_at": now_utc_iso(),
+            }
+        }) is True
+    except Exception as exc:
+        log.error("[%s] late-fill marker write failed | local=%s error=%s",
+                  order.get("client_id"), order.get("local_order_id"), exc)
+        return False
+
+
+def _reconcile_entry_fill_economics(
+    broker,
+    order: dict,
+    result: dict,
+    *,
+    osm,
+    pm,
+    exit_engine,
+    data_broker,
+    filled_qty: int,
+    late: bool,
+) -> tuple[bool, str]:
+    """Materialize one confirmed ENTRY quantity without changing terminal state."""
+    if not pm:
+        audit(str(order.get("client_id") or "default"), "CRITICAL",
+              "ENTRY_FILL_POSITION_RECONCILIATION_UNAVAILABLE",
+              {"local_order_id": order.get("local_order_id"), "late": late})
+        return False, ""
+
+    normalized_result = dict(result)
+    normalized_result["filled_qty"] = int(filled_qty or 0)
+    price = _finite_float_or_none(normalized_result.get("avg_fill"))
+    if price is None or price <= 0:
+        return False, ""
+
+    try:
+        local_id = order.get("local_order_id")
+        signal_id = order.get("signal_id") or local_id
+        position_id = _open_position_safe(
+            pm,
+            order=order,
+            result=normalized_result,
+            plan_id=order.get("plan_id") or signal_id or local_id,
+            signal_id=signal_id,
+            local_id=local_id,
+            broker=broker,
+            quote_broker=data_broker,
+        )
+        if not position_id:
+            raise RuntimeError("canonical_position_create_failed")
+        stop_result = _establish_canonical_handoff_standing_stop(
+            broker=broker, order=order, qty=int(filled_qty or 0), entry_price=price
+        )
+        bind_result = _bind_filled_entry_position_id(order, position_id)
+        if not bind_result.get("ok"):
+            _emit_canonical_owner_handoff_failure(
+                order, position_id, {**bind_result, "standing_stop": stop_result}
+            )
+            return False, str(position_id)
+        seed_result = _seed_exit_engine(
+            exit_engine, position_id, order, normalized_result, signal_id
+        )
+        if not isinstance(seed_result, dict) or not seed_result.get("ok"):
+            seed_failure = seed_result if isinstance(seed_result, dict) else {
+                "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                "detail_reason": "seed_result_missing_or_invalid",
+            }
+            _emit_canonical_owner_handoff_failure(
+                order, position_id, dict(seed_failure)
+            )
+            return False, str(position_id)
+        owner_result = _verify_canonical_entry_owner(exit_engine, order, position_id)
+        if not owner_result.get("ok"):
+            _emit_canonical_owner_handoff_failure(
+                order, position_id, dict(owner_result)
+            )
+            return False, str(position_id)
+        if not _clear_canonical_owner_handoff_retry(order):
+            _emit_canonical_owner_handoff_failure(order, position_id, {
+                "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+                "detail_reason": "retry_state_clear_failed",
+            })
+            return False, str(position_id)
+        return True, str(position_id)
+    except Exception as exc:
+        _emit_canonical_owner_handoff_failure(order, "", {
+            "reason_code": "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
+            "detail_reason": "entry_fill_reconciliation_exception",
+            "exception_type": type(exc).__name__, "exception": str(exc), "late": late,
+        })
+        return False, ""
+
+
+def _reconcile_late_exit_fill(
+    order: dict,
+    result: dict,
+    *,
+    exit_engine,
+    filled_qty: int,
+) -> bool:
+    """Reconcile EXIT economics while leaving a terminal order status unchanged."""
+    late_result = dict(result)
+    late_result["status"] = "EXIT_FILLED" if str(result.get("status") or "").upper() == "EXIT_FILLED" else "EXIT_PARTIAL_FILL"
+    late_result["filled_qty"] = int(filled_qty or 0)
+    late_result["broker_order_id"] = order.get("broker_order_id")
+
+    try:
+        from ap.exit_fill_truth_guard import reconcile_confirmed_exit_fill
+
+        reconciled = reconcile_confirmed_exit_fill(order, late_result)
+        if not isinstance(reconciled, dict):
+            return False
+        projection = reconciled.get("projection")
+        position_id = str(
+            reconciled.get("position_id") or order.get("position_id") or ""
+        )
+        if exit_engine and position_id and projection is not None:
+            delta = max(0, int(filled_qty or 0) - int(order.get("filled_qty") or 0))
+            if bool(getattr(projection, "closed", False)):
+                exit_engine.mark_position_closed(
+                    position_id,
+                    reason="LATE_BROKER_EXIT_FILL_RECONCILED",
+                    qty_filled=delta or int(filled_qty or 0),
+                    fill_price=late_result.get("avg_fill"),
+                    local_order_id=str(order.get("local_order_id") or ""),
+                    broker_order_id=str(order.get("broker_order_id") or ""),
+                    cumulative_filled=int(filled_qty or 0),
+                    reconciled=True,
+                )
+            else:
+                exit_engine.note_partial_exit_fill(
+                    position_id,
+                    delta or int(filled_qty or 0),
+                    fill_price=late_result.get("avg_fill"),
+                    local_order_id=str(order.get("local_order_id") or ""),
+                    broker_order_id=str(order.get("broker_order_id") or ""),
+                    cumulative_filled=int(filled_qty or 0),
+                )
+        return True
+    except Exception as exc:
+        audit(
+            str(order.get("client_id") or "default"),
+            "CRITICAL",
+            "BROKER_LATE_EXIT_FILL_RECONCILIATION_FAILED",
+            {
+                "local_order_id": order.get("local_order_id"),
+                "broker_order_id": order.get("broker_order_id"),
+                "filled_qty": filled_qty,
+                "error": str(exc),
+            },
+        )
+        return False
+
+
+def _reconcile_late_broker_fill(
+    broker,
+    order: dict,
+    result: dict,
+    *,
+    osm,
+    pm,
+    exit_engine,
+    data_broker,
+    kind: str,
+    mapped: str,
+    filled_qty: int,
+) -> bool:
+    """Dedicated broker-fill recovery for rows already terminalized locally."""
+    if _late_fill_already_reconciled(order, filled_qty):
+        return True
+
+    if kind == "ENTRY":
+        reconciled, position_id = _reconcile_entry_fill_economics(
+            broker,
+            order,
+            result,
+            osm=osm,
+            pm=pm,
+            exit_engine=exit_engine,
+            data_broker=data_broker,
+            filled_qty=filled_qty,
+            late=True,
+        )
+    else:
+        reconciled = _reconcile_late_exit_fill(
+            order,
+            result,
+            exit_engine=exit_engine,
+            filled_qty=filled_qty,
+        )
+        position_id = str(order.get("position_id") or "")
+
+    if not reconciled:
+        audit(str(order.get("client_id") or "default"), "CRITICAL",
+              "BROKER_LATE_FILL_RECONCILIATION_FAILED", {
+                  "local_order_id": order.get("local_order_id"),
+                  "broker_order_id": order.get("broker_order_id"),
+                  "kind": kind, "mapped_status": mapped, "filled_qty": filled_qty,
+              })
+        return False
+
+    marker_persisted = _persist_late_fill_marker(
+        osm,
+        order,
+        status=mapped,
+        filled_qty=filled_qty,
+        avg_fill=result.get("avg_fill"),
+        outcome="RECONCILED",
+        position_id=position_id,
+        reason=result.get("reason"),
+    )
+    if not marker_persisted:
+        audit(str(order.get("client_id") or "default"), "CRITICAL",
+              "BROKER_LATE_FILL_MARKER_WRITE_FAILED", {
+                  "local_order_id": order.get("local_order_id"),
+                  "broker_order_id": order.get("broker_order_id"),
+                  "kind": kind, "filled_qty": filled_qty,
+              })
+        return False
+    emit_fill_event(
+        order,
+        decision="RECONCILED",
+        reason_code="BROKER_LATE_FILL_RECONCILED",
+        explanation=(
+            "Broker-confirmed fill was reconciled after local terminalization; "
+            "the terminal order state was preserved."
+        ),
+        result=result,
+        extra_context={"mapped_status": mapped, "filled_qty": filled_qty},
+    )
+    audit(str(order.get("client_id") or "default"), "WARNING",
+          "BROKER_LATE_FILL_RECONCILED", {
+              "local_order_id": order.get("local_order_id"),
+              "broker_order_id": order.get("broker_order_id"),
+              "kind": kind, "mapped_status": mapped, "filled_qty": filled_qty,
+          })
+    return True
+
+
+def _apply_terminal_fill_remainder(
+    osm,
+    order: dict,
+    result: dict,
+    *,
+    mapped: str,
+    filled_qty: int,
+    kind: str,
+) -> bool:
+    """Terminalize only the broker-confirmed unfilled remainder."""
+    terminal_status = str(result.get("terminal_remainder_status") or "").upper()
+    if terminal_status not in TERMINAL_FAILURE_STATUSES:
+        return True
+    local_id = order.get("local_order_id")
+    broker_id = order.get("broker_order_id")
+    client_id = order.get("client_id", "?")
+    reason = result.get("terminal_remainder_reason") or result.get("reason")
+    meta_patch = {
+        "terminal_fill_reconciliation": {
+            "broker_status": terminal_status,
+            "executed_qty": int(filled_qty or 0),
+            "remainder_qty": int(result.get("terminal_remainder_qty") or 0),
+            "recorded_at": now_utc_iso(),
+        }
+    }
+    terminal_applied = False
+    if osm:
+        try:
+            terminal_applied = osm.transition(
+                local_id,
+                terminal_status,
+                broker_order_id=broker_id,
+                filled_qty=int(filled_qty or 0),
+                fill_price=result.get("avg_fill"),
+                last_error=reason,
+                meta_patch=meta_patch,
+            ) is True
+        except Exception as exc:
+            log.error("[%s] OSM terminal remainder transition failed | local=%s error=%s", client_id, local_id, exc)
+    else:
+        _legacy_update_order_status(
+            local_id,
+            terminal_status,
+            filled_qty=int(filled_qty or 0),
+            error=reason,
+        )
+        terminal_applied = True
+
+    if not terminal_applied:
+        audit(client_id, "CRITICAL", "OSM_TERMINAL_REMAINDER_APPLY_FAILED", {
+            "local_order_id": local_id, "broker_order_id": broker_id,
+            "mapped_status": mapped, "terminal_status": terminal_status,
+            "filled_qty": filled_qty, "kind": kind,
+        })
+        return False
+
+    if kind == "ENTRY":
+        _release_entry_guards(order)
+    audit(client_id, "WARNING", f"ORDER_{terminal_status}_AFTER_FILL", {
+        "local_order_id": local_id, "broker_order_id": broker_id,
+        "kind": kind, "executed_qty": filled_qty,
+        "remainder_qty": result.get("terminal_remainder_qty"),
+    })
+    return True
+
+
 # =============================================================================
 # CORE — PROCESS ONE PENDING ORDER
 # =============================================================================
@@ -4265,27 +4692,35 @@ def process_pending_order(
     if mapped in ("FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL") and str(
         order.get("status") or ""
     ).upper() in TERMINAL_FAILURE_STATUSES:
-        reason = f"broker fill conflicts with local terminal status {order.get('status')}"
-        emit_fill_event(
+        _reconcile_late_broker_fill(
+            broker,
             order,
-            decision="ERROR",
-            reason_code="BROKER_FILL_LOCAL_TERMINAL_CONFLICT",
-            explanation=reason,
-            result=result,
+            result,
+            osm=osm,
+            pm=pm,
+            exit_engine=exit_engine,
+            data_broker=data_broker,
+            kind=kind,
+            mapped=mapped,
+            filled_qty=new_filled,
         )
+        return
+
+    if (
+        str(order.get("status") or "").upper() in TERMINAL_FAILURE_STATUSES
+        and mapped not in ("UNKNOWN", "ERROR")
+    ):
         audit(
             client_id,
-            "CRITICAL",
-            "BROKER_FILL_LOCAL_TERMINAL_CONFLICT",
+            "INFO",
+            "BROKER_TERMINAL_REPOLL_NO_FILL",
             {
                 "local_order_id": local_id,
                 "broker_order_id": broker_id,
                 "local_status": order.get("status"),
                 "broker_status": mapped,
-                "filled_qty": new_filled,
             },
         )
-        _mark_broker_fill_anomaly(osm, order, reason=reason, mapped=mapped)
         return
 
     # ── FILLED / EXIT_FILLED ────────────────────────────────────────────────
@@ -4726,6 +5161,31 @@ def process_pending_order(
             partial_result["filled_qty"] = new_filled
             partial_result["broker_order_id"] = broker_id
             _sync_exit_price(order, partial_result)
+
+        if result.get("terminal_remainder_status"):
+            if kind == "ENTRY":
+                entry_reconciled, _position_id = _reconcile_entry_fill_economics(
+                    broker,
+                    order,
+                    result,
+                    osm=osm,
+                    pm=pm,
+                    exit_engine=exit_engine,
+                    data_broker=data_broker,
+                    filled_qty=new_filled,
+                    late=False,
+                )
+                if not entry_reconciled:
+                    return
+            if not _apply_terminal_fill_remainder(
+                osm,
+                order,
+                result,
+                mapped=mapped,
+                filled_qty=new_filled,
+                kind=kind,
+            ):
+                return
 
         audit(
             client_id,

@@ -433,6 +433,8 @@ def test_pending_sql_attests_the_same_retry_prefix_constants(monkeypatch):
     assert fm.get_pending_orders("jason@example.com") == []
     assert "last_error" in captured["sql"]
     assert "canonical_owner_handoff_entry_handoff_proven" in captured["sql"]
+    assert "status IN ('CANCELED', 'REJECTED', 'EXPIRED')" in captured["sql"]
+    assert "updated_ts >= NOW() - INTERVAL '1 hour'" in captured["sql"]
     assert "UPPER(BTRIM(broker_order_id)) NOT IN" in captured["sql"]
     assert tuple(
         f"{prefix}%" for prefix in fm._CANONICAL_OWNER_HANDOFF_RETRY_ERROR_PREFIXES
@@ -1133,7 +1135,9 @@ def test_terminal_osm_false_does_not_release_entry_guards(monkeypatch):
     assert released == []
 
 
-def test_late_broker_fill_after_local_terminal_status_is_held(monkeypatch):
+def test_late_broker_fill_after_local_terminal_status_reaches_reconciliation(
+    monkeypatch,
+):
     from ap import fill_monitor as fm
 
     monkeypatch.setattr(
@@ -1142,6 +1146,7 @@ def test_late_broker_fill_after_local_terminal_status_is_held(monkeypatch):
         lambda *_args: {"status": "FILLED", "filled_qty": 1, "avg_fill": 1.46},
     )
     transition_calls = []
+    late_calls = []
 
     class _OSM:
         def transition(self, *args, **kwargs):
@@ -1151,10 +1156,13 @@ def test_late_broker_fill_after_local_terminal_status_is_held(monkeypatch):
         def increment_retry(self, *_args, **_kwargs):
             return None
 
+        def update_order_meta(self, *args, **kwargs):
+            return True
+
     monkeypatch.setattr(
         fm,
-        "_open_position_safe",
-        lambda *args, **kwargs: pytest.fail("late fill must not open a position"),
+        "_reconcile_late_broker_fill",
+        lambda *args, **kwargs: late_calls.append((args, kwargs)) or True,
     )
 
     fm.process_pending_order(
@@ -1167,6 +1175,180 @@ def test_late_broker_fill_after_local_terminal_status_is_held(monkeypatch):
     )
 
     assert transition_calls == []
+    assert late_calls
+    assert late_calls[0][1]["mapped"] == "FILLED"
+
+
+def test_late_entry_fill_materializes_position_without_terminal_transition(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {"status": "FILLED", "filled_qty": 1, "avg_fill": 1.46},
+    )
+    monkeypatch.setattr(fm, "trace_gate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
+    open_calls = []
+    marker_calls = []
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *args, **kwargs: open_calls.append((args, kwargs)) or "position-1",
+    )
+    monkeypatch.setattr(
+        fm,
+        "_establish_canonical_handoff_standing_stop",
+        lambda **kwargs: {"standing_stop_attempted": True, "state": "SUBMITTED", "protection_proven": True},
+    )
+    monkeypatch.setattr(fm, "_bind_filled_entry_position_id", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(fm, "_verify_canonical_entry_owner", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(fm, "_clear_canonical_owner_handoff_retry", lambda *args, **kwargs: True)
+
+    class _OSM:
+        def transition(self, *_args, **_kwargs):
+            pytest.fail("late fill must preserve the local terminal status")
+
+        def update_order_meta(self, local_order_id, patch):
+            marker_calls.append((local_order_id, patch))
+            return True
+
+    fm.process_pending_order(
+        object(),
+        _order(status="CANCELED"),
+        osm=_OSM(),
+        pm=SimpleNamespace(),
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
+    )
+
+    assert len(open_calls) == 1
+    assert marker_calls[0][1]["late_fill_reconciliation"]["status"] == "RECONCILED"
+
+
+def test_late_exit_fill_uses_canonical_reconciler_without_terminal_transition(monkeypatch):
+    from ap import exit_fill_truth_guard
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {
+            "status": "EXIT_PARTIAL_FILL",
+            "filled_qty": 1,
+            "avg_fill": 1.25,
+        },
+    )
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
+    reconciler_calls = []
+    monkeypatch.setattr(
+        exit_fill_truth_guard,
+        "reconcile_confirmed_exit_fill",
+        lambda order, result: reconciler_calls.append((order, result))
+        or {
+            "position_id": "position-1",
+            "projection": SimpleNamespace(closed=False),
+        },
+    )
+    partial_calls = []
+
+    class _ExitEngine:
+        def note_partial_exit_fill(self, *args, **kwargs):
+            partial_calls.append((args, kwargs))
+
+    class _OSM:
+        def transition(self, *_args, **_kwargs):
+            pytest.fail("late EXIT fill must preserve the local terminal status")
+
+        def update_order_meta(self, *_args, **_kwargs):
+            return True
+
+    fm.process_pending_order(
+        object(),
+        _order(
+            kind="EXIT",
+            local_order_id="exit-local-1",
+            broker_order_id="exit-broker-1",
+            position_id="position-1",
+            status="CANCELED",
+            qty=2,
+        ),
+        osm=_OSM(),
+        exit_engine=_ExitEngine(),
+        runtime_execution_mode="live",
+    )
+
+    assert reconciler_calls[0][1]["status"] == "EXIT_PARTIAL_FILL"
+    assert partial_calls
+
+
+@pytest.mark.parametrize("kind", ["ENTRY", "EXIT"])
+def test_terminal_cumulative_fill_updates_delta_then_terminalizes_remainder(
+    monkeypatch, kind
+):
+    from ap import fill_monitor as fm
+
+    mapped = "PARTIAL_FILL" if kind == "ENTRY" else "EXIT_PARTIAL_FILL"
+    transitions = []
+    sync_calls = []
+    released = []
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda *_args: {
+            "status": mapped,
+            "filled_qty": 1,
+            "avg_fill": 1.46,
+            "terminal_remainder_status": "CANCELED",
+            "terminal_remainder_qty": 1,
+            "terminal_remainder_reason": "canceled_after_partial_execution",
+        },
+    )
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda order: released.append(order))
+    monkeypatch.setattr(fm, "_sync_exit_price", lambda *args, **kwargs: sync_calls.append(1))
+    if kind == "ENTRY":
+        monkeypatch.setattr(
+            fm,
+            "_reconcile_entry_fill_economics",
+            lambda *args, **kwargs: (True, "position-1"),
+        )
+
+    class _OSM:
+        def transition(self, *args, **kwargs):
+            transitions.append((args, kwargs))
+            return True
+
+        def update_order_meta(self, *_args, **_kwargs):
+            return True
+
+    fm.process_pending_order(
+        object(),
+        _order(
+            kind=kind,
+            status="ACKNOWLEDGED" if kind == "ENTRY" else "EXIT_ACKNOWLEDGED",
+            local_order_id=f"{kind.lower()}-local-1",
+            broker_order_id=f"{kind.lower()}-broker-1",
+            position_id="position-1" if kind == "EXIT" else None,
+            qty=2,
+        ),
+        osm=_OSM(),
+        pm=SimpleNamespace() if kind == "ENTRY" else None,
+        exit_engine=SimpleNamespace(),
+        runtime_execution_mode="live",
+    )
+
+    assert [call[0][1] for call in transitions] == [mapped, "CANCELED"]
+    assert transitions[0][1]["filled_qty"] == 1
+    assert transitions[1][1]["filled_qty"] == 1
+    if kind == "ENTRY":
+        assert len(released) == 1
+    else:
+        assert sync_calls == [1]
 
 
 def test_pair_cancel_false_broker_response_does_not_transition(monkeypatch):
@@ -2111,11 +2293,15 @@ def test_filled_handoff_uses_durable_db_proof_when_broker_poll_unavailable(
         fm,
         "check_order_with_broker",
         lambda *_args: {
-            "status": "UNKNOWN",
+            "status": "ERROR",
             "filled_qty": 0,
             "avg_fill": 0.0,
-            "reason": "broker_timeout",
-            "raw": {},
+            "reason": "timeout",
+            "raw": {
+                "status": "ERROR",
+                "reason": "timeout",
+                "_broker_response_unavailable": True,
+            },
         },
     )
     monkeypatch.setattr(
