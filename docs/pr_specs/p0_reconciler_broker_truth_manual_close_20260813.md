@@ -99,8 +99,6 @@ Reuse `ap/manual_close_reconciliation.py` as an existing library. Modify it only
 
 The exact-path audit proved three reuse blockers in the current helper/finalizer seam: broker quantities/prices were coerced before strict validation; fill chronology could fall back to generic update timestamps or accept naive values; and the finalizer did not recheck external ownership or exact remaining quantity under its row lock. The amendment therefore keeps the existing architecture but adds only the corresponding fail-closed scalar, timestamp-provenance, durable-metadata, and locked-CAS guardrails in `ap/manual_close_reconciliation.py` and `ap/position_manager.py`.
 
-The follow-up runtime compatibility check found that Tradier's documented filled-order payload supplies `transaction_date` (the broker's last order update) rather than `last_fill_date`. The parser now accepts that broker-owned timestamp only as a chronology fallback for an otherwise exact final `FILLED` order; it still rejects naive/malformed timestamps and generic local `update_date`/`updated_at` fields. The stored metadata preserves which broker field was used.
-
 Expected test scope: one new focused regression module, plus minimal updates to existing reconciler/manual-close tests if required.
 
 Do not touch unless a directly proven compile/test requirement makes it unavoidable:
@@ -200,7 +198,7 @@ The helper should:
 6. require `sell_to_close` semantics;
 7. require real executed quantity > 0;
 8. require finite positive broker fill price;
-9. require a timezone-aware broker fill/event timestamp (explicit fill timestamp when available, otherwise Tradier `transaction_date` for a final filled order);
+9. require an explicit timezone-aware broker fill timestamp;
 10. require aggregate broker fill quantity to equal the position's current remaining quantity for a full close;
 11. preserve all matching broker order IDs for diagnostics;
 12. return a normalized exact-fill structure only after the existing selector says the evidence is exact.

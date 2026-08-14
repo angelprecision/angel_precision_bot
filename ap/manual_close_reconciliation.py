@@ -74,17 +74,6 @@ BROKER_FILL_TIMESTAMP_KEYS = (
     "filled_ts",
     "fill_ts",
 )
-# Tradier's documented order payload exposes ``transaction_date`` as the
-# order's last broker update and does not expose ``last_fill_date``. For a
-# final FILLED order, that broker-owned event timestamp is the only available
-# chronology field. It is accepted as a timestamp fallback only after the
-# order's exact status/side/quantity/price/identity checks pass; generic local
-# update fields remain deliberately unsupported.
-BROKER_ORDER_TIMESTAMP_KEY = "transaction_date"
-BROKER_ACCEPTED_TIMESTAMP_KEYS = (
-    *BROKER_FILL_TIMESTAMP_KEYS,
-    BROKER_ORDER_TIMESTAMP_KEY,
-)
 
 
 def _terminal_position_statuses() -> list[str]:
@@ -180,13 +169,12 @@ def parse_timestamp(value: Any) -> datetime | None:
 
 
 def parse_broker_fill_timestamp(value: Any) -> datetime | None:
-    """Parse a broker-provided fill/event timestamp, fail closed.
+    """Parse an explicit broker execution timestamp, fail closed.
 
     Generic local lifecycle timestamps are intentionally not accepted here. A
     broker timestamp must be timezone-aware (or an unambiguous numeric epoch),
-    because naive values cannot establish exit chronology. Tradier's
-    transaction_date is handled separately as the final order-event timestamp
-    when no explicit fill timestamp is present.
+    because naive values and last-updated timestamps cannot establish exit
+    chronology or execution provenance.
     """
     if value is None or value == "" or isinstance(value, bool):
         return None
@@ -494,19 +482,6 @@ def _broker_fill_timestamp(order: dict) -> tuple[datetime | None, str | None]:
             return None, None
         return first_ts, first_key
 
-    # The official Tradier order schema calls this field transaction_date and
-    # defines it as the order's last update. A final FILLED order has no
-    # separate fill-date field in that response, so retain this broker-owned
-    # timestamp for chronology after the status/side/economics checks in the
-    # caller. Do not fall through to local update/created timestamps.
-    if order_status(order) != "filled":
-        return None, None
-    raw_order_ts = order.get(BROKER_ORDER_TIMESTAMP_KEY)
-    if raw_order_ts is not None and raw_order_ts != "":
-        parsed_order_ts = parse_broker_fill_timestamp(raw_order_ts)
-        if parsed_order_ts is None:
-            return None, None
-        return parsed_order_ts, BROKER_ORDER_TIMESTAMP_KEY
     return None, None
 
 
@@ -649,7 +624,7 @@ def _validate_durable_fills(
             continue
         if (
             timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
-            or timestamp_key not in BROKER_ACCEPTED_TIMESTAMP_KEYS
+            or timestamp_key not in BROKER_FILL_TIMESTAMP_KEYS
         ):
             log.warning(
                 "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_PROVENANCE_INVALID "
@@ -945,7 +920,7 @@ def load_manual_close_state(
                     ).strip()
                     if (
                         timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
-                        or timestamp_key not in BROKER_ACCEPTED_TIMESTAMP_KEYS
+                        or timestamp_key not in BROKER_FILL_TIMESTAMP_KEYS
                     ):
                         # Legacy/adulterated external rows without an exact
                         # broker timestamp binding are not recovery truth.
@@ -1102,7 +1077,7 @@ def _row_matches_expected(
         and str(metadata.get("exit_fill_timestamp_key") or "").strip()
         == expected_timestamp_key
         and expected_timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
-        and expected_timestamp_key in BROKER_ACCEPTED_TIMESTAMP_KEYS
+        and expected_timestamp_key in BROKER_FILL_TIMESTAMP_KEYS
     )
 
 
@@ -1166,7 +1141,7 @@ def adopt_external_exit_fills(
                     or fill_price <= 0
                     or filled_at is None
                     or timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
-                    or timestamp_key not in BROKER_ACCEPTED_TIMESTAMP_KEYS
+                    or timestamp_key not in BROKER_FILL_TIMESTAMP_KEYS
                 ):
                     raise RuntimeError("external_exit_adoption_fill_invalid")
 
