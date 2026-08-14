@@ -3032,10 +3032,7 @@ class APOrderStateMachine:
                 cur = c.execute(
                     """
                     UPDATE orders
-                    SET contract = CONCAT(
-                            'DEFERRED:',
-                            COALESCE(NULLIF(symbol, ''), '')
-                        ),
+                    SET contract = 'DEFERRED:',
                         limit_price = 0,
                         qty = 0,
                         reserved_cost = 0,
