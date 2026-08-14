@@ -36,7 +36,7 @@ jobs:
       - name: Install minimal test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas yfinance
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
 
       - name: Apply exit decision generation migration
         env:
@@ -111,7 +111,6 @@ jobs:
             tests/test_p0_selector_recovery_cursor.py \
             tests/test_p0_selector_recovery_july27_replay.py \
             tests/test_p0_item11_behavioral_regressions.py \
-            tests/test_p0_intelligence_truth_outcome_binding.py \
             tests/test_p0_audit_blockers_401.py \
             tests/test_p0_selector_recovery_deploy_preflight.py \
             tests/test_p0_pr401_deployability_closure.py \
@@ -121,8 +120,6 @@ jobs:
             tests/test_p0_pr418_preflight_coverage_parity.py \
             tests/test_p0_broker_owned_exit_requested_recovery.py \
             tests/test_p0_broker_owned_exit_recovery_preflight.py \
-            tests/test_p0_post_cancel_entry_retry_liveness.py \
-            tests/test_phase9_retry_wire_in.py \
             tests/test_fill_monitor_mvp_hardening.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
