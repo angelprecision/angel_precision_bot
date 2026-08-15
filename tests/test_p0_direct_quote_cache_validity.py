@@ -23,6 +23,7 @@ import pytest
 
 from ap.contract_quote_revalidator import (
     fetch_direct_option_quote,
+    fetch_direct_option_quote_with_meta,
     direct_quote_is_valid,
     quote_is_cache_eligible,
     clear_quote_cache,
@@ -188,3 +189,43 @@ def test_pr471_budget_authority_symbols_unchanged():
     brk = SeqBroker([{"bid": 1.1, "ask": 1.2}])
     fetch_direct_option_quote(brk, OCC)
     assert _is_cached(brk)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# with_meta path — production-path coverage for the OTHER shared cache writer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_with_meta_valid_quote_caches_and_cache_hit_avoids_second_call():
+    """with_meta: a valid quote caches; a second call is served from cache."""
+    brk = SeqBroker([{"bid": 1.10, "ask": 1.20}])
+    m1 = fetch_direct_option_quote_with_meta(brk, OCC)
+    m2 = fetch_direct_option_quote_with_meta(brk, OCC)
+    assert m1["ok"] is True and m2["ok"] is True
+    assert m1["quote"]["bid"] == 1.10 and m2["quote"]["bid"] == 1.10
+    assert _is_cached(brk)
+    assert brk.calls == 1, "with_meta cache hit must avoid a second provider call"
+
+
+def test_with_meta_deceptive_invalid_then_valid_fresh_read_and_recovers():
+    """with_meta: a deceptive invalid first observation (NaN, then boolean) must
+    NOT be cached, so the next invocation performs a fresh provider read and
+    recovers the valid quote. NaN and boolean previously slipped past the
+    downstream validity gate, so they are exercised explicitly here.
+    """
+    # First observation NaN bid, second valid.
+    brk = SeqBroker([{"bid": float("nan"), "ask": 1.50}, {"bid": 1.00, "ask": 1.50}])
+    first = fetch_direct_option_quote_with_meta(brk, OCC)
+    assert not _is_cached(brk), "deceptive NaN first observation must not be cached"
+    second = fetch_direct_option_quote_with_meta(brk, OCC)
+    assert brk.calls == 2, "second with_meta invocation must perform a fresh provider read"
+    assert second["ok"] is True
+    assert second["quote"]["bid"] == 1.00, "recovered valid quote must be returned"
+    assert _is_cached(brk), "recovered valid quote must now be cached"
+
+    # Same contract, boolean-True deceptive first observation.
+    clear_quote_cache()
+    brk2 = SeqBroker([{"bid": True, "ask": 1.50}, {"bid": 1.25, "ask": 1.50}])
+    fetch_direct_option_quote_with_meta(brk2, OCC)
+    assert not _is_cached(brk2), "deceptive boolean-True first observation must not be cached"
+    rec = fetch_direct_option_quote_with_meta(brk2, OCC)
+    assert brk2.calls == 2, "boolean-poisoned cache must not suppress a fresh read"
+    assert rec["quote"]["bid"] == 1.25 and _is_cached(brk2)

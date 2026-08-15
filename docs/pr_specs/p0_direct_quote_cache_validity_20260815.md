@@ -54,11 +54,14 @@ selection-policy expansion.
 
 ## Tests (production-path)
 
-`tests/test_p0_direct_quote_cache_validity.py` (16 tests, all pass), covering
+`tests/test_p0_direct_quote_cache_validity.py` (18 tests, all pass), covering
 the 12 required cases: valid caches + cache-hit avoidance; zero bid; zero ask;
 negative; NaN; +/-Infinity; boolean; malformed; overflow; inverted;
 invalid-then-valid fresh-read recovery; invalid shapes rejected from selector
-authority; #471 budget behavior unchanged.
+authority; #471 budget behavior unchanged. Plus explicit production-path
+coverage for the second cache writer, `fetch_direct_option_quote_with_meta`:
+one valid-cache/cache-hit case, and one deceptive-invalid-then-valid
+fresh-provider-read case using NaN and boolean-True as the first observations.
 
 ## Regression
 
@@ -79,7 +82,15 @@ authority; #471 budget behavior unchanged.
 ## Recommendation
 
 Fix is proven and surgical (one file, both paths, strict validity, zero
-regressions). Recommend **MERGE** once exact-head P0 + DB hot-path CI are green.
+regressions). Recommend **MERGE** once the exact-head **P0 Regression Suite** is
+green.
+
+Release-gate note: the P0 Regression Suite already provisions a real
+PostgreSQL 17 service and runs against a live `DATABASE_URL`
+(`intelligence_test`), so its DB-backed coverage is included in that single
+workflow. There is **no separate DB-hot-path workflow to wait for** — a green
+P0 Regression run on the exact head is the DB-backed gate.
+
 **#464 should be closed as superseded.**
 
 Do not merge without explicit operator instruction.
