@@ -554,7 +554,12 @@ def _process_entry(monkeypatch, *, bind_result, seed_result):
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "trace_gate", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", lambda *args, **kwargs: True)
-    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        fm, "_cancel_pair_opposite", lambda *args, **kwargs: ("NOT_APPLICABLE", "test_mock")
+    )
+    monkeypatch.setattr(
+        fm, "_persist_filled_entry_pair_resolution_state", lambda *args, **kwargs: True
+    )
     monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **kwargs: calls.append("standing_stop"))
     monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "_record_position_create_failure", lambda order, reason: markers.append((order["client_id"], order["local_order_id"], reason)))
@@ -593,7 +598,12 @@ def test_jason_reconciler_shape_binds_before_seed_and_preserves_plan(monkeypatch
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "trace_gate", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", lambda *args, **kwargs: True)
-    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        fm, "_cancel_pair_opposite", lambda *args, **kwargs: ("NOT_APPLICABLE", "test_mock")
+    )
+    monkeypatch.setattr(
+        fm, "_persist_filled_entry_pair_resolution_state", lambda *args, **kwargs: True
+    )
     monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "_open_position_safe", lambda *args, **kwargs: POSITION_ID)
 

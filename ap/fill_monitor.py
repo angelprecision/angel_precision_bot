@@ -407,6 +407,14 @@ def _persist_filled_entry_handoff_state(
                         "position_id=%s",
                         "COALESCE(meta->>'filled_entry_handoff_state','') IN ('IN_PROGRESS','HOLD','')",
                         "meta->'filled_entry_guards_released' = 'true'::jsonb",
+                        # P0 amendment: the opposite 1-1 pair's cancellation
+                        # outcome must be durably proven — NOT_APPLICABLE (no
+                        # pair existed) or CONFIRMED (broker+local cancel
+                        # truth confirmed) — before COMPLETE can be written.
+                        # A crash between OSM FILLED and pair-cancel
+                        # resolution must never be able to reach COMPLETE.
+                        "COALESCE(meta->>'filled_entry_pair_resolution_state','') "
+                        "IN ('NOT_APPLICABLE','CONFIRMED')",
                     ]
                 )
                 params.append(str(position_id).strip())
@@ -442,6 +450,74 @@ def _persist_filled_entry_handoff_state(
     if position_id:
         order["position_id"] = str(position_id).strip()
     return True
+
+
+_PAIR_RESOLUTION_STATES = frozenset(
+    {"NOT_APPLICABLE", "CONFIRMED", "OUTCOME_UNPROVEN"}
+)
+
+
+def _pair_resolution_state(order: dict) -> str:
+    """Read the durable pair-resolution marker with zero normalization.
+
+    Unlike ``_filled_entry_handoff_state``, this deliberately does not
+    strip or uppercase.  This field only ever gets a canonical value from
+    ``_persist_filled_entry_pair_resolution_state``'s own validated write
+    path, so a value that isn't an exact match for one of
+    ``_PAIR_RESOLUTION_STATES`` (wrong case, trailing whitespace, wrong
+    type, or a genuinely missing key) must be treated as unproven, not
+    coerced into looking proven.
+    """
+    value = _order_meta_dict(order).get("filled_entry_pair_resolution_state")
+    return value if isinstance(value, str) else ""
+
+
+def _persist_filled_entry_pair_resolution_state(
+    order: dict,
+    state: str,
+    *,
+    detail: str = "",
+) -> bool:
+    """Durably record the opposite 1-1 pair's cancellation outcome.
+
+    This piggybacks on the existing handoff-namespace CAS write so no
+    schema migration or second write path is introduced.  The write itself
+    does not gate anything — the COMPLETE CAS predicate in
+    ``_persist_filled_entry_handoff_state`` is what refuses to let a
+    handoff finish while this field is missing or ``OUTCOME_UNPROVEN``.
+    """
+    state = str(state or "").strip().upper()
+    if state not in _PAIR_RESOLUTION_STATES:
+        log.critical(
+            "[%s] FILLED_ENTRY_PAIR_RESOLUTION_STATE_INVALID local=%s state=%r",
+            order.get("client_id"),
+            order.get("local_order_id"),
+            state,
+        )
+        return False
+    current_handoff_state = _filled_entry_handoff_state(order)
+    write_state = current_handoff_state if current_handoff_state in {
+        "IN_PROGRESS", "HOLD",
+    } else "IN_PROGRESS"
+    ok = _persist_filled_entry_handoff_state(
+        order,
+        write_state,
+        reason=f"filled_entry_pair_resolution_{state.lower()}",
+        retryable=(state == "OUTCOME_UNPROVEN"),
+        extra_meta={
+            "filled_entry_pair_resolution_state": state,
+            "filled_entry_pair_resolution_state_at": now_utc_iso(),
+            "filled_entry_pair_resolution_detail": str(detail or ""),
+        },
+    )
+    if not ok:
+        log.error(
+            "[%s] FILLED_ENTRY_PAIR_RESOLUTION_STATE_WRITE_FAILED local=%s state=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+            state,
+        )
+    return ok
 
 
 def get_interrupted_filled_entry_handoffs(client_id: str) -> list[dict]:
@@ -1111,40 +1187,13 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             "raw": raw,
         }
 
-        # A terminal broker fill must carry exact positive integral quantity
-        # and positive finite price before any OSM or downstream mutation.
-        if our in {"FILLED", "EXIT_FILLED"} and (
-            _strict_positive_integral(raw_filled_qty) is None
-            or _strict_positive_finite(raw_avg_fill) is None
-        ):
-            try:
-                _raw_qty_is_zero = (
-                    raw_filled_qty is None
-                    or (not isinstance(raw_filled_qty, bool) and float(raw_filled_qty) == 0)
-                )
-            except (TypeError, ValueError, OverflowError):
-                _raw_qty_is_zero = False
-            reason = "BROKER_FILLED_ZERO_QTY" if _raw_qty_is_zero else "BROKER_FILLED_TRUTH_INVALID"
-            client_id = str(order.get("client_id") or "default")
-            payload = {
-                "local_order_id": order.get("local_order_id"),
-                "broker_order_id": broker_order_id,
-                "kind": kind,
-                "mapped_status": our,
-                "raw_filled_qty": raw_filled_qty,
-                "raw_avg_fill": raw_avg_fill,
-            }
-            log.critical("[%s] %s | %s", client_id, reason, payload)
-            audit(client_id, "CRITICAL", reason, payload)
-            emit_fill_event(
-                order,
-                decision="ERROR",
-                reason_code=reason,
-                explanation="Broker terminal fill quantity/price is malformed or non-positive; lifecycle mutation blocked.",
-                result=result,
-                extra_context=payload,
-            )
-            return {**result, "status": "ERROR", "filled_qty": 0, "avg_fill": 0.0, "reason": reason}
+        # Scope correction (P0 amendment on #473): the strict positive-
+        # integral/positive-finite admission gate belongs only to the
+        # ENTRY-specific handoff boundary (_validate_filled_entry_admission),
+        # not to this shared broker-status mapper.  Applying it here blocked
+        # EXIT_FILLED collaterally, which is outside this PR's one job.  EXIT
+        # terminalization keeps its pre-existing PR #235 hardening below
+        # (filled_qty<=0 guard) unchanged.
 
         # PR #235 (hardening #3): broker FILLED / EXIT_FILLED with cumulative
         # filled_qty <= 0 is impossible truth for filled or partial-fill states.  Block the OSM transition and
@@ -1269,15 +1318,26 @@ def _release_entry_guards(order: dict):
 # PAIR MANAGER HELPER — BROKER CANCEL FIRST
 # =============================================================================
 
-def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None) -> None:
+def _cancel_pair_opposite(
+    order: dict, broker: BrokerAdapter, osm, alert_fn=None
+) -> tuple[str, str]:
     """
     On ENTRY fill: cancel the opposite side of a 1-1 pair.
 
     Broker cancel is attempted before local CANCELED transition.
     If broker id cannot be resolved, local order is not marked canceled.
+
+    Returns ``(pair_resolution_state, detail)`` where state is one of
+    ``NOT_APPLICABLE`` (no opposite pair existed for this fill),
+    ``CONFIRMED`` (an opposite pair existed and its broker+local
+    cancellation was durably confirmed), or ``OUTCOME_UNPROVEN`` (a pair
+    may have existed but cancellation could not be confirmed — the caller
+    must not treat the downstream handoff as safe to complete).  This
+    return value carries no cancel authority itself; it only reports what
+    this call actually did so the caller can persist a durable marker.
     """
     if not osm:
-        return
+        return "OUTCOME_UNPROVEN", "no_osm"
 
     try:
         from ap.signal_pair_manager import get_pair_manager
@@ -1288,7 +1348,7 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
         _pair_side, _pair_side_source = _resolve_order_option_side(order)
         if not _pair_side:
             _emit_side_unresolved(order, reason_code="PAIR_CANCEL_SIDE_UNRESOLVED", alert_fn=alert_fn)
-            return
+            return "OUTCOME_UNPROVEN", "PAIR_CANCEL_SIDE_UNRESOLVED"
 
         pair_manager = get_pair_manager()
         ticker = (order.get("symbol") or "").upper()
@@ -1302,7 +1362,7 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
         )
 
         if not cancel_local_id:
-            return
+            return "NOT_APPLICABLE", "no_opposite_pair"
 
         log.warning(
             "[%s] 1-1 PAIR FILL — canceling opposite local_order_id=%s",
@@ -1344,7 +1404,7 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
                 },
             )
             _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
-            return
+            return "OUTCOME_UNPROVEN", "PAIR_CANCEL_SKIPPED_NO_BROKER_ID"
 
         try:
             if hasattr(broker, "cancel_order"):
@@ -1383,7 +1443,7 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
                 },
             )
             _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
-            return
+            return "OUTCOME_UNPROVEN", "PAIR_CANCEL_BROKER_FAILED"
 
         ok = osm.transition(
             cancel_local_id,
@@ -1410,9 +1470,24 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
                     "side": side,
                 },
             )
+            # Broker cancel succeeded AND the local CANCELED transition was
+            # durably confirmed — both halves of "broker/local cancellation
+            # truth" required for CONFIRMED are now proven.
+            return "CONFIRMED", "PAIR_CANCEL_CONFIRMED"
+
+        # Broker-side cancel succeeded but the local CANCELED transition was
+        # not confirmed (e.g. a concurrent CAS miss).  The opposite order's
+        # local record cannot be trusted, so the pair outcome as a whole is
+        # not durably proven even though the broker call itself landed.
+        return "OUTCOME_UNPROVEN", "PAIR_CANCEL_LOCAL_TRANSITION_UNCONFIRMED"
 
     except ImportError:
-        pass
+        # The pairing subsystem itself is unavailable.  This is
+        # indistinguishable from "no pairing feature in this deployment" at
+        # the code level, but we cannot safely assume that from inside a
+        # fill-handling path — treat it as unproven rather than silently
+        # authorizing a handoff that might still have a live opposite order.
+        return "OUTCOME_UNPROVEN", "PAIR_MANAGER_IMPORT_UNAVAILABLE"
     except Exception as exc:
         msg = f"PAIR_CANCEL_MANAGER_FAILED | {order.get('symbol','?')} | local={order.get('local_order_id')} error={exc}"
         log.warning(msg)
@@ -1428,6 +1503,7 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
             },
         )
         _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
+        return "OUTCOME_UNPROVEN", f"PAIR_CANCEL_MANAGER_FAILED:{type(exc).__name__}"
 
 
 def _cancel_with_session(broker: BrokerAdapter, broker_order_id: str):
@@ -3126,6 +3202,40 @@ def recover_interrupted_filled_entry_handoff(
             "retryable": False,
         }
 
+    # P0 amendment: recovery has zero pair-cancel authority.  It must not
+    # call _cancel_pair_opposite, broker.cancel_order, or any cancellation
+    # path — it can only check whether the fresh-fill path already durably
+    # proved the opposite pair's outcome before the crash.  Applies equally
+    # to ACTIVE_EXISTING and ACTIVE_RECREATE: neither may proceed to bind/
+    # seed/guard-release/COMPLETE while the pair outcome is unproven.
+    pair_state = _pair_resolution_state(order)
+    if pair_state not in {"NOT_APPLICABLE", "CONFIRMED"}:
+        reason = "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=True,
+        )
+        emit_fill_event(
+            order,
+            decision="HOLD",
+            reason_code=reason,
+            explanation=(
+                "Opposite 1-1 pair cancellation outcome is not durably "
+                "proven; recovery has zero cancel authority and cannot "
+                "complete this handoff."
+            ),
+            result={"filled_qty": order.get("filled_qty"), "avg_fill": order.get("fill_price")},
+            extra_context={**authority, "pair_resolution_state": pair_state or None},
+        )
+        return {
+            **authority,
+            "disposition": "HOLD",
+            "reason_code": reason,
+            "retryable": True,
+        }
+
     local_id = str(order.get("local_order_id") or "").strip()
     signal_id = str(order.get("signal_id") or local_id).strip()
     plan_id = order.get("plan_id") or signal_id or local_id
@@ -3533,7 +3643,17 @@ def process_pending_order(
                 # Fresh-fill behavior remains pair-cancel -> local position ->
                 # optional standing stop.  The durable marker was written
                 # before OSM FILLED above; recovery never enters this branch.
-                _cancel_pair_opposite(order, broker, osm, alert_fn=alert_fn)
+                # P0 amendment: durably record the pair-cancel outcome
+                # immediately.  This does not block position creation on a
+                # non-crash fresh fill — it exists so a crash between here
+                # and the COMPLETE write leaves a fail-closed trail that the
+                # COMPLETE CAS predicate refuses to bypass.
+                _pair_state, _pair_detail = _cancel_pair_opposite(
+                    order, broker, osm, alert_fn=alert_fn
+                )
+                _persist_filled_entry_pair_resolution_state(
+                    order, _pair_state, detail=_pair_detail
+                )
                 position_id = _open_position_safe(
                     pm,
                     order=order,

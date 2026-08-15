@@ -6,6 +6,8 @@ import ast
 from datetime import date
 import inspect
 from pathlib import Path
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -46,7 +48,15 @@ def _order(**overrides):
         "filled_qty": 1,
         "fill_price": 1.58,
         "execution_mode": LIVE,
-        "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+        "meta": {
+            "filled_entry_handoff_state": "IN_PROGRESS",
+            # Most fills have no opposite 1-1 pair.  Existing tests below
+            # exercise bind/seed/guard-release/idempotency logic downstream
+            # of the pair-resolution gate, so the default here is resolved;
+            # the pair-resolution gate itself is tested explicitly with its
+            # own overrides further down this file.
+            "filled_entry_pair_resolution_state": "NOT_APPLICABLE",
+        },
     }
     row.update(overrides)
     return row
@@ -214,7 +224,14 @@ def test_fresh_fill_persists_in_progress_before_terminal_osm(monkeypatch):
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "trace_gate", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        fm, "_cancel_pair_opposite", lambda *args, **kwargs: ("NOT_APPLICABLE", "test_mock")
+    )
+    monkeypatch.setattr(
+        fm,
+        "_persist_filled_entry_pair_resolution_state",
+        lambda *args, **kwargs: True,
+    )
     monkeypatch.setattr(fm, "_open_position_safe", lambda *args, **kwargs: POSITION_ID)
     monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **kwargs: None)
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
@@ -255,7 +272,11 @@ def test_marker_persistence_failure_keeps_fill_nonterminal(monkeypatch):
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", lambda *args, **kwargs: False)
-    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: side_effects.append("cancel"))
+    monkeypatch.setattr(
+        fm,
+        "_cancel_pair_opposite",
+        lambda *args, **kwargs: (side_effects.append("cancel"), ("NOT_APPLICABLE", "test_mock"))[1],
+    )
     monkeypatch.setattr(fm, "_open_position_safe", lambda *args, **kwargs: side_effects.append("open"))
 
     fm.process_pending_order(
@@ -674,7 +695,11 @@ def test_active_recreate_recovery_opens_once_without_fresh_fill_side_effects(mon
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
     monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
     monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda *args, **kwargs: calls.append(("STOP", None)))
-    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: calls.append(("CANCEL", None)))
+    monkeypatch.setattr(
+        fm,
+        "_cancel_pair_opposite",
+        lambda *args, **kwargs: (calls.append(("CANCEL", None)), ("NOT_APPLICABLE", "test_mock"))[1],
+    )
 
     result = fm.recover_interrupted_filled_entry_handoff(
         broker=broker,
@@ -1015,3 +1040,558 @@ def test_interrupted_query_does_not_silently_filter_malformed_money_or_mode_trut
     assert "fill_price > 0" not in source
     assert "execution_mode IN ('live','paper')" not in source
     assert "OR (\n                      AND" not in source
+
+
+# =============================================================================
+# P0 AMENDMENT — durable pair-resolution state for the opposite 1-1 pair
+# =============================================================================
+
+
+class _FakePairOSM:
+    """Minimal OSM double for exercising _cancel_pair_opposite directly."""
+
+    def __init__(self, *, opposite_broker_id="OPP-BROKER-1", transition_result=True):
+        self.opposite_broker_id = opposite_broker_id
+        self.transition_result = transition_result
+        self.transitions = []
+
+    def get_order(self, local_order_id):
+        if not self.opposite_broker_id:
+            return {"broker_order_id": None}
+        return {"broker_order_id": self.opposite_broker_id}
+
+    def transition(self, local_order_id, status, **kwargs):
+        self.transitions.append((local_order_id, status, kwargs))
+        return self.transition_result
+
+
+def _install_fake_pair_manager(monkeypatch, *, cancel_local_id="opposite-local-id", raise_on_get=None):
+    fake_module = types.ModuleType("ap.signal_pair_manager")
+
+    class _FakeManager:
+        def on_fill(self, **kwargs):
+            return cancel_local_id
+
+    def get_pair_manager():
+        if raise_on_get is not None:
+            raise raise_on_get
+        return _FakeManager()
+
+    fake_module.get_pair_manager = get_pair_manager
+    monkeypatch.setitem(sys.modules, "ap.signal_pair_manager", fake_module)
+    return fake_module
+
+
+def test_pair_cancel_returns_not_applicable_when_no_opposite_exists(monkeypatch):
+    _install_fake_pair_manager(monkeypatch, cancel_local_id=None)
+    osm = _FakePairOSM()
+    broker = _Broker()
+
+    state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
+
+    assert state == "NOT_APPLICABLE"
+    assert broker.mutations == []
+    assert osm.transitions == []
+
+
+def test_pair_cancel_returns_confirmed_when_broker_and_local_cancel_both_land(monkeypatch):
+    _install_fake_pair_manager(monkeypatch, cancel_local_id="opposite-local-id")
+    osm = _FakePairOSM(opposite_broker_id="OPP-1", transition_result=True)
+    broker = _Broker()
+    calls = []
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    broker.cancel_order = lambda *a, **k: calls.append(("cancel", a, k))
+
+    state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
+
+    assert state == "CONFIRMED"
+    assert calls == [("cancel", ("OPP-1",), {})]
+    assert osm.transitions[0][1] == "CANCELED"
+
+
+def test_pair_cancel_returns_outcome_unproven_when_local_cas_misses(monkeypatch):
+    _install_fake_pair_manager(monkeypatch, cancel_local_id="opposite-local-id")
+    osm = _FakePairOSM(opposite_broker_id="OPP-1", transition_result=False)
+    broker = _Broker()
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    broker.cancel_order = lambda *a, **k: None
+
+    state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_CANCEL_LOCAL_TRANSITION_UNCONFIRMED"
+
+
+def test_pair_cancel_returns_outcome_unproven_when_broker_cancel_raises(monkeypatch):
+    _install_fake_pair_manager(monkeypatch, cancel_local_id="opposite-local-id")
+    osm = _FakePairOSM(opposite_broker_id="OPP-1")
+    broker = _Broker()
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+
+    def raise_cancel(*a, **k):
+        raise RuntimeError("broker down")
+
+    broker.cancel_order = raise_cancel
+
+    state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_CANCEL_BROKER_FAILED"
+    assert osm.transitions == []
+
+
+def test_pair_cancel_returns_outcome_unproven_when_opposite_broker_id_missing(monkeypatch):
+    _install_fake_pair_manager(monkeypatch, cancel_local_id="opposite-local-id")
+    osm = _FakePairOSM(opposite_broker_id=None)
+    broker = _Broker()
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+
+    state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_CANCEL_SKIPPED_NO_BROKER_ID"
+    assert broker.mutations == []
+
+
+def test_pair_cancel_returns_outcome_unproven_when_side_unresolved(monkeypatch):
+    _install_fake_pair_manager(monkeypatch, cancel_local_id="opposite-local-id")
+    osm = _FakePairOSM()
+    broker = _Broker()
+    order = _order(direction=None, contract="NOTOCC")
+
+    state, detail = fm._cancel_pair_opposite(order, broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_CANCEL_SIDE_UNRESOLVED"
+    assert broker.mutations == []
+
+
+def test_pair_cancel_returns_outcome_unproven_on_import_error(monkeypatch):
+    monkeypatch.setitem(sys.modules, "ap.signal_pair_manager", None)
+    osm = _FakePairOSM()
+    broker = _Broker()
+
+    state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_MANAGER_IMPORT_UNAVAILABLE"
+
+
+def test_pair_cancel_returns_outcome_unproven_on_manager_exception(monkeypatch):
+    _install_fake_pair_manager(monkeypatch, raise_on_get=RuntimeError("manager broken"))
+    osm = _FakePairOSM()
+    broker = _Broker()
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+
+    state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail.startswith("PAIR_CANCEL_MANAGER_FAILED")
+
+
+def test_pair_cancel_returns_outcome_unproven_without_osm():
+    state, detail = fm._cancel_pair_opposite(_order(), _Broker(), None)
+    assert state == "OUTCOME_UNPROVEN"
+
+
+# --- Crash-matrix requirement 1: crash after OSM FILLED but before pair
+#     cancellation resolves -> restart must not cancel and must not COMPLETE.
+
+
+def test_crash_before_pair_cancel_resolution_holds_on_restart(monkeypatch):
+    # The fresh-fill path never got far enough to write ANY pair-resolution
+    # marker before crashing -- meta shows IN_PROGRESS handoff with no
+    # filled_entry_pair_resolution_state key at all, exactly like a process
+    # that died right after OSM FILLED committed.
+    order = _order(
+        position_id=None,
+        meta={"filled_entry_handoff_state": "IN_PROGRESS"},
+    )
+    calls = []
+    cancel_calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+    monkeypatch.setattr(
+        fm,
+        "_cancel_pair_opposite",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("recovery must not cancel pair")),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not proceed past pair gate")),
+    )
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=_Broker([_broker_position()]),
+        order=order,
+        pm=_PM(),
+        exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+    assert "COMPLETE" not in [state for state, _ in calls]
+    assert cancel_calls == []
+
+
+# --- Crash-matrix requirement 2: broker cancel may have happened but local
+#     confirmation never landed -> restart must not repeat the cancel and
+#     must hold.
+
+
+def test_crash_after_ambiguous_pair_cancel_holds_without_repeating_cancel(monkeypatch):
+    order = _order(
+        position_id=None,
+        meta={
+            "filled_entry_handoff_state": "IN_PROGRESS",
+            "filled_entry_pair_resolution_state": "OUTCOME_UNPROVEN",
+            "filled_entry_pair_resolution_detail": "PAIR_CANCEL_LOCAL_TRANSITION_UNCONFIRMED",
+        },
+    )
+    calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+    monkeypatch.setattr(
+        fm,
+        "_cancel_pair_opposite",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("recovery must not cancel pair")),
+    )
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=_Broker([_broker_position()]),
+        order=order,
+        pm=_PM(),
+        exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+    assert "COMPLETE" not in [state for state, _ in calls]
+
+
+# --- Crash-matrix requirement 3: fresh fill with no applicable pair
+#     durably records NOT_APPLICABLE and may complete normally.
+
+
+def test_fresh_fill_no_pair_persists_not_applicable_and_completes(monkeypatch):
+    order = _order(status="ACKNOWLEDGED", filled_qty=0, meta={})
+    osm = _OSM()
+    persisted = []
+    monkeypatch.setattr(
+        fm, "check_order_with_broker",
+        lambda *_a, **_k: {"status": "FILLED", "filled_qty": 1, "avg_fill": 1.58, "raw": {}},
+    )
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "trace_gate", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *a, **k: ("NOT_APPLICABLE", "no_opposite_pair"))
+    monkeypatch.setattr(fm, "_open_position_safe", lambda *a, **k: POSITION_ID)
+    monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **k: None)
+    monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **k: (True, "BOUND"))
+    monkeypatch.setattr(fm, "_seed_exit_engine", lambda *a, **k: (True, "SEEDED"))
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda *a, **k: None)
+
+    def persist(order_arg, state, **kwargs):
+        persisted.append((state, kwargs.get("extra_meta")))
+        meta = dict(order_arg.get("meta") or {})
+        meta["filled_entry_handoff_state"] = state if state != "COMPLETE" else "COMPLETE"
+        if kwargs.get("extra_meta"):
+            meta.update(kwargs["extra_meta"])
+        order_arg["meta"] = meta
+        return True
+
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", persist)
+
+    fm.process_pending_order(
+        _Broker(), order, osm=osm, pm=_PM(), exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+    )
+
+    pair_writes = [p for _, p in persisted if p and "filled_entry_pair_resolution_state" in p]
+    assert pair_writes and pair_writes[0]["filled_entry_pair_resolution_state"] == "NOT_APPLICABLE"
+    assert order["meta"]["filled_entry_handoff_state"] == "COMPLETE"
+
+
+# --- Crash-matrix requirement 4: fresh fill with confirmed opposite
+#     cancellation durably records CONFIRMED and may complete normally.
+
+
+def test_fresh_fill_confirmed_pair_cancel_persists_confirmed_and_completes(monkeypatch):
+    order = _order(status="ACKNOWLEDGED", filled_qty=0, meta={})
+    osm = _OSM()
+    persisted = []
+    monkeypatch.setattr(
+        fm, "check_order_with_broker",
+        lambda *_a, **_k: {"status": "FILLED", "filled_qty": 1, "avg_fill": 1.58, "raw": {}},
+    )
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "trace_gate", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *a, **k: ("CONFIRMED", "PAIR_CANCEL_CONFIRMED"))
+    monkeypatch.setattr(fm, "_open_position_safe", lambda *a, **k: POSITION_ID)
+    monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **k: None)
+    monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **k: (True, "BOUND"))
+    monkeypatch.setattr(fm, "_seed_exit_engine", lambda *a, **k: (True, "SEEDED"))
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda *a, **k: None)
+
+    def persist(order_arg, state, **kwargs):
+        persisted.append((state, kwargs.get("extra_meta")))
+        meta = dict(order_arg.get("meta") or {})
+        meta["filled_entry_handoff_state"] = state
+        if kwargs.get("extra_meta"):
+            meta.update(kwargs["extra_meta"])
+        order_arg["meta"] = meta
+        return True
+
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", persist)
+
+    fm.process_pending_order(
+        _Broker(), order, osm=osm, pm=_PM(), exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+    )
+
+    pair_writes = [p for _, p in persisted if p and "filled_entry_pair_resolution_state" in p]
+    assert pair_writes and pair_writes[0]["filled_entry_pair_resolution_state"] == "CONFIRMED"
+    assert order["meta"]["filled_entry_handoff_state"] == "COMPLETE"
+
+
+# --- Crash-matrix requirements 5 & 6: terminal recovery with CONFIRMED or
+#     NOT_APPLICABLE takes zero pair-cancel calls and may complete.
+
+
+@pytest.mark.parametrize("pair_state", ["CONFIRMED", "NOT_APPLICABLE"])
+def test_terminal_recovery_completes_when_pair_resolution_proven(monkeypatch, pair_state):
+    order = _order(
+        position_id=POSITION_ID,
+        meta={
+            "filled_entry_handoff_state": "IN_PROGRESS",
+            "filled_entry_pair_resolution_state": pair_state,
+        },
+    )
+    pm = _PM([_existing_position()])
+    broker = _Broker([_broker_position()])
+    calls = []
+    release_calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+    monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
+    monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(
+        fm,
+        "_cancel_pair_opposite",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("recovery must not cancel pair")),
+    )
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=broker,
+        order=order,
+        osm=_OSM(),
+        pm=pm,
+        exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "ACTIVE_EXISTING"
+    assert result["completed"] is True
+    assert release_calls == [True]
+    assert broker.mutations == []
+    assert "COMPLETE" in [state for state, _ in calls]
+
+
+# --- Crash-matrix requirement 7: terminal recovery with OUTCOME_UNPROVEN
+#     takes zero pair-cancel calls, holds, and never completes.
+
+
+def test_terminal_recovery_holds_when_pair_resolution_unproven(monkeypatch):
+    order = _order(
+        position_id=POSITION_ID,
+        meta={
+            "filled_entry_handoff_state": "IN_PROGRESS",
+            "filled_entry_pair_resolution_state": "OUTCOME_UNPROVEN",
+        },
+    )
+    pm = _PM([_existing_position()])
+    broker = _Broker([_broker_position()])
+    calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+    monkeypatch.setattr(
+        fm,
+        "_bind_filled_entry_durable_identity",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not bind while pair unproven")),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_cancel_pair_opposite",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("recovery must not cancel pair")),
+    )
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=broker,
+        order=order,
+        osm=_OSM(),
+        pm=pm,
+        exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+    assert broker.mutations == []
+    assert "COMPLETE" not in [state for state, _ in calls]
+
+
+# --- Crash-matrix requirement 8: malformed/ambiguous pair-resolution truth
+#     (unexpected string, wrong type) fails closed exactly like a missing
+#     value -- never treated as proof.
+
+
+@pytest.mark.parametrize(
+    "malformed_value",
+    ["", "confirmed", "NOT-APPLICABLE", "CONFIRMED ", None, 1, True, ["CONFIRMED"]],
+)
+def test_malformed_pair_resolution_truth_fails_closed(monkeypatch, malformed_value):
+    order = _order(
+        position_id=POSITION_ID,
+        meta={
+            "filled_entry_handoff_state": "IN_PROGRESS",
+            "filled_entry_pair_resolution_state": malformed_value,
+        },
+    )
+    pm = _PM([_existing_position()])
+    broker = _Broker([_broker_position()])
+    calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+    monkeypatch.setattr(
+        fm,
+        "_bind_filled_entry_durable_identity",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not bind on malformed pair truth")),
+    )
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=broker,
+        order=order,
+        osm=_OSM(),
+        pm=pm,
+        exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+    assert "COMPLETE" not in [state for state, _ in calls]
+
+
+def test_complete_write_sql_requires_pair_resolution_proof():
+    source = inspect.getsource(fm._persist_filled_entry_handoff_state)
+    assert (
+        "COALESCE(meta->>'filled_entry_pair_resolution_state','') "
+        in source
+    )
+    assert "IN ('NOT_APPLICABLE','CONFIRMED')" in source
+
+
+def test_recovery_never_calls_cancel_pair_opposite_statically():
+    source = inspect.getsource(fm.recover_interrupted_filled_entry_handoff)
+    tree = ast.parse(source)
+    call_names = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name))
+    }
+    assert "_cancel_pair_opposite" not in call_names
+
+
+# =============================================================================
+# SCOPE CORRECTION — EXIT terminalization semantics must be unchanged
+# =============================================================================
+
+
+def test_check_order_with_broker_no_longer_forces_exit_error_on_malformed_price():
+    source = inspect.getsource(fm.check_order_with_broker)
+    assert "BROKER_FILLED_TRUTH_INVALID" not in source
+
+
+def test_exit_zero_qty_still_blocked_by_pre_existing_pr235_guard():
+    source = inspect.getsource(fm.check_order_with_broker)
+    assert "PR #235 (hardening #3)" in source
+    assert "EXIT_FILLED" in source.split("PR #235 (hardening #3)")[1][:400]
+
+
+def test_entry_admission_boundary_still_enforces_strict_qty_and_price():
+    source = inspect.getsource(fm._validate_filled_entry_admission)
+    assert "_strict_positive_integral(result.get(\"filled_qty\"))" in source
+    assert "_strict_positive_finite(result.get(\"avg_fill\"))" in source
+
+
+# =============================================================================
+# WINDOW E — behavioral owner-rehydration proof, not only startup ordering
+# =============================================================================
+
+
+def test_seed_from_db_rehydrates_exactly_one_owner_for_complete_position(monkeypatch):
+    """A COMPLETE canonical position must have exactly one behavior-active
+    exit-engine owner after a full process restart -- not just the right
+    startup call order.  This builds one exact active DB position row (as
+    a COMPLETE filled-entry handoff would have left it), rehydrates a
+    fresh exit engine from it, and asserts identity, cardinality, and zero
+    broker mutation authority.
+    """
+    import ap_exit_engine
+
+    position_row = {
+        "id": POSITION_ID,
+        "client_id": CLIENT,
+        "execution_mode": LIVE,
+        "contract": CONTRACT,
+        "symbol": "PEP",
+        "underlying": "PEP",
+        "direction": "CALL",
+        "qty": 1,
+        "quantity_remaining": 1,
+        "avg_fill": 1.58,
+        "underlying_entry": 141.0,
+        "target_underlying": 145.0,
+        "stop_underlying": 138.0,
+        "local_order_id": LOCAL_ID,
+        "broker_order_id": BROKER_ID,
+        "signal_id": LOCAL_ID,
+        "scale_outs_done": 0,
+        "meta": {},
+    }
+    pm = _PM([position_row])
+
+    class _MutationTrapBroker:
+        def submit_order(self, **kwargs):
+            raise AssertionError("rehydration must not submit")
+
+        def cancel_order(self, *a, **kwargs):
+            raise AssertionError("rehydration must not cancel")
+
+        def place_stop_order(self, **kwargs):
+            raise AssertionError("rehydration must not place a stop")
+
+    engine = ap_exit_engine.APExitEngine(broker=_MutationTrapBroker())
+
+    engine.seed_from_db(pm)
+
+    owners = [
+        mp for mp in engine._positions if str(mp.position_id) == POSITION_ID
+    ]
+    assert len(owners) == 1
+    owner = owners[0]
+    assert owner.client_id == CLIENT
+    assert owner.execution_mode == LIVE
+    assert owner.option_symbol == CONTRACT
+    assert owner.position_id == POSITION_ID
+    assert engine._positions_by_id.get(POSITION_ID) is owner
