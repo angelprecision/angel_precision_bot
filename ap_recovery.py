@@ -3391,9 +3391,20 @@ class APStartupRecovery:
                                AND o.signal_id = trade_queue.signal_id
                                AND o.kind = 'ENTRY'
                                AND o.status = 'PENDING_TRIGGER'
-                               AND o.broker_order_id IS NULL
-                               AND o.submitted_ts IS NULL
-                               AND o.filled_ts IS NULL
+                               AND (
+                                     NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NOT NULL
+                                  OR o.submitted_ts IS NOT NULL
+                                  OR (
+                                         o.filled_ts IS NULL
+                                     AND o.submitted_ts IS NULL
+                                     AND (
+                                           NULLIF(BTRIM(COALESCE(o.broker_order_id, '')), '') IS NULL
+                                        OR UPPER(BTRIM(COALESCE(o.broker_order_id, ''))) IN (
+                                               'N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE'
+                                           )
+                                        )
+                                     )
+                                  )
                            )
                     """,
                     (_marker_payload, self.client_id, cutoff_utc),
@@ -3426,6 +3437,9 @@ class APStartupRecovery:
                            o.pattern,
                            o.timeframe,
                            o.meta,
+                           o.broker_order_id,
+                           o.submitted_ts,
+                           o.filled_ts,
                            tq.status     AS _tq_status,
                            tq.last_error AS _tq_last_error
                     FROM orders o
@@ -3441,9 +3455,20 @@ class APStartupRecovery:
                       AND o.kind = 'ENTRY'
                       AND o.status = 'PENDING_TRIGGER'
                       AND o.created_ts >= %s
-                      AND o.broker_order_id IS NULL
-                      AND o.submitted_ts IS NULL
-                      AND o.filled_ts IS NULL
+                      AND (
+                            NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NOT NULL
+                         OR o.submitted_ts IS NOT NULL
+                         OR (
+                                o.filled_ts IS NULL
+                            AND o.submitted_ts IS NULL
+                            AND (
+                                  NULLIF(BTRIM(COALESCE(o.broker_order_id, '')), '') IS NULL
+                               OR UPPER(BTRIM(COALESCE(o.broker_order_id, ''))) IN (
+                                      'N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE'
+                                  )
+                               )
+                            )
+                         )
                       AND (
                             tq.status IS NULL           -- no paired queue row (legacy safety)
                          OR tq.status = 'WATCHING'      -- fresh eligible pair

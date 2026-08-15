@@ -3711,6 +3711,7 @@ class ClientRunner(threading.Thread):
                               AND   o.created_ts < NOW() - (%s || ' seconds')::interval
                               AND   o.created_ts < to_timestamp(%s)
                               AND   o.submitted_ts IS NULL
+                              AND   NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NULL
                               AND   o.filled_ts IS NULL
                               AND   o.position_id IS NULL
                               AND   (

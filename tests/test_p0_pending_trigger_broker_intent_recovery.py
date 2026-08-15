@@ -399,6 +399,77 @@ def test_startup_watcher_reseed_holds_submit_intent_before_ptr(monkeypatch):
     watcher.watch.assert_not_called()
 
 
+def test_startup_phantom_cleanup_excludes_submit_intent_before_reconciliation(monkeypatch):
+    import client_runner
+
+    sql_calls = []
+
+    class Cursor:
+        rowcount = 0
+
+        def execute(self, sql, _params=None):
+            sql_calls.append(" ".join(str(sql).split()))
+            return self
+
+        def fetchone(self):
+            return (0, 0)
+
+    @contextmanager
+    def fake_conn():
+        yield Cursor()
+
+    monkeypatch.setattr(db, "conn", fake_conn)
+    monkeypatch.setattr(client_runner, "run_with_retry", lambda fn, *args, **kwargs: fn())
+
+    runner = object.__new__(client_runner.ClientRunner)
+    runner.email = CLIENT_ID
+    runner.mode = "PAPER"
+    runner._runner_startup_ts = 0
+    runner._clear_old_phantom_orders()
+
+    candidate_sql = sql_calls[0]
+    assert "NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NULL" in candidate_sql
+
+
+def test_startup_watcher_reseed_sql_holds_submit_evidence_before_queue_reset(monkeypatch):
+    sql_calls = []
+
+    class Cursor:
+        rowcount = 0
+
+        def execute(self, sql, _params=None):
+            sql_calls.append(" ".join(str(sql).split()))
+            return self
+
+        def fetchall(self):
+            return []
+
+    @contextmanager
+    def fake_conn():
+        yield Cursor()
+
+    monkeypatch.setattr(db, "conn", fake_conn)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn, *args, **kwargs: fn())
+
+    recovery = APStartupRecovery(
+        client_id=CLIENT_ID,
+        broker=MagicMock(),
+        osm=MagicMock(client_id=CLIENT_ID),
+        pm=None,
+        master_control=types.SimpleNamespace(mode="PAPER"),
+        entry_watcher=MagicMock(),
+    )
+    recovery._reseed_watchers({"watchers_requeued": 0})
+
+    reset_sql, orphan_sql = sql_calls
+    for sql in (reset_sql, orphan_sql):
+        assert "submit_intent_at" in sql
+        assert "submitted_ts IS NOT NULL" in sql
+    assert "NULLIF(BTRIM(COALESCE(o.broker_order_id, '')), '') IS NULL" in reset_sql
+    assert "o.broker_order_id" in orphan_sql
+    assert "o.submitted_ts" in orphan_sql
+
+
 def test_order_monitor_holds_submit_intent_before_hydration_or_rearm():
     row = _row(created_ts=datetime.now(timezone.utc) - timedelta(days=4))
     monitor = object.__new__(APOrderMonitor)
