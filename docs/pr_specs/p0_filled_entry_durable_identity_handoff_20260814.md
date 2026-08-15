@@ -79,12 +79,29 @@ For every terminal broker-confirmed ENTRY fill, before canonical exit-engine ado
 orders.client_id            == positions.client_id
 orders.execution_mode       == positions.execution_mode == exact live|paper
 orders.contract             == positions.contract       == exact OCC contract
-orders.signal_id            == positions.signal_id      when present
-orders.plan_id              == positions.plan_id        when present
 orders.local_order_id       == positions.local_order_id
 orders.broker_order_id      == positions.broker_order_id
 orders.position_id          == positions.id
 ```
+
+Signal and plan provenance are fenced separately:
+
+```text
+signal_id:
+  - populated ENTRY/position values must agree exactly;
+  - the reconciler-plan exception requires an exact, nonblank ENTRY and
+    position signal_id.
+
+plan_id:
+  - normally the ENTRY and position values must agree;
+  - the one permitted exception is a position plan exactly shaped as
+    reconciled:{exact OCC}:{nonblank fingerprint}, provided client_id,
+    execution_mode, OCC, signal_id, local_order_id and broker_order_id
+    are all exact as described above.
+```
+
+The reconciled plan is provenance and **must not be overwritten**. Every other
+plan mismatch fails closed.
 
 The identity must be proven by rereading durable DB state after the write.
 
@@ -561,4 +578,6 @@ FILLED ENTRY with broker id
 
 That state must become impossible on the normal fill path without adding any new trading authority.
 
-**Current verdict: DRAFT / SPEC ONLY. Codex may implement only within the hard scope above. No merge or deployment is authorized.**
+**Current verdict: IMPLEMENTED / REVIEWED.** The scoped implementation and
+exact-head P0 verification passed. The PR remains open/Draft pending formal
+review; no merge or deployment is authorized by this PR.
