@@ -171,15 +171,13 @@ def test_exact_match_adopts_only_submitted_for_every_remote_status():
 
         assert result["reason_code"] == "BROKER_ORDER_ADOPTED"
         assert result["status"] == "SUBMITTED"
-        osm.transition.assert_called_once_with(
-            LOCAL_ORDER_ID,
-            "SUBMITTED",
-            broker_order_id="TR-JNJ-472",
-        )
+        osm.transition.assert_called_once()
+        assert osm.transition.call_args.args[:2] == (LOCAL_ORDER_ID, "SUBMITTED")
         transition_kwargs = osm.transition.call_args.kwargs
+        assert transition_kwargs["broker_order_id"] == "TR-JNJ-472"
+        assert transition_kwargs["submitted_ts"]
         assert "filled_qty" not in transition_kwargs
         assert "fill_price" not in transition_kwargs
-        assert "submitted_ts" not in transition_kwargs
         patch = osm.update_order_meta.call_args.args[1]
         assert patch["broker_reconcile_status"] == remote_status
         assert patch["lifecycle_state"] == "SUBMITTED"
@@ -197,11 +195,11 @@ def test_existing_broker_id_repairs_pending_trigger_to_submitted():
 
     assert result["reason_code"] == "RECONCILE_BROKER_ORDER_PRESENT"
     assert result["status"] == "SUBMITTED"
-    osm.transition.assert_called_once_with(
-        LOCAL_ORDER_ID,
-        "SUBMITTED",
-        broker_order_id="TR-JNJ-472",
-    )
+    osm.transition.assert_called_once()
+    assert osm.transition.call_args.args[:2] == (LOCAL_ORDER_ID, "SUBMITTED")
+    transition_kwargs = osm.transition.call_args.kwargs
+    assert transition_kwargs["broker_order_id"] == "TR-JNJ-472"
+    assert transition_kwargs["submitted_ts"]
     broker.list_orders.assert_not_called()
     osm.update_order_meta.assert_not_called()
     _assert_no_broker_mutations(broker)
@@ -216,11 +214,82 @@ def test_placeholder_broker_id_is_reconciled_as_missing():
 
     assert result["reason_code"] == "BROKER_ORDER_ADOPTED"
     assert result["status"] == "SUBMITTED"
-    osm.transition.assert_called_once_with(
-        LOCAL_ORDER_ID,
-        "SUBMITTED",
-        broker_order_id="TR-JNJ-472",
+    osm.transition.assert_called_once()
+    assert osm.transition.call_args.args[:2] == (LOCAL_ORDER_ID, "SUBMITTED")
+    transition_kwargs = osm.transition.call_args.kwargs
+    assert transition_kwargs["broker_order_id"] == "TR-JNJ-472"
+    assert transition_kwargs["submitted_ts"]
+    _assert_no_broker_mutations(broker)
+
+
+def test_non_entry_kind_is_held_before_broker_read():
+    core, broker, osm = _core(_row(kind="EXIT"), [_remote()])
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=LOCAL_ORDER_ID
     )
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "RECONCILE_KIND_MISMATCH"
+    broker.list_orders.assert_not_called()
+    osm.transition.assert_not_called()
+    osm.update_order_meta.assert_not_called()
+    _assert_no_broker_mutations(broker)
+
+
+def test_existing_broker_id_transition_cas_miss_holds_without_followup_mutation():
+    core, broker, osm = _core(_row(broker_order_id="TR-JNJ-472"), [])
+    osm.transition.return_value = False
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=LOCAL_ORDER_ID
+    )
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "RECONCILE_ADOPTION_TRANSITION_FAILED"
+    broker.list_orders.assert_not_called()
+    osm.update_order_meta.assert_not_called()
+    _assert_no_broker_mutations(broker)
+
+
+def test_non_string_submit_intent_is_held_before_broker_read():
+    row = _row(meta={**_row()["meta"], "submit_intent_at": 12345})
+    core, broker, osm = _core(row, [_remote()])
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=LOCAL_ORDER_ID
+    )
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "RECONCILE_SUBMIT_INTENT_MALFORMED"
+    broker.list_orders.assert_not_called()
+    osm.transition.assert_not_called()
+    osm.update_order_meta.assert_not_called()
+    _assert_no_broker_mutations(broker)
+
+
+def test_reconcile_is_restart_idempotent_for_adopted_and_ambiguous_rows():
+    core, broker, osm = _core(
+        _row(status="SUBMITTED", broker_order_id="TR-JNJ-472"),
+        [],
+    )
+    first = core.reconcile_deferred_broker_intent(local_order_id=LOCAL_ORDER_ID)
+    second = core.reconcile_deferred_broker_intent(local_order_id=LOCAL_ORDER_ID)
+    assert first["reason_code"] == "RECONCILE_BROKER_ORDER_PRESENT"
+    assert second["reason_code"] == "RECONCILE_BROKER_ORDER_PRESENT"
+    broker.list_orders.assert_not_called()
+    osm.transition.assert_not_called()
+
+    core, broker, osm = _core(
+        _row(),
+        [_remote(), _remote(id="TR-JNJ-473")],
+    )
+    first = core.reconcile_deferred_broker_intent(local_order_id=LOCAL_ORDER_ID)
+    second = core.reconcile_deferred_broker_intent(local_order_id=LOCAL_ORDER_ID)
+    assert first["reason_code"] == "RECONCILE_MULTIPLE_MATCHES"
+    assert second["reason_code"] == "RECONCILE_MULTIPLE_MATCHES"
+    osm.transition.assert_not_called()
+    osm.update_order_meta.assert_not_called()
     _assert_no_broker_mutations(broker)
 
 
@@ -549,6 +618,10 @@ def test_startup_phantom_cleanup_excludes_submit_intent_before_reconciliation(mo
         target_sql = candidate_sql.split(target, 1)[1].split("RETURNING", 1)[0]
         assert write_guard in target_sql
     assert "v3_submit_intent_cas" in sql_params[0]
+    assert (
+        "'N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE'"
+        in candidate_sql
+    )
 
 
 def test_startup_watcher_reseed_sql_holds_submit_evidence_before_queue_reset(monkeypatch):
@@ -605,6 +678,44 @@ def test_order_monitor_holds_submit_intent_before_hydration_or_rearm():
     monitor._check_pending_trigger_order.assert_not_called()
 
 
+def test_adoption_timestamp_prevents_created_ts_stale_entry_cancel(monkeypatch):
+    adoption_created = datetime.now(timezone.utc) - timedelta(days=1)
+    row = _row(
+        created_ts=adoption_created,
+    )
+    core, broker, osm = _core(row, [_remote()])
+
+    def persist_transition(_local_id, status, **kwargs):
+        row["status"] = status
+        row["broker_order_id"] = kwargs.get("broker_order_id")
+        row["submitted_ts"] = kwargs.get("submitted_ts")
+        return True
+
+    osm.transition.side_effect = persist_transition
+    result = core.reconcile_deferred_broker_intent(local_order_id=LOCAL_ORDER_ID)
+    assert result["reason_code"] == "BROKER_ORDER_ADOPTED"
+    assert row["submitted_ts"]
+
+    monitor = object.__new__(APOrderMonitor)
+    monitor.client_id = CLIENT_ID
+    monitor._get_active_entry_orders = lambda: [row]
+
+    def parse_ts(raw):
+        if isinstance(raw, datetime):
+            return raw
+        if isinstance(raw, str):
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return None
+
+    monitor._parse_ts = parse_ts
+    monitor._check_stale_entry_cancel = MagicMock(return_value=False)
+    monitor._check_entry_orders()
+
+    age_secs = monitor._check_stale_entry_cancel.call_args.args[4]
+    assert 0 <= age_secs < 5
+    _assert_no_broker_mutations(broker)
+
+
 def test_reconciler_routes_evidence_row_and_never_missing_id_cleanup(monkeypatch):
     row = _row()
     execution_core = MagicMock()
@@ -640,6 +751,37 @@ def test_reconciler_routes_evidence_row_and_never_missing_id_cleanup(monkeypatch
     rec._handle_order_without_broker_id.assert_not_called()
     broker.get_order.assert_not_called()
     assert summary["orders_alerted"] == 1
+
+
+def test_reconciler_preserves_core_exception_reason(monkeypatch):
+    row = _row()
+    execution_core = MagicMock()
+    execution_core.reconcile_deferred_broker_intent.side_effect = RuntimeError("boom")
+    broker = MagicMock()
+    monkeypatch.setattr(APBrokerReconciler, "_register_health", lambda self: None)
+    rec = APBrokerReconciler(
+        broker=broker,
+        client_id=CLIENT_ID,
+        osm=MagicMock(),
+        pm=MagicMock(),
+        execution_mode="paper",
+        execution_core=execution_core,
+    )
+    rec._check_ghost_fills = MagicMock()
+    rec._handle_order_without_broker_id = MagicMock()
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.get_open_orders_with_invalid_execution_mode = lambda **_: []
+    fake_db.get_open_orders_for_reconcile = lambda **_: [row]
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
+
+    summary = _empty_summary(CLIENT_ID)
+    rec._reconcile_orders(summary)
+
+    assert summary["errors"] == [
+        "pending_trigger_submit_intent_hold:RECONCILE_CORE_CALL_FAILED:RuntimeError"
+    ]
 
 
 def test_reconciler_without_core_holds_evidence_row(monkeypatch):

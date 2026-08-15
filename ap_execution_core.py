@@ -3548,6 +3548,7 @@ class APExecutionCore:
                     local_order_id,
                     "SUBMITTED",
                     broker_order_id=broker_order_id,
+                    submitted_ts=now_utc_iso(),
                 ):
                     return _keep("RECONCILE_ADOPTION_TRANSITION_FAILED")
             return {
@@ -3717,7 +3718,12 @@ class APExecutionCore:
 
         # Establish the accepted boundary only.  Fill monitor owns every later
         # broker status, including a status already terminal in this listing.
-        if not osm.transition(local_order_id, "SUBMITTED", broker_order_id=remote_id):
+        if not osm.transition(
+            local_order_id,
+            "SUBMITTED",
+            broker_order_id=remote_id,
+            submitted_ts=now_utc_iso(),
+        ):
             return {
                 **_base,
                 "disposition": "RECONCILE_PENDING",

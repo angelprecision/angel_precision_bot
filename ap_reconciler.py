@@ -1312,10 +1312,12 @@ class APBrokerReconciler:
             if not callable(reconcile):
                 reason = "RECONCILE_EXECUTION_CORE_UNAVAILABLE"
             else:
+                _core_call_failed = False
                 try:
                     result = reconcile(local_order_id=local_id)
                 except Exception as exc:
                     result = None
+                    _core_call_failed = True
                     reason = f"RECONCILE_CORE_CALL_FAILED:{type(exc).__name__}"
                 if isinstance(result, dict):
                     disposition = str(result.get("disposition") or "").strip().upper()
@@ -1333,7 +1335,7 @@ class APBrokerReconciler:
                         )
                 elif result is not None:
                     reason = "RECONCILE_CORE_RESULT_MALFORMED"
-                else:
+                elif not _core_call_failed:
                     reason = "RECONCILE_CORE_RESULT_MALFORMED"
 
         summary.setdefault("errors", []).append(

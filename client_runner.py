@@ -3722,7 +3722,7 @@ class ClientRunner(threading.Thread):
                               AND   (
                                         o.broker_order_id IS NULL
                                     OR  TRIM(COALESCE(o.broker_order_id, '')) = ''
-                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL')
+                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE')
                                     )
                               AND   (
                                         o.meta->'watcher_audit' IS NULL
@@ -3814,7 +3814,7 @@ class ClientRunner(threading.Thread):
                               AND  (
                                         o.broker_order_id IS NULL
                                     OR  TRIM(COALESCE(o.broker_order_id, '')) = ''
-                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL')
+                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE')
                                   )
                             RETURNING o.local_order_id
                         ),
@@ -3854,7 +3854,7 @@ class ClientRunner(threading.Thread):
                               AND  (
                                         o.broker_order_id IS NULL
                                     OR  TRIM(COALESCE(o.broker_order_id, '')) = ''
-                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL')
+                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE')
                                   )
                             RETURNING o.local_order_id
                         )
