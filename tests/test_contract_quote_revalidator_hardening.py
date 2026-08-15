@@ -18,10 +18,12 @@ from ap.contract_quote_revalidator import (
     fetch_direct_option_quote_with_meta,
     final_quote_check_before_submit,
     revalidate_with_direct_quote,
+    direct_quote_is_valid,
     REASON_DIRECT_QUOTE_AUTH_FAILED,
     REASON_DIRECT_QUOTE_FETCH_TIMEOUT,
     REASON_DIRECT_QUOTE_RATE_LIMITED,
     REASON_DIRECT_QUOTE_SERVER_ERROR,
+    REASON_FINAL_CONTRACT_QUOTE_INVALID,
     REASON_FINAL_CONTRACT_UNAFFORDABLE,
 )
 
@@ -45,6 +47,16 @@ class StubBroker:
         if self.exc is not None:
             raise self.exc
         return dict(self.quote)
+
+
+class SequencedBroker(StubBroker):
+    def __init__(self, responses, *, base_url="https://api.tradier.com"):
+        super().__init__(quote={}, base_url=base_url)
+        self.responses = list(responses)
+
+    def get_quote(self, symbol: str):
+        self.calls.append(symbol)
+        return dict(self.responses.pop(0))
 
 
 class ResponseBackedError(RuntimeError):
@@ -131,6 +143,129 @@ def test_backward_compatible_fetch_still_returns_normalized_empty_quote():
     assert quote["bid"] is None
     assert quote["ask"] is None
     assert quote["quote_age_semantics"] == "fetch_latency_not_exchange_age"
+
+
+@pytest.mark.parametrize(
+    "invalid_quote",
+    [
+        pytest.param({"bid": 0.0, "ask": 1.25}, id="zero-bid"),
+        pytest.param({"bid": 1.20, "ask": 0.0}, id="zero-ask"),
+        pytest.param({"ask": 1.25}, id="missing-bid"),
+        pytest.param({"bid": 1.20}, id="missing-ask"),
+        pytest.param({"bid": 1.30, "ask": 1.20}, id="crossed"),
+        pytest.param({"bid": float("nan"), "ask": 1.25}, id="nan-bid"),
+        pytest.param({"bid": 1.20, "ask": float("inf")}, id="infinite-ask"),
+        pytest.param({"bid": True, "ask": 1.25}, id="boolean-bid"),
+        pytest.param({"bid": "not-a-number", "ask": 1.25}, id="malformed-bid"),
+    ],
+)
+def test_invalid_direct_quote_is_not_cached_over_a_recovered_feed(invalid_quote):
+    broker = SequencedBroker([invalid_quote, {"bid": 1.20, "ask": 1.25}])
+
+    first = fetch_direct_option_quote_with_meta(broker, OCC, cache_ttl_s=60)
+    second = fetch_direct_option_quote_with_meta(broker, OCC, cache_ttl_s=60)
+
+    assert first["ok"] is True
+    assert direct_quote_is_valid(first["quote"]) is False
+    assert second["ok"] is True
+    assert second["quote"]["bid"] == 1.20
+    assert second["quote"]["ask"] == 1.25
+    assert broker.calls == [OCC, OCC]
+
+
+@pytest.mark.parametrize(
+    "invalid_quote",
+    [
+        {"bid": None, "ask": 1.25},
+        {"bid": 1.20, "ask": None},
+        {"bid": float("nan"), "ask": 1.25},
+        {"bid": 1.20, "ask": float("inf")},
+        {"bid": True, "ask": 1.25},
+        {"bid": "not-a-number", "ask": 1.25},
+    ],
+)
+def test_direct_quote_is_valid_requires_finite_positive_non_crossed_scalars(invalid_quote):
+    assert direct_quote_is_valid(invalid_quote) is False
+
+
+def test_selector_revalidation_does_not_starve_after_chain_zero_recovery():
+    broker = SequencedBroker([
+        {"bid": 0.0, "ask": 0.0},
+        {"bid": 1.20, "ask": 1.25},
+    ])
+    chain_row = _chain_opt_zero()
+
+    first = revalidate_with_direct_quote(
+        broker,
+        chain_row,
+        "zero_bid_or_ask",
+        market_open_override=True,
+    )
+    second = revalidate_with_direct_quote(
+        broker,
+        chain_row,
+        "zero_bid_or_ask",
+        market_open_override=True,
+    )
+
+    assert first["action"] == "REJECT_DIRECT_ZERO"
+    assert second["action"] == "PASS"
+    assert second["opt_updated"]["bid"] == 1.20
+    assert second["opt_updated"]["ask"] == 1.25
+    assert broker.calls == [OCC, OCC]
+
+
+def test_valid_direct_quote_preserves_cache_hit_behavior():
+    broker = SequencedBroker([
+        {"bid": 1.20, "ask": 1.25},
+        {"bid": 9.00, "ask": 9.25},
+    ])
+
+    first = fetch_direct_option_quote_with_meta(broker, OCC, cache_ttl_s=60)
+    second = fetch_direct_option_quote_with_meta(broker, OCC, cache_ttl_s=60)
+
+    assert first["quote"]["bid"] == 1.20
+    assert second["quote"]["bid"] == 1.20
+    assert broker.calls == [OCC]
+
+
+def test_legacy_fetch_does_not_cache_malformed_direct_quote():
+    broker = SequencedBroker([
+        {"bid": float("nan"), "ask": 1.25},
+        {"bid": 1.20, "ask": 1.25},
+    ])
+
+    first = fetch_direct_option_quote(broker, OCC, cache_ttl_s=60)
+    second = fetch_direct_option_quote(broker, OCC, cache_ttl_s=60)
+
+    assert first["bid"] is None
+    assert second["bid"] == 1.20
+    assert broker.calls == [OCC, OCC]
+
+
+@pytest.mark.parametrize(
+    "invalid_quote",
+    [
+        {"bid": float("nan"), "ask": 1.25},
+        {"bid": 1.20, "ask": float("inf")},
+        {"bid": True, "ask": 1.25},
+    ],
+)
+def test_final_quote_gate_rejects_malformed_direct_quote(invalid_quote):
+    broker = StubBroker(quote=invalid_quote)
+    result = final_quote_check_before_submit(
+        broker,
+        OCC,
+        max_spread_pct=0.50,
+        min_premium=10.0,
+        max_premium=350.0,
+        budget_usd=1000.0,
+        qty=1,
+        is_live=True,
+    )
+
+    assert result["ok"] is False
+    assert result["reason_code"] == REASON_FINAL_CONTRACT_QUOTE_INVALID
 
 
 def test_direct_quote_metadata_names_latency_not_exchange_age():
