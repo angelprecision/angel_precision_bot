@@ -136,12 +136,23 @@ def test_release_symbol_lock_even_when_reserved_cost_missing(monkeypatch):
     monkeypatch.setattr(fm, "release_equity", lambda *a: released_equity.append(a))
     monkeypatch.setattr(fm, "release_symbol_lock", lambda *a: released_locks.append(a))
 
-    fm._release_entry_guards(
+    assert fm._release_entry_guards(
         _base_order(symbol="TSLA", reserved_cost=None, limit_price=None, qty=None)
-    )
+    ) is False
 
     assert released_equity == []
     assert released_locks == [("client@example.com", "TSLA")]
+
+
+def test_release_entry_guards_does_not_claim_success_when_equity_release_is_unconfirmed(monkeypatch):
+    from ap import fill_monitor as fm
+
+    monkeypatch.setattr(fm, "release_equity", lambda *args: False)
+    monkeypatch.setattr(fm, "release_symbol_lock", lambda *args: True)
+
+    assert fm._release_entry_guards(
+        _base_order(symbol="TSLA", reserved_cost=120.0)
+    ) is False
 
 
 def test_open_position_uses_data_broker_for_underlying_entry(monkeypatch):

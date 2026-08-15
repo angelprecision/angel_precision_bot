@@ -48,6 +48,8 @@ def _order(**overrides):
         "filled_qty": 1,
         "fill_price": 1.58,
         "execution_mode": LIVE,
+        "signal_id": "signal-jason-pep",
+        "plan_id": "plan-jason-pep",
         "meta": {
             "filled_entry_handoff_state": "IN_PROGRESS",
             # Most fills have no opposite 1-1 pair.  Existing tests below
@@ -212,6 +214,125 @@ def test_recovery_query_is_separate_from_normal_pending_query():
     assert hasattr(fm, "recover_interrupted_filled_entry_handoff")
 
 
+@pytest.mark.parametrize(
+    "unconfirmed_result",
+    [
+        None,
+        {},
+        object(),
+        {"ok": False, "status": "canceled"},
+        {"ok": True, "status": "unknown"},
+        {"ok": True, "status": "open"},
+    ],
+)
+def test_pair_cancel_requires_broker_confirmed_canceled_status(monkeypatch, unconfirmed_result):
+    import ap.signal_pair_manager as pair_manager_module
+
+    class _PairManager:
+        def on_fill(self, **kwargs):
+            return "opposite-local"
+
+    class _PairOSM:
+        def __init__(self):
+            self.transitions = []
+
+        def get_order(self, local_order_id):
+            assert local_order_id == "opposite-local"
+            return {"broker_order_id": "opposite-broker"}
+
+        def transition(self, *args, **kwargs):
+            self.transitions.append((args, kwargs))
+            return True
+
+    class _PairBroker:
+        def __init__(self, result):
+            self.result = result
+
+        def cancel_order(self, broker_order_id):
+            assert broker_order_id == "opposite-broker"
+            return self.result
+
+    monkeypatch.setattr(pair_manager_module, "get_pair_manager", lambda: _PairManager())
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_safe_alert", lambda *args, **kwargs: None)
+
+    unconfirmed_osm = _PairOSM()
+    fm._cancel_pair_opposite(
+        _order(),
+        _PairBroker(unconfirmed_result),
+        unconfirmed_osm,
+    )
+    assert unconfirmed_osm.transitions == []
+
+    confirmed_osm = _PairOSM()
+    fm._cancel_pair_opposite(
+        _order(),
+        _PairBroker({"ok": True, "status": "canceled"}),
+        confirmed_osm,
+    )
+    assert [args[1] for args, _kwargs in confirmed_osm.transitions] == ["CANCELED"]
+
+
+def test_recovery_holds_when_active_recreate_provenance_is_missing(monkeypatch):
+    order = _order(signal_id="", plan_id="")
+    opened = []
+    monkeypatch.setattr(fm, "_open_position_safe", lambda *args, **kwargs: opened.append(True))
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", lambda *args, **kwargs: True)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=_Broker([_broker_position()]),
+        order=order,
+        pm=_PM(),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_RECOVERY_PROVENANCE_UNPROVEN"
+    assert opened == []
+
+
+def test_recovery_is_processed_before_ordinary_pending_orders(monkeypatch):
+    order_events = []
+    recovery = _order(local_order_id="recovery-local")
+    ordinary = _order(local_order_id="ordinary-local", status="ACKNOWLEDGED")
+
+    monkeypatch.setattr(fm, "get_pending_orders", lambda _client_id: [ordinary])
+    monkeypatch.setattr(fm, "get_broker_owned_exit_requests", lambda _client_id: [])
+    monkeypatch.setattr(fm, "get_interrupted_filled_entry_handoffs", lambda _client_id: [recovery])
+    monkeypatch.setattr(fm, "recover_interrupted_filled_entry_handoff", lambda **kwargs: order_events.append("recovery"))
+    monkeypatch.setattr(fm, "process_pending_order", lambda _broker, order, **kwargs: order_events.append("ordinary"))
+
+    import ap.filled_entry_recovery_authority as authority_module
+    monkeypatch.setattr(authority_module, "fetch_current_broker_positions", lambda _broker: [])
+
+    class _Stop:
+        def __init__(self):
+            self.waited = False
+
+        def is_set(self):
+            return self.waited
+
+        def wait(self, _seconds):
+            self.waited = True
+
+    stop = _Stop()
+    fm.fill_monitor_loop(
+        broker=object(),
+        poll_seconds=0,
+        osm=SimpleNamespace(client_id=CLIENT),
+        pm=SimpleNamespace(),
+        exit_engine=SimpleNamespace(master_control=SimpleNamespace(mode=LIVE)),
+        stop_event=stop,
+        client_id=CLIENT,
+    )
+
+    assert order_events == ["recovery", "ordinary"]
+
+
 def test_fresh_fill_persists_in_progress_before_terminal_osm(monkeypatch):
     order = _order(status="ACKNOWLEDGED", filled_qty=0)
     osm = _OSM()
@@ -236,7 +357,7 @@ def test_fresh_fill_persists_in_progress_before_terminal_osm(monkeypatch):
     monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **kwargs: None)
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: True)
 
     def persist(*args, **kwargs):
         state = args[1] if len(args) > 1 else kwargs.get("state")
@@ -295,7 +416,7 @@ def test_terminal_recovery_has_zero_broker_mutations_and_no_osm_filled_replay(mo
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", lambda *args, **kwargs: True)
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: True)
 
     result = fm.recover_interrupted_filled_entry_handoff(
         broker=broker,
@@ -627,6 +748,49 @@ def test_broker_snapshot_adapter_returns_exact_option_rows_and_ignores_equities(
     assert fetch_current_broker_positions(object())[0]["symbol"] == CONTRACT
 
 
+def test_raw_broker_position_payload_rejects_ambiguous_option_identity():
+    from ap.manual_close_reconciliation import normalize_positions_payload
+
+    payload = {
+        "positions": {
+            "position": [
+                {
+                    "option_symbol": CONTRACT,
+                    "symbol": "PEP260821P00141000",
+                    "quantity": 1,
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match="BROKER_POSITION_IDENTITY_AMBIGUOUS"):
+        normalize_positions_payload(payload)
+
+
+def test_authoritative_position_raw_alias_cannot_hide_invalid_option_truth():
+    from ap.filled_entry_recovery_authority import fetch_current_broker_positions
+
+    class _RawBroker:
+        cfg = SimpleNamespace(account_id="acct-1")
+
+        def _get(self, path):
+            assert path == "/v1/accounts/acct-1/positions"
+            return {
+                "positions": {
+                    "position": [
+                        {
+                            "symbol": "PEP",
+                            "option_symbol": "PEP-INVALID",
+                            "quantity": 1,
+                        }
+                    ]
+                }
+            }
+
+    with pytest.raises(ValueError, match="OCC_INVALID"):
+        fetch_current_broker_positions(_RawBroker())
+
+
 def test_active_existing_recovery_never_reopens_or_places_protection(monkeypatch):
     order = _order(position_id=POSITION_ID)
     pm = _PM([_existing_position()])
@@ -636,7 +800,7 @@ def test_active_existing_recovery_never_reopens_or_places_protection(monkeypatch
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
     monkeypatch.setattr(
         fm,
         "_open_position_safe",
@@ -669,7 +833,7 @@ def test_active_existing_recovery_never_reopens_or_places_protection(monkeypatch
     assert pm.open_calls == []
     assert release_calls == [True]
     assert broker.mutations == []
-    assert [state for state, _ in calls] == ["IN_PROGRESS", "IN_PROGRESS", "COMPLETE"]
+    assert [state for state, _ in calls] == ["COMPLETE"]
 
 
 def test_active_recreate_recovery_opens_once_without_fresh_fill_side_effects(monkeypatch):
@@ -693,7 +857,7 @@ def test_active_recreate_recovery_opens_once_without_fresh_fill_side_effects(mon
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
     monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda *args, **kwargs: calls.append(("STOP", None)))
     monkeypatch.setattr(
         fm,
@@ -728,7 +892,7 @@ def test_recovery_bind_failure_holds_before_guard_release_or_complete(monkeypatc
     monkeypatch.setattr(fm, "_record_position_create_failure", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (False, "IDENTITY_CONFLICT"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
 
     result = fm.recover_interrupted_filled_entry_handoff(
         broker=_Broker([_broker_position()]),
@@ -753,7 +917,7 @@ def test_recovery_owner_seed_failure_holds_before_guard_release(monkeypatch):
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (False, "OWNER_LOOKUP_FAILED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
     monkeypatch.setattr(fm, "_record_position_create_failure", lambda *args, **kwargs: None)
 
     result = fm.recover_interrupted_filled_entry_handoff(
@@ -778,7 +942,7 @@ def test_recovery_guard_release_failure_holds_without_complete(monkeypatch):
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("release unavailable")))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("release unavailable")))
     monkeypatch.setattr(fm, "_record_position_create_failure", lambda *args, **kwargs: None)
 
     result = fm.recover_interrupted_filled_entry_handoff(
@@ -806,7 +970,7 @@ def test_legacy_recovery_holds_before_recreate_or_guard_release(monkeypatch):
         "_open_position_safe",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not recreate legacy handoff")),
     )
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
 
     result = fm.recover_interrupted_filled_entry_handoff(
         broker=_Broker([_broker_position()]),
@@ -835,7 +999,7 @@ def test_recovery_complete_write_failure_remains_retryable_hold(monkeypatch):
     )
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
     monkeypatch.setattr(fm, "_record_position_create_failure", lambda *args, **kwargs: None)
 
     result = fm.recover_interrupted_filled_entry_handoff(
@@ -860,7 +1024,7 @@ def test_claimed_guard_release_outcome_is_fail_closed_and_not_repeated(monkeypat
     )
     monkeypatch.setattr(
         fm,
-        "_release_entry_guards",
+        "_release_entry_guards_atomically",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not repeat release")),
     )
 
@@ -882,7 +1046,7 @@ def test_malformed_guard_release_marker_fails_closed(monkeypatch, marker):
     )
     monkeypatch.setattr(
         fm,
-        "_release_entry_guards",
+        "_release_entry_guards_atomically",
         lambda *args, **kwargs: release_calls.append(True),
     )
 
@@ -902,7 +1066,7 @@ def test_complete_shortcut_requires_boolean_guard_release_marker(monkeypatch, ma
     )
     monkeypatch.setattr(
         fm,
-        "_release_entry_guards",
+        "_release_entry_guards_atomically",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("complete shortcut must not release guards")
         ),
@@ -924,29 +1088,73 @@ def test_complete_shortcut_requires_boolean_guard_release_marker(monkeypatch, ma
 def test_guard_release_claim_is_atomic_across_stale_order_copies(monkeypatch):
     first = _order(position_id=POSITION_ID)
     second = _order(position_id=POSITION_ID)
-    claim_taken = False
     release_calls = []
-    persist_source = inspect.getsource(fm._persist_filled_entry_handoff_state)
 
-    def persist(order, state, **kwargs):
-        nonlocal claim_taken
-        if kwargs.get("require_guard_release_claim_absent"):
-            if claim_taken:
-                return False
-            claim_taken = True
-        if kwargs.get("extra_meta"):
-            order.setdefault("meta", {}).update(kwargs["extra_meta"])
+    def atomic_release(order, **kwargs):
+        if release_calls:
+            return False
+        release_calls.append(order["local_order_id"])
         return True
 
-    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", persist)
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", atomic_release)
 
     assert fm._release_entry_guards_once(first, position_id=POSITION_ID) is True
     assert fm._release_entry_guards_once(second, position_id=POSITION_ID) is False
-    assert release_calls == [True]
-    assert "filled_entry_guards_release_claimed" in persist_source
-    assert "filled_entry_guards_release_claimed' = 'false'::jsonb" in persist_source
-    assert "filled_entry_guards_released' = 'true'::jsonb" in persist_source
+    assert release_calls == [LOCAL_ID]
+
+
+def test_atomic_guard_release_commits_marker_with_guard_mutations(monkeypatch):
+    class _Conn:
+        def __init__(self, lock_acquired=True):
+            self.lock_acquired = lock_acquired
+            self.current_row = None
+            self.rowcount = 1
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+            if "pg_try_advisory_xact_lock" in sql:
+                self.current_row = {
+                    "pg_try_advisory_xact_lock": self.lock_acquired,
+                }
+            elif "SELECT meta" in sql:
+                self.current_row = {"meta": {"filled_entry_handoff_state": "IN_PROGRESS"}}
+            elif "SELECT v FROM kv" in sql:
+                self.current_row = {"v": "120.0"}
+            elif "UPDATE orders" in sql:
+                self.rowcount = 1
+                self.current_row = None
+            else:
+                self.current_row = None
+            return self
+
+        def fetchone(self):
+            row = self.current_row
+            self.current_row = None
+            return row
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(fm, "conn", lambda: fake_conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
+
+    order = _order(reserved_cost=120.0)
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is True
+    assert order["meta"]["filled_entry_guards_released"] is True
+    assert any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
+    assert any("INSERT INTO kv" in sql for sql, _params in fake_conn.statements)
+    assert any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
+
+    busy_conn = _Conn(lock_acquired=False)
+    monkeypatch.setattr(fm, "conn", lambda: busy_conn)
+    order = _order(reserved_cost=120.0)
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is False
+    assert not any("UPDATE orders" in sql for sql, _params in busy_conn.statements)
 
 
 def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(monkeypatch):
@@ -970,7 +1178,7 @@ def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(mon
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
 
     first = fm.recover_interrupted_filled_entry_handoff(
         broker=broker,
@@ -1026,6 +1234,44 @@ def test_startup_rehydrates_filled_entry_positions_before_monitors_start():
     assert startup.index("self._run_startup_recovery(") < startup.index("self._seed_exit_engine_from_db(")
     assert startup.index("self._seed_exit_engine_from_db(") < startup.index("self._start_position_quote_monitor(")
     assert startup.index("self._start_position_quote_monitor(") < startup.index("self._start_fill_monitor(")
+
+
+def test_fresh_exit_engine_hydration_restores_exact_position_owner(monkeypatch):
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine(broker=SimpleNamespace(), email=CLIENT)
+    monkeypatch.setattr(engine, "hydrate_pending_exit_identity_from_db", lambda _position: False)
+
+    class _HydrationPM:
+        def get_active_positions(self):
+            return [
+                {
+                    "id": POSITION_ID,
+                    "client_id": CLIENT,
+                    "signal_id": "signal-jason-pep",
+                    "underlying": "PEP",
+                    "contract": CONTRACT,
+                    "direction": "CALL",
+                    "qty": 1,
+                    "quantity_remaining": 1,
+                    "avg_fill": 1.58,
+                    "underlying_entry": 149.0,
+                    "target_underlying": 151.0,
+                    "stop_underlying": 147.0,
+                    "execution_mode": LIVE,
+                    "meta": {},
+                }
+            ]
+
+    engine.seed_from_db(_HydrationPM())
+
+    active = engine.active_positions()
+    assert len(active) == 1
+    assert active[0].position_id == POSITION_ID
+    assert active[0].client_id == CLIENT
+    assert active[0].execution_mode == LIVE
+    assert active[0].option_symbol == CONTRACT
+    assert active[0].signal_id == "signal-jason-pep"
 
 
 def test_recovery_batch_takes_one_current_broker_snapshot():
@@ -1100,7 +1346,11 @@ def test_pair_cancel_returns_confirmed_when_broker_and_local_cancel_both_land(mo
     broker = _Broker()
     calls = []
     monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
-    broker.cancel_order = lambda *a, **k: calls.append(("cancel", a, k))
+    broker.cancel_order = lambda *a, **k: calls.append(("cancel", a, k)) or {
+        "ok": True,
+        "status": "canceled",
+        "broker_order_id": "OPP-1",
+    }
 
     state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
 
@@ -1114,7 +1364,11 @@ def test_pair_cancel_returns_outcome_unproven_when_local_cas_misses(monkeypatch)
     osm = _FakePairOSM(opposite_broker_id="OPP-1", transition_result=False)
     broker = _Broker()
     monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
-    broker.cancel_order = lambda *a, **k: None
+    broker.cancel_order = lambda *a, **k: {
+        "ok": True,
+        "status": "canceled",
+        "broker_order_id": "OPP-1",
+    }
 
     state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
 
@@ -1294,7 +1548,7 @@ def test_fresh_fill_no_pair_persists_not_applicable_and_completes(monkeypatch):
     monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **k: None)
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **k: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *a, **k: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *a, **k: True)
 
     def persist(order_arg, state, **kwargs):
         persisted.append((state, kwargs.get("extra_meta")))
@@ -1337,7 +1591,7 @@ def test_fresh_fill_confirmed_pair_cancel_persists_confirmed_and_completes(monke
     monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **k: None)
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **k: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *a, **k: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *a, **k: True)
 
     def persist(order_arg, state, **kwargs):
         persisted.append((state, kwargs.get("extra_meta")))
@@ -1380,7 +1634,11 @@ def test_terminal_recovery_completes_when_pair_resolution_proven(monkeypatch, pa
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
     monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_atomically",
+        lambda *args, **kwargs: release_calls.append(True) or True,
+    )
     monkeypatch.setattr(
         fm,
         "_cancel_pair_opposite",

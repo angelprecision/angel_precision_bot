@@ -71,10 +71,15 @@ def _positive_finite(value: Any) -> float:
 
 def _broker_quantity(row: dict) -> int:
     """Return quantity only when every supplied quantity alias agrees."""
+    containers = [row]
+    raw = row.get("raw") if isinstance(row, dict) else None
+    if isinstance(raw, dict) and raw is not row:
+        containers.append(raw)
     supplied = [
-        row[key]
+        container[key]
+        for container in containers
         for key in ("quantity", "qty")
-        if key in row and row[key] is not None
+        if key in container and container[key] is not None
     ]
     if not supplied:
         return 0
@@ -167,16 +172,41 @@ def fetch_current_broker_positions(broker: Any) -> list[dict]:
         if not isinstance(row, dict):
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_ROW_MALFORMED")
 
-        option_symbol = row.get("option_symbol") or row.get("contract")
-        symbol = option_symbol or row.get("symbol")
-        contract = _normalize_contract(symbol)
-        if not contract:
+        containers = [row]
+        raw = row.get("raw")
+        if isinstance(raw, dict) and raw is not row:
+            containers.append(raw)
+        explicit_contracts = {
+            _normalize_contract(container.get(key))
+            for container in containers
+            for key in ("option_symbol", "contract")
+            if container.get(key) is not None
+            and str(container.get(key)).strip()
+        }
+        symbols = {
+            _normalize_contract(container.get("symbol"))
+            for container in containers
+            if container.get("symbol") is not None
+            and str(container.get("symbol")).strip()
+        }
+        if len(explicit_contracts) > 1:
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
+        if explicit_contracts and any(
+            is_valid_occ_contract(symbol)
+            for symbol in symbols - explicit_contracts
+        ):
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
+        identities = explicit_contracts or symbols
+        if len(identities) > 1:
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
+        if not identities:
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_MISSING")
+        contract = next(iter(identities))
 
         # A symbol-only non-OCC row can be an equity position and is not part
         # of the option-risk snapshot.  Explicit option_symbol/contract rows
         # must always be exact OCC rows.
-        explicit_option = option_symbol is not None and str(option_symbol).strip() != ""
+        explicit_option = bool(explicit_contracts)
         if not is_valid_occ_contract(contract):
             if explicit_option:
                 raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_OCC_INVALID")
