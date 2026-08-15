@@ -300,8 +300,11 @@ _INVALID_DURABLE_META_BOOL = object()
 
 def _durable_meta_bool(order: dict, key: str):
     """Read a durable JSON boolean without accepting truthy coercions."""
-    value = _order_meta_dict(order).get(key)
-    if value is None or type(value) is bool:
+    meta = _order_meta_dict(order)
+    if key not in meta:
+        return None
+    value = meta[key]
+    if type(value) is bool:
         return value
     return _INVALID_DURABLE_META_BOOL
 

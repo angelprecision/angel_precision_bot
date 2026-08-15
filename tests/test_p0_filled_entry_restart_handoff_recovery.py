@@ -842,7 +842,7 @@ def test_claimed_guard_release_outcome_is_fail_closed_and_not_repeated(monkeypat
     assert fm._release_entry_guards_once(order, position_id=POSITION_ID) is False
 
 
-@pytest.mark.parametrize("marker", ["false", "true", 0, 1, []])
+@pytest.mark.parametrize("marker", [None, "false", "true", 0, 1, []])
 def test_malformed_guard_release_marker_fails_closed(monkeypatch, marker):
     order = _order(
         position_id=POSITION_ID,
@@ -866,7 +866,7 @@ def test_malformed_guard_release_marker_fails_closed(monkeypatch, marker):
     assert persist_calls == []
 
 
-@pytest.mark.parametrize("marker", ["false", "true", 0, 1, []])
+@pytest.mark.parametrize("marker", [None, "false", "true", 0, 1, []])
 def test_complete_shortcut_requires_boolean_guard_release_marker(monkeypatch, marker):
     order = _order(
         position_id=POSITION_ID,
