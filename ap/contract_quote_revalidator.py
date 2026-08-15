@@ -44,6 +44,7 @@ PR: hotfix/p0-direct-option-quote-revalidation
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 import logging
@@ -524,12 +525,22 @@ def _empty_quote_failure() -> dict:
 
 def _normalize_quote(raw: dict, fetched_at: float, latency_ms: int) -> dict:
     def _f(v):
+        # Reject bool outright (float(True)==1.0 would otherwise masquerade as a
+        # real price) and reject NaN/+/-Infinity, so an unusable scalar
+        # normalizes to None rather than a poisonous numeric value.
+        if isinstance(v, bool):
+            return None
         try:
-            return float(v) if v is not None else None
+            f = float(v) if v is not None else None
         except (TypeError, ValueError):
             return None
+        if f is not None and not math.isfinite(f):
+            return None
+        return f
 
     def _i(v):
+        if isinstance(v, bool):
+            return None
         try:
             return int(v) if v is not None else None
         except (TypeError, ValueError):
@@ -718,7 +729,13 @@ def fetch_direct_option_quote_with_meta(
     latency_ms = int((_now() - t0) * 1000)
     _ctx_add_stage_ms(request_context, "direct_quote", latency_ms)
     quote = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, quote)
+    # Only cache a quote that is strictly cache-eligible (finite, positive,
+    # uncrossed). Invalid observations (None/bool/NaN/Inf/zero/neg/inverted)
+    # are never written, so the next eligible attempt can perform a fresh
+    # provider read instead of being poisoned by a stale invalid entry for
+    # the cache TTL. Return behavior is unchanged.
+    if quote_is_cache_eligible(quote):
+        _QUOTE_CACHE[cache_key] = (t0, quote)
 
     if quote.get("_quote_payload_empty"):
         return _empty_quote_failure()
@@ -775,28 +792,63 @@ def fetch_direct_option_quote(
 
     latency_ms = int((_now() - t0) * 1000)
     out = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, out)
+    # Only cache strictly cache-eligible quotes (see quote_is_cache_eligible).
+    # Invalid observations are returned to the caller but never cached, so a
+    # subsequent fetch is free to re-read the provider rather than being
+    # poisoned by a stale invalid entry for the cache TTL.
+    if quote_is_cache_eligible(out):
+        _QUOTE_CACHE[cache_key] = (t0, out)
     return out
+
+
+def _strict_finite_positive(value) -> Optional[float]:
+    """Return a finite, strictly-positive float, or None.
+
+    Stricter than float() coercion on purpose:
+      * bool is rejected outright (float(True)==1.0 would otherwise pass);
+      * NaN and +/-Infinity are rejected (math.isfinite);
+      * non-finite / non-positive values are rejected.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    if f <= 0:
+        return None
+    return f
+
+
+def quote_is_cache_eligible(quote: Optional[dict]) -> bool:
+    """Whether a normalized quote may be written to the direct-quote cache.
+
+    Cache-eligibility is intentionally strict: bid and ask must BOTH be finite,
+    strictly positive, and the book must not be crossed (ask >= bid). None,
+    bool, malformed scalars, zero/negative, NaN, +/-Infinity, overflow, and
+    inverted quotes are all ineligible. An ineligible observation must never be
+    cached, so a subsequent fetch is free to perform a fresh provider read
+    rather than being poisoned by a stale invalid entry for the cache TTL.
+    """
+    if not quote:
+        return False
+    bid = _strict_finite_positive(quote.get("bid"))
+    ask = _strict_finite_positive(quote.get("ask"))
+    if bid is None or ask is None:
+        return False
+    if ask < bid:
+        return False
+    return True
 
 
 def direct_quote_is_valid(quote: Optional[dict]) -> bool:
     """
-    Hard validity check for a direct quote: bid > 0 AND ask > 0 AND ask >= bid.
+    Hard validity check for a direct quote: bid > 0 AND ask > 0 AND ask >= bid,
+    with strict finite/bool rejection (delegates to quote_is_cache_eligible).
     """
-    if not quote:
-        return False
-    bid = quote.get("bid")
-    ask = quote.get("ask")
-    if bid is None or ask is None:
-        return False
-    try:
-        if float(bid) <= 0 or float(ask) <= 0:
-            return False
-        if float(ask) < float(bid):
-            return False
-    except (TypeError, ValueError):
-        return False
-    return True
+    return quote_is_cache_eligible(quote)
 
 
 def revalidate_with_direct_quote(
