@@ -105,18 +105,23 @@ def reserve_equity_if_available(
     return ok
 
 
-def release_equity(client_id: str, amount: float) -> None:
+def release_equity(client_id: str, amount: float) -> bool:
     """
     Atomically release reserved equity. Floors at 0.
+
+    Returns ``True`` only when this call acquired the reservation advisory
+    lock and committed the release.  A busy lock is not a successful release.
     """
     client_id = (client_id or "default").strip()
     amount     = float(amount)
     if amount <= 0:
-        return
+        return True
 
     key = f"reserved_equity:{client_id}"
+    ok = False
 
     def _txn():
+        nonlocal ok
         with _conn()() as c:
             c.execute(
                 "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
@@ -140,9 +145,14 @@ def release_equity(client_id: str, amount: float) -> None:
                 """,
                 (key, json_dumps(reserved_new), now_utc_iso()),
             )
+            ok = True
 
     _run_with_retry(_txn)
-    log.info(f"Released ${amount:,.2f} for {client_id}")
+    if ok:
+        log.info(f"Released ${amount:,.2f} for {client_id}")
+    else:
+        log.warning(f"Release not confirmed for {client_id}: ${amount:,.2f}")
+    return ok
 
 
 def get_reserved_equity(client_id: str) -> float:
@@ -222,11 +232,11 @@ def acquire_symbol_lock(
     return ok
 
 
-def release_symbol_lock(client_id: str, symbol: str) -> None:
+def release_symbol_lock(client_id: str, symbol: str) -> bool:
     client_id = (client_id or "default").strip()
     symbol    = (symbol or "").strip().upper()
     if not symbol:
-        return
+        return False
     key = f"lock:{client_id}:{symbol}"
 
     def _delete():
@@ -235,6 +245,7 @@ def release_symbol_lock(client_id: str, symbol: str) -> None:
 
     _run_with_retry(_delete)
     log.info(f"Released lock: {client_id}:{symbol}")
+    return True
 
 
 def is_symbol_locked(
