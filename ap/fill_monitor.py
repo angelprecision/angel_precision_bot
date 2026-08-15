@@ -317,12 +317,15 @@ def _persist_filled_entry_handoff_state(
     retryable: bool = False,
     position_id: str | None = None,
     extra_meta: dict | None = None,
+    require_guard_release_claim_absent: bool = False,
 ) -> bool:
     """CAS-like durable state write for the FILLED ENTRY handoff.
 
     The write is deliberately owned by ``fill_monitor.py`` so the marker can
     be persisted before OSM terminalization and without a schema migration.
     Exact client/local/broker/mode/OCC identity is part of the SQL fence.
+    Guard-release claiming can additionally require that no prior worker has
+    claimed the non-idempotent release side effect.
     ``COMPLETE`` additionally requires the durable order-to-position bind and
     refuses to downgrade a row already marked complete.
     """
@@ -379,6 +382,10 @@ def _persist_filled_entry_handoff_state(
                 execution_mode,
                 contract,
             ]
+            if require_guard_release_claim_absent:
+                predicates.append(
+                    "COALESCE(meta->>'filled_entry_guards_release_claimed','false') <> 'true'"
+                )
             if state == "COMPLETE":
                 predicates.extend(
                     [
@@ -480,11 +487,13 @@ def get_interrupted_filled_entry_handoffs(client_id: str) -> list[dict]:
                       meta->>'filled_entry_handoff_state'='HOLD'
                       AND meta->>'filled_entry_handoff_retryable'='true'
                     )
-                    OR COALESCE(last_error,'') LIKE 'FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED%'
-                    OR COALESCE(last_error,'') LIKE 'FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN%'
                     OR (
-                      NULLIF(BTRIM(COALESCE(position_id,'')),'') IS NULL
-                      AND COALESCE(meta->>'filled_entry_handoff_state','')=''
+                      COALESCE(meta->>'filled_entry_handoff_state','')=''
+                      AND (
+                        COALESCE(last_error,'') LIKE 'FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED%'
+                        OR COALESCE(last_error,'') LIKE 'FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN%'
+                        OR NULLIF(BTRIM(COALESCE(position_id,'')),'') IS NULL
+                      )
                     )
                   )
                 ORDER BY filled_ts ASC NULLS LAST, created_ts ASC NULLS LAST
@@ -2940,6 +2949,7 @@ def _release_entry_guards_once(order: dict, *, position_id: str) -> bool:
             "filled_entry_guards_release_claimed": True,
             "filled_entry_guards_release_claimed_at": now_utc_iso(),
         },
+        require_guard_release_claim_absent=True,
     )
     if not claimed:
         log.error(
@@ -2987,6 +2997,7 @@ def recover_interrupted_filled_entry_handoff(
     exit_engine=None,
     data_broker=None,
     runtime_execution_mode: str | None = None,
+    expected_client_id: str,
     broker_positions=None,
     broker_positions_error: Exception | str | None = None,
 ) -> dict:
@@ -3007,7 +3018,7 @@ def recover_interrupted_filled_entry_handoff(
         "broker": broker,
         "order": order,
         "runtime_execution_mode": runtime_execution_mode,
-        "expected_client_id": str(order.get("client_id") or "").strip(),
+        "expected_client_id": expected_client_id,
     }
     if broker_positions is not None:
         authority_kwargs["broker_positions"] = broker_positions
@@ -3044,6 +3055,52 @@ def recover_interrupted_filled_entry_handoff(
 
     if disposition not in {"ACTIVE_EXISTING", "ACTIVE_RECREATE"}:
         return authority
+
+    handoff_state = _filled_entry_handoff_state(order)
+    if handoff_state == "COMPLETE":
+        if not bool(_order_meta_dict(order).get("filled_entry_guards_released")):
+            return {
+                **authority,
+                "disposition": "HOLD",
+                "reason_code": "FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN",
+                "retryable": False,
+            }
+        position_id = str(authority.get("position_id") or order.get("position_id") or "").strip()
+        if not position_id:
+            return {
+                **authority,
+                "disposition": "HOLD",
+                "reason_code": "FILLED_ENTRY_RECOVERY_POSITION_IDENTITY_UNPROVEN",
+                "retryable": False,
+            }
+        return {
+            **authority,
+            "reason_code": "FILLED_ENTRY_HANDOFF_ALREADY_COMPLETE",
+            "completed": True,
+            "position_id": position_id,
+        }
+    if handoff_state not in {"IN_PROGRESS", "HOLD"}:
+        reason = "FILLED_ENTRY_LEGACY_GUARD_RELEASE_UNPROVEN"
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=False,
+        )
+        emit_fill_event(
+            order,
+            decision="HOLD",
+            reason_code=reason,
+            explanation="Legacy FILLED ENTRY handoff lacks durable guard-release authority.",
+            result={"filled_qty": order.get("filled_qty"), "avg_fill": order.get("fill_price")},
+            extra_context={**authority, "handoff_state": handoff_state},
+        )
+        return {
+            **authority,
+            "disposition": "HOLD",
+            "reason_code": reason,
+            "retryable": False,
+        }
 
     local_id = str(order.get("local_order_id") or "").strip()
     signal_id = str(order.get("signal_id") or local_id).strip()
@@ -4036,6 +4093,7 @@ def fill_monitor_loop(
                             exit_engine=exit_engine,
                             data_broker=data_broker,
                             runtime_execution_mode=resolved_runtime_execution_mode,
+                            expected_client_id=client_id,
                             broker_positions=recovery_positions,
                             broker_positions_error=recovery_positions_error,
                         )

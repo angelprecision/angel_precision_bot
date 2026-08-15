@@ -69,6 +69,23 @@ def _positive_finite(value: Any) -> float:
     return parsed
 
 
+def _broker_quantity(row: dict) -> int:
+    """Return quantity only when every supplied quantity alias agrees."""
+    supplied = [
+        row[key]
+        for key in ("quantity", "qty")
+        if key in row and row[key] is not None
+    ]
+    if not supplied:
+        return 0
+    quantities = [_positive_integral(value) for value in supplied]
+    if any(quantity <= 0 for quantity in quantities):
+        return 0
+    if len(set(quantities)) != 1:
+        return 0
+    return quantities[0]
+
+
 def _position_value(position: Any, name: str, default: Any = None) -> Any:
     if isinstance(position, dict):
         return position.get(name, default)
@@ -165,7 +182,8 @@ def fetch_current_broker_positions(broker: Any) -> list[dict]:
                 raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_OCC_INVALID")
             continue
 
-        quantity = _positive_integral(row.get("quantity") or row.get("qty"))
+        raw_row = row.get("raw") if isinstance(row.get("raw"), dict) else row
+        quantity = _broker_quantity(raw_row)
         if quantity <= 0:
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_QUANTITY_INVALID")
         normalized.append({
@@ -206,11 +224,22 @@ def _load_local_candidates(pm: Any, order: dict) -> tuple[list[Any], str | None]
                 row_id = _position_id(row)
                 row_local = str(_position_value(row, "local_order_id", "") or "").strip()
                 row_broker = str(_position_value(row, "broker_order_id", "") or "").strip()
-                if (
+                same_risk_domain = (
+                    str(_position_value(row, "client_id", "") or "").strip()
+                    == str(order.get("client_id") or "").strip()
+                    and _position_value(row, "execution_mode", None)
+                    == order.get("execution_mode")
+                    and _position_contract(row)
+                    == _normalize_contract(order.get("contract"))
+                )
+                exact_identity = (
                     (order.get("position_id") and row_id == str(order.get("position_id")).strip())
                     or (row_local and row_local == str(order.get("local_order_id") or "").strip())
                     or (row_broker and row_broker == str(order.get("broker_order_id") or "").strip())
-                ):
+                )
+                if same_risk_domain and not exact_identity:
+                    return [], "FILLED_ENTRY_RECOVERY_LOCAL_POSITION_AMBIGUOUS"
+                if exact_identity:
                     _append_unique(candidates, row)
     except Exception:
         return [], "FILLED_ENTRY_RECOVERY_LOCAL_POSITION_LOOKUP_FAILED"
@@ -404,7 +433,7 @@ def evaluate_filled_entry_recovery_authority(
             # this exact OCC risk domain and are safely ignored.
             continue
         if row_contract == contract:
-            row_qty = _positive_integral(row.get("quantity") or row.get("qty"))
+            row_qty = _broker_quantity(row)
             if row_qty <= 0:
                 return _result(
                     "HOLD",
