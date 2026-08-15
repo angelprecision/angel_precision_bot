@@ -570,6 +570,119 @@ class TestConfigConflictPreflightExitCode:
         assert config_conflict_exit == 0
 
 
+class TestDirectQuoteBudgetPreflight:
+    _BUDGET_KEYS = (
+        "SELECTOR_MAX_DIRECT_QUOTE_CALLS",
+        "DIRECT_QUOTE_RECOVERY_TOP_N",
+        "CONTRACT_REVALIDATE_TOP_N",
+    )
+
+    def _run_without_rows(self, monkeypatch, capsys, values):
+        for key in (
+            *self._BUDGET_KEYS,
+            "MAX_BREACH_SELECTOR_RETRIES",
+            "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        for key, value in values.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setattr(preflight_module, "_fetch_candidate_rows", lambda: [])
+
+        exit_code = main()
+        output = json.loads(capsys.readouterr().out)
+        return exit_code, output["selector_direct_quote_budget"]
+
+    def test_canonical_only_40_is_clean_and_reports_both_envelopes(
+        self, monkeypatch, capsys
+    ):
+        exit_code, budget = self._run_without_rows(
+            monkeypatch,
+            capsys,
+            {"SELECTOR_MAX_DIRECT_QUOTE_CALLS": "40"},
+        )
+
+        assert exit_code == 0
+        assert set(budget) == {
+            "canonical_value",
+            "direct_recovery_alias",
+            "contract_revalidate_alias",
+            "source",
+            "ordinary_effective_limit",
+            "deferred_effective_limit",
+            "conflict",
+            "conflict_detail",
+            "invalid_explicit_keys",
+        }
+        assert budget == {
+            "canonical_value": 40,
+            "direct_recovery_alias": None,
+            "contract_revalidate_alias": None,
+            "source": "SELECTOR_MAX_DIRECT_QUOTE_CALLS",
+            "ordinary_effective_limit": 20,
+            "deferred_effective_limit": 40,
+            "conflict": False,
+            "conflict_detail": None,
+            "invalid_explicit_keys": [],
+        }
+
+    def test_matching_40_aliases_are_clean(self, monkeypatch, capsys):
+        exit_code, budget = self._run_without_rows(
+            monkeypatch,
+            capsys,
+            {
+                "SELECTOR_MAX_DIRECT_QUOTE_CALLS": "40",
+                "DIRECT_QUOTE_RECOVERY_TOP_N": "40",
+                "CONTRACT_REVALIDATE_TOP_N": "40",
+            },
+        )
+
+        assert exit_code == 0
+        assert budget["deferred_effective_limit"] == 40
+        assert budget["conflict"] is False
+        assert budget["invalid_explicit_keys"] == []
+
+    def test_paper_shaped_conflict_holds_even_without_rows(self, monkeypatch, capsys):
+        exit_code, budget = self._run_without_rows(
+            monkeypatch,
+            capsys,
+            {
+                "SELECTOR_MAX_DIRECT_QUOTE_CALLS": "20",
+                "DIRECT_QUOTE_RECOVERY_TOP_N": "8",
+                "CONTRACT_REVALIDATE_TOP_N": "20",
+            },
+        )
+
+        assert exit_code == 2
+        assert budget["ordinary_effective_limit"] == 20
+        assert budget["deferred_effective_limit"] == 20
+        assert budget["conflict"] is True
+        assert budget["invalid_explicit_keys"] == []
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "abc"),
+            ("DIRECT_QUOTE_RECOVERY_TOP_N", "0"),
+            ("CONTRACT_REVALIDATE_TOP_N", "-2"),
+        ],
+    )
+    def test_malformed_or_non_positive_budget_env_holds_and_names_key(
+        self, monkeypatch, capsys, key, value
+    ):
+        exit_code, budget = self._run_without_rows(
+            monkeypatch,
+            capsys,
+            {
+                "SELECTOR_MAX_DIRECT_QUOTE_CALLS": "40",
+                key: value,
+            },
+        )
+
+        assert exit_code == 2
+        assert budget["invalid_explicit_keys"] == [key]
+        assert budget["conflict"] is False
+
+
 # ---------------------------------------------------------------------------
 # Blocker 3: generation completeness (independent of attempt number)
 # ---------------------------------------------------------------------------

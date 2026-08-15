@@ -75,8 +75,11 @@ from ap.contract_quote_revalidator import (
     correct_recovered_cursor_disposition as _correct_recovered_cursor_disposition,
     _ctx_persist_structural_skip,
     _ctx_persist_attempt,
-    DEFAULT_REVALIDATE_TOP_N,
 )
+
+# Legacy compatibility export only. This fixed value is not behavioral
+# authority; request contexts resolve SELECTOR_MAX_DIRECT_QUOTE_CALLS below.
+DEFAULT_REVALIDATE_TOP_N = 5
 
 # ── P0: exact chain-fetch taxonomy exceptions ────────────────────────────────
 class ChainProviderError(Exception):
@@ -150,10 +153,14 @@ class DirectQuoteBudgetConfig:
     canonical_raw: str | None
     direct_recovery_raw: str | None
     contract_revalidate_raw: str | None
+    canonical_value: int | None
+    direct_recovery_value: int | None
+    contract_revalidate_value: int | None
     effective_limit: int
     source: str
     conflict: bool
     conflict_detail: str | None
+    invalid_explicit_keys: tuple[str, ...] = ()
 
 
 @dataclass
@@ -183,6 +190,7 @@ class SelectorRequestContext:
     direct_quote_budget_source: str = "default"
     direct_quote_budget_conflict: bool = False
     direct_quote_budget_conflict_detail: str | None = None
+    direct_quote_budget_invalid_explicit_keys: tuple[str, ...] = ()
     configured_selector_max_direct_quote_calls: int | None = None
     configured_direct_quote_recovery_top_n: int | None = None
     configured_contract_revalidate_top_n: int | None = None
@@ -771,10 +779,16 @@ _DIRECT_QUOTE_BUDGET_CONFLICTS_LOGGED: set[str] = set()
 
 
 def _parse_positive_int_config(env, key: str) -> tuple[int | None, str | None]:
-    raw = env.get(key)
-    if raw is None or str(raw).strip() == "":
+    if key not in env:
         return None, None
-    raw_s = str(raw).strip()
+    raw_s = str(env.get(key)).strip()
+    if not raw_s:
+        log.warning(
+            "SELECTOR_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int",
+            key,
+            raw_s,
+        )
+        return None, raw_s
     try:
         parsed = int(raw_s)
     except (TypeError, ValueError):
@@ -799,6 +813,15 @@ def _resolve_direct_quote_budget_config(env=None) -> DirectQuoteBudgetConfig:
     canonical, canonical_raw = _parse_positive_int_config(env, "SELECTOR_MAX_DIRECT_QUOTE_CALLS")
     direct_recovery, direct_recovery_raw = _parse_positive_int_config(env, "DIRECT_QUOTE_RECOVERY_TOP_N")
     contract_revalidate, contract_revalidate_raw = _parse_positive_int_config(env, "CONTRACT_REVALIDATE_TOP_N")
+    invalid_explicit_keys = tuple(
+        key
+        for key, value, raw in (
+            ("SELECTOR_MAX_DIRECT_QUOTE_CALLS", canonical, canonical_raw),
+            ("DIRECT_QUOTE_RECOVERY_TOP_N", direct_recovery, direct_recovery_raw),
+            ("CONTRACT_REVALIDATE_TOP_N", contract_revalidate, contract_revalidate_raw),
+        )
+        if raw is not None and value is None
+    )
 
     conflict = False
     conflict_detail = None
@@ -839,11 +862,27 @@ def _resolve_direct_quote_budget_config(env=None) -> DirectQuoteBudgetConfig:
         canonical_raw=canonical_raw,
         direct_recovery_raw=direct_recovery_raw,
         contract_revalidate_raw=contract_revalidate_raw,
+        canonical_value=canonical,
+        direct_recovery_value=direct_recovery,
+        contract_revalidate_value=contract_revalidate,
         effective_limit=int(effective),
         source=source,
         conflict=conflict,
         conflict_detail=conflict_detail,
+        invalid_explicit_keys=invalid_explicit_keys,
     )
+
+
+def _direct_quote_budget_effective_limits(
+    budget_cfg: DirectQuoteBudgetConfig,
+) -> tuple[int, int]:
+    """Return the unchanged ordinary and deferred request envelopes."""
+    ordinary_limit = (
+        min(20, budget_cfg.effective_limit)
+        if budget_cfg.source == "SELECTOR_MAX_DIRECT_QUOTE_CALLS"
+        else 5
+    )
+    return ordinary_limit, budget_cfg.effective_limit
 
 
 def _new_selector_request_context(
@@ -860,6 +899,9 @@ def _new_selector_request_context(
     ).strip().upper()
     deferred_recovery = request_kind == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
     budget_cfg = _resolve_direct_quote_budget_config()
+    ordinary_effective_limit, deferred_effective_limit = (
+        _direct_quote_budget_effective_limits(budget_cfg)
+    )
     # PR #401 recovery capacity is explicit deferred-breach behavior.  Ordinary
     # selection retains the pre-PR production default of FIVE direct quotes when
     # the canonical env is absent — never the deferred-recovery capacity.
@@ -879,14 +921,9 @@ def _new_selector_request_context(
     #   ordinary, canonical env=1   → min(20,  1) =  1
     #   ordinary, canonical env=20  → min(20, 20) = 20
     #   ordinary, canonical env=40  → min(20, 40) = 20
-    if deferred_recovery:
-        effective_direct_quote_limit = budget_cfg.effective_limit
-    elif budget_cfg.source == "SELECTOR_MAX_DIRECT_QUOTE_CALLS":
-        # Canonical env explicitly set: apply as a ceiling for ordinary.
-        effective_direct_quote_limit = min(20, budget_cfg.effective_limit)
-    else:
-        # Ordinary default with no canonical env: pre-PR #401 default of five.
-        effective_direct_quote_limit = 5
+    effective_direct_quote_limit = (
+        deferred_effective_limit if deferred_recovery else ordinary_effective_limit
+    )
     context = SelectorRequestContext(
         ticker=str(ticker or ""),
         direct_quote_attempts_remaining=effective_direct_quote_limit,
@@ -914,15 +951,10 @@ def _new_selector_request_context(
         ),
         direct_quote_budget_conflict=budget_cfg.conflict,
         direct_quote_budget_conflict_detail=budget_cfg.conflict_detail,
-        configured_selector_max_direct_quote_calls=(
-            int(budget_cfg.canonical_raw) if budget_cfg.canonical_raw and budget_cfg.canonical_raw.isdigit() else None
-        ),
-        configured_direct_quote_recovery_top_n=(
-            int(budget_cfg.direct_recovery_raw) if budget_cfg.direct_recovery_raw and budget_cfg.direct_recovery_raw.isdigit() else None
-        ),
-        configured_contract_revalidate_top_n=(
-            int(budget_cfg.contract_revalidate_raw) if budget_cfg.contract_revalidate_raw and budget_cfg.contract_revalidate_raw.isdigit() else None
-        ),
+        direct_quote_budget_invalid_explicit_keys=budget_cfg.invalid_explicit_keys,
+        configured_selector_max_direct_quote_calls=budget_cfg.canonical_value,
+        configured_direct_quote_recovery_top_n=budget_cfg.direct_recovery_value,
+        configured_contract_revalidate_top_n=budget_cfg.contract_revalidate_value,
         max_total_elapsed_ms=(
             _positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 25000)
             if deferred_recovery
@@ -1118,6 +1150,9 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
             "remaining": direct_quote_remaining,
             "conflict": bool(ctx.direct_quote_budget_conflict),
             "conflict_detail": ctx.direct_quote_budget_conflict_detail,
+            "invalid_explicit_keys": list(
+                ctx.direct_quote_budget_invalid_explicit_keys
+            ),
         },
         "direct_quote_structural_candidates": int(ctx.direct_quote_structural_candidates or 0),
         "direct_quote_eligible_candidates": int(ctx.direct_quote_eligible_candidates or 0),
