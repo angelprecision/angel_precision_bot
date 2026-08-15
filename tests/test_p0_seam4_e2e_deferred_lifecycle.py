@@ -817,7 +817,20 @@ def _build_core(osm: _StatefulOSM, broker: _Broker, selector: _Selector):
         broker=broker,
         order_state_machine=osm,
         contract_selector=selector,
-        master_control=types.SimpleNamespace(mode="LIVE", max_positions=5, _kill_switch_fn=lambda: False),
+        master_control=types.SimpleNamespace(
+            mode="LIVE",
+            max_positions=5,
+            _kill_switch_fn=lambda: False,
+            # P0 (PR #474): _on_entry_trigger's deferred final exposure
+            # revalidation calls master_control.revalidate_exposure() directly
+            # (previously only _breach_risk_check() did, which this fixture
+            # mocks away below). This stub reflects that real contract; a
+            # deferred entry with an affordable real contract must pass, so the
+            # single-POST call graph this test asserts is unaffected.
+            revalidate_exposure=lambda plan, client_id: types.SimpleNamespace(
+                ok=True, reason=None,
+            ),
+        ),
         _kill_switch=False,
         _max_positions=5,
     )
