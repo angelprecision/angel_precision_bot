@@ -7,6 +7,7 @@ import sys
 import types
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 os.environ.setdefault(
@@ -18,6 +19,8 @@ os.environ.setdefault("PGSSLMODE", "disable")
 import ap.db as db
 import ap_execution_core
 import ap_reconciler
+from ap.order_monitor import APOrderMonitor
+from ap_recovery import APStartupRecovery
 from ap_reconciler import APBrokerReconciler, _empty_summary
 
 
@@ -106,6 +109,49 @@ def _assert_no_broker_mutations(broker):
         "post",
     ):
         assert not getattr(broker, method_name).called, method_name
+
+
+class _RecoveryCursor:
+    def __init__(self, rows):
+        self.rows = rows
+        self.rowcount = 0
+
+    def execute(self, *_args, **_kwargs):
+        return self
+
+    def fetchall(self):
+        return self.rows
+
+
+class _RecoveryConn:
+    def __init__(self, rows):
+        self.cursor = _RecoveryCursor(rows)
+
+    def __enter__(self):
+        return self.cursor
+
+    def __exit__(self, *_args):
+        return False
+
+
+def _run_deferred_recovery(monkeypatch, row, execution_core):
+    monkeypatch.setattr(db, "conn", lambda: _RecoveryConn([row]))
+    monkeypatch.setattr(db, "run_with_retry", lambda fn, *args, **kwargs: fn())
+    osm = MagicMock()
+    osm.client_id = CLIENT_ID
+    osm.retain_recovery_ownership_if_no_watcher = None
+    osm.update_order_meta.return_value = True
+    recovery = APStartupRecovery(
+        client_id=CLIENT_ID,
+        broker=MagicMock(),
+        osm=osm,
+        pm=None,
+        master_control=types.SimpleNamespace(mode="PAPER"),
+        execution_core=execution_core,
+    )
+    result = {"deferred_lifecycles_recovered": 0}
+    recovery._recover_deferred_breach_lifecycles(result)
+    return osm, result
 
 
 def test_exact_match_adopts_only_submitted_for_every_remote_status():
@@ -210,6 +256,76 @@ def test_malformed_broker_list_and_missing_submit_key_hold():
     _assert_no_broker_mutations(broker)
 
 
+def test_malformed_exact_equal_occ_contract_is_held():
+    malformed = f"{CONTRACT}TRAILING"
+    core, broker, osm = _core(
+        _row(contract=malformed),
+        [_remote(option_symbol=malformed)],
+    )
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=LOCAL_ORDER_ID
+    )
+
+    assert result["reason_code"] == "RECONCILE_CONTRACT_MALFORMED"
+    osm.transition.assert_not_called()
+    _assert_no_broker_mutations(broker)
+
+
+def test_startup_recovery_holds_stale_submit_intent_before_terminalization(monkeypatch):
+    row = _row(
+        created_ts=datetime.now(timezone.utc) - timedelta(days=4),
+    )
+    execution_core = MagicMock()
+    execution_core.reconcile_deferred_broker_intent.return_value = {
+        "disposition": "RECONCILE_PENDING",
+        "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD",
+    }
+
+    osm, _result = _run_deferred_recovery(monkeypatch, row, execution_core)
+
+    execution_core.reconcile_deferred_broker_intent.assert_called_once_with(
+        local_order_id=LOCAL_ORDER_ID
+    )
+    osm.terminalize_deferred_breach.assert_not_called()
+    osm.submit_existing_entry.assert_not_called()
+
+
+def test_startup_watcher_reseed_holds_submit_intent_before_ptr(monkeypatch):
+    row = _row(created_ts=datetime.now(timezone.utc))
+    watcher = MagicMock()
+    watcher.has_order.return_value = False
+    recovery = APStartupRecovery(
+        client_id=CLIENT_ID,
+        broker=MagicMock(),
+        osm=MagicMock(client_id=CLIENT_ID),
+        pm=None,
+        master_control=types.SimpleNamespace(mode="PAPER"),
+        entry_watcher=watcher,
+    )
+    monkeypatch.setattr(db, "conn", lambda: _RecoveryConn([row]))
+    monkeypatch.setattr(db, "run_with_retry", lambda fn, *args, **kwargs: fn())
+
+    recovery._reseed_watchers({"watchers_requeued": 0})
+
+    watcher.watch.assert_not_called()
+
+
+def test_order_monitor_holds_submit_intent_before_hydration_or_rearm():
+    row = _row(created_ts=datetime.now(timezone.utc) - timedelta(days=4))
+    monitor = object.__new__(APOrderMonitor)
+    monitor.client_id = CLIENT_ID
+    monitor._get_active_entry_orders = lambda: [row]
+    monitor._parse_ts = lambda raw: raw if isinstance(raw, datetime) else None
+    monitor._maybe_hydrate_deferred_order = MagicMock()
+    monitor._check_pending_trigger_order = MagicMock()
+
+    monitor._check_entry_orders()
+
+    monitor._maybe_hydrate_deferred_order.assert_not_called()
+    monitor._check_pending_trigger_order.assert_not_called()
+
+
 def test_reconciler_routes_evidence_row_and_never_missing_id_cleanup(monkeypatch):
     row = _row()
     execution_core = MagicMock()
@@ -305,6 +421,12 @@ def test_reconcile_query_keeps_watcher_rows_out_and_fences_client_mode(monkeypat
     assert "submitted_ts IS NOT NULL" in sql
     assert "NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NOT NULL" in sql
     assert "LOWER(TRIM(COALESCE(execution_mode,'')))=%s" in sql
+
+    assert db.get_open_orders_for_reconcile() == []
+    sql, params = calls[-1]
+    assert params == (200,)
+    assert "WHERE 1=1 AND (" in sql
+    assert "WHERE AND" not in sql
 
 
 def test_client_runner_passes_the_existing_core_instance(monkeypatch):

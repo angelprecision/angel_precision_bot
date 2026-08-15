@@ -822,6 +822,14 @@ class APOrderMonitor:
                         log.debug("[%s] lost-handoff systemic check failed: %s", self.client_id, _e)
 
             elif status == "PENDING_TRIGGER":
+                if self._has_durable_submit_intent(order):
+                    log.warning(
+                        "[%s] PENDING_TRIGGER broker submit evidence present "
+                        "local_order_id=%s — hydration/rearm held for broker reconciliation",
+                        self.client_id,
+                        local_id,
+                    )
+                    continue
                 if hydration_attempts >= max(1, DEFERRED_HYDRATION_MAX_PER_CYCLE):
                     if str(order.get("contract") or "").strip().upper().startswith("DEFERRED:"):
                         log.info(
@@ -1166,6 +1174,37 @@ class APOrderMonitor:
             return True, "prior_day_high_or_low_present"
 
         return False, "no_overnight_deferred_evidence"
+
+    @staticmethod
+    def _has_durable_submit_intent(order: dict) -> bool:
+        """Hold PENDING_TRIGGER rows whose broker-submit boundary is durable."""
+        if order.get("submitted_ts") is not None:
+            return True
+
+        raw_meta = order.get("meta")
+        if raw_meta is None:
+            meta = {}
+        elif isinstance(raw_meta, dict):
+            meta = raw_meta
+        elif isinstance(raw_meta, str):
+            if not raw_meta.strip():
+                meta = {}
+            else:
+                try:
+                    import json as _json
+                    meta = _json.loads(raw_meta)
+                except Exception:
+                    return True
+                if not isinstance(meta, dict):
+                    return True
+        else:
+            return True
+
+        submit_intent_at = meta.get("submit_intent_at")
+        return submit_intent_at is not None and (
+            not isinstance(submit_intent_at, str)
+            or bool(submit_intent_at.strip())
+        )
 
     def _is_valid_watcher_held_pending_trigger(self, order: dict) -> tuple[bool, str]:
         """Return (is_valid_watcher_row, evidence_description).

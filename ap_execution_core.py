@@ -108,6 +108,26 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
     return None
 ET  = ZoneInfo("America/New_York")
 _OCC_CONTRACT_RE = re.compile(r"\d{6}[CP]\d{5,8}")
+_RECONCILE_OCC_SUFFIX_RE = re.compile(r"\d{6}[CP]\d{8}")
+_RECONCILE_OCC_ROOT_RE = re.compile(r"[A-Z][A-Z0-9.\-]{0,9}")
+
+
+def _is_exact_reconcile_occ_contract(contract_symbol: str, ticker: str = "") -> bool:
+    """Validate the full contract identity used by broker adoption."""
+    contract = str(contract_symbol or "").strip().upper()
+    ticker_upper = str(ticker or "").strip().upper()
+    if not contract or contract.startswith("DEFERRED:"):
+        return False
+    if ticker_upper:
+        if not contract.startswith(ticker_upper):
+            return False
+        return bool(_RECONCILE_OCC_SUFFIX_RE.fullmatch(contract[len(ticker_upper):]))
+    return bool(
+        re.fullmatch(
+            rf"{_RECONCILE_OCC_ROOT_RE.pattern}{_RECONCILE_OCC_SUFFIX_RE.pattern}",
+            contract,
+        )
+    )
 
 
 def _validate_deferred_selector_result(selection, ticker: str = "") -> tuple[bool, str, float, int]:
@@ -3592,7 +3612,7 @@ class APExecutionCore:
         expected_ticker = str(
             row.get("symbol") or row.get("ticker") or ""
         ).strip()
-        if not APExecutionCore._is_real_occ_contract(expected_contract, expected_ticker):
+        if not _is_exact_reconcile_occ_contract(expected_contract, expected_ticker):
             return _keep("RECONCILE_CONTRACT_MALFORMED")
         selected_contract = meta.get("selected_contract")
         if selected_contract is not None and str(selected_contract).strip() != expected_contract:

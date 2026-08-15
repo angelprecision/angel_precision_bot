@@ -1346,6 +1346,36 @@ class APStartupRecovery:
         return {}
 
     @staticmethod
+    def _has_durable_submit_evidence(order: dict) -> bool:
+        """Return whether the row must remain broker-owned and fail-closed."""
+        if order.get("submitted_ts") is not None:
+            return True
+
+        raw_meta = order.get("meta")
+        if raw_meta is None:
+            meta = {}
+        elif isinstance(raw_meta, dict):
+            meta = raw_meta
+        elif isinstance(raw_meta, str):
+            if not raw_meta.strip():
+                meta = {}
+            else:
+                try:
+                    meta = json.loads(raw_meta)
+                except Exception:
+                    return True
+                if not isinstance(meta, dict):
+                    return True
+        else:
+            return True
+
+        submit_intent_at = meta.get("submit_intent_at")
+        return submit_intent_at is not None and (
+            not isinstance(submit_intent_at, str)
+            or bool(submit_intent_at.strip())
+        )
+
+    @staticmethod
     def _find_pending_watcher_by_logical_identity(
         entry_watcher, *, local_order_id, client_id, signal_id, execution_mode,
     ):
@@ -2128,6 +2158,7 @@ class APStartupRecovery:
             meta = self._coerce_order_meta(order.get("meta"))
             lifecycle = str(meta.get("lifecycle_state") or "").upper()
             materialization_status = str(meta.get("materialization_status") or "").upper()
+            submit_evidence = self._has_durable_submit_evidence(order)
 
             # Do this before stale/terminal classification, quote work, or any
             # recovery ownership mutation.  A confirmed timestamp with missing
@@ -2161,7 +2192,7 @@ class APStartupRecovery:
                 stale_pending = (now - created_at).total_seconds() > 72 * 3600
             except Exception:
                 stale_pending = False
-            if stale_pending:
+            if stale_pending and not submit_evidence:
                 _terminalize_verified(
                     local_order_id,
                     reason_code="RECOVERY_STALE_PENDING_TRIGGER",
@@ -2170,7 +2201,7 @@ class APStartupRecovery:
                 )
                 continue
 
-            if lifecycle in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            if lifecycle in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"} and not submit_evidence:
                 _terminalize_verified(
                     local_order_id,
                     reason_code=str(meta.get("reason_code") or meta.get("final_reason") or "RECOVERY_TERMINAL_STATE"),
@@ -2193,7 +2224,7 @@ class APStartupRecovery:
             # and never terminalizes until the broker-query adoption gate is
             # wired. On RECONCILE_PENDING we retain durable ownership so the
             # row is never lost while it waits for reconciliation.
-            if meta.get("submit_intent_at") and not str(order.get("broker_order_id") or "").strip():
+            if submit_evidence and not str(order.get("broker_order_id") or "").strip():
                 reconcile_fn = None
                 if self.execution_core is not None:
                     reconcile_fn = getattr(
@@ -3518,6 +3549,15 @@ class APStartupRecovery:
                 order = dict(row or {})
                 local_order_id = str(order.get("local_order_id") or "").strip()
                 if not local_order_id:
+                    continue
+
+                if self._has_durable_submit_evidence(order):
+                    log.warning(
+                        "[%s] RECOVERY: broker submit evidence present "
+                        "local_order_id=%s — watcher reseed held for broker reconciliation",
+                        self.client_id,
+                        local_order_id,
+                    )
                     continue
 
                 # P0 amendment (PR #294): per-row readiness guard. The SELECT

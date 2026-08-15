@@ -791,7 +791,7 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
                     + "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
             else:
                 c.execute(
-                    "SELECT * FROM orders WHERE "
+                    "SELECT * FROM orders WHERE 1=1 "
                     + reconcile_statuses
                     + "ORDER BY created_ts DESC LIMIT %s", (limit,))
             return c.fetchall()
