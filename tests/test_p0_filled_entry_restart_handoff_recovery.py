@@ -842,6 +842,60 @@ def test_claimed_guard_release_outcome_is_fail_closed_and_not_repeated(monkeypat
     assert fm._release_entry_guards_once(order, position_id=POSITION_ID) is False
 
 
+@pytest.mark.parametrize("marker", ["false", "true", 0, 1, []])
+def test_malformed_guard_release_marker_fails_closed(monkeypatch, marker):
+    order = _order(
+        position_id=POSITION_ID,
+        meta={"filled_entry_guards_released": marker},
+    )
+    release_calls = []
+    persist_calls = []
+    monkeypatch.setattr(
+        fm,
+        "_persist_filled_entry_handoff_state",
+        _memory_persist(persist_calls),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards",
+        lambda *args, **kwargs: release_calls.append(True),
+    )
+
+    assert fm._release_entry_guards_once(order, position_id=POSITION_ID) is False
+    assert release_calls == []
+    assert persist_calls == []
+
+
+@pytest.mark.parametrize("marker", ["false", "true", 0, 1, []])
+def test_complete_shortcut_requires_boolean_guard_release_marker(monkeypatch, marker):
+    order = _order(
+        position_id=POSITION_ID,
+        meta={
+            "filled_entry_handoff_state": "COMPLETE",
+            "filled_entry_guards_released": marker,
+        },
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("complete shortcut must not release guards")
+        ),
+    )
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=_Broker([_broker_position()]),
+        order=order,
+        pm=_PM([_existing_position()]),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN"
+
+
 def test_guard_release_claim_is_atomic_across_stale_order_copies(monkeypatch):
     first = _order(position_id=POSITION_ID)
     second = _order(position_id=POSITION_ID)
@@ -866,6 +920,8 @@ def test_guard_release_claim_is_atomic_across_stale_order_copies(monkeypatch):
     assert fm._release_entry_guards_once(second, position_id=POSITION_ID) is False
     assert release_calls == [True]
     assert "filled_entry_guards_release_claimed" in persist_source
+    assert "filled_entry_guards_release_claimed' = 'false'::jsonb" in persist_source
+    assert "filled_entry_guards_released' = 'true'::jsonb" in persist_source
 
 
 def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(monkeypatch):
