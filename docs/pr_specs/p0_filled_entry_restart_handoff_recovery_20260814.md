@@ -2,7 +2,14 @@
 
 ## STATUS
 
-**DRAFT / SPEC ONLY / DO NOT MERGE OR DEPLOY.**
+**IMPLEMENTED / DRAFT / REVIEW REQUIRED / DO NOT MERGE OR DEPLOY.**
+
+Amended after independent audit to close the Window-A pair-cancel durability
+gap, narrow the EXIT-scope validation change back to ENTRY-only, and add a
+behavioral Window-E owner-rehydration test. See the "P0 AMENDMENT" and
+"WINDOW E" sections below for the added durable pair-resolution state
+contract and its required crash-window tests. No merge, deploy, or
+production-data mutation is authorized by this amendment.
 
 Base at spec creation:
 
@@ -107,6 +114,56 @@ broker FILLED
 
 Restart must recover only if current broker position truth proves the exact OCC risk still exists.
 
+## P0 AMENDMENT: Window A pair-cancel outcome durability
+
+Independent audit found Window A as originally implemented did not account
+for the opposite 1-1 pair order. Fresh-fill ordering is:
+
+```text
+IN_PROGRESS -> OSM FILLED -> _cancel_pair_opposite() -> position -> ...
+```
+
+A crash between `OSM FILLED` and `_cancel_pair_opposite()` resolving left
+recovery with zero cancel authority (correct) but also zero knowledge of
+whether the opposite pair order was ever addressed — meaning recovery
+could reach `COMPLETE` while a live opposite-side order still existed,
+producing unintended double exposure.
+
+Closed via a durable `filled_entry_pair_resolution_state` field in the
+same `orders.meta` handoff namespace:
+
+```text
+NOT_APPLICABLE   — no opposite pair existed for this fill
+CONFIRMED        — an opposite pair existed; broker cancel AND local OSM
+                    CANCELED transition were both durably confirmed
+OUTCOME_UNPROVEN — pair existed or applicability cannot be safely
+                    reconstructed; recovery gets zero cancel authority
+                    and must HOLD, never COMPLETE
+```
+
+`_cancel_pair_opposite()` now returns `(state, detail)` instead of `None`;
+every existing exit branch (no pair, broker cancel failure, missing
+broker id, unresolved side, local CAS miss after broker cancel succeeded,
+`ImportError`, generic exception) maps to `NOT_APPLICABLE` or
+`OUTCOME_UNPROVEN` — only a fully-confirmed broker+local cancel yields
+`CONFIRMED`. The fresh-fill path persists this immediately after calling
+`_cancel_pair_opposite()`. The `COMPLETE` write itself is additionally
+gated at the SQL layer:
+`COALESCE(meta->>'filled_entry_pair_resolution_state','') IN
+('NOT_APPLICABLE','CONFIRMED')` — a crash before this is durably proven
+cannot reach `COMPLETE` regardless of any application-level bug, since the
+CAS predicate itself refuses the write. `recover_interrupted_filled_entry_handoff`
+checks this state early (before bind/seed/guard-release) for both
+`ACTIVE_EXISTING` and `ACTIVE_RECREATE`, and never calls
+`_cancel_pair_opposite` itself (verified by the existing AST-based static
+guard test). Any value other than an exact-match `NOT_APPLICABLE` or
+`CONFIRMED` string — missing key, wrong case, wrong type, trailing
+whitespace — is treated as unproven and fails closed; no normalization is
+applied on read.
+
+Production change: `ap/fill_monitor.py` only. No new production file, no
+new broker cancel authority, no second pair-cancel implementation.
+
 ## Window B: after position exists, before durable identity bind
 
 ```text
@@ -157,6 +214,31 @@ Do **not** assume completed durable identity implies in-memory owner survival.
 
 If existing startup rehydration is proven, add regression evidence and do not duplicate it. If it is absent or incomplete, implement the smallest restart sweep in `ap/fill_monitor.py`; do not edit the exit engine merely to create another hydration system.
 
+## P0 AMENDMENT: Window E behavioral proof
+
+Independent audit found the only existing Window E evidence was a
+source-order assertion (`_run_startup_recovery` runs before
+`_seed_exit_engine_from_db` before the monitors) — proof of call
+ordering, not proof of actual rehydration behavior.
+
+`client_runner._seed_exit_engine_from_db()` delegates to
+`APExitEngine.seed_from_db()`, which is pre-existing, generic, and reads
+`position_manager.get_active_positions()` — it has no awareness of
+`filled_entry_handoff_state` and treats a recovery-completed position
+identically to a fresh-fill-completed one, because both paths write the
+position row through the same shared `_bind_filled_entry_durable_identity`
+/ `_open_position_safe` / `_seed_exit_engine` primitives (verified: single
+definition of each, called from both `process_pending_order` and
+`recover_interrupted_filled_entry_handoff`, no parallel reimplementation).
+
+Added `test_seed_from_db_rehydrates_exactly_one_owner_for_complete_position`:
+builds one exact active DB position row (client/mode/OCC/position_id
+matching what a COMPLETE handoff leaves behind), rehydrates a fresh
+`APExitEngine` with a broker double that raises on any submit/cancel/stop
+call, and asserts exactly one owner in `engine._positions` with exact
+identity match. No production change was required — existing generic
+mechanism, unmodified.
+
 ---
 
 # HISTORICAL EVIDENCE: USE, DO NOT CHERRY-PICK
@@ -202,6 +284,20 @@ HOLD
 
 **Do not cherry-pick #455.** Port only the narrow present-tense authority concept onto fresh current main and tighten it to this spec.
 
+## P0 AMENDMENT: legacy FILLED row contract
+
+`FILLED_ENTRY_LEGACY_GUARD_RELEASE_UNPROVEN` already correctly holds any
+row whose `filled_entry_handoff_state` predates this durable protocol
+(not `IN_PROGRESS`/`HOLD`/`COMPLETE`). This behavior is unchanged by this
+amendment and must remain fail-closed.
+
+This PR provides restart-safe handoff for fills processed **after** this
+durable protocol exists. Legacy FILLED rows (Jason/Jose or any other
+client) with unproven historical guard-release or pair-cancel outcomes
+remain `HOLD` unless a separately authorized exact historical repair
+proves those outcomes. No production-data repair is authorized in this
+PR or this amendment.
+
 ---
 
 # HARD FILE BUDGET
@@ -216,6 +312,30 @@ HOLD
 `ap/filled_entry_recovery_authority.py` may be newly created if it does not exist on current main.
 
 If a third production file appears necessary, **STOP and explain exactly why. Do not expand scope.**
+
+## P0 AMENDMENT: EXIT scope correction
+
+Independent audit found `check_order_with_broker()` had been changed to
+apply the new strict positive-integral/positive-finite admission gate
+globally to `{"FILLED", "EXIT_FILLED"}`, collaterally changing EXIT
+terminalization control flow. This PR's one job is FILLED ENTRY restart
+handoff; EXIT semantics are out of scope.
+
+Removed the global gate. Verified no protection was lost:
+
+- EXIT still has its own pre-existing PR #235 hardening (`filled_qty<=0`
+  block, predates this PR) unchanged.
+- ENTRY's admission boundary (`_validate_filled_entry_admission`) already
+  independently re-validates `result.get("filled_qty")` /
+  `result.get("avg_fill")` with the same strict helpers, so ENTRY lost no
+  protection either — the removed block was fully redundant for ENTRY.
+
+The raw-value parsing hardening in `check_order_with_broker` (using
+`_strict_positive_integral`/`_strict_positive_finite` instead of naive
+`int()`/`float()` coercion for `filled_qty`/`avg_fill`) was kept, since
+it is a strict superset improvement over the old casts and ENTRY's
+admission boundary depends on receiving accurately-coerced values — only
+the new hard error/short-circuit behavior was removed.
 
 ## Tests
 
