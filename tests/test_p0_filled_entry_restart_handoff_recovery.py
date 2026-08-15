@@ -46,7 +46,7 @@ def _order(**overrides):
         "filled_qty": 1,
         "fill_price": 1.58,
         "execution_mode": LIVE,
-        "meta": {},
+        "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
     }
     row.update(overrides)
     return row
@@ -179,6 +179,24 @@ def test_recovery_identity_or_money_truth_holds(order_overrides):
     assert result["disposition"] == "HOLD"
 
 
+def test_recovery_applies_explicit_client_fence(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=_Broker([_broker_position()]),
+        order=_order(),
+        pm=_PM(),
+        runtime_execution_mode=LIVE,
+        expected_client_id="different-client@example.com",
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_RECOVERY_CLIENT_MISMATCH"
+    assert calls == [("HOLD", None)]
+
+
 def test_recovery_query_is_separate_from_normal_pending_query():
     assert hasattr(fm, "get_interrupted_filled_entry_handoffs")
     assert hasattr(fm, "recover_interrupted_filled_entry_handoff")
@@ -274,6 +292,7 @@ def test_terminal_recovery_has_zero_broker_mutations_and_no_osm_filled_replay(mo
         }]),
         exit_engine=SimpleNamespace(execution_mode=LIVE, active_positions=lambda: []),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
 
@@ -346,6 +365,28 @@ def test_authority_holds_local_terminal_position_against_current_broker_risk():
 def test_authority_holds_multiple_local_candidates():
     result = evaluate_filled_entry_recovery_authority(
         pm=_PM([_existing_position(), _existing_position(id="position-duplicate")]),
+        order=_order(),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+        today=date(2026, 8, 14),
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_RECOVERY_LOCAL_POSITION_AMBIGUOUS"
+
+
+def test_authority_holds_same_contract_with_different_local_identity():
+    result = evaluate_filled_entry_recovery_authority(
+        pm=_PM(
+            [
+                _existing_position(
+                    id="other-position",
+                    local_order_id="other-local",
+                    broker_order_id="other-broker",
+                )
+            ]
+        ),
         order=_order(),
         runtime_execution_mode=LIVE,
         expected_client_id=CLIENT,
@@ -434,6 +475,7 @@ def test_authority_holds_malformed_current_broker_snapshot(payload):
     [
         [{}],
         [{"symbol": CONTRACT, "quantity": 0}],
+        [{"symbol": CONTRACT, "quantity": 0, "qty": 1}],
         [{"symbol": CONTRACT, "quantity": 1.5}],
         [{"symbol": CONTRACT, "quantity": True}],
     ],
@@ -531,6 +573,7 @@ def test_authority_ignores_equity_rows_but_not_option_identity(payload):
     [
         ([{"option_symbol": "PEP-INVALID", "quantity": 1}], "OCC_INVALID"),
         ([{"symbol": CONTRACT, "quantity": 0}], "QUANTITY_INVALID"),
+        ([{"symbol": CONTRACT, "quantity": 0, "qty": 1}], "QUANTITY_INVALID"),
         ([{"symbol": CONTRACT, "quantity": 1.5}], "QUANTITY_INVALID"),
     ],
 )
@@ -596,6 +639,7 @@ def test_active_existing_recovery_never_reopens_or_places_protection(monkeypatch
         pm=pm,
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
 
@@ -639,6 +683,7 @@ def test_active_recreate_recovery_opens_once_without_fresh_fill_side_effects(mon
         pm=pm,
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
 
@@ -666,6 +711,7 @@ def test_recovery_bind_failure_holds_before_guard_release_or_complete(monkeypatc
         pm=_PM(),
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
 
@@ -691,6 +737,7 @@ def test_recovery_owner_seed_failure_holds_before_guard_release(monkeypatch):
         pm=_PM([_existing_position()]),
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
 
@@ -715,12 +762,41 @@ def test_recovery_guard_release_failure_holds_without_complete(monkeypatch):
         pm=_PM([_existing_position()]),
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
 
     assert result["disposition"] == "HOLD"
     assert result["reason_code"] == "FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN"
     assert "COMPLETE" not in [state for state, _ in calls]
+
+
+def test_legacy_recovery_holds_before_recreate_or_guard_release(monkeypatch):
+    order = _order(meta={})
+    calls = []
+    release_calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not recreate legacy handoff")),
+    )
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=_Broker([_broker_position()]),
+        order=order,
+        pm=_PM(),
+        exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position()],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_LEGACY_GUARD_RELEASE_UNPROVEN"
+    assert calls == [("HOLD", None)]
+    assert release_calls == []
 
 
 def test_recovery_complete_write_failure_remains_retryable_hold(monkeypatch):
@@ -743,6 +819,7 @@ def test_recovery_complete_write_failure_remains_retryable_hold(monkeypatch):
         pm=_PM([_existing_position()]),
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
 
@@ -763,6 +840,32 @@ def test_claimed_guard_release_outcome_is_fail_closed_and_not_repeated(monkeypat
     )
 
     assert fm._release_entry_guards_once(order, position_id=POSITION_ID) is False
+
+
+def test_guard_release_claim_is_atomic_across_stale_order_copies(monkeypatch):
+    first = _order(position_id=POSITION_ID)
+    second = _order(position_id=POSITION_ID)
+    claim_taken = False
+    release_calls = []
+    persist_source = inspect.getsource(fm._persist_filled_entry_handoff_state)
+
+    def persist(order, state, **kwargs):
+        nonlocal claim_taken
+        if kwargs.get("require_guard_release_claim_absent"):
+            if claim_taken:
+                return False
+            claim_taken = True
+        if kwargs.get("extra_meta"):
+            order.setdefault("meta", {}).update(kwargs["extra_meta"])
+        return True
+
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", persist)
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: release_calls.append(True))
+
+    assert fm._release_entry_guards_once(first, position_id=POSITION_ID) is True
+    assert fm._release_entry_guards_once(second, position_id=POSITION_ID) is False
+    assert release_calls == [True]
+    assert "filled_entry_guards_release_claimed" in persist_source
 
 
 def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(monkeypatch):
@@ -794,6 +897,7 @@ def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(mon
         pm=pm,
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
     second = fm.recover_interrupted_filled_entry_handoff(
@@ -802,6 +906,7 @@ def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(mon
         pm=pm,
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
         broker_positions=[_broker_position()],
     )
 
@@ -845,6 +950,7 @@ def test_startup_rehydrates_filled_entry_positions_before_monitors_start():
 def test_recovery_batch_takes_one_current_broker_snapshot():
     source = inspect.getsource(fm.fill_monitor_loop)
     assert source.count("fetch_current_broker_positions(broker)") == 1
+    assert "expected_client_id=client_id" in source
 
 
 def test_interrupted_query_does_not_silently_filter_malformed_money_or_mode_truth():
@@ -852,3 +958,4 @@ def test_interrupted_query_does_not_silently_filter_malformed_money_or_mode_trut
     assert "filled_qty > 0" not in source
     assert "fill_price > 0" not in source
     assert "execution_mode IN ('live','paper')" not in source
+    assert "OR (\n                      AND" not in source
