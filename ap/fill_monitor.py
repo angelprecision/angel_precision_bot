@@ -473,6 +473,7 @@ def get_interrupted_filled_entry_handoffs(client_id: str) -> list[dict]:
                 WHERE client_id=%s
                   AND kind='ENTRY'
                   AND status='FILLED'
+                  AND COALESCE(meta->>'filled_entry_handoff_state','') <> 'COMPLETE'
                   AND (
                     meta->>'filled_entry_handoff_state'='IN_PROGRESS'
                     OR (
@@ -2912,10 +2913,41 @@ def _recovery_failure_retryable(reason: str) -> bool:
 
 
 def _release_entry_guards_once(order: dict, *, position_id: str) -> bool:
-    """Release entry reservations once, with a durable idempotency marker."""
+    """Release entry reservations once, with a durable side-effect claim.
+
+    The claim is written before the external guard release.  If the process
+    dies after the claim, recovery holds rather than repeating a non-idempotent
+    equity release against another order's reservation.  A normal successful
+    release records the second, durable ``released`` marker before COMPLETE.
+    """
     meta = _order_meta_dict(order)
     if bool(meta.get("filled_entry_guards_released")):
         return True
+    if bool(meta.get("filled_entry_guards_release_claimed")):
+        log.critical(
+            "[%s] FILLED_ENTRY_GUARDS_RELEASE_OUTCOME_UNPROVEN local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+        return False
+    claimed = _persist_filled_entry_handoff_state(
+        order,
+        "IN_PROGRESS",
+        reason="filled_entry_guards_release_claimed",
+        retryable=True,
+        position_id=position_id,
+        extra_meta={
+            "filled_entry_guards_release_claimed": True,
+            "filled_entry_guards_release_claimed_at": now_utc_iso(),
+        },
+    )
+    if not claimed:
+        log.error(
+            "[%s] FILLED_ENTRY_GUARDS_RELEASE_CLAIM_FAILED local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+        return False
     try:
         _release_entry_guards(order)
     except Exception as exc:
