@@ -612,3 +612,19 @@ def test_client_runner_passes_the_existing_core_instance(monkeypatch):
     runner._start_reconciler(MagicMock(), MagicMock())
 
     assert captured["execution_core"] is runner.core
+
+
+def test_tradier_list_orders_requests_tags_and_full_session_limit():
+    from ap.brokers.tradier import TradierBroker
+
+    broker = object.__new__(TradierBroker)
+    broker.cfg = types.SimpleNamespace(account_id="ACCT-1")
+    broker._get = MagicMock(
+        return_value={"orders": {"order": {"id": "TR-1", "tag": TAG}}}
+    )
+
+    assert broker.list_orders() == [{"id": "TR-1", "tag": TAG}]
+    broker._get.assert_called_once_with(
+        "/v1/accounts/ACCT-1/orders",
+        params={"includeTags": "true", "limit": 1500},
+    )

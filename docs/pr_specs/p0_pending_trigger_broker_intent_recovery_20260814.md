@@ -91,7 +91,7 @@ This preserves PR #470's canonical filled ENTRY identity handoff.
 
 ## HARD FILE BUDGET
 
-### Production: exactly six files
+### Production: exactly seven files
 
 1. `ap/db.py`
 2. `ap_reconciler.py`
@@ -99,6 +99,7 @@ This preserves PR #470's canonical filled ENTRY identity handoff.
 4. `client_runner.py`
 5. `ap/order_monitor.py`
 6. `ap_recovery.py`
+7. `ap/brokers/tradier.py`
 
 `ap/order_monitor.py` and `ap_recovery.py` are required lifecycle fences, not a broader recovery redesign:
 
@@ -106,6 +107,8 @@ This preserves PR #470's canonical filled ENTRY identity handoff.
 - `ap_recovery.py` must not stale-expire, terminalize, or watcher-reseed that row before reconciler ownership resolves.
 
 Without these two fences, existing hydration, stale cleanup, ghost sweep, and startup reseed paths can mutate a `PENDING_TRIGGER` row that already has durable submit evidence before broker reconciliation runs.
+
+`ap/brokers/tradier.py` is required only at the broker-listing seam: it requests `includeTags=true` and the bounded maximum `limit=1500`, so the reconciler receives durable submit tags and can search the current account-order window instead of the Tradier default first 25 orders. It does not add POST, cancel, fill, or terminal-state behavior.
 
 No other production files are in scope.
 
@@ -115,7 +118,7 @@ No other production files are in scope.
 2. `.github/workflows/p0_regression.yml` may change only to add that exact focused test if needed.
 3. This spec document.
 
-If a seventh production file appears necessary, STOP and report the exact blocker. Do not expand scope.
+If an eighth production file appears necessary, STOP and report the exact blocker. Do not expand scope.
 
 ## Forbidden production edits
 
@@ -273,7 +276,7 @@ Do not fix generic STUCK_TRIGGER_READY without submit intent, watcher rearm, def
 
 # Codex instruction
 
-Implement this spec exactly on the PR branch. Do not restore historical #445/#456 wholesale. Keep production changes to the six named files and one focused test. If a seventh production file is required, STOP and explain the blocker instead of expanding scope.
+Implement this spec exactly on the PR branch. Do not restore historical #445/#456 wholesale. Keep production changes to the seven named files and one focused test. If an eighth production file is required, STOP and explain the blocker instead of expanding scope.
 
 Do not merge, deploy, change env vars, mutate production data, or clean historical rows.
 

@@ -416,7 +416,10 @@ class TradierBroker(BrokerAdapter):
         callers must distinguish an authoritative empty result from an unavailable
         broker query before deciding that a new POST is safe.
         """
-        j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
+        j = self._get(
+            f"/v1/accounts/{self.cfg.account_id}/orders",
+            params={"includeTags": "true", "limit": 1500},
+        )
         node = j.get("orders") if isinstance(j, dict) else None
         orders = node.get("order") if isinstance(node, dict) else node
         if orders is None:
