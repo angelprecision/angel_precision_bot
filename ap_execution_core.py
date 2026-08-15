@@ -2153,7 +2153,46 @@ class APExecutionCore:
                     "context_notes": msg + "_paper_fail_open",
                 })
 
-        if approved_plan is not None and self.master_control is not None:
+        # ── P0 (PR #474): a DEFERRED:<ticker> entry has no real contract cost
+        # yet. Until breach-time materialization runs in _on_entry_trigger(), the
+        # plan carries limit_price=0.01 and max_position_usd=<account budget>
+        # (a reservation/selector budget, NOT a selected-contract cost). Feeding
+        # that placeholder into master_control.revalidate_exposure() here can
+        # false-reject a legitimate setup as an actual-cost cap breach before any
+        # OCC contract exists. Kill-switch and position-slot checks above have
+        # already run and still protect this path. The authoritative capital
+        # check for a deferred entry runs AFTER materialization and before any
+        # broker POST (see the deferred final exposure revalidation in
+        # _on_entry_trigger). Hydrated-prebreach rows are materialized to a real
+        # contract before their own dedicated revalidation, so they are not
+        # deferred here. This is not a risk bypass — there is no actual contract
+        # cost to validate yet.
+        _skip_exposure_reval_deferred = False
+        if approved_plan is not None:
+            _bp_meta = getattr(approved_plan, "metadata", None) or {}
+            _bp_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
+            _bp_is_deferred = bool(
+                (isinstance(_bp_meta, dict) and _bp_meta.get("contract_deferred"))
+                or not _bp_contract
+                or _bp_contract.upper().startswith("DEFERRED:")
+            )
+            if _bp_is_deferred:
+                # Suppress only the capital-cost revalidation; kill-switch and
+                # position-slot checks above already ran and still apply. Fall
+                # through to the shared final success path so this method's
+                # control-flow signature (block returns vs. success) is unchanged.
+                _skip_exposure_reval_deferred = True
+                log.info(
+                    "[%s] Breach exposure revalidation deferred until contract "
+                    "materialization — placeholder budget is not real contract cost",
+                    ticker,
+                )
+
+        if (
+            not _skip_exposure_reval_deferred
+            and approved_plan is not None
+            and self.master_control is not None
+        ):
             try:
                 reval = self.master_control.revalidate_exposure(
                     approved_plan,
@@ -5334,9 +5373,18 @@ class APExecutionCore:
                         _sel_qty = _sel_qty_candidate
                         if _sel_qty > 0:
                             approved_plan.contracts = _sel_qty
-                            _prem_per_contract = float(getattr(_sel, "premium_per_contract", 0) or 0)
-                            if _prem_per_contract > 0:
-                                approved_plan.max_position_usd = _sel_qty * _prem_per_contract
+                            # P0 (PR #474): the real selected-contract cost is
+                            # deterministic from the validated executable per-share
+                            # price and quantity (option multiplier = 100). Do NOT
+                            # gate this on an optional premium_per_contract being
+                            # present/nonzero — when it is absent the placeholder
+                            # account budget would otherwise survive into the final
+                            # exposure revalidation as if it were the real cost.
+                            # _validate_deferred_selector_result already proved
+                            # price > 0 and qty > 0 for this real-OCC result.
+                            approved_plan.max_position_usd = round(
+                                float(_sel_price_candidate) * int(_sel_qty) * 100.0, 2
+                            )
                         _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
                         # P0 amendment #3 (PR #294): capture stages 1 & 2 of
                         # the handoff snapshot the moment copy-back completes.
@@ -5486,13 +5534,20 @@ class APExecutionCore:
                     # contract at the selected premium.
                     try:
                         approved_plan.contracts = 1
-                        _prem = float(getattr(_sel, "premium_per_contract", 0) or 0)
-                        if _prem > 0:
-                            approved_plan.max_position_usd = _prem
+                        # P0 (PR #474): acceptance mode clamps qty to exactly 1.
+                        # Recompute the real cost from the validated executable
+                        # per-share price and the final clamped qty (option
+                        # multiplier = 100) so the placeholder account budget can
+                        # never survive into the final exposure revalidation.
+                        # Independent of optional premium_per_contract.
+                        approved_plan.max_position_usd = round(
+                            float(_sel_price_candidate) * 1 * 100.0, 2
+                        )
                         log.info(
                             "[%s] DEFERRED_ACCEPTANCE_CAP_PASS contract=%s "
-                            "ask=%.2f cap=%.2f qty=1",
+                            "ask=%.2f cap=%.2f qty=1 cost=$%.2f",
                             ticker, _sel_contract, _sel_ask, _accept_cap,
+                            float(getattr(approved_plan, "max_position_usd", 0) or 0),
                         )
                     except Exception as _cap_exc:
                         log.warning(
@@ -6549,6 +6604,80 @@ class APExecutionCore:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan has invalid contracts=%s", ticker, approved_qty)
             _terminalize_breach_failure(f"approved_plan_invalid_contracts={approved_qty}")
             return
+
+        # ── 4a) P0 (PR #474): final capital authority for DEFERRED entries only.
+        # A deferred entry skipped the breach-time exposure revalidation in
+        # _breach_risk_check() because at that seam only a DEFERRED:<ticker>
+        # placeholder budget existed (no real contract to price). Now the real OCC
+        # contract, executable price, and final quantity (including any acceptance
+        # qty clamp) are materialized and validated above, so the authoritative
+        # Master Control exposure check must run against the REAL contract cost
+        # before any quote-refresh submit gate or broker POST. Non-deferred and
+        # hydrated-prebreach entries already revalidated earlier (breach reval /
+        # hydration reval) and must NOT be revalidated a second time here — this
+        # block is gated on _deferred and never runs for them. master_control
+        # presence is read via getattr — identical to _breach_risk_check() and
+        # the hydration bridge — so a degraded/test construction without the
+        # attribute is treated as absent rather than raising. Production start()
+        # validation guarantees master_control is wired before any trigger runs.
+        _deferred_master_control = getattr(self, "master_control", None)
+        if _deferred and _deferred_master_control is not None:
+            # Recompute the actual cost from the final (post-clamp) qty and the
+            # validated executable per-share price so Master Control sees the
+            # exact money path — never the stale placeholder budget.
+            _final_cost = round(float(_plan_limit) * int(approved_qty) * 100.0, 2)
+            try:
+                approved_plan.max_position_usd = _final_cost
+            except Exception:
+                pass
+            _dmc_client_id = _breach_client_id or self.email or "default"
+            try:
+                _final_reval = _deferred_master_control.revalidate_exposure(
+                    approved_plan,
+                    client_id=_dmc_client_id,
+                )
+                if not getattr(_final_reval, "ok", False):
+                    _dmc_reason = getattr(
+                        _final_reval, "reason", "exposure_revalidation_failed"
+                    )
+                    log.info(
+                        "[%s] DEFERRED final exposure revalidation blocked "
+                        "contract=%s cost=$%.2f reason=%s — no broker POST",
+                        ticker, approved_contract, _final_cost, _dmc_reason,
+                    )
+                    return _terminalize_deferred_breach_failure(
+                        f"deferred_final_exposure_revalidation:{_dmc_reason}",
+                        extra_meta={
+                            "failure_stage": "deferred_final_exposure_revalidation",
+                            "selected_contract": approved_contract,
+                            "actual_contract_cost": _final_cost,
+                            "final_qty": int(approved_qty),
+                            "mc_block_reason": str(_dmc_reason),
+                        },
+                    )
+            except Exception as _dmc_exc:
+                if self.mode == "LIVE":
+                    log.critical(
+                        "[%s] LIVE DEFERRED final exposure revalidation errored: %s "
+                        "— failing closed, no broker POST",
+                        ticker, _dmc_exc,
+                    )
+                    return _terminalize_deferred_breach_failure(
+                        f"deferred_final_exposure_revalidation_error:{_dmc_exc}",
+                        extra_meta={
+                            "failure_stage": "deferred_final_exposure_revalidation",
+                            "selected_contract": approved_contract,
+                            "actual_contract_cost": _final_cost,
+                            "final_qty": int(approved_qty),
+                            "exception_type": type(_dmc_exc).__name__,
+                        },
+                    )
+                # PAPER preserves the existing revalidation-exception posture:
+                # fail open (log + continue), identical to _breach_risk_check().
+                log.warning(
+                    "[%s] PAPER deferred final exposure revalidation failed open: %s",
+                    ticker, _dmc_exc,
+                )
 
         # 4b) P0 FIX: refresh the option contract ask immediately before submit.
         #
