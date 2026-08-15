@@ -1052,6 +1052,8 @@ class APOrderMonitor:
                         WHERE client_id = %s
                           AND status = 'PENDING_TRIGGER'
                           AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NULL
                           AND UPPER(contract) LIKE 'DEFERRED:%%'
                           AND kind = 'ENTRY'
                           AND created_ts < %s

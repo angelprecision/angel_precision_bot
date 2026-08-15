@@ -49,7 +49,7 @@ log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 _BROKER_ID_PLACEHOLDERS = frozenset(
-    {"N/A", "NA", "NONE", "NULL", "PENDING", "UNKNOWN", "ERROR"}
+    {"N/A", "NA", "NONE", "NULL", "PENDING", "UNKNOWN", "ERROR", "0", "FALSE"}
 )
 
 
@@ -119,6 +119,8 @@ def _is_exact_reconcile_occ_contract(contract_symbol: str, ticker: str = "") -> 
     if not contract or contract.startswith("DEFERRED:"):
         return False
     if ticker_upper:
+        if not _RECONCILE_OCC_ROOT_RE.fullmatch(ticker_upper):
+            return False
         if not contract.startswith(ticker_upper):
             return False
         return bool(_RECONCILE_OCC_SUFFIX_RE.fullmatch(contract[len(ticker_upper):]))
@@ -3448,9 +3450,8 @@ class APExecutionCore:
         result is strongly checked against contract, side and quantity before
         an existing order is adopted. Ambiguity remains fail-closed.
 
-          * ALREADY_RECONCILED — broker_order_id already present; the
-            order monitor owns the row.  (Defensive; the recovery load
-            filter normally excludes these.)
+          * ALREADY_RECONCILED — the broker identity is already durable or
+            an exact broker match was adopted; the order monitor owns the row.
           * NOT_IN_CRASH_WINDOW — no submit_intent_at; the row never
             reached the broker-submit boundary and is safe for the normal
             resume path.
@@ -3512,6 +3513,8 @@ class APExecutionCore:
         if row_mode and expected_mode and row_mode != expected_mode:
             return _keep("RECONCILE_EXECUTION_MODE_MISMATCH")
         broker_order_id = str(row.get("broker_order_id") or "").strip()
+        if broker_order_id.upper() in _BROKER_ID_PLACEHOLDERS:
+            broker_order_id = ""
         raw_meta = row.get("meta")
         if raw_meta is None:
             meta = {}
@@ -3536,8 +3539,17 @@ class APExecutionCore:
         if str(row.get("kind") or "").strip().upper() != "ENTRY":
             return _keep("RECONCILE_KIND_MISMATCH")
 
-        # ── Already has a broker order → adopted, not our concern ────
+        # A real durable broker id is already broker identity evidence.  Repair
+        # only the local lifecycle boundary so fill_monitor can own the next
+        # broker transition; never infer fills or terminal truth here.
         if broker_order_id:
+            if str(row.get("status") or "").strip().upper() == "PENDING_TRIGGER":
+                if not osm.transition(
+                    local_order_id,
+                    "SUBMITTED",
+                    broker_order_id=broker_order_id,
+                ):
+                    return _keep("RECONCILE_ADOPTION_TRANSITION_FAILED")
             return {
                 **_base,
                 "disposition": "ALREADY_RECONCILED",

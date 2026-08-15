@@ -188,6 +188,42 @@ def test_exact_match_adopts_only_submitted_for_every_remote_status():
         _assert_no_broker_mutations(broker)
 
 
+def test_existing_broker_id_repairs_pending_trigger_to_submitted():
+    core, broker, osm = _core(_row(broker_order_id="TR-JNJ-472"), [])
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=LOCAL_ORDER_ID
+    )
+
+    assert result["reason_code"] == "RECONCILE_BROKER_ORDER_PRESENT"
+    assert result["status"] == "SUBMITTED"
+    osm.transition.assert_called_once_with(
+        LOCAL_ORDER_ID,
+        "SUBMITTED",
+        broker_order_id="TR-JNJ-472",
+    )
+    broker.list_orders.assert_not_called()
+    osm.update_order_meta.assert_not_called()
+    _assert_no_broker_mutations(broker)
+
+
+def test_placeholder_broker_id_is_reconciled_as_missing():
+    core, broker, osm = _core(_row(broker_order_id="N/A"), [_remote()])
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=LOCAL_ORDER_ID
+    )
+
+    assert result["reason_code"] == "BROKER_ORDER_ADOPTED"
+    assert result["status"] == "SUBMITTED"
+    osm.transition.assert_called_once_with(
+        LOCAL_ORDER_ID,
+        "SUBMITTED",
+        broker_order_id="TR-JNJ-472",
+    )
+    _assert_no_broker_mutations(broker)
+
+
 def test_empty_or_ambiguous_broker_truth_holds_without_post_or_cancel():
     cases = (
         [],
@@ -198,6 +234,7 @@ def test_empty_or_ambiguous_broker_truth_holds_without_post_or_cancel():
         [_remote(quantity="malformed")],
         [_remote(quantity="0")],
         [_remote(id="N/A")],
+        [_remote(id="0")],
     )
     for broker_orders in cases:
         core, broker, osm = _core(_row(), broker_orders)
@@ -270,6 +307,57 @@ def test_malformed_exact_equal_occ_contract_is_held():
     assert result["reason_code"] == "RECONCILE_CONTRACT_MALFORMED"
     osm.transition.assert_not_called()
     _assert_no_broker_mutations(broker)
+
+
+def test_malformed_ticker_root_is_held():
+    malformed = "J!J260821C00260000"
+    row = _row(
+        symbol="J!J",
+        contract=malformed,
+        meta={**_row()["meta"], "selected_contract": malformed},
+    )
+    core, broker, osm = _core(row, [_remote(option_symbol=malformed)])
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=LOCAL_ORDER_ID
+    )
+
+    assert result["reason_code"] == "RECONCILE_CONTRACT_MALFORMED"
+    osm.transition.assert_not_called()
+    _assert_no_broker_mutations(broker)
+
+
+def test_deferred_ghost_sweep_fences_submit_evidence(monkeypatch):
+    import ap.order_monitor as order_monitor
+
+    class Cursor:
+        def __init__(self):
+            self.sql = ""
+
+        def execute(self, sql, _params):
+            self.sql = " ".join(str(sql).split())
+            return self
+
+        def fetchall(self):
+            return []
+
+    cursor = Cursor()
+
+    @contextmanager
+    def fake_conn():
+        yield cursor
+
+    monkeypatch.setattr(order_monitor, "EOD_DEFERRED_GHOST_SWEEP_ENABLED", True)
+    monkeypatch.setattr(order_monitor, "conn", fake_conn)
+    monkeypatch.setattr(order_monitor, "run_with_retry", lambda fn: fn())
+
+    monitor = object.__new__(APOrderMonitor)
+    monitor.client_id = CLIENT_ID
+    monitor._is_after_pt_eod_cutoff = lambda: False
+
+    assert monitor._sweep_stale_deferred_ghosts() == 0
+    assert "submitted_ts IS NULL" in cursor.sql
+    assert "submit_intent_at" in cursor.sql
 
 
 def test_startup_recovery_holds_stale_submit_intent_before_terminalization(monkeypatch):
