@@ -4153,12 +4153,18 @@ class APOrderStateMachine:
         def _terminalize():
             with conn() as c:
                 cur = c.execute(
+                    # Reassert the broker-ownership boundary at write time.
+                    # Recovery classifies rows from an earlier snapshot; a
+                    # submit intent committed after that read must turn this
+                    # into a CAS miss, never a terminal write.
                     "UPDATE orders SET status=%s, last_error=%s, "
                     "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, updated_ts=NOW() "
                     "WHERE local_order_id=%s AND client_id=%s AND kind='ENTRY' "
                     "AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
                     "AND (broker_order_id IS NULL OR broker_order_id='') "
-                    "AND submitted_ts IS NULL" + _where_owner,
+                    "AND submitted_ts IS NULL "
+                    "AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NULL"
+                    + _where_owner,
                     tuple(_params),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)

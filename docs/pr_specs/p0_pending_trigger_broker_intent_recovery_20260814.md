@@ -111,7 +111,7 @@ Without these two fences, existing hydration, stale cleanup, ghost sweep, and st
 
 `ap/brokers/tradier.py` is required only at the broker-listing seam: it requests `includeTags=true` and the bounded maximum `limit=1500`, so the reconciler receives durable submit tags and can search the current account-order window instead of the Tradier default first 25 orders. It does not add POST, cancel, fill, or terminal-state behavior.
 
-`ap/order_state_machine.py` is required only at the broker-identity CAS seam: an exact reconciliation may replace a legacy placeholder broker ID (`N/A`, `PENDING`, and the existing placeholder set) with the exact remote ID atomically. It does not loosen replacement of a different durable broker ID or change other lifecycle transitions.
+`ap/order_state_machine.py` is required only at two narrow CAS seams: (1) an exact reconciliation may replace a legacy placeholder broker ID (`N/A`, `PENDING`, and the existing placeholder set) with the exact remote ID atomically, and (2) the existing deferred terminalization write must reassert that no durable submit intent exists at write time. It does not loosen replacement of a different durable broker ID or add lifecycle behavior.
 
 No other production files are in scope.
 
@@ -125,7 +125,7 @@ If a ninth production file appears necessary, STOP and report the exact blocker.
 
 ## Forbidden production edits
 
-Do NOT modify OSM outside the narrow broker-identity CAS fence described above, entry watcher, contract selector/revalidator, sizing/risk policy, scanners, queue, fill monitor, position manager, exit engine, proof writers, manual-close reconciliation, reconciler position economics, intelligence, migrations, Render, scheduled jobs, or package/import-root files.
+Do NOT modify OSM outside the narrow broker-identity and deferred-terminalization CAS fences described above, entry watcher, contract selector/revalidator, sizing/risk policy, scanners, queue, fill monitor, position manager, exit engine, proof writers, manual-close reconciliation, reconciler position economics, intelligence, migrations, Render, scheduled jobs, or package/import-root files.
 
 The `ap/order_monitor.py` and `ap_recovery.py` edits remain limited to the lifecycle fences stated above; they do not authorize a general pending-trigger restart-recovery or classifier redesign.
 
@@ -152,7 +152,7 @@ Do NOT broadly include all `PENDING_TRIGGER` rows. Ordinary watcher-owned rows w
 
 When constructing `APBrokerReconciler`, pass the already-existing client execution core as `execution_core=self.core` (or the current exact attribute if named equivalently).
 
-Do not construct a second core. Do not change runner startup order.
+Do not construct a second core. Do not change runner startup order. The startup phantom cleanup write targets must reassert the full pre-submit ownership predicate, including `submitted_ts IS NULL`, blank `submit_intent_at`, no fill/position, and a missing/placeholder broker ID. The cleanup audit marker must identify this guard version as `v3_submit_intent_cas`.
 
 ## 3. `ap_reconciler.py` — route submit-intent rows before phantom cleanup
 
@@ -222,6 +222,16 @@ Do NOT transition here directly to FILLED, PARTIAL_FILL, REJECTED, CANCELED, or 
 
 If an existing trustworthy broker-submission timestamp helper is already available in this file, it may be used. Do not invent chronology from reconciliation time merely to populate `submitted_ts`; otherwise leave it unchanged/null.
 
+## 5. `ap/order_state_machine.py` — terminalization CAS fence
+
+Keep the existing `terminalize_deferred_breach(...)` API and diagnostics unchanged, but add this predicate to its `UPDATE orders` write boundary:
+
+```sql
+AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NULL
+```
+
+Recovery classifies rows from an earlier snapshot. If submit intent is committed after that read, terminalization must return a CAS miss and leave the row broker-owned for reconciliation. Do not add a retry scheduler or a second terminalization path.
+
 # Broker authority
 
 Permitted: read/list broker orders.
@@ -250,6 +260,8 @@ Minimum cases:
 14. Reconciler missing `execution_core` -> HOLD, no age cancel.
 15. `client_runner` passes its exact existing core instance into reconciler.
 16. Broker mutation trap -> zero submit/replace/cancel across all recovery cases.
+17. Startup cleanup asserts the write-time ownership guard in both `cancel_targets` and `skip_targets`.
+18. Deferred terminalization asserts the write-time `submit_intent_at` CAS guard.
 
 Run adjacent reconciler exact-mode tests, existing deferred broker-intent tests, fill monitor normal ENTRY tests, and PR #470 handoff tests if present on the integration base.
 
@@ -264,6 +276,9 @@ PENDING_TRIGGER ENTRY + durable submit intent + no broker id
 
 0 match / ambiguity / mismatch
   -> HOLD, zero POST
+
+Concurrent submit intent after a stale startup/recovery read
+  -> write-time CAS miss, zero CANCELED/RETRY_ELIGIBLE/terminal mutation
 
 exactly one exact match
   -> adopt exact broker_order_id

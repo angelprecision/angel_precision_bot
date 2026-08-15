@@ -447,6 +447,44 @@ def test_osm_transition_accepts_placeholder_as_missing_broker_identity(monkeypat
     assert "'N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE'" in cursor.sql
 
 
+def test_osm_terminalization_reasserts_submit_intent_cas(monkeypatch):
+    import ap.order_state_machine as order_state_machine
+
+    class Cursor:
+        rowcount = 0
+
+        def execute(self, sql, params):
+            self.sql = " ".join(str(sql).split())
+            self.params = params
+            return self
+
+    cursor = Cursor()
+
+    @contextmanager
+    def fake_conn():
+        yield cursor
+
+    monkeypatch.setattr(order_state_machine, "conn", fake_conn)
+    monkeypatch.setattr(
+        order_state_machine,
+        "run_with_retry",
+        lambda fn, *args, **kwargs: fn(),
+    )
+
+    osm = object.__new__(order_state_machine.APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    assert osm.terminalize_deferred_breach(
+        LOCAL_ORDER_ID,
+        reason_code="RECOVERY_STALE_PENDING_TRIGGER",
+        terminal_status="EXPIRED",
+    ) is False
+    assert (
+        "NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NULL"
+        in cursor.sql
+    )
+
+
 def test_startup_watcher_reseed_holds_submit_intent_before_ptr(monkeypatch):
     row = _row(created_ts=datetime.now(timezone.utc))
     watcher = MagicMock()
@@ -471,12 +509,14 @@ def test_startup_phantom_cleanup_excludes_submit_intent_before_reconciliation(mo
     import client_runner
 
     sql_calls = []
+    sql_params = []
 
     class Cursor:
         rowcount = 0
 
         def execute(self, sql, _params=None):
             sql_calls.append(" ".join(str(sql).split()))
+            sql_params.append(_params)
             return self
 
         def fetchone(self):
@@ -497,6 +537,18 @@ def test_startup_phantom_cleanup_excludes_submit_intent_before_reconciliation(mo
 
     candidate_sql = sql_calls[0]
     assert "NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NULL" in candidate_sql
+    write_guard = (
+        "o.status IN ('CREATED','PENDING_TRIGGER','PENDING','DEFERRED')"
+        " AND o.submitted_ts IS NULL"
+        " AND NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NULL"
+        " AND o.filled_ts IS NULL"
+        " AND o.position_id IS NULL"
+    )
+    for target in ("cancel_targets AS (", "skip_targets AS ("):
+        assert target in candidate_sql
+        target_sql = candidate_sql.split(target, 1)[1].split("RETURNING", 1)[0]
+        assert write_guard in target_sql
+    assert "v3_submit_intent_cas" in sql_params[0]
 
 
 def test_startup_watcher_reseed_sql_holds_submit_evidence_before_queue_reset(monkeypatch):
