@@ -59,6 +59,14 @@ ACTIVE_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
 
 _OCC_SIDE_RE = re.compile(r"\d{6}([CP])\d{8}$")
 _VALID_EXECUTION_MODES = frozenset({"PAPER", "LIVE"})
+_BROKER_ID_PLACEHOLDERS = frozenset(
+    {"N/A", "NA", "NONE", "NULL", "PENDING", "UNKNOWN", "ERROR", "0", "FALSE"}
+)
+
+
+def _is_missing_broker_order_id(value) -> bool:
+    normalized = str(value or "").strip().upper()
+    return not normalized or normalized in _BROKER_ID_PLACEHOLDERS
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -1746,7 +1754,13 @@ class APStartupRecovery:
                       AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
-                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND (
+                            broker_order_id IS NULL
+                         OR BTRIM(COALESCE(broker_order_id, '')) = ''
+                         OR UPPER(BTRIM(COALESCE(broker_order_id, ''))) IN (
+                                'N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE'
+                            )
+                      )
                       AND submitted_ts IS NULL
                     ORDER BY created_ts ASC
                     """,
@@ -2224,7 +2238,9 @@ class APStartupRecovery:
             # and never terminalizes until the broker-query adoption gate is
             # wired. On RECONCILE_PENDING we retain durable ownership so the
             # row is never lost while it waits for reconciliation.
-            if submit_evidence and not str(order.get("broker_order_id") or "").strip():
+            if submit_evidence and _is_missing_broker_order_id(
+                order.get("broker_order_id")
+            ):
                 reconcile_fn = None
                 if self.execution_core is not None:
                     reconcile_fn = getattr(

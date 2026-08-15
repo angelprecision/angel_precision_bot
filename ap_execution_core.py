@@ -3588,6 +3588,9 @@ class APExecutionCore:
         tag = canonical_broker_submit_key(broker_submit_key)
         if not tag:
             return _keep("RECONCILE_SUBMIT_KEY_MALFORMED")
+        expected_submit_tag = canonical_broker_submit_key(requested_local_order_id)
+        if tag != expected_submit_tag:
+            return _keep("RECONCILE_SUBMIT_KEY_LOCAL_ORDER_MISMATCH")
 
         broker = getattr(self, "broker", None)
         list_orders = getattr(broker, "list_orders", None)

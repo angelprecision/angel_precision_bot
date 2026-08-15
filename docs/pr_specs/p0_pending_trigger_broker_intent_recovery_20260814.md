@@ -91,7 +91,7 @@ This preserves PR #470's canonical filled ENTRY identity handoff.
 
 ## HARD FILE BUDGET
 
-### Production: exactly seven files
+### Production: exactly eight files
 
 1. `ap/db.py`
 2. `ap_reconciler.py`
@@ -100,6 +100,7 @@ This preserves PR #470's canonical filled ENTRY identity handoff.
 5. `ap/order_monitor.py`
 6. `ap_recovery.py`
 7. `ap/brokers/tradier.py`
+8. `ap/order_state_machine.py`
 
 `ap/order_monitor.py` and `ap_recovery.py` are required lifecycle fences, not a broader recovery redesign:
 
@@ -110,6 +111,8 @@ Without these two fences, existing hydration, stale cleanup, ghost sweep, and st
 
 `ap/brokers/tradier.py` is required only at the broker-listing seam: it requests `includeTags=true` and the bounded maximum `limit=1500`, so the reconciler receives durable submit tags and can search the current account-order window instead of the Tradier default first 25 orders. It does not add POST, cancel, fill, or terminal-state behavior.
 
+`ap/order_state_machine.py` is required only at the broker-identity CAS seam: an exact reconciliation may replace a legacy placeholder broker ID (`N/A`, `PENDING`, and the existing placeholder set) with the exact remote ID atomically. It does not loosen replacement of a different durable broker ID or change other lifecycle transitions.
+
 No other production files are in scope.
 
 ### Tests and spec
@@ -118,11 +121,11 @@ No other production files are in scope.
 2. `.github/workflows/p0_regression.yml` may change only to add that exact focused test if needed.
 3. This spec document.
 
-If an eighth production file appears necessary, STOP and report the exact blocker. Do not expand scope.
+If a ninth production file appears necessary, STOP and report the exact blocker. Do not expand scope.
 
 ## Forbidden production edits
 
-Do NOT modify OSM, entry watcher, contract selector/revalidator, sizing/risk policy, scanners, queue, fill monitor, position manager, exit engine, proof writers, manual-close reconciliation, reconciler position economics, intelligence, migrations, Render, scheduled jobs, or package/import-root files.
+Do NOT modify OSM outside the narrow broker-identity CAS fence described above, entry watcher, contract selector/revalidator, sizing/risk policy, scanners, queue, fill monitor, position manager, exit engine, proof writers, manual-close reconciliation, reconciler position economics, intelligence, migrations, Render, scheduled jobs, or package/import-root files.
 
 The `ap/order_monitor.py` and `ap_recovery.py` edits remain limited to the lifecycle fences stated above; they do not authorize a general pending-trigger restart-recovery or classifier redesign.
 
@@ -276,7 +279,7 @@ Do not fix generic STUCK_TRIGGER_READY without submit intent, watcher rearm, def
 
 # Codex instruction
 
-Implement this spec exactly on the PR branch. Do not restore historical #445/#456 wholesale. Keep production changes to the seven named files and one focused test. If an eighth production file is required, STOP and explain the blocker instead of expanding scope.
+Implement this spec exactly on the PR branch. Do not restore historical #445/#456 wholesale. Keep production changes to the eight named files and one focused test. If a ninth production file is required, STOP and explain the blocker instead of expanding scope.
 
 Do not merge, deploy, change env vars, mutate production data, or clean historical rows.
 

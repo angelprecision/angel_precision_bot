@@ -1123,9 +1123,16 @@ class APOrderStateMachine:
             f"WHERE local_order_id=%s AND client_id=%s AND status=%s"
         )
         if broker_order_id:
-            # Never replace a different durable broker identity.  Empty/equal
-            # are the only idempotent acceptance states.
-            sql += " AND (broker_order_id IS NULL OR broker_order_id='' OR broker_order_id=%s)"
+            # Never replace a different durable broker identity.  Blank and
+            # legacy placeholder IDs are not durable identity, so an exact
+            # broker reconciliation may atomically replace them.
+            sql += (
+                " AND (broker_order_id IS NULL"
+                " OR BTRIM(COALESCE(broker_order_id,''))=''"
+                " OR UPPER(BTRIM(COALESCE(broker_order_id,''))) IN ("
+                "'N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE')"
+                " OR broker_order_id=%s)"
+            )
             params.append(str(broker_order_id))
         if (
             kind.upper() == "ENTRY"

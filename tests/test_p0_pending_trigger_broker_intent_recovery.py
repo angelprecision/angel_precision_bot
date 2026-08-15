@@ -293,6 +293,24 @@ def test_malformed_broker_list_and_missing_submit_key_hold():
     _assert_no_broker_mutations(broker)
 
 
+def test_submit_key_must_match_local_order_before_broker_read():
+    row = _row()
+    row["meta"]["broker_submit_key"] = "other-local-order"
+    core, broker, osm = _core(
+        row,
+        [_remote(tag="other-local-order")],
+    )
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=LOCAL_ORDER_ID
+    )
+
+    assert result["reason_code"] == "RECONCILE_SUBMIT_KEY_LOCAL_ORDER_MISMATCH"
+    broker.list_orders.assert_not_called()
+    osm.transition.assert_not_called()
+    _assert_no_broker_mutations(broker)
+
+
 def test_malformed_exact_equal_occ_contract_is_held():
     malformed = f"{CONTRACT}TRAILING"
     core, broker, osm = _core(
@@ -362,6 +380,7 @@ def test_deferred_ghost_sweep_fences_submit_evidence(monkeypatch):
 
 def test_startup_recovery_holds_stale_submit_intent_before_terminalization(monkeypatch):
     row = _row(
+        broker_order_id="N/A",
         created_ts=datetime.now(timezone.utc) - timedelta(days=4),
     )
     execution_core = MagicMock()
@@ -377,6 +396,55 @@ def test_startup_recovery_holds_stale_submit_intent_before_terminalization(monke
     )
     osm.terminalize_deferred_breach.assert_not_called()
     osm.submit_existing_entry.assert_not_called()
+
+
+def test_osm_transition_accepts_placeholder_as_missing_broker_identity(monkeypatch):
+    import ap.order_state_machine as order_state_machine
+
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, sql, params):
+            self.sql = " ".join(str(sql).split())
+            self.params = params
+            return self
+
+    cursor = Cursor()
+
+    @contextmanager
+    def fake_conn():
+        yield cursor
+
+    monkeypatch.setattr(order_state_machine, "conn", fake_conn)
+    monkeypatch.setattr(
+        order_state_machine,
+        "run_with_retry",
+        lambda fn, *args, **kwargs: fn(),
+    )
+
+    osm = object.__new__(order_state_machine.APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+    osm._get_order = MagicMock(
+        return_value={
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "kind": "ENTRY",
+            "status": "PENDING_TRIGGER",
+            "broker_order_id": "N/A",
+            "filled_qty": 0,
+        }
+    )
+    osm._emit_transition_event = MagicMock()
+    osm._notify_opportunity_ledger = MagicMock()
+    osm._handle_exit_engine_hooks = MagicMock()
+    osm._record_error = MagicMock()
+
+    assert osm.transition(
+        LOCAL_ORDER_ID,
+        "SUBMITTED",
+        broker_order_id="TR-JNJ-472",
+    ) is True
+    assert "'N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE'" in cursor.sql
 
 
 def test_startup_watcher_reseed_holds_submit_intent_before_ptr(monkeypatch):
