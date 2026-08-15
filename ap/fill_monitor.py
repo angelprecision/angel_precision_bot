@@ -295,6 +295,17 @@ def _order_meta_dict(order: dict) -> dict:
     return {}
 
 
+_INVALID_DURABLE_META_BOOL = object()
+
+
+def _durable_meta_bool(order: dict, key: str):
+    """Read a durable JSON boolean without accepting truthy coercions."""
+    value = _order_meta_dict(order).get(key)
+    if value is None or type(value) is bool:
+        return value
+    return _INVALID_DURABLE_META_BOOL
+
+
 def _filled_entry_handoff_state(order: dict) -> str:
     return str(
         _order_meta_dict(order).get("filled_entry_handoff_state") or ""
@@ -384,13 +395,15 @@ def _persist_filled_entry_handoff_state(
             ]
             if require_guard_release_claim_absent:
                 predicates.append(
-                    "COALESCE(meta->>'filled_entry_guards_release_claimed','false') <> 'true'"
+                    "(NOT (COALESCE(meta, '{}'::jsonb) ? 'filled_entry_guards_release_claimed') "
+                    "OR meta->'filled_entry_guards_release_claimed' = 'false'::jsonb)"
                 )
             if state == "COMPLETE":
                 predicates.extend(
                     [
                         "position_id=%s",
                         "COALESCE(meta->>'filled_entry_handoff_state','') IN ('IN_PROGRESS','HOLD','')",
+                        "meta->'filled_entry_guards_released' = 'true'::jsonb",
                     ]
                 )
                 params.append(str(position_id).strip())
@@ -2929,10 +2942,18 @@ def _release_entry_guards_once(order: dict, *, position_id: str) -> bool:
     equity release against another order's reservation.  A normal successful
     release records the second, durable ``released`` marker before COMPLETE.
     """
-    meta = _order_meta_dict(order)
-    if bool(meta.get("filled_entry_guards_released")):
+    released = _durable_meta_bool(order, "filled_entry_guards_released")
+    if released is True:
         return True
-    if bool(meta.get("filled_entry_guards_release_claimed")):
+    if released is _INVALID_DURABLE_META_BOOL:
+        log.critical(
+            "[%s] FILLED_ENTRY_GUARDS_RELEASE_MARKER_INVALID local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+        return False
+    claimed = _durable_meta_bool(order, "filled_entry_guards_release_claimed")
+    if claimed is True or claimed is _INVALID_DURABLE_META_BOOL:
         log.critical(
             "[%s] FILLED_ENTRY_GUARDS_RELEASE_OUTCOME_UNPROVEN local=%s",
             order.get("client_id"),
@@ -3058,7 +3079,7 @@ def recover_interrupted_filled_entry_handoff(
 
     handoff_state = _filled_entry_handoff_state(order)
     if handoff_state == "COMPLETE":
-        if not bool(_order_meta_dict(order).get("filled_entry_guards_released")):
+        if _durable_meta_bool(order, "filled_entry_guards_released") is not True:
             return {
                 **authority,
                 "disposition": "HOLD",
