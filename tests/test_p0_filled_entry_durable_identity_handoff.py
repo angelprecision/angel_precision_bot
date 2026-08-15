@@ -353,6 +353,24 @@ class _SeedEngine:
         return list(self.owners)
 
 
+class _FallbackManagedPosition:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FallbackSeedEngine:
+    def __init__(self):
+        self.add_calls = 0
+        self.owners = []
+
+    def add_position(self, position):
+        self.add_calls += 1
+        self.owners.append(position)
+
+    def active_positions(self):
+        return list(self.owners)
+
+
 def test_seed_result_reports_existing_success_and_failure(monkeypatch):
     monkeypatch.setattr(fm, "_load_managed_position_class", lambda: (_ for _ in ()).throw(RuntimeError("no fallback")))
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -373,6 +391,44 @@ def test_seed_success_requires_exact_canonical_behavior_active_owner(monkeypatch
     assert fm._seed_exit_engine(
         engine, POSITION_ID, _order(), _result(), SIGNAL_ID
     ) == (False, "OWNER_COUNT_0")
+    assert engine.seed_calls == 1
+
+
+def test_fallback_add_position_success_requires_proven_owner(monkeypatch):
+    monkeypatch.setattr(fm, "_load_managed_position_class", lambda: _FallbackManagedPosition)
+
+    engine = _FallbackSeedEngine()
+    assert fm._seed_exit_engine(
+        engine, POSITION_ID, _order(), _result(), SIGNAL_ID
+    ) == (True, "SEEDED")
+    assert engine.add_calls == 1
+    assert engine.owners[0].position_id == POSITION_ID
+
+
+class _NoOwnerLookupEngine:
+    def __init__(self, *, raises=False):
+        self.seed_calls = 0
+        self.raises = raises
+
+    def seed_position(self, position_id, order, result):
+        self.seed_calls += 1
+
+    def active_positions(self):
+        if self.raises:
+            raise RuntimeError("owner lookup failed")
+        return []
+
+
+@pytest.mark.parametrize(
+    ("raises", "reason"),
+    [(False, "OWNER_COUNT_0"), (True, "OWNER_LOOKUP_FAILED")],
+)
+def test_seed_never_reports_success_without_readable_owner_postcondition(raises, reason):
+    engine = _NoOwnerLookupEngine(raises=raises)
+
+    assert fm._seed_exit_engine(
+        engine, POSITION_ID, _order(), _result(), SIGNAL_ID
+    ) == (False, reason)
     assert engine.seed_calls == 1
 
 
