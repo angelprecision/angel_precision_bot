@@ -636,23 +636,34 @@ class APStartupRecovery:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _load_active_positions(self) -> list[dict]:
-        """Load all economically active position rows for this client.
+        """Load economically active position rows that belong to THIS runtime.
 
-        Bounded to a recent trading window (RECOVERY_ACTIVE_POSITION_LOOKBACK_HOURS,
-        default 72h). Rows whose entry_ts/created_at predate the cutoff are
-        excluded so long-dead historical positions (e.g. NULL-mode rows with
-        residual quantity_remaining from prior months) can never be
-        re-registered and polled against the live broker on startup.
+        Identity fence (not age): a position is only recovered into this runner
+        when its persisted execution_mode exactly matches the current runner
+        mode. NULL, blank, malformed, or opposite-mode rows are excluded at the
+        SQL boundary and never registered — this is the same execution-mode
+        authority the deferred-recovery pass already enforces via
+        _execution_mode(). Historical NULL-mode rows (the 2026-08-13 incident)
+        can no longer re-enter recovery regardless of how recently they were
+        written.
+
+        Age is deliberately NOT used as proof that exposure no longer exists. A
+        legitimate same-mode position held across a long weekend / outage must
+        still be recovered. Dead *option* contracts are excluded by exact OCC
+        expiry (see _recover_positions), which is economically authoritative,
+        not by a stopwatch.
         """
         from ap.db import conn, run_with_retry
 
-        try:
-            lookback_hours = int(os.getenv("RECOVERY_ACTIVE_POSITION_LOOKBACK_HOURS", "72"))
-        except (TypeError, ValueError):
-            lookback_hours = 72
-        if lookback_hours <= 0:
-            lookback_hours = 72
-        cutoff_utc = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        mode = self._execution_mode()
+        if mode is None:
+            # Fail closed: unknown runner mode cannot prove ownership of any row.
+            log.critical(
+                "[%s] RECOVERY_BLOCKED unknown_execution_mode — active positions not loaded",
+                self.client_id,
+            )
+            return []
+        mode_sql = mode.lower()
 
         def _query():
             with conn() as c:
@@ -665,10 +676,10 @@ class APStartupRecovery:
                         UPPER(COALESCE(status, '')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
                         OR COALESCE(quantity_remaining, 0) > 0
                       )
-                      AND COALESCE(entry_ts, created_at) >= %s
+                      AND LOWER(BTRIM(COALESCE(execution_mode, ''))) = %s
                     ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
                     """,
-                    (self.client_id, cutoff_utc),
+                    (self.client_id, mode_sql),
                 )
                 return c.fetchall()
 
@@ -686,6 +697,30 @@ class APStartupRecovery:
             pos_id     = pos.get("id")
             underlying = pos.get("underlying") or pos.get("ticker", "?")
             status     = pos.get("status", "OPEN")
+
+            # Expired-OCC fence: an option contract whose OCC expiry is before
+            # today cannot be an active option position. Excluded on economic
+            # authority (parsed expiry), not on age. Reuses the reconciler's
+            # proven OCC parser so we don't re-derive expiry parsing here.
+            contract = str(pos.get("contract") or "").strip()
+            if contract:
+                try:
+                    from ap.reconcile import _is_expired as _occ_is_expired
+                    if _occ_is_expired(contract):
+                        log.warning(
+                            "[%s] RECOVERY: skipped expired OCC contract | %s pos=%s",
+                            self.client_id, contract, pos_id,
+                        )
+                        result.setdefault("positions_skipped_expired", 0)
+                        result["positions_skipped_expired"] += 1
+                        continue
+                except Exception as _exp_exc:
+                    # Parser failure must never silently drop a position: fall
+                    # through and recover it rather than assume it is dead.
+                    log.warning(
+                        "[%s] RECOVERY: OCC expiry check failed (recovering anyway) | %s: %s",
+                        self.client_id, contract, _exp_exc,
+                    )
             qty        = _safe_int(pos.get("quantity_remaining"), 0) or _safe_int(pos.get("qty"), 0) or _safe_int(pos.get("quantity"), 0)
             direction, side_source = _resolve_side_from_order_or_meta(pos)
             direction_label = direction or "UNKNOWN"

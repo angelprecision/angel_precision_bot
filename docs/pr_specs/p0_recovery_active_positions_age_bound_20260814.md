@@ -1,84 +1,91 @@
-# P0: Bound startup recovery active-positions query to a recent window
+# P0: Fence startup recovery active-positions to the current runtime identity
 
-**Date:** 2026-08-14
+**Date:** 2026-08-14 (amended after review)
 **Base:** `main@b43ce9c5`
-**Scope:** Surgical. One function, one file. `ap_recovery.py::_load_active_positions`.
+**Scope:** Surgical. One production file (`ap_recovery.py`), two functions:
+`_load_active_positions` and the guard block in `_recover_positions`.
 
 ## Incident
 
-At the 2026-08-14 market open, live/paper runtime exhibited behavior not seen
-before: cancel/submit/position-create side effects firing against long-expired
-contracts. Runtime slices from 2026-08-13 already showed the precursor —
-`FILL_EXECUTION_MODE_UNPROVEN` repeatedly emitted for May 29 / June 5 2026 OCC
-contracts, i.e. months-old rows being revisited as if fresh.
+At the 2026-08-14 market open, live/paper runtime fired
+cancel/submit/position-create side effects against long-expired contracts. The
+2026-08-13 slice showed the precursor: `FILL_EXECUTION_MODE_UNPROVEN` repeatedly
+emitted for May 29 / June 5 2026 OCC contracts — months-old **NULL
+execution_mode** rows being revisited as if fresh.
 
 ## Root cause
 
-`APStartupRecovery._load_active_positions()` selected every `positions` row for
-the client where `status IN ('OPEN','CLOSING','PARTIAL','ACTIVE')` **or**
-`quantity_remaining > 0`, with **no lower bound on age**.
+`APStartupRecovery._load_active_positions()` selected every `positions` row
+where status was economically active (or `quantity_remaining > 0`) with **no
+execution-mode fence**. `_recover_positions()` then registered every returned
+row with `PositionManager` and bumped `master_control._position_count`. There
+was no per-position proof that the row belonged to this runner's mode.
 
-Historical positions from prior months that were never cleanly closed (NULL
-`execution_mode`, residual `quantity_remaining`) matched on every startup. They
-were then:
+## Corrected invariant (this version)
 
-1. re-registered with `PositionManager` (`_recover_positions`),
-2. counted into `master_control._position_count`,
-3. handed downstream where they get polled against the live broker,
+An earlier draft of this PR bounded recovery by **age** (72h lookback). Review
+correctly rejected that: age is not authority. A legitimate LIVE position held
+across a long weekend / outage is still real exposure at the broker; a
+stopwatch must never silently conclude it is dead. And age did not fix the
+actual identity bug — a recent NULL-mode or opposite-mode row still passed.
 
-which is the mechanism that produced the cancel/submit calls against dead
-contracts.
+This version enforces identity, not age:
 
-## Fix (this PR — nothing else)
+1. **Execution-mode identity fence (SQL).** `_load_active_positions` resolves
+   the canonical current runner mode via the existing `_execution_mode()` and
+   filters positions to `LOWER(BTRIM(COALESCE(execution_mode,''))) = <mode>`.
+   NULL, blank, malformed, or opposite-mode rows are excluded at the SQL
+   boundary and never registered. This mirrors the fail-closed authority the
+   deferred-recovery pass already uses.
 
-Add a single age lower bound to the recovery query:
+2. **Fail closed on unknown mode.** If the runner mode is not PAPER/LIVE,
+   `_load_active_positions` loads nothing and does not query the DB.
 
-```sql
-AND COALESCE(entry_ts, created_at) >= %s
-```
+3. **No age authority.** The 72h cutoff is removed entirely.
 
-Cutoff = `now() - RECOVERY_ACTIVE_POSITION_LOOKBACK_HOURS` (default **72h**,
-env-overridable, invalid/≤0 falls back to 72). Uses only imports already present
-in the module (`os`, `datetime`, `timezone`, `timedelta`). No new files, no new
-module, no change to any other recovery path.
+4. **Expired-OCC exclusion (economic authority).** In `_recover_positions`, an
+   option whose exact OCC expiry is before today is skipped. This reuses the
+   reconciler's proven `ap.reconcile._is_expired` parser — no new OCC parsing.
 
-The 72h default deliberately does **not** reuse
-`STARTUP_WATCHER_RESEED_LOOKBACK_HOURS` (48h) so that tuning position recovery
-can never silently alter watcher-reseed behavior.
+5. **Parser failure never drops a position.** If the expiry check raises, the
+   position falls through and is recovered rather than assumed dead.
 
-## Invariant enforced
+## Behavioral tests (not SQL-text)
 
-Startup recovery cannot re-register a position whose `entry_ts`/`created_at`
-predate the lookback window. Stale historical positions can no longer re-enter
-in-memory state or be polled against the broker.
+`tests/test_p0_recovery_active_positions_age_bound.py`:
 
-Nothing else about recovery behavior is changed.
+- current runner mode is bound into the query (paper and live)
+- unknown runner mode loads zero positions and does not query the DB
+- an old but same-mode, unexpired position is still recovered (age is not authority)
+- an expired OCC contract is excluded and counted, not registered
+- an unparseable contract is recovered, not silently dropped
 
-## Relationship to existing PRs
+All 6 pass. `tests/test_recovery_freeze_hardening.py` — 22 passed, unchanged.
+`tests/test_p0_canonical_exit_fill_truth.py` — 50 passed / 2 skipped, unchanged.
 
-- **#455** claims "historical FILLED recovery" but adds a 341-line new module
-  (`ap/filled_entry_recovery_authority.py`) targeting the FILLED **entry** path,
-  which is distinct from position recovery (`_recover_positions`). It does not
-  touch `_load_active_positions` and would not exclude these rows. This PR is
-  narrower and independent.
-- No open PR modifies `_load_active_positions` or `_recover_positions`
-  (verified across #472, #436, #423, and all other recovery-touching PRs).
+## Production state (verified read-only)
 
-## Validation
+There are currently **zero** positions matching the active-family / residual-qty
+candidate set, and zero older-than-72h rows retaining positive
+`quantity_remaining` (historical rows are terminalized into CLOSED /
+CLOSED_REPAIR / EXPIRED). This PR therefore **prevents recurrence**; it is not
+rescuing an active DB zombie tonight. That is deliberate room to fix the
+invariant correctly rather than merge under P0 urgency.
 
-- New test `tests/test_p0_recovery_active_positions_age_bound.py` reproduces the
-  bug on current main (query had no age bound → **fails**), and passes after the
-  fix.
-- `tests/test_recovery_freeze_hardening.py` — **22 passed**, unchanged.
-- Recovery-suite regression delta vs baseline: **exactly +1 pass, 0 new
-  failures** (baseline 79 failed / 664 passed → 78 failed / 665 passed). The
-  remaining pre-existing failures require a real local PostgreSQL fixture and are
-  untouched by this change.
-- `ap_recovery.py` compiles clean.
+## Relationship / sequencing
+
+- **#455** ("historical FILLED recovery") adds a 341-line new module targeting
+  the FILLED *entry* path — distinct from position recovery, does not touch
+  `_load_active_positions`. Independent.
+- **#472** also edits `ap_recovery.py` but not these functions — no textual
+  conflict expected. After #472 lands, this PR must be rebased/retested against
+  the resulting main before merge; two recovery PRs green independently against
+  `b43ce9c` is not proof of their combined runtime.
 
 ## Release gate
 
-- Exact-head CI (P0 regression + DB hot-path) must pass before merge.
-- Review the predicate and the 72h default; confirm it covers weekend +
-  overnight-deferred windows for this deployment.
-- **Do not merge without explicit `merge #N` instruction.**
+- Exact-head **P0 regression AND DB hot-path** CI must both pass before merge.
+  (The earlier head had only the P0 regression run; DB hot-path evidence must be
+  present on the amended head.)
+- Review the mode-fence and expired-OCC exclusion.
+- **Do not merge without explicit operator instruction. Only the operator merges.**
