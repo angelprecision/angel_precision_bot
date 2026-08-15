@@ -604,7 +604,7 @@ def test_active_existing_recovery_never_reopens_or_places_protection(monkeypatch
     assert pm.open_calls == []
     assert release_calls == [True]
     assert broker.mutations == []
-    assert [state for state, _ in calls] == ["IN_PROGRESS", "COMPLETE"]
+    assert [state for state, _ in calls] == ["IN_PROGRESS", "IN_PROGRESS", "COMPLETE"]
 
 
 def test_active_recreate_recovery_opens_once_without_fresh_fill_side_effects(monkeypatch):
@@ -749,6 +749,20 @@ def test_recovery_complete_write_failure_remains_retryable_hold(monkeypatch):
     assert result["disposition"] == "HOLD"
     assert result["reason_code"] == "FILLED_ENTRY_HANDOFF_COMPLETE_WRITE_FAILED"
     assert release_calls == [True]
+
+
+def test_claimed_guard_release_outcome_is_fail_closed_and_not_repeated(monkeypatch):
+    order = _order(
+        position_id=POSITION_ID,
+        meta={"filled_entry_guards_release_claimed": True},
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not repeat release")),
+    )
+
+    assert fm._release_entry_guards_once(order, position_id=POSITION_ID) is False
 
 
 def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(monkeypatch):
