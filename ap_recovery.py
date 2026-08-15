@@ -636,8 +636,23 @@ class APStartupRecovery:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _load_active_positions(self) -> list[dict]:
-        """Load all economically active position rows for this client."""
+        """Load all economically active position rows for this client.
+
+        Bounded to a recent trading window (RECOVERY_ACTIVE_POSITION_LOOKBACK_HOURS,
+        default 72h). Rows whose entry_ts/created_at predate the cutoff are
+        excluded so long-dead historical positions (e.g. NULL-mode rows with
+        residual quantity_remaining from prior months) can never be
+        re-registered and polled against the live broker on startup.
+        """
         from ap.db import conn, run_with_retry
+
+        try:
+            lookback_hours = int(os.getenv("RECOVERY_ACTIVE_POSITION_LOOKBACK_HOURS", "72"))
+        except (TypeError, ValueError):
+            lookback_hours = 72
+        if lookback_hours <= 0:
+            lookback_hours = 72
+        cutoff_utc = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
         def _query():
             with conn() as c:
@@ -650,9 +665,10 @@ class APStartupRecovery:
                         UPPER(COALESCE(status, '')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
                         OR COALESCE(quantity_remaining, 0) > 0
                       )
+                      AND COALESCE(entry_ts, created_at) >= %s
                     ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
                     """,
-                    (self.client_id,),
+                    (self.client_id, cutoff_utc),
                 )
                 return c.fetchall()
 
