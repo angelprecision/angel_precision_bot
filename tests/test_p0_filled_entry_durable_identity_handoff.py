@@ -31,8 +31,9 @@ CONTRACT = "PEP260821C00141000"
 LOCAL_ORDER_ID = "1b8ec150-38cc-424c-93e5-b1a1820ea50b"
 BROKER_ORDER_ID = "141999576"
 POSITION_ID = "86ed1496-75ef-472c-8a36-94eee1698509"
-SIGNAL_ID = "signal-pep-1"
-PLAN_ID = "plan-pep-1"
+SIGNAL_ID = "f42a3a99-974a-4793-b04f-9fa04ec5218f"
+PLAN_ID = "720ec5fa-a14d-4eee-9816-ff33bead4de6"
+RECONCILED_PLAN_ID = "reconciled:PEP260821C00141000:daeb6be995af7739a8cbcd3e"
 
 
 class _MemoryCursor:
@@ -151,7 +152,7 @@ def _position(**overrides):
         "contract": CONTRACT,
         "status": "OPEN",
         "signal_id": SIGNAL_ID,
-        "plan_id": PLAN_ID,
+        "plan_id": RECONCILED_PLAN_ID,
         "local_order_id": None,
         "broker_order_id": None,
     }
@@ -184,6 +185,7 @@ def test_jason_pep_null_identity_binds_before_exit_seed(monkeypatch):
     assert db.orders[LOCAL_ORDER_ID]["position_id"] == POSITION_ID
     assert db.positions[POSITION_ID]["local_order_id"] == LOCAL_ORDER_ID
     assert db.positions[POSITION_ID]["broker_order_id"] == BROKER_ORDER_ID
+    assert db.positions[POSITION_ID]["plan_id"] == RECONCILED_PLAN_ID
 
 
 def test_already_correct_identity_is_idempotent(monkeypatch):
@@ -207,7 +209,7 @@ def test_already_correct_identity_is_idempotent(monkeypatch):
         ({}, {}, {"local_order_id": "foreign-local"}, "position_local_order_id_conflict"),
         ({}, {}, {"broker_order_id": "foreign-broker"}, "position_broker_order_id_conflict"),
         ({}, {}, {"signal_id": "foreign-signal"}, "position_signal_id_conflict"),
-        ({}, {}, {"plan_id": "foreign-plan"}, "position_plan_id_conflict"),
+        ({}, {}, {"plan_id": "foreign-plan"}, "position_plan_conflict"),
         ({"execution_mode": "paper"}, {}, {}, "entry_execution_mode_conflict"),
         ({"contract": "PEP260821P00141000"}, {}, {}, "entry_contract_conflict"),
     ],
@@ -227,6 +229,38 @@ def test_exact_identity_conflicts_hold_without_overwrite(
     assert db.orders[LOCAL_ORDER_ID]["position_id"] == db_order_overrides.get("position_id")
     assert db.positions[POSITION_ID]["local_order_id"] in (None, "foreign-local")
     assert db.positions[POSITION_ID]["broker_order_id"] in (None, "foreign-broker")
+
+
+@pytest.mark.parametrize(
+    ("position_overrides", "reason"),
+    [
+        ({"plan_id": "reconciled:WRONG_OCC:daeb6be995af7739a8cbcd3e"}, "position_plan_conflict"),
+        ({"signal_id": "wrong-signal"}, "position_signal_id_conflict"),
+        ({"signal_id": None}, "position_plan_conflict"),
+        ({"plan_id": "ordinary-plan-1"}, "position_plan_conflict"),
+    ],
+)
+def test_reconciled_plan_exception_remains_exactly_fenced(
+    monkeypatch, position_overrides, reason
+):
+    outcome, db = _bind(
+        monkeypatch,
+        position=_position(**position_overrides),
+    )
+
+    assert outcome == (False, reason)
+    assert db.mutations == 0
+
+
+def test_reconciled_plan_exception_does_not_mask_order_plan_conflict(monkeypatch):
+    outcome, db = _bind(
+        monkeypatch,
+        order=_order(plan_id="different-entry-plan"),
+        db_order=_order(),
+    )
+
+    assert outcome == (False, "order_plan_conflict")
+    assert db.mutations == 0
 
 
 def test_wrong_client_and_wrong_mode_never_cross_bind(monkeypatch):
@@ -542,6 +576,57 @@ def _process_entry(monkeypatch, *, bind_result, seed_result):
         exit_engine=object(),
     )
     return calls, markers, broker, osm
+
+
+def test_jason_reconciler_shape_binds_before_seed_and_preserves_plan(monkeypatch):
+    db = _MemoryDB(_order(), _position())
+    monkeypatch.setattr(fm, "conn", db.conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        fm,
+        "check_order_with_broker",
+        lambda broker, order: {"status": "FILLED", "filled_qty": 1, "avg_fill": 1.58},
+    )
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "trace_gate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_open_position_safe", lambda *args, **kwargs: POSITION_ID)
+
+    calls = []
+    monkeypatch.setattr(
+        fm,
+        "_place_standing_stop_best_effort",
+        lambda **kwargs: calls.append("standing_stop"),
+    )
+    real_bind = fm._bind_filled_entry_durable_identity
+
+    def _bind_and_record(**kwargs):
+        outcome = real_bind(**kwargs)
+        calls.append("bind")
+        return outcome
+
+    monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", _bind_and_record)
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: (calls.append("seed") or (True, "SEEDED")),
+    )
+
+    fm.process_pending_order(
+        _Broker(),
+        _order(status="ACKNOWLEDGED", filled_qty=0),
+        osm=_OSM(),
+        pm=object(),
+        exit_engine=object(),
+    )
+
+    assert calls == ["standing_stop", "bind", "seed"]
+    assert db.orders[LOCAL_ORDER_ID]["position_id"] == POSITION_ID
+    assert db.positions[POSITION_ID]["local_order_id"] == LOCAL_ORDER_ID
+    assert db.positions[POSITION_ID]["broker_order_id"] == BROKER_ORDER_ID
+    assert db.positions[POSITION_ID]["plan_id"] == RECONCILED_PLAN_ID
 
 
 def test_handoff_binds_before_seed_and_does_not_add_broker_authority(monkeypatch):

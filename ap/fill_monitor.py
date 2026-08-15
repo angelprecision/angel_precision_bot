@@ -1437,6 +1437,16 @@ def _bind_filled_entry_durable_identity(
     def _exact(value, expected: str) -> bool:
         return value is not None and str(value) == expected
 
+    def _is_reconciled_plan_for_contract(value, expected_contract: str) -> bool:
+        _plan = _text(value)
+        _contract = _text(expected_contract)
+        if not _plan or not _contract:
+            return False
+        return re.fullmatch(
+            rf"reconciled:{re.escape(_contract)}:([^:\s]+)",
+            _plan,
+        ) is not None
+
     position_id = _text(position_id)
     client_id = _text(order.get("client_id"))
     local_order_id = _text(order.get("local_order_id"))
@@ -1532,7 +1542,12 @@ def _bind_filled_entry_durable_identity(
             if _text(position_row.get("status")).upper() not in {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"}:
                 return False, "position_not_active"
 
-            for field in ("signal_id", "plan_id"):
+            if not _blank(position_row.get("local_order_id")) and _text(position_row.get("local_order_id")) != local_order_id:
+                return False, "position_local_order_id_conflict"
+            if not _blank(position_row.get("broker_order_id")) and _text(position_row.get("broker_order_id")) != broker_order_id:
+                return False, "position_broker_order_id_conflict"
+
+            for field in ("signal_id",):
                 entry_value = entry_row.get(field)
                 position_value = position_row.get(field)
                 if not _blank(entry_value) and not _blank(position_value):
@@ -1546,10 +1561,25 @@ def _bind_filled_entry_durable_identity(
                     if str(order_value) != str(position_value):
                         return False, f"order_position_{field}_conflict"
 
-            if not _blank(position_row.get("local_order_id")) and _text(position_row.get("local_order_id")) != local_order_id:
-                return False, "position_local_order_id_conflict"
-            if not _blank(position_row.get("broker_order_id")) and _text(position_row.get("broker_order_id")) != broker_order_id:
-                return False, "position_broker_order_id_conflict"
+            entry_plan = entry_row.get("plan_id")
+            position_plan = position_row.get("plan_id")
+            order_plan = order.get("plan_id")
+            reconciled_plan_exception = (
+                not _blank(entry_plan)
+                and not _blank(position_plan)
+                and not _blank(entry_row.get("signal_id"))
+                and _text(entry_row.get("signal_id")) == _text(position_row.get("signal_id"))
+                and _is_reconciled_plan_for_contract(position_plan, contract)
+            )
+            if not _blank(entry_plan) and not _blank(position_plan):
+                if _text(entry_plan) != _text(position_plan) and not reconciled_plan_exception:
+                    return False, "position_plan_conflict"
+            if not _blank(order_plan) and not _blank(entry_plan):
+                if _text(order_plan) != _text(entry_plan):
+                    return False, "order_plan_conflict"
+            if not _blank(order_plan) and not _blank(position_plan):
+                if _text(order_plan) != _text(position_plan) and not reconciled_plan_exception:
+                    return False, "order_position_plan_conflict"
 
             position_updates = []
             position_params = []
