@@ -871,11 +871,28 @@ class WatchedSignal:
             _reason_code = f"TRIGGER_EVIDENCE_UNAVAILABLE_{_required_side}"
             _already_confirmed = self.trigger_crossed_at is not None
             self.last_trigger_evidence_reason = _reason_code
+            # PR #479 amendment 3 (Blocker 2): invalid/unavailable required
+            # trigger-side evidence must block *trigger evidence only*. It
+            # must never blind unrelated, independently provable lifecycle
+            # safety decisions (stale-move expiration, the late-attachment
+            # gate, dormant-stop skip logic) that run later in this same
+            # check() call. The prior version of this block returned
+            # immediately pre-confirmation, which meant the intraday
+            # stale-move check below could never run on a poll where the
+            # trigger-side quote happened to be missing — even when the
+            # OPPOSITE side's quote independently proved the move was
+            # already stale and should expire. Suppress entry-breach
+            # evidence for this poll in both the pre- and post-confirmation
+            # case; only pre-confirmation resets two-poll continuity (there
+            # is no confirmed lifecycle to protect post-confirmation, so
+            # continuity reset is meaningless there and amendment 1 already
+            # established that the confirmed path must not reset anything).
+            _suppress_entry_breach_evidence = True
             if not _already_confirmed:
                 # Pre-confirmation: an unavailable poll breaks continuity.
                 # Do not let a valid first observation combine with a later
-                # valid observation. No confirmed lifecycle to protect yet,
-                # so it is safe (and correct) to return immediately.
+                # valid observation. This no longer returns early — see
+                # amendment 3 note above.
                 self.breach_count = 0
                 self._pending_first_breach_at = None
                 self.breach_price = 0.0
@@ -884,7 +901,9 @@ class WatchedSignal:
                 self.trigger_price = None
                 log.debug(
                     "[%s] %s — side=%s raw_bid=%r raw_ask=%r "
-                    "trigger_valid=%s pending_breach_reset=True",
+                    "trigger_valid=%s pending_breach_reset=True "
+                    "(continuing to lifecycle-safety checks; not an "
+                    "early return)",
                     self.ticker,
                     _reason_code,
                     self.side,
@@ -892,27 +911,27 @@ class WatchedSignal:
                     _raw_ask,
                     _entry_trigger is not None,
                 )
-                return self.state
-            # Already-confirmed lifecycle (e.g. a callback-driven retry
-            # returned this watcher to PENDING): do NOT reset breach
-            # continuity and do NOT return early. Suppress entry-breach
-            # evidence for this poll only, and continue on to let the
-            # per-side stop-invalidation check run against whichever side
-            # quote is actually valid.
-            _suppress_entry_breach_evidence = True
-            log.debug(
-                "[%s] %s — side=%s raw_bid=%r raw_ask=%r trigger_valid=%s "
-                "already_confirmed=True suppressing entry-breach evidence "
-                "only; stop-invalidation check remains live",
-                self.ticker,
-                _reason_code,
-                self.side,
-                _raw_bid,
-                _raw_ask,
-                _entry_trigger is not None,
-            )
+            else:
+                # Already-confirmed lifecycle (e.g. a callback-driven retry
+                # returned this watcher to PENDING): do NOT reset breach
+                # continuity. Suppress entry-breach evidence for this poll
+                # only, and continue on to let the per-side stop-
+                # invalidation check run against whichever side quote is
+                # actually valid.
+                log.debug(
+                    "[%s] %s — side=%s raw_bid=%r raw_ask=%r trigger_valid=%s "
+                    "already_confirmed=True suppressing entry-breach evidence "
+                    "only; stop-invalidation check remains live",
+                    self.ticker,
+                    _reason_code,
+                    self.side,
+                    _raw_bid,
+                    _raw_ask,
+                    _entry_trigger is not None,
+                )
         else:
             self.last_trigger_evidence_reason = None
+
 
         # Intraday stale-move invalidation. Daily overnight signals get their
         # own structural validator, not generic drift logic.
@@ -1203,6 +1222,51 @@ class WatchedSignal:
                         # Not reset yet; keep waiting (never terminalize).
                         self.late_reset_polls = 0
                         return self.state
+
+        # PR #479 amendment 3 (Blocker 1): once a trigger is durably
+        # confirmed (trigger_crossed_at is not None) and a scanner stop
+        # exists, UNKNOWN active stop-side truth must mean HOLD — it is
+        # never permission to retrigger execution.
+        #
+        # Amendment 1 suppressed retrigger evidence when the ENTRY-side
+        # quote (ASK for CALL, BID for PUT) was unavailable. It did NOT
+        # cover the inverse: a confirmed watcher returned to PENDING by a
+        # callback-driven retry (RETRY_WAIT / KEEP_WATCHER /
+        # RECONCILE_BROKER_INTENT) whose ENTRY-side quote is perfectly
+        # valid but whose STOP-side quote (BID for CALL, ASK for PUT) is
+        # unavailable. In that case the ordinary breach block below would
+        # re-run normally — ask/bid crossing the entry trigger again would
+        # re-set state=TRIGGERED and let on_trigger fire a second time —
+        # while the stop-invalidation check later in this function stays
+        # silently skipped, because it is independently gated on that same
+        # missing stop-side quote (fail-open). Suppress retrigger evidence
+        # for this poll only whenever stop-side truth cannot be proven;
+        # never touch trigger_crossed_at; never fabricate stop-safe or
+        # stop-broken. Once the stop-side quote returns — whether intact or
+        # broken — the existing retry lifecycle (re-fire on valid entry
+        # evidence, or INVALIDATED on a proven broken stop) resumes exactly
+        # as before this amendment.
+        _stop_side_quote_for_gate = _bid_quote if self.side == "CALL" else _ask_quote
+        _active_stop_truth_unavailable = (
+            self.trigger_crossed_at is not None
+            and bool(self.stop_level)
+            and _stop_side_quote_for_gate is None
+        )
+        if _active_stop_truth_unavailable and not _suppress_entry_breach_evidence:
+            _stop_side_name = "BID" if self.side == "CALL" else "ASK"
+            self.last_trigger_evidence_reason = (
+                f"ACTIVE_STOP_TRUTH_UNAVAILABLE_{_stop_side_name}"
+            )
+            log.debug(
+                "[%s] ACTIVE_STOP_TRUTH_UNAVAILABLE_%s — side=%s raw_bid=%r "
+                "raw_ask=%r already_confirmed=True suppressing retrigger "
+                "evidence this poll only; trigger_crossed_at preserved; "
+                "no fabricated stop-safe or stop-broken",
+                self.ticker, _stop_side_name, self.side, _raw_bid, _raw_ask,
+            )
+        _suppress_entry_breach_evidence = (
+            _suppress_entry_breach_evidence or _active_stop_truth_unavailable
+        )
 
         if self.side == "CALL":
             # PR #479 amendment: suppress entry-breach evidence (no
