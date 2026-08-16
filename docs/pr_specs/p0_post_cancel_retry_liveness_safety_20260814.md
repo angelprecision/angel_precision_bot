@@ -1,433 +1,302 @@
-# P0 SPEC — Make post-cancel ENTRY retry bounded, anti-chase, and single-owner
+# P0 SPEC — Post-cancel retry must use one canonical ENTRY authority
 
 ## Status
 
 **SPEC ONLY / HARD HOLD. DO NOT MERGE OR DEPLOY AS AN IMPLEMENTATION.**
 
-Base SHA: `b43ce9c53433bd0479baa87e9757b50740adaa01`
+Original branch base was older than current main. Before implementation, rebase this branch onto exact current `main@f26d31cef3d3bf5d3c5d5ff16fb260f245602f89` and re-read all touched paths. Do not implement against the stale base.
 
-This PR is a surgical Codex work order. It repairs the retry machinery that already exists. It does not authorize a new execution subsystem, relaxed entry gates, or aggressive chasing.
+## Audit amendment — binding
+
+The 2026-08-15 trade-lifecycle audit proved that the current retry submit path is not merely "unproven". It is unsafe.
+
+Current production path:
+
+```text
+ap/order_monitor.py::_check_armed_retries()
+  -> _submit_armed_retry()
+  -> ap.execution.process_signal()
+  -> ap.db.insert_order(status='NEW')
+  -> ap.execution._submit_order_with_retry()
+  -> broker.place_order(buy_to_open)
+  -> ap.db.update_order(status='ACK')
+```
+
+Three defects are one architectural failure:
+
+1. `NEW` / `ACK` are a second order-state vocabulary. Canonical OSM active queries use `CREATED`, `PENDING_TRIGGER`, `SUBMITTED`, `ACKNOWLEDGED`, `PARTIAL_FILL`.
+2. `ap.execution._submit_order_with_retry()` performs blind retry POSTs after exceptions and passes no idempotency tag. An ambiguous broker acceptance can create duplicate LIVE entries.
+3. current-main `ap.db.insert_order()` does not persist top-level `execution_mode`.
+
+Therefore the old spec clause allowing Claude to "prove `process_signal()` safe and retain it" is deleted.
+
+**`ap.execution.process_signal()` is forbidden as the post-cancel retry submit authority.**
+
+Do not patch `NEW`, patch `ACK`, add a tag, and persist mode while leaving the second engine alive. F4/F5/F7 are one defect: duplicate entry authority. Collapse the retry back into the canonical control path.
+
+PR #450 (`fix: persist execution mode on legacy order inserts`) is now superseded for the retry problem. Do not merge #450 as the solution to this P0. Persisting mode on a duplicate authority does not remove the duplicate authority.
 
 ## One job
 
-When an ENTRY was genuinely submitted but did not fill, and the broker-confirmed cancel reason represents an execution miss rather than a dead setup, permit **at most one** bounded retry only when the setup is still provably aligned.
+A broker-confirmed no-fill ENTRY cancel may receive **at most one** bounded retry only if the setup remains provably valid, and that retry must re-enter Angel Precision's canonical ENTRY lifecycle before any broker POST.
 
-The retry must be single-owner and must never run for a missed move, invalid thesis, wide spread, runaway quote, unknown reason, unproven alignment, or ambiguous broker state.
+No retry broker POST may originate from `ap/execution.py`.
 
-## Existing production path
+## Required canonical lifecycle
 
-Current main already has post-cancel retry machinery. Do not build another one.
-
-### `ap/order_monitor.py`
-
-Current path:
+The retry must converge back into the same architecture ordinary current-main entries use:
 
 ```text
-stale/unfilled ENTRY
--> broker cancel request
--> broker terminal cancel confirmation
--> OSM CANCELED transition
--> _release_symbol_lock_for_canceled()
--> _maybe_arm_post_cancel_retry()
--> orders.meta.retry_status = ARMED
--> _check_armed_retries()
--> _submit_armed_retry()
--> ap.execution.process_signal(...)
+retry intent
+-> one durable owner claim
+-> current client/mode/risk/duplicate eligibility
+-> fresh market/contract truth
+-> canonical OSM order row/status vocabulary
+-> watcher/trigger semantics where required by the ordinary route
+-> OSM hardened broker submit boundary
+-> fill monitor
+-> position ownership
 ```
 
-Key current-main anchors on base SHA:
+The final broker POST must be owned by `APOrderStateMachine`'s hardened submit path with:
 
-- `_check_stale_entry_cancel()` age-ceiling path: approximately **2850–3035**.
-- `_maybe_arm_post_cancel_retry()` begins around **3090**.
-- `_check_armed_retries()` begins around **3215**.
-- `_submit_armed_retry()` begins around **3265**.
-- `_handle_stale_entry()` and broker-confirmed retry hook are around **3440–3635**.
+- broker tag derived from canonical local order identity;
+- ambiguous-outcome lookup by tag;
+- no blind replacement POST;
+- canonical status transition;
+- durable `execution_mode`.
 
-### `ap/post_cancel_retry.py`
+If Claude discovers another current-main canonical wrapper around that exact OSM boundary, reuse it. Do not invent another submit helper.
 
-Current engine already normalizes cancel reasons, checks alignment, builds the retry payload, and caps attempts.
+## Routing requirement
 
-Current-main defects found in that existing path:
+The preferred implementation is to hand the claimed retry back to the **existing canonical queue/execution-control path** rather than directly constructing a broker order in the monitor.
 
-1. `RETRYABLE_REASONS` currently includes `"missed_move"` even though a missed move is the explicit anti-chase terminal condition.
-2. `evaluate_retry()` reads prior count from `meta["retry_attempts"]` **plural**, while `order_monitor` persists `meta["retry_attempt"]` **singular** and the retry payload also uses `retry_attempt`. The cap can therefore forget the previous attempt.
-3. `_alignment_ok()` returns `None` when direction / entry reference / current spot cannot be proven, and `evaluate_retry()` currently treats `None` as allow. A money-moving retry must not arm on unproven alignment.
-4. `_check_armed_retries()` SELECTs ARMED rows and submits them without first atomically claiming the ARMED lifecycle. Two monitor owners/restarts can race on the same durable retry intent.
-5. `_submit_armed_retry()` currently calls `ap.execution.process_signal()`, which can call `broker.place_order()` directly. This PR must not silently expand or replace that routing architecture. Codex must prove the existing path preserves the required identity/risk contract before retaining it; if that proof fails within the hard file budget, STOP and report rather than inventing a third path.
+Before choosing the exact seam, trace current main:
 
-## Required behavior
+- `ap/queue.py::_dispatch()`
+- Master Control evaluation/revalidation
+- contract selector
+- `APOrderStateMachine.create_entry_order()`
+- entry watcher registration / trigger callback
+- `APOrderStateMachine.submit_existing_entry()` / hardened submit helper
 
-### A. MISSED_MOVE is terminal, never retryable
+Then use the smallest existing entry point that executes those same controls for a retry payload.
 
-In `ap/post_cancel_retry.py`:
+If re-enqueueing through `trade_queue` is the canonical safe seam, requirements are:
 
-- remove `"missed_move"` from `RETRYABLE_REASONS`;
-- add `"missed_move"` to `NON_RETRYABLE_REASONS`.
+- use one deterministic retry idempotency key, e.g. identity equivalent to `(client_id, canonical_signal_id, retry_root, retry_attempt=1)`;
+- preserve `canonical_signal_id` while giving the retry generation its own exact execution/order identity;
+- queue insertion must be idempotent under duplicate monitor ticks/restart;
+- claim success does not mean broker submit success;
+- queue worker remains the sole downstream owner.
 
-`_normalize_reason()` must continue mapping production text containing `MISSED_MOVE` to canonical `missed_move`.
+If current canonical dedupe semantics make a same-opportunity retry impossible through queue, **STOP and report the exact blocker**. Do not fall back to `process_signal()`.
 
-Result:
+A direct call from order monitor to `APOrderStateMachine.submit_*` is not acceptable unless the same Master Control, contract freshness, risk/capital, trigger/revalidation, and identity gates are demonstrably executed first through an existing canonical wrapper. The monitor is an orchestrator, not a broker submitter.
+
+## Existing post-cancel policy defects retained from original spec
+
+### A. MISSED_MOVE is terminal
+
+Remove `missed_move` from retryable reasons and classify it as non-retryable.
 
 ```text
-STALE_ENTRY_CANCEL MISSED_MOVE ...
--> canceled
--> evaluate_retry(...)
--> ABORT / NON_RETRYABLE_REASON
--> zero retry broker POST
+STALE_ENTRY_CANCEL MISSED_MOVE
+-> CANCELED
+-> retry decision ABORT
+-> zero queue retry generation
+-> zero broker retry POST
 ```
 
-Do not weaken the existing missed-move classifier merely to generate more fills.
+### B. One canonical retry attempt
 
-### B. One canonical attempt counter
+Canonical field: `retry_attempt` singular.
 
-For this P0, **one retry maximum per original signal**.
+Read legacy `retry_attempts` only for compatibility. Never let a new local order reset lineage.
 
-Canonical durable field: `retry_attempt` singular.
-
-Read compatibility:
-
-```python
-prior_retry = first_valid_int(
-    meta.get("retry_attempt"),
-    meta.get("retry_attempts"),       # legacy read only
-    previous_retry_payload.get("retry_attempt"),
-    default=0,
-)
-```
-
-Write:
-
-- write `retry_attempt` singular;
-- preserve a legacy plural field only as diagnostic if required for backward compatibility, never as a second authority;
-- effective maximum for this P0 is 1.
-
-A second canceled retry order belonging to the same retry lineage must resolve to `MAX_ATTEMPTS_REACHED` and issue zero broker ENTRY POST.
-
-Do not reset the count merely because a new local order ID was created for retry #1. Lineage must follow the original signal / retry root.
+Maximum: one retry generation per original retry root.
 
 ### C. Alignment must be proven
 
-Change retry admission from:
+Required before ARM:
+
+- exact CALL/PUT direction;
+- positive original trigger/entry reference;
+- positive fresh underlying observation;
+- current setup has not invalidated target/stop/thesis;
+- any required market evidence is current under existing policy.
+
+`None`/missing evidence is `ALIGNMENT_UNPROVEN`, not allow.
+
+### D. Cancel must be broker-confirmed terminal
+
+A cancel request is not enough. The original broker order must be proven terminal and non-filled before retry intent is armed.
+
+Late fill or partial fill wins over retry. Any positive broker fill quantity routes to fill/position ownership, not a new entry generation.
+
+### E. ARMED -> SUBMITTING/QUEUED claim is CAS authority
+
+Discovery SELECT is not authority.
+
+Before any retry handoff, atomically claim the canceled original order's retry intent:
 
 ```text
-alignment False -> abort
-alignment None -> allow
+client exact
+kind=ENTRY
+status=CANCELED
+execution_mode exact live|paper
+meta.retry_status=ARMED
+retry_ready_at due
+retry_attempt=1
 ```
 
-to:
+Persist JSONB patch, not full metadata replacement.
 
-```text
-alignment True -> may continue
-alignment False -> ALIGNMENT_LOST
-alignment None -> ALIGNMENT_UNPROVEN
-```
+The state name may be `SUBMITTING` or `QUEUED` depending on the chosen canonical handoff, but it must mean exactly one durable owner has taken responsibility.
 
-Required proof inputs:
+Claim loser and DB failure perform zero queue/broker work.
 
-- direction is exactly CALL or PUT;
-- positive original signal/trigger entry reference;
-- positive fresh underlying spot.
+### F. Preserve identity lineage
 
-If any are missing/malformed, ABORT. Do not retry from stale metadata guesses.
+Durable retry lineage must preserve:
 
-### D. Broker-confirmed cancellation remains mandatory
+- client_id
+- execution_mode
+- signal_id
+- canonical_signal_id
+- original local order id / retry root
+- retry attempt=1
+- prior broker order id
+- cancellation reason and terminal proof
+- side/direction
+- ticker
+- trigger / breach generation where present
+- plan/materialization identity where present
 
-Do not arm a retry merely because a cancel request was sent.
+No PAPER -> LIVE or LIVE -> PAPER adoption.
 
-The existing `_handle_stale_entry()` boundary is correct:
+## Required removal / quarantine of legacy authority
 
-- broker cancel requested;
-- broker status must prove a terminal cancel status;
-- OSM transition to CANCELED must succeed;
-- only then may `_maybe_arm_post_cancel_retry()` run.
-
-If broker truth is unknown/ambiguous, retain the existing reconcile/poll behavior. Zero retry submit.
-
-### E. Atomically claim ARMED before any retry submit
-
-`_check_armed_retries()` currently performs a SELECT and then submit. Replace the ownership boundary with a compare-and-swap claim using the existing `orders` row and existing DB connection helper.
-
-A candidate is eligible only if all of these are still true at claim time:
-
-```text
-client_id == this monitor client
-kind == ENTRY
-status == CANCELED
-meta.retry_status == ARMED
-meta.retry_ready_at <= now
-execution_mode is valid and matches this runtime
-retry_attempt == 1
-```
-
-Claim transition:
-
-```text
-ARMED -> SUBMITTING
-```
-
-Persist at least:
-
-```text
-retry_status = SUBMITTING
-retry_submit_claim_owner = <stable per-process/call token>
-retry_submit_claimed_at = <UTC timestamp>
-retry_attempt = 1
-```
-
-Requirements:
-
-- use one conditional SQL UPDATE / CAS and require exactly one row returned/updated;
-- do not SELECT then blindly overwrite full `meta`;
-- preserve all existing JSONB metadata;
-- only the claim winner may call `_submit_armed_retry()`;
-- claim loser performs zero broker work;
-- if claim DB write fails, perform zero broker work.
-
-After canonical submit result:
-
-- success -> existing `SUBMITTED` retry status and new local/broker order references;
-- safe pre-broker reject -> `FAILED`/`ABORTED` with exact reason;
-- ambiguous broker result after bytes may have left process -> **do not reset to ARMED**. Preserve reconcile-required truth instead of enabling a duplicate retry.
-
-### F. Preserve exact retry lineage and execution identity
-
-Retry payload/durable metadata must carry and preserve:
-
-- original `client_id`;
-- original `execution_mode` (`live|paper`);
-- original `signal_id`;
-- original `canonical_signal_id` when available;
-- `retry_of_local_oid`;
-- stable retry root / original local order ID;
-- `retry_attempt=1`;
-- ticker/symbol;
-- direction;
-- score/tier;
-- trigger/entry reference;
-- selected contract only as evidence, not permission to bypass fresh quote checks.
-
-Any client or execution-mode mismatch -> ABORT before broker work.
-
-Never allow a PAPER canceled order to create a LIVE retry or vice versa.
-
-### G. Existing submit route must be proven, not assumed
-
-Current `_submit_armed_retry()` calls:
+After implementation, the current post-cancel retry path must contain **zero calls** to:
 
 ```python
 from ap.execution import process_signal
-result = process_signal(self.broker, self.client_id, retry_payload)
+process_signal(...)
 ```
 
-`ap.execution.process_signal()` has its own direct broker submit path via `broker.place_order()`.
+Add a static regression asserting this for `ap/order_monitor.py`.
 
-For this surgical PR, Codex may retain that call **only if focused tests prove** that the retry invocation still executes the production-required controls for this exact retry shape before broker POST, including:
+Do not delete `ap/execution.py` in this PR unless source search proves it has no remaining production callers and deletion is independently safe. The objective is to remove it from this LIVE-reachable retry money path.
 
-- client activity/mode resolution;
-- kill switch;
-- position / capital authority;
-- symbol/duplicate protection;
-- fresh option quote;
-- spread/chase protection;
-- quantity/cost reservation;
-- no pre-fill position/proof mutation;
-- exactly one broker ENTRY POST maximum.
+Also search all production callers of `ap.execution.process_signal()` and report them in the PR description. Any other LIVE-reachable caller discovered is a separate blocker and must be declared rather than silently ignored.
 
-If proving/fixing those invariants requires editing `ap/execution.py`, `ap/queue.py`, `ap_master_control.py`, broker code, OSM, or another production file, **STOP and report the scope expansion. Do not edit those files in this PR.**
+`ap/manual_trades.py` is known dead/broken and is not an excuse to retain the retry route.
 
-This prevents a liveness fix from becoming an accidental execution rewrite.
+## Expected production scope
 
-## HARD FILE BUDGET
-
-### Production maximum
+Authorized starting set:
 
 - `ap/post_cancel_retry.py`
 - `ap/order_monitor.py`
+- the **single canonical handoff owner actually required** by current architecture, likely one of:
+  - `ap/queue.py`, or
+  - `ap_execution_core.py`, or
+  - `client_runner.py` solely for dependency wiring.
 
-No other production file is authorized.
+`ap/order_state_machine.py` should be reused, not reimplemented. Edit it only if a missing narrowly-defined retry-generation API is proven necessary.
 
-If another production file appears necessary, STOP.
+`ap/execution.py` is not to be hardened into another authority in this PR.
 
-### Tests
-
-Create:
-
-- `tests/test_p0_post_cancel_retry_liveness_safety.py`
-
-Run existing adjacent tests unchanged:
-
-- `tests/test_phase5_post_cancel_retry.py`
-- `tests/test_phase9_retry_wire_in.py`
-- `tests/test_phase11_entry_fill_conversion.py`
-
-Do not rewrite unrelated legacy tests to greenwash the patch.
-
-## Suggested code changes
-
-### `ap/post_cancel_retry.py`
-
-Minimal shape:
-
-```python
-NON_RETRYABLE_REASONS = frozenset({
-    ...,
-    "missed_move",
-})
-
-RETRYABLE_REASONS = frozenset({
-    "entry_max_age_normal_reached",
-    "entry_max_age_aplus_reached",
-    "stale_entry_timeout",
-    "broker_transient_error",
-    "broker_rejected_transient",
-    "unfilled_at_ladder_top",
-})
-
-# one canonical lineage attempt
-prior_retries = _resolve_prior_retry_attempt(meta, canceled_order)
-next_attempt = prior_retries + 1
-if next_attempt > 1:
-    return ABORT(MAX_ATTEMPTS_REACHED)
-
-align = _alignment_ok(...)
-if align is None:
-    return ABORT(ALIGNMENT_UNPROVEN)
-if align is False:
-    return ABORT(ALIGNMENT_LOST)
-```
-
-Do not add new retry reasons in this PR.
-
-### `ap/order_monitor.py`
-
-Add one small helper near the existing retry methods, e.g.:
-
-```python
-def _claim_armed_retry_for_submit(self, local_order_id: str, now_epoch: float) -> dict | None:
-    """CAS ARMED -> SUBMITTING. Return claimed production row or None."""
-```
-
-It must patch JSONB rather than replacing full `meta`, and fence on client/status/kind/mode/attempt/current ARMED state.
-
-Then `_check_armed_retries()` becomes conceptually:
-
-```python
-for candidate in due_rows:
-    claimed = self._claim_armed_retry_for_submit(candidate["local_order_id"], now_epoch)
-    if not claimed:
-        continue
-    self._submit_armed_retry(
-        claimed["local_order_id"],
-        claimed["contract"],
-        claimed_meta["retry_payload"],
-        claimed_meta,
-    )
-```
-
-The due-row SELECT is discovery only. CAS is authority.
+If more than the minimal handoff/wiring set is required, report the expansion before coding further.
 
 ## Required tests
 
-At minimum:
+Create/update `tests/test_p0_post_cancel_retry_liveness_safety.py`.
 
-1. `MISSED_MOVE` -> ABORT; zero retry submit.
-2. normal max-age unfilled + proven alignment -> ARM retry #1.
-3. A+ max-age unfilled + proven alignment -> ARM retry #1.
-4. unknown cancel reason -> fail closed.
-5. spread/runaway/thesis invalid -> fail closed.
-6. missing current underlying -> `ALIGNMENT_UNPROVEN`.
-7. missing entry reference -> `ALIGNMENT_UNPROVEN`.
-8. invalid direction -> `ALIGNMENT_UNPROVEN` or existing specific missing-direction block; zero submit.
-9. singular `retry_attempt=1` -> second retry rejected.
-10. legacy plural `retry_attempts=1` -> second retry rejected.
-11. previous retry payload `retry_attempt=1` -> second retry rejected even if outer meta lost the field.
-12. ARMED CAS winner submits once.
-13. two concurrent claim attempts -> one winner, one loser, one submit maximum.
-14. stale candidate selected before peer changes status -> CAS loses, zero submit.
-15. DB claim failure -> zero submit.
-16. wrong client -> zero submit.
-17. PAPER/LIVE mismatch -> zero submit.
-18. malformed execution mode -> zero submit.
-19. broker cancel requested but not terminal-confirmed -> retry never armed.
-20. OSM CANCELED transition fails -> retry never armed.
-21. retry payload preserves signal/canonical identity and retry root.
-22. process_signal pre-broker rejection -> exact retry failure reason persisted, no second arm.
-23. successful retry -> old canceled row references new local order and broker order; no position/proof mutation is fabricated by retry orchestrator.
-24. crash/race after SUBMITTING claim cannot return row to ARMED automatically.
-25. exact broker-call counting proves at most one retry ENTRY POST.
+Minimum cases:
 
-## Mandatory validation
+1. MISSED_MOVE -> no retry generation.
+2. unknown cancel reason -> no retry.
+3. unproven alignment -> no retry.
+4. lost alignment -> no retry.
+5. broker cancel request but terminal state unproven -> no retry.
+6. late original fill -> fill path, no retry.
+7. original partial fill -> fill/position path, no full duplicate retry.
+8. first valid no-fill cancel -> exactly one retry intent.
+9. singular retry_attempt=1 -> second retry blocked.
+10. legacy plural retry_attempts=1 -> second retry blocked.
+11. two concurrent ARMED claims -> one owner.
+12. crash after claim before canonical handoff -> restart cannot create two retry generations.
+13. duplicate monitor ticks -> one queue/canonical handoff maximum.
+14. retry identity mismatch client -> zero handoff.
+15. retry mode mismatch -> zero handoff.
+16. malformed mode -> zero handoff.
+17. canonical handoff creates only OSM vocabulary statuses; no `NEW` or `ACK` order row.
+18. retry order has top-level execution_mode exact.
+19. final broker submit carries canonical tag/local identity.
+20. ambiguous broker POST outcome -> lookup/reconcile; zero blind second POST.
+21. successful retry -> exactly one broker buy-to-open maximum.
+22. pre-broker risk failure -> zero broker POST and durable exact reason.
+23. fresh quote/contract rejection -> zero broker POST.
+24. no position/proof mutation before broker fill.
+25. queue/handoff diagnostics preserve retry root and prior broker order.
+26. static test: order_monitor contains no `process_signal` import/call.
+27. static/source inventory: all remaining production `process_signal` callers are reported.
+28. ordinary non-retry queue entry behavior remains unchanged.
+29. PAPER retry remains PAPER through broker adapter selection.
+30. LIVE retry remains LIVE and cannot use sandbox identity.
 
-```bash
-python -m pytest -q \
-  tests/test_p0_post_cancel_retry_liveness_safety.py \
-  tests/test_phase5_post_cancel_retry.py \
-  tests/test_phase9_retry_wire_in.py \
-  tests/test_phase11_entry_fill_conversion.py
-python -m py_compile \
-  ap/post_cancel_retry.py \
-  ap/order_monitor.py \
-  tests/test_p0_post_cancel_retry_liveness_safety.py
-git diff --check
-```
+Run adjacent:
 
-## Frozen non-goals
-
-Do not change:
-
-- scanner or signal generation;
-- score floors;
-- trigger/watch logic;
-- selector delta/DTE/moneyness/spread/OI/volume gates;
-- position sizing percentages;
-- Master Control cap formulas;
-- broker adapter;
-- cancellation semantics before broker confirmation;
-- exit engine;
-- position manager;
-- proof trades;
-- deferred materialization;
-- overnight reevaluation;
-- database schema/migrations;
-- environment configuration;
-- general `process_signal()` behavior;
-- queue architecture;
-- retry count above one;
-- PAPER fill policy;
-- LIVE execution pricing policy.
+- phase5 post-cancel retry
+- phase9 retry wire-in
+- queue hardening/current P0 queue tests
+- OSM broker submit boundary tests
+- execution-mode identity tests
+- fill conversion tests
+- duplicate submit/idempotency tests
 
 ## Money-path safety checklist
 
-- **Live behavior?** Yes, retry liveness can create one additional ENTRY attempt after a confirmed no-fill cancel.
-- **Flag-off?** Existing `ENTRY_RETRY_ENABLED` remains the emergency kill switch. Do not add another flag unless absolutely necessary.
-- **Broker submit/cancel?** Uses existing cancel path; retry can reach existing ENTRY submit path only after CAS ownership and all required gates. No new cancel path.
-- **Orders mutation?** Existing canceled order meta is patched for retry ownership/status. New retry order may be created only through the existing approved entry path.
-- **Positions/proof_trades?** Zero mutation by retry orchestrator before broker fill truth.
-- **Queue?** No new queue writer in this PR.
-- **client_id/execution_mode?** Exact preservation required and checked before submit.
-- **Production metadata shape?** Tests must use the existing JSONB `orders.meta` fields, including both legacy plural and canonical singular attempt shapes.
-- **Diagnostics?** Preserve exact cancel reason, normalized reason, alignment result, attempt, claim owner/time, submit result, and new order IDs.
-- **Paper/live taxonomy?** Separate and exact; no cross-mode adoption.
-- **Could this make Jason trade junk?** Not if this spec is followed: MISSED_MOVE becomes terminal, unknown/unproven alignment becomes terminal, and no quality/risk gate is loosened.
+- Live behavior: **YES.** Retry route changes.
+- Flag: existing `ENTRY_RETRY_ENABLED` remains emergency off switch; do not rely on it as correctness.
+- Broker submit/cancel: cancel remains existing; retry broker submit must be OSM-only.
+- Orders: canonical OSM rows only; no NEW/ACK writes from retry.
+- Positions/proof: no pre-fill mutation.
+- Queue: may be used only as canonical handoff, with deterministic idempotency and exact lineage.
+- client_id/execution_mode: exact durable columns, not metadata guesses.
+- Diagnostics: preserve cancellation, claim, retry root, canonical handoff, OSM local id, broker id, ambiguity disposition.
+- PAPER/LIVE taxonomy: strict.
+- Could this make Jason trade junk? Not if implemented correctly: no missed-move retry, no unproven alignment, full canonical gates rerun, and no blind broker retry.
 
-## Codex implementation instruction
+## Supersession / overlap
 
-Implement only this work order on this branch.
+- **#450**: do not merge as the fix for F7. This PR eliminates the retry caller that depended on legacy mode-less inserts.
+- **#440**: owns broker cancel/replace race semantics and must land/rebase coherently. This PR must not add its own cancel owner.
+- **#473/#480**: own fill->position handoff; late/partial fill observed during retry cancellation must route there.
 
-First read the current implementations of `evaluate_retry`, `_maybe_arm_post_cancel_retry`, `_check_armed_retries`, `_submit_armed_retry`, and `_handle_stale_entry`. Reuse them. Do not create parallel methods unless the single CAS helper described above is needed.
+## Claude implementation instruction
 
-Before retaining `process_signal()` as the retry submit seam, prove from current code/tests that it satisfies the required pre-broker controls for this retry shape. If that cannot be proved without touching a third production file, STOP and report the exact missing invariant.
+1. Rebase this spec branch onto exact current main.
+2. Read PR #440, #473, #480 and current queue/OSM execution path before editing.
+3. Reproduce `NEW`, `ACK`, mode omission, and ambiguous blind retry from current main.
+4. Remove `process_signal()` from retry authority.
+5. Route the single claimed retry through the existing canonical entry-control seam.
+6. Preserve one retry maximum and anti-chase rules.
+7. Return exact broker-call counts and all mutation paths.
 
-After implementation report:
+Before requesting review, update the PR with:
 
-1. exact changed production lines;
-2. why every retryable reason is safe;
-3. exact attempt-count authority;
-4. concurrent claim proof;
-5. broker ENTRY POST count proof;
-6. `client_id` / `execution_mode` preservation;
-7. orders/positions/proof/queue mutation exposure;
-8. focused test results;
-9. complete changed-file list.
+- exact current-main base/head SHA;
+- changed files;
+- caller inventory for `process_signal`;
+- canonical handoff chosen and why;
+- one-owner concurrency proof;
+- client/mode lineage proof;
+- broker ambiguity proof;
+- focused/adjacent test counts;
+- exact-head CI;
+- fresh MERGE / HOLD / HARD HOLD verdict.
 
-**No merge, deploy, migration, environment mutation, or LIVE authority change is authorized by this spec.**
+No merge, deploy, migration, environment mutation, or production-data mutation is authorized.
