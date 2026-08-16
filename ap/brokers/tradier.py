@@ -469,33 +469,90 @@ class TradierBroker(BrokerAdapter):
                     "broker_order_id": broker_order_id, "raw": {}, "error": str(e)}
 
     def list_positions(self) -> list:
+        """Return open positions for the exact account as authoritative broker truth.
+
+        P0 invariant (spec: p0_broker_position_unavailable_not_flat_20260815):
+        **BROKER UNAVAILABLE != BROKER FLAT.** Like ``list_orders``, this method
+        deliberately propagates transport/auth/HTTP failures instead of swallowing
+        them into ``[]``. A swallowed failure would let ``resolve_exit_broker_truth``
+        read an unavailable broker as a fresh, authoritative flat snapshot and
+        terminalize a still-open live position under
+        ``SYNTHETIC_POSITION_STALE_BROKER_FLAT``.
+
+        Contract:
+          - UNAVAILABLE  (401/403/429/5xx, connect/read timeout, connection error):
+            ``_get`` raises and the exception propagates. Never ``[]``. No retries
+            are added here — this changes truth semantics, not transport policy.
+          - MALFORMED    (a successful response that cannot be interpreted as the
+            supported Tradier positions shape): raise a deterministic
+            ``ValueError('TRADIER_POSITIONS_PAYLOAD_MALFORMED: ...')``. Never coerce
+            malformed truth into flatness.
+          - SUCCESS_EMPTY  ({} / null / "null" / empty position node): return ``[]``.
+          - SUCCESS (one object or a list): return the normalized rows below.
+
+        Normalized valid-row contract (unchanged; downstream consumers depend on it):
+        ``symbol``, ``quantity``, ``cost_basis``, ``side``, ``raw``.
         """
-        Return open positions from Tradier account.
-        Returns list of dicts with: symbol, quantity, cost_basis, side
-        Returns [] if no positions or on error.
-        """
-        try:
-            resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
-            positions = resp.get("positions", {})
-            if not positions or positions == "null":
-                return []
-            pos_list = positions.get("position", [])
-            if isinstance(pos_list, dict):
-                pos_list = [pos_list]
-            result = []
-            for p in pos_list:
-                result.append({
-                    "symbol":     p.get("symbol", ""),
-                    "quantity":   float(p.get("quantity", 0)),
-                    "cost_basis": float(p.get("cost_basis", 0)),
-                    "side":       (lambda sym: (
-                        "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
-                        "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
-                        "CALL" if "C" in sym else "PUT"
-                    ))(str(p.get("symbol", ""))),
-                    "raw":        p,
-                })
-            return result
-        except Exception as e:
-            log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
+        # Transport/auth/HTTP failures propagate out of _get() unchanged.
+        resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
+
+        # A successful HTTP response must still be interpretable. A body that is
+        # not a JSON object is not "no positions" — it is unknown truth.
+        if resp is None or not isinstance(resp, dict):
+            raise ValueError(
+                f"TRADIER_POSITIONS_PAYLOAD_MALFORMED: top-level type="
+                f"{type(resp).__name__}"
+            )
+
+        positions = resp.get("positions", {})
+        # Authoritative empty shapes: {}, "", None, "null".
+        if not positions or positions == "null":
             return []
+        if not isinstance(positions, dict):
+            raise ValueError(
+                f"TRADIER_POSITIONS_PAYLOAD_MALFORMED: positions node type="
+                f"{type(positions).__name__}"
+            )
+
+        pos_node = positions.get("position", [])
+        # Explicit empty position node is still an authoritative empty snapshot.
+        if pos_node is None or pos_node == "null" or pos_node == "":
+            return []
+        if isinstance(pos_node, dict):
+            pos_list = [pos_node]
+        elif isinstance(pos_node, list):
+            pos_list = pos_node
+        else:
+            raise ValueError(
+                f"TRADIER_POSITIONS_PAYLOAD_MALFORMED: position container type="
+                f"{type(pos_node).__name__}"
+            )
+
+        result = []
+        for p in pos_list:
+            if not isinstance(p, dict):
+                raise ValueError(
+                    f"TRADIER_POSITIONS_PAYLOAD_MALFORMED: non-dict position row "
+                    f"type={type(p).__name__}"
+                )
+            try:
+                quantity = float(p.get("quantity", 0))
+                cost_basis = float(p.get("cost_basis", 0))
+            except (TypeError, ValueError) as exc:
+                # A row whose quantity cannot be established truthfully must not
+                # silently become flat truth.
+                raise ValueError(
+                    "TRADIER_POSITIONS_PAYLOAD_MALFORMED: unparseable numeric field"
+                ) from exc
+            result.append({
+                "symbol":     p.get("symbol", ""),
+                "quantity":   quantity,
+                "cost_basis": cost_basis,
+                "side":       (lambda sym: (
+                    "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
+                    "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
+                    "CALL" if "C" in sym else "PUT"
+                ))(str(p.get("symbol", ""))),
+                "raw":        p,
+            })
+        return result
