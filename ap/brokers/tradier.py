@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -486,8 +487,13 @@ class TradierBroker(BrokerAdapter):
           - MALFORMED    (a successful response that cannot be interpreted as the
             supported Tradier positions shape): raise a deterministic
             ``ValueError('TRADIER_POSITIONS_PAYLOAD_MALFORMED: ...')``. Never coerce
-            malformed truth into flatness.
-          - SUCCESS_EMPTY  ({} / null / "null" / empty position node): return ``[]``.
+            malformed truth into flatness. This includes: a missing ``positions``
+            key, a falsy-but-not-authoritative-empty ``positions``/row shape
+            (``[]``, ``False``, ``0``), a position row missing ``symbol`` or
+            ``quantity``, and a non-finite (``NaN``/``inf``) quantity.
+          - SUCCESS_EMPTY  (top-level ``{}``; or ``positions`` is ``null`` /
+            ``"null"`` / ``""`` / ``{}``; or an explicitly empty position node):
+            return ``[]``.
           - SUCCESS (one object or a list): return the normalized rows below.
 
         Normalized valid-row contract (unchanged; downstream consumers depend on it):
@@ -504,9 +510,16 @@ class TradierBroker(BrokerAdapter):
                 f"{type(resp).__name__}"
             )
 
-        positions = resp.get("positions", {})
-        # Authoritative empty shapes: {}, "", None, "null".
-        if not positions or positions == "null":
+        if resp == {}:
+            return []
+        if "positions" not in resp:
+            raise ValueError(
+                "TRADIER_POSITIONS_PAYLOAD_MALFORMED: positions key missing"
+            )
+
+        positions = resp["positions"]
+        # Authoritative empty shapes only: null / "null" / "" / {}.
+        if positions is None or positions == "null" or positions == "" or positions == {}:
             return []
         if not isinstance(positions, dict):
             raise ValueError(
@@ -535,8 +548,17 @@ class TradierBroker(BrokerAdapter):
                     f"TRADIER_POSITIONS_PAYLOAD_MALFORMED: non-dict position row "
                     f"type={type(p).__name__}"
                 )
+            symbol = str(p.get("symbol") or "").strip()
+            if not symbol:
+                raise ValueError(
+                    "TRADIER_POSITIONS_PAYLOAD_MALFORMED: position row missing symbol"
+                )
+            if "quantity" not in p:
+                raise ValueError(
+                    "TRADIER_POSITIONS_PAYLOAD_MALFORMED: position row missing quantity"
+                )
             try:
-                quantity = float(p.get("quantity", 0))
+                quantity = float(p["quantity"])
                 cost_basis = float(p.get("cost_basis", 0))
             except (TypeError, ValueError) as exc:
                 # A row whose quantity cannot be established truthfully must not
@@ -544,15 +566,21 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError(
                     "TRADIER_POSITIONS_PAYLOAD_MALFORMED: unparseable numeric field"
                 ) from exc
+            if not math.isfinite(quantity):
+                # NaN/inf cannot be truthfully interpreted as a share/contract
+                # count and must never be silently coerced toward zero.
+                raise ValueError(
+                    "TRADIER_POSITIONS_PAYLOAD_MALFORMED: non-finite quantity"
+                )
             result.append({
-                "symbol":     p.get("symbol", ""),
+                "symbol":     symbol,
                 "quantity":   quantity,
                 "cost_basis": cost_basis,
                 "side":       (lambda sym: (
                     "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
                     "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
                     "CALL" if "C" in sym else "PUT"
-                ))(str(p.get("symbol", ""))),
+                ))(symbol),
                 "raw":        p,
             })
         return result

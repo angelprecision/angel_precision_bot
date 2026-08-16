@@ -256,6 +256,28 @@ MALFORMED_PAYLOADS = {
                                                          _raw_position(PUT_CONTRACT, 4)]}},
     "position_qty_unparseable": {"positions": {"position": {"symbol": PUT_CONTRACT,
                                                             "quantity": "abc"}}},
+    # Amendment (audit finding): falsy-but-not-authoritative-empty positions
+    # node must raise, not silently resolve to SUCCESS_EMPTY.
+    "positions_node_empty_list": {"positions": []},
+    "positions_node_false": {"positions": False},
+    "positions_node_zero": {"positions": 0},
+    # Amendment: successful body with no "positions" key at all is not the
+    # same as an authoritative empty snapshot — .get(..., {}) must not be
+    # allowed to invent flatness for an unrecognized payload shape.
+    "positions_key_missing": {"unexpected": "successful-but-wrong-payload"},
+    # Amendment: an empty position row carries no truth-bearing contract
+    # identity and must not silently normalize to qty=0.
+    "position_row_empty_dict": {"positions": {"position": {}}},
+    # Amendment: a row with contract identity but no quantity field at all
+    # must not default to qty=0 (that is exactly "no exposure" proof).
+    "position_row_missing_quantity": {"positions": {"position":
+                                                     {"symbol": PUT_CONTRACT}}},
+    # Amendment: NaN/inf pass float() without raising and must be rejected
+    # explicitly, since they cannot be interpreted as a real position size.
+    "position_row_quantity_nan": {"positions": {"position":
+                                                 {"symbol": PUT_CONTRACT, "quantity": "nan"}}},
+    "position_row_quantity_inf": {"positions": {"position":
+                                                 {"symbol": PUT_CONTRACT, "quantity": "inf"}}},
 }
 
 
@@ -546,6 +568,58 @@ def test_case15_malformed_broker_during_submit_exit_never_closes(monkeypatch):
     assert _closed_writes(fake_conn) == []
     assert _synthetic_transitions(osm) == []
     assert broker.session.post.call_count == 1
+
+
+@pytest.mark.parametrize("get_payload,label", [
+    # Amendment (audit finding): exact-contract row present but quantity is
+    # entirely absent. Must never manufacture "exact matched row, qty=0".
+    ({"positions": {"position": {"symbol": PUT_CONTRACT}}}, "missing_quantity"),
+    # Amendment: NaN/inf quantity on an exact contract match. float() alone
+    # would silently accept these; they must be rejected before reaching the
+    # resolver so they can never present as fresh exact zero exposure.
+    ({"positions": {"position": {"symbol": PUT_CONTRACT, "quantity": "nan"}}}, "quantity_nan"),
+    ({"positions": {"position": {"symbol": PUT_CONTRACT, "quantity": "inf"}}}, "quantity_inf"),
+])
+def test_case15_amendment_malformed_exact_match_during_submit_exit_never_closes(
+        monkeypatch, get_payload, label):
+    """The exact false-flat manufacture the audit flagged: an exact-OCC row
+    with unusable quantity truth must resolve unknown, not fresh-exact-zero,
+    and must never terminalize the position under
+    SYNTHETIC_POSITION_STALE_BROKER_FLAT."""
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    broker = _integration_broker(get_payload=get_payload)
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=broker,
+        position_id="pos-live-open",
+        contract=PUT_CONTRACT,
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result.get("reason") != "SYNTHETIC_POSITION_STALE_BROKER_FLAT", label
+    assert _closed_writes(fake_conn) == [], label
+    assert _synthetic_transitions(osm) == [], label
+    assert broker.session.post.call_count == 1, label
+
+
+@pytest.mark.parametrize("get_payload,label", [
+    ({"positions": {"position": {"symbol": PUT_CONTRACT}}}, "missing_quantity"),
+    ({"positions": {"position": {"symbol": PUT_CONTRACT, "quantity": "nan"}}}, "quantity_nan"),
+    ({"positions": {"position": {"symbol": PUT_CONTRACT, "quantity": "inf"}}}, "quantity_inf"),
+])
+def test_case15_amendment_malformed_exact_match_resolver_is_unknown(get_payload, label):
+    broker = _broker(get_payload)
+    truth = resolve_exit_broker_truth(broker=broker, client_id="jason@example.com", contract=PUT_CONTRACT)
+    assert truth["broker_truth_open_qty"] is None, label
+    assert truth["is_fresh_exact"] is False, label
 
 
 # =============================================================================
