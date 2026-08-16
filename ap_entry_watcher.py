@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -72,6 +73,24 @@ def _ew_record(signal_id: str, ticker: str, to_state_name: str, reason: str, **m
         pass
 
 log = logging.getLogger("ap.entry_watcher")
+
+
+def _valid_positive_finite_quote(value) -> Optional[float]:
+    """Return a usable positive quote, or ``None`` when it is unavailable.
+
+    Trigger evidence is stricter than ordinary display data: booleans,
+    malformed scalars, non-finite values, zero, and negative values are all
+    unavailable and must never reach the breach comparison.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
 
 # Module-level ET zoneinfo: declared BEFORE any helper that uses it.
 ET = ZoneInfo("America/New_York")
@@ -665,6 +684,9 @@ class WatchedSignal:
         self.breach_price = 0.0
         self.last_quote_bid = 0.0
         self.last_quote_ask = 0.0
+        self.last_quote_bid_raw = None
+        self.last_quote_ask_raw = None
+        self.last_trigger_evidence_reason: Optional[str] = None
         self.last_quote_age_ms: Optional[int] = None
         self._watcher_ref = None
         self._pending_audit: Optional[dict] = None  # audit payload staged inside check(), persisted by poll loop
@@ -795,6 +817,17 @@ class WatchedSignal:
         # intentional. See tests/test_entry_watcher_audit.py
         # TestPrecedenceTriggerVsStop for the structural guarantee.
         now = datetime.now(timezone.utc)
+        _raw_bid = bid
+        _raw_ask = ask
+        _bid_quote = _valid_positive_finite_quote(bid)
+        _ask_quote = _valid_positive_finite_quote(ask)
+        _entry_trigger = _valid_positive_finite_quote(self.entry_trigger)
+        # Store normalized values for existing numeric audit consumers while
+        # retaining the raw scalars for the unavailable-evidence diagnostic.
+        bid = _bid_quote if _bid_quote is not None else 0.0
+        ask = _ask_quote if _ask_quote is not None else 0.0
+        self.last_quote_bid_raw = _raw_bid
+        self.last_quote_ask_raw = _raw_ask
         self.last_quote_bid = bid
         self.last_quote_ask = ask
         if quote_age_ms is not None:
@@ -804,6 +837,35 @@ class WatchedSignal:
             self.state = WatchState.EXPIRED
             log.info("[%s] EXPIRED — no breach in %smin", self.ticker, MAX_WATCH_MINUTES)
             return self.state
+
+        _required_quote = _ask_quote if self.side == "CALL" else _bid_quote
+        if _entry_trigger is None or _required_quote is None:
+            _required_side = "ASK" if self.side == "CALL" else "BID"
+            _reason_code = f"TRIGGER_EVIDENCE_UNAVAILABLE_{_required_side}"
+            _reset_pending = self.trigger_crossed_at is None
+            if _reset_pending:
+                # An unavailable poll breaks continuity. Do not let a valid
+                # first observation combine with a later valid observation.
+                self.breach_count = 0
+                self._pending_first_breach_at = None
+                self.breach_price = 0.0
+                self.first_breach_bid = 0.0
+                self.first_breach_ask = 0.0
+                self.trigger_price = None
+            self.last_trigger_evidence_reason = _reason_code
+            log.debug(
+                "[%s] %s — side=%s raw_bid=%r raw_ask=%r "
+                "trigger_valid=%s pending_breach_reset=%s",
+                self.ticker,
+                _reason_code,
+                self.side,
+                _raw_bid,
+                _raw_ask,
+                _entry_trigger is not None,
+                _reset_pending,
+            )
+            return self.state
+        self.last_trigger_evidence_reason = None
 
         # Intraday stale-move invalidation. Daily overnight signals get their
         # own structural validator, not generic drift logic.
@@ -889,9 +951,9 @@ class WatchedSignal:
                 try:
                     _tgt = float(self.target_price or 0)
                     if _tgt > 0:
-                        if self.side == "CALL" and ask > 0 and ask >= _tgt:
+                        if self.side == "CALL" and _ask_quote is not None and ask >= _tgt:
                             _tgt_complete = True
-                        elif self.side == "PUT" and bid > 0 and bid <= _tgt:
+                        elif self.side == "PUT" and _bid_quote is not None and bid <= _tgt:
                             _tgt_complete = True
                 except (TypeError, ValueError):
                     _tgt_complete = False
@@ -907,10 +969,10 @@ class WatchedSignal:
                 try:
                     _t_poll = float(self.entry_trigger or 0)
                     if _t_poll > 0:
-                        if self.side == "CALL" and ask > 0:
+                        if self.side == "CALL" and _ask_quote is not None:
                             if ask > _t_poll * (1.0 + MAX_INTRADAY_DRIFT_PCT):
                                 _decisive_drift = True
-                        elif self.side == "PUT" and bid > 0:
+                        elif self.side == "PUT" and _bid_quote is not None:
                             if bid < _t_poll * (1.0 - MAX_INTRADAY_DRIFT_PCT):
                                 _decisive_drift = True
                 except (TypeError, ValueError):
@@ -1096,7 +1158,7 @@ class WatchedSignal:
                         return self.state
 
         if self.side == "CALL":
-            if ask >= self.entry_trigger:
+            if _ask_quote is not None and ask >= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = ask
                     # PR #407: durable trigger_crossed_at proof is issued ONLY
@@ -1174,6 +1236,7 @@ class WatchedSignal:
             if (
                 self.stop_level
                 and getattr(self, "trigger_crossed_at", None) is not None
+                and _bid_quote is not None
                 and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -1257,7 +1320,7 @@ class WatchedSignal:
                 )
 
         else:  # PUT
-            if bid <= self.entry_trigger:
+            if _bid_quote is not None and bid <= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = bid
                     # PR #407: see CALL branch — pending until confirmed.
@@ -1308,6 +1371,7 @@ class WatchedSignal:
             if (
                 self.stop_level
                 and getattr(self, "trigger_crossed_at", None) is not None
+                and _ask_quote is not None
                 and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -5238,6 +5302,8 @@ class APEntryWatcher:
         except Exception as exc:
             log.warning("Quote fetch failed: %s", exc)
             return
+        if not isinstance(quotes, dict):
+            quotes = {}
 
         completed = []
         with self._lock:
@@ -5257,16 +5323,16 @@ class APEntryWatcher:
                         # clear and let the normal breach check re-prove the trigger.
                         w.deferred_retry_not_before = None
                 quote = quotes.get(w.ticker)
-                if not quote:
-                    continue
+                if not isinstance(quote, dict):
+                    quote = {}
 
-                bid = float(quote.get("bid", 0) or 0)
-                ask = float(quote.get("ask", 0) or 0)
+                # Keep raw side values intact for WatchedSignal.check(),
+                # which owns the positive/finite/type validation. In
+                # particular, LAST is never promoted into BID/ASK authority.
+                bid = quote.get("bid")
+                ask = quote.get("ask")
                 _quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
                 w.last_quote_age_ms = _quote_age_ms
-                if bid == 0 and ask == 0:
-                    last = float(quote.get("last", 0) or 0)
-                    bid = ask = last
 
                 new_state = w.check(bid, ask, quote_age_ms=_quote_age_ms)
                 if new_state == WatchState.TRIGGERED:
