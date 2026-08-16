@@ -292,3 +292,172 @@ def test_invalid_entry_trigger_is_not_authority(side):
     assert watched.check(99.0, 100.0) == WatchState.PENDING
     assert watched.breach_count == 0
     assert watched.trigger_crossed_at is None
+
+
+# ── PR #479 amendment: P0 ordering fix regressions ──────────────────────
+#
+# Audit finding: the invalid-required-quote early return in check() ran
+# BEFORE the per-side stop-invalidation check. On an already-confirmed
+# lifecycle (trigger_crossed_at set) that a callback-driven retry
+# (RETRY_WAIT / KEEP_WATCHER / RECONCILE_BROKER_INTENT) has returned to
+# PENDING, a missing *entry*-side quote (ASK for CALL, BID for PUT) would
+# early-return and skip the stop check entirely — even when the
+# *opposite*-side quote was valid and had broken the still-active stop.
+# That could leave a stale/junk confirmed setup retryable when it should
+# already have been killed.
+
+
+def _confirm_trigger(watched: WatchedSignal, side: str):
+    """Drive a fresh WatchedSignal through a normal two-poll confirmation
+    and return the durable trigger_crossed_at timestamp."""
+    quote = (99.0, 100.0) if side == "CALL" else (100.0, 101.0)
+    assert watched.check(*quote) == WatchState.PENDING
+    assert watched.check(*quote) == WatchState.TRIGGERED
+    assert watched.trigger_crossed_at is not None
+    return watched.trigger_crossed_at
+
+
+def test_call_confirmed_stop_break_invalidates_despite_missing_ask():
+    """CALL: confirmed trigger -> callback retry (PENDING) -> next poll has
+    an invalid/unavailable ASK but a valid BID that has broken the active
+    CALL stop -> must INVALIDATE. Must not silently stay PENDING just
+    because the required entry-side quote went missing."""
+    watched = WatchedSignal(_signal(side="CALL"), overnight=False)
+    confirmed_at = _confirm_trigger(watched, "CALL")
+
+    # Simulate a callback-ownership retry (RETRY_WAIT / KEEP_WATCHER /
+    # RECONCILE_BROKER_INTENT) returning the watcher to PENDING while the
+    # durable trigger proof is preserved — mirrors
+    # APEntryWatcher._poll_active_signals' `w.state = WatchState.PENDING`.
+    watched.state = WatchState.PENDING
+
+    # stop_price for CALL is 95.0 (see _signal()); bid=90.0 is well below
+    # 95.0 * (1 - WRONG_DIR_BUFFER_PCT) and must break the active stop.
+    result = watched.check(bid=90.0, ask=None)
+
+    assert result == WatchState.INVALIDATED
+    assert watched.last_trigger_evidence_reason == "TRIGGER_EVIDENCE_UNAVAILABLE_ASK"
+    # The original trigger proof is untouched — only the lifecycle died.
+    assert watched.trigger_crossed_at == confirmed_at
+
+
+def test_put_confirmed_stop_break_invalidates_despite_missing_bid():
+    """PUT mirror of the CALL case above."""
+    watched = WatchedSignal(_signal(side="PUT"), overnight=False)
+    confirmed_at = _confirm_trigger(watched, "PUT")
+
+    watched.state = WatchState.PENDING
+
+    # stop_price for PUT is 105.0 (see _signal()); ask=110.0 is well above
+    # 105.0 * (1 + WRONG_DIR_BUFFER_PCT) and must break the active stop.
+    result = watched.check(bid=None, ask=110.0)
+
+    assert result == WatchState.INVALIDATED
+    assert watched.last_trigger_evidence_reason == "TRIGGER_EVIDENCE_UNAVAILABLE_BID"
+    assert watched.trigger_crossed_at == confirmed_at
+
+
+def test_call_confirmed_retry_no_callback_fire_after_stop_invalidation():
+    """Integration-level: once the missing-ASK/broken-stop poll invalidates
+    a confirmed, retry-pending CALL watcher, the poll loop must mark it
+    done and must NOT invoke on_trigger again."""
+    quotes = [
+        {"bid": 99.0, "ask": 100.0},  # breach candidate
+        {"bid": 99.0, "ask": 100.0},  # confirms -> TRIGGERED, callback fires
+        {"bid": 90.0, "ask": None},   # retry-pending poll: ASK missing, stop broken
+    ]
+    watcher, watched = _poll_watched("CALL", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals()
+    watcher._poll_active_signals()
+    assert callback.call_count == 1
+    assert watched.state == WatchState.PENDING
+    assert watched.trigger_crossed_at is not None
+    watched.deferred_retry_not_before = None  # clear retry backoff for the test poll
+
+    watcher._poll_active_signals()
+
+    assert watched.state == WatchState.INVALIDATED
+    assert callback.call_count == 1  # must not have fired again
+    assert watcher.broker.submit_order.call_count == 0
+
+
+def test_put_confirmed_retry_no_callback_fire_after_stop_invalidation():
+    """PUT mirror of the integration-level case above."""
+    quotes = [
+        {"bid": 100.0, "ask": 101.0},  # breach candidate
+        {"bid": 100.0, "ask": 101.0},  # confirms -> TRIGGERED, callback fires
+        {"bid": None, "ask": 110.0},   # retry-pending poll: BID missing, stop broken
+    ]
+    watcher, watched = _poll_watched("PUT", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals()
+    watcher._poll_active_signals()
+    assert callback.call_count == 1
+    assert watched.state == WatchState.PENDING
+    assert watched.trigger_crossed_at is not None
+    watched.deferred_retry_not_before = None
+
+    watcher._poll_active_signals()
+
+    assert watched.state == WatchState.INVALIDATED
+    assert callback.call_count == 1
+    assert watcher.broker.submit_order.call_count == 0
+
+
+def test_call_confirmed_retry_pending_missing_ask_stays_pending_when_stop_intact():
+    """Preservation case: confirmed trigger -> retry PENDING -> required
+    entry quote invalid -> stop-side quote valid but NOT broken -> must
+    remain safely PENDING. No fabricated trigger, no reconfirmation."""
+    watched = WatchedSignal(_signal(side="CALL"), overnight=False)
+    confirmed_at = _confirm_trigger(watched, "CALL")
+    watched.state = WatchState.PENDING
+
+    # bid=99.0 is well above the CALL stop (95.0) — stop not broken.
+    result = watched.check(bid=99.0, ask=None)
+
+    assert result == WatchState.PENDING
+    assert watched.last_trigger_evidence_reason == "TRIGGER_EVIDENCE_UNAVAILABLE_ASK"
+    assert watched.trigger_crossed_at == confirmed_at
+
+
+def test_put_confirmed_retry_pending_missing_bid_stays_pending_when_stop_intact():
+    """PUT mirror of the preservation case above."""
+    watched = WatchedSignal(_signal(side="PUT"), overnight=False)
+    confirmed_at = _confirm_trigger(watched, "PUT")
+    watched.state = WatchState.PENDING
+
+    # ask=101.0 is well below the PUT stop (105.0) — stop not broken.
+    result = watched.check(bid=None, ask=101.0)
+
+    assert result == WatchState.PENDING
+    assert watched.last_trigger_evidence_reason == "TRIGGER_EVIDENCE_UNAVAILABLE_BID"
+    assert watched.trigger_crossed_at == confirmed_at
+
+
+@pytest.mark.parametrize("side", ["CALL", "PUT"])
+def test_pre_confirmation_missing_quote_still_returns_early_and_resets(side):
+    """Regression guard: the PRE-confirmation path (trigger_crossed_at is
+    still None) must retain its original behavior exactly — full early
+    return with pending-breach continuity reset. The amendment only
+    changes behavior for the already-confirmed lifecycle."""
+    watched = WatchedSignal(_signal(side=side), overnight=False)
+    first_quote = (99.0, 100.0) if side == "CALL" else (100.0, 101.0)
+
+    assert watched.check(*first_quote) == WatchState.PENDING
+    assert watched.breach_count == 1
+    assert watched._pending_first_breach_at is not None
+
+    invalid_quote = (99.0, None) if side == "CALL" else (None, 101.0)
+    result = watched.check(*invalid_quote)
+
+    assert result == WatchState.PENDING
+    assert watched.breach_count == 0
+    assert watched._pending_first_breach_at is None
+    assert watched.breach_price == 0.0
+    assert watched.trigger_price is None
+    assert watched.trigger_crossed_at is None
