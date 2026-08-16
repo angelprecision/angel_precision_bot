@@ -5433,7 +5433,32 @@ class APEntryWatcher:
         completed = []
         with self._lock:
             for w in active:
+                # PR #479 amendment 4: deferred callback/reconciliation
+                # backoff (RETRY_WAIT / KEEP_WATCHER / RECONCILE_BROKER_
+                # INTENT, all set only on an already-confirmed watcher —
+                # deferred_retry_not_before is never assigned before
+                # trigger_crossed_at exists) must throttle EXECUTION retry
+                # only. It must never blind SAFETY OBSERVATION. Previously
+                # this block `continue`d before w.check() was ever called,
+                # so an active scanner-stop break (or any other
+                # independently provable terminal condition — stale-move
+                # expiration, late-attachment terminal classification)
+                # during the defer window was invisible to the state
+                # machine: a transient stop break that recovered before the
+                # retry deadline could leave the durable pending-entry
+                # lifecycle retryable when it should already be dead.
+                #
+                # Fix: compute whether execution retry is still deferred,
+                # but always call w.check() below regardless. Safety
+                # observation (INVALIDATED / EXPIRED) always dispatches
+                # normally — a transient stop break permanently kills that
+                # lifecycle even if the underlying later recovers. Only the
+                # TRIGGERED branch is gated on _retry_deferred: if
+                # execution retry is not yet due, restore PENDING and
+                # preserve the existing retry deadline instead of
+                # dispatching to on_trigger early.
                 _retry_not_before = getattr(w, "deferred_retry_not_before", None)
+                _retry_deferred = False
                 if _retry_not_before is not None:
                     try:
                         if isinstance(_retry_not_before, str):
@@ -5441,8 +5466,9 @@ class APEntryWatcher:
                         if _retry_not_before.tzinfo is None:
                             _retry_not_before = _retry_not_before.replace(tzinfo=timezone.utc)
                         if datetime.now(timezone.utc) < _retry_not_before:
-                            continue
-                        w.deferred_retry_not_before = None
+                            _retry_deferred = True
+                        else:
+                            w.deferred_retry_not_before = None
                     except Exception:
                         # Invalid retry timestamps never create an indefinite wait;
                         # clear and let the normal breach check re-prove the trigger.
@@ -5461,6 +5487,26 @@ class APEntryWatcher:
 
                 new_state = w.check(bid, ask, quote_age_ms=_quote_age_ms)
                 if new_state == WatchState.TRIGGERED:
+                    if _retry_deferred:
+                        # Safety observation has run and re-proven the entry
+                        # condition, but execution/callback retry authority
+                        # is not due yet. Do NOT dispatch to on_trigger.
+                        # Restore PENDING and leave deferred_retry_not_before
+                        # untouched (never cleared above while still in the
+                        # future) so the existing retry lifecycle resumes
+                        # normally once the deadline passes.
+                        w.state = WatchState.PENDING
+                        w.last_trigger_evidence_reason = (
+                            "WATCHER_RETRY_EXECUTION_DEFERRED_SAFETY_ACTIVE"
+                        )
+                        log.debug(
+                            "[%s] WATCHER_RETRY_EXECUTION_DEFERRED_SAFETY_ACTIVE "
+                            "— entry re-proven during retry backoff but "
+                            "execution authority not due until %s; holding "
+                            "PENDING, no callback dispatch",
+                            w.ticker, getattr(w, "deferred_retry_not_before", None),
+                        )
+                        continue
                     if open_protect_active and w.ticker in self._open_trigger_tickers:
                         # Per-ticker open protection: this ticker already triggered once
                         # at open. Block duplicate triggers for the same ticker within
@@ -5477,6 +5523,9 @@ class APEntryWatcher:
                             self._open_trigger_tickers.add(w.ticker)
                         completed.append(("trigger", w))
                 elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
+                    # Terminal safety conditions dispatch normally even
+                    # during a retry-execution defer window — safety may
+                    # always terminalize; only new execution is throttled.
                     completed.append(("done", w))
 
             # ── P0 (PR #304) Bug B fix: DO NOT remove triggered watchers here.

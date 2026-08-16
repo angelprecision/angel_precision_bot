@@ -667,3 +667,239 @@ def test_pre_confirm_invalid_quote_no_stale_condition_stays_pending(side):
     assert watched.breach_count == 0
     assert watched._pending_first_breach_at is None
     assert watched.trigger_crossed_at is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# PR #479 amendment 4 — RETRY BACKOFF MUST NOT DISABLE ACTIVE SAFETY
+# OBSERVATION
+# ─────────────────────────────────────────────────────────────────────────
+# APEntryWatcher._poll_active_signals() previously `continue`d past a
+# watcher entirely whenever deferred_retry_not_before was still in the
+# future — meaning WatchedSignal.check() was never called during a
+# callback-driven retry backoff window (RETRY_WAIT / KEEP_WATCHER /
+# RECONCILE_BROKER_INTENT). A transient stop break during that window was
+# therefore invisible to the state machine: if the underlying recovered
+# before the retry deadline, the durable pending-entry lifecycle stayed
+# retryable even though it had already violated its stop. These tests
+# drive the real production scheduler path (APEntryWatcher._poll_active_
+# signals) and deliberately do NOT manually clear deferred_retry_not_before
+# — that would hide the exact seam this amendment fixes.
+
+def test_call_stop_breaks_during_retry_defer_invalidates_and_never_refires():
+    """CALL: confirmed -> RETRY_WAIT with future deferred_retry_not_before
+    -> stop breaks BEFORE the retry deadline -> must INVALIDATE through the
+    real scheduler path, must not re-fire even if price later recovers."""
+    quotes = [
+        {"bid": 99.0, "ask": 100.0},   # breach candidate
+        {"bid": 99.0, "ask": 100.0},   # confirms -> TRIGGERED, callback fires -> RETRY_WAIT
+        {"bid": 90.0, "ask": 100.50},  # BEFORE retry deadline: BID breaks CALL stop(95)
+        {"bid": 99.0, "ask": 100.50},  # price recovers on a later poll
+    ]
+    watcher, watched = _poll_watched("CALL", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 1
+    assert watched.state == WatchState.PENDING
+    assert watched.deferred_retry_not_before is not None
+    assert watched.deferred_retry_not_before > datetime.now(timezone.utc)
+
+    # Poll BEFORE the retry deadline — do NOT clear deferred_retry_not_before.
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.INVALIDATED
+    assert callback.call_count == 1
+    assert watcher.broker.submit_order.call_count == 0
+    assert watcher.broker.cancel_order.call_count == 0
+
+    # Recovered price on a later poll must never resurrect this lifecycle.
+    watcher._poll_active_signals(open_protect_active=False)
+    assert watched.state == WatchState.INVALIDATED
+    assert callback.call_count == 1
+
+
+def test_put_stop_breaks_during_retry_defer_invalidates_and_never_refires():
+    """PUT mirror."""
+    quotes = [
+        {"bid": 100.0, "ask": 101.0},
+        {"bid": 100.0, "ask": 101.0},
+        {"bid": 99.50, "ask": 110.0},  # BEFORE deadline: ASK breaks PUT stop(105)
+        {"bid": 99.50, "ask": 101.0},  # recovered
+    ]
+    watcher, watched = _poll_watched("PUT", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 1
+    assert watched.deferred_retry_not_before > datetime.now(timezone.utc)
+
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.INVALIDATED
+    assert callback.call_count == 1
+    assert watcher.broker.submit_order.call_count == 0
+    assert watcher.broker.cancel_order.call_count == 0
+
+    watcher._poll_active_signals(open_protect_active=False)
+    assert watched.state == WatchState.INVALIDATED
+    assert callback.call_count == 1
+
+
+def test_call_intact_stop_during_defer_holds_and_resumes_after_deadline():
+    """Preservation: CALL stop stays intact during the defer window — the
+    watcher must remain PENDING with no callback churn, and the retry
+    deadline must be preserved. Once the deadline passes, normal retry
+    lifecycle resumes."""
+    quotes = [
+        {"bid": 99.0, "ask": 100.0},
+        {"bid": 99.0, "ask": 100.0},
+        {"bid": 99.0, "ask": 100.50},  # intact stop during defer
+    ]
+    watcher, watched = _poll_watched("CALL", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 1
+    deadline_before = watched.deferred_retry_not_before
+    assert deadline_before is not None
+
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.PENDING
+    assert callback.call_count == 1
+    assert watched.deferred_retry_not_before == deadline_before
+    assert watched.trigger_crossed_at is not None
+
+    # Deadline reached — normal retry lifecycle may resume.
+    watched.deferred_retry_not_before = datetime.now(timezone.utc)
+    watcher._quote_sequence.append({"bid": 99.0, "ask": 100.50})
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 2
+
+
+def test_put_intact_stop_during_defer_holds_and_resumes_after_deadline():
+    """PUT mirror."""
+    quotes = [
+        {"bid": 100.0, "ask": 101.0},
+        {"bid": 100.0, "ask": 101.0},
+        {"bid": 99.50, "ask": 101.0},  # intact stop during defer
+    ]
+    watcher, watched = _poll_watched("PUT", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 1
+    deadline_before = watched.deferred_retry_not_before
+
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.PENDING
+    assert callback.call_count == 1
+    assert watched.deferred_retry_not_before == deadline_before
+
+    watched.deferred_retry_not_before = datetime.now(timezone.utc)
+    watcher._quote_sequence.append({"bid": 99.50, "ask": 101.0})
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 2
+
+
+def test_call_unknown_stop_truth_during_defer_holds_no_callback():
+    """UNKNOWN STOP TRUTH DURING DEFER: entry-side (ASK) valid but stop-side
+    (BID) unavailable during the retry backoff. Must HOLD — no callback, no
+    fabricated stop-safe/broken state, retry deadline preserved."""
+    quotes = [
+        {"bid": 99.0, "ask": 100.0},
+        {"bid": 99.0, "ask": 100.0},
+        {"bid": None, "ask": 100.50},  # BID (CALL stop authority) unavailable
+    ]
+    watcher, watched = _poll_watched("CALL", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 1
+    deadline_before = watched.deferred_retry_not_before
+
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.PENDING
+    assert callback.call_count == 1
+    assert watched.deferred_retry_not_before == deadline_before
+    assert watched.trigger_crossed_at is not None
+    assert watched.last_trigger_evidence_reason == "ACTIVE_STOP_TRUTH_UNAVAILABLE_BID"
+
+
+def test_put_unknown_stop_truth_during_defer_holds_no_callback():
+    """PUT mirror."""
+    quotes = [
+        {"bid": 100.0, "ask": 101.0},
+        {"bid": 100.0, "ask": 101.0},
+        {"bid": 99.50, "ask": None},  # ASK (PUT stop authority) unavailable
+    ]
+    watcher, watched = _poll_watched("PUT", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 1
+    deadline_before = watched.deferred_retry_not_before
+
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.PENDING
+    assert callback.call_count == 1
+    assert watched.deferred_retry_not_before == deadline_before
+    assert watched.last_trigger_evidence_reason == "ACTIVE_STOP_TRUTH_UNAVAILABLE_ASK"
+
+
+def test_call_entry_side_missing_and_stop_broken_during_defer_invalidates():
+    """Amendment 1/2 combination through the real scheduler: ASK missing,
+    BID broken, still inside the defer window. Stop must win."""
+    quotes = [
+        {"bid": 99.0, "ask": 100.0},
+        {"bid": 99.0, "ask": 100.0},
+        {"bid": 90.0, "ask": None},  # ASK missing, BID broken, still deferred
+    ]
+    watcher, watched = _poll_watched("CALL", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 1
+
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.INVALIDATED
+    assert callback.call_count == 1
+
+
+def test_put_entry_side_missing_and_stop_broken_during_defer_invalidates():
+    """PUT mirror."""
+    quotes = [
+        {"bid": 100.0, "ask": 101.0},
+        {"bid": 100.0, "ask": 101.0},
+        {"bid": None, "ask": 110.0},  # BID missing, ASK broken, still deferred
+    ]
+    watcher, watched = _poll_watched("PUT", quotes)
+    callback = MagicMock(return_value={"disposition": "RETRY_WAIT"})
+    watcher.on_trigger = callback
+
+    watcher._poll_active_signals(open_protect_active=False)
+    watcher._poll_active_signals(open_protect_active=False)
+    assert callback.call_count == 1
+
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.INVALIDATED
+    assert callback.call_count == 1
