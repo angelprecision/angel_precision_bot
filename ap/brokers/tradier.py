@@ -488,7 +488,8 @@ class TradierBroker(BrokerAdapter):
             supported Tradier positions shape): raise a deterministic
             ``ValueError('TRADIER_POSITIONS_PAYLOAD_MALFORMED: ...')``. Never coerce
             malformed truth into flatness. This includes: a missing ``positions``
-            key, a falsy-but-not-authoritative-empty ``positions``/row shape
+            key, a non-empty ``positions`` dict missing its ``position`` key, a
+            falsy-but-not-authoritative-empty ``positions``/row shape
             (``[]``, ``False``, ``0``), a position row missing ``symbol`` or
             ``quantity``, and a non-finite (``NaN``/``inf``) quantity.
           - SUCCESS_EMPTY  (top-level ``{}``; or ``positions`` is ``null`` /
@@ -527,7 +528,11 @@ class TradierBroker(BrokerAdapter):
                 f"{type(positions).__name__}"
             )
 
-        pos_node = positions.get("position", [])
+        if "position" not in positions:
+            raise ValueError(
+                "TRADIER_POSITIONS_PAYLOAD_MALFORMED: position key missing"
+            )
+        pos_node = positions["position"]
         # Explicit empty position node is still an authoritative empty snapshot.
         if pos_node is None or pos_node == "null" or pos_node == "":
             return []

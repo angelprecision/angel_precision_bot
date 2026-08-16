@@ -278,6 +278,11 @@ MALFORMED_PAYLOADS = {
                                                  {"symbol": PUT_CONTRACT, "quantity": "nan"}}},
     "position_row_quantity_inf": {"positions": {"position":
                                                  {"symbol": PUT_CONTRACT, "quantity": "inf"}}},
+    # Amendment 2 (audit finding): a non-empty positions dict with no
+    # "position" key at all was defaulting via .get("position", []) to an
+    # empty list, which list_positions() then returned as [] -- silently
+    # indistinguishable from an authoritative empty snapshot.
+    "positions_dict_missing_position_key": {"positions": {"foo": "bar"}},
 }
 
 
@@ -568,6 +573,43 @@ def test_case15_malformed_broker_during_submit_exit_never_closes(monkeypatch):
     assert _closed_writes(fake_conn) == []
     assert _synthetic_transitions(osm) == []
     assert broker.session.post.call_count == 1
+
+
+def test_case15_amendment2_missing_position_key_during_submit_exit_never_closes(monkeypatch):
+    """Audit finding: {"positions": {"foo": "bar"}} is a non-empty, dict-typed
+    positions node with no "position" key. positions.get("position", [])
+    was silently defaulting to [] -- indistinguishable from an authoritative
+    empty snapshot -- letting a still-open LIVE position resolve as flat and
+    reach SYNTHETIC_POSITION_STALE_BROKER_FLAT. Must resolve unknown instead."""
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    broker = _integration_broker(get_payload={"positions": {"foo": "bar"}})
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=broker,
+        position_id="pos-live-open",
+        contract=PUT_CONTRACT,
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result.get("reason") != "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+    assert _closed_writes(fake_conn) == []
+    assert _synthetic_transitions(osm) == []
+    assert broker.session.post.call_count == 1
+
+
+def test_case15_amendment2_missing_position_key_resolver_is_unknown(monkeypatch):
+    broker = _broker({"positions": {"foo": "bar"}})
+    truth = resolve_exit_broker_truth(broker=broker, client_id="jason@example.com", contract=PUT_CONTRACT)
+    assert truth["broker_truth_open_qty"] is None
+    assert truth["is_fresh_exact"] is False
 
 
 @pytest.mark.parametrize("get_payload,label", [
