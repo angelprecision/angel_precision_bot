@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from datetime import date
 import inspect
+import json
+import threading
 from pathlib import Path
 import sys
 import types
 from types import SimpleNamespace
+import uuid
 
 import pytest
 
 import os
 
-os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
+_REAL_PG_DSN = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("INTELLIGENCE_POSTGRES_TEST_URL")
+    or os.environ.get("MANUAL_CLOSE_POSTGRES_TEST_URL")
+    or ""
+)
+os.environ.setdefault("DATABASE_URL", _REAL_PG_DSN or "postgresql://test:test@localhost/test")
 os.environ.setdefault("AP_ENV", "test")
 
 from ap import fill_monitor as fm
@@ -722,11 +732,11 @@ def test_authority_ignores_equity_rows_but_not_option_identity(payload):
 def test_broker_snapshot_adapter_rejects_malformed_option_rows(
     monkeypatch, payload, expected_message
 ):
-    import ap.manual_close_reconciliation as reconciliation
+    import ap.filled_entry_recovery_authority as authority
 
     monkeypatch.setattr(
-        reconciliation,
-        "fetch_authoritative_broker_positions",
+        authority,
+        "_fetch_authoritative_broker_positions",
         lambda _broker: payload,
     )
     from ap.filled_entry_recovery_authority import fetch_current_broker_positions
@@ -736,11 +746,11 @@ def test_broker_snapshot_adapter_rejects_malformed_option_rows(
 
 
 def test_broker_snapshot_adapter_returns_exact_option_rows_and_ignores_equities(monkeypatch):
-    import ap.manual_close_reconciliation as reconciliation
+    import ap.filled_entry_recovery_authority as authority
 
     monkeypatch.setattr(
-        reconciliation,
-        "fetch_authoritative_broker_positions",
+        authority,
+        "_fetch_authoritative_broker_positions",
         lambda _broker: [{"symbol": "SPY", "quantity": 10}, _broker_position()],
     )
     from ap.filled_entry_recovery_authority import fetch_current_broker_positions
@@ -749,7 +759,7 @@ def test_broker_snapshot_adapter_returns_exact_option_rows_and_ignores_equities(
 
 
 def test_raw_broker_position_payload_rejects_ambiguous_option_identity():
-    from ap.manual_close_reconciliation import normalize_positions_payload
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
 
     payload = {
         "positions": {
@@ -763,8 +773,8 @@ def test_raw_broker_position_payload_rejects_ambiguous_option_identity():
         }
     }
 
-    with pytest.raises(ValueError, match="BROKER_POSITION_IDENTITY_AMBIGUOUS"):
-        normalize_positions_payload(payload)
+    with pytest.raises(ValueError, match="IDENTITY_AMBIGUOUS"):
+        _normalize_positions_payload(payload)
 
 
 def test_authoritative_position_raw_alias_cannot_hide_invalid_option_truth():
@@ -797,9 +807,14 @@ def test_active_existing_recovery_never_reopens_or_places_protection(monkeypatch
     broker = _Broker([_broker_position()])
     calls = []
     release_calls = []
+    owner_ids = []
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
-    monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: owner_ids.append(args[1]) or (True, "SEEDED"),
+    )
     monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
     monkeypatch.setattr(
         fm,
@@ -1162,6 +1177,7 @@ def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(mon
     pm = _PM()
     broker = _Broker([_broker_position()])
     calls = []
+    owner_ids = []
     release_calls = []
 
     def recreate(*args, **kwargs):
@@ -1177,7 +1193,11 @@ def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(mon
     monkeypatch.setattr(fm, "_open_position_safe", recreate)
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
-    monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: owner_ids.append(args[1]) or (True, "SEEDED"),
+    )
     monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: release_calls.append(True) or True)
 
     first = fm.recover_interrupted_filled_entry_handoff(
@@ -1202,8 +1222,370 @@ def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(mon
     assert first["completed"] is True
     assert second["completed"] is True
     assert len(pm.open_calls) == 1
+    assert owner_ids == ["position-1"]
     assert release_calls == [True]
     assert broker.mutations == []
+
+
+@contextmanager
+def _real_postgres_filled_entry_guard_case():
+    """Provision one isolated public row and a trigger for a real lock race."""
+    if not _REAL_PG_DSN or _REAL_PG_DSN.endswith("/test"):
+        pytest.skip("PostgreSQL test database is unavailable")
+    psycopg2 = pytest.importorskip("psycopg2")
+
+    token = uuid.uuid4().hex
+    client_id = f"p0-recovery-race-{token}@example.com"
+    local_order_id = f"p0-recovery-race-local-{token}"
+    broker_order_id = f"p0-recovery-race-broker-{token}"
+    position_id = f"p0-recovery-race-position-{token}"
+    reserve_key = f"reserved_equity:{client_id}"
+    symbol_key = f"lock:{client_id}:PEP"
+    event_table = f"p0_recovery_guard_events_{token}"
+    function_name = f"p0_recovery_guard_sleep_{token}"
+    trigger_name = f"p0_recovery_guard_trigger_{token}"
+
+    db = psycopg2.connect(_REAL_PG_DSN)
+    db.autocommit = True
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    broker_order_id TEXT,
+                    client_id TEXT,
+                    position_id TEXT,
+                    kind TEXT,
+                    status TEXT,
+                    meta JSONB DEFAULT '{}'::jsonb,
+                    created_ts TIMESTAMPTZ DEFAULT NOW(),
+                    updated_ts TIMESTAMPTZ DEFAULT NOW(),
+                    contract TEXT,
+                    execution_mode TEXT,
+                    filled_qty INTEGER,
+                    fill_price NUMERIC,
+                    qty INTEGER,
+                    signal_id TEXT,
+                    plan_id TEXT
+                )
+                """
+            )
+            for column, column_type in (
+                ("local_order_id", "TEXT"),
+                ("broker_order_id", "TEXT"),
+                ("client_id", "TEXT"),
+                ("position_id", "TEXT"),
+                ("kind", "TEXT"),
+                ("status", "TEXT"),
+                ("meta", "JSONB DEFAULT '{}'::jsonb"),
+                ("created_ts", "TIMESTAMPTZ DEFAULT NOW()"),
+                ("updated_ts", "TIMESTAMPTZ DEFAULT NOW()"),
+                ("contract", "TEXT"),
+                ("execution_mode", "TEXT"),
+                ("filled_qty", "INTEGER"),
+                ("fill_price", "NUMERIC"),
+                ("qty", "INTEGER"),
+                ("signal_id", "TEXT"),
+                ("plan_id", "TEXT"),
+            ):
+                cur.execute(
+                    f"ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS {column} {column_type}"
+                )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.kv (
+                    k TEXT PRIMARY KEY,
+                    v JSONB,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                "ALTER TABLE public.kv ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"
+            )
+            cur.execute(
+                f"""
+                CREATE TABLE public.{event_table} (
+                    id BIGSERIAL PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    backend_pid INTEGER NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE OR REPLACE FUNCTION public.{function_name}()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $function$
+                BEGIN
+                    IF NEW.local_order_id = '{local_order_id}' THEN
+                        INSERT INTO public.{event_table} (kind, backend_pid)
+                        VALUES (
+                            CASE
+                                WHEN COALESCE(NEW.meta->>'filled_entry_guards_released', 'false') = 'true'
+                                 AND COALESCE(OLD.meta->>'filled_entry_guards_released', 'false') <> 'true'
+                                THEN 'guard_release_marker'
+                                ELSE 'meta_update'
+                            END,
+                            pg_backend_pid()
+                        );
+                        IF COALESCE(NEW.meta->>'filled_entry_guards_released', 'false') = 'true'
+                           AND COALESCE(OLD.meta->>'filled_entry_guards_released', 'false') <> 'true' THEN
+                            PERFORM pg_sleep(0.8);
+                        END IF;
+                    END IF;
+                    RETURN NEW;
+                END
+                $function$
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE TRIGGER {trigger_name}
+                BEFORE UPDATE OF meta ON public.orders
+                FOR EACH ROW
+                EXECUTE FUNCTION public.{function_name}()
+                """
+            )
+            cur.execute(
+                "DELETE FROM public.orders WHERE local_order_id = %s",
+                (local_order_id,),
+            )
+            cur.execute(
+                "DELETE FROM public.kv WHERE k IN (%s, %s)",
+                (reserve_key, symbol_key),
+            )
+            meta = {
+                "filled_entry_handoff_state": "IN_PROGRESS",
+                "filled_entry_pair_resolution_state": "NOT_APPLICABLE",
+            }
+            cur.execute(
+                """
+                INSERT INTO public.orders
+                    (local_order_id, broker_order_id, client_id, position_id,
+                     kind, status, meta, contract, execution_mode, filled_qty,
+                     fill_price, qty, signal_id, plan_id)
+                VALUES (%s, %s, %s, %s, 'ENTRY', 'FILLED', %s::jsonb,
+                        %s, 'live', 1, 1.58, 1, %s, %s)
+                """,
+                (
+                    local_order_id,
+                    broker_order_id,
+                    client_id,
+                    position_id,
+                    json.dumps(meta),
+                    CONTRACT,
+                    f"signal-{token}",
+                    f"plan-{token}",
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO public.kv (k, v, updated_at)
+                VALUES (%s, %s::jsonb, NOW())
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
+                """,
+                (reserve_key, json.dumps(120.0)),
+            )
+            cur.execute(
+                """
+                INSERT INTO public.kv (k, v, updated_at)
+                VALUES (%s, %s::jsonb, NOW())
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
+                """,
+                (symbol_key, json.dumps({"token": token})),
+            )
+
+        yield {
+            "dsn": _REAL_PG_DSN,
+            "client_id": client_id,
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "position_id": position_id,
+            "reserve_key": reserve_key,
+            "symbol_key": symbol_key,
+            "event_table": event_table,
+            "token": token,
+        }
+    finally:
+        try:
+            with db.cursor() as cur:
+                cur.execute(f"DROP TRIGGER IF EXISTS {trigger_name} ON public.orders")
+                cur.execute(f"DROP FUNCTION IF EXISTS public.{function_name}()")
+                cur.execute(f"DROP TABLE IF EXISTS public.{event_table}")
+                cur.execute(
+                    "DELETE FROM public.orders WHERE local_order_id = %s",
+                    (local_order_id,),
+                )
+                cur.execute(
+                    "DELETE FROM public.kv WHERE k IN (%s, %s)",
+                    (reserve_key, symbol_key),
+                )
+        finally:
+            db.close()
+
+
+def test_postgres_guard_release_race_uses_real_sessions_and_converges(monkeypatch):
+    """Two real production DB sessions release one filled ENTRY exactly once."""
+    with _real_postgres_filled_entry_guard_case() as case:
+        monkeypatch.setattr(
+            fm,
+            "_bind_filled_entry_durable_identity",
+            lambda **kwargs: (True, "BOUND"),
+        )
+        monkeypatch.setattr(
+            fm,
+            "_seed_exit_engine",
+            lambda *args, **kwargs: (True, "SEEDED"),
+        )
+        monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
+
+        def make_order(meta=None):
+            return _order(
+                client_id=case["client_id"],
+                local_order_id=case["local_order_id"],
+                broker_order_id=case["broker_order_id"],
+                position_id=case["position_id"],
+                reserved_cost=120.0,
+                signal_id=f"signal-{case['token']}",
+                plan_id=f"plan-{case['token']}",
+                meta=dict(
+                    meta
+                    or {
+                        "filled_entry_handoff_state": "IN_PROGRESS",
+                        "filled_entry_pair_resolution_state": "NOT_APPLICABLE",
+                    }
+                ),
+            )
+
+        position = _existing_position(
+            id=case["position_id"],
+            client_id=case["client_id"],
+            local_order_id=case["local_order_id"],
+            broker_order_id=case["broker_order_id"],
+        )
+        start = threading.Barrier(2)
+        results = []
+        errors = []
+        session_pids = []
+        result_lock = threading.Lock()
+
+        def recover_once():
+            try:
+                # Hold one real production-pool session per worker until both
+                # workers are present.  The recovery calls below then acquire
+                # their own independent production sessions; neither conn()
+                # nor run_with_retry is replaced by the test.
+                with fm.conn() as session:
+                    session.execute("SELECT pg_backend_pid()")
+                    pid_row = session.fetchone() or {}
+                    with result_lock:
+                        session_pids.append(pid_row.get("pg_backend_pid"))
+                    start.wait(timeout=10)
+                result = fm.recover_interrupted_filled_entry_handoff(
+                    broker=_Broker([_broker_position()]),
+                    order=make_order(),
+                    pm=_PM([position]),
+                    exit_engine=SimpleNamespace(execution_mode=LIVE),
+                    runtime_execution_mode=LIVE,
+                    expected_client_id=case["client_id"],
+                    broker_positions=[_broker_position()],
+                )
+                with result_lock:
+                    results.append(result)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                with result_lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=recover_once) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(results) == 2
+        assert len(set(session_pids)) == 2
+        assert sum(result.get("completed") is True for result in results) == 1
+        holds = [result for result in results if result.get("disposition") == "HOLD"]
+        assert len(holds) == 1
+        assert holds[0]["reason_code"] == "FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN"
+
+        psycopg2 = pytest.importorskip("psycopg2")
+        check = psycopg2.connect(case["dsn"])
+        check.autocommit = True
+        try:
+            with check.cursor() as cur:
+                cur.execute(
+                    "SELECT v, meta FROM public.kv JOIN public.orders ON TRUE "
+                    "WHERE public.kv.k = %s AND public.orders.local_order_id = %s",
+                    (case["reserve_key"], case["local_order_id"]),
+                )
+                reserved, meta = cur.fetchone()
+                cur.execute(
+                    f"SELECT count(*) FROM public.{case['event_table']} "
+                    "WHERE kind = 'guard_release_marker'"
+                )
+                marker_count = cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT count(DISTINCT backend_pid) FROM public.{case['event_table']} "
+                    "WHERE kind = 'guard_release_marker'"
+                )
+                marker_session_count = cur.fetchone()[0]
+            assert float(reserved) == 0.0
+            assert meta["filled_entry_guards_release_claimed"] is True
+            assert meta["filled_entry_guards_released"] is True
+            assert meta["filled_entry_handoff_state"] == "COMPLETE"
+            assert marker_count == 1
+            assert marker_session_count == 1
+        finally:
+            check.close()
+
+        retry = fm.recover_interrupted_filled_entry_handoff(
+            broker=_Broker([_broker_position()]),
+            order=make_order(
+                meta={
+                    "filled_entry_handoff_state": "COMPLETE",
+                    "filled_entry_pair_resolution_state": "NOT_APPLICABLE",
+                    "filled_entry_guards_release_claimed": True,
+                    "filled_entry_guards_released": True,
+                }
+            ),
+            pm=_PM([position]),
+            exit_engine=SimpleNamespace(execution_mode=LIVE),
+            runtime_execution_mode=LIVE,
+            expected_client_id=case["client_id"],
+            broker_positions=[_broker_position()],
+        )
+        assert retry["completed"] is True
+        assert retry["reason_code"] == "FILLED_ENTRY_HANDOFF_ALREADY_COMPLETE"
+
+        check = psycopg2.connect(case["dsn"])
+        check.autocommit = True
+        try:
+            with check.cursor() as cur:
+                cur.execute(
+                    "SELECT v FROM public.kv WHERE k = %s",
+                    (case["reserve_key"],),
+                )
+                assert float(cur.fetchone()[0]) == 0.0
+                cur.execute(
+                    f"SELECT count(*) FROM public.{case['event_table']} "
+                    "WHERE kind = 'guard_release_marker'"
+                )
+                assert cur.fetchone()[0] == 1
+                cur.execute(
+                    "SELECT 1 FROM public.kv WHERE k = %s",
+                    (case["symbol_key"],),
+                )
+                assert cur.fetchone() is None
+        finally:
+            check.close()
 
 
 def test_recovery_function_has_no_broker_mutation_or_osm_transition_calls():
@@ -1462,7 +1844,8 @@ def test_crash_before_pair_cancel_resolution_holds_on_restart(monkeypatch):
         meta={"filled_entry_handoff_state": "IN_PROGRESS"},
     )
     calls = []
-    cancel_calls = []
+    bind_calls = []
+    seed_calls = []
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(
         fm,
@@ -1472,7 +1855,29 @@ def test_crash_before_pair_cancel_resolution_holds_on_restart(monkeypatch):
     monkeypatch.setattr(
         fm,
         "_open_position_safe",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not proceed past pair gate")),
+        lambda *a, **k: _PM().open_position(
+            client_id=CLIENT,
+            execution_mode=LIVE,
+            contract=CONTRACT,
+            qty=1,
+            local_order_id=LOCAL_ID,
+            broker_order_id=BROKER_ID,
+        ),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_bind_filled_entry_durable_identity",
+        lambda **kwargs: bind_calls.append(kwargs["position_id"]) or (True, "BOUND"),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: seed_calls.append(args[1]) or (True, "SEEDED"),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_once",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not release guards")),
     )
 
     result = fm.recover_interrupted_filled_entry_handoff(
@@ -1487,8 +1892,12 @@ def test_crash_before_pair_cancel_resolution_holds_on_restart(monkeypatch):
 
     assert result["disposition"] == "HOLD"
     assert result["reason_code"] == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+    assert result["canonical_owner_proven"] is True
+    assert result["position_id"] == "position-1"
+    assert bind_calls == ["position-1"]
+    assert seed_calls == ["position-1"]
+    assert order["position_id"] == "position-1"
     assert "COMPLETE" not in [state for state, _ in calls]
-    assert cancel_calls == []
 
 
 # --- Crash-matrix requirement 2: broker cancel may have happened but local
@@ -1498,13 +1907,14 @@ def test_crash_before_pair_cancel_resolution_holds_on_restart(monkeypatch):
 
 def test_crash_after_ambiguous_pair_cancel_holds_without_repeating_cancel(monkeypatch):
     order = _order(
-        position_id=None,
+        position_id=POSITION_ID,
         meta={
             "filled_entry_handoff_state": "IN_PROGRESS",
             "filled_entry_pair_resolution_state": "OUTCOME_UNPROVEN",
             "filled_entry_pair_resolution_detail": "PAIR_CANCEL_LOCAL_TRANSITION_UNCONFIRMED",
         },
     )
+    pm = _PM([_existing_position()])
     calls = []
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(
@@ -1512,11 +1922,18 @@ def test_crash_after_ambiguous_pair_cancel_holds_without_repeating_cancel(monkey
         "_cancel_pair_opposite",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("recovery must not cancel pair")),
     )
+    monkeypatch.setattr(fm, "_bind_filled_entry_durable_identity", lambda **kwargs: (True, "BOUND"))
+    monkeypatch.setattr(fm, "_seed_exit_engine", lambda *args, **kwargs: (True, "SEEDED"))
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_once",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not release guards")),
+    )
 
     result = fm.recover_interrupted_filled_entry_handoff(
         broker=_Broker([_broker_position()]),
         order=order,
-        pm=_PM(),
+        pm=pm,
         exit_engine=SimpleNamespace(execution_mode=LIVE),
         runtime_execution_mode=LIVE,
         expected_client_id=CLIENT,
@@ -1525,6 +1942,8 @@ def test_crash_after_ambiguous_pair_cancel_holds_without_repeating_cancel(monkey
 
     assert result["disposition"] == "HOLD"
     assert result["reason_code"] == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+    assert result["canonical_owner_proven"] is True
+    assert result["position_id"] == POSITION_ID
     assert "COMPLETE" not in [state for state, _ in calls]
 
 
@@ -1678,11 +2097,23 @@ def test_terminal_recovery_holds_when_pair_resolution_unproven(monkeypatch):
     pm = _PM([_existing_position()])
     broker = _Broker([_broker_position()])
     calls = []
+    bind_calls = []
+    seed_calls = []
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(
         fm,
         "_bind_filled_entry_durable_identity",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not bind while pair unproven")),
+        lambda **kwargs: bind_calls.append(kwargs["position_id"]) or (True, "BOUND"),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: seed_calls.append(args[1]) or (True, "SEEDED"),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_once",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not release guards")),
     )
     monkeypatch.setattr(
         fm,
@@ -1703,6 +2134,10 @@ def test_terminal_recovery_holds_when_pair_resolution_unproven(monkeypatch):
 
     assert result["disposition"] == "HOLD"
     assert result["reason_code"] == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+    assert result["canonical_owner_proven"] is True
+    assert result["position_id"] == POSITION_ID
+    assert bind_calls == [POSITION_ID]
+    assert seed_calls == [POSITION_ID]
     assert broker.mutations == []
     assert "COMPLETE" not in [state for state, _ in calls]
 
@@ -1727,11 +2162,23 @@ def test_malformed_pair_resolution_truth_fails_closed(monkeypatch, malformed_val
     pm = _PM([_existing_position()])
     broker = _Broker([_broker_position()])
     calls = []
+    bind_calls = []
+    seed_calls = []
     monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
     monkeypatch.setattr(
         fm,
         "_bind_filled_entry_durable_identity",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not bind on malformed pair truth")),
+        lambda **kwargs: bind_calls.append(kwargs["position_id"]) or (True, "BOUND"),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: seed_calls.append(args[1]) or (True, "SEEDED"),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_once",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not release guards")),
     )
 
     result = fm.recover_interrupted_filled_entry_handoff(
@@ -1747,6 +2194,10 @@ def test_malformed_pair_resolution_truth_fails_closed(monkeypatch, malformed_val
 
     assert result["disposition"] == "HOLD"
     assert result["reason_code"] == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+    assert result["canonical_owner_proven"] is True
+    assert result["position_id"] == POSITION_ID
+    assert bind_calls == [POSITION_ID]
+    assert seed_calls == [POSITION_ID]
     assert "COMPLETE" not in [state for state, _ in calls]
 
 

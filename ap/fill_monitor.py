@@ -1274,14 +1274,38 @@ def _entry_guard_cost(order: dict) -> Optional[float]:
     return cost if math.isfinite(cost) and cost > 0 else None
 
 
-def _release_entry_guards(order: dict) -> bool:
-    """Release reserved equity and symbol lock, returning only proven success."""
+def _release_entry_guards(order: dict):
+    """Release reserved equity and symbol lock for ENTRY orders."""
     client_id = order["client_id"]
     symbol = order.get("symbol")
-    cost = _entry_guard_cost(order)
+    # PR #235 (hardening #5): compute reserved cost defensively but do NOT
+    # let a missing cost skip the symbol lock release.  Pre-#235 an
+    # early-return here would leak the entry symbol lock forever if
+    # reserved_cost was None and limit_price × qty was also unavailable
+    # (e.g. broker-repair rows).
+    cost: Optional[float] = None
+    if order.get("reserved_cost") is not None:
+        try:
+            cost = float(order["reserved_cost"])
+        except Exception:
+            cost = None
+
+    if cost is None:
+        try:
+            cost = (
+                float(order.get("limit_price") or 0.0)
+                * int(order.get("qty") or 0)
+                * OPT_MULTIPLIER
+            )
+        except Exception:
+            cost = None
+
     equity_released = False
-    if cost is not None:
-        equity_released = bool(release_equity(client_id, cost))
+    if cost and cost > 0:
+        # ``ap.state`` intentionally retains its historical None-returning
+        # public API.  Treat an explicit False as an unconfirmed release, but
+        # accept None from the legacy helper after it completes its mutation.
+        equity_released = release_equity(client_id, cost) is not False
     else:
         log.warning(
             "[%s] _release_entry_guards: cost is zero/unknown for order=%s — equity may not be fully released",
@@ -1291,7 +1315,7 @@ def _release_entry_guards(order: dict) -> bool:
     # Always release the symbol lock, regardless of cost resolution.
     symbol_released = False
     if symbol:
-        symbol_released = bool(release_symbol_lock(client_id, symbol))
+        symbol_released = release_symbol_lock(client_id, symbol) is not False
     else:
         log.warning(
             "[%s] _release_entry_guards: symbol missing for order=%s — symbol lock could not be released",
@@ -3401,40 +3425,6 @@ def recover_interrupted_filled_entry_handoff(
             "retryable": False,
         }
 
-    # P0 amendment: recovery has zero pair-cancel authority.  It must not
-    # call _cancel_pair_opposite, broker.cancel_order, or any cancellation
-    # path — it can only check whether the fresh-fill path already durably
-    # proved the opposite pair's outcome before the crash.  Applies equally
-    # to ACTIVE_EXISTING and ACTIVE_RECREATE: neither may proceed to bind/
-    # seed/guard-release/COMPLETE while the pair outcome is unproven.
-    pair_state = _pair_resolution_state(order)
-    if pair_state not in {"NOT_APPLICABLE", "CONFIRMED"}:
-        reason = "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
-        _persist_filled_entry_handoff_state(
-            order,
-            "HOLD",
-            reason=reason,
-            retryable=True,
-        )
-        emit_fill_event(
-            order,
-            decision="HOLD",
-            reason_code=reason,
-            explanation=(
-                "Opposite 1-1 pair cancellation outcome is not durably "
-                "proven; recovery has zero cancel authority and cannot "
-                "complete this handoff."
-            ),
-            result={"filled_qty": order.get("filled_qty"), "avg_fill": order.get("fill_price")},
-            extra_context={**authority, "pair_resolution_state": pair_state or None},
-        )
-        return {
-            **authority,
-            "disposition": "HOLD",
-            "reason_code": reason,
-            "retryable": True,
-        }
-
     local_id = str(order.get("local_order_id") or "").strip()
     signal_id = str(order.get("signal_id") or "").strip()
     plan_id = str(order.get("plan_id") or "").strip()
@@ -3546,6 +3536,47 @@ def recover_interrupted_filled_entry_handoff(
             position_id=position_id,
         )
         return {**authority, "disposition": "HOLD", "reason_code": reason}
+
+    # Recovery has zero pair-cancel authority. It first establishes the
+    # canonical owner for already-proven broker risk, then gates only guard
+    # release and COMPLETE on durable pair truth. This mirrors the fresh-fill
+    # path: pair truth protects final completion, but an open broker position
+    # must never remain ownerless after a restart.
+    pair_state = _pair_resolution_state(order)
+    if pair_state not in {"NOT_APPLICABLE", "CONFIRMED"}:
+        reason = "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=True,
+            position_id=position_id,
+        )
+        emit_fill_event(
+            order,
+            decision="HOLD",
+            reason_code=reason,
+            explanation=(
+                "Canonical ownership was established, but the opposite "
+                "1-1 pair cancellation outcome is not durably proven; "
+                "recovery has zero cancel authority and cannot complete."
+            ),
+            result={"filled_qty": order.get("filled_qty"), "avg_fill": order.get("fill_price")},
+            extra_context={
+                **authority,
+                "position_id": position_id,
+                "pair_resolution_state": pair_state or None,
+                "canonical_owner_proven": True,
+            },
+        )
+        return {
+            **authority,
+            "disposition": "HOLD",
+            "reason_code": reason,
+            "retryable": True,
+            "position_id": position_id,
+            "canonical_owner_proven": True,
+        }
 
     if not _release_entry_guards_once(order, position_id=position_id):
         reason = "FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN"

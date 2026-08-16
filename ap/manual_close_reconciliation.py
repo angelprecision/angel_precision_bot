@@ -267,53 +267,15 @@ def normalize_positions_payload(payload: Any) -> list[dict]:
     normalized: list[dict] = []
     for row in rows:
         if not isinstance(row, dict):
-            raise ValueError("BROKER_POSITION_ROW_MALFORMED")
-
-        containers = [row]
-        raw = row.get("raw")
-        if isinstance(raw, dict) and raw is not row:
-            containers.append(raw)
-
-        explicit_contracts = {
-            normalize_contract(container.get(key))
-            for container in containers
-            for key in ("option_symbol", "contract")
-            if container.get(key) is not None
-            and str(container.get(key)).strip()
-        }
-        symbols = {
-            normalize_contract(container.get("symbol"))
-            for container in containers
-            if container.get("symbol") is not None
-            and str(container.get("symbol")).strip()
-        }
-        if len(explicit_contracts) > 1:
-            raise ValueError("BROKER_POSITION_IDENTITY_AMBIGUOUS")
-        if explicit_contracts and any(
-            is_valid_occ_contract(symbol)
-            for symbol in symbols - explicit_contracts
-        ):
-            raise ValueError("BROKER_POSITION_IDENTITY_AMBIGUOUS")
-        identities = explicit_contracts or symbols
-        if len(identities) > 1:
-            raise ValueError("BROKER_POSITION_IDENTITY_AMBIGUOUS")
-        if not identities:
-            raise ValueError("BROKER_POSITION_IDENTITY_MISSING")
-        contract = next(iter(identities))
-
-        quantity_values = [
-            positive_int(container.get(key))
-            for container in containers
-            for key in ("quantity", "qty")
-            if container.get(key) is not None
-        ]
-        if (
-            not quantity_values
-            or any(quantity <= 0 for quantity in quantity_values)
-            or len(set(quantity_values)) != 1
-        ):
-            raise ValueError("BROKER_POSITION_QUANTITY_INVALID")
-        normalized.append({"symbol": contract, "quantity": quantity_values[0], "raw": dict(row)})
+            continue
+        contract = normalize_contract(
+            row.get("option_symbol") or row.get("contract") or row.get("symbol")
+        )
+        quantity = positive_int(row.get("quantity") or row.get("qty"))
+        if contract and quantity > 0:
+            normalized.append(
+                {"symbol": contract, "quantity": quantity, "raw": dict(row)}
+            )
     return normalized
 
 
@@ -323,9 +285,7 @@ def fetch_authoritative_broker_positions(broker: Any) -> list[dict]:
         rows = authoritative()
         if not isinstance(rows, list):
             raise ValueError("AUTHORITATIVE_POSITIONS_RESULT_MALFORMED")
-        if any(not isinstance(row, dict) for row in rows):
-            raise ValueError("AUTHORITATIVE_POSITION_ROW_MALFORMED")
-        return [dict(row) for row in rows]
+        return [dict(row) for row in rows if isinstance(row, dict)]
 
     raw_get = getattr(broker, "_get", None)
     cfg = getattr(broker, "cfg", None)

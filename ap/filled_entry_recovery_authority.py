@@ -151,6 +151,101 @@ def _occ_expiration(contract: str) -> date | None:
         return None
 
 
+def _normalize_positions_payload(payload: Any) -> list[dict]:
+    """Normalize the recovery broker payload without dropping malformed rows."""
+    if not isinstance(payload, dict) or "positions" not in payload:
+        raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITIONS_PAYLOAD_MALFORMED")
+
+    positions_node = payload.get("positions")
+    if positions_node is None or positions_node == "null":
+        return []
+    if not isinstance(positions_node, dict):
+        raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITIONS_NODE_MALFORMED")
+
+    rows = positions_node.get("position")
+    if rows is None or rows == "null":
+        return []
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_ROWS_MALFORMED")
+
+    normalized: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_ROW_MALFORMED")
+
+        containers = [row]
+        raw = row.get("raw")
+        if isinstance(raw, dict) and raw is not row:
+            containers.append(raw)
+
+        explicit_contracts = {
+            _normalize_contract(container.get(key))
+            for container in containers
+            for key in ("option_symbol", "contract")
+            if container.get(key) is not None
+            and str(container.get(key)).strip()
+        }
+        symbols = {
+            _normalize_contract(container.get("symbol"))
+            for container in containers
+            if container.get("symbol") is not None
+            and str(container.get("symbol")).strip()
+        }
+        if len(explicit_contracts) > 1:
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
+        if explicit_contracts and any(
+            is_valid_occ_contract(symbol)
+            for symbol in symbols - explicit_contracts
+        ):
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
+        identities = explicit_contracts or symbols
+        if len(identities) > 1:
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
+        if not identities:
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_MISSING")
+        contract = next(iter(identities))
+
+        quantity_values = [
+            _positive_integral(container.get(key))
+            for container in containers
+            for key in ("quantity", "qty")
+            if container.get(key) is not None
+        ]
+        if (
+            not quantity_values
+            or any(quantity <= 0 for quantity in quantity_values)
+            or len(set(quantity_values)) != 1
+        ):
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_QUANTITY_INVALID")
+        normalized.append(
+            {"symbol": contract, "quantity": quantity_values[0], "raw": dict(row)}
+        )
+    return normalized
+
+
+def _fetch_authoritative_broker_positions(broker: Any) -> list[dict]:
+    """Fetch the exact broker snapshot used only by FILLED ENTRY recovery."""
+    authoritative = getattr(broker, "list_positions_authoritative", None)
+    if callable(authoritative):
+        rows = authoritative()
+        if not isinstance(rows, list):
+            raise ValueError("FILLED_ENTRY_RECOVERY_AUTHORITATIVE_POSITIONS_MALFORMED")
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError("FILLED_ENTRY_RECOVERY_AUTHORITATIVE_POSITION_ROW_MALFORMED")
+        return [dict(row) for row in rows]
+
+    raw_get = getattr(broker, "_get", None)
+    cfg = getattr(broker, "cfg", None)
+    account_id = str(getattr(cfg, "account_id", "") or "").strip()
+    if not callable(raw_get) or not account_id:
+        raise RuntimeError("FILLED_ENTRY_RECOVERY_AUTHORITATIVE_POSITIONS_UNAVAILABLE")
+    return _normalize_positions_payload(
+        raw_get(f"/v1/accounts/{account_id}/positions")
+    )
+
+
 def fetch_current_broker_positions(broker: Any) -> list[dict]:
     """Fetch and structurally validate one current broker position snapshot.
 
@@ -161,9 +256,7 @@ def fetch_current_broker_positions(broker: Any) -> list[dict]:
     matcher; option rows must have an exact OCC symbol and positive integral
     quantity.
     """
-    from ap.manual_close_reconciliation import fetch_authoritative_broker_positions
-
-    rows = fetch_authoritative_broker_positions(broker)
+    rows = _fetch_authoritative_broker_positions(broker)
     if not isinstance(rows, list):
         raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITIONS_MALFORMED")
 

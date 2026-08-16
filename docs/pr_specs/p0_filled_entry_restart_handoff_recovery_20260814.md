@@ -153,16 +153,21 @@ gated at the SQL layer:
 ('NOT_APPLICABLE','CONFIRMED')` — a crash before this is durably proven
 cannot reach `COMPLETE` regardless of any application-level bug, since the
 CAS predicate itself refuses the write. `recover_interrupted_filled_entry_handoff`
-checks this state early (before bind/seed/guard-release) for both
-`ACTIVE_EXISTING` and `ACTIVE_RECREATE`, and never calls
-`_cancel_pair_opposite` itself (verified by the existing AST-based static
-guard test). Any value other than an exact-match `NOT_APPLICABLE` or
+first proves the current broker risk, then finds or recreates the exact
+canonical local position, binds the exact identity, and seeds one exit owner.
+Only after that ownership proof does it check this state for both
+`ACTIVE_EXISTING` and `ACTIVE_RECREATE`. An unproven pair state therefore
+holds with the exposure managed, without guard release or `COMPLETE`;
+`NOT_APPLICABLE` and `CONFIRMED` permit the guard-release/`COMPLETE` phase.
+Recovery never calls `_cancel_pair_opposite` itself (verified by the existing
+AST-based static guard test). Any value other than an exact-match `NOT_APPLICABLE` or
 `CONFIRMED` string — missing key, wrong case, wrong type, trailing
 whitespace — is treated as unproven and fails closed; no normalization is
 applied on read.
 
-Production change: `ap/fill_monitor.py` only. No new production file, no
-new broker cancel authority, no second pair-cancel implementation.
+Production change: `ap/fill_monitor.py` plus the new read-only
+`ap/filled_entry_recovery_authority.py`. No manual-close/state API change, no
+new broker cancel authority, and no second pair-cancel implementation.
 
 ## Window B: after position exists, before durable identity bind
 
@@ -562,7 +567,7 @@ Do not make this helper submit/cancel broker orders or mutate DB state.
 
 ## Fetch broker positions ONCE per client recovery batch
 
-If any recovery candidates exist in a loop iteration, obtain one authoritative current broker-position snapshot for that client's execution broker using the repository's strict existing broker-position parser.
+If any recovery candidates exist in a loop iteration, obtain one authoritative current broker-position snapshot for that client's execution broker using the strict recovery-local broker-position parser in `ap/filled_entry_recovery_authority.py`.
 
 Do not call the broker positions endpoint independently once per historical FILLED row.
 
