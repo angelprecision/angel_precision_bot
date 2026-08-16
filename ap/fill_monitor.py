@@ -3241,10 +3241,24 @@ def _validate_filled_entry_admission(
         return False, "FILLED_ENTRY_MODE_CONFLICT"
     if not re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract):
         return False, "FILLED_ENTRY_CONTRACT_INVALID"
-    if _strict_positive_integral(result.get("filled_qty")) is None:
+    filled_qty_val = _strict_positive_integral(result.get("filled_qty"))
+    if filled_qty_val is None:
         return False, "FILLED_ENTRY_QUANTITY_INVALID"
     if _strict_positive_finite(result.get("avg_fill")) is None:
         return False, "FILLED_ENTRY_FILL_PRICE_INVALID"
+
+    # Terminal state and terminal quantity must agree before any durable
+    # mutation.  A broker FILLED with filled_qty != order.qty is an
+    # unresolvable contradiction: writing IN_PROGRESS, OSM FILLED, position,
+    # or releasing guards based on contradictory quantity truth creates
+    # irreparable money-state mismatches (qty=1 position, reservation released
+    # as if qty=2, orders.filled_qty != orders.qty in terminal state).
+    requested_qty = _strict_positive_integral(order.get("qty"))
+    if requested_qty is None:
+        return False, "FILLED_ENTRY_REQUESTED_QUANTITY_UNPROVEN"
+    if filled_qty_val != requested_qty:
+        return False, "FILLED_ENTRY_TERMINAL_QUANTITY_CONFLICT"
+
     return True, "FILLED_ENTRY_ADMISSION_PROVEN"
 
 
@@ -3971,28 +3985,42 @@ def process_pending_order(
                             "[%s] filled_entry_canonical_owner_unproven order=%s position=%s reason=%s",
                             client_id, local_id, position_id, seed_reason,
                         )
-                    elif _release_entry_guards_once(order, position_id=position_id):
-                        handoff_complete = _persist_filled_entry_handoff_state(
-                            order,
-                            "COMPLETE",
-                            reason="filled_entry_handoff_complete",
-                            retryable=False,
-                            position_id=position_id,
-                        )
-                        if not handoff_complete:
-                            log.error(
-                                "[%s] FILLED_ENTRY_HANDOFF_COMPLETE_WRITE_FAILED local=%s",
-                                client_id,
-                                local_id,
-                            )
                     else:
-                        _persist_filled_entry_handoff_state(
-                            order,
-                            "HOLD",
-                            reason="FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN",
-                            retryable=True,
-                            position_id=position_id,
-                        )
+                        # Pair proof gates guard release as well as COMPLETE.
+                        # Read the durable marker, rather than trusting the
+                        # in-memory result from _cancel_pair_opposite: a
+                        # failed pair-state persistence must remain HOLD.
+                        pair_state = _pair_resolution_state(order)
+                        if pair_state not in {"NOT_APPLICABLE", "CONFIRMED"}:
+                            _persist_filled_entry_handoff_state(
+                                order,
+                                "HOLD",
+                                reason="FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN",
+                                retryable=True,
+                                position_id=position_id,
+                            )
+                        elif _release_entry_guards_once(order, position_id=position_id):
+                            handoff_complete = _persist_filled_entry_handoff_state(
+                                order,
+                                "COMPLETE",
+                                reason="filled_entry_handoff_complete",
+                                retryable=False,
+                                position_id=position_id,
+                            )
+                            if not handoff_complete:
+                                log.error(
+                                    "[%s] FILLED_ENTRY_HANDOFF_COMPLETE_WRITE_FAILED local=%s",
+                                    client_id,
+                                    local_id,
+                                )
+                        else:
+                            _persist_filled_entry_handoff_state(
+                                order,
+                                "HOLD",
+                                reason="FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN",
+                                retryable=True,
+                                position_id=position_id,
+                            )
 
                 log.info(
                     "[%s] order_filled_detected order=%s contract=%s qty=%d "

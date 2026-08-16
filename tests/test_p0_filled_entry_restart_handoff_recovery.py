@@ -2033,6 +2033,131 @@ def test_fresh_fill_confirmed_pair_cancel_persists_confirmed_and_completes(monke
     assert order["meta"]["filled_entry_handoff_state"] == "COMPLETE"
 
 
+def test_fresh_fill_unproven_pair_keeps_guards_after_owner_seed(monkeypatch):
+    order = _order(status="ACKNOWLEDGED", filled_qty=0, meta={})
+    osm = _OSM()
+    events = []
+    persisted = []
+    guard_calls = []
+    monkeypatch.setattr(
+        fm, "check_order_with_broker",
+        lambda *_a, **_k: {"status": "FILLED", "filled_qty": 1, "avg_fill": 1.58, "raw": {}},
+    )
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "trace_gate", lambda *a, **k: None)
+    monkeypatch.setattr(
+        fm, "_cancel_pair_opposite", lambda *a, **k: ("OUTCOME_UNPROVEN", "cancel_not_confirmed")
+    )
+    monkeypatch.setattr(fm, "_open_position_safe", lambda *a, **k: events.append("position") or POSITION_ID)
+    monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **k: events.append("stop"))
+    monkeypatch.setattr(
+        fm,
+        "_bind_filled_entry_durable_identity",
+        lambda **k: events.append("bind") or (True, "BOUND"),
+    )
+    monkeypatch.setattr(
+        fm, "_seed_exit_engine", lambda *a, **k: events.append("seed") or (True, "SEEDED")
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_once",
+        lambda *a, **k: guard_calls.append(True) or True,
+    )
+
+    def persist(order_arg, state, **kwargs):
+        persisted.append((state, kwargs.get("extra_meta"), kwargs.get("reason")))
+        meta = dict(order_arg.get("meta") or {})
+        meta["filled_entry_handoff_state"] = state
+        if kwargs.get("extra_meta"):
+            meta.update(kwargs["extra_meta"])
+        order_arg["meta"] = meta
+        if kwargs.get("position_id"):
+            order_arg["position_id"] = kwargs["position_id"]
+        return True
+
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", persist)
+
+    fm.process_pending_order(
+        _Broker(), order, osm=osm, pm=_PM(), exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+    )
+
+    assert events == ["position", "stop", "bind", "seed"]
+    assert order["position_id"] == POSITION_ID
+    assert order["meta"]["filled_entry_pair_resolution_state"] == "OUTCOME_UNPROVEN"
+    assert order["meta"]["filled_entry_handoff_state"] == "HOLD"
+    assert guard_calls == []
+    assert "COMPLETE" not in [state for state, _, _ in persisted]
+    assert any(
+        state == "HOLD" and reason == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+        for state, _, reason in persisted
+    )
+
+
+def test_fresh_fill_pair_state_write_failure_keeps_guards_after_owner_seed(monkeypatch):
+    order = _order(status="ACKNOWLEDGED", filled_qty=0, meta={})
+    osm = _OSM()
+    events = []
+    persisted = []
+    guard_calls = []
+    monkeypatch.setattr(
+        fm, "check_order_with_broker",
+        lambda *_a, **_k: {"status": "FILLED", "filled_qty": 1, "avg_fill": 1.58, "raw": {}},
+    )
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: None)
+    monkeypatch.setattr(fm, "trace_gate", lambda *a, **k: None)
+    monkeypatch.setattr(
+        fm, "_cancel_pair_opposite", lambda *a, **k: ("CONFIRMED", "cancel_confirmed")
+    )
+    monkeypatch.setattr(fm, "_persist_filled_entry_pair_resolution_state", lambda *a, **k: False)
+    monkeypatch.setattr(fm, "_open_position_safe", lambda *a, **k: events.append("position") or POSITION_ID)
+    monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **k: events.append("stop"))
+    monkeypatch.setattr(
+        fm,
+        "_bind_filled_entry_durable_identity",
+        lambda **k: events.append("bind") or (True, "BOUND"),
+    )
+    monkeypatch.setattr(
+        fm, "_seed_exit_engine", lambda *a, **k: events.append("seed") or (True, "SEEDED")
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_once",
+        lambda *a, **k: guard_calls.append(True) or True,
+    )
+
+    def persist(order_arg, state, **kwargs):
+        persisted.append((state, kwargs.get("extra_meta"), kwargs.get("reason")))
+        meta = dict(order_arg.get("meta") or {})
+        meta["filled_entry_handoff_state"] = state
+        if kwargs.get("extra_meta"):
+            meta.update(kwargs["extra_meta"])
+        order_arg["meta"] = meta
+        if kwargs.get("position_id"):
+            order_arg["position_id"] = kwargs["position_id"]
+        return True
+
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", persist)
+
+    fm.process_pending_order(
+        _Broker(), order, osm=osm, pm=_PM(), exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+    )
+
+    assert events == ["position", "stop", "bind", "seed"]
+    assert order["position_id"] == POSITION_ID
+    assert "filled_entry_pair_resolution_state" not in order["meta"]
+    assert order["meta"]["filled_entry_handoff_state"] == "HOLD"
+    assert guard_calls == []
+    assert "COMPLETE" not in [state for state, _, _ in persisted]
+    assert any(
+        state == "HOLD" and reason == "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+        for state, _, reason in persisted
+    )
+
+
 # --- Crash-matrix requirements 5 & 6: terminal recovery with CONFIRMED or
 #     NOT_APPLICABLE takes zero pair-cancel calls and may complete.
 
@@ -2304,3 +2429,230 @@ def test_seed_from_db_rehydrates_exactly_one_owner_for_complete_position(monkeyp
     assert owner.option_symbol == CONTRACT
     assert owner.position_id == POSITION_ID
     assert engine._positions_by_id.get(POSITION_ID) is owner
+
+
+# =============================================================================
+# P0 REGRESSION — Malformed broker positions_node must HOLD, never NONACTIONABLE
+# Audit finding: {"positions": {"unexpected": "shape"}} was silently returning []
+# which caused the recovery authority to emit NONACTIONABLE / NO_CURRENT_BROKER_POSITION,
+# destroying Jason's real LIVE exposure with no retry possible.
+# =============================================================================
+
+
+def test_malformed_positions_node_raises_not_returns_empty():
+    """_normalize_positions_payload must raise on {"position" key absent} node.
+
+    A broker HTTP 200 with a structurally valid outer dict but an unexpected
+    positions_node shape (no "position" key, non-empty) is uninterpretable
+    broker truth.  It must raise ValueError so the caller can route to HOLD,
+    not silently return [] (flat account) which collapses to NONACTIONABLE.
+    """
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    # Known-empty authoritative shapes must still return [] (not regressed).
+    assert _normalize_positions_payload({"positions": None}) == []
+    assert _normalize_positions_payload({"positions": "null"}) == []
+    assert _normalize_positions_payload({"positions": {}}) == []
+
+    # Malformed non-empty dict without "position" key must raise.
+    with pytest.raises(ValueError, match="FILLED_ENTRY_RECOVERY_BROKER_POSITION_NODE_MISSING"):
+        _normalize_positions_payload({"positions": {"unexpected": "shape"}})
+
+    with pytest.raises(ValueError, match="FILLED_ENTRY_RECOVERY_BROKER_POSITION_NODE_MISSING"):
+        _normalize_positions_payload({"positions": {"account": "123", "other": "data"}})
+
+
+def test_malformed_positions_node_holds_not_nonactionable_end_to_end():
+    """Broker HTTP success with malformed positions_node must produce HOLD/retryable.
+
+    This is the full production chain:
+      Tradier HTTP 200 → payload {"positions": {"unexpected": "shape"}}
+      → _normalize_positions_payload raises
+      → fetch_current_broker_positions raises
+      → evaluate_filled_entry_recovery_authority catches → HOLD retryable=True
+      → NOT NONACTIONABLE (which would be no retry, no reconstruction)
+    """
+
+    class _MalformedBroker:
+        cfg = SimpleNamespace(account_id="123456789")
+
+        def _get(self, path):
+            # HTTP 200 but structurally ambiguous — not a known-empty shape.
+            return {"positions": {"unexpected": "shape"}}
+
+    result = evaluate_filled_entry_recovery_authority(
+        pm=_PM(),
+        broker=_MalformedBroker(),
+        order=_order(today=None),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        today=date(2026, 8, 21),
+    )
+
+    # Must HOLD and be retryable — Jason's real LIVE fill must remain recoverable.
+    assert result["disposition"] == "HOLD", (
+        f"Expected HOLD got {result['disposition']!r}: {result}"
+    )
+    assert result.get("retryable") is True, (
+        f"Must be retryable so recovery can retry: {result}"
+    )
+    # Explicit guard: must never reach NONACTIONABLE on uninterpretable broker truth.
+    assert result["disposition"] != "NONACTIONABLE", (
+        "Malformed broker payload must never collapse to NONACTIONABLE — "
+        "that would destroy position/owner reconstruction authority with no retry."
+    )
+
+
+# =============================================================================
+# P0 REGRESSION — Terminal FILLED must prove filled_qty == order.qty
+# Audit finding: admission proved filled_qty > 0 but not filled_qty == order.qty,
+# allowing a broker payload of status=FILLED / filled_qty=1 on a 2-contract order
+# to pass admission, write position qty=1, and release reservation for 2 contracts.
+# =============================================================================
+
+
+def test_admission_rejects_terminal_underfill_quantity_conflict():
+    """_validate_filled_entry_admission must block filled_qty != order.qty.
+
+    A broker FILLED with filled_qty=1 on an order.qty=2 is a terminal
+    quantity contradiction.  The admission gate must reject it before
+    IN_PROGRESS, before OSM FILLED, before position creation, before guard
+    release.  No partial truth must become durable terminal state.
+    """
+    ok, reason = fm._validate_filled_entry_admission(
+        order=_order(qty=2, filled_qty=2),
+        result={"filled_qty": 1, "avg_fill": 1.58},
+        runtime_execution_mode=LIVE,
+    )
+    assert not ok, f"Underfill should be rejected but got ok=True, reason={reason!r}"
+    assert reason == "FILLED_ENTRY_TERMINAL_QUANTITY_CONFLICT", (
+        f"Expected FILLED_ENTRY_TERMINAL_QUANTITY_CONFLICT, got {reason!r}"
+    )
+
+
+def test_admission_rejects_overfill_after_clamp_still_disagrees():
+    """filled_qty > order.qty after clamp bypass must also be rejected."""
+    ok, reason = fm._validate_filled_entry_admission(
+        order=_order(qty=1, filled_qty=1),
+        result={"filled_qty": 3, "avg_fill": 1.58},
+        runtime_execution_mode=LIVE,
+    )
+    assert not ok
+    assert reason == "FILLED_ENTRY_TERMINAL_QUANTITY_CONFLICT"
+
+
+def test_admission_rejects_missing_requested_qty():
+    """An order with no parseable qty must be rejected before terminalization."""
+    ok, reason = fm._validate_filled_entry_admission(
+        order=_order(qty=None),
+        result={"filled_qty": 1, "avg_fill": 1.58},
+        runtime_execution_mode=LIVE,
+    )
+    assert not ok
+    assert reason == "FILLED_ENTRY_REQUESTED_QUANTITY_UNPROVEN"
+
+
+def test_admission_passes_when_filled_qty_matches_order_qty():
+    """Happy path: exact quantity agreement must still admit cleanly."""
+    ok, reason = fm._validate_filled_entry_admission(
+        order=_order(qty=2, filled_qty=2),
+        result={"filled_qty": 2, "avg_fill": 1.58},
+        runtime_execution_mode=LIVE,
+    )
+    assert ok, f"Exact quantity match should admit but got reason={reason!r}"
+    assert reason == "FILLED_ENTRY_ADMISSION_PROVEN"
+
+
+def test_fresh_fill_terminal_underfill_blocked_before_any_mutation(monkeypatch):
+    """End-to-end: broker FILLED with filled_qty=1 on qty=2 order must HOLD.
+
+    This tests the full process_pending_order path to prove that the terminal
+    underfill is blocked before IN_PROGRESS marker, before OSM transition,
+    before position creation, and before guard release.
+    """
+    # Fresh 2-contract order that has not yet had a fill written locally.
+    order = _order(qty=2, filled_qty=0, status="PENDING")
+    order["meta"] = {
+        "filled_entry_pair_resolution_state": "NOT_APPLICABLE",
+    }
+
+    # Broker says FILLED but only confirms 1 of 2 requested contracts.
+    broker_result = {
+        "status": "FILLED",
+        "filled_qty": 1,   # ← underfill: only 1 of 2 contracts
+        "avg_fill": 1.58,
+        "broker_order_id": BROKER_ID,
+    }
+
+    # Intercept the broker check so we control the result.
+    monkeypatch.setattr(fm, "check_order_with_broker", lambda broker, order: broker_result)
+
+    in_progress_written = []
+    osm_transitioned = []
+    position_created = []
+    guards_released = []
+
+    monkeypatch.setattr(
+        fm,
+        "_persist_filled_entry_handoff_state",
+        lambda order, state, **kw: in_progress_written.append(state) or True,
+    )
+
+    class _TrapOSM:
+        def transition(self, *a, **kw):
+            osm_transitioned.append((a, kw))
+            return True
+
+        def increment_retry(self, *a):
+            pass
+
+    class _TrapBroker:
+        pass
+
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_atomically",
+        lambda *a, **kw: guards_released.append(True) or True,
+    )
+
+    monkeypatch.setattr(fm, "_resolve_runtime_execution_mode", lambda **kw: LIVE)
+
+    fill_events = []
+
+    def _capture_emit(order, *, decision, reason_code, **kw):
+        fill_events.append({"decision": decision, "reason_code": reason_code})
+
+    monkeypatch.setattr(fm, "emit_fill_event", _capture_emit)
+    monkeypatch.setattr(fm, "_record_position_create_failure", lambda *a, **kw: None)
+    monkeypatch.setattr(fm, "_reset_broker_anomaly_count", lambda *a, **kw: None)
+
+    fm.process_pending_order(
+        broker=_TrapBroker(),
+        order=order,
+        osm=_TrapOSM(),
+        pm=_PM(),
+        exit_engine=None,
+        runtime_execution_mode=LIVE,
+    )
+
+    # No IN_PROGRESS marker may have been written.
+    assert not in_progress_written, (
+        f"IN_PROGRESS must not be written for terminal underfill: {in_progress_written}"
+    )
+    # OSM must not have been told FILLED.
+    assert not osm_transitioned, (
+        f"OSM must not transition on terminal underfill: {osm_transitioned}"
+    )
+    # Guards must not be released.
+    assert not guards_released, (
+        f"Guards must not be released on terminal underfill: {guards_released}"
+    )
+    # The fill event must reflect the block.
+    assert fill_events, "A fill event must be emitted to explain the block"
+    assert fill_events[-1]["decision"] == "HOLD", (
+        f"Expected HOLD fill event, got: {fill_events[-1]}"
+    )
+    assert (
+        "TERMINAL_QUANTITY_CONFLICT" in fill_events[-1]["reason_code"]
+        or "REQUESTED_QUANTITY" in fill_events[-1]["reason_code"]
+    ), f"Reason code must surface quantity conflict: {fill_events[-1]}"

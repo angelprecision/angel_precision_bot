@@ -162,7 +162,18 @@ def _normalize_positions_payload(payload: Any) -> list[dict]:
     if not isinstance(positions_node, dict):
         raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITIONS_NODE_MALFORMED")
 
-    rows = positions_node.get("position")
+    # Authoritative-empty: Tradier returns {} (no positions in account).
+    if positions_node == {}:
+        return []
+
+    # Any dict without the "position" key is an uninterpretable broker shape.
+    # Silently treating it as [] would collapse to NONACTIONABLE and destroy
+    # position/owner reconstruction authority with no retry.  Raise so the
+    # caller routes to HOLD/retryable instead.
+    if "position" not in positions_node:
+        raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_NODE_MISSING")
+
+    rows = positions_node["position"]
     if rows is None or rows == "null":
         return []
     if isinstance(rows, dict):
