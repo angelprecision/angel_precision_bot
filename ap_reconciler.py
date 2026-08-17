@@ -3298,16 +3298,54 @@ class APBrokerReconciler:
                     # derived from this broker row. The exit engine keeps
                     # tracking the EXISTING DB-open position unchanged --
                     # this is not a new import, just continued management.
-                    log.warning(
-                        "[%s] BROKER_POSITION_QTY_SIGNED_CONFLICT | %s | DB=%d "
-                        "broker_raw_qty=%r — broker quantity does not establish "
-                        "positive long exposure for this contract; holding DB "
-                        "position OPEN without treating as flat or re-importing",
-                        self.client_id, contract, db_qty,
-                        broker_pos.get("quantity", broker_pos.get("qty", broker_pos.get("long_quantity"))),
-                    )
+                    # P0 (final signed-direction quarantine correction):
+                    # calling _seed_exit_engine_from_position(pos) here was
+                    # NOT a safe hold. It constructs/refreshes a normal,
+                    # behavior-active ManagedPosition -- APExitEngine's
+                    # on_exit/on_scale machinery treats a normal positive
+                    # ManagedPosition as eligible for ordinary ordinary
+                    # SELL_TO_CLOSE lifecycle regardless of what this
+                    # reconciler pass just logged. A logged conflict alert
+                    # does not, by itself, stop the exit engine from acting
+                    # on a position it already believes is a normal long.
+                    #
+                    # Do NOT call _seed_exit_engine_from_position here.
+                    # Additionally, if a ManagedPosition for this position_id
+                    # ALREADY exists in the exit engine (e.g. seeded on a
+                    # prior reconciler pass before this conflict was first
+                    # detected, or adopted at startup), it must be made
+                    # behavior-inactive now -- merely skipping a NEW seed
+                    # call is insufficient if a normal active object is
+                    # already sitting in the engine's position table.
+                    #
+                    # Reuse the existing, already-battle-tested
+                    # adoption-identity-quarantine primitive
+                    # (_is_behavior_active_position /
+                    # _mark_adoption_identity_quarantined in
+                    # ap_exit_engine.py) rather than inventing a new
+                    # subsystem: it already gates on_exit/on_scale
+                    # eligibility via active_positions()'s
+                    # _is_behavior_active_position() filter, does not
+                    # submit/cancel anything itself, does not mark the
+                    # position flat, and does not create a new position.
+                    if self.exit_engine and hasattr(self.exit_engine, "get_position"):
+                        try:
+                            _existing_mp = self.exit_engine.get_position(pos_id)
+                        except Exception:
+                            _existing_mp = None
+                        if _existing_mp is not None:
+                            from ap_exit_engine import _mark_adoption_identity_quarantined as _quarantine_mp
+                            _quarantine_mp(_existing_mp, "BROKER_POSITION_QTY_SIGNED_CONFLICT")
+                            log.warning(
+                                "[%s] BROKER_POSITION_QTY_SIGNED_CONFLICT_QUARANTINE | %s | "
+                                "existing ManagedPosition %s marked behavior-inactive due to "
+                                "signed-direction conflict with exact broker quantity",
+                                self.client_id, contract, pos_id,
+                            )
                     summary["positions_alerted"] += 1
-                    self._seed_exit_engine_from_position(pos)
+                    summary.setdefault("errors", []).append(
+                        "broker_position_signed_conflict_quarantined"
+                    )
                     continue
                 if broker_qty != db_qty and db_qty > 0:
                     log.warning(

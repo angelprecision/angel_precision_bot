@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import math
 import os
+import types
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -278,25 +279,71 @@ def test_1_broker_negative_qty_db_missing_no_import_explicit_conflict():
 # ===========================================================================
 
 def test_2_db_open_long_broker_negative_same_contract_explicit_conflict_not_flat():
+    # P0 (final signed-direction quarantine correction): the earlier
+    # version of this test asserted "pos-db-1" in seeded, treating a
+    # normal exit-engine reseed as proof the conflict was "handled".
+    # That was itself the defect this correction closes -- reseeding a
+    # normal ManagedPosition from a signed-conflicting broker row
+    # reactivates ordinary SELL_TO_CLOSE eligibility. The corrected
+    # invariant is the opposite: the conflicted position must NOT be
+    # seeded/reseeded into normal exit-engine management, AND must NOT
+    # be routed toward the broker-missing/ghost-close pathway either.
     rec, alerts, seeded = _make_reconciler()
     db_pos = _db_position(contract=_TARGET_OCC, qty=1, position_id="pos-db-1")
     rec._get_open_db_positions = lambda: [db_pos]
     rec._safe_get_broker_positions = lambda: [{"symbol": _TARGET_OCC, "quantity": -1}]
+    missing_at_broker_calls: list[str] = []
+    rec._handle_db_position_missing_at_broker = lambda **kwargs: missing_at_broker_calls.append(
+        kwargs.get("pos", {}).get("id")
+    )
 
     summary: dict = {"positions_alerted": 0}
-    # The DB position must still be tracked (belt-and-suspenders reseed),
-    # proving it was NOT treated as "broker position missing" (which would
-    # route toward the ghost-close pathway instead).
     rec._reconcile_positions(summary)
 
-    assert "pos-db-1" in seeded, (
-        "DB OPEN position must remain tracked by the exit engine -- proving "
-        "the negative broker row was recognized as a present-but-conflicting "
-        "match, not treated as 'broker position missing'"
+    assert "pos-db-1" not in seeded, (
+        "A signed-direction-conflicted DB position must NOT be seeded/reseeded "
+        "into normal exit-engine management -- that would preserve ordinary "
+        "SELL_TO_CLOSE eligibility against a broker row that is actually short"
+    )
+    assert len(missing_at_broker_calls) == 0, (
+        "The conflicted position must NOT be routed toward the broker-missing/ "
+        "ghost-close pathway either -- it is present but conflicting, not absent"
     )
     assert summary.get("positions_imported", 0) == 0, "No second synthetic long must be imported"
     assert summary.get("positions_alerted", 0) >= 1, (
         f"Expected an explicit conflict alert to be recorded; summary={summary}"
+    )
+
+
+def test_2_variant_existing_managed_position_becomes_quarantined():
+    """Document 12's essential distinction: merely skipping a NEW seed call
+    is insufficient if a ManagedPosition for this position already exists
+    in the exit engine from a prior pass. It must be made behavior-inactive
+    (quarantined), not just left alone."""
+    from ap_exit_engine import _is_behavior_active_position
+
+    class _FakeManagedPosition:
+        def __init__(self):
+            self.closed = False
+            self.quantity_remaining = 1
+
+    rec, alerts, seeded = _make_reconciler()
+    db_pos = _db_position(contract=_TARGET_OCC, qty=1, position_id="pos-db-existing")
+    rec._get_open_db_positions = lambda: [db_pos]
+    rec._safe_get_broker_positions = lambda: [{"symbol": _TARGET_OCC, "quantity": -1}]
+
+    existing_mp = _FakeManagedPosition()
+    assert _is_behavior_active_position(existing_mp) is True, "sanity: starts active"
+
+    rec.exit_engine = types.SimpleNamespace(get_position=lambda pid: existing_mp if pid == "pos-db-existing" else None)
+
+    summary: dict = {"positions_alerted": 0}
+    rec._reconcile_positions(summary)
+
+    assert _is_behavior_active_position(existing_mp) is False, (
+        "An existing ManagedPosition for a now-signed-conflicted contract must "
+        "become behavior-inactive (quarantined), not remain active in the "
+        "normal exit loop"
     )
 
 
