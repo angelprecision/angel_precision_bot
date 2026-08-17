@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -62,6 +64,48 @@ def _normalize_contract(value: Any) -> str:
     return str(value or "").strip().upper().replace(" ", "")
 
 
+# P0 amendment 4 (spec: p0_tradier_exact_quantity_flat_guard_20260817,
+# blockers 1 & 2): the single canonical definition of "this string is a
+# proven exact OCC option contract identity", used at every contract-based
+# authority boundary in both this module and ap/exit_autonomous_recovery.py.
+#
+# Root cause this closes: normalization alone (strip/uppercase/remove
+# spaces) is NOT identity proof. A non-empty but malformed/incomplete
+# token -- "UNKNOWN", a bare underlying ticker like "SMCI", a placeholder
+# like "DEFERRED:SMCI", a truncated or malformed OCC shape -- could pass
+# a bare `if not normalized_contract` guard and then match ZERO rows in
+# any successful broker snapshot, manufacturing authoritative broker-flat
+# truth for a contract that was never actually proven to exist.
+#
+# OCC option symbol shape: 1-6 alphanumeric/dot root symbol (dots permit
+# tickers like BRK.B), exactly 6 digits (YYMMDD expiration), a single
+# C/P side letter, exactly 8 digits (strike price, dollars * 1000,
+# zero-padded). Example: SMCI260626P00032500.
+_OCC_CONTRACT_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
+
+
+def _is_exact_occ_contract(value: str) -> bool:
+    """True only if `value` is already normalized AND matches the exact
+    OCC option symbol shape. Does not normalize its input."""
+    return bool(value) and bool(_OCC_CONTRACT_RE.match(value))
+
+
+def _normalize_exact_occ_contract(value: Any) -> str:
+    """Normalize and validate in one step. Returns the normalized exact
+    OCC contract string, or "" for anything that is empty, whitespace,
+    or does not prove out as a complete exact OCC option symbol.
+
+    This is the identity boundary every contract-based broker-truth
+    decision must pass through: resolve_exit_broker_truth()'s target
+    contract, and (via import) every contract-based guard in
+    ap/exit_autonomous_recovery.py.
+    """
+    normalized = _normalize_contract(value)
+    if not _is_exact_occ_contract(normalized):
+        return ""
+    return normalized
+
+
 def _extract_broker_account_id(broker: Any) -> str:
     return _normalize_text(
         getattr(broker, "account_id", None)
@@ -95,15 +139,47 @@ def _extract_position_contract(raw: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_long_position_qty(raw: dict[str, Any]) -> int:
+def _extract_long_position_qty(raw: dict[str, Any]) -> Optional[int]:
+    """Extract the long, open quantity for a matched exact-contract broker
+    position row.
+
+    P0 invariant (spec: p0_tradier_exact_quantity_flat_guard_20260817):
+    malformed, negative, non-integral, boolean, or short-side quantity truth
+    must NEVER silently collapse to 0 and be summed as though it were a
+    confirmed-flat/absent contribution. This helper returns exactly one of:
+
+      - a POSITIVE int  -> a confirmed, valid, open long quantity.
+      - int ``0``       -> an explicit, well-formed zero. This is
+        deliberately distinct from ``None``: the caller (``resolve_exit_
+        broker_truth``) applies the "an exact-contract row asserting
+        quantity=0 is not, by itself, authoritative flat truth" policy —
+        real broker-flat is normally row *absence*, not an explicit zero
+        row, so a zero here is suspicious/conflicting rather than trusted.
+      - ``None``        -> malformed / negative / non-integral / boolean /
+        short-side / unparseable / missing quantity. The caller must never
+        treat this as 0 and must never sum it toward an open-quantity total.
+
+    NOTE: for TradierBroker-sourced rows specifically, ``list_positions()``
+    already rejects bool/fractional/negative/non-finite quantities at the
+    adapter boundary (raises before this function is ever reached for that
+    row). This function is defense-in-depth for any other broker/raw-dict
+    source that does not enforce the same adapter-level contract.
+    """
     nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
-    qty = None
+    raw_value: Any = None
+    found = False
     for key in ("quantity", "qty", "quantity_remaining", "remaining_quantity"):
-        qty = _safe_int(raw.get(key))
-        if qty is None:
-            qty = _safe_int(nested.get(key))
-        if qty is not None:
+        candidate = raw.get(key)
+        if candidate not in (None, ""):
+            raw_value = candidate
+            found = True
             break
+        candidate = nested.get(key)
+        if candidate not in (None, ""):
+            raw_value = candidate
+            found = True
+            break
+
     side_text = " ".join(
         str(v or "")
         for v in (
@@ -115,13 +191,45 @@ def _extract_long_position_qty(raw: dict[str, Any]) -> int:
             nested.get("direction"),
         )
     ).strip().lower()
-    if qty is None:
-        return 0
+
+    if not found:
+        # No quantity field present at all -- cannot establish truth. This is
+        # NOT the same as a confirmed-absent contract (that case never
+        # reaches this function; absence is handled by resolve_exit_broker_
+        # truth's "no matched rows" branch). A row that IS present but
+        # carries no quantity is malformed.
+        return None
+
+    # bool is a numeric subtype in Python (float(False) == 0.0); it must
+    # never masquerade as a real quantity.
+    if isinstance(raw_value, bool):
+        return None
+
+    try:
+        qty_float = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(qty_float):
+        return None
+
+    if not qty_float.is_integer():
+        # A fractional quantity is not a valid whole-contract count and must
+        # not be silently truncated toward a believable integer.
+        return None
+
+    qty = int(qty_float)
+
     if qty < 0:
-        return 0
+        # Negative quantity is broker exposure, not flat. Never coerce to 0.
+        return None
+
     if "short" in side_text:
-        return 0
-    return int(qty)
+        # Short-side exposure conflicts with AP's long-only lifecycle here;
+        # never coerce to 0 either -- this is a conflict, not an absence.
+        return None
+
+    return qty
 
 
 def resolve_exit_broker_truth(
@@ -131,7 +239,19 @@ def resolve_exit_broker_truth(
     contract: str,
 ) -> dict[str, Any]:
     checked_at = now_utc_iso()
-    normalized_contract = _normalize_contract(contract)
+    # P0 amendment 4 (blocker 1): normalization alone is NOT identity
+    # proof. _normalize_contract() only strips/uppercases/removes spaces --
+    # it does not prove the value is a complete exact OCC option symbol.
+    # A non-empty but malformed/incomplete token ("UNKNOWN", a bare
+    # underlying ticker, a placeholder, a truncated/malformed OCC shape)
+    # would previously pass the amendment-2 `if not normalized_contract`
+    # guard and then match zero rows in any successful snapshot,
+    # manufacturing authoritative broker-flat truth for a contract that
+    # was never actually proven to exist. _normalize_exact_occ_contract()
+    # returns "" for anything that isn't a proven exact OCC symbol, so the
+    # existing empty-contract guard below now also catches this case.
+    _raw_contract_str = str(contract or "").strip()
+    normalized_contract = _normalize_exact_occ_contract(contract)
     account_id = _extract_broker_account_id(broker)
     audit = {
         "source": "broker.list_positions",
@@ -142,6 +262,32 @@ def resolve_exit_broker_truth(
         "normalized_contract": normalized_contract,
         "exact_contract_match": False,
     }
+
+    # P0 amendment 2 (spec: p0_tradier_exact_quantity_flat_guard_20260817,
+    # surgical follow-up): a missing/unproven contract identity must NEVER
+    # be treated as authoritative broker-flat truth. Without this guard, an
+    # empty normalized_contract would match no row in any successful
+    # snapshot -- including a non-empty one -- and the "no matched rows"
+    # branch below would incorrectly manufacture fresh broker-flat truth
+    # (broker_truth_open_qty=0, is_fresh_exact=True) for a contract we never
+    # actually established identity for.
+    #
+    # ABSENCE CAN ONLY PROVE FLATNESS WHEN WE KNOW EXACTLY WHICH BROKER
+    # CONTRACT WE WERE TRYING TO FIND. Missing/unproven identity is UNKNOWN
+    # truth, never broker-flat truth. As of amendment 4, this also covers
+    # non-empty but invalid identity -- distinguished in the audit status
+    # below so operators can tell "no contract given" apart from "a
+    # malformed contract token was given".
+    if not normalized_contract:
+        audit["snapshot_status"] = (
+            "contract_identity_unavailable" if not _raw_contract_str
+            else "contract_identity_invalid"
+        )
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
 
     list_positions = getattr(broker, "list_positions", None)
     if not callable(list_positions):
@@ -178,6 +324,7 @@ def resolve_exit_broker_truth(
         }
 
     matched_rows: list[dict[str, Any]] = []
+    conflict_rows: list[dict[str, Any]] = []
     broker_truth_open_qty = 0
     for raw in rows:
         if not isinstance(raw, dict):
@@ -189,14 +336,73 @@ def resolve_exit_broker_truth(
         if row_account and account_id and row_account != account_id:
             continue
         long_qty = _extract_long_position_qty(raw)
-        broker_truth_open_qty += max(int(long_qty), 0)
+        # P0 amendment (spec: p0_tradier_exact_quantity_flat_guard_20260817):
+        # _extract_long_position_qty now returns three distinct outcomes and
+        # each must be handled differently -- None and 0 are NOT the same
+        # as "no exposure" and must never be silently summed as 0 the way
+        # they were before this amendment (which allowed a malformed,
+        # negative, or explicit-zero exact-match row to manufacture fresh
+        # broker-flat truth).
+        if long_qty is None:
+            # Malformed / negative / non-integral / boolean / short-side
+            # quantity on an exact-match row. Cannot establish truth for
+            # this row; the WHOLE resolution must become unknown rather
+            # than silently contributing 0 toward the open-quantity sum.
+            conflict_rows.append(
+                {
+                    "contract": row_contract,
+                    "account": row_account or account_id,
+                    "long_qty": None,
+                    "conflict_reason": "malformed_or_conflicting_quantity",
+                }
+            )
+            continue
+        if long_qty == 0:
+            # An exact-contract row explicitly asserting quantity=0. Real
+            # broker-flat is normally row ABSENCE, not an explicit zero row
+            # (see the "no matched rows" branch below) — a well-formed but
+            # explicit zero on an exact match is itself suspicious/
+            # conflicting rather than trusted authoritative flat truth.
+            conflict_rows.append(
+                {
+                    "contract": row_contract,
+                    "account": row_account or account_id,
+                    "long_qty": 0,
+                    "conflict_reason": "explicit_zero_exact_match_row",
+                }
+            )
+            continue
+        broker_truth_open_qty += long_qty
         matched_rows.append(
             {
                 "contract": row_contract,
                 "account": row_account or account_id,
-                "long_qty": int(long_qty),
+                "long_qty": long_qty,
             }
         )
+
+    if conflict_rows:
+        # Any conflicting/malformed/explicit-zero exact-match row makes the
+        # ENTIRE resolution unknown -- fail closed, consistent with the
+        # existing per-row malformed-payload philosophy in
+        # TradierBroker.list_positions() (one bad row invalidates the whole
+        # snapshot's truth for this contract rather than being averaged
+        # away or silently dropped).
+        audit.update(
+            {
+                "snapshot_status": "exact_match_conflict_unknown_quantity",
+                "exact_contract_match": True,
+                "matched_row_count": len(matched_rows),
+                "matched_rows": matched_rows,
+                "conflict_row_count": len(conflict_rows),
+                "conflict_rows": conflict_rows,
+            }
+        )
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
 
     if not matched_rows:
         # Production-shape fix: list_positions() succeeded and returned a valid list

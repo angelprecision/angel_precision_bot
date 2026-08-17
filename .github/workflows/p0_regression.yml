@@ -198,6 +198,19 @@ jobs:
             tests/test_p0_queue_deferral_truth.py \
             tests/test_p0_manual_rescue_restart_guard_bypass.py \
             tests/test_p0_broker_position_unavailable_not_flat.py \
+            tests/test_p0_tradier_exact_quantity_flat_guard.py \
+            tests/test_p0_exit_autonomous_recovery_quantity_guard.py \
+            tests/test_p0_missing_contract_identity_never_flat.py \
+            tests/test_p0_missing_contract_identity_no_wildcard_match.py \
+            tests/test_p0_invalid_nonempty_contract_never_flat.py \
+            tests/test_p0_tradier_order_shape_option_symbol.py \
+            tests/test_p0_unrelated_short_position_no_poison.py \
+            tests/test_p0_broker_order_query_unknown_never_empty.py \
+            tests/test_p0_scale_out_fill_recovery_no_false_close.py \
+            tests/test_p0_tradier_orders_unknown_never_empty.py \
+            tests/test_p0_reconciler_signed_position_no_positive_long.py \
+            tests/test_p0_malformed_filled_quantity_no_manufactured_close.py \
+            tests/test_p0_filled_quantity_conflict_final_guard.py \
             -v --tb=short --color=yes
 
       - name: Summary

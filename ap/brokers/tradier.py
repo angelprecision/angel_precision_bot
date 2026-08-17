@@ -416,20 +416,102 @@ class TradierBroker(BrokerAdapter):
         Unlike ``get_order`` this deliberately propagates transport/auth errors:
         callers must distinguish an authoritative empty result from an unavailable
         broker query before deciding that a new POST is safe.
+
+        P0 amendment 6 (spec: p0_tradier_exact_quantity_flat_guard_20260817):
+        **BROKER RESPONSE UNUSABLE != BROKER EMPTY** -- the same invariant
+        already established for ``list_positions()``. Amendment 5 correctly
+        made ``ap/exit_autonomous_recovery.py::_list_open_orders()``
+        tri-state (UNKNOWN vs AVAILABLE_EMPTY vs AVAILABLE_NONEMPTY), but
+        this adapter could still collapse an unusable broker response into
+        ``[]`` *before* autonomous recovery ever saw it, defeating that
+        protection at its source. A non-dict top-level payload, or an order
+        row that isn't a dict, is unknown/unusable order truth -- not proof
+        that zero matching exit orders exist. One malformed row could be
+        exactly the live EXIT this call exists to prove does or does not
+        exist; it must never be silently filtered out of the result.
+
+        Contract (mirrors ``list_positions()`` exactly):
+          - UNAVAILABLE   (401/403/429/5xx, timeout, connection error):
+            ``_get`` raises and the exception propagates. Never ``[]``.
+          - MALFORMED     (a successful response that cannot be interpreted
+            as the supported Tradier orders shape): raise a deterministic
+            ``ValueError('TRADIER_ORDERS_PAYLOAD_MALFORMED: ...')``. This
+            includes: a non-dict top-level response, an ``orders`` node
+            missing entirely from a non-empty top-level dict, an
+            ``orders.order`` node missing entirely from a non-empty
+            ``orders`` dict, an order container that is neither a dict nor
+            a list, and any individual order row that isn't a dict.
+          - SUCCESS_EMPTY (top-level ``{}``; or ``orders`` is ``null`` /
+            ``"null"`` / ``""`` / ``{}``; or ``orders.order`` is ``null`` /
+            ``"null"`` / ``""`` / an empty list): return ``[]``.
+          - SUCCESS (one order object, or a list of order objects, all of
+            which are dicts): return the normalized rows.
         """
-        j = self._get(
+        # Transport/auth/HTTP failures propagate out of _get() unchanged.
+        resp = self._get(
             f"/v1/accounts/{self.cfg.account_id}/orders",
             params={"includeTags": "true", "limit": 1500},
         )
-        node = j.get("orders") if isinstance(j, dict) else None
-        orders = node.get("order") if isinstance(node, dict) else node
-        if orders is None:
+
+        # A successful HTTP response must still be interpretable. A body
+        # that is not a JSON object is not "no orders" -- it is unknown
+        # truth.
+        if resp is None or not isinstance(resp, dict):
+            raise ValueError(
+                f"TRADIER_ORDERS_PAYLOAD_MALFORMED: top-level type="
+                f"{type(resp).__name__}"
+            )
+
+        if resp == {}:
             return []
-        if isinstance(orders, dict):
-            return [orders]
-        if isinstance(orders, list):
-            return [order for order in orders if isinstance(order, dict)]
-        raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        if "orders" not in resp:
+            raise ValueError(
+                "TRADIER_ORDERS_PAYLOAD_MALFORMED: orders key missing"
+            )
+
+        node = resp["orders"]
+        # Authoritative empty shapes only: null / "null" / "" / {}.
+        if node is None or node == "null" or node == "" or node == {}:
+            return []
+        if not isinstance(node, dict):
+            raise ValueError(
+                f"TRADIER_ORDERS_PAYLOAD_MALFORMED: orders node type="
+                f"{type(node).__name__}"
+            )
+
+        if "order" not in node:
+            raise ValueError(
+                "TRADIER_ORDERS_PAYLOAD_MALFORMED: order key missing"
+            )
+
+        order_node = node["order"]
+        # Explicit empty order node is still an authoritative empty snapshot.
+        if order_node is None or order_node == "null" or order_node == "":
+            return []
+        if isinstance(order_node, dict):
+            order_list = [order_node]
+        elif isinstance(order_node, list):
+            order_list = order_node
+        else:
+            raise ValueError(
+                f"TRADIER_ORDERS_PAYLOAD_MALFORMED: order container type="
+                f"{type(order_node).__name__}"
+            )
+
+        result: List[Dict[str, Any]] = []
+        for o in order_list:
+            if not isinstance(o, dict):
+                # DO NOT silently filter a malformed row out of the
+                # result. A malformed row could be exactly the live EXIT
+                # this call exists to prove does or does not exist --
+                # dropping it and returning the remaining valid rows would
+                # claim a complete authoritative snapshot that it is not.
+                raise ValueError(
+                    f"TRADIER_ORDERS_PAYLOAD_MALFORMED: non-dict order row "
+                    f"type={type(o).__name__}"
+                )
+            result.append(o)
+        return result
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
         # Not used in current architecture
@@ -480,25 +562,68 @@ class TradierBroker(BrokerAdapter):
         terminalize a still-open live position under
         ``SYNTHETIC_POSITION_STALE_BROKER_FLAT``.
 
-        Contract:
+        Contract (final effective contract, post-Amendment-4/5; supersedes any
+        earlier docstring text implying quantity is always integer-valued or that
+        fractional/negative quantity is rejected here):
           - UNAVAILABLE  (401/403/429/5xx, connect/read timeout, connection error):
             ``_get`` raises and the exception propagates. Never ``[]``. No retries
             are added here — this changes truth semantics, not transport policy.
           - MALFORMED    (a successful response that cannot be interpreted as the
-            supported Tradier positions shape): raise a deterministic
+            supported Tradier positions shape, or a row whose quantity cannot be
+            truthfully established as *any* numeric value): raise a deterministic
             ``ValueError('TRADIER_POSITIONS_PAYLOAD_MALFORMED: ...')``. Never coerce
             malformed truth into flatness. This includes: a missing ``positions``
             key, a non-empty ``positions`` dict missing its ``position`` key, a
             falsy-but-not-authoritative-empty ``positions``/row shape
             (``[]``, ``False``, ``0``), a position row missing ``symbol`` or
-            ``quantity``, and a non-finite (``NaN``/``inf``) quantity.
+            ``quantity``, a non-finite (``NaN``/``inf``) quantity, and a boolean
+            quantity (``bool`` is numeric in Python — ``float(False) == 0.0``
+            — and must never masquerade as a real quantity). These represent
+            genuine structural payload garbage and are rejected regardless of
+            which row they appear on. **Fractional and negative quantity are
+            NOT in this list** — see SIGNED/FRACTIONAL QUANTITY below.
+          - SIGNED / FRACTIONAL QUANTITY (P0 amendment 4 blocker 3; amendment 5
+            blocker 1): neither a negative nor a fractional quantity is rejected
+            here. Tradier position quantity is signed, and Tradier accounts may
+            legitimately hold fractional equity positions (fractional-share
+            programs) alongside AP's whole-contract options — this method reads
+            the ENTIRE brokerage account in one call. Earlier versions of this
+            method raised ``TRADIER_POSITIONS_PAYLOAD_CONFLICT``/
+            ``TRADIER_POSITIONS_PAYLOAD_MALFORMED`` for the whole snapshot the
+            moment ANY row anywhere in the account carried a negative or
+            fractional quantity, which meant one unrelated legitimate short
+            position or fractional-share equity holding (a different underlying,
+            or a position Angel Precision never opened) made broker truth
+            UNAVAILABLE for the actual AP target contract being resolved — even
+            though the target's own row was perfectly valid. BROKER PAYLOAD
+            VALIDITY (structural garbage, above) is a separate concern from AP
+            EXACT-CONTRACT LONG-ONLY OPTION LIFECYCLE AUTHORITY: a negative or
+            fractional finite quantity now passes through this adapter as valid
+            broker truth for whichever row carries it, exactly as reported.
+            Rejecting a negative, fractional, zero, or otherwise non-positive-
+            integral quantity as UNKNOWN/never-flat for AP's own long-only
+            target option contract happens downstream at the exact-contract
+            resolver boundary (``ap/exit_safety.py::_extract_long_position_qty``
+            / ``resolve_exit_broker_truth``) and in reconciler lifecycle
+            classification (``ap_reconciler.py::_broker_position_qty``), both of
+            which examine only the row that exact-matches the contract actually
+            being resolved — never here, where "this row" and "the target AP is
+            resolving" are not yet known to be the same thing.
           - SUCCESS_EMPTY  (top-level ``{}``; or ``positions`` is ``null`` /
             ``"null"`` / ``""`` / ``{}``; or an explicitly empty position node):
             return ``[]``.
           - SUCCESS (one object or a list): return the normalized rows below.
 
         Normalized valid-row contract (unchanged; downstream consumers depend on it):
-        ``symbol``, ``quantity``, ``cost_basis``, ``side``, ``raw``.
+        ``symbol``, ``quantity``, ``cost_basis``, ``side``, ``raw``. ``quantity``
+        is guaranteed to be a finite float once a row reaches this contract, but
+        is **not** guaranteed to be a positive integer — it may be zero, negative
+        (signed short exposure), or fractional (e.g. a fractional-share equity
+        row), exactly as reported by the broker. AP exact-option-contract
+        long-only authority (rejecting anything other than a positive integral
+        quantity for AP's own target contract) is enforced downstream by
+        ``resolve_exit_broker_truth()`` / reconciler lifecycle classification,
+        not by this adapter.
         """
         # Transport/auth/HTTP failures propagate out of _get() unchanged.
         resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
@@ -562,8 +687,19 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError(
                     "TRADIER_POSITIONS_PAYLOAD_MALFORMED: position row missing quantity"
                 )
+            raw_quantity = p["quantity"]
+            # P0 amendment (spec: p0_tradier_exact_quantity_flat_guard_20260817):
+            # bool is a numeric subtype in Python — float(True) == 1.0 and
+            # float(False) == 0.0 — so it must be rejected explicitly before
+            # any numeric coercion, or a boolean quantity silently becomes a
+            # believable qty=0/1 row and can manufacture false broker-flat
+            # truth downstream.
+            if isinstance(raw_quantity, bool):
+                raise ValueError(
+                    "TRADIER_POSITIONS_PAYLOAD_MALFORMED: boolean quantity"
+                )
             try:
-                quantity = float(p["quantity"])
+                quantity = float(raw_quantity)
                 cost_basis = float(p.get("cost_basis", 0))
             except (TypeError, ValueError) as exc:
                 # A row whose quantity cannot be established truthfully must not
@@ -577,6 +713,44 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError(
                     "TRADIER_POSITIONS_PAYLOAD_MALFORMED: non-finite quantity"
                 )
+            # P0 amendment 5 (blocker 1): DO NOT raise for fractional
+            # quantity here either, for the same reason as the amendment-4
+            # negative-quantity change immediately below. Tradier accounts
+            # may legitimately hold fractional EQUITY positions (fractional
+            # share programs); this method reads the ENTIRE brokerage
+            # account in one call, so raising for ANY fractional row
+            # anywhere poisoned the WHOLE snapshot -- including the actual
+            # AP target OCC contract's own row, which could be a perfectly
+            # valid whole-integer quantity. The adapter has no way to know
+            # whether a given row is the exact AP option contract, an
+            # unrelated equity, or a legitimate fractional share position.
+            # BROKER PAYLOAD VALIDITY (bool/missing/unparseable/NaN/inf --
+            # genuine structural garbage, checked above and still rejected
+            # globally) is a separate concern from AP EXACT-CONTRACT
+            # OPTION-QUANTITY AUTHORITY. Angel Precision's rejection of a
+            # fractional quantity on its own long-only option contract
+            # happens at the resolver boundary
+            # (ap/exit_safety.py::_extract_long_position_qty, already
+            # returns None -- never a truncated int -- for a fractional
+            # quantity on the row that exact-matches the target), which is
+            # unaffected by this adapter-level change.
+            # P0 amendment 4 (blocker 3): DO NOT raise for negative
+            # quantity here. Tradier position quantity is signed broker
+            # data — negative legitimately represents a short position —
+            # and this method reads the ENTIRE brokerage account in one
+            # call. Raising here for ANY row anywhere in the account
+            # poisoned the WHOLE snapshot for every other row, including
+            # the actual AP target contract's own row, which could be
+            # perfectly valid. BROKER PAYLOAD VALIDITY (bool/missing/
+            # unparseable/NaN/inf, checked above -- genuine structural
+            # garbage) is a separate concern from AP EXACT-CONTRACT
+            # LONG-ONLY LIFECYCLE AUTHORITY. Angel Precision's
+            # long-only rejection of a negative quantity happens at the
+            # resolver boundary for the EXACT target contract being
+            # resolved (ap/exit_safety.py::_extract_long_position_qty),
+            # which already returns None (never a coerced 0) for a
+            # negative quantity on the row that exact-matches the target
+            # -- that check is unaffected by this adapter-level change.
             result.append({
                 "symbol":     symbol,
                 "quantity":   quantity,
