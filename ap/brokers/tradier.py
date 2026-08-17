@@ -491,14 +491,25 @@ class TradierBroker(BrokerAdapter):
             key, a non-empty ``positions`` dict missing its ``position`` key, a
             falsy-but-not-authoritative-empty ``positions``/row shape
             (``[]``, ``False``, ``0``), a position row missing ``symbol`` or
-            ``quantity``, and a non-finite (``NaN``/``inf``) quantity.
+            ``quantity``, a non-finite (``NaN``/``inf``) quantity, a boolean
+            quantity (``bool`` is numeric in Python — ``float(False) == 0.0``
+            — and must never masquerade as a real quantity), and a fractional
+            (non-integer) quantity.
+          - CONFLICT     (a successful, well-formed response whose quantity
+            contradicts Angel Precision's long-only option lifecycle): raise a
+            deterministic ``ValueError('TRADIER_POSITIONS_PAYLOAD_CONFLICT: ...')``.
+            This includes a negative quantity, which proves broker exposure
+            exists in a direction the lifecycle does not expect — it is never
+            silently coerced to zero/flat.
           - SUCCESS_EMPTY  (top-level ``{}``; or ``positions`` is ``null`` /
             ``"null"`` / ``""`` / ``{}``; or an explicitly empty position node):
             return ``[]``.
           - SUCCESS (one object or a list): return the normalized rows below.
 
         Normalized valid-row contract (unchanged; downstream consumers depend on it):
-        ``symbol``, ``quantity``, ``cost_basis``, ``side``, ``raw``.
+        ``symbol``, ``quantity``, ``cost_basis``, ``side``, ``raw``. ``quantity``
+        is guaranteed to be a non-negative, finite, integer-valued float once a
+        row reaches this contract (e.g. ``4.0``, never ``0.5``/``-1``/``True``).
         """
         # Transport/auth/HTTP failures propagate out of _get() unchanged.
         resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
@@ -562,8 +573,19 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError(
                     "TRADIER_POSITIONS_PAYLOAD_MALFORMED: position row missing quantity"
                 )
+            raw_quantity = p["quantity"]
+            # P0 amendment (spec: p0_tradier_exact_quantity_flat_guard_20260817):
+            # bool is a numeric subtype in Python — float(True) == 1.0 and
+            # float(False) == 0.0 — so it must be rejected explicitly before
+            # any numeric coercion, or a boolean quantity silently becomes a
+            # believable qty=0/1 row and can manufacture false broker-flat
+            # truth downstream.
+            if isinstance(raw_quantity, bool):
+                raise ValueError(
+                    "TRADIER_POSITIONS_PAYLOAD_MALFORMED: boolean quantity"
+                )
             try:
-                quantity = float(p["quantity"])
+                quantity = float(raw_quantity)
                 cost_basis = float(p.get("cost_basis", 0))
             except (TypeError, ValueError) as exc:
                 # A row whose quantity cannot be established truthfully must not
@@ -576,6 +598,23 @@ class TradierBroker(BrokerAdapter):
                 # count and must never be silently coerced toward zero.
                 raise ValueError(
                     "TRADIER_POSITIONS_PAYLOAD_MALFORMED: non-finite quantity"
+                )
+            if not quantity.is_integer():
+                # A fractional option-contract count is not a valid whole
+                # position size. int(0.5) == 0 would otherwise silently
+                # truncate into a believable "flat" quantity downstream.
+                raise ValueError(
+                    "TRADIER_POSITIONS_PAYLOAD_MALFORMED: fractional option quantity"
+                )
+            # DO NOT silently coerce negative quantity to zero. Angel
+            # Precision's lifecycle only holds long option positions here; a
+            # negative quantity means broker exposure exists in a direction
+            # that conflicts with the expected lifecycle. That is broker
+            # exposure, not flatness, and must fail closed rather than
+            # collapse toward a believable zero/flat row.
+            if quantity < 0:
+                raise ValueError(
+                    "TRADIER_POSITIONS_PAYLOAD_CONFLICT: negative option quantity"
                 )
             result.append({
                 "symbol":     symbol,

@@ -198,6 +198,7 @@ jobs:
             tests/test_p0_queue_deferral_truth.py \
             tests/test_p0_manual_rescue_restart_guard_bypass.py \
             tests/test_p0_broker_position_unavailable_not_flat.py \
+            tests/test_p0_tradier_exact_quantity_flat_guard.py \
             -v --tb=short --color=yes
 
       - name: Summary
