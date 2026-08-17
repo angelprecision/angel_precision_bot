@@ -124,36 +124,53 @@ def _strict_filled_exit_qty(raw: dict) -> tuple:
     """Strict parser for a broker-confirmed FILLED exit order's fill
     quantity. Returns (qty, field_was_present):
 
-      (positive_int, True)  -- a valid quantity was found under the
-        first recognized key that carried a non-empty value: non-
-        boolean, finite, mathematically integral, and strictly positive.
+      (positive_int, True)  -- one or more recognized keys are present in
+        the payload (checked via `key in raw`), every present key's value
+        independently proves valid (non-boolean, finite, mathematically
+        integral, strictly positive), and if more than one key is
+        present, they all agree on the same value.
 
-      (None, False)         -- no recognized quantity field was present
-        at all (every candidate key was missing, None, or ""). This is
-        genuine ABSENCE, not a conflict -- callers MAY apply an existing,
+      (None, False)         -- genuine ABSENCE: none of the recognized
+        keys exist in the payload at all. Callers MAY apply an existing,
         narrowly-scoped ABSENT-only fallback (e.g. the position's own
         pending_exit_qty) when the broker order identity is otherwise
         exactly confirmed by broker_order_id + status=="filled".
 
-      (None, True)          -- a recognized quantity field WAS present
-        with a non-empty value but that value is malformed or
-        conflicting: boolean, explicit zero, negative, fractional
-        (non-integral), non-finite (NaN/inf), or unparseable. This is
-        CONFLICT EVIDENCE, not absence. Callers must NEVER fall back to
-        pending_exit_qty, apply any cumulative fill, call
-        mark_position_closed, or run any terminal proof/economics in
-        this case -- hold instead.
+      (None, True)          -- CONFLICT: at least one recognized key IS
+        present but its value is None, an empty/whitespace-only string,
+        boolean, zero, negative, fractional (non-integral), non-finite
+        (NaN/inf), or unparseable -- OR multiple present keys carry
+        individually-valid but mutually disagreeing values (e.g.
+        quantity=4 and exec_quantity=1). This is CONFLICT EVIDENCE, not
+        absence. Callers must NEVER fall back to pending_exit_qty, apply
+        any cumulative fill, call mark_position_closed, or run any
+        terminal proof/economics in this case -- hold instead.
 
-    Only the first key (in priority order) that carries a non-empty
-    value determines the outcome; later keys are not consulted once a
-    present-but-empty gate has been passed, so a corrupt primary field
-    cannot be silently papered over by a coincidentally-valid secondary
-    field.
+    Key presence is checked with `key in raw`, not `raw.get(key)`, so a
+    key present with value None/""/whitespace is correctly distinguished
+    from a key that is truly absent from the payload -- these previously
+    collapsed to the same outcome, letting a present-but-empty field
+    silently qualify for the ABSENT-only pending_exit_qty fallback
+    instead of holding as the conflict evidence it actually is.
+
+    Every recognized key that IS present is inspected (not just the
+    first) so that a valid secondary field can never mask a malformed
+    primary field, and so that mutually disagreeing present fields
+    (e.g. a generic order-quantity field and a fill-specific field that
+    report different amounts) are detected as conflicting broker
+    evidence rather than one silently overriding the other.
     """
-    for key in _FILLED_QTY_KEYS:
-        val = raw.get(key)
-        if val is None or val == "":
-            continue
+    present_keys = [key for key in _FILLED_QTY_KEYS if key in raw]
+    if not present_keys:
+        return None, False
+
+    valid_values: set = set()
+    for key in present_keys:
+        val = raw[key]
+        if val is None:
+            return None, True
+        if isinstance(val, str) and val.strip() == "":
+            return None, True
         if isinstance(val, bool):
             return None, True
         try:
@@ -167,8 +184,14 @@ def _strict_filled_exit_qty(raw: dict) -> tuple:
         qty = int(qty_float)
         if qty <= 0:
             return None, True
-        return qty, True
-    return None, False
+        valid_values.add(qty)
+
+    if len(valid_values) != 1:
+        # Multiple present fields disagree on the value -- conflicting
+        # broker evidence, never silently pick one.
+        return None, True
+
+    return valid_values.pop(), True
 
 
 def _is_exit_like(raw: dict) -> bool:
