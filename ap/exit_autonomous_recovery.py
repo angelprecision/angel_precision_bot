@@ -24,6 +24,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+# PR #481 amendment: import the canonical broker-truth resolver so that
+# autonomous recovery consumes the same quantity-conflict semantics as the
+# rest of the exit pipeline — one definition of "broker flat", not two.
+from ap.exit_safety import resolve_exit_broker_truth
+
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
 OPEN_BROKER_STATUSES = {"open", "pending", "accepted", "submitted", "queued", "working", "acknowledged", "partially_filled"}
@@ -362,37 +367,78 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
         return RecoveryAction("NOOP", "multiple_live_exit_orders_cancel_not_proven", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
 
     # Negative proof: no matching open sell-to-close order currently at broker.
-    # Before marking replacement safe, verify the contract is still held.
-    # If position is flat at the broker (exit filled, callback dropped), close it
-    # instead of spawning a duplicate sell-to-close that Tradier will reject.
-    try:
-        _broker_positions = broker.list_positions() if hasattr(broker, "list_positions") else []
-        _contract_held = any(
-            str(p.get("symbol") or "").upper() == str(contract or "").upper()
-            for p in (_broker_positions or [])
-            if int(p.get("quantity") or 0) != 0
-        )
-        if not _contract_held and contract:
-            # Position is flat at broker — exit filled but callback was dropped.
-            # Mark position closed rather than allowing a duplicate exit submission.
-            if exit_engine and hasattr(exit_engine, "mark_position_closed"):
-                exit_engine.mark_position_closed(pid, exit_price=None, filled_qty=getattr(pos, "contracts", 0))
-            return RecoveryAction(
-                "MARKED_CLOSED",
-                "autonomous_recovery_contract_flat_at_broker",
-                pid, local_id, "",
-                {"contract": contract, "quote_health": qh, "source": "negative_proof_position_check"},
-            )
-    except Exception as _bp_exc:
-        log.debug("exit_autonomous_recovery: broker position check failed (non-fatal): %s", _bp_exc)
+    # Before acting, verify the contract's position truth via the canonical resolver.
+    #
+    # PR #481 amendment — do NOT re-implement exact-contract quantity semantics
+    # locally.  The previous try/except block called broker.list_positions() and
+    # evaluated int(p.get("quantity") or 0) != 0, which silently collapsed an
+    # explicit-zero row, a boolean-False row, or a fractional row to
+    # _contract_held=False and called mark_position_closed() — real live exposure
+    # was falsely terminalized.  The exception path fell through to
+    # _mark_replacement_safe(), so a failed broker query could by itself authorize
+    # replacement — also forbidden.
+    #
+    # resolve_exit_broker_truth() is the single canonical definition of "broker
+    # flat" for this contract.  It enforces all PR #481 quantity-conflict guards.
+    #
+    # Decision table (amendment spec §REQUIRED BOUNDED REPAIR):
+    #   broker_truth_open_qty=None               → UNKNOWN → NOOP / HOLD
+    #   broker_truth_open_qty=0, is_fresh_exact  → authoritative flat → mark_position_closed()
+    #   broker_truth_open_qty>0, is_fresh_exact  → position held → replacement-safe
+    _client_id = str(getattr(pos, "client_id", "") or "")
+    _bt = resolve_exit_broker_truth(broker=broker, client_id=_client_id, contract=contract)
+    _bt_qty: Any = _bt.get("broker_truth_open_qty")
+    _bt_exact: bool = bool(_bt.get("is_fresh_exact", False))
+    _bt_audit: dict = _bt.get("audit", {})
 
+    if _bt_qty is None:
+        # Broker position truth is UNKNOWN: exception, malformed payload,
+        # conflicting / explicit-zero / boolean / fractional exact-match row,
+        # or adapter error.  UNKNOWN position truth must NEVER authorize
+        # mark_position_closed() or _mark_replacement_safe() on its own.
+        log.warning(
+            "exit_autonomous_recovery: broker position truth UNKNOWN for pid=%s "
+            "contract=%s — NOOP/HOLD; snapshot_status=%s",
+            pid, contract, _bt_audit.get("snapshot_status", ""),
+        )
+        return RecoveryAction(
+            "NOOP",
+            "broker_position_truth_unknown_hold",
+            pid, local_id, "",
+            {"contract": contract, "quote_health": qh, "broker_truth_audit": _bt_audit},
+        )
+
+    if _bt_qty == 0 and _bt_exact:
+        # Authoritative broker flat: contract absent from a successful fresh
+        # snapshot.  Only this path may call mark_position_closed() from the
+        # negative-proof block — the exact-OCC row is genuinely absent, not
+        # merely zero/malformed.
+        if exit_engine and hasattr(exit_engine, "mark_position_closed"):
+            exit_engine.mark_position_closed(
+                pid, exit_price=None, filled_qty=getattr(pos, "contracts", 0)
+            )
+        return RecoveryAction(
+            "MARKED_CLOSED",
+            "autonomous_recovery_contract_flat_at_broker",
+            pid, local_id, "",
+            {
+                "contract": contract,
+                "quote_health": qh,
+                "source": "negative_proof_position_check",
+                "broker_truth_audit": _bt_audit,
+            },
+        )
+
+    # _bt_qty > 0: broker confirms position is held (positive integral quantity).
+    # No open exit orders exist (we reached this point); position is confirmed
+    # held — fall through to replacement-safe so a fresh exit may be submitted.
     return _mark_replacement_safe(
         exit_engine,
         pid,
         reason="autonomous_recovery_no_matching_live_exit_order",
         local_id=local_id,
         broker_id="",
-        details={"contract": contract, "quote_health": qh},
+        details={"contract": contract, "quote_health": qh, "broker_truth_audit": _bt_audit},
     )
 
 
