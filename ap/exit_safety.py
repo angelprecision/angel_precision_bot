@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -61,6 +62,48 @@ def _safe_int(value: Any) -> Optional[int]:
 
 def _normalize_contract(value: Any) -> str:
     return str(value or "").strip().upper().replace(" ", "")
+
+
+# P0 amendment 4 (spec: p0_tradier_exact_quantity_flat_guard_20260817,
+# blockers 1 & 2): the single canonical definition of "this string is a
+# proven exact OCC option contract identity", used at every contract-based
+# authority boundary in both this module and ap/exit_autonomous_recovery.py.
+#
+# Root cause this closes: normalization alone (strip/uppercase/remove
+# spaces) is NOT identity proof. A non-empty but malformed/incomplete
+# token -- "UNKNOWN", a bare underlying ticker like "SMCI", a placeholder
+# like "DEFERRED:SMCI", a truncated or malformed OCC shape -- could pass
+# a bare `if not normalized_contract` guard and then match ZERO rows in
+# any successful broker snapshot, manufacturing authoritative broker-flat
+# truth for a contract that was never actually proven to exist.
+#
+# OCC option symbol shape: 1-6 alphanumeric/dot root symbol (dots permit
+# tickers like BRK.B), exactly 6 digits (YYMMDD expiration), a single
+# C/P side letter, exactly 8 digits (strike price, dollars * 1000,
+# zero-padded). Example: SMCI260626P00032500.
+_OCC_CONTRACT_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
+
+
+def _is_exact_occ_contract(value: str) -> bool:
+    """True only if `value` is already normalized AND matches the exact
+    OCC option symbol shape. Does not normalize its input."""
+    return bool(value) and bool(_OCC_CONTRACT_RE.match(value))
+
+
+def _normalize_exact_occ_contract(value: Any) -> str:
+    """Normalize and validate in one step. Returns the normalized exact
+    OCC contract string, or "" for anything that is empty, whitespace,
+    or does not prove out as a complete exact OCC option symbol.
+
+    This is the identity boundary every contract-based broker-truth
+    decision must pass through: resolve_exit_broker_truth()'s target
+    contract, and (via import) every contract-based guard in
+    ap/exit_autonomous_recovery.py.
+    """
+    normalized = _normalize_contract(value)
+    if not _is_exact_occ_contract(normalized):
+        return ""
+    return normalized
 
 
 def _extract_broker_account_id(broker: Any) -> str:
@@ -196,7 +239,19 @@ def resolve_exit_broker_truth(
     contract: str,
 ) -> dict[str, Any]:
     checked_at = now_utc_iso()
-    normalized_contract = _normalize_contract(contract)
+    # P0 amendment 4 (blocker 1): normalization alone is NOT identity
+    # proof. _normalize_contract() only strips/uppercases/removes spaces --
+    # it does not prove the value is a complete exact OCC option symbol.
+    # A non-empty but malformed/incomplete token ("UNKNOWN", a bare
+    # underlying ticker, a placeholder, a truncated/malformed OCC shape)
+    # would previously pass the amendment-2 `if not normalized_contract`
+    # guard and then match zero rows in any successful snapshot,
+    # manufacturing authoritative broker-flat truth for a contract that
+    # was never actually proven to exist. _normalize_exact_occ_contract()
+    # returns "" for anything that isn't a proven exact OCC symbol, so the
+    # existing empty-contract guard below now also catches this case.
+    _raw_contract_str = str(contract or "").strip()
+    normalized_contract = _normalize_exact_occ_contract(contract)
     account_id = _extract_broker_account_id(broker)
     audit = {
         "source": "broker.list_positions",
@@ -219,9 +274,15 @@ def resolve_exit_broker_truth(
     #
     # ABSENCE CAN ONLY PROVE FLATNESS WHEN WE KNOW EXACTLY WHICH BROKER
     # CONTRACT WE WERE TRYING TO FIND. Missing/unproven identity is UNKNOWN
-    # truth, never broker-flat truth.
+    # truth, never broker-flat truth. As of amendment 4, this also covers
+    # non-empty but invalid identity -- distinguished in the audit status
+    # below so operators can tell "no contract given" apart from "a
+    # malformed contract token was given".
     if not normalized_contract:
-        audit["snapshot_status"] = "contract_identity_unavailable"
+        audit["snapshot_status"] = (
+            "contract_identity_unavailable" if not _raw_contract_str
+            else "contract_identity_invalid"
+        )
         return {
             "broker_truth_open_qty": None,
             "is_fresh_exact": False,

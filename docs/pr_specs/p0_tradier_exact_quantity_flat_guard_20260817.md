@@ -676,21 +676,172 @@ applied. Confirmed:
 
 Post-fix: 9/9 pass.
 
+## Amendment 4 — exact-contract authority hardening + real Tradier order shape + signed-quantity isolation
+
+Independent audit against the exact head of Amendment 3 found three
+further merge blockers, all confirmed against the live code before any
+change was made. All three amendments 1-3 fixes were explicitly preserved
+and re-verified; none were reverted or weakened.
+
+### Blocker 1 — non-empty invalid contract identity could still become authoritative broker flat
+
+**Defect.** `_normalize_contract()` only strips/uppercases/removes spaces
+— it never proved the value was a complete, exact OCC option symbol.
+Amendment 2's `if not normalized_contract` guard only caught the *empty*
+case. A non-empty but malformed/incomplete token — `"UNKNOWN"`, a bare
+underlying ticker like `"SMCI"`, a placeholder like `"DEFERRED:SMCI"`, a
+truncated or malformed OCC shape — passed that guard, then matched zero
+rows in any successful broker snapshot, manufacturing authoritative
+broker-flat truth for a contract that was never actually proven to exist.
+
+**Fix.** One canonical exact-OCC validator, `ap/exit_safety.py::
+_normalize_exact_occ_contract()`, built on the regex
+`^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$` (root symbol, 6-digit YYMMDD expiration,
+C/P side, 8-digit strike). `resolve_exit_broker_truth()`'s identity gate
+now uses this instead of the bare normalizer, and distinguishes
+`contract_identity_unavailable` (empty/whitespace) from
+`contract_identity_invalid` (non-empty but not a proven exact OCC) in the
+audit. `ap/exit_autonomous_recovery.py::_position_contract()` was
+rewritten to use the same validator — this single change propagates the
+protection through every existing `if not contract:` HOLD guard already
+in place from Amendments 2 and 3, with no new guard code required.
+
+### Blocker 2 — autonomous recovery didn't parse real Tradier option-order identity
+
+**Defect.** `ap/exit_autonomous_recovery.py::_contract(raw)` checked
+`raw.get("contract") or raw.get("symbol") or raw.get("option_symbol") or
+raw.get("instrument")`. Real Tradier option orders carry `symbol` =
+underlying ticker (e.g. `"SMCI"`) and `option_symbol` = the exact OCC
+contract (e.g. `"SMCI260626P00032500"`) as two *different* fields. Because
+`symbol` was checked first and is truthy, `_contract(raw)` returned the
+underlying instead of the OCC contract for any production-shaped order
+row — an already-live same-contract exit order could be missed entirely,
+risking a duplicate exit submission.
+
+**Fix.** `_contract(raw)` now iterates `("contract", "option_symbol",
+"symbol", "instrument")` but only *accepts* a candidate field's value if
+it proves out as a complete exact OCC symbol via the same validator from
+Blocker 1 — a bare underlying ticker fails that proof and is skipped
+rather than blindly accepted via short-circuit `or`.
+
+### Blocker 3 — valid signed quantity on an unrelated position poisoned the whole account snapshot
+
+**Defect.** `ap/brokers/tradier.py::TradierBroker.list_positions()`
+raised `TRADIER_POSITIONS_PAYLOAD_CONFLICT` for the *entire* account
+snapshot the moment any row anywhere carried a negative quantity. Tradier
+position quantity is signed broker data — negative legitimately
+represents a short position — and this method reads the whole brokerage
+account in one call. One completely unrelated legitimate short position
+(a different underlying, or a short option AP never opened) made broker
+truth unavailable for the actual AP target contract being resolved, even
+though the target's own row was perfectly valid.
+
+**Fix.** Removed the blanket negative-quantity raise. Genuine structural
+payload garbage — boolean, missing quantity, unparseable, non-finite,
+fractional — is still rejected globally, since those represent real
+malformed data regardless of which row carries them (and the fractional
+check runs *before* the sign would ever be examined, so a
+negative-and-fractional quantity like `-0.5` still raises exactly as
+before). A negative quantity now simply passes through as valid signed
+data for whichever row carries it. Rejection of a negative quantity as
+UNKNOWN/never-flat for AP's own long-only target contract already
+happened at the resolver boundary
+(`ap/exit_safety.py::_extract_long_position_qty`, unchanged) — that
+function only examines the row that exact-matches the contract actually
+being resolved, so it was never the source of the poisoning; the adapter
+was.
+
+All four external non-test callers of `list_positions()` were re-audited
+against this change: `ap_exit_engine.py` and `app.py::nightly_reconcile`
+already filter to `qty > 0` before using the result; `ap_reconciler.py`'s
+`_safe_get_broker_positions()` → `_handle_db_position_missing_at_broker`
+path is observation-only (already covered by the original spec's caller
+audit); `app.py::nightly_reconcile`'s remaining path is pure
+reporting/alerting with zero position mutation. No caller needed a
+change.
+
+**Known second-order consequence, flagged for awareness (not fixed —
+outside this amendment's bounded file scope, no failing regression
+proves a dependency):** `ap_reconciler.py::_broker_position_qty()`
+predates this amendment and already applies `abs()` to the raw quantity,
+apparently anticipating signed data. Before this fix, a negative quantity
+on *any* row — including a hypothetical anomaly where AP's own tracked
+contract itself reports negative at the broker — would have caused
+`list_positions()` to raise, and the reconciler's existing exception
+handling would flag the affected rows for manual review without changing
+status. After this fix, such a row now flows through and gets `abs()`'d
+into a positive magnitude by the reconciler's pre-existing logic. This
+only matters for the narrow case of AP's *own* target contract itself
+carrying negative quantity (a broker-side data anomaly distinct from the
+"unrelated position" case this blocker targets) — genuinely unrelated
+short positions on other contracts remain harmless in the reconciler's
+by-contract/by-underlying dictionaries, keyed by their own (non-colliding)
+contract symbol. No test in this amendment's scope currently exercises
+this specific edge case; it is documented here rather than silently
+left unaddressed.
+
+### Tests
+
+Three new files, 48 tests total:
+
+- `tests/test_p0_invalid_nonempty_contract_never_flat.py` (29 tests) —
+  8 invalid non-empty contract values × 3 coverage angles (resolver
+  against empty snapshot, resolver against non-empty snapshot, full
+  `recover_exit_position()` end-to-end), plus empty-like regression
+  coverage and two valid-contract regression guards.
+- `tests/test_p0_tradier_order_shape_option_symbol.py` (8 tests) —
+  cases A-F per the amendment spec (same-OCC adopted, terminal-id
+  different-live-exit recognized, bounded duplicate-cancel preserved,
+  same-underlying-different-OCC never matches, unrelated never matches,
+  missing/malformed order identity never wildcards) plus a direct
+  extractor unit test.
+- `tests/test_p0_unrelated_short_position_no_poison.py` (11 tests) —
+  required tests 1-6 per the amendment spec, plus direct adapter-level
+  proof that the real `TradierBroker.list_positions()` no longer raises
+  for an unrelated negative row, and a regression proof that fractional
+  quantity still raises regardless of sign.
+
+One pre-existing test was rewritten:
+`test_negative_integer_quantity_raises_at_adapter` in
+`tests/test_p0_tradier_exact_quantity_flat_guard.py` asserted the
+pre-Blocker-3 (now-incorrect) adapter behavior; renamed to
+`test_negative_integer_quantity_does_not_raise_at_adapter` and rewritten
+to assert the corrected invariant. `test_negative_fractional_quantity_
+raises_at_adapter` (testing `-0.5`) required no change — the fractional
+check runs before the sign check in the adapter's row-parsing order, so
+it continues to raise exactly as before.
+
+Fail-first: 30/48 new tests failed against pre-Amendment-4 code — 24 for
+Blocker 1 (8 values × 3 angles), 4 for Blocker 2 (extractor + cases A/B/C;
+cases D/E/F were confirmed analytically and empirically to already pass
+pre-fix, since a mismatched-but-still-wrong extracted value coincidentally
+still failed to match the target — they serve as regression guards, not
+fail-first evidence), 2 for Blocker 3 (the two direct adapter-level
+tests; all 11 resolver-level Blocker-3 tests already passed pre-fix,
+confirming the resolver's per-row exact-match filtering already correctly
+isolated unrelated rows — the defect was purely adapter-scoped). Post-fix:
+48/48 pass.
+
 ## Required tests — status
 
 All required fail-first and regression coverage across the original fix
-and all three amendments is implemented in four dedicated files:
+and all four amendments is implemented in seven dedicated files:
 
 - `tests/test_p0_tradier_exact_quantity_flat_guard.py` (33 tests) —
-  original adapter/resolver fix.
+  original adapter/resolver fix (one test rewritten under Amendment 4;
+  see above).
 - `tests/test_p0_exit_autonomous_recovery_quantity_guard.py` (15 tests) —
   Amendment 1.
 - `tests/test_p0_missing_contract_identity_never_flat.py` (15 tests) —
   Amendment 2.
 - `tests/test_p0_missing_contract_identity_no_wildcard_match.py` (9 tests)
   — Amendment 3.
+- `tests/test_p0_invalid_nonempty_contract_never_flat.py` (29 tests),
+  `tests/test_p0_tradier_order_shape_option_symbol.py` (8 tests),
+  `tests/test_p0_unrelated_short_position_no_poison.py` (11 tests) —
+  Amendment 4 (Blockers 1, 2, 3 respectively).
 
-All four files are included in `.github/workflows/p0_regression.yml` and
+All seven files are included in `.github/workflows/p0_regression.yml` and
 run as part of the exact-head CI P0 Regression Suite.
 
 Original fix's dedicated suite breakdown:
@@ -792,16 +943,54 @@ Amendment 3:
   one production file changed, additive only (+61/-0 lines,
   `ap/exit_autonomous_recovery.py`).
 
+Amendment 4:
+
+- Fail-first (pre-fix): 30/48 new tests failed — 24 for Blocker 1, 4 for
+  Blocker 2 (cases A/B/C + extractor), 2 for Blocker 3 (adapter-level
+  only; all resolver-level Blocker-3 tests already passed pre-fix,
+  confirming the defect was purely adapter-scoped). Full detail above
+  under "Amendment 4".
+- Post-fix: all three new files 48/48 passed
+  (`test_p0_invalid_nonempty_contract_never_flat.py` 29/29,
+  `test_p0_tradier_order_shape_option_symbol.py` 8/8,
+  `test_p0_unrelated_short_position_no_poison.py` 11/11).
+- `tests/test_p0_tradier_exact_quantity_flat_guard.py` re-verified after
+  the one required rewrite: still 33/33 passed.
+- Combined PR-#481-targeted suite (all ten files: original + Amendments
+  1-4 + `test_p0_broker_owned_exit_requested_recovery.py` +
+  `test_p0_broker_owned_exit_recovery_preflight.py`): 354 passed, 1
+  skipped, 0 failed.
+- `tests/test_p0_broker_position_unavailable_not_flat.py` (#478)
+  re-verified in isolation, post all four amendments: 69/69 passed,
+  unmodified.
+- `tests/test_p0_exit_closed_guard_and_circuit_breaker.py` (explicitly
+  required by the amendment): 25/25 passed.
+- Broader blast-radius check: `test_p0_exit_engine_broker_truth.py` +
+  `test_p0_reconciler_external_close_broker_truth.py` +
+  `test_p0_broker_open_protective_monitoring.py`: 122 passed, 15
+  skipped, 1 failed — the 1 failure
+  (`test_postgres_fixture_wrapper_returns_dict_rows`) requires a live
+  local Postgres connection unavailable in the validation sandbox; it is
+  an environment gap, not a regression, and is unrelated to any code this
+  amendment touched.
+- Scope discipline: `git diff --stat` for this amendment shows exactly
+  the three production files the amendment specified —
+  `ap/brokers/tradier.py`, `ap/exit_safety.py`,
+  `ap/exit_autonomous_recovery.py` — plus the one required pre-existing
+  test rewrite. No ENTRY, selector, watcher, execution_mode, client_id,
+  proof_trades, queue, reporting, position sizing, or exit
+  strategy/intelligence file was touched.
+
 Full CI-exact P0 Regression Suite: see PR #481 body / latest CI run for
-the exact-head result at the current head SHA — all three amendment test
-files are included in `.github/workflows/p0_regression.yml` and execute
-as part of that workflow.
+the exact-head result at the current head SHA — all four amendments'
+test files are included in `.github/workflows/p0_regression.yml` and
+execute as part of that workflow.
 
 ## Delivery
 
 New forward-fix branch/PR from current main. #478 is not reverted or
 rewritten. Branch was rebased onto post-#479 main
 (`d0d37e79ae698e604eb8080065d2314b161de351`) with zero conflicts; all
-three amendments were implemented and validated against the rebased
+four amendments were implemented and validated against the rebased
 branch. Do not merge, deploy, or mark ready for review without Angel's
 explicit authorization.

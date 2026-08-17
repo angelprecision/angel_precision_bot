@@ -27,7 +27,12 @@ from typing import Any, Optional
 # PR #481 amendment: import the canonical broker-truth resolver so that
 # autonomous recovery consumes the same quantity-conflict semantics as the
 # rest of the exit pipeline — one definition of "broker flat", not two.
-from ap.exit_safety import resolve_exit_broker_truth
+#
+# PR #481 amendment 4 (blockers 1 & 2): also import the canonical exact-OCC
+# contract validator so every contract-based decision in this module uses
+# the same proven-identity predicate as the resolver — one definition of
+# "this is a real contract identity", not two.
+from ap.exit_safety import resolve_exit_broker_truth, _normalize_exact_occ_contract
 
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
@@ -60,7 +65,26 @@ def _broker_order_id(raw: dict) -> str:
 
 
 def _contract(raw: dict) -> str:
-    return _norm_contract(raw.get("contract") or raw.get("symbol") or raw.get("option_symbol") or raw.get("instrument"))
+    # P0 amendment 4 (blocker 2): the raw underlying `symbol` must NEVER
+    # shadow a valid `option_symbol`. Real Tradier option orders carry TWO
+    # distinct fields -- symbol=underlying (e.g. "SMCI"), option_symbol=
+    # exact OCC contract (e.g. "SMCI260626P00032500") -- and the previous
+    # `raw.get("contract") or raw.get("symbol") or raw.get("option_symbol")
+    # or raw.get("instrument")` short-circuited on the first truthy field,
+    # returning the underlying instead of the exact OCC contract for any
+    # production-shaped order row. That could cause an already-live
+    # same-contract exit order to be missed by exact-OCC matching
+    # elsewhere in this module, risking a duplicate exit submission.
+    #
+    # Fix: check each candidate field in priority order, but only ACCEPT a
+    # candidate if it proves out as a complete exact OCC option symbol.
+    # A bare underlying ticker fails that proof and is skipped rather than
+    # blindly accepted via short-circuit `or`.
+    for key in ("contract", "option_symbol", "symbol", "instrument"):
+        candidate = _normalize_exact_occ_contract(raw.get(key))
+        if candidate:
+            return candidate
+    return ""
 
 
 def _qty(raw: dict) -> int:
@@ -212,7 +236,22 @@ def _cancel_order_with_proof(
 
 
 def _position_contract(pos: Any) -> str:
-    return _norm_contract(getattr(pos, "option_symbol", "") or getattr(pos, "contract", "") or getattr(pos, "symbol", ""))
+    # P0 amendment 4 (blocker 1): a bare `_norm_contract()` here only
+    # strips/uppercases/removes spaces -- it does not prove the position's
+    # option_symbol/contract/symbol attribute is a complete exact OCC
+    # option identity. A non-empty but malformed value ("UNKNOWN", a bare
+    # underlying ticker, a placeholder) would previously pass through as
+    # "identity established" and could reach every contract-based decision
+    # in recover_exit_position() below. Using the same validated normalizer
+    # as ap.exit_safety.resolve_exit_broker_truth() means every existing
+    # `if not contract:` HOLD guard already in this module (from
+    # amendments 2 and 3) now also correctly fires for invalid non-empty
+    # identity, with no new guard code required.
+    for attr in ("option_symbol", "contract", "symbol"):
+        candidate = _normalize_exact_occ_contract(getattr(pos, attr, ""))
+        if candidate:
+            return candidate
+    return ""
 
 
 def _position_id(pos: Any) -> str:

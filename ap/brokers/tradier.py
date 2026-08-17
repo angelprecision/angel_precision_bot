@@ -494,13 +494,29 @@ class TradierBroker(BrokerAdapter):
             ``quantity``, a non-finite (``NaN``/``inf``) quantity, a boolean
             quantity (``bool`` is numeric in Python — ``float(False) == 0.0``
             — and must never masquerade as a real quantity), and a fractional
-            (non-integer) quantity.
-          - CONFLICT     (a successful, well-formed response whose quantity
-            contradicts Angel Precision's long-only option lifecycle): raise a
-            deterministic ``ValueError('TRADIER_POSITIONS_PAYLOAD_CONFLICT: ...')``.
-            This includes a negative quantity, which proves broker exposure
-            exists in a direction the lifecycle does not expect — it is never
-            silently coerced to zero/flat.
+            (non-integer) quantity. These represent genuine structural payload
+            garbage and are rejected regardless of which row they appear on.
+          - SIGNED QUANTITY (P0 amendment 4, blocker 3): a negative quantity is
+            NOT rejected here. Tradier position quantity is signed broker data —
+            negative legitimately represents a short position, and this method
+            reads the ENTIRE brokerage account in one call. An earlier version of
+            this method raised ``TRADIER_POSITIONS_PAYLOAD_CONFLICT`` for the
+            whole snapshot the moment ANY row anywhere in the account carried a
+            negative quantity, which meant one unrelated legitimate short
+            position (a different underlying, or a short option Angel Precision
+            never opened) made broker truth UNAVAILABLE for the actual AP target
+            contract being resolved — even though the target's own row was
+            perfectly valid. BROKER PAYLOAD VALIDITY (structural garbage, above)
+            is a separate concern from AP EXACT-CONTRACT LONG-ONLY LIFECYCLE
+            AUTHORITY: a negative quantity now passes through this adapter as
+            valid signed data for whichever row carries it. Rejecting a negative
+            quantity as UNKNOWN/never-flat for AP's own long-only target contract
+            happens at the resolver boundary
+            (``ap/exit_safety.py::_extract_long_position_qty`` /
+            ``resolve_exit_broker_truth``), which examines only the row that
+            exact-matches the contract actually being resolved — never here,
+            where "this row" and "the target AP is resolving" are not yet known
+            to be the same thing.
           - SUCCESS_EMPTY  (top-level ``{}``; or ``positions`` is ``null`` /
             ``"null"`` / ``""`` / ``{}``; or an explicitly empty position node):
             return ``[]``.
@@ -508,8 +524,9 @@ class TradierBroker(BrokerAdapter):
 
         Normalized valid-row contract (unchanged; downstream consumers depend on it):
         ``symbol``, ``quantity``, ``cost_basis``, ``side``, ``raw``. ``quantity``
-        is guaranteed to be a non-negative, finite, integer-valued float once a
-        row reaches this contract (e.g. ``4.0``, never ``0.5``/``-1``/``True``).
+        is guaranteed to be a finite, integer-valued float once a row reaches
+        this contract (e.g. ``4.0`` or ``-1.0``, never ``0.5``/``True``) — it may
+        be negative (signed broker exposure; see SIGNED QUANTITY above).
         """
         # Transport/auth/HTTP failures propagate out of _get() unchanged.
         resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
@@ -603,19 +620,29 @@ class TradierBroker(BrokerAdapter):
                 # A fractional option-contract count is not a valid whole
                 # position size. int(0.5) == 0 would otherwise silently
                 # truncate into a believable "flat" quantity downstream.
+                # This check runs BEFORE the sign is ever examined, so a
+                # negative-and-fractional quantity (e.g. -0.5) still raises
+                # here regardless of the P0 amendment 4 sign change below.
                 raise ValueError(
                     "TRADIER_POSITIONS_PAYLOAD_MALFORMED: fractional option quantity"
                 )
-            # DO NOT silently coerce negative quantity to zero. Angel
-            # Precision's lifecycle only holds long option positions here; a
-            # negative quantity means broker exposure exists in a direction
-            # that conflicts with the expected lifecycle. That is broker
-            # exposure, not flatness, and must fail closed rather than
-            # collapse toward a believable zero/flat row.
-            if quantity < 0:
-                raise ValueError(
-                    "TRADIER_POSITIONS_PAYLOAD_CONFLICT: negative option quantity"
-                )
+            # P0 amendment 4 (blocker 3): DO NOT raise for negative
+            # quantity here. Tradier position quantity is signed broker
+            # data — negative legitimately represents a short position —
+            # and this method reads the ENTIRE brokerage account in one
+            # call. Raising here for ANY row anywhere in the account
+            # poisoned the WHOLE snapshot for every other row, including
+            # the actual AP target contract's own row, which could be
+            # perfectly valid. BROKER PAYLOAD VALIDITY (bool/missing/
+            # unparseable/NaN/inf/fractional, checked above -- genuine
+            # structural garbage) is a separate concern from AP EXACT-
+            # CONTRACT LONG-ONLY LIFECYCLE AUTHORITY. Angel Precision's
+            # long-only rejection of a negative quantity happens at the
+            # resolver boundary for the EXACT target contract being
+            # resolved (ap/exit_safety.py::_extract_long_position_qty),
+            # which already returns None (never a coerced 0) for a
+            # negative quantity on the row that exact-matches the target
+            # -- that check is unaffected by this adapter-level change.
             result.append({
                 "symbol":     symbol,
                 "quantity":   quantity,

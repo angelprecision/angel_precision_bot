@@ -310,10 +310,19 @@ def test_fractional_quantity_raises_at_adapter():
         b.list_positions()
 
 
-def test_negative_integer_quantity_raises_at_adapter():
+def test_negative_integer_quantity_does_not_raise_at_adapter():
+    # P0 amendment 4 (blocker 3): negative quantity is signed broker data
+    # (a legitimate short position) and must no longer raise at the
+    # adapter boundary -- doing so poisoned the ENTIRE account snapshot
+    # for any unrelated row. Rejection of a negative quantity as
+    # UNKNOWN/never-flat for the EXACT AP target contract happens at the
+    # resolver boundary (ap/exit_safety.py::_extract_long_position_qty),
+    # not here. See tests/test_p0_unrelated_short_position_no_poison.py
+    # for full coverage of this invariant.
     b = _broker(_payload(_row(PUT_CONTRACT, -1)))
-    with pytest.raises(ValueError, match="TRADIER_POSITIONS_PAYLOAD_CONFLICT"):
-        b.list_positions()
+    rows = b.list_positions()
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == -1.0
 
 
 def test_negative_fractional_quantity_raises_at_adapter():
