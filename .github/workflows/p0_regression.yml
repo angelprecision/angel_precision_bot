@@ -211,6 +211,7 @@ jobs:
             tests/test_p0_reconciler_signed_position_no_positive_long.py \
             tests/test_p0_malformed_filled_quantity_no_manufactured_close.py \
             tests/test_p0_filled_quantity_conflict_final_guard.py \
+            tests/test_p0_reconciler_missing_id_exit_order_truth.py \
             -v --tb=short --color=yes
 
       - name: Summary

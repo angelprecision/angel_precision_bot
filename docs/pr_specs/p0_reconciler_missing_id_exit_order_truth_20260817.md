@@ -4,7 +4,64 @@
 **Branch:** `spec/p0-reconciler-missing-id-exit-order-truth-20260817`  
 **Classification:** P0 money-path safety  
 **Primary production owner:** `ap_reconciler.py`  
-**Status:** SPEC-ONLY / DRAFT / DO NOT MERGE OR DEPLOY UNTIL IMPLEMENTED + RE-AUDITED
+**Status:** IMPLEMENTED / DRAFT / DO NOT MERGE OR DEPLOY UNTIL ANGEL AUDIT + EXPLICIT MERGE INSTRUCTION
+
+## Implementation Summary (2026-08-17)
+
+**Implementation base SHA:** `945e9da869a88bffebfd26d9fd3abbd982621c6c` (#481 merged)  
+**Starting #487 head SHA:** `f3d5dcd85568db0c1c75ad36e931f44b2e528029`  
+**#487 rebased onto new main — head after rebase:** `6e534d589f08ce54dfbe82fe1e81400386e62b78`  
+
+### Production file changed
+- `ap_reconciler.py` — ONLY file modified
+
+### Non-production files changed
+- `tests/test_p0_reconciler_missing_id_exit_order_truth.py` — 43 focused tests (all passing)
+- `.github/workflows/p0_regression.yml` — focused test file wired into CI
+- `docs/pr_specs/p0_reconciler_missing_id_exit_order_truth_20260817.md` — this file
+
+### Fixes applied
+
+**DEFECT 1 — `_safe_get_broker_open_orders` tri-state:**  
+Return type changed from `list[dict]` → `Optional[list[dict]]`.  
+`None` = UNKNOWN (exception / timeout / ConnectionError / malformed / None result / error dict / no callable method).  
+`[]` = AVAILABLE_EMPTY (authoritative).  
+`[...]` = AVAILABLE_NONEMPTY.
+
+**DEFECT 1 propagation — `_recover_missing_broker_id_exit`:**  
+Return type changed from `bool` → `Optional[bool]`.  
+`None` returned immediately when `_safe_get_broker_open_orders()` is `None`.  
+Emits `RECONCILER_BROKER_ORDER_TRUTH_UNKNOWN_HOLD` log line.
+
+**DEFECT 1 propagation — `_handle_order_without_broker_id`:**  
+`None` return from `_recover_missing_broker_id_exit` triggers HOLD alert + return.  
+Negative-proof counter (`_missing_id_exit_tracker`) is NOT incremented.  
+`mark_exit_replacement_safe` / `clear_exit_in_flight` are NOT called.
+
+**DEFECT 1 propagation — `_resolve_missing_id_exit_truth`:**  
+`None` return from `_recover_missing_broker_id_exit` emits HOLD alert and returns `False`.  
+Does NOT fall through to endpoint 3 (replacement-safe / CANCELED).
+
+**DEFECT 1 propagation — `_broker_open_exit_exists_for_contract`:**  
+Return type changed from `bool` → `Optional[bool]`.  
+`None` returned when broker orders are UNKNOWN.  
+Call site treats `None` as fail-closed (block ghost close).
+
+**DEFECT 2 — `_broker_order_qty_from_raw` strict validation:**  
+Return type changed from `int` → `Optional[int]`.  
+Rejects: bool, negative, zero, fractional, nonfinite, non-numeric.  
+Forbidden operations removed: `abs()`, `round()`, truncation, sign correction.  
+`_score_missing_id_exit_candidate`: `broker_qty is not None` guard — malformed qty contributes neither `qty_exact` nor `qty_mismatch`.  
+`_recover_missing_broker_id_exit` hard-filter: `bqty is not None` guard before mismatch rejection.
+
+### Broker / submit / cancel / mutation audit
+- No new broker submit calls added
+- No new broker cancel calls added
+- No new ENTRY authority
+- No BUY_TO_CLOSE authority
+- No position creation / proof finalization / queue mutations
+- No schema changes
+- No #481 quarantine-liveness work absorbed
 
 ---
 

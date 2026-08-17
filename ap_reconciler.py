@@ -1376,8 +1376,14 @@ class APBrokerReconciler:
             return False
 
         # Endpoint 1: recover an active broker order identity if possible.
+        # #487 FIX: _recover_missing_broker_id_exit returns Optional[bool].
+        #   True  — recovered; wire exit_engine and return.
+        #   None  — UNKNOWN broker truth; HOLD — must not fall through to endpoint 3
+        #           (replacement safe) because UNKNOWN is never negative proof.
+        #   False — authoritative not found; fall through to endpoint 2 / 3.
         try:
-            if self._recover_missing_broker_id_exit(order, summary):
+            recovery_result = self._recover_missing_broker_id_exit(order, summary)
+            if recovery_result is True:
                 broker_oid = None
                 try:
                     refreshed  = self.osm.get_order(local_id) if hasattr(self.osm, "get_order") else None
@@ -1399,6 +1405,16 @@ class APBrokerReconciler:
                             self.client_id, exc,
                         )
                 return True
+            if recovery_result is None:
+                # Broker truth is UNKNOWN — hold in place; do NOT reach endpoint 3.
+                self._alert(
+                    f"RECONCILER_BROKER_ORDER_TRUTH_UNKNOWN_HOLD | {contract or '?'} | {local_id} | "
+                    f"pos={pos_id}; broker open-order query UNKNOWN inside resolve; "
+                    "quarantine maintained; no replacement authority granted"
+                )
+                summary["orders_alerted"] += 1
+                return False
+            # recovery_result is False — authoritative not found; fall through.
         except Exception as exc:
             log.warning(
                 "[%s] missing-id broker recovery errored for %s: %s",
@@ -1525,10 +1541,31 @@ class APBrokerReconciler:
             "EXIT_REQUESTED", "EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL",
             "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL",
         }:
-            if self._recover_missing_broker_id_exit(order, summary):
+            # #487 FIX: _recover_missing_broker_id_exit returns Optional[bool]:
+            #   True  — RECOVERED: broker EXIT found and adopted; clear tracker.
+            #   False — AUTHORITATIVE_NOT_FOUND: broker is available but has no match;
+            #           eligible to advance the negative-proof counter.
+            #   None  — UNKNOWN: broker truth unavailable (exception/timeout/malformed);
+            #           MUST NOT advance the counter or allow any replacement authority.
+            recovery_result = self._recover_missing_broker_id_exit(order, summary)
+
+            if recovery_result is True:
                 self._missing_id_exit_tracker.pop(str(local_id), None)
                 return
 
+            if recovery_result is None:
+                # Broker truth is UNKNOWN — hold in place, emit diagnostic, do NOT
+                # increment the negative-proof counter, do NOT allow replacement.
+                self._alert(
+                    f"RECONCILER_BROKER_ORDER_TRUTH_UNKNOWN_HOLD | {contract} | {local_id} | "
+                    "broker open-order query returned UNKNOWN; holding missing-ID EXIT; "
+                    "negative-proof counter not advanced; no replacement authority granted"
+                )
+                summary["orders_alerted"] += 1
+                return
+
+            # recovery_result is False — broker truth is AVAILABLE_EMPTY or no match.
+            # Eligible to check recent fill and advance negative-proof counter.
             recent_fill = self._get_recent_exit_fill(
                 contract,
                 self._norm_underlying(
@@ -1554,9 +1591,9 @@ class APBrokerReconciler:
                 return
 
             # Full recovery contract for v8/v9 exit-engine quarantine:
-            # after repeated negative broker-open-order and recent-fill checks,
-            # resolve the exit into exactly one endpoint instead of falling into
-            # generic phantom-cancel logic and leaving the exit engine locked.
+            # after repeated authoritative-negative broker-open-order and recent-fill
+            # checks, resolve the exit into exactly one endpoint instead of falling
+            # into generic phantom-cancel logic and leaving the exit engine locked.
             if self._resolve_missing_id_exit_truth(
                 order,
                 summary,
@@ -1587,33 +1624,53 @@ class APBrokerReconciler:
             except Exception:
                 pass
 
-    def _safe_get_broker_open_orders(self) -> list[dict]:
+    def _safe_get_broker_open_orders(self) -> Optional[list[dict]]:
         """
         Best-effort broker open-order fetch across adapter method names.
 
-        FIX-6: error-response guard added. If the broker returns a bare dict without
-        a recognized list key, and it contains error/message indicators, we skip it
-        rather than wrapping the error payload as a fake order object.
+        Returns a tri-state:
+          list[dict]  — AVAILABLE_NONEMPTY: broker confirms open orders exist.
+          []          — AVAILABLE_EMPTY:    broker authoritatively confirms no open orders.
+          None        — UNKNOWN: broker truth is unavailable (exception, timeout, auth
+                        failure, None result, malformed/unusable response shape, or no
+                        recognized method is callable).
+
+        BINDING INVARIANT (PR #487):
+          UNKNOWN broker-order truth is NEVER negative proof.
+          Time does not convert UNKNOWN into EMPTY.
+          Retries do not convert UNKNOWN into EMPTY.
+
+        FIX-6 retained: error-indicator dicts are skipped rather than wrapped as fake
+        order objects.  But skipping a method does NOT yield an authoritative []; we
+        only return UNKNOWN (None) when no callable method produced a valid response.
         """
+        found_callable_method = False
         for method_name in ("list_open_orders", "get_open_orders", "list_orders", "orders"):
             method = getattr(self.broker, method_name, None)
             if not callable(method):
                 continue
+            found_callable_method = True
             try:
                 try:
                     result = method(status="open")
                 except TypeError:
                     result = method()
+
+                # None result from a callable method is inconclusive; try next method.
                 if result is None:
                     continue
+
                 if isinstance(result, dict):
+                    # Dict with a recognized list container key — use the list.
                     for key in ("orders", "data", "results"):
                         if isinstance(result.get(key), list):
                             return [dict(x) for x in result.get(key) if isinstance(x, dict)]
-                    # FIX-6: guard — error dicts must not become fake order objects.
+                    # FIX-6: error-indicator dicts must not become fake order objects.
+                    # These are also UNKNOWN — we cannot establish authoritative truth
+                    # from an error payload.
                     if result.get("error") or result.get("errors") or result.get("message"):
                         log.warning(
-                            "[%s] broker %s returned error-like dict; skipping: %s",
+                            "[%s] broker %s returned error-like dict; treating as UNKNOWN: %s",
                             self.client_id, method_name, result,
                         )
                         continue
@@ -1621,19 +1678,39 @@ class APBrokerReconciler:
                     # treat as a single-order response only if it has an id field.
                     if result.get("id") or result.get("order_id") or result.get("broker_order_id"):
                         return [result]
+                    # Unrecognized shape — cannot establish complete order truth.
                     log.warning(
-                        "[%s] broker %s returned unrecognized dict shape; skipping: keys=%s",
+                        "[%s] broker %s returned unrecognized dict shape; treating as UNKNOWN: keys=%s",
                         self.client_id, method_name, list(result.keys())[:10],
                     )
                     continue
+
                 if isinstance(result, list):
+                    # Valid list — authoritative (may be empty).
                     return [dict(x) for x in result if isinstance(x, dict)]
+
+                # Unexpected type — cannot establish truth.
+                log.warning(
+                    "[%s] broker %s returned unexpected type %s; treating as UNKNOWN",
+                    self.client_id, method_name, type(result).__name__,
+                )
+                continue
+
             except Exception as exc:
                 log.debug(
                     "[%s] broker %s failed during missing-id recovery: %s",
                     self.client_id, method_name, exc,
                 )
-        return []
+                # Exception on this method — try the next one; do not convert to [].
+
+        # Reaching here means: either no method was callable, or every callable
+        # method produced None / malformed / exception — broker truth is UNKNOWN.
+        if not found_callable_method:
+            log.warning(
+                "[%s] broker has no recognized open-order method; treating as UNKNOWN",
+                self.client_id,
+            )
+        return None
 
     def _broker_order_id_from_raw(self, raw: dict) -> str:
         return str(
@@ -1653,15 +1730,57 @@ class APBrokerReconciler:
             or ""
         )
 
-    def _broker_order_qty_from_raw(self, raw: dict) -> int:
+    def _broker_order_qty_from_raw(self, raw: dict) -> Optional[int]:
+        """
+        Strict broker-order quantity extraction for missing-ID EXIT recovery.
+
+        Returns Optional[int]:
+          int   — Valid: strictly positive, finite, mathematically integral.
+          None  — UNKNOWN/invalid: boolean, negative, zero, fractional, nonfinite,
+                  non-numeric string, None, missing.
+
+        Forbidden operations (PR #487):
+          abs(), round(), int(float(x)) truncation, sign correction.
+
+        A malformed, signed, boolean, or fractional broker-order quantity must NOT
+        gain matching authority through numeric coercion.  It contributes ZERO
+        positive evidence.
+
+        Valid examples:  1, 4, 4.0, "4"
+        Invalid:         True, False, 0, -1, -4, 0.5, NaN, Inf, "garbage", None
+        """
+        import math as _math
         for key in ("quantity", "qty", "order_qty", "remaining_quantity", "remaining_qty"):
+            val = raw.get(key)
+            if val is None or val == "":
+                continue
+
+            # Booleans are a subclass of int in Python; reject them explicitly first.
+            if isinstance(val, bool):
+                return None
+
             try:
-                val = raw.get(key)
-                if val is not None and val != "":
-                    return abs(int(float(val)))
-            except Exception:
-                pass
-        return 0
+                as_float = float(val)
+            except (TypeError, ValueError):
+                return None
+
+            # Reject nonfinite (NaN, ±Infinity).
+            if not _math.isfinite(as_float):
+                return None
+
+            # Reject non-integral (fractional).
+            if as_float != int(as_float):
+                return None
+
+            as_int = int(as_float)
+
+            # Reject non-positive (zero, negative).  No sign correction.
+            if as_int <= 0:
+                return None
+
+            return as_int
+
+        return None
 
     def _broker_order_side_action_from_raw(self, raw: dict) -> str:
         """
@@ -1796,8 +1915,12 @@ class APBrokerReconciler:
             reasons.append("no_exit_action")
 
         requested_qty = self._db_order_requested_qty(order)
+        # #487 FIX: _broker_order_qty_from_raw returns Optional[int].
+        # None = unknown/invalid (bool, signed, fractional, nonfinite, garbage).
+        # Malformed qty contributes ZERO positive authority — no qty_exact, no
+        # qty_mismatch penalty.  Only confirmed valid positive qty participates.
         broker_qty    = self._broker_order_qty_from_raw(raw)
-        if requested_qty > 0 and broker_qty > 0:
+        if requested_qty > 0 and broker_qty is not None:
             if requested_qty == broker_qty:
                 score += 25
                 reasons.append("qty_exact")
@@ -1826,7 +1949,21 @@ class APBrokerReconciler:
 
         return score, reasons
 
-    def _recover_missing_broker_id_exit(self, order: dict, summary: dict) -> bool:
+    def _recover_missing_broker_id_exit(self, order: dict, summary: dict) -> Optional[bool]:
+        """
+        Attempt to recover a missing broker_order_id for an EXIT order.
+
+        Returns Optional[bool] (tri-state):
+          True  — RECOVERED: a matching broker open EXIT was identified and adopted.
+          False — AUTHORITATIVE_NOT_FOUND: broker truth is AVAILABLE but no match found.
+          None  — UNKNOWN: broker truth is unavailable; caller must HOLD, not count as
+                  negative proof.
+
+        BINDING INVARIANT (PR #487):
+          A None return must NEVER advance a negative-proof counter, call
+          mark_exit_replacement_safe, call clear_exit_in_flight, or cancel the
+          local EXIT order.
+        """
         local_id      = str(order.get("local_order_id") or order.get("id") or "")
         contract      = self._norm_contract(order.get("contract") or order.get("symbol") or "")
         requested_qty = self._db_order_requested_qty(order)
@@ -1836,7 +1973,19 @@ class APBrokerReconciler:
         scored: list[tuple[int, str, dict, list[str]]] = []
         rejected_count = 0
 
-        for raw in self._safe_get_broker_open_orders():
+        # #487 FIX: retrieve broker orders with tri-state semantics.
+        broker_orders = self._safe_get_broker_open_orders()
+        if broker_orders is None:
+            # Broker truth is UNKNOWN — do not iterate, do not count as negative proof.
+            log.warning(
+                "[%s] RECONCILER_BROKER_ORDER_TRUTH_UNKNOWN_HOLD | %s | %s | "
+                "broker open-order query returned UNKNOWN; holding recovery; "
+                "will not advance negative-proof counter",
+                self.client_id, contract or "?", local_id or "?",
+            )
+            return None
+
+        for raw in broker_orders:
             status = str(raw.get("status") or raw.get("Status") or "").lower().strip()
             if status and status in BROKER_TERMINAL:
                 continue
@@ -1848,8 +1997,12 @@ class APBrokerReconciler:
                 rejected_count += 1
                 continue
 
+            # #487 FIX: _broker_order_qty_from_raw now returns Optional[int].
+            # None = unknown/invalid qty — not a disqualifying mismatch; scoring
+            # will simply omit qty_exact credit.  Only hard-filter on confirmed
+            # valid positive qty that provably mismatches the requested quantity.
             bqty = self._broker_order_qty_from_raw(raw)
-            if requested_qty > 0 and bqty > 0 and bqty != requested_qty:
+            if requested_qty > 0 and bqty is not None and bqty != requested_qty:
                 continue
 
             action       = self._broker_order_side_action_from_raw(raw)
@@ -3387,12 +3540,24 @@ class APBrokerReconciler:
         pos_id = pos.get("id") or pos.get("position_id")
         pos_id_str = str(pos_id or "")
         active_exit      = self._active_exit_order_exists(position_id=pos_id_str) if pos_id_str else None
+        # #487 FIX: _broker_open_exit_exists_for_contract returns Optional[bool].
+        # None = UNKNOWN — broker truth unavailable; treat as fail-closed (block ghost
+        # close, because we cannot confirm broker is flat without authoritative truth).
         broker_open_exit = self._broker_open_exit_exists_for_contract(contract)
-        if active_exit or broker_open_exit:
+        if active_exit or broker_open_exit or broker_open_exit is None:
             self._ghost_tracker.pop(contract, None)
-            self._alert(
-                f"GHOST_CLOSE_BLOCKED_ACTIVE_EXIT | {contract} | pos={pos_id_str or '?'} | "
+            reason_suffix = (
                 "broker position missing but active local/broker exit evidence exists; keeping DB OPEN"
+                if broker_open_exit is not True or active_exit
+                else "broker position missing but active local/broker exit evidence exists; keeping DB OPEN"
+            )
+            alert_tag = (
+                "GHOST_CLOSE_BLOCKED_BROKER_ORDER_TRUTH_UNKNOWN"
+                if broker_open_exit is None and not active_exit
+                else "GHOST_CLOSE_BLOCKED_ACTIVE_EXIT"
+            )
+            self._alert(
+                f"{alert_tag} | {contract} | pos={pos_id_str or '?'} | {reason_suffix}"
             )
             summary["positions_alerted"] += 1
             return
@@ -4403,12 +4568,30 @@ class APBrokerReconciler:
             # Fail safe: unknown means do not force reopen.
             return {"status": "UNKNOWN_CHECK_FAILED", "error": str(exc)}
 
-    def _broker_open_exit_exists_for_contract(self, contract: str) -> bool:
-        """Return True when broker still shows an open sell-to-close order for contract."""
+    def _broker_open_exit_exists_for_contract(self, contract: str) -> Optional[bool]:
+        """
+        Return whether broker shows an open sell-to-close order for contract.
+
+        Returns Optional[bool] (tri-state, PR #487):
+          True  — broker confirms an open exit-like order exists for the contract.
+          False — broker authoritatively confirms no such order (AVAILABLE_EMPTY).
+          None  — UNKNOWN: broker truth unavailable; callers must treat this as
+                  fail-closed (assume an exit may still exist — do not proceed with
+                  actions that require confirmed broker-flat truth).
+        """
         contract = self._norm_contract(contract)
         if not contract:
             return False
-        for raw in self._safe_get_broker_open_orders():
+        broker_orders = self._safe_get_broker_open_orders()
+        if broker_orders is None:
+            # Broker truth is UNKNOWN — fail-closed.
+            log.warning(
+                "[%s] _broker_open_exit_exists_for_contract: broker UNKNOWN for %s; "
+                "returning None (fail-closed)",
+                self.client_id, contract,
+            )
+            return None
+        for raw in broker_orders:
             status = str(raw.get("status") or raw.get("Status") or "").lower().strip()
             if status in BROKER_TERMINAL:
                 continue
