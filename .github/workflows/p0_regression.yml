@@ -210,6 +210,7 @@ jobs:
             tests/test_p0_tradier_orders_unknown_never_empty.py \
             tests/test_p0_reconciler_signed_position_no_positive_long.py \
             tests/test_p0_malformed_filled_quantity_no_manufactured_close.py \
+            tests/test_p0_filled_quantity_conflict_final_guard.py \
             -v --tb=short --color=yes
 
       - name: Summary
