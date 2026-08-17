@@ -119,6 +119,34 @@ def _dt_age_seconds(dt: Any) -> Optional[float]:
         return None
 
 
+def _looks_like_broker_order_row(d: dict) -> bool:
+    """A dict returned from a broker order-query method is only accepted
+    as a genuine single order row if it carries actual broker-order
+    identity. Without this check, error-shaped payloads such as
+    ``{"error": "rate_limited"}``, ``{"message": "broker unavailable"}``,
+    ``{"status": "ERROR", "reason": "timeout"}``, or an empty ``{}`` would
+    be silently wrapped as ``[result]`` and treated as a successful,
+    authoritative single-order snapshot. Downstream contract/status
+    filtering would then discard that fake row (it matches no real
+    contract and has no real status), producing a confirmed-empty ``[]``
+    match list that looks exactly like a genuine "broker confirms zero
+    open orders" result -- even though the broker query actually failed
+    or returned garbage. That confirmed-but-wrong empty could then
+    authorize replacement-safe as though a real scan had proven no live
+    exit exists.
+    """
+    if not isinstance(d, dict) or not d:
+        return False
+    # An explicit error/message key is disqualifying on its own, even if
+    # the payload happens to also carry an id-like field by coincidence.
+    if any(k in d for k in ("error", "errors", "message")):
+        return False
+    status_val = str(d.get("status") or "").strip().lower()
+    if status_val in ("error", "fail", "failed", "failure"):
+        return False
+    return bool(_broker_order_id(d))
+
+
 def _list_open_orders(broker: Any) -> Optional[list[dict]]:
     """Query the broker for open orders.
 
@@ -154,7 +182,22 @@ def _list_open_orders(broker: Any) -> Optional[list[dict]]:
                 for key in ("orders", "data", "results", "items"):
                     if isinstance(result.get(key), list):
                         return [dict(x) for x in result[key] if isinstance(x, dict)]
-                return [result]
+                if _looks_like_broker_order_row(result):
+                    return [result]
+                # An unrecognized/error-like/empty dict is NOT authoritative
+                # order truth. It is not a recognized container, and it does
+                # not carry genuine broker-order identity -- accepting it as
+                # [result] would let a broker error response masquerade as a
+                # successful single-order snapshot, which downstream
+                # contract/status filtering would then reduce to a
+                # confirmed-empty match list indistinguishable from a real
+                # "broker confirms zero open orders" result.
+                log.warning(
+                    "broker.%s returned an unrecognized/error-like dict "
+                    "shape during autonomous recovery: keys=%s",
+                    method_name, sorted(result.keys()),
+                )
+                continue
             if isinstance(result, list):
                 return [dict(x) for x in result if isinstance(x, dict)]
             # A non-None result that isn't a recognized dict/list shape is

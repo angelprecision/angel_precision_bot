@@ -51,11 +51,14 @@ from typing import Any
 
 os.environ.setdefault("DATABASE_URL", "postgresql://x:x@localhost/x")
 
+import pytest  # noqa: E402
+
 from ap.exit_autonomous_recovery import (  # noqa: E402
     recover_exit_position,
     _list_open_orders,
     _matching_open_exit_orders,
 )
+from ap.brokers.tradier import TradierBroker, TradierConfig  # noqa: E402
 
 _TARGET_OCC = "SMCI260626P00032500"
 
@@ -361,3 +364,187 @@ def test_successful_nonempty_still_finds_and_adopts_exact_live_exit():
     )
     assert len(ee.set_pending_exit_order_calls) == 1
     assert ee.set_pending_exit_order_calls[0]["broker_order_id"] == "matching-bid-1"
+
+
+# =============================================================================
+# PR #481 merge-gate correction (post-Amendment-5): error-like/unrecognized
+# dict payloads from an order-query method must never be silently wrapped
+# as a single authoritative order row.
+# =============================================================================
+#
+# _list_open_orders()'s dict-handling branch previously did:
+#
+#     if isinstance(result, dict):
+#         for key in ("orders", "data", "results", "items"):
+#             if isinstance(result.get(key), list):
+#                 return [...]
+#         return [result]
+#
+# Any dict that wasn't a recognized container -- including an explicit
+# error/message payload like {"error": "rate_limited"} or an empty {} --
+# was blindly wrapped as [result] and treated as a successful single-order
+# snapshot. _matching_open_exit_orders() then filtered that fake row out
+# (it matches no real contract, has no real status), producing a
+# confirmed-empty [] match list indistinguishable from a genuine "broker
+# confirms zero open orders" result -- even though the query actually
+# failed or returned garbage. That confirmed-but-wrong empty could still
+# reach replacement-safe as though a real scan had proven no live exit
+# exists.
+
+import types as _types  # noqa: E402
+
+
+def _error_broker(payload: Any) -> Any:
+    def _list_open_orders(**_kwargs: Any):
+        return payload
+    return _types.SimpleNamespace(list_open_orders=_list_open_orders)
+
+
+@pytest.mark.parametrize("bad_payload,label", [
+    ({"error": "rate_limited"}, "error_key"),
+    ({"errors": ["bad request"]}, "errors_key"),
+    ({"message": "broker unavailable"}, "message_key"),
+    ({}, "empty_dict"),
+    ({"status": "ERROR", "reason": "timeout"}, "status_error_no_identity"),
+])
+def test_error_like_dict_from_query_method_is_unknown_not_empty(bad_payload, label):
+    broker = _error_broker(bad_payload)
+    result = _list_open_orders(broker)
+    assert result is None, (
+        f"[{label}] expected None (UNKNOWN) for error-like/unrecognized dict "
+        f"{bad_payload!r}; got {result!r} -- this must never be silently "
+        f"wrapped as a single authoritative order row"
+    )
+
+
+def test_genuine_single_order_dict_without_error_shape_still_accepted():
+    """Regression guard: a genuine single order dict -- no error/message
+    key, no error status, and carrying real broker-order identity -- must
+    still be accepted as [result], unaffected by the error-shape guard."""
+    order = _stc_order("bid-1", _TARGET_OCC)
+    broker = _error_broker(order)
+    result = _list_open_orders(broker)
+    assert result == [order], f"Expected genuine order dict accepted as [order]; got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: generic path + error-like dict -> HOLD, zero side effects
+# ---------------------------------------------------------------------------
+
+def test_generic_path_error_dict_holds_zero_side_effects():
+    pos = _make_pos(_TARGET_OCC)
+    ee = _ExitEngine()
+
+    def _rate_limited(**_kwargs: Any):
+        return {"error": "rate_limited"}
+
+    canceled: list[str] = []
+
+    def _cancel_order(broker_order_id: str) -> dict:
+        canceled.append(broker_order_id)
+        return {"status": "canceled", "ok": True}
+
+    broker = types.SimpleNamespace(
+        list_open_orders=_rate_limited,
+        get_order=lambda _bid: None,
+        list_positions=lambda: [{"symbol": _TARGET_OCC, "quantity": 1}],
+        cancel_order=_cancel_order,
+    )
+
+    action = recover_exit_position(pos, broker=broker, exit_engine=ee)
+
+    assert action.action == "NOOP", (
+        f"Expected NOOP/HOLD for an error-like dict order-query response; "
+        f"got action={action.action} reason={action.reason}"
+    )
+    assert action.reason == "broker_order_truth_unknown_hold", (
+        f"Expected the UNKNOWN-order-truth hold reason; got reason={action.reason}"
+    )
+    assert not ee.any_replacement_authorized, "must NOT authorize replacement from an error-like dict"
+    assert not ee.any_order_adopted, "must NOT adopt any order from an error-like dict"
+    assert len(ee.mark_position_closed_calls) == 0, "must NOT close the position from an error-like dict"
+    assert len(canceled) == 0, "must NOT cancel any broker order from an error-like dict"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: terminal-old-ID duplicate scan + error-like dict -> HOLD
+# ---------------------------------------------------------------------------
+
+def test_terminal_pending_id_error_dict_holds_zero_side_effects():
+    pos = _make_pos(_TARGET_OCC, pending_broker_order_id="old-terminal-bid")
+    ee = _ExitEngine()
+
+    def _rate_limited(**_kwargs: Any):
+        return {"error": "rate_limited"}
+
+    canceled: list[str] = []
+
+    def _cancel_order(broker_order_id: str) -> dict:
+        canceled.append(broker_order_id)
+        return {"status": "canceled", "ok": True}
+
+    broker = types.SimpleNamespace(
+        list_open_orders=_rate_limited,
+        get_order=lambda _bid: {"id": "old-terminal-bid", "status": "canceled"},
+        list_positions=lambda: [{"symbol": _TARGET_OCC, "quantity": 1}],
+        cancel_order=_cancel_order,
+    )
+
+    action = recover_exit_position(pos, broker=broker, exit_engine=ee)
+
+    assert action.action == "NOOP"
+    assert action.reason == "broker_order_truth_unknown_hold"
+    assert not ee.any_replacement_authorized
+    assert not ee.any_order_adopted
+    assert len(ee.mark_position_closed_calls) == 0
+    assert len(canceled) == 0
+
+
+# ---------------------------------------------------------------------------
+# Real TradierBroker.list_orders() -- missing orders container and
+# authoritative-empty / valid-nonempty regression coverage, per the
+# merge-gate correction's explicit request (also covered in
+# tests/test_p0_tradier_orders_unknown_never_empty.py; duplicated here
+# narrowly since that was the file explicitly named).
+# ---------------------------------------------------------------------------
+
+class _FakeHttpResponse:
+    def __init__(self, payload: Any):
+        self.status_code = 200
+        self._payload = payload
+        self.content = b"{}"
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def _real_tradier_broker(payload: Any) -> TradierBroker:
+    b = TradierBroker(TradierConfig(
+        base_url="https://api.tradier.com",
+        access_token="redacted-test-token",
+        account_id="ACC-LIVE-1",
+    ))
+    b.session = types.SimpleNamespace(
+        get=lambda url, params=None, timeout=None: _FakeHttpResponse(payload)
+    )
+    return b
+
+
+def test_real_adapter_missing_orders_container_raises_not_empty():
+    broker = _real_tradier_broker({"unexpected_key": 1})
+    with pytest.raises(ValueError, match="TRADIER_ORDERS_PAYLOAD_MALFORMED"):
+        broker.list_orders()
+
+
+def test_real_adapter_explicit_authoritative_empty_returns_empty_list():
+    broker = _real_tradier_broker({"orders": "null"})
+    assert broker.list_orders() == []
+
+
+def test_real_adapter_valid_nonempty_payload_preserved():
+    row = _stc_order("bid-1", _TARGET_OCC)
+    broker = _real_tradier_broker({"orders": {"order": row}})
+    assert broker.list_orders() == [row]
