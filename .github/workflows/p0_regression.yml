@@ -208,6 +208,8 @@ jobs:
             tests/test_p0_broker_order_query_unknown_never_empty.py \
             tests/test_p0_scale_out_fill_recovery_no_false_close.py \
             tests/test_p0_tradier_orders_unknown_never_empty.py \
+            tests/test_p0_reconciler_signed_position_no_positive_long.py \
+            tests/test_p0_malformed_filled_quantity_no_manufactured_close.py \
             -v --tb=short --color=yes
 
       - name: Summary

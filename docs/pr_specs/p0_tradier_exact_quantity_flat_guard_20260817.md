@@ -1117,6 +1117,146 @@ required. Post-fix: 25/25 pass in the full file (14 original + 11 new).
   untouched, scale-out routing untouched, no ENTRY/selector/watcher/
   reporting/queue/execution_mode/client_id changes in either.
 
+## Final narrow merge-gate amendment — signed reconciler position classification + strict FILLED quantity parsing
+
+Independent audit against the exact head of Amendment 6 + the prior
+merge-gate correction found two remaining bounded defects, both outside
+`ap/brokers/tradier.py`/`ap/exit_safety.py`/`ap/exit_autonomous_recovery.py`'s
+broker-truth-boundary territory covered by Amendments 4-6: one in
+`ap_reconciler.py`'s own signed-quantity classification, one in a
+different quantity-parsing path inside `ap/exit_autonomous_recovery.py`
+specific to broker-confirmed FILLED status.
+
+### Blocker 1 — signed broker position must not become a positive AP long in the reconciler
+
+**Defect.** `#481` correctly allows legitimate signed broker quantities
+to pass through `ap/brokers/tradier.py::TradierBroker.list_positions()`
+unmodified (Amendment 4's Blocker 3) — negative quantity is real signed
+broker data, not malformed payload. `ap_reconciler.py::
+_broker_position_qty()` still used `abs(int(float(raw)))`, silently
+flipping a negative (short) broker quantity into a positive value — e.g.
+broker qty=-1 became reconciler qty=+1. That positive value could then be
+imported as a new AP long when the DB position was missing, or silently
+"matched" against an existing DB OPEN long as though the broker confirmed
+the same direction of exposure.
+
+**Fix.** `_broker_position_qty()` rewritten to return `Optional[int]`:
+positive int for a valid, non-boolean, finite, integral, strictly
+positive quantity; `None` for negative, zero, boolean, fractional,
+non-finite, or unparseable — never coerced via `abs()`, never collapsed
+to a masking bare `0`. `short_quantity` is deliberately excluded from the
+extraction fallback chain entirely (it represents a magnitude of SHORT
+exposure, not a positive long quantity — including it as a fallback
+source would reproduce the same wrong-direction effect even without any
+sign-flip arithmetic). A companion `_broker_position_qty_is_negative()`
+helper distinguishes an explicit negative-quantity conflict from a
+generic "not positive" case, used only for alert-message specificity.
+
+A subtlety surfaced during implementation, not spelled out in the
+amendment spec itself: simply excluding negative/invalid-quantity rows
+from the `broker_by_contract`/`broker_by_underlying` row-presence
+collection loop (mirroring the old `if qty <= 0: continue` pattern with
+the new `None`-aware check) would have made a genuinely conflicting
+broker row indistinguishable from "broker position missing" — routing it
+toward the ghost-close / flat-conclusion pathway instead of the required
+explicit conflict/hold. Row presence tracking and quantity validity were
+decoupled: the collection loop now tracks every row with an identifiable
+contract/underlying regardless of quantity validity, and the downstream
+DB-matched comparison explicitly checks `if broker_qty is None:`, logging
+a `BROKER_POSITION_QTY_SIGNED_CONFLICT` alert and continuing to track the
+existing DB-open position without reaching any flat conclusion or
+importing a synthetic long. The import-missing pass independently skips
+negative/malformed rows and logs the same conflict alert specifically for
+the negative case. Two further call sites (entry-price derivation,
+partial-close-repair broker-truth check) were fixed for `None`-safety,
+since `None > 0` raises `TypeError` where the old code assumed a plain
+int.
+
+**Tests.** `tests/test_p0_reconciler_signed_position_no_positive_long.py`
+— 32 tests: 15 direct unit tests of `_broker_position_qty()`/
+`_broker_position_qty_is_negative()` covering every required value class;
+required tests 1-6 from the amendment spec, including two variants for
+test 2 (explicit `BROKER_POSITION_QTY_SIGNED_CONFLICT` log-message proof,
+and a regression guard confirming a genuine valid-positive match doesn't
+spuriously trigger the new conflict path).
+
+Fail-first: verified via a full-file `git stash` of `ap_reconciler.py` —
+20/32 failed pre-fix, including all of required tests 1, 2 (both
+variants), and 3.
+
+### Blocker 2 — malformed FILLED exit quantity must not fall back to the entire pending_exit_qty
+
+**Defect.** `ap/exit_autonomous_recovery.py::_qty()` performs logic
+equivalent to `abs(int(float(val)))` and returns `0` on parse failure.
+The FILLED-status branch used `filled_qty = _qty(raw) or pending_exit_qty`.
+Tracing the actual failure modes precisely (more nuanced than the
+amendment's framing) revealed two distinct dangerous outcomes: a
+fractional or non-finite/unparseable value collapses to a falsy `0` via
+truncation or the exception-caught fallback, triggering the `or
+pending_exit_qty` fallback and manufacturing a full close from unproven
+quantity truth; a boolean or negative value produces a believable-looking
+*wrong* nonzero value via `abs()`/numeric coercion (`True` → `1`,
+`-1` → `1`), silently applying an incorrect partial fill without ever
+triggering the fallback at all.
+
+**Fix.** A new, dedicated `_strict_filled_exit_qty()` parser — separate
+from the shared, more lenient `_qty()` helper, which remains unchanged
+since it's used by two other call sites for order-adoption quantity
+tracking (a different concern, out of this amendment's scope). The new
+parser returns `(qty, field_was_present)`, cleanly distinguishing genuine
+absence (no recognized quantity key present at all — narrowly preserves
+the existing fallback to the position's own `pending_exit_qty`, justified
+since `broker_order_id` + `status=="filled"` for the exact submitted
+order already establishes strong identity) from present-but-malformed
+(boolean, zero, negative, fractional, non-finite, unparseable — returns
+`NOOP`/`broker_filled_quantity_malformed_hold`, never falls back, never
+applies any fill, never calls `mark_position_closed`). Only the first
+recognized key carrying a non-empty value determines the outcome, so a
+corrupt primary field can't be papered over by a coincidentally-valid
+secondary field.
+
+**Tests.**
+`tests/test_p0_malformed_filled_quantity_no_manufactured_close.py` — 13
+tests: the full required malformed-value matrix (`False`, `True`, `0.5`,
+`-1`, `-0.5`, `NaN`, `Infinity`, `"garbage"`) each holding with
+`quantity_remaining` unchanged and zero fill application; documented
+ABSENT-quantity fallback preservation; valid partial (remaining 4→3,
+`OPEN`) and valid full (remaining 4→0, `CLOSED`) regression cases;
+duplicate-FILLED-callback idempotency for both a valid repeat and a
+malformed second report following a valid first report.
+
+Fail-first: verified via a targeted temporary revert of just the
+`st == "filled"` quantity-computation preamble (not a full-file stash,
+since Blocker 1's independent fix in a different file needed to remain
+untouched and this file also carries Amendments 1, 3, 5, and 6's
+unrelated fixes) — 9/13 failed pre-fix, with exact confirmed values:
+`False`/`0.5`/`-0.5`/`NaN`/`Infinity`/`"garbage"` all manufactured a full
+false close (`quantity_remaining` reached `0`, `closed=True`); `True` and
+`-1` silently applied a wrong partial fill (`quantity_remaining` reduced
+to `3` via a coerced/sign-flipped quantity of `1`) rather than holding.
+
+### Combined validation
+
+- Full PR-#481-targeted suite (16 files: original fix + all six
+  amendments + the two merge-gate corrections + this final narrow
+  amendment + `test_p0_broker_owned_exit_requested_recovery.py` +
+  `test_p0_broker_owned_exit_recovery_preflight.py` +
+  `test_p0_exit_closed_guard_and_circuit_breaker.py`): 493 passed, 1
+  skipped, 0 failed.
+- `tests/test_p0_broker_position_unavailable_not_flat.py` (#478)
+  re-verified in isolation: 69/69 passed, unmodified.
+- Explicitly requested canonical exit-fill suites
+  (`test_p0_canonical_exit_fill_truth.py` +
+  `test_p0_partial_exit_ownership_guard.py` +
+  `test_p0_exit_decision_idempotency_guard.py`): 172 passed, 2 skipped, 0
+  failed.
+- Scope discipline: `git diff --stat` for this amendment shows exactly
+  the two production files budgeted — `ap_reconciler.py` and
+  `ap/exit_autonomous_recovery.py`. No `ap/brokers/tradier.py` or
+  `ap/exit_safety.py` change was needed. No ENTRY, selector, watcher,
+  signals, FVG, position sizing, reporting, queue, threshold, client_id,
+  or execution_mode change.
+
 ## Required tests — status
 
 All required fail-first and regression coverage across the original fix
