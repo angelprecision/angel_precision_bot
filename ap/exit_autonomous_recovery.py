@@ -119,7 +119,25 @@ def _dt_age_seconds(dt: Any) -> Optional[float]:
         return None
 
 
-def _list_open_orders(broker: Any) -> list[dict]:
+def _list_open_orders(broker: Any) -> Optional[list[dict]]:
+    """Query the broker for open orders.
+
+    P0 amendment 5 (blocker 2): broker-order truth must be tri-state, not
+    binary. This function returns exactly one of:
+
+      - a list (possibly empty)  -> AVAILABLE. A query succeeded and
+        returned a usable payload. An empty list is authoritative negative
+        proof: the broker confirms zero open orders exist.
+      - ``None``                 -> UNKNOWN / UNAVAILABLE. Every candidate
+        query method was either missing, raised, returned ``None``, or
+        returned a payload shape this function cannot interpret. This is
+        NOT proof that zero matching exit orders exist -- callers must
+        NEVER collapse this into ``[]`` and treat it as negative broker-
+        order proof. Doing so previously let a broker query failure be
+        silently reinterpreted as "no live exit exists", authorizing a
+        duplicate replacement exit while the real one was still working
+        at the broker.
+    """
     for method_name in ("list_open_orders", "get_open_orders", "list_orders", "orders"):
         method = getattr(broker, method_name, None)
         if not callable(method):
@@ -139,9 +157,18 @@ def _list_open_orders(broker: Any) -> list[dict]:
                 return [result]
             if isinstance(result, list):
                 return [dict(x) for x in result if isinstance(x, dict)]
+            # A non-None result that isn't a recognized dict/list shape is
+            # unusable -- not the same as a confirmed-empty response.
+            log.warning(
+                "broker.%s returned unusable payload type=%s during autonomous recovery",
+                method_name, type(result).__name__,
+            )
         except Exception as exc:
             log.warning("broker.%s failed during autonomous recovery: %s", method_name, exc)
-    return []
+    # Every candidate method was unavailable, raised, returned None, or
+    # returned an unusable shape. Broker-order truth is UNKNOWN -- never
+    # normalize this to [] and use it as negative proof.
+    return None
 
 
 def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
@@ -162,7 +189,7 @@ def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
         return None
 
 
-def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> list[tuple[str, dict]]:
+def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> Optional[list[tuple[str, dict]]]:
     # P0 amendment 3: defense-in-depth. An empty/unproven contract identity
     # must NEVER act as a wildcard match across every open exit-like broker
     # order in the account. Without this guard, `if contract and ...` short-
@@ -174,10 +201,26 @@ def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id:
     # early-return alone: an empty result here must not be silently
     # reinterpreted by a caller as "no matches -> replacement-safe" when
     # the real reason is "identity unknown, scan never meaningfully ran".
+    #
+    # This early return is a confirmed EMPTY (by construction: we refuse
+    # to scan at all), not UNKNOWN -- it is a distinct invariant from
+    # amendment 5's broker-order-query tri-state below, and takes
+    # precedence over it.
     if not contract:
         return []
+    # P0 amendment 5 (blocker 2): broker-order query truth is tri-state.
+    # _list_open_orders() returns None for UNKNOWN/UNAVAILABLE (query
+    # failure, no usable method, unusable payload) -- this must propagate
+    # as None here too, never be silently treated as "confirmed zero open
+    # orders". Every caller of this function must check `is None`
+    # explicitly rather than relying on a falsy/empty-list check, which
+    # cannot distinguish "confirmed no matches" from "never actually
+    # looked".
+    open_orders = _list_open_orders(broker)
+    if open_orders is None:
+        return None
     matches: list[tuple[str, dict]] = []
-    for raw in _list_open_orders(broker):
+    for raw in open_orders:
         if contract and _contract(raw) != contract:
             continue
         if not _is_exit_like(raw):
@@ -345,6 +388,80 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                             break
                     except Exception:
                         pass
+                # P0 amendment 5 (blocker 3): a broker "filled" status on
+                # the pending exit order does NOT by itself prove the
+                # position's ENTIRE remaining exposure was closed. A
+                # SCALE_OUT tranche can independently report "filled" for
+                # just that tranche's quantity while genuine broker
+                # exposure remains open. Blindly calling
+                # mark_position_closed() here set quantity_remaining=0 and
+                # pos.closed=True unconditionally, which could silently
+                # drop real remaining exposure from management.
+                #
+                # Reuse the existing canonical partial-fill/full-close
+                # classification (note_partial_exit_fill) instead of
+                # duplicating a second scale-out algorithm here. That
+                # helper is idempotent per order-key cumulative-fill
+                # tracking (safe against duplicate FILLED callbacks/
+                # recovery passes), reduces quantity_remaining by the
+                # actual fill delta, and only marks the position closed
+                # when quantity_remaining reaches zero -- exactly the
+                # semantics this recovery path needs.
+                if exit_engine and hasattr(exit_engine, "note_partial_exit_fill"):
+                    # Pass filled_qty as CUMULATIVE for this specific
+                    # broker_order_id, not as an incremental qty_filled
+                    # delta. A single Tradier order's reported fill
+                    # quantity at "filled" terminal status is fixed/final
+                    # for that order_key -- using the cumulative-tracking
+                    # path in note_partial_exit_fill (keyed by
+                    # broker_order_id) makes a duplicate FILLED callback
+                    # or duplicate recovery pass for the SAME order
+                    # correctly compute delta=0 (already applied) instead
+                    # of double-decrementing quantity_remaining. Passing
+                    # this as a plain qty_filled increment would NOT be
+                    # idempotent against a repeated call.
+                    exit_engine.note_partial_exit_fill(
+                        pid,
+                        cumulative_filled=filled_qty,
+                        fill_price=fill_price,
+                        local_order_id=local_id,
+                        broker_order_id=pending_broker_id,
+                    )
+                    if bool(getattr(pos, "closed", False)):
+                        return RecoveryAction(
+                            "MARKED_CLOSED", "broker_order_filled_full_close",
+                            pid, local_id, pending_broker_id,
+                            {"status": st, "filled_qty": filled_qty, "quote_health": qh},
+                        )
+                    return RecoveryAction(
+                        "PARTIAL_FILL_APPLIED", "broker_order_filled_partial_scale_out",
+                        pid, local_id, pending_broker_id,
+                        {"status": st, "filled_qty": filled_qty, "quote_health": qh},
+                    )
+
+                # Fallback for an exit_engine that does not implement the
+                # canonical partial-fill helper. Only allow a full close
+                # when the fill quantity is PROVEN to consume all
+                # remaining exposure (quantity_remaining is tracked and
+                # the fill covers it); otherwise never fabricate a full
+                # close from an uncertain/partial fill -- hold instead.
+                # When quantity_remaining isn't tracked on this position
+                # object at all, we have no better information than the
+                # pre-amendment behavior, so we fall through to the
+                # existing mark_position_closed() call unchanged.
+                _remaining_before = getattr(pos, "quantity_remaining", None)
+                if _remaining_before is not None and int(filled_qty) < int(_remaining_before or 0):
+                    log.warning(
+                        "exit_autonomous_recovery: pid=%s broker FILLED qty=%s is less than "
+                        "quantity_remaining=%s and no canonical partial-fill helper is "
+                        "available on this exit_engine — NOOP/HOLD rather than fabricate a full close",
+                        pid, filled_qty, _remaining_before,
+                    )
+                    return RecoveryAction(
+                        "NOOP", "broker_order_filled_partial_no_canonical_handler_hold",
+                        pid, local_id, pending_broker_id,
+                        {"status": st, "filled_qty": filled_qty, "quantity_remaining": _remaining_before, "quote_health": qh},
+                    )
                 if exit_engine and hasattr(exit_engine, "mark_position_closed"):
                     exit_engine.mark_position_closed(
                         pid,
@@ -384,6 +501,30 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                         {"status": st, "quote_health": qh},
                     )
                 other_matches = _matching_open_exit_orders(broker, contract, exclude_broker_id=pending_broker_id)
+                # P0 amendment 5 (blocker 2): broker-order truth is
+                # UNKNOWN -- the query failed, no usable method existed,
+                # or the payload was unusable. This must NEVER be treated
+                # as "confirmed no other live exit exists". Without this
+                # check, `len(other_matches)` on a None would raise, or
+                # (if this were ever weakened to a bare `if not
+                # other_matches` check) None would be silently treated
+                # exactly like a confirmed-empty [] and fall through to
+                # _mark_replacement_safe() below -- authorizing a
+                # duplicate replacement exit while the real one might
+                # still be working at the broker, unseen only because the
+                # query failed.
+                if other_matches is None:
+                    log.warning(
+                        "exit_autonomous_recovery: broker open-order truth UNKNOWN for pid=%s "
+                        "during terminal-status duplicate-exit scan — NOOP/HOLD",
+                        pid,
+                    )
+                    return RecoveryAction(
+                        "NOOP",
+                        "broker_order_truth_unknown_hold",
+                        pid, local_id, pending_broker_id,
+                        {"status": st, "quote_health": qh},
+                    )
                 if len(other_matches) == 1:
                     other_bid, other_raw = other_matches[0]
                     if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
@@ -434,6 +575,24 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
         )
 
     matches = _matching_open_exit_orders(broker, contract)
+
+    # P0 amendment 5 (blocker 2): broker-order truth is UNKNOWN -- must
+    # NEVER be treated as "confirmed zero matching exit orders". Without
+    # this explicit check, a None here would fall through toward the
+    # negative-proof block below as though the scan had genuinely found
+    # nothing, when it never actually looked.
+    if matches is None:
+        log.warning(
+            "exit_autonomous_recovery: broker open-order truth UNKNOWN for pid=%s "
+            "during open-order scan — NOOP/HOLD",
+            pid,
+        )
+        return RecoveryAction(
+            "NOOP",
+            "broker_order_truth_unknown_hold",
+            pid, local_id, pending_broker_id,
+            {"contract": contract, "quote_health": qh},
+        )
 
     if len(matches) == 1:
         recovered_broker_id, raw = matches[0]

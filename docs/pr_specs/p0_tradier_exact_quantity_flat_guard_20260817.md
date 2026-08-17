@@ -822,13 +822,181 @@ confirming the resolver's per-row exact-match filtering already correctly
 isolated unrelated rows — the defect was purely adapter-scoped). Post-fix:
 48/48 pass.
 
+## Amendment 5 — account-wide fractional poisoning + broker order query tri-state + SCALE_OUT fill routing
+
+Independent audit against the exact head of Amendment 4 found three
+further P0 defects, all confirmed against the live code before any
+change was made, and all confirmed with proper fail-first evidence
+(including, for Blocker 3, temporarily reverting just the affected code
+block to capture failure evidence without losing Blocker 2's already-
+verified fix in the same file). Amendments 1-4 were explicitly preserved
+and re-verified; none were reverted or weakened.
+
+### Blocker 1 — account-wide fractional quantity poisoned exact-OCC broker truth
+
+**Defect.** The same class of defect Amendment 4 fixed for negative
+quantity also existed for fractional quantity:
+`ap/brokers/tradier.py::list_positions()` raised
+`TRADIER_POSITIONS_PAYLOAD_MALFORMED: fractional option quantity`
+globally the moment any row anywhere in the account carried a
+non-integral quantity. Tradier accounts may legitimately hold fractional
+EQUITY positions (fractional-share programs); one unrelated fractional
+row made the actual AP target OCC contract's broker truth unavailable,
+even though the target's own row could be a perfectly valid whole-integer
+quantity.
+
+**Fix.** Removed the global `quantity.is_integer()` raise. The resolver's
+`_extract_long_position_qty()` already correctly returned `None` (never a
+truncated int) for a fractional quantity on the row that exact-matches
+the AP target contract — that protection was already in place and
+required no change. Boolean and non-finite (NaN/inf) quantities remain
+globally rejected, since those represent genuine structural garbage
+regardless of which row carries them.
+
+**Tests.** Added to the existing `tests/test_p0_unrelated_short_position_
+no_poison.py` file (per the amendment's explicit instruction to extend
+the Blocker-3 suite rather than create a new file for this closely
+related invariant): 10 new tests covering unrelated fractional equity
+alongside a valid target, target absence with an unrelated fractional
+row present, the real adapter not raising for an unrelated fractional
+row, the target's own fractional and negative-fractional quantity
+resolving UNKNOWN, and bool/NaN/±inf regression coverage. Two
+pre-existing tests in `tests/test_p0_tradier_exact_quantity_flat_guard.py`
+asserted the now-superseded behavior and were rewritten:
+`test_fractional_quantity_raises_at_adapter` →
+`test_fractional_quantity_does_not_raise_at_adapter`, and
+`test_negative_fractional_quantity_raises_at_adapter` →
+`test_negative_fractional_quantity_does_not_raise_at_adapter` (both
+values now pass through as valid signed/fractional broker data).
+
+Fail-first: 2/11 new tests failed pre-fix (the two direct adapter-level
+tests — all resolver-level tests already passed, confirming the defect
+was purely adapter-scoped, exactly mirroring Blocker 3's shape).
+Post-fix: 21/21 pass in the combined file (11 Blocker-3 + 10 Blocker-1).
+
+### Blocker 2 — broker open-order query failure could become false "no exit exists" truth
+
+**Defect.** `ap/exit_autonomous_recovery.py::_list_open_orders()` caught
+every broker-order query failure mode — exceptions, `None` returns,
+unusable/malformed payloads, no supported query method available — and
+returned `[]` in every case. That result was indistinguishable from an
+authoritative successful broker response confirming zero open orders
+exist. If a real live exit order for the position's exact contract was
+still OPEN/WORKING at the broker but the query happened to fail during a
+recovery pass, the failure was silently reinterpreted as "no live exit
+exists," and autonomous recovery could authorize a duplicate replacement
+exit while the real one was still working — violating the module's own
+stated rule: "If broker truth is ambiguous, alert/no-op."
+
+**Fix.** `_list_open_orders()` now returns `Optional[list[dict]]`: a list
+(possibly empty) for `AVAILABLE_NONEMPTY`/`AVAILABLE_EMPTY`, `None` for
+`UNKNOWN`/`UNAVAILABLE`. `_matching_open_exit_orders()` propagates `None`
+(distinct from its pre-existing Amendment-3 empty-contract guard, which
+still returns confirmed `[]` by construction since it never even attempts
+a scan). Both call sites in `recover_exit_position()` — the
+terminal-pending-broker-id duplicate-exit scan, and the generic
+missing-broker-id scan — now explicitly check `is None` and return
+`NOOP`/`broker_order_truth_unknown_hold` rather than letting `None` fall
+through toward `_mark_replacement_safe()`.
+
+**Tests.** `tests/test_p0_broker_order_query_unknown_never_empty.py` — 14
+tests: direct unit coverage of `_list_open_orders()`'s tri-state contract
+(raises, returns `None`, returns an unusable shape, no method available,
+all methods fail — each → `None`; genuine empty/nonempty → the list
+itself), `_matching_open_exit_orders()` propagation, and full
+`recover_exit_position()` end-to-end coverage of both call sites holding
+on `UNKNOWN`, plus normal-path preservation for genuinely successful
+empty and nonempty scans.
+
+Fail-first: 9/14 failed pre-fix, with the two end-to-end cases showing
+the exact money-path consequence: `action=REPLACEMENT_SAFE` where `NOOP`
+was required, for both the generic-path and terminal-status-duplicate-
+scan call sites.
+
+### Blocker 3 — broker-confirmed FILLED SCALE_OUT could full-close remaining exposure
+
+**Defect.** `recover_exit_position()`'s `st == "filled"` branch
+unconditionally called `exit_engine.mark_position_closed()` for any
+broker-confirmed fill on the pending exit order — which hard-sets
+`quantity_remaining = 0` and `closed = True`. A `SCALE_OUT` tranche
+independently reports `"filled"` for just that tranche's quantity while
+genuine broker exposure remains open on the rest of the position (e.g. a
+4-contract position with a 1-contract `SCALE_OUT` order filling would
+silently drop the other 3 contracts from management).
+
+**Fix.** The `st == "filled"` branch now routes through the existing
+canonical partial-fill/full-close classification,
+`ap_exit_engine.py::APExitEngine.note_partial_exit_fill()`, rather than
+duplicating a second scale-out algorithm in autonomous recovery. That
+helper already correctly reduces `quantity_remaining` by the actual fill
+delta and only marks the position closed when `quantity_remaining`
+reaches zero. The fill quantity is passed as `cumulative_filled` (not
+`qty_filled`) keyed by `broker_order_id`, so a duplicate `FILLED`
+callback or duplicate recovery pass for the same order computes
+`delta = 0` and is correctly ignored rather than double-decrementing —
+this was a deliberate choice after tracing `note_partial_exit_fill()`'s
+own cumulative-vs-incremental branching, since passing a plain
+incremental `qty_filled` would NOT have been idempotent against a
+repeated call. A bounded fallback preserves exact pre-amendment-5
+behavior for exit-engine implementations that don't provide
+`note_partial_exit_fill()`: if `quantity_remaining` is tracked on the
+position and proves the fill is partial, hold (`NOOP`) rather than
+fabricate a close; if `quantity_remaining` isn't tracked at all (as in
+several pre-existing test doubles from earlier amendments), fall through
+to the original `mark_position_closed()` call unchanged, since there is
+no information available to determine partial-vs-full in that case.
+
+**Tests.** `tests/test_p0_scale_out_fill_recovery_no_false_close.py` — 9
+tests covering cases A-G from the amendment spec: partial fills of 1 and
+2 out of 4 contracts remain open with correct `quantity_remaining`
+(cases A/B); a second scale-out tranche under a different
+`broker_order_id` after a prior partial fill applies correctly with no
+double subtraction (case C); a fill that exactly consumes all remaining
+exposure closes (case D); a duplicate recovery pass for the same order is
+idempotent (case E); an ambiguous/missing fill quantity falls back to
+`pending_exit_qty` and is still routed through the canonical partial-fill
+path rather than fabricating a close (case F); and two normal-path
+preservation variants for exit-engine doubles without the canonical
+helper — one where `quantity_remaining` proves the fill partial and
+recovery holds, one where it's genuinely a full fill and the legacy path
+still closes, and one full regression guard for position objects that
+don't track `quantity_remaining` at all (preserving exact prior behavior
+for every pre-existing amendment 1-4 test).
+
+Fail-first: 6/9 failed pre-fix. Verified via a targeted temporary revert
+of just the `st == "filled"` code block (rather than a full-file
+`git stash`, since Blocker 2's already-verified fix lives in the same
+file and needed to remain active) — pre-fix, a 1-of-4 `SCALE_OUT` fill
+resulted in `quantity_remaining == 0` and `closed == True`, confirming
+the exact defect: 3 real contracts silently dropped from management.
+Post-fix: 9/9 pass.
+
+### Combined validation
+
+- Full PR-#481-targeted suite (12 files: original fix + Amendments 1-5 +
+  `test_p0_broker_owned_exit_requested_recovery.py` +
+  `test_p0_broker_owned_exit_recovery_preflight.py`): 387 passed, 1
+  skipped, 0 failed.
+- `tests/test_p0_broker_position_unavailable_not_flat.py` (#478)
+  re-verified in isolation, post all five amendments: 69/69 passed,
+  unmodified.
+- Exit-fill-adjacent blast-radius check (`test_p0_canonical_exit_fill_
+  truth.py` + `test_p0_partial_exit_ownership_guard.py` +
+  `test_p0_exit_decision_idempotency_guard.py`, run specifically because
+  Blocker 3 touches fill-routing logic): 172 passed, 2 skipped, 0 failed.
+- Scope discipline: `git diff --stat` for this amendment shows exactly
+  the two production files the amendment specified —
+  `ap/brokers/tradier.py`, `ap/exit_autonomous_recovery.py` — plus the
+  required pre-existing test rewrites. `ap_reconciler.py` was explicitly
+  NOT touched, per the amendment's own non-scope finding.
+
 ## Required tests — status
 
 All required fail-first and regression coverage across the original fix
-and all four amendments is implemented in seven dedicated files:
+and all five amendments is implemented in nine dedicated files:
 
 - `tests/test_p0_tradier_exact_quantity_flat_guard.py` (33 tests) —
-  original adapter/resolver fix (one test rewritten under Amendment 4;
+  original adapter/resolver fix (two tests rewritten under Amendment 5;
   see above).
 - `tests/test_p0_exit_autonomous_recovery_quantity_guard.py` (15 tests) —
   Amendment 1.
@@ -838,10 +1006,15 @@ and all four amendments is implemented in seven dedicated files:
   — Amendment 3.
 - `tests/test_p0_invalid_nonempty_contract_never_flat.py` (29 tests),
   `tests/test_p0_tradier_order_shape_option_symbol.py` (8 tests),
-  `tests/test_p0_unrelated_short_position_no_poison.py` (11 tests) —
-  Amendment 4 (Blockers 1, 2, 3 respectively).
+  `tests/test_p0_unrelated_short_position_no_poison.py` (21 tests,
+  includes Amendment 5's Blocker 1 coverage) — Amendment 4 (Blockers 1,
+  2, 3 respectively).
+- `tests/test_p0_broker_order_query_unknown_never_empty.py` (14 tests),
+  `tests/test_p0_scale_out_fill_recovery_no_false_close.py` (9 tests) —
+  Amendment 5 (Blockers 2, 3 respectively; Blocker 1 folded into the
+  existing Amendment-4 file above).
 
-All seven files are included in `.github/workflows/p0_regression.yml` and
+All nine files are included in `.github/workflows/p0_regression.yml` and
 run as part of the exact-head CI P0 Regression Suite.
 
 Original fix's dedicated suite breakdown:
@@ -991,6 +1164,6 @@ execute as part of that workflow.
 New forward-fix branch/PR from current main. #478 is not reverted or
 rewritten. Branch was rebased onto post-#479 main
 (`d0d37e79ae698e604eb8080065d2314b161de351`) with zero conflicts; all
-four amendments were implemented and validated against the rebased
+five amendments were implemented and validated against the rebased
 branch. Do not merge, deploy, or mark ready for review without Angel's
 explicit authorization.

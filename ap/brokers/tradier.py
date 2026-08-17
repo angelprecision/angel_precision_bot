@@ -616,16 +616,27 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError(
                     "TRADIER_POSITIONS_PAYLOAD_MALFORMED: non-finite quantity"
                 )
-            if not quantity.is_integer():
-                # A fractional option-contract count is not a valid whole
-                # position size. int(0.5) == 0 would otherwise silently
-                # truncate into a believable "flat" quantity downstream.
-                # This check runs BEFORE the sign is ever examined, so a
-                # negative-and-fractional quantity (e.g. -0.5) still raises
-                # here regardless of the P0 amendment 4 sign change below.
-                raise ValueError(
-                    "TRADIER_POSITIONS_PAYLOAD_MALFORMED: fractional option quantity"
-                )
+            # P0 amendment 5 (blocker 1): DO NOT raise for fractional
+            # quantity here either, for the same reason as the amendment-4
+            # negative-quantity change immediately below. Tradier accounts
+            # may legitimately hold fractional EQUITY positions (fractional
+            # share programs); this method reads the ENTIRE brokerage
+            # account in one call, so raising for ANY fractional row
+            # anywhere poisoned the WHOLE snapshot -- including the actual
+            # AP target OCC contract's own row, which could be a perfectly
+            # valid whole-integer quantity. The adapter has no way to know
+            # whether a given row is the exact AP option contract, an
+            # unrelated equity, or a legitimate fractional share position.
+            # BROKER PAYLOAD VALIDITY (bool/missing/unparseable/NaN/inf --
+            # genuine structural garbage, checked above and still rejected
+            # globally) is a separate concern from AP EXACT-CONTRACT
+            # OPTION-QUANTITY AUTHORITY. Angel Precision's rejection of a
+            # fractional quantity on its own long-only option contract
+            # happens at the resolver boundary
+            # (ap/exit_safety.py::_extract_long_position_qty, already
+            # returns None -- never a truncated int -- for a fractional
+            # quantity on the row that exact-matches the target), which is
+            # unaffected by this adapter-level change.
             # P0 amendment 4 (blocker 3): DO NOT raise for negative
             # quantity here. Tradier position quantity is signed broker
             # data — negative legitimately represents a short position —
@@ -634,9 +645,9 @@ class TradierBroker(BrokerAdapter):
             # poisoned the WHOLE snapshot for every other row, including
             # the actual AP target contract's own row, which could be
             # perfectly valid. BROKER PAYLOAD VALIDITY (bool/missing/
-            # unparseable/NaN/inf/fractional, checked above -- genuine
-            # structural garbage) is a separate concern from AP EXACT-
-            # CONTRACT LONG-ONLY LIFECYCLE AUTHORITY. Angel Precision's
+            # unparseable/NaN/inf, checked above -- genuine structural
+            # garbage) is a separate concern from AP EXACT-CONTRACT
+            # LONG-ONLY LIFECYCLE AUTHORITY. Angel Precision's
             # long-only rejection of a negative quantity happens at the
             # resolver boundary for the EXACT target contract being
             # resolved (ap/exit_safety.py::_extract_long_position_qty),

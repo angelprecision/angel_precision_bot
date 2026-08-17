@@ -304,10 +304,18 @@ def test_boolean_true_quantity_raises_at_adapter():
         b.list_positions()
 
 
-def test_fractional_quantity_raises_at_adapter():
+def test_fractional_quantity_does_not_raise_at_adapter():
+    # P0 amendment 5 (blocker 1): fractional quantity is legitimate signed
+    # broker data too (fractional-share equity positions are real) and
+    # must no longer raise at the adapter boundary -- doing so poisoned
+    # the ENTIRE account snapshot for any unrelated row. Rejection of a
+    # fractional quantity as UNKNOWN/never-flat for the EXACT AP target
+    # option contract happens at the resolver boundary
+    # (ap/exit_safety.py::_extract_long_position_qty), not here.
     b = _broker(_payload(_row(PUT_CONTRACT, 0.5)))
-    with pytest.raises(ValueError, match="TRADIER_POSITIONS_PAYLOAD_MALFORMED"):
-        b.list_positions()
+    rows = b.list_positions()
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == 0.5
 
 
 def test_negative_integer_quantity_does_not_raise_at_adapter():
@@ -325,12 +333,18 @@ def test_negative_integer_quantity_does_not_raise_at_adapter():
     assert rows[0]["quantity"] == -1.0
 
 
-def test_negative_fractional_quantity_raises_at_adapter():
+def test_negative_fractional_quantity_does_not_raise_at_adapter():
+    # P0 amendment 5 (blocker 1): with both the fractional and negative
+    # global rejections removed at the adapter boundary (amendments 4 and
+    # 5), a negative-and-fractional quantity is simply valid signed
+    # fractional broker data too -- e.g. a fractional-share equity
+    # position that has gone short. It passes through unraised, exactly
+    # like -1 and 0.5 individually. Rejection for the EXACT AP target
+    # option contract happens at the resolver boundary.
     b = _broker(_payload(_row(PUT_CONTRACT, -0.5)))
-    # Fractional check runs before sign check; either deterministic error is
-    # acceptable as long as it raises and never coerces to a believable qty.
-    with pytest.raises(ValueError, match="TRADIER_POSITIONS_PAYLOAD_MALFORMED|TRADIER_POSITIONS_PAYLOAD_CONFLICT"):
-        b.list_positions()
+    rows = b.list_positions()
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == -0.5
 
 
 def test_explicit_zero_quantity_does_not_raise_at_adapter():
