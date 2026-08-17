@@ -139,6 +139,11 @@ def _order(**overrides):
         "signal_id": SIGNAL_ID,
         "plan_id": PLAN_ID,
         "filled_qty": 1,
+        # #473 amendment: _validate_filled_entry_admission requires a proven
+        # requested quantity before any terminalization mutation is allowed.
+        # orders.qty is a real column; the original fixture omitted it because
+        # the admission gate did not yet exist on main.
+        "qty": 1,
     }
     row.update(overrides)
     return row
