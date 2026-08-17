@@ -562,43 +562,53 @@ class TradierBroker(BrokerAdapter):
         terminalize a still-open live position under
         ``SYNTHETIC_POSITION_STALE_BROKER_FLAT``.
 
-        Contract:
+        Contract (final effective contract, post-Amendment-4/5; supersedes any
+        earlier docstring text implying quantity is always integer-valued or that
+        fractional/negative quantity is rejected here):
           - UNAVAILABLE  (401/403/429/5xx, connect/read timeout, connection error):
             ``_get`` raises and the exception propagates. Never ``[]``. No retries
             are added here — this changes truth semantics, not transport policy.
           - MALFORMED    (a successful response that cannot be interpreted as the
-            supported Tradier positions shape): raise a deterministic
+            supported Tradier positions shape, or a row whose quantity cannot be
+            truthfully established as *any* numeric value): raise a deterministic
             ``ValueError('TRADIER_POSITIONS_PAYLOAD_MALFORMED: ...')``. Never coerce
             malformed truth into flatness. This includes: a missing ``positions``
             key, a non-empty ``positions`` dict missing its ``position`` key, a
             falsy-but-not-authoritative-empty ``positions``/row shape
             (``[]``, ``False``, ``0``), a position row missing ``symbol`` or
-            ``quantity``, a non-finite (``NaN``/``inf``) quantity, a boolean
+            ``quantity``, a non-finite (``NaN``/``inf``) quantity, and a boolean
             quantity (``bool`` is numeric in Python — ``float(False) == 0.0``
-            — and must never masquerade as a real quantity), and a fractional
-            (non-integer) quantity. These represent genuine structural payload
-            garbage and are rejected regardless of which row they appear on.
-          - SIGNED QUANTITY (P0 amendment 4, blocker 3): a negative quantity is
-            NOT rejected here. Tradier position quantity is signed broker data —
-            negative legitimately represents a short position, and this method
-            reads the ENTIRE brokerage account in one call. An earlier version of
-            this method raised ``TRADIER_POSITIONS_PAYLOAD_CONFLICT`` for the
-            whole snapshot the moment ANY row anywhere in the account carried a
-            negative quantity, which meant one unrelated legitimate short
-            position (a different underlying, or a short option Angel Precision
-            never opened) made broker truth UNAVAILABLE for the actual AP target
-            contract being resolved — even though the target's own row was
-            perfectly valid. BROKER PAYLOAD VALIDITY (structural garbage, above)
-            is a separate concern from AP EXACT-CONTRACT LONG-ONLY LIFECYCLE
-            AUTHORITY: a negative quantity now passes through this adapter as
-            valid signed data for whichever row carries it. Rejecting a negative
-            quantity as UNKNOWN/never-flat for AP's own long-only target contract
-            happens at the resolver boundary
-            (``ap/exit_safety.py::_extract_long_position_qty`` /
-            ``resolve_exit_broker_truth``), which examines only the row that
-            exact-matches the contract actually being resolved — never here,
-            where "this row" and "the target AP is resolving" are not yet known
-            to be the same thing.
+            — and must never masquerade as a real quantity). These represent
+            genuine structural payload garbage and are rejected regardless of
+            which row they appear on. **Fractional and negative quantity are
+            NOT in this list** — see SIGNED/FRACTIONAL QUANTITY below.
+          - SIGNED / FRACTIONAL QUANTITY (P0 amendment 4 blocker 3; amendment 5
+            blocker 1): neither a negative nor a fractional quantity is rejected
+            here. Tradier position quantity is signed, and Tradier accounts may
+            legitimately hold fractional equity positions (fractional-share
+            programs) alongside AP's whole-contract options — this method reads
+            the ENTIRE brokerage account in one call. Earlier versions of this
+            method raised ``TRADIER_POSITIONS_PAYLOAD_CONFLICT``/
+            ``TRADIER_POSITIONS_PAYLOAD_MALFORMED`` for the whole snapshot the
+            moment ANY row anywhere in the account carried a negative or
+            fractional quantity, which meant one unrelated legitimate short
+            position or fractional-share equity holding (a different underlying,
+            or a position Angel Precision never opened) made broker truth
+            UNAVAILABLE for the actual AP target contract being resolved — even
+            though the target's own row was perfectly valid. BROKER PAYLOAD
+            VALIDITY (structural garbage, above) is a separate concern from AP
+            EXACT-CONTRACT LONG-ONLY OPTION LIFECYCLE AUTHORITY: a negative or
+            fractional finite quantity now passes through this adapter as valid
+            broker truth for whichever row carries it, exactly as reported.
+            Rejecting a negative, fractional, zero, or otherwise non-positive-
+            integral quantity as UNKNOWN/never-flat for AP's own long-only
+            target option contract happens downstream at the exact-contract
+            resolver boundary (``ap/exit_safety.py::_extract_long_position_qty``
+            / ``resolve_exit_broker_truth``) and in reconciler lifecycle
+            classification (``ap_reconciler.py::_broker_position_qty``), both of
+            which examine only the row that exact-matches the contract actually
+            being resolved — never here, where "this row" and "the target AP is
+            resolving" are not yet known to be the same thing.
           - SUCCESS_EMPTY  (top-level ``{}``; or ``positions`` is ``null`` /
             ``"null"`` / ``""`` / ``{}``; or an explicitly empty position node):
             return ``[]``.
@@ -606,9 +616,14 @@ class TradierBroker(BrokerAdapter):
 
         Normalized valid-row contract (unchanged; downstream consumers depend on it):
         ``symbol``, ``quantity``, ``cost_basis``, ``side``, ``raw``. ``quantity``
-        is guaranteed to be a finite, integer-valued float once a row reaches
-        this contract (e.g. ``4.0`` or ``-1.0``, never ``0.5``/``True``) — it may
-        be negative (signed broker exposure; see SIGNED QUANTITY above).
+        is guaranteed to be a finite float once a row reaches this contract, but
+        is **not** guaranteed to be a positive integer — it may be zero, negative
+        (signed short exposure), or fractional (e.g. a fractional-share equity
+        row), exactly as reported by the broker. AP exact-option-contract
+        long-only authority (rejecting anything other than a positive integral
+        quantity for AP's own target contract) is enforced downstream by
+        ``resolve_exit_broker_truth()`` / reconciler lifecycle classification,
+        not by this adapter.
         """
         # Transport/auth/HTTP failures propagate out of _get() unchanged.
         resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")

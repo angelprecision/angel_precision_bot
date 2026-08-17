@@ -35,6 +35,63 @@ before merge. This status reflects that the implementation, fail-first
 proof, and regression coverage are complete — it does not itself authorize
 merge or deployment.
 
+## FINAL EFFECTIVE CONTRACT (post-Amendment-5; read this first)
+
+This document is ~1,400 lines and was written incrementally as each
+amendment landed. Several early sections below (particularly "Implementation"
+and "Final quantity semantics (post-fix)", both written for the *original*
+pre-Amendment-4 fix) describe adapter behavior that was later superseded by
+Amendment 4 (blocker 3) and Amendment 5 (blocker 1). Those sections are
+marked `[SUPERSEDED — see FINAL EFFECTIVE CONTRACT]` inline where they
+make claims that are no longer true, and are left in place as an accurate
+historical record of what each amendment fixed and why — but they do not
+describe the current adapter contract. This section is the current,
+authoritative summary.
+
+**`ap/brokers/tradier.py::TradierBroker.list_positions()` final adapter
+contract:**
+
+```text
+bool                -> MALFORMED / raise
+missing quantity    -> MALFORMED / raise
+unparseable         -> MALFORMED / raise
+NaN / Infinity      -> MALFORMED / raise
+
+finite positive integer     -> preserve, returned as-is
+finite zero                 -> preserve, returned as-is
+finite negative integer     -> preserve signed broker truth, returned as-is
+finite positive fractional  -> preserve raw broker truth, returned as-is
+finite negative fractional  -> preserve raw broker truth, returned as-is
+```
+
+The adapter never raises for a negative or fractional quantity as of
+Amendment 4 (blocker 3) and Amendment 5 (blocker 1) respectively. It has
+no concept of which row corresponds to "the exact AP option contract
+currently being resolved" — it reads and returns the entire brokerage
+account in one call, and a legitimate unrelated short position or
+fractional-share equity holding elsewhere in the account must never make
+the adapter raise for the whole snapshot.
+
+**AP exact-option-contract long-only authority is enforced downstream,
+not by this adapter:**
+
+- `ap/exit_safety.py::_extract_long_position_qty()` /
+  `resolve_exit_broker_truth()` — for the row that exact-matches the
+  contract actually being resolved, a zero, negative, fractional, or
+  boolean quantity resolves `None` (`broker_truth_open_qty = None,
+  is_fresh_exact = False`), never authoritative flat, never truncated
+  toward a believable value.
+- `ap_reconciler.py::_broker_position_qty()` — for reconciler-level
+  DB/broker position-lifecycle classification, the same non-positive-
+  integral values resolve `None` (never `abs()`'d into a positive AP
+  long), and an exact same-contract signed-direction conflict against an
+  existing DB OPEN long triggers explicit quarantine rather than either a
+  flat conclusion or continued normal long exit-engine management.
+
+Both of these downstream boundaries only ever examine the single row that
+exact-matches the contract they are resolving — never the whole account
+snapshot the adapter returns.
+
 ## Relationship to #478
 
 #478 (spec: `p0_broker_position_unavailable_not_flat_20260815.md`) fixed
@@ -177,6 +234,18 @@ or raise at the adapter boundary so the resolver maps it to unknown.
 
 ## Implementation
 
+**[SUPERSEDED — see FINAL EFFECTIVE CONTRACT above]** The adapter-boundary
+behavior described immediately below (§1) — rejecting fractional and
+negative quantity via `TRADIER_POSITIONS_PAYLOAD_MALFORMED`/`_CONFLICT` —
+was the *original* fix and was correct at the time this section was
+written. It was later superseded: Amendment 4 (blocker 3) removed the
+negative-quantity rejection, and Amendment 5 (blocker 1) removed the
+fractional-quantity rejection, both for the same reason (an unrelated
+account row must not poison the target contract's resolution). §2 below
+(the resolver-level `Optional[int]` handling) remains fully accurate and
+current. This section is retained as an accurate historical record of the
+original fix's reasoning, not as the current adapter contract.
+
 ### 1. Adapter boundary — `ap/brokers/tradier.py::TradierBroker.list_positions()`
 
 After reading the raw quantity and before any numeric coercion:
@@ -232,6 +301,17 @@ conflict, the valid row's quantity is not silently summed in isolation —
 the whole resolution is unknown.
 
 ## Final quantity semantics (post-fix)
+
+**[SUPERSEDED — see FINAL EFFECTIVE CONTRACT above]** Despite the section
+title, this table describes the semantics as of the *original* fix only.
+The "raises at adapter (TradierBroker source)" rows for `quantity =
+negative` and `quantity = fractional` immediately below are no longer
+true at the adapter layer as of Amendment 4 (blocker 3) and Amendment 5
+(blocker 1) — both values now pass through the adapter unrejected and are
+instead resolved to `broker_truth_open_qty = None` at the resolver
+boundary shown in the same rows, which remains accurate. The
+`quantity = bool` row (adapter rejection) remains accurate and current —
+boolean quantity is still rejected at the adapter layer.
 
 ```text
 CALL/PUT exact-match row, quantity = positive integer  -> VALID_LONG_OPEN
@@ -304,8 +384,15 @@ other callers remain confirmed to fail closed on any exception.
 ## Caller audit
 
 All direct `list_positions()` callers, confirmed safe against the new
-raised-exception cases (bool/fractional/negative quantity anywhere in the
-account payload now raises where it previously did not):
+raised-exception cases at the time this audit was written (bool/
+fractional/negative quantity anywhere in the account payload now raises
+where it previously did not). **[SUPERSEDED — see FINAL EFFECTIVE
+CONTRACT above]** Fractional and negative quantity no longer raise as of
+Amendments 5 and 4 respectively — only the boolean/non-finite/unparseable/
+missing-field cases still raise. This caller audit's conclusions (each
+caller's exception-handling behavior) remain valid and current for the
+cases that do still raise; it is only the parenthetical characterization
+of *which* cases raise that is now stale:
 
 1. **`ap/exit_safety.py::resolve_exit_broker_truth`** — exception ->
    `broker_truth_open_qty=None`, `is_fresh_exact=False`. No flat authority.
@@ -362,8 +449,8 @@ New/tightened deterministic reason codes (adapter boundary,
 
 ```text
 TRADIER_POSITIONS_PAYLOAD_MALFORMED: boolean quantity
-TRADIER_POSITIONS_PAYLOAD_MALFORMED: fractional option quantity
-TRADIER_POSITIONS_PAYLOAD_CONFLICT: negative option quantity
+TRADIER_POSITIONS_PAYLOAD_MALFORMED: fractional option quantity   # [SUPERSEDED — see FINAL EFFECTIVE CONTRACT] no longer raised; fractional preserved as of Amendment 5
+TRADIER_POSITIONS_PAYLOAD_CONFLICT: negative option quantity      # [SUPERSEDED — see FINAL EFFECTIVE CONTRACT] no longer raised; negative preserved as of Amendment 4
 ```
 
 Resolver-level audit status (`ap/exit_safety.py`,
