@@ -95,20 +95,46 @@ def _structural_broker_quantity(row: dict) -> float | None:
     raw = row.get("raw") if isinstance(row, dict) else None
     if isinstance(raw, dict) and raw is not row:
         containers.append(raw)
-    supplied = [
-        container[key]
-        for container in containers
-        for key in ("quantity", "qty")
-        if key in container and container[key] is not None
-    ]
-    if not supplied:
+    return _resolve_quantity_aliases(containers, _structural_quantity)
+
+
+def _resolve_quantity_aliases(containers: list, parse) -> Any:
+    """Resolve one quantity across ``quantity``/``qty`` aliases.
+
+    PRESENCE is validated separately from VALUE.  A recognized alias key
+    that is literally present in a container -- even with ``None``, an
+    empty/whitespace string, a boolean, NaN, inf, or other unusable
+    content -- is NOT equivalent to that alias being absent.  Silently
+    dropping a present-but-unusable alias in favor of a different,
+    parseable alias is a broker-truth laundering seam: it can hide
+    contradictory/unproven quantity evidence beneath a normalized value
+    that looks clean.
+
+    ``parse`` converts one raw alias value to a validated result, or
+    returns ``None`` if that value is unusable (its own semantics --
+    e.g. ``_structural_quantity`` treats negative/zero/fractional as
+    valid, ``_positive_integral``-based parsers do not).
+
+    Returns the single agreed value, or ``None`` if no alias was
+    supplied at all, any supplied alias was individually unusable, or
+    multiple supplied aliases disagree.
+    """
+    values = []
+    any_present = False
+    for container in containers:
+        for key in ("quantity", "qty"):
+            if key not in container:
+                continue
+            any_present = True
+            parsed = parse(container[key])
+            if parsed is None:
+                return None
+            values.append(parsed)
+    if not any_present:
         return None
-    quantities = [_structural_quantity(value) for value in supplied]
-    if any(quantity is None for quantity in quantities):
+    if len(set(values)) != 1:
         return None
-    if len(set(quantities)) != 1:
-        return None
-    return quantities[0]
+    return values[0]
 
 
 def _positive_finite(value: Any) -> float:
@@ -123,26 +149,44 @@ def _positive_finite(value: Any) -> float:
     return parsed
 
 
+def _integral_or_none(value: Any) -> int | None:
+    """Return an integer if the value is structurally a whole number.
+
+    Distinct from ``_positive_integral``: zero and negative integral
+    values are returned (not collapsed to ``None``/0) so presence-aware
+    alias resolution can distinguish "structurally a number, just not
+    positive" from "not a number at all".  AP long-only positivity is
+    enforced by the caller after alias agreement is established.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
 def _broker_quantity(row: dict) -> int:
-    """Return quantity only when every supplied quantity alias agrees."""
+    """Return the AP-long-authority quantity only when every supplied
+    quantity alias is individually valid and in exact agreement.
+
+    A recognized alias that is PRESENT with an unusable value (None, "",
+    whitespace, bool, NaN, inf, non-numeric, non-integer) is a validation
+    failure -- it is never silently dropped in favor of a different,
+    parseable alias.  That would launder contradictory/unproven broker
+    evidence into an apparently-clean quantity.
+    """
     containers = [row]
     raw = row.get("raw") if isinstance(row, dict) else None
     if isinstance(raw, dict) and raw is not row:
         containers.append(raw)
-    supplied = [
-        container[key]
-        for container in containers
-        for key in ("quantity", "qty")
-        if key in container and container[key] is not None
-    ]
-    if not supplied:
+    resolved = _resolve_quantity_aliases(containers, _integral_or_none)
+    if resolved is None or resolved <= 0:
         return 0
-    quantities = [_positive_integral(value) for value in supplied]
-    if any(quantity <= 0 for quantity in quantities):
-        return 0
-    if len(set(quantities)) != 1:
-        return 0
-    return quantities[0]
+    return resolved
 
 
 def _position_value(position: Any, name: str, default: Any = None) -> Any:
@@ -283,18 +327,26 @@ def _normalize_positions_payload(payload: Any) -> list[dict]:
         # positive-integral AP-long validation happens only once the
         # exact target OCC contract is matched, in
         # ``evaluate_filled_entry_recovery_authority``.
-        quantity_values = [
-            _structural_quantity(container.get(key))
-            for container in containers
-            for key in ("quantity", "qty")
-            if container.get(key) is not None
-        ]
-        if not quantity_values or any(quantity is None for quantity in quantity_values):
+        #
+        # Raw Tradier transport contract: the canonical `quantity` field
+        # is required.  #481's TradierBroker.list_positions() enforces
+        # this on the adapter path; this raw _get() fallback -- the
+        # actual path production TradierBroker takes when
+        # list_positions_authoritative() is absent -- must not become
+        # more permissive by accepting `qty` alone when the canonical
+        # field is entirely missing from the row.  This check is scoped
+        # to this raw-transport parser only; already-normalized internal
+        # rows consumed via list_positions_authoritative() may still use
+        # `qty` as a standalone compatibility alias (see
+        # _structural_broker_quantity).
+        if not any("quantity" in container for container in containers):
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_QUANTITY_INVALID")
-        if len(set(quantity_values)) != 1:
+
+        quantity_value = _resolve_quantity_aliases(containers, _structural_quantity)
+        if quantity_value is None:
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_QUANTITY_INVALID")
         normalized.append(
-            {"symbol": contract, "quantity": quantity_values[0], "raw": dict(row)}
+            {"symbol": contract, "quantity": quantity_value, "raw": dict(row)}
         )
     return normalized
 

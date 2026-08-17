@@ -847,6 +847,210 @@ def test_unrelated_signed_or_fractional_row_does_not_poison_target_recovery(unre
     assert result["disposition"] == "ACTIVE_RECREATE"
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Merge-Gate A: present-null/missing quantity alias laundering must fail
+# closed at every quantity-alias validation boundary.  A recognized alias
+# key that is literally PRESENT with unusable content (None, "", whitespace,
+# bool, NaN, inf, non-numeric, disagreement with another present alias) is
+# NOT equivalent to that alias being absent, and must never be silently
+# dropped in favor of a different, parseable alias.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "raw_row, expected_message",
+    [
+        # A1: canonical quantity present-but-None, qty present-and-clean.
+        # The None must not be silently dropped in favor of qty=1.
+        ({"symbol": CONTRACT, "quantity": None, "qty": 1}, "QUANTITY_INVALID"),
+        # A2: canonical `quantity` entirely absent; qty alone must not be
+        # accepted as authoritative raw Tradier transport truth.
+        ({"symbol": CONTRACT, "qty": 1}, "QUANTITY_INVALID"),
+        # A3: canonical present-and-clean, qty present-but-None.
+        ({"symbol": CONTRACT, "quantity": 1, "qty": None}, "QUANTITY_INVALID"),
+        # A4: qty present as an empty string.
+        ({"symbol": CONTRACT, "quantity": 1, "qty": ""}, "QUANTITY_INVALID"),
+        # A5: qty present as a whitespace-only string.
+        ({"symbol": CONTRACT, "quantity": 1, "qty": "   "}, "QUANTITY_INVALID"),
+        # A6: qty present as a boolean.
+        ({"symbol": CONTRACT, "quantity": 1, "qty": True}, "QUANTITY_INVALID"),
+        # A8: both present and clean but numerically disagree.
+        ({"symbol": CONTRACT, "quantity": 1, "qty": 2}, "QUANTITY_INVALID"),
+    ],
+)
+def test_raw_tradier_quantity_alias_presence_is_never_laundered(
+    raw_row, expected_message
+):
+    """Merge-Gate A: raw production-shaped Tradier input.
+
+    Exercises _normalize_positions_payload directly with the exact raw
+    node shape the real broker._get() fallback returns.  A present-but-
+    unusable alias, or a missing canonical field, must HOLD — never
+    silently resolve to a believable quantity via a different alias.
+    """
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [raw_row]}}
+    with pytest.raises(ValueError, match=expected_message):
+        _normalize_positions_payload(node)
+
+
+def test_raw_tradier_quantity_alias_agreement_is_structurally_valid():
+    """A7: quantity=1, qty=1.0 — both present, both clean, numerically equal."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "qty": 1.0}]}}
+    result = _normalize_positions_payload(node)
+    assert result[0]["symbol"] == CONTRACT
+    assert result[0]["quantity"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "unrelated_row",
+    [
+        # A9: unrelated negative quantity row must still survive normalization.
+        {"symbol": "SPY", "quantity": -10},
+        # A10: unrelated fractional equity row must still survive normalization.
+        {"symbol": "AAPL", "quantity": 0.25},
+    ],
+)
+def test_unrelated_row_alias_fix_does_not_regress_prior_amendment(unrelated_row):
+    """A9/A10: the alias-laundering fix must not reintroduce the account-wide
+    poisoning defect closed in the prior amendment.  Unrelated valid
+    negative/fractional rows must still survive alongside a clean target."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {
+        "positions": {
+            "position": [unrelated_row, {"symbol": CONTRACT, "quantity": 1}]
+        }
+    }
+    result = _normalize_positions_payload(node)
+    symbols = {row["symbol"]: row["quantity"] for row in result}
+    assert symbols[unrelated_row["symbol"]] == unrelated_row["quantity"]
+    assert symbols[CONTRACT] == 1
+
+
+@pytest.mark.parametrize(
+    "target_quantity",
+    [
+        -1,    # A11
+        0.5,   # A12
+        0,     # A13
+    ],
+)
+def test_exact_target_non_long_quantity_survives_snapshot_then_authority_holds(
+    target_quantity,
+):
+    """A11/A12/A13: exact target row with a structurally valid but non-AP-long
+    quantity (negative/fractional/zero) must survive account-wide snapshot
+    normalization, then HOLD only at the exact-target-OCC authority gate."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [{"symbol": CONTRACT, "quantity": target_quantity}]}}
+    normalized = _normalize_positions_payload(node)
+    assert normalized[0]["quantity"] == target_quantity
+
+    result = evaluate_filled_entry_recovery_authority(
+        pm=_PM(),
+        order=_order(),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=normalized,
+        today=date(2026, 8, 14),
+    )
+    assert result["disposition"] == "HOLD"
+
+
+@pytest.mark.parametrize(
+    "target_quantity, expected_message",
+    [
+        (True, "QUANTITY_INVALID"),           # A14
+        (float("nan"), "QUANTITY_INVALID"),   # A15
+        (float("inf"), "QUANTITY_INVALID"),   # A16
+    ],
+)
+def test_exact_target_malformed_quantity_fails_structural_normalization(
+    target_quantity, expected_message
+):
+    """A14/A15/A16: boolean/NaN/inf on the exact target row are structurally
+    malformed — HOLD occurs before exact-target authority is even reached,
+    at account-wide snapshot normalization."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [{"symbol": CONTRACT, "quantity": target_quantity}]}}
+    with pytest.raises(ValueError, match=expected_message):
+        _normalize_positions_payload(node)
+
+
+def test_duplicate_target_occ_rows_remain_ambiguous():
+    """A17: duplicate target OCC rows must HOLD as ambiguous."""
+    result = evaluate_filled_entry_recovery_authority(
+        pm=_PM(),
+        order=_order(),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[
+            {"symbol": CONTRACT, "quantity": 1},
+            {"symbol": CONTRACT, "quantity": 1},
+        ],
+        today=date(2026, 8, 14),
+    )
+    assert result["disposition"] == "HOLD"
+    assert result["reason_code"] == "FILLED_ENTRY_RECOVERY_BROKER_POSITION_AMBIGUOUS"
+
+
+def test_broker_target_qty_exceeds_durable_filled_qty_holds_no_mutation(monkeypatch):
+    """A18: broker target qty=2, durable filled_qty=1 — HOLD, zero mutation.
+
+    This PR does not own partial-fill reconciliation (#480's scope); it
+    must simply refuse to create a position, seed an owner, or release
+    guards when broker-reported quantity contradicts the durably recorded
+    filled quantity.
+    """
+    calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not create position")),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not seed owner")),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_atomically",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not release guards")),
+    )
+
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=_Broker([_broker_position(quantity=2)]),
+        order=_order(filled_qty=1),
+        pm=_PM(),
+        exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=[_broker_position(quantity=2)],
+    )
+
+    assert result["disposition"] == "HOLD"
+    assert result.get("completed") is not True
+
+
+def test_raw_tradier_alias_fix_normal_valid_target_row_unaffected():
+    """Sanity: the ordinary single-canonical-quantity row used throughout
+    this file's existing tests is completely unaffected by the alias fix."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1}]}}
+    result = _normalize_positions_payload(node)
+    assert result[0]["symbol"] == CONTRACT
+    assert result[0]["quantity"] == 1
+
+
 def test_raw_broker_position_payload_rejects_ambiguous_option_identity():
     from ap.filled_entry_recovery_authority import _normalize_positions_payload
 
