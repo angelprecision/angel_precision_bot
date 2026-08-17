@@ -289,32 +289,33 @@ def _normalize_positions_payload(payload: Any) -> list[dict]:
         if isinstance(raw, dict) and raw is not row:
             containers.append(raw)
 
-        explicit_contracts = {
-            _normalize_contract(container.get(key))
-            for container in containers
-            for key in ("option_symbol", "contract")
-            if container.get(key) is not None
-            and str(container.get(key)).strip()
-        }
-        symbols = {
-            _normalize_contract(container.get("symbol"))
-            for container in containers
-            if container.get("symbol") is not None
-            and str(container.get("symbol")).strip()
-        }
-        if len(explicit_contracts) > 1:
-            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
-        if explicit_contracts and any(
-            is_valid_occ_contract(symbol)
-            for symbol in symbols - explicit_contracts
-        ):
-            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
-        identities = explicit_contracts or symbols
-        if len(identities) > 1:
-            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS")
-        if not identities:
+        # Raw Tradier transport contract: canonical `symbol` is required,
+        # exactly as #481's TradierBroker.list_positions() requires a
+        # non-empty `symbol` on every raw row.  This raw _get() fallback
+        # -- the actual path production TradierBroker takes when
+        # list_positions_authoritative() is absent -- must not become
+        # structurally more permissive by letting an option_symbol/contract
+        # ALIAS manufacture identity when canonical `symbol` is missing or
+        # blank, or override canonical identity when it disagrees.  Aliases
+        # may only CONFIRM identity here; they may never replace or upgrade
+        # it.  (Already-normalized/internal rows reached via
+        # list_positions_authoritative() are a separate compatibility path
+        # and are unaffected -- see fetch_current_broker_positions.)
+        if "symbol" not in row:
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_MISSING")
-        contract = next(iter(identities))
+        canonical_symbol = _normalize_contract(row.get("symbol"))
+        if not canonical_symbol:
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_MISSING")
+        for container in containers:
+            for key in ("option_symbol", "contract"):
+                alias_value = container.get(key)
+                if alias_value is None or not str(alias_value).strip():
+                    continue
+                if _normalize_contract(alias_value) != canonical_symbol:
+                    raise ValueError(
+                        "FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_AMBIGUOUS"
+                    )
+        contract = canonical_symbol
 
         # #481 established that account-level broker snapshot validity is
         # not the same thing as AP exact-contract long-option authority.

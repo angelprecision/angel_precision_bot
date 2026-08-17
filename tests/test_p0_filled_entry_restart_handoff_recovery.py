@@ -1051,6 +1051,218 @@ def test_raw_tradier_alias_fix_normal_valid_target_row_unaffected():
     assert result[0]["quantity"] == 1
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Raw Tradier identity merge-gate: canonical `symbol` must be required at
+# the raw transport boundary; option_symbol/contract aliases may confirm
+# identity but must never manufacture it (when symbol is missing/blank) or
+# override it (when symbol disagrees with an alias).
+# ─────────────────────────────────────────────────────────────────────────
+
+_DIFFERENT_OCC = "PEP260821P00141000"
+
+
+@pytest.mark.parametrize(
+    "raw_row",
+    [
+        # R1: option_symbol only, no canonical symbol at all.
+        {"option_symbol": CONTRACT, "quantity": 1},
+        # R2: contract only, no canonical symbol at all.
+        {"contract": CONTRACT, "quantity": 1},
+        # R3: canonical symbol present but empty string.
+        {"symbol": "", "option_symbol": CONTRACT, "quantity": 1},
+        # R4: canonical symbol present but None.
+        {"symbol": None, "option_symbol": CONTRACT, "quantity": 1},
+        # R15: no identity evidence of any kind.
+        {"quantity": 1},
+    ],
+)
+def test_raw_tradier_identity_missing_canonical_symbol_is_never_manufactured(raw_row):
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [raw_row]}}
+    with pytest.raises(ValueError, match="IDENTITY_MISSING"):
+        _normalize_positions_payload(node)
+
+
+def test_raw_tradier_identity_non_occ_canonical_cannot_be_upgraded_by_alias():
+    """R5: canonical symbol is non-OCC ('PEP'); alias claims target OCC.
+    Must NEVER normalize to the alias's target OCC identity."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {
+        "positions": {
+            "position": [{"symbol": "PEP", "option_symbol": CONTRACT, "quantity": 1}]
+        }
+    }
+    with pytest.raises(ValueError, match="IDENTITY_AMBIGUOUS"):
+        _normalize_positions_payload(node)
+
+
+@pytest.mark.parametrize(
+    "raw_row",
+    [
+        {"symbol": CONTRACT, "option_symbol": CONTRACT, "quantity": 1},  # R6
+        {"symbol": CONTRACT, "contract": CONTRACT, "quantity": 1},        # R7
+    ],
+)
+def test_raw_tradier_identity_agreeing_aliases_confirm_canonical_symbol(raw_row):
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [raw_row]}}
+    result = _normalize_positions_payload(node)
+    assert result[0]["symbol"] == CONTRACT
+    assert result[0]["quantity"] == 1
+
+
+@pytest.mark.parametrize(
+    "raw_row",
+    [
+        {"symbol": CONTRACT, "option_symbol": _DIFFERENT_OCC, "quantity": 1},  # R8
+        {"symbol": CONTRACT, "contract": _DIFFERENT_OCC, "quantity": 1},        # R9
+    ],
+)
+def test_raw_tradier_identity_disagreeing_alias_is_ambiguous(raw_row):
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [raw_row]}}
+    with pytest.raises(ValueError, match="IDENTITY_AMBIGUOUS"):
+        _normalize_positions_payload(node)
+
+
+def test_raw_tradier_identity_equity_fractional_remains_structurally_valid():
+    """R10: unrelated equity row (AAPL, fractional) is valid raw identity;
+    it is only later ignored as non-OCC by the exact-option matcher."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [{"symbol": "AAPL", "quantity": 0.25}]}}
+    result = _normalize_positions_payload(node)
+    assert result[0]["symbol"] == "AAPL"
+    assert result[0]["quantity"] == 0.25
+
+
+def test_raw_tradier_identity_equity_short_remains_structurally_valid():
+    """R11: unrelated equity row (SPY, negative/short) is valid raw identity."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [{"symbol": "SPY", "quantity": -10}]}}
+    result = _normalize_positions_payload(node)
+    assert result[0]["symbol"] == "SPY"
+    assert result[0]["quantity"] == -10
+
+
+def test_raw_tradier_identity_unrelated_signed_option_does_not_poison_target():
+    """R12: unrelated signed different-OCC row plus a clean target row —
+    both survive normalization; target recovery remains possible."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {
+        "positions": {
+            "position": [
+                {"symbol": _DIFFERENT_OCC, "quantity": -1},
+                {"symbol": CONTRACT, "quantity": 1},
+            ]
+        }
+    }
+    result = _normalize_positions_payload(node)
+    by_symbol = {row["symbol"]: row["quantity"] for row in result}
+    assert by_symbol[_DIFFERENT_OCC] == -1
+    assert by_symbol[CONTRACT] == 1
+
+    authority = evaluate_filled_entry_recovery_authority(
+        pm=_PM(),
+        order=_order(),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=result,
+        today=date(2026, 8, 14),
+    )
+    assert authority["disposition"] == "ACTIVE_RECREATE"
+
+
+def test_raw_tradier_identity_normal_target_path_unchanged():
+    """R13: the ordinary single-canonical-symbol target row is unaffected."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1}]}}
+    result = _normalize_positions_payload(node)
+    assert result == [{"symbol": CONTRACT, "quantity": 1, "raw": {"symbol": CONTRACT, "quantity": 1}}]
+
+
+def test_raw_tradier_identity_fix_does_not_bypass_quantity_gate():
+    """R14: identity is valid, but quantity is laundered (None + qty=1).
+    Proves the identity patch does not accidentally reorder past or
+    bypass the already-fixed quantity alias gate."""
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {
+        "positions": {
+            "position": [{"symbol": CONTRACT, "quantity": None, "qty": 1}]
+        }
+    }
+    with pytest.raises(ValueError, match="QUANTITY_INVALID"):
+        _normalize_positions_payload(node)
+
+
+def test_raw_tradier_identity_malformed_end_to_end_never_reaches_active_recreate(
+    monkeypatch,
+):
+    """End-to-end authority test: a raw production-shaped broker response
+    with missing canonical symbol must HOLD through the full recovery
+    authority evaluation — never ACTIVE_RECREATE, never any mutation."""
+    from ap.filled_entry_recovery_authority import fetch_current_broker_positions
+
+    monkeypatch.setattr(
+        fm,
+        "_open_position_safe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not create position")
+        ),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_seed_exit_engine",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not seed owner")
+        ),
+    )
+    monkeypatch.setattr(
+        fm,
+        "_release_entry_guards_atomically",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not release guards")
+        ),
+    )
+
+    class _ProductionShapedBrokerMissingSymbol:
+        cfg = SimpleNamespace(account_id="acct-jason")
+
+        def _get(self, path):
+            assert path == "/v1/accounts/acct-jason/positions"
+            return {
+                "positions": {
+                    "position": [{"option_symbol": CONTRACT, "quantity": 1}]
+                }
+            }
+
+    with pytest.raises(ValueError, match="IDENTITY_MISSING"):
+        fetch_current_broker_positions(_ProductionShapedBrokerMissingSymbol())
+
+    calls = []
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", _memory_persist(calls))
+    result = fm.recover_interrupted_filled_entry_handoff(
+        broker=_ProductionShapedBrokerMissingSymbol(),
+        order=_order(),
+        pm=_PM(),
+        exit_engine=SimpleNamespace(execution_mode=LIVE),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        # broker_positions intentionally omitted so the real fetch path
+        # (broker._get -> _normalize_positions_payload) is exercised.
+    )
+    assert result["disposition"] == "HOLD"
+    assert result.get("completed") is not True
+
+
 def test_raw_broker_position_payload_rejects_ambiguous_option_identity():
     from ap.filled_entry_recovery_authority import _normalize_positions_payload
 
@@ -1090,7 +1302,12 @@ def test_authoritative_position_raw_alias_cannot_hide_invalid_option_truth():
                 }
             }
 
-    with pytest.raises(ValueError, match="OCC_INVALID"):
+    # Merge-gate amendment: canonical raw `symbol` ("PEP", non-OCC) now
+    # correctly wins identity authority at the raw-transport layer. A
+    # disagreeing option_symbol alias ("PEP-INVALID") can no longer
+    # manufacture or hide behind option identity — it is rejected as an
+    # identity conflict before OCC validity is even evaluated.
+    with pytest.raises(ValueError, match="IDENTITY_AMBIGUOUS"):
         fetch_current_broker_positions(_RawBroker())
 
 
