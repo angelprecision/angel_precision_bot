@@ -139,6 +139,19 @@ def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
 
 
 def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> list[tuple[str, dict]]:
+    # P0 amendment 3: defense-in-depth. An empty/unproven contract identity
+    # must NEVER act as a wildcard match across every open exit-like broker
+    # order in the account. Without this guard, `if contract and ...` short-
+    # circuits to False for an empty contract and no row is ever filtered
+    # out — every live sell-to-close order in the account (belonging to
+    # ANY position, ANY client) would match. Callers must still perform
+    # their own explicit contract-identity check before calling this
+    # helper (see recover_exit_position) rather than relying on this
+    # early-return alone: an empty result here must not be silently
+    # reinterpreted by a caller as "no matches -> replacement-safe" when
+    # the real reason is "identity unknown, scan never meaningfully ran".
+    if not contract:
+        return []
     matches: list[tuple[str, dict]] = []
     for raw in _list_open_orders(broker):
         if contract and _contract(raw) != contract:
@@ -308,6 +321,29 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
             if st in TERMINAL_BROKER_STATUSES:
                 # CRITICAL safety: terminal status for the old pending id is NOT enough.
                 # Scan broker for a different live exit on the same contract before allowing replacement.
+                #
+                # P0 amendment 3: this scan must never run against an unproven
+                # contract identity. _matching_open_exit_orders() is now
+                # hardened to return [] for an empty contract (defense in
+                # depth), but that alone is NOT safe here: an empty result
+                # would fall through to len(other_matches) == 0 below, which
+                # authorizes _mark_replacement_safe() from terminal status
+                # alone -- exactly the "duplicate scan cannot be performed,
+                # so let's assume it's safe" failure mode this amendment
+                # forbids. Hold explicitly instead of letting that fallthrough
+                # fire.
+                if not contract:
+                    log.warning(
+                        "exit_autonomous_recovery: contract identity unestablished for pid=%s "
+                        "during terminal-status duplicate-exit scan — NOOP/HOLD",
+                        pid,
+                    )
+                    return RecoveryAction(
+                        "NOOP",
+                        "broker_contract_identity_unknown_hold",
+                        pid, local_id, pending_broker_id,
+                        {"status": st, "quote_health": qh},
+                    )
                 other_matches = _matching_open_exit_orders(broker, contract, exclude_broker_id=pending_broker_id)
                 if len(other_matches) == 1:
                     other_bid, other_raw = other_matches[0]
@@ -333,6 +369,31 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
             return RecoveryAction("NOOP", "broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
 
     # Missing broker id: scan open orders for matching exit order.
+    #
+    # P0 amendment 3: this path is also reached when pending_broker_id WAS
+    # set but the exact-order-id lookup failed/was unavailable (raw was
+    # falsy above, so none of the `if raw:` branches returned) -- the
+    # "lookup unavailable" case is the same fallthrough as "no pending
+    # broker id at all". Either way, this scan must never run against an
+    # unproven contract identity: _matching_open_exit_orders() is hardened
+    # to return [] for an empty contract, but relying on that alone would
+    # let an empty result fall through to the "no matching open sell-to-
+    # close order" negative-proof block below as if the scan had
+    # meaningfully run and found nothing -- it never actually looked.
+    # Hold explicitly instead.
+    if not contract:
+        log.warning(
+            "exit_autonomous_recovery: contract identity unestablished for pid=%s "
+            "before open-order scan — NOOP/HOLD",
+            pid,
+        )
+        return RecoveryAction(
+            "NOOP",
+            "broker_contract_identity_unknown_hold",
+            pid, local_id, pending_broker_id,
+            {"quote_health": qh},
+        )
+
     matches = _matching_open_exit_orders(broker, contract)
 
     if len(matches) == 1:

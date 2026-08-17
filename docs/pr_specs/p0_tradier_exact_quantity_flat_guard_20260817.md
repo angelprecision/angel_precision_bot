@@ -536,10 +536,150 @@ Fail-first: 6/15 failed against pre-Amendment-2 code (the Case A and
 Case B tests specifically; Cases C/D/E and the normal-path test were
 written to already pass, proving they were unaffected by the fix).
 
+## Amendment 3 — missing contract identity must never become wildcard broker-order identity
+
+### Defect
+
+An independent review of Amendment 2 found that its HOLD guard, while
+correctly preventing missing contract identity from becoming authoritative
+broker-**flat** truth, executed too late to prevent a second, more severe
+consequence: missing contract identity becoming a **wildcard match against
+unrelated broker orders**.
+
+`ap/exit_autonomous_recovery.py::recover_exit_position()` calls
+`_matching_open_exit_orders(broker, contract, ...)` at two call sites
+**before** any contract-identity guard runs:
+
+1. the terminal-pending-broker-id path, scanning for a "different live
+   exit on the same contract" before authorizing replacement;
+2. the generic/missing-broker-id path, scanning for any matching live
+   exit order — also reached when a pending broker id was set but its
+   exact-order-id lookup failed/was unavailable.
+
+`_matching_open_exit_orders()` filtered rows with:
+
+```python
+if contract and _contract(raw) != contract:
+    continue
+```
+
+When `contract == ""`, this condition is always `False` — **no row is ever
+filtered out by contract**. Every exit-like open order in the account,
+belonging to any position or any client, became a "match" regardless of
+which position was actually being recovered.
+
+Consequences, all reachable with an unproven contract identity:
+
+- a single unrelated live sell-to-close order could be **adopted** for
+  the wrong position via `set_pending_exit_order()`;
+- multiple unrelated live sell-to-close orders could be **canceled** via
+  `_cancel_order_with_proof()` — broker cancel authority exercised
+  against orders never proven to belong to this position;
+- a terminal-pending-broker-id recovery could adopt an unrelated broker
+  order as the position's "different live exit still open".
+
+Amendment 2's HOLD guard (in the negative-proof block) only covers the
+case where the scan already ran and returned zero matches — it could not
+prevent a wildcard scan from finding and acting on unrelated real orders
+in the first place.
+
+### Binding invariant
+
+**UNPROVEN CONTRACT IDENTITY MUST NEVER AUTHORIZE:**
+wildcard broker-order matching, broker-order adoption, broker cancel,
+replacement-safe, or broker-flat close.
+
+Exact broker-order-id truth (the `pending_broker_id` path, when the exact
+order lookup succeeds) remains independently authoritative and is
+unaffected — see cases G/H below.
+
+### Fix
+
+One production file, additive only (`ap/exit_autonomous_recovery.py`,
++61/-0 lines across three changes):
+
+1. **Helper-level defense in depth** — `_matching_open_exit_orders()` now
+   returns `[]` immediately if `contract` is empty/falsy, before scanning
+   any broker order. This alone is *not* sufficient at every call site
+   (see below), so it is explicitly documented as one layer among several.
+2. **Terminal-pending-broker-id path** — before calling
+   `_matching_open_exit_orders(broker, contract, exclude_broker_id=...)`,
+   an explicit `if not contract:` check returns `NOOP` /
+   `broker_contract_identity_unknown_hold`. This is necessary in addition
+   to the helper-level guard: without it, an empty scan result would fall
+   through to `len(other_matches) == 0`, which authorizes
+   `_mark_replacement_safe()` from terminal status alone — exactly the
+   "duplicate scan cannot be performed, so assume it's safe" failure mode
+   this amendment forbids.
+3. **Generic/missing-broker-id path** — the same explicit `if not
+   contract:` HOLD check runs before `_matching_open_exit_orders(broker,
+   contract)`, for the same reason: an empty result must not be
+   reinterpreted as "the scan ran and found nothing" when the scan never
+   meaningfully executed. This call site is reached both when no pending
+   broker id exists at all, and when a pending broker id existed but its
+   exact-order-id lookup failed (`raw` falsy) — both scenarios needed the
+   same guard.
+
+Amendment 2's original negative-proof HOLD guard remains in place as a
+fourth, now-redundant-but-harmless layer, consistent with the
+defense-in-depth philosophy both amendments were written under.
+
+### Normal-path preservation
+
+Explicitly re-verified unaffected:
+
+- valid contract + one matching live exit → existing `RECOVERED_BROKER_ID`
+  broker-id recovery unchanged (case E);
+- valid contract + multiple matching live exits → existing bounded
+  cancel-then-replacement-safe behavior unchanged (case F);
+- missing contract + exact pending broker id confirmed `OPEN` → exact
+  broker-id truth remains valid, unaffected by contract-based scanning
+  being unavailable (case G);
+- missing contract + exact pending broker id confirmed `FILLED` → exact
+  broker fill truth remains valid and the position still closes (case H).
+
+### Tests
+
+`tests/test_p0_missing_contract_identity_no_wildcard_match.py` — 9 tests:
+
+- **Case A** — missing contract, no pending broker id, one unrelated live
+  STC order → `NOOP`, zero adoption, zero replacement authorization.
+- **Case B** — missing contract, no pending broker id, two unrelated live
+  STC orders → `NOOP`, `cancel_order` call count `0`, zero replacement.
+- **Case C** — missing contract, terminal pending broker id, one
+  unrelated live STC → zero adoption, zero replacement-safe, `NOOP`.
+- **Case D** — missing contract, pending-broker-id lookup unavailable
+  (broker.get_order raises), unrelated live STC → zero adoption, `NOOP`.
+- **Case E** — valid contract, one matching exit → unchanged
+  `RECOVERED_BROKER_ID` behavior.
+- **Case F** — valid contract, two matching exits → unchanged bounded
+  cancel-then-replacement-safe behavior.
+- **Case G** — missing contract, exact pending id confirmed `OPEN` →
+  unchanged `CONFIRMED_OPEN` behavior.
+- **Case H** — missing contract, exact pending id confirmed `FILLED` →
+  unchanged `MARKED_CLOSED` behavior.
+- **Defense-in-depth** — direct unit test of `_matching_open_exit_orders()`
+  confirming `[]` for both `""` and `None` contract.
+
+Fail-first: 5/9 failed against pre-Amendment-3 code — Cases A, B, C, D, and
+the defense-in-depth helper test. Cases E/F/G/H were written to already
+pass, proving normal-path behavior was unaffected before the fix was even
+applied. Confirmed:
+
+- Case A pre-fix: `action=RECOVERED_BROKER_ID`, unrelated order adopted.
+- Case B pre-fix: `action=REPLACEMENT_SAFE`, unrelated orders canceled via
+  `_cancel_order_with_proof`.
+- Case C pre-fix: unrelated order adopted as "different live exit still
+  open".
+- Case D pre-fix: unrelated order adopted despite the pending-id lookup
+  having failed.
+
+Post-fix: 9/9 pass.
+
 ## Required tests — status
 
 All required fail-first and regression coverage across the original fix
-and both amendments is implemented in three dedicated files:
+and all three amendments is implemented in four dedicated files:
 
 - `tests/test_p0_tradier_exact_quantity_flat_guard.py` (33 tests) —
   original adapter/resolver fix.
@@ -547,8 +687,10 @@ and both amendments is implemented in three dedicated files:
   Amendment 1.
 - `tests/test_p0_missing_contract_identity_never_flat.py` (15 tests) —
   Amendment 2.
+- `tests/test_p0_missing_contract_identity_no_wildcard_match.py` (9 tests)
+  — Amendment 3.
 
-All three files are included in `.github/workflows/p0_regression.yml` and
+All four files are included in `.github/workflows/p0_regression.yml` and
 run as part of the exact-head CI P0 Regression Suite.
 
 Original fix's dedicated suite breakdown:
@@ -630,8 +772,28 @@ Amendment 2:
   re-verified in isolation, post both amendments: 69/69 passed,
   unmodified.
 
+Amendment 3:
+
+- Fail-first (pre-fix): 5/9 new tests failed (Cases A, B, C, D, and the
+  defense-in-depth helper test), confirmed with exact captured
+  action/reason values showing unrelated broker orders adopted or
+  canceled. Cases E/F/G/H passed pre-fix, proving normal-path behavior
+  was unaffected before the fix was even applied.
+- Post-fix: `tests/test_p0_missing_contract_identity_no_wildcard_match.py`
+  9/9 passed.
+- Combined PR-#481-targeted suite (all seven files: original +
+  Amendment 1 + Amendment 2 + Amendment 3 + `test_p0_broker_owned_exit_
+  requested_recovery.py` + `test_p0_broker_owned_exit_recovery_
+  preflight.py`): 306 passed, 1 skipped, 0 failed.
+- `tests/test_p0_broker_position_unavailable_not_flat.py` (#478)
+  re-verified in isolation, post all three amendments: 69/69 passed,
+  unmodified.
+- Scope discipline: `git diff --stat` for this amendment shows exactly
+  one production file changed, additive only (+61/-0 lines,
+  `ap/exit_autonomous_recovery.py`).
+
 Full CI-exact P0 Regression Suite: see PR #481 body / latest CI run for
-the exact-head result at the current head SHA — both new amendment test
+the exact-head result at the current head SHA — all three amendment test
 files are included in `.github/workflows/p0_regression.yml` and execute
 as part of that workflow.
 
@@ -639,7 +801,7 @@ as part of that workflow.
 
 New forward-fix branch/PR from current main. #478 is not reverted or
 rewritten. Branch was rebased onto post-#479 main
-(`d0d37e79ae698e604eb8080065d2314b161de351`) with zero conflicts; both
-amendments were implemented and validated against the rebased branch.
-Do not merge, deploy, or mark ready for review without Angel's explicit
-authorization.
+(`d0d37e79ae698e604eb8080065d2314b161de351`) with zero conflicts; all
+three amendments were implemented and validated against the rebased
+branch. Do not merge, deploy, or mark ready for review without Angel's
+explicit authorization.

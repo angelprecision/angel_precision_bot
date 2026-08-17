@@ -201,6 +201,7 @@ jobs:
             tests/test_p0_tradier_exact_quantity_flat_guard.py \
             tests/test_p0_exit_autonomous_recovery_quantity_guard.py \
             tests/test_p0_missing_contract_identity_never_flat.py \
+            tests/test_p0_missing_contract_identity_no_wildcard_match.py \
             -v --tb=short --color=yes
 
       - name: Summary
