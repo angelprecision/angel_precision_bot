@@ -416,20 +416,102 @@ class TradierBroker(BrokerAdapter):
         Unlike ``get_order`` this deliberately propagates transport/auth errors:
         callers must distinguish an authoritative empty result from an unavailable
         broker query before deciding that a new POST is safe.
+
+        P0 amendment 6 (spec: p0_tradier_exact_quantity_flat_guard_20260817):
+        **BROKER RESPONSE UNUSABLE != BROKER EMPTY** -- the same invariant
+        already established for ``list_positions()``. Amendment 5 correctly
+        made ``ap/exit_autonomous_recovery.py::_list_open_orders()``
+        tri-state (UNKNOWN vs AVAILABLE_EMPTY vs AVAILABLE_NONEMPTY), but
+        this adapter could still collapse an unusable broker response into
+        ``[]`` *before* autonomous recovery ever saw it, defeating that
+        protection at its source. A non-dict top-level payload, or an order
+        row that isn't a dict, is unknown/unusable order truth -- not proof
+        that zero matching exit orders exist. One malformed row could be
+        exactly the live EXIT this call exists to prove does or does not
+        exist; it must never be silently filtered out of the result.
+
+        Contract (mirrors ``list_positions()`` exactly):
+          - UNAVAILABLE   (401/403/429/5xx, timeout, connection error):
+            ``_get`` raises and the exception propagates. Never ``[]``.
+          - MALFORMED     (a successful response that cannot be interpreted
+            as the supported Tradier orders shape): raise a deterministic
+            ``ValueError('TRADIER_ORDERS_PAYLOAD_MALFORMED: ...')``. This
+            includes: a non-dict top-level response, an ``orders`` node
+            missing entirely from a non-empty top-level dict, an
+            ``orders.order`` node missing entirely from a non-empty
+            ``orders`` dict, an order container that is neither a dict nor
+            a list, and any individual order row that isn't a dict.
+          - SUCCESS_EMPTY (top-level ``{}``; or ``orders`` is ``null`` /
+            ``"null"`` / ``""`` / ``{}``; or ``orders.order`` is ``null`` /
+            ``"null"`` / ``""`` / an empty list): return ``[]``.
+          - SUCCESS (one order object, or a list of order objects, all of
+            which are dicts): return the normalized rows.
         """
-        j = self._get(
+        # Transport/auth/HTTP failures propagate out of _get() unchanged.
+        resp = self._get(
             f"/v1/accounts/{self.cfg.account_id}/orders",
             params={"includeTags": "true", "limit": 1500},
         )
-        node = j.get("orders") if isinstance(j, dict) else None
-        orders = node.get("order") if isinstance(node, dict) else node
-        if orders is None:
+
+        # A successful HTTP response must still be interpretable. A body
+        # that is not a JSON object is not "no orders" -- it is unknown
+        # truth.
+        if resp is None or not isinstance(resp, dict):
+            raise ValueError(
+                f"TRADIER_ORDERS_PAYLOAD_MALFORMED: top-level type="
+                f"{type(resp).__name__}"
+            )
+
+        if resp == {}:
             return []
-        if isinstance(orders, dict):
-            return [orders]
-        if isinstance(orders, list):
-            return [order for order in orders if isinstance(order, dict)]
-        raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        if "orders" not in resp:
+            raise ValueError(
+                "TRADIER_ORDERS_PAYLOAD_MALFORMED: orders key missing"
+            )
+
+        node = resp["orders"]
+        # Authoritative empty shapes only: null / "null" / "" / {}.
+        if node is None or node == "null" or node == "" or node == {}:
+            return []
+        if not isinstance(node, dict):
+            raise ValueError(
+                f"TRADIER_ORDERS_PAYLOAD_MALFORMED: orders node type="
+                f"{type(node).__name__}"
+            )
+
+        if "order" not in node:
+            raise ValueError(
+                "TRADIER_ORDERS_PAYLOAD_MALFORMED: order key missing"
+            )
+
+        order_node = node["order"]
+        # Explicit empty order node is still an authoritative empty snapshot.
+        if order_node is None or order_node == "null" or order_node == "":
+            return []
+        if isinstance(order_node, dict):
+            order_list = [order_node]
+        elif isinstance(order_node, list):
+            order_list = order_node
+        else:
+            raise ValueError(
+                f"TRADIER_ORDERS_PAYLOAD_MALFORMED: order container type="
+                f"{type(order_node).__name__}"
+            )
+
+        result: List[Dict[str, Any]] = []
+        for o in order_list:
+            if not isinstance(o, dict):
+                # DO NOT silently filter a malformed row out of the
+                # result. A malformed row could be exactly the live EXIT
+                # this call exists to prove does or does not exist --
+                # dropping it and returning the remaining valid rows would
+                # claim a complete authoritative snapshot that it is not.
+                raise ValueError(
+                    f"TRADIER_ORDERS_PAYLOAD_MALFORMED: non-dict order row "
+                    f"type={type(o).__name__}"
+                )
+            result.append(o)
+        return result
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
         # Not used in current architecture
