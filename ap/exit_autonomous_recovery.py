@@ -18,6 +18,7 @@ Safety rules
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -96,6 +97,78 @@ def _qty(raw: dict) -> int:
         except Exception:
             pass
     return 0
+
+
+# P0 (post-#481 final narrow merge-gate amendment, blocker 2): a
+# dedicated, strict parser for a broker-confirmed FILLED exit order's
+# fill quantity -- deliberately separate from the lenient, magnitude-
+# oriented _qty() helper above, which is still used elsewhere in this
+# module (order-adoption quantity tracking, not fill-quantity truth) and
+# is out of scope for this amendment.
+#
+# _qty() silently produces a WRONG value for malformed FILLED quantity
+# rather than surfacing it as a conflict: a fractional value (0.5)
+# truncates to a believable-looking 0 via int(0.5)==0; a negative value
+# (-1) sign-flips to a believable-looking 1 via abs(); a boolean (True)
+# masquerades as a real quantity of 1. Combined with the FILLED-status
+# call site's `filled_qty = _qty(raw) or pending_exit_qty` fallback
+# pattern, a fractional/zero-collapsing malformed value silently
+# manufactured a FULL close (fell back to the position's entire
+# pending_exit_qty), while a sign-flipped/boolean value silently applied
+# a WRONG partial fill -- neither is proof of what the broker actually
+# filled.
+_FILLED_QTY_KEYS = ("quantity", "qty", "filled_qty", "filled_quantity", "exec_quantity")
+
+
+def _strict_filled_exit_qty(raw: dict) -> tuple:
+    """Strict parser for a broker-confirmed FILLED exit order's fill
+    quantity. Returns (qty, field_was_present):
+
+      (positive_int, True)  -- a valid quantity was found under the
+        first recognized key that carried a non-empty value: non-
+        boolean, finite, mathematically integral, and strictly positive.
+
+      (None, False)         -- no recognized quantity field was present
+        at all (every candidate key was missing, None, or ""). This is
+        genuine ABSENCE, not a conflict -- callers MAY apply an existing,
+        narrowly-scoped ABSENT-only fallback (e.g. the position's own
+        pending_exit_qty) when the broker order identity is otherwise
+        exactly confirmed by broker_order_id + status=="filled".
+
+      (None, True)          -- a recognized quantity field WAS present
+        with a non-empty value but that value is malformed or
+        conflicting: boolean, explicit zero, negative, fractional
+        (non-integral), non-finite (NaN/inf), or unparseable. This is
+        CONFLICT EVIDENCE, not absence. Callers must NEVER fall back to
+        pending_exit_qty, apply any cumulative fill, call
+        mark_position_closed, or run any terminal proof/economics in
+        this case -- hold instead.
+
+    Only the first key (in priority order) that carries a non-empty
+    value determines the outcome; later keys are not consulted once a
+    present-but-empty gate has been passed, so a corrupt primary field
+    cannot be silently papered over by a coincidentally-valid secondary
+    field.
+    """
+    for key in _FILLED_QTY_KEYS:
+        val = raw.get(key)
+        if val is None or val == "":
+            continue
+        if isinstance(val, bool):
+            return None, True
+        try:
+            qty_float = float(val)
+        except (TypeError, ValueError):
+            return None, True
+        if not math.isfinite(qty_float):
+            return None, True
+        if not qty_float.is_integer():
+            return None, True
+        qty = int(qty_float)
+        if qty <= 0:
+            return None, True
+        return qty, True
+    return None, False
 
 
 def _is_exit_like(raw: dict) -> bool:
@@ -422,7 +495,46 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                     )
                 return RecoveryAction("CONFIRMED_OPEN", "broker_order_still_open", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
             if st == "filled":
-                filled_qty = _qty(raw) or int(getattr(pos, "pending_exit_qty", 0) or 0)
+                # P0 (post-#481 final narrow merge-gate amendment,
+                # blocker 2): FILLED status and FILLED quantity are
+                # separate broker truth fields. The previous
+                # `filled_qty = _qty(raw) or pending_exit_qty` pattern let
+                # a malformed-but-present quantity (fractional, boolean,
+                # negative, non-finite, unparseable) either silently
+                # produce a WRONG nonzero value or collapse to a falsy 0
+                # that triggered the pending_exit_qty fallback --
+                # manufacturing a full close (or a wrong partial fill)
+                # from broker data that never actually proved that
+                # amount. MALFORMED is conflict evidence, not absence: it
+                # must HOLD, never fall back, never apply a fill.
+                _strict_qty, _qty_field_present = _strict_filled_exit_qty(raw)
+                if _strict_qty is None and _qty_field_present:
+                    log.warning(
+                        "exit_autonomous_recovery: pid=%s broker FILLED order "
+                        "broker_order_id=%s reported a present-but-malformed/"
+                        "conflicting fill quantity — NOOP/HOLD rather than "
+                        "manufacture a fill from unproven quantity truth",
+                        pid, pending_broker_id,
+                    )
+                    return RecoveryAction(
+                        "NOOP", "broker_filled_quantity_malformed_hold",
+                        pid, local_id, pending_broker_id,
+                        {"status": st, "quote_health": qh},
+                    )
+                if _strict_qty is not None:
+                    filled_qty = _strict_qty
+                else:
+                    # Genuine ABSENCE (no recognized quantity field at
+                    # all): the existing exact-broker-order-identity
+                    # fallback to this position's own pending_exit_qty is
+                    # preserved -- broker_order_id + status=="filled" for
+                    # the EXACT order this position submitted is already
+                    # confirmed at this point in the exact-broker-identity
+                    # path, so inferring the fill quantity from what we
+                    # ourselves submitted for that specific order is a
+                    # narrowly-scoped, provably-bounded fallback, not a
+                    # guess from unrelated data.
+                    filled_qty = int(getattr(pos, "pending_exit_qty", 0) or 0)
                 fill_price = None
                 for key in ("avg_fill_price", "average_fill_price", "fill_price", "filled_avg_price", "price"):
                     try:
