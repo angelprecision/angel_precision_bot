@@ -382,9 +382,27 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
     # flat" for this contract.  It enforces all PR #481 quantity-conflict guards.
     #
     # Decision table (amendment spec §REQUIRED BOUNDED REPAIR):
+    #   missing/unproven contract                → UNKNOWN → NOOP / HOLD
     #   broker_truth_open_qty=None               → UNKNOWN → NOOP / HOLD
     #   broker_truth_open_qty=0, is_fresh_exact  → authoritative flat → mark_position_closed()
     #   broker_truth_open_qty>0, is_fresh_exact  → position held → replacement-safe
+    #
+    # P0 amendment 2: defense-in-depth against missing contract identity.
+    # Do NOT rely solely on the resolver's internal guard — a position
+    # whose exact OCC contract cannot be established must hold here too,
+    # before resolve_exit_broker_truth() is even called.
+    if not contract:
+        log.warning(
+            "exit_autonomous_recovery: contract identity unestablished for pid=%s — NOOP/HOLD",
+            pid,
+        )
+        return RecoveryAction(
+            "NOOP",
+            "broker_contract_identity_unknown_hold",
+            pid, local_id, "",
+            {"quote_health": qh},
+        )
+
     _client_id = str(getattr(pos, "client_id", "") or "")
     _bt = resolve_exit_broker_truth(broker=broker, client_id=_client_id, contract=contract)
     _bt_qty: Any = _bt.get("broker_truth_open_qty")

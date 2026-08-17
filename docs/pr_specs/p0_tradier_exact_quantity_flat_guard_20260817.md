@@ -8,9 +8,27 @@ This is a forward-fix on top of #478 (merged, `main@37f61d0` via commit
 `9a4287a`). #478 remains correct and is not reverted or rewritten by this
 spec or its implementing PR — see "Relationship to #478" below.
 
-Base: `main@37f61d004b44bfebd6708680b3261f90e528e0d5`.
+Branch was subsequently rebased onto post-#479 `main` with zero conflicts.
+Current base: `main@d0d37e79ae698e604eb8080065d2314b161de351` (merge of
+PR #479, `spec/p0-watcher-zero-quote-breach-guard-20260815` — watcher
+zero-quote-breach guard work, unrelated territory to this spec; the
+rebase touched no shared files).
 
 Implementing branch: `spec/p0-tradier-exact-quantity-flat-guard-20260817`.
+
+This spec now covers three layers of work, described separately below:
+
+1. **Original fix** — adapter/resolver quantity-conflict hardening
+   (`ap/brokers/tradier.py`, `ap/exit_safety.py`).
+2. **Amendment 1** — autonomous-recovery false-flat seam. An independent
+   caller audit found that `ap/exit_autonomous_recovery.py::recover_exit_
+   position()` re-implemented broker-position quantity semantics locally
+   instead of consuming the resolver above, reopening the same class of
+   defect through a second code path. See "Amendment 1" below.
+3. **Amendment 2** — missing-contract-identity seam. A further audit found
+   that an empty/unproven contract identity could be normalized to `""`
+   and then treated as "absent from snapshot" = authoritative flat, even
+   though no exact contract was ever established. See "Amendment 2" below.
 
 Independent review and Angel's explicit merge authorization are required
 before merge. This status reflects that the implementation, fail-first
@@ -243,6 +261,11 @@ Broker unavailable / malformed payload / missing method   -> UNKNOWN
                                                             broker_truth_open_qty = None
                                                             is_fresh_exact = False
                                                             (unchanged from #478)
+Missing/empty/unproven contract identity                  -> UNKNOWN
+                                                            broker_truth_open_qty = None
+                                                            is_fresh_exact = False
+                                                            (Amendment 2 — never authoritative
+                                                            flat regardless of snapshot state)
 ```
 
 ## Explicit non-goals
@@ -265,14 +288,18 @@ Do not change in this fix:
 
 ## Production file budget
 
-- `ap/brokers/tradier.py` (adapter boundary hardening)
-- `ap/exit_safety.py` (resolver + defense-in-depth helper hardening)
+- `ap/brokers/tradier.py` (adapter boundary hardening — original fix)
+- `ap/exit_safety.py` (resolver + defense-in-depth helper hardening —
+  original fix; missing-contract-identity guard — Amendment 2)
+- `ap/exit_autonomous_recovery.py` (negative-proof block now consumes the
+  canonical resolver instead of re-implementing quantity semantics —
+  Amendment 1; defense-in-depth contract-identity check — Amendment 2)
 
-No other production file required a change. Every direct
-`broker.list_positions()` caller was re-audited (see "Caller audit" below)
-and confirmed to already fail closed on any exception — the increase in
-raised-exception cases from the adapter fix does not change any caller's
-flat-truth authority.
+Every direct `broker.list_positions()` caller was re-audited (see "Caller
+audit" below). The original audit incorrectly cleared
+`ap/exit_autonomous_recovery.py` as needing no change — that error is
+corrected in the caller-audit entry above and fixed by Amendment 1. All
+other callers remain confirmed to fail closed on any exception.
 
 ## Caller audit
 
@@ -305,17 +332,28 @@ account payload now raises where it previously did not):
    per-runner, `{"ok": False, "error": ...}`. Pure reporting/alerting
    endpoint; no position mutation occurs in this function at all. No
    change needed.
-7. **`ap/exit_autonomous_recovery.py`** (`~line 369`) — exception caught by
-   a `try/except Exception: log.debug(...)` that swallows and falls
-   through to `_mark_replacement_safe(...)`, **not**
-   `exit_engine.mark_position_closed(...)`. Confirmed: the exception path
-   never reaches the close call — it only reaches `mark_position_closed`
-   inside the `try` block's success path, when `_contract_held` is
-   explicitly proven `False` from a successfully-parsed broker snapshot.
-   No change needed.
+7. **`ap/exit_autonomous_recovery.py`** (`~line 369`, original audit) —
+   **STALE / CORRECTED BY AMENDMENT 1.** The original caller audit stated
+   this call site required no change, on the theory that its
+   `try/except Exception: log.debug(...)` swallowed exceptions and fell
+   through to `_mark_replacement_safe(...)` rather than
+   `mark_position_closed(...)`. That analysis missed a second, independent
+   defect in the **success path** of the same `try` block: it called raw
+   `broker.list_positions()` and evaluated
+   `int(p.get("quantity") or 0) != 0` directly, which — for an exact-match
+   row with `quantity=0`/`False`/fractional/negative — collapsed to
+   `_contract_held=False` and called `mark_position_closed()`, exactly the
+   false-flat defect this spec exists to prevent, via a second
+   independent code path that bypassed the resolver entirely. The
+   exception path was also wrong: it fell through to
+   `_mark_replacement_safe()`, letting a failed broker query independently
+   authorize replacement. **This call site required a change and received
+   one — see "Amendment 1" below.**
 
 No caller converts a newly-propagated quantity-conflict exception into
-authoritative flatness.
+authoritative flatness (true of the adapter/resolver layer as originally
+audited; Amendment 1 extends the same guarantee to the autonomous-recovery
+caller that the original audit incorrectly cleared).
 
 ## Diagnostics
 
@@ -365,10 +403,155 @@ Existing statuses (`exact_match`, `contract_absent_open_qty_zero`,
   impossible — every such case now resolves as unknown broker truth
   instead of manufactured flat.
 
+## Amendment 1 — autonomous-recovery false-flat seam
+
+### Defect
+
+`ap/exit_autonomous_recovery.py::recover_exit_position()`'s negative-proof
+block (reached when no pending broker order id and no matching open
+sell-to-close order exists) independently re-implemented broker-position
+quantity semantics instead of consuming `resolve_exit_broker_truth()`:
+
+```python
+_broker_positions = broker.list_positions()
+_contract_held = any(
+    str(p.get("symbol") or "").upper() == str(contract or "").upper()
+    for p in (_broker_positions or [])
+    if int(p.get("quantity") or 0) != 0
+)
+if not _contract_held and contract:
+    exit_engine.mark_position_closed(...)
+```
+
+For an exact-match row with `quantity=0`/`False`/`0.5`/`-1`/`-0.5`,
+`int(p.get("quantity") or 0) != 0` evaluates falsy, `_contract_held`
+becomes `False`, and `mark_position_closed()` is called — the same
+false-flat defect this spec fixes at the adapter/resolver layer,
+reintroduced via a second independent code path that bypassed the
+resolver entirely.
+
+The exception path was also unsafe:
+
+```python
+except Exception as _bp_exc:
+    log.debug(...)
+# falls through to _mark_replacement_safe(...)
+```
+
+A failed `broker.list_positions()` call let execution fall through to
+`_mark_replacement_safe()`, letting unknown broker truth independently
+authorize replacement.
+
+### Fix
+
+The negative-proof block now calls `resolve_exit_broker_truth()` and
+applies a three-branch decision table:
+
+```text
+broker_truth_open_qty is None                -> NOOP / HOLD
+broker_truth_open_qty == 0, is_fresh_exact   -> MARKED_CLOSED (authoritative flat)
+broker_truth_open_qty > 0                    -> replacement-safe (position held)
+```
+
+Only one canonical definition of "broker flat" now exists in the
+codebase; autonomous recovery consumes it rather than re-deriving it.
+
+### Tests
+
+`tests/test_p0_exit_autonomous_recovery_quantity_guard.py` — 15 tests,
+covering: exact-OCC quantity=0/False/0.5/-1/-0.5, broker exception
+(RuntimeError plus ConnectionError/TimeoutError/ValueError/OSError
+variants), valid positive quantity (position remains held), authoritative
+flat on genuine absence (both non-empty-snapshot and empty-snapshot
+variants), and a static-analysis guard against new broker submit/cancel
+authority. Fail-first: 11/15 failed against pre-fix code, confirmed before
+any production line was touched.
+
+## Amendment 2 — missing-contract-identity seam
+
+### Defect
+
+An independent audit found that Amendment 1's centralization through
+`resolve_exit_broker_truth()` removed an older implicit safety property:
+authoritative broker-flat cleanup required a usable contract identity.
+`_position_contract(pos)` can return an empty string when a position's
+`option_symbol`/`contract`/`symbol` fields are all unset. Before this
+amendment, `resolve_exit_broker_truth()` would normalize that to
+`normalized_contract = ""`, no row in any snapshot would match the empty
+string, and the "no matched rows" branch would manufacture authoritative
+flat truth (`broker_truth_open_qty=0`, `is_fresh_exact=True`) for a
+contract that was never actually identified — even against a non-empty,
+otherwise-valid broker snapshot.
+
+Binding invariant: **absence can only prove flatness when we know exactly
+which broker contract we were trying to find.** Missing/unproven contract
+identity is UNKNOWN truth, never broker-flat truth.
+
+### Fix
+
+Two layers, per the amendment's explicit "do not rely solely on the
+resolver guard" instruction:
+
+1. **`ap/exit_safety.py::resolve_exit_broker_truth()`** — immediately
+   after contract normalization, before any broker call: if
+   `normalized_contract` is empty, return
+   `{"broker_truth_open_qty": None, "is_fresh_exact": False, "audit": {..., "snapshot_status": "contract_identity_unavailable"}}`
+   without ever calling `broker.list_positions()`.
+2. **`ap/exit_autonomous_recovery.py::recover_exit_position()`** —
+   defense-in-depth: before calling the resolver at all, if
+   `contract` (from `_position_contract(pos)`) is falsy, return
+   `RecoveryAction("NOOP", "broker_contract_identity_unknown_hold", ...)`.
+
+Both guards are intentionally redundant — the amendment spec requires the
+caller not depend solely on the resolver-level fix.
+
+### Tests
+
+`tests/test_p0_missing_contract_identity_never_flat.py` — 15 tests:
+
+- **Case A** (3 parametrized + 1 empty-snapshot variant) — resolver with
+  empty/`None`/whitespace-only contract, against both a non-empty and an
+  empty broker snapshot: `broker_truth_open_qty is None`,
+  `is_fresh_exact is False`,
+  `audit["snapshot_status"] == "contract_identity_unavailable"`.
+- **Case B** (2 variants) — `recover_exit_position()` with an unestablished
+  contract identity, against both a non-empty and an empty broker
+  snapshot: action is `NOOP`, zero `mark_position_closed()` calls, zero
+  replacement authorization.
+- **Case C** — valid known OCC contract genuinely absent from a successful
+  non-empty snapshot: still resolves authoritative flat and autonomous
+  recovery still marks it closed (regression guard on existing working
+  behavior).
+- **Case D** — valid known OCC contract with positive quantity: still
+  resolves open, never falsely closed (regression guard).
+- **Case E** (5 parametrized quantity variants + 1 broker-exception case)
+  — all existing Amendment-1/original malformed-quantity protections
+  re-verified intact after the contract-identity hardening.
+- **Normal-path preservation** — valid contract + positive quantity: exact
+  resolver truth, position stays open, and a static-analysis check
+  confirms zero new broker submit/cancel authority in either file touched
+  by this amendment.
+
+Fail-first: 6/15 failed against pre-Amendment-2 code (the Case A and
+Case B tests specifically; Cases C/D/E and the normal-path test were
+written to already pass, proving they were unaffected by the fix).
+
 ## Required tests — status
 
-All required fail-first and regression coverage implemented in
-`tests/test_p0_tradier_exact_quantity_flat_guard.py` (33 tests):
+All required fail-first and regression coverage across the original fix
+and both amendments is implemented in three dedicated files:
+
+- `tests/test_p0_tradier_exact_quantity_flat_guard.py` (33 tests) —
+  original adapter/resolver fix.
+- `tests/test_p0_exit_autonomous_recovery_quantity_guard.py` (15 tests) —
+  Amendment 1.
+- `tests/test_p0_missing_contract_identity_never_flat.py` (15 tests) —
+  Amendment 2.
+
+All three files are included in `.github/workflows/p0_regression.yml` and
+run as part of the exact-head CI P0 Regression Suite.
+
+Original fix's dedicated suite breakdown:
 
 - Section A — adapter boundary rejects bool/fractional/negative, accepts
   explicit zero and valid integers (including numeric-string `"4"`).
@@ -396,6 +579,8 @@ that file were unaffected and required no changes.
 
 ## Validation results
 
+Original fix:
+
 - `tests/test_p0_broker_position_unavailable_not_flat.py` (#478's own
   suite): 69/69 passed, unmodified.
 - `tests/test_p0_tradier_exact_quantity_flat_guard.py` (this fix's
@@ -416,13 +601,45 @@ that file were unaffected and required no changes.
   failed — all 8 failures confirmed identical (same test, same failure
   reason) on a clean, unmodified `main@37f61d0` checkout with this fix's
   changes stashed out; they are pre-existing and unrelated to this work.
-- Full CI-exact P0 Regression Suite (116 files, including this fix's new
-  dedicated test file added to `.github/workflows/p0_regression.yml`)
-  against a fresh local Postgres 16 instance: 3910 passed, 28 skipped, 0
-  failed.
+
+Amendment 1:
+
+- Fail-first (pre-fix): 11/15 new tests failed, confirmed.
+- Post-fix: `tests/test_p0_exit_autonomous_recovery_quantity_guard.py`
+  15/15 passed.
+- Combined PR-#481-targeted suite (`test_p0_broker_position_unavailable_
+  not_flat.py` + `test_p0_tradier_exact_quantity_flat_guard.py` +
+  `test_p0_exit_autonomous_recovery_quantity_guard.py` +
+  `test_p0_broker_owned_exit_requested_recovery.py` +
+  `test_p0_broker_owned_exit_recovery_preflight.py`): 282 passed, 1
+  skipped, 0 failed.
+- `tests/test_p0_broker_position_unavailable_not_flat.py` (#478)
+  re-verified in isolation: 69/69 passed, unmodified.
+
+Amendment 2:
+
+- Fail-first (pre-fix): 6/15 new tests failed (Case A + Case B), 9/15
+  passed (Cases C/D/E + normal-path, proving they were unaffected by the
+  fix before it was even applied) — confirmed.
+- Post-fix: `tests/test_p0_missing_contract_identity_never_flat.py` 15/15
+  passed.
+- Combined PR-#481-targeted suite (all five files above plus
+  `test_p0_missing_contract_identity_never_flat.py`): 297 passed, 1
+  skipped, 0 failed.
+- `tests/test_p0_broker_position_unavailable_not_flat.py` (#478)
+  re-verified in isolation, post both amendments: 69/69 passed,
+  unmodified.
+
+Full CI-exact P0 Regression Suite: see PR #481 body / latest CI run for
+the exact-head result at the current head SHA — both new amendment test
+files are included in `.github/workflows/p0_regression.yml` and execute
+as part of that workflow.
 
 ## Delivery
 
 New forward-fix branch/PR from current main. #478 is not reverted or
-rewritten. Do not merge, deploy, or mark ready for review without Angel's
-explicit authorization.
+rewritten. Branch was rebased onto post-#479 main
+(`d0d37e79ae698e604eb8080065d2314b161de351`) with zero conflicts; both
+amendments were implemented and validated against the rebased branch.
+Do not merge, deploy, or mark ready for review without Angel's explicit
+authorization.

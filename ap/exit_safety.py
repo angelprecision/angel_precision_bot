@@ -208,6 +208,26 @@ def resolve_exit_broker_truth(
         "exact_contract_match": False,
     }
 
+    # P0 amendment 2 (spec: p0_tradier_exact_quantity_flat_guard_20260817,
+    # surgical follow-up): a missing/unproven contract identity must NEVER
+    # be treated as authoritative broker-flat truth. Without this guard, an
+    # empty normalized_contract would match no row in any successful
+    # snapshot -- including a non-empty one -- and the "no matched rows"
+    # branch below would incorrectly manufacture fresh broker-flat truth
+    # (broker_truth_open_qty=0, is_fresh_exact=True) for a contract we never
+    # actually established identity for.
+    #
+    # ABSENCE CAN ONLY PROVE FLATNESS WHEN WE KNOW EXACTLY WHICH BROKER
+    # CONTRACT WE WERE TRYING TO FIND. Missing/unproven identity is UNKNOWN
+    # truth, never broker-flat truth.
+    if not normalized_contract:
+        audit["snapshot_status"] = "contract_identity_unavailable"
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
     list_positions = getattr(broker, "list_positions", None)
     if not callable(list_positions):
         audit["snapshot_status"] = "broker_positions_unavailable"
