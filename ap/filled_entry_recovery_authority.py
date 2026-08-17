@@ -57,6 +57,60 @@ def _positive_integral(value: Any) -> int:
     return int(parsed)
 
 
+def _structural_quantity(value: Any) -> float | None:
+    """Return a finite numeric quantity if the value is structurally valid.
+
+    Structural validity is deliberately distinct from AP long-option
+    authority.  A whole Tradier account snapshot can legitimately contain
+    unrelated rows the AP recovery flow does not own or manage: short
+    positions (negative quantity), fractional equity holdings, or other
+    contracts.  Those are valid broker truth and must survive account-wide
+    normalization unchanged so they cannot poison the exact-target-OCC
+    evaluation that happens later in ``evaluate_filled_entry_recovery_authority``.
+
+    Only genuinely malformed values are rejected here: missing, boolean,
+    non-numeric, NaN, and infinite.  Negative, zero, and fractional values
+    are preserved as-is.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _structural_broker_quantity(row: dict) -> float | None:
+    """Return quantity as a finite float when every supplied alias agrees.
+
+    Mirrors ``_broker_quantity`` except it does not force AP long-option
+    authority (strictly positive integral).  Negative, zero, and fractional
+    single-valued quantities are preserved; missing quantity, malformed
+    values, and alias disagreement remain structurally invalid.
+    """
+    containers = [row]
+    raw = row.get("raw") if isinstance(row, dict) else None
+    if isinstance(raw, dict) and raw is not row:
+        containers.append(raw)
+    supplied = [
+        container[key]
+        for container in containers
+        for key in ("quantity", "qty")
+        if key in container and container[key] is not None
+    ]
+    if not supplied:
+        return None
+    quantities = [_structural_quantity(value) for value in supplied]
+    if any(quantity is None for quantity in quantities):
+        return None
+    if len(set(quantities)) != 1:
+        return None
+    return quantities[0]
+
+
 def _positive_finite(value: Any) -> float:
     if value is None or isinstance(value, bool):
         return 0.0
@@ -218,17 +272,26 @@ def _normalize_positions_payload(payload: Any) -> list[dict]:
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_IDENTITY_MISSING")
         contract = next(iter(identities))
 
+        # #481 established that account-level broker snapshot validity is
+        # not the same thing as AP exact-contract long-option authority.
+        # An unrelated row (a short position, a fractional equity holding,
+        # a different contract) can carry a structurally valid negative or
+        # fractional quantity; that must not raise here and poison the
+        # whole account snapshot.  Only genuinely malformed quantity data
+        # (missing, boolean, non-numeric, NaN/inf, or alias disagreement)
+        # is rejected at this account-wide normalization boundary.  Strict
+        # positive-integral AP-long validation happens only once the
+        # exact target OCC contract is matched, in
+        # ``evaluate_filled_entry_recovery_authority``.
         quantity_values = [
-            _positive_integral(container.get(key))
+            _structural_quantity(container.get(key))
             for container in containers
             for key in ("quantity", "qty")
             if container.get(key) is not None
         ]
-        if (
-            not quantity_values
-            or any(quantity <= 0 for quantity in quantity_values)
-            or len(set(quantity_values)) != 1
-        ):
+        if not quantity_values or any(quantity is None for quantity in quantity_values):
+            raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_QUANTITY_INVALID")
+        if len(set(quantity_values)) != 1:
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_QUANTITY_INVALID")
         normalized.append(
             {"symbol": contract, "quantity": quantity_values[0], "raw": dict(row)}
@@ -316,9 +379,16 @@ def fetch_current_broker_positions(broker: Any) -> list[dict]:
                 raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_OCC_INVALID")
             continue
 
+        # See _normalize_positions_payload: account-wide snapshot validity
+        # is not AP-long authority.  Preserve structurally valid negative,
+        # zero, and fractional quantities for unrelated rows here; the
+        # exact-target-OCC matcher in
+        # evaluate_filled_entry_recovery_authority enforces strict
+        # positive-integral AP-long authority only for the one row whose
+        # contract equals the order being recovered.
         raw_row = row.get("raw") if isinstance(row.get("raw"), dict) else row
-        quantity = _broker_quantity(raw_row)
-        if quantity <= 0:
+        quantity = _structural_broker_quantity(raw_row)
+        if quantity is None:
             raise ValueError("FILLED_ENTRY_RECOVERY_BROKER_POSITION_QUANTITY_INVALID")
         normalized.append({
             "symbol": contract,

@@ -724,9 +724,16 @@ def test_authority_ignores_equity_rows_but_not_option_identity(payload):
     "payload, expected_message",
     [
         ([{"option_symbol": "PEP-INVALID", "quantity": 1}], "OCC_INVALID"),
-        ([{"symbol": CONTRACT, "quantity": 0}], "QUANTITY_INVALID"),
+        # Alias disagreement is genuinely malformed data (which value is
+        # true?), not a structurally-valid-but-non-AP-long quantity, and
+        # must still be rejected at the account-wide snapshot boundary.
         ([{"symbol": CONTRACT, "quantity": 0, "qty": 1}], "QUANTITY_INVALID"),
-        ([{"symbol": CONTRACT, "quantity": 1.5}], "QUANTITY_INVALID"),
+        ([{"symbol": CONTRACT, "quantity": None}], "QUANTITY_INVALID"),
+        ([{"symbol": CONTRACT, "quantity": "not-a-number"}], "QUANTITY_INVALID"),
+        ([{"symbol": CONTRACT, "quantity": True}], "QUANTITY_INVALID"),
+        ([{"symbol": CONTRACT, "quantity": float("nan")}], "QUANTITY_INVALID"),
+        ([{"symbol": CONTRACT, "quantity": float("inf")}], "QUANTITY_INVALID"),
+        ([{"symbol": CONTRACT}], "QUANTITY_INVALID"),
     ],
 )
 def test_broker_snapshot_adapter_rejects_malformed_option_rows(
@@ -745,6 +752,30 @@ def test_broker_snapshot_adapter_rejects_malformed_option_rows(
         fetch_current_broker_positions(object())
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # #481 P0 integration fix: account-level broker snapshot validity is
+        # not the same thing as AP exact-contract long-option authority.
+        # A structurally valid negative, zero, or fractional quantity on
+        # the target row must survive account-wide normalization — the
+        # snapshot fetch layer must not raise for it.  AP long-only
+        # validation happens later, only at the exact-OCC evaluation
+        # boundary (see test_authority_holds_unproven_current_broker_quantity).
+        [{"symbol": CONTRACT, "quantity": 0}],
+        [{"symbol": CONTRACT, "quantity": 1.5}],
+        [{"symbol": CONTRACT, "quantity": -1}],
+    ],
+)
+def test_broker_snapshot_adapter_preserves_structurally_valid_non_long_quantity(payload):
+    from ap.filled_entry_recovery_authority import _normalize_positions_payload
+
+    node = {"positions": {"position": payload}}
+    result = _normalize_positions_payload(node)
+    assert result[0]["symbol"] == CONTRACT
+    assert result[0]["quantity"] == payload[0]["quantity"]
+
+
 def test_broker_snapshot_adapter_returns_exact_option_rows_and_ignores_equities(monkeypatch):
     import ap.filled_entry_recovery_authority as authority
 
@@ -756,6 +787,64 @@ def test_broker_snapshot_adapter_returns_exact_option_rows_and_ignores_equities(
     from ap.filled_entry_recovery_authority import fetch_current_broker_positions
 
     assert fetch_current_broker_positions(object())[0]["symbol"] == CONTRACT
+
+
+@pytest.mark.parametrize(
+    "unrelated_row",
+    [
+        {"symbol": "SPY", "quantity": -10},
+        {"symbol": "SPY", "quantity": 0.25},
+        {"option_symbol": "PEP260821P00141000", "symbol": "PEP260821P00141000", "quantity": -1},
+        {"symbol": "AAPL", "quantity": -20},
+    ],
+)
+def test_unrelated_signed_or_fractional_row_does_not_poison_target_recovery(unrelated_row):
+    """#481 P0 integration fix (production-shaped regression).
+
+    This exercises the REAL production path: a broker fake without
+    ``list_positions_authoritative`` (matching TradierBroker), so
+    ``_fetch_authoritative_broker_positions`` falls through to
+    ``broker._get(...)`` -> ``_normalize_positions_payload``, exactly as
+    happens in production.  A prior defect made an unrelated
+    negative/fractional account row raise during whole-snapshot
+    normalization, HOLDing recovery on the exact AP target contract even
+    though that contract's own broker quantity was clean.
+    """
+    from ap.filled_entry_recovery_authority import fetch_current_broker_positions
+
+    class _ProductionShapedBroker:
+        """No list_positions_authoritative — forces the real _get() path."""
+
+        cfg = SimpleNamespace(account_id="acct-jason")
+
+        def _get(self, path):
+            assert path == "/v1/accounts/acct-jason/positions"
+            return {
+                "positions": {
+                    "position": [
+                        unrelated_row,
+                        {"symbol": CONTRACT, "quantity": 1},
+                    ]
+                }
+            }
+
+    # The unrelated row must not raise and must not poison the snapshot.
+    rows = fetch_current_broker_positions(_ProductionShapedBroker())
+    target_rows = [row for row in rows if row["symbol"] == CONTRACT]
+    assert len(target_rows) == 1
+    assert target_rows[0]["quantity"] == 1
+
+    # And the exact-OCC recovery authority must still prove the target
+    # contract normally, despite the unrelated broker truth being present.
+    result = evaluate_filled_entry_recovery_authority(
+        pm=_PM(),
+        order=_order(),
+        runtime_execution_mode=LIVE,
+        expected_client_id=CLIENT,
+        broker_positions=rows,
+        today=date(2026, 8, 14),
+    )
+    assert result["disposition"] == "ACTIVE_RECREATE"
 
 
 def test_raw_broker_position_payload_rejects_ambiguous_option_identity():
