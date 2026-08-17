@@ -978,7 +978,8 @@ Post-fix: 9/9 pass.
   `test_p0_broker_owned_exit_recovery_preflight.py`): 387 passed, 1
   skipped, 0 failed.
 - `tests/test_p0_broker_position_unavailable_not_flat.py` (#478)
-  re-verified in isolation, post all five amendments: 69/69 passed,
+  re-verified in isolation, post all six amendments plus the merge-gate
+  correction: 69/69 passed,
   unmodified.
 - Exit-fill-adjacent blast-radius check (`test_p0_canonical_exit_fill_
   truth.py` + `test_p0_partial_exit_ownership_guard.py` +
@@ -990,10 +991,137 @@ Post-fix: 9/9 pass.
   required pre-existing test rewrites. `ap_reconciler.py` was explicitly
   NOT touched, per the amendment's own non-scope finding.
 
+## Amendment 6 — Tradier list_orders() UNKNOWN-vs-EMPTY boundary + order-query dict-handling correction
+
+Independent audit against the exact head of Amendment 5 found one
+remaining adapter-boundary blocker, and a follow-up correction found one
+further bounded defect in the same broker-order-truth territory. Both
+are documented together since they share root cause and were fixed in
+the same session against the same underlying invariant.
+
+### Amendment 6 proper — Tradier `list_orders()` boundary
+
+**Defect.** Amendment 5 correctly made
+`ap/exit_autonomous_recovery.py::_list_open_orders()` tri-state, but the
+production Tradier adapter could still collapse an unusable broker order
+response into `[]` *before* autonomous recovery ever saw it — the same
+class of defect Amendment 4 fixed for `list_positions()`. Two concrete
+paths: a malformed top-level payload (scalar/string/non-dict JSON)
+collapsed to `[]` via `node = None -> orders = None -> return []`; and
+malformed order rows within an `orders.order` list were silently filtered
+out via a list comprehension (`[order for order in orders if
+isinstance(order, dict)]`), producing a false confirmed-empty result even
+though the broker reported rows whose identity couldn't be established.
+
+**Fix.** `TradierBroker.list_orders()` rewritten to mirror
+`list_positions()`'s exact shape-validation discipline: propagate
+transport/auth exceptions unchanged; raise
+`TRADIER_ORDERS_PAYLOAD_MALFORMED` for a non-dict top-level response, a
+missing `orders`/`order` key on an otherwise non-empty dict, a
+non-dict/non-list order container, or any individual order row that
+isn't a dict (fail closed, never silently filter a malformed row out of
+an otherwise-returned list); return `[]` only for explicit
+authoritative-empty shapes (top-level `{}`; `orders`/`order` ==
+`null`/`"null"`/`""`/`{}` or an empty list).
+
+No other production file required a change: `TradierBroker` only exposes
+`list_orders` (not `list_open_orders`/`get_open_orders`), so
+`_list_open_orders()`'s tri-state helper already finds and calls it as a
+fallback candidate — confirmed via direct inspection before writing any
+test. `ap/manual_close_reconciliation.py`'s separate `list_orders()`
+fallback path is unreachable for the real production `TradierBroker` (it
+always has `_get`/`cfg.account_id`, so it takes the primary pagination
+branch instead) and has zero existing test coverage — verified safe to
+leave untouched rather than widening scope without a failing regression.
+
+**Tests.** `tests/test_p0_tradier_orders_unknown_never_empty.py` — 25
+tests covering cases A-F from the spec: 4 malformed-top-level variants, 3
+malformed-order-row variants, 2 mixed-valid-and-malformed variants, 9
+legitimate-empty-shape variants (all correctly returning `[]`), valid
+single-order and list-of-orders shapes, an end-to-end same-OCC live EXIT
+recognition proof through the real adapter, and three end-to-end
+malformed-payload-holds proofs wiring a real `TradierBroker` into
+`recover_exit_position()` (generic path, malformed-row variant,
+terminal-pending-id path).
+
+Fail-first: verified via a targeted temporary revert of just the
+`list_orders()` method body — 15/25 failed pre-fix, including all 3
+end-to-end proofs showing `action=REPLACEMENT_SAFE` where `NOOP` was
+required. The revert also surfaced that the old implementation was
+internally inconsistent across plausible empty-shape variants (over-
+raising on some string-typed empty markers while under-raising on scalar
+top-level payloads and malformed rows) — the new implementation is
+uniform. Post-fix: 25/25 pass.
+
+### Merge-gate correction — order-query dict-handling
+
+**Defect.** A follow-up independent review found that
+`_list_open_orders()`'s dict-handling branch still treated *every*
+unrecognized dict as a successful singleton order result:
+`return [result]` unconditionally, once the recognized-container checks
+failed. Broker responses such as `{"error": "rate_limited"}`,
+`{"errors": [...]}`, `{"message": "broker unavailable"}`,
+`{"status": "ERROR", ...}`, or `{}` were silently wrapped as `[result]`
+and treated as `AVAILABLE` broker-order truth.
+`_matching_open_exit_orders()` then filtered those fake rows out (they
+match no real contract and have no real status) and obtained zero
+matching exits — a confirmed-but-wrong empty result that could still
+reach replacement-safe logic as though an authoritative scan had proven
+no live exit exists, violating Amendment 5's own binding invariant.
+
+**Fix.** New helper `_looks_like_broker_order_row(d)`: a dict is only
+accepted as a genuine single order row if it carries actual
+broker-order identity (via the existing `_broker_order_id()` extractor)
+*and* carries no explicit `error`/`errors`/`message` key *and* carries no
+`status` of `error`/`fail`/`failed`/`failure`. Wired into
+`_list_open_orders()`'s dict-handling branch: a dict that is neither a
+recognized container nor a genuine order row now logs and falls through
+to the next candidate method rather than being accepted.
+
+**Bounded Fix 2** (the correction's own name for the `list_orders()`
+missing-container case) required *zero* additional changes: fail-first
+testing confirmed Amendment 6 (already implemented earlier in this same
+session) already raises `TRADIER_ORDERS_PAYLOAD_MALFORMED` for exactly
+this shape. Narrow confirmatory tests were added anyway per the explicit
+instruction to add them to `tests/test_p0_broker_order_query_unknown_
+never_empty.py`.
+
+**Tests.** Appended to the existing Amendment-5 test file per the
+correction's explicit file instruction: 11 new tests — 5 parametrized
+error-like/unrecognized dict shapes each resolving to `None`; a
+regression guard confirming a genuine single order dict without any
+error shape is still correctly accepted; two end-to-end tests (generic
+path and terminal-pending-id duplicate-scan path) proving zero
+replacement-safe/clear-in-flight/adoption/cancel/close; and three
+real-`TradierBroker` confirmatory tests for the missing-container/
+authoritative-empty/valid-nonempty cases.
+
+Fail-first: verified via a targeted temporary revert of just the
+dict-handling branch — 7/11 relevant tests failed pre-fix, including both
+end-to-end cases showing `action=REPLACEMENT_SAFE` where `NOOP` was
+required. Post-fix: 25/25 pass in the full file (14 original + 11 new).
+
+### Combined validation
+
+- Full PR-#481-targeted suite (14 files: original fix + Amendments 1-6 +
+  merge-gate correction + `test_p0_broker_owned_exit_requested_
+  recovery.py` + `test_p0_broker_owned_exit_recovery_preflight.py` +
+  `test_p0_exit_closed_guard_and_circuit_breaker.py`): 448 passed, 1
+  skipped, 0 failed.
+- `tests/test_p0_broker_position_unavailable_not_flat.py` (#478)
+  re-verified in isolation, post Amendment 6 and the merge-gate
+  correction: 69/69 passed, unmodified.
+- Scope discipline: Amendment 6 touched exactly `ap/brokers/tradier.py`
+  (production) as required; the merge-gate correction touched exactly
+  `ap/exit_autonomous_recovery.py` (production). `ap_reconciler.py`
+  untouched, scale-out routing untouched, no ENTRY/selector/watcher/
+  reporting/queue/execution_mode/client_id changes in either.
+
 ## Required tests — status
 
 All required fail-first and regression coverage across the original fix
-and all five amendments is implemented in nine dedicated files:
+and all six amendments (plus the Amendment-5 merge-gate correction) is
+implemented in ten dedicated files:
 
 - `tests/test_p0_tradier_exact_quantity_flat_guard.py` (33 tests) —
   original adapter/resolver fix (two tests rewritten under Amendment 5;
@@ -1009,12 +1137,15 @@ and all five amendments is implemented in nine dedicated files:
   `tests/test_p0_unrelated_short_position_no_poison.py` (21 tests,
   includes Amendment 5's Blocker 1 coverage) — Amendment 4 (Blockers 1,
   2, 3 respectively).
-- `tests/test_p0_broker_order_query_unknown_never_empty.py` (14 tests),
-  `tests/test_p0_scale_out_fill_recovery_no_false_close.py` (9 tests) —
-  Amendment 5 (Blockers 2, 3 respectively; Blocker 1 folded into the
-  existing Amendment-4 file above).
+- `tests/test_p0_broker_order_query_unknown_never_empty.py` (25 tests:
+  14 original Amendment-5 Blocker-2 tests + 11 merge-gate correction
+  tests), `tests/test_p0_scale_out_fill_recovery_no_false_close.py`
+  (9 tests) — Amendment 5 (Blockers 2, 3 respectively; Blocker 1 folded
+  into the existing Amendment-4 file above).
+- `tests/test_p0_tradier_orders_unknown_never_empty.py` (25 tests) —
+  Amendment 6.
 
-All nine files are included in `.github/workflows/p0_regression.yml` and
+All ten files are included in `.github/workflows/p0_regression.yml` and
 run as part of the exact-head CI P0 Regression Suite.
 
 Original fix's dedicated suite breakdown:
@@ -1164,6 +1295,7 @@ execute as part of that workflow.
 New forward-fix branch/PR from current main. #478 is not reverted or
 rewritten. Branch was rebased onto post-#479 main
 (`d0d37e79ae698e604eb8080065d2314b161de351`) with zero conflicts; all
-five amendments were implemented and validated against the rebased
+six amendments (plus the Amendment-5 merge-gate correction) were
+implemented and validated against the rebased
 branch. Do not merge, deploy, or mark ready for review without Angel's
 explicit authorization.
