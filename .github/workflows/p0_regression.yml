@@ -51,6 +51,7 @@ jobs:
         run: |
           python -m py_compile ap_execution_core.py
           python -m py_compile tests/test_p0_deferred_real_cost_revalidation.py
+          python -m py_compile tests/test_p0_seam4_e2e_deferred_lifecycle.py
           git diff --check
 
       - name: Run PR474 focused and adjacent tests
@@ -86,7 +87,7 @@ jobs:
           )
           p.write_text(text)
           PY
-          git add ap_execution_core.py .github/workflows/p0_regression.yml
+          git add ap_execution_core.py tests/test_p0_seam4_e2e_deferred_lifecycle.py .github/workflows/p0_regression.yml
           git diff --cached --exit-code && { echo 'No implementation diff produced'; exit 1; } || true
           git commit -m 'fix(pr474): revalidate deferred entries at final broker-ready cost'
           git push origin HEAD:spec/p0-deferred-real-cost-revalidation-20260814
