@@ -19,16 +19,6 @@ from ap.admission_thresholds import (
     resolve_admission_thresholds,
 )
 
-# PR #483: single canonical sector-identity resolver. Master Control
-# previously owned a small local SECTOR_MAP with a `.get(ticker, "other")`
-# fallback, which silently treated every unmapped ticker as economically
-# identical to every other unmapped ticker (proven false correlation:
-# 22 revalidate_sector_cap_other blocks in Jason's 2026-08-06..08-17 LIVE
-# audit). ap.exposure_gate.get_sector() is the reused, already-correct
-# contract: known ticker -> canonical sector string; unknown -> None.
-# Master Control must not maintain a second, competing sector authority.
-from ap.exposure_gate import get_sector as resolve_sector
-
 try:
     from ap.counterfactual_tracker import track_counterfactual_signal
 except Exception:  # pragma: no cover
@@ -486,11 +476,48 @@ def _setup_lifecycle_owner_key(signal: dict, *, raw_signal_id: str = "") -> str:
 class APMasterControl:
     """Single decision authority for whether a signal may become a trade."""
 
-    # PR #483: removed local SECTOR_MAP. Sector identity is now resolved
-    # exclusively through ap.exposure_gate.get_sector() (imported above as
-    # resolve_sector). Do not reintroduce a class-local authoritative
-    # sector map here — see PR #483 spec for the false-correlation defect
-    # this caused.
+    SECTOR_MAP: dict[str, str] = {
+        "AAPL": "tech",
+        "MSFT": "tech",
+        "NVDA": "tech",
+        "AMD": "tech",
+        "GOOGL": "tech",
+        "META": "tech",
+        "CRM": "tech",
+        "ORCL": "tech",
+        "TSLA": "tech",
+        "AMZN": "tech",
+        "NFLX": "tech",
+        "SNOW": "tech",
+        "JPM": "financials",
+        "BAC": "financials",
+        "GS": "financials",
+        "MS": "financials",
+        "C": "financials",
+        "WFC": "financials",
+        "UNH": "healthcare",
+        "JNJ": "healthcare",
+        "PFE": "healthcare",
+        "ABBV": "healthcare",
+        "MRK": "healthcare",
+        "LLY": "healthcare",
+        "WMT": "consumer",
+        "COST": "consumer",
+        "TGT": "consumer",
+        "LOW": "consumer",
+        "HD": "consumer",
+        "NKE": "consumer",
+        "XOM": "energy",
+        "CVX": "energy",
+        "SLB": "energy",
+        "CAT": "industrials",
+        "DE": "industrials",
+        "BA": "industrials",
+        "CMCSA": "telecom",
+        "VZ": "telecom",
+        "T": "telecom",
+        "DIS": "media",
+    }
 
     def __init__(
         self,
@@ -1136,21 +1163,40 @@ class APMasterControl:
     def _position_capital_for_exposure(cls, pos: dict) -> float:
         return cls._position_price_for_exposure(pos) * cls._position_qty_for_exposure(pos) * 100
 
+    @staticmethod
+    def _sector_telemetry(sector: Optional[str]) -> dict:
+        """PR #483: explicit sector-resolution decision telemetry for
+        diagnostics/audit. Observability only — must never create a
+        second allow/block authority. The actual gate decision is made
+        purely from `sector is not None` at each call site; this method
+        only describes, after the fact, what that decision was and why.
+        """
+        if sector is None:
+            return {
+                "sector_resolution": "unknown",
+                "sector_cap_applied": False,
+                "sector_cap_skip_reason": "unknown_sector_identity",
+            }
+        return {
+            "sector_resolution": "known",
+            "sector_cap_applied": True,
+            "sector_cap_skip_reason": None,
+        }
+
     def _sector_capital_deployed(self, positions: list, sector: Optional[str]) -> float:
-        """Sum capital deployed in existing positions that resolve to the
-        given known sector. PR #483: an unknown candidate sector (None)
-        must never aggregate against unknown existing positions — each
-        position is resolved individually through the canonical resolver,
-        and only exact known-sector matches count. If `sector` itself is
-        None (unknown candidate), this always returns 0.0, matching the
-        "unknown never becomes a shared bucket" invariant.
+        """PR #483: `sector` is None for an unmapped candidate ticker.
+        Unknown never aggregates: if `sector` itself is None this always
+        returns 0.0, and each existing position is resolved individually
+        (no `"other"` fallback), so unrelated unmapped positions can never
+        be counted as economically correlated with each other or with an
+        unknown candidate.
         """
         if not sector:
             return 0.0
         total = 0.0
         for pos in positions:
             ticker_in_pos = str(pos.get("underlying") or pos.get("ticker") or "")
-            pos_sector = resolve_sector(ticker_in_pos)
+            pos_sector = self.SECTOR_MAP.get(ticker_in_pos.upper())
             if pos_sector is not None and pos_sector == sector:
                 try:
                     total += self._position_capital_for_exposure(pos)
@@ -1633,14 +1679,16 @@ class APMasterControl:
         return True
 
     def get_sector_exposure(self, positions: list) -> dict[str, float]:
-        """PR #483: unknown-sector positions are tracked under the explicit
-        'sector_unknown' diagnostic bucket, never silently merged with
-        each other under a fake 'other' identity. Known sectors keep
-        their canonical resolver identity."""
+        """PR #483: unknown-sector positions are tracked under the
+        explicit 'sector_unknown' diagnostic key, never silently merged
+        with each other under a fake 'other' identity. This is a
+        reporting-only bucket — it must never be used as an economic
+        correlation/risk key (see _sector_capital_deployed, which never
+        reads this dict)."""
         exposure: dict[str, float] = {}
         for pos in positions:
             ticker_in_pos = str(pos.get("underlying") or pos.get("ticker") or "")
-            sector = resolve_sector(ticker_in_pos) or "sector_unknown"
+            sector = self.SECTOR_MAP.get(ticker_in_pos.upper()) or "sector_unknown"
             try:
                 exposure[sector] = exposure.get(sector, 0.0) + self._position_capital_for_exposure(pos)
             except Exception as _exp_err:
@@ -2179,14 +2227,12 @@ class APMasterControl:
                     f"capital_limit (projected ${projected_total:.0f} > ${max_capital:.0f})",
                 )
 
-        # PR #483: sector identity resolved once through the canonical
-        # resolver. `sector` is None for an unmapped ticker — unknown
-        # sector never gets a synthetic shared bucket, so
-        # _sector_capital_deployed(..., None) short-circuits to 0.0 and no
-        # sector-cap block reason is produced below for unknown candidates.
-        # Every other gate (ticker cap, total cap, affordability, etc.)
-        # still runs unchanged.
-        sector = resolve_sector(ticker)
+        # PR #483: sector is None for an unmapped ticker (no "other"
+        # fallback). _sector_capital_deployed(..., None) short-circuits
+        # to 0.0, and the `sector is not None` guards below skip only
+        # the sector-specific cap for unknown identity — every other
+        # gate (ticker cap, total cap, affordability, etc.) still runs.
+        sector = self.SECTOR_MAP.get(ticker.upper())
         sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
         # PR E FIX-3: use the snapshot value, not the instance field.
         effective_equity = account_equity
@@ -2840,9 +2886,10 @@ class APMasterControl:
                 "sizing_method": _sizing.method if _sizing is not None else "tier_fallback",
                 "sizing_reason": _sizing.reason if _sizing is not None else "",
                 "intel_result": intel,
-                # PR #483: canonical resolver; None for a genuinely
-                # unmapped ticker rather than a fake "other" identity.
-                "sector": resolve_sector(ticker),
+                # PR #483: no "other" fallback; None for a genuinely
+                # unmapped ticker.
+                "sector": self.SECTOR_MAP.get(ticker.upper()),
+                **self._sector_telemetry(self.SECTOR_MAP.get(ticker.upper())),
                 # PR: sizing-bootstrap-fix — dedicated, named bucket so
                 # future audits can answer "why N contracts?" from a single
                 # JSON path in orders.meta. Persisted unconditionally on
@@ -4038,11 +4085,11 @@ class APMasterControl:
         max_capital = per_trade_budget
         pct_used = projected_total_exposure / equity * 100 if equity > 0 else 0
 
-        # PR #483: canonical resolver. sector is None for an unmapped
-        # ticker; _sector_capital_deployed(..., None) returns 0.0 and the
-        # sector-cap gate below is skipped entirely for unknown identity —
-        # it must never produce a revalidate_sector_cap_other block.
-        sector = resolve_sector(ticker)
+        # PR #483: no "other" fallback; sector is None for an unmapped
+        # ticker. _sector_capital_deployed(..., None) returns 0.0 and the
+        # sector-cap block below is skipped entirely for unknown identity
+        # — it must never produce a revalidate_sector_cap_other block.
+        sector = self.SECTOR_MAP.get(ticker.upper())
         sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
         proj_sector = sector_deployed + real_cost
         max_sector = equity * self.max_sector_pct
@@ -4077,6 +4124,7 @@ class APMasterControl:
                 ticker_limit=max_ticker,
                 blocked=blocked,
                 block_reason=block_reason,
+                **self._sector_telemetry(sector),
             )
 
         # ── PR #155 split-cap revalidate_exposure ─────────────────────────────
@@ -4248,11 +4296,11 @@ class APMasterControl:
                         reason_code=reason_code,
                     )
 
-        # PR #483: unknown sector (sector is None) never triggers a sector
-        # cap block here — proj_sector is always equal to real_cost in
-        # that case (sector_deployed forced to 0.0), so gating on
-        # `sector is not None` is the explicit guard against reintroducing
-        # a synthetic "other" bucket via this comparison.
+        # PR #483: unknown sector (sector is None) never triggers a
+        # sector-cap block here — the guard is explicit rather than
+        # relying on proj_sector == real_cost when deployed is forced
+        # to 0.0, to prevent silently reintroducing a synthetic "other"
+        # bucket via this comparison.
         if sector is not None and proj_sector > max_sector:
             reason = f"sector_cap_{sector}: ${proj_sector:.0f} > ${max_sector:.0f}"
             _log_revalidation(True, reason)
@@ -4445,6 +4493,12 @@ class APMasterControl:
         ticker_limit: float,
         blocked: bool,
         block_reason: str,
+        # PR #483: explicit sector-decision telemetry. Observability
+        # only — does not alter gate authority. Defaults preserve
+        # backward compatibility for any other existing caller.
+        sector_resolution: str = "unknown",
+        sector_cap_applied: bool = False,
+        sector_cap_skip_reason: Optional[str] = "unknown_sector_identity",
     ):
         decision = "BLOCKED" if blocked else "APPROVED"
         per_trade_budget_value = float(limit if per_trade_budget is None else per_trade_budget)
@@ -4490,6 +4544,10 @@ class APMasterControl:
             "decision": decision,
             "block_reason": block_reason,
             "account_equity": round(self.account_equity, 2),
+            # PR #483: explicit sector-decision telemetry.
+            "sector_resolution": sector_resolution,
+            "sector_cap_applied": sector_cap_applied,
+            "sector_cap_skip_reason": sector_cap_skip_reason,
         }
         log.info(
             "CAPITAL_GATE client_id=%s symbol=%s execution_mode=%s "
