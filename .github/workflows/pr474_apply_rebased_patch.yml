@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - spec/p0-deferred-real-cost-revalidation-20260814
+  pull_request:
+    types: [reopened]
+    branches:
+      - main
 
 permissions:
   contents: write
