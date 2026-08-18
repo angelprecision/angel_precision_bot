@@ -7358,7 +7358,59 @@ class APExecutionCore:
         # Master Control must see the FINAL submit_limit after the fresh exact-OCC
         # quote, spread/drift gates, and any PR180 repricing. This block runs before
         # the broker-ready CAS and therefore before any broker POST.
-        if _deferred and _handoff_snapshot.get("captured"):
+        #
+        # INVARIANT (PR #474 amendment): once breach-time capital-cost revalidation
+        # is deliberately skipped for a canonical deferred entry, the final capital-cost
+        # authority becomes MANDATORY — not conditional on an observability flag.
+        # If the handoff proof is missing we FAIL CLOSED rather than silently proceeding.
+        #
+        # There are exactly two valid outcomes for a deferred LIVE entry:
+        #   A) final MC explicitly approves → broker-ready CAS proceeds
+        #   B) final MC blocks, or proof is missing → terminalize, zero broker POST
+        # There is no third state.
+        requires_final_cost_revalidation = bool(_deferred)
+
+        if requires_final_cost_revalidation:
+            if not _handoff_snapshot.get("captured"):
+                _proof_missing_reason = "DEFERRED_FINAL_HANDOFF_PROOF_MISSING"
+                _proof_missing_meta = {
+                    "failure_stage": "deferred_final_handoff_proof",
+                    "local_order_id": queue_local_order_id,
+                    "client_id": getattr(self, "client_id", None),
+                    "execution_mode": getattr(self, "execution_mode",
+                                              getattr(self, "mode", None)),
+                    "ticker": ticker,
+                    "selected_contract": approved_contract,
+                    "deferred": True,
+                    "handoff_snapshot_captured": bool(
+                        _handoff_snapshot.get("captured") if _handoff_snapshot else False
+                    ),
+                    "broker_post_count": 0,
+                }
+                log.critical(
+                    "[%s] %s — deferred entry reached final authority gate with no "
+                    "handoff proof; fail closed, zero broker POST "
+                    "local=%s client_id=%s mode=%s contract=%s",
+                    ticker,
+                    _proof_missing_reason,
+                    queue_local_order_id,
+                    _proof_missing_meta["client_id"],
+                    _proof_missing_meta["execution_mode"],
+                    approved_contract,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SUBMISSION_SKIPPED",
+                    reason=_proof_missing_reason,
+                    contract=approved_contract,
+                    extra=_proof_missing_meta,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _proof_missing_reason,
+                    extra_meta=_proof_missing_meta,
+                )
+
+            # Handoff proof is confirmed present — proceed with mandatory final
+            # identity proof and final Master Control capital authority.
             _identity_row, _identity_read_error, _identity_read_attempts = (
                 _read_order_row_for_handoff_proof(
                     self.order_state_machine,
