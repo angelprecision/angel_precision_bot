@@ -1635,6 +1635,47 @@ def _broker_cancel_confirmed(result: object) -> bool:
     }
 
 
+# P0 — #473 FINAL merge-gate amendment: restart pair-truth fix.
+#
+# SignalPairManager (ap/signal_pair_manager.py) is a process-memory-only
+# registry. A process restart resets it to an empty ``_pairs`` dict. Before
+# this fix, ``pair_manager.on_fill(...) is None`` was treated as durable
+# proof that "no opposite pair ever existed" for this fill — but after a
+# restart it just as easily means "this WAS a 1-1 pair, and the in-memory
+# registry that would have proven it was erased by the restart."
+#
+# CORE INVARIANT: process-memory absence is never durable negative proof.
+# Only durable ENTRY evidence already persisted on the order row may
+# authorize a NOT_APPLICABLE conclusion.
+#
+# _durable_pair_applicability() inspects the order's own durable ``pattern``
+# field — the same field SignalPairManager.register() inspects at signal
+# time — using identical substring matching, so the two are never out of
+# sync. It returns:
+#   PAIR      — pattern durably proves this WAS pair-capable
+#   NON_PAIR  — pattern durably proves this was NOT pair-capable
+#   UNKNOWN   — pattern missing/blank/unusable; applicability unprovable
+_PAIR_PATTERN_MARKERS = ("1-1", "1_1", "inside")
+
+
+def _durable_pair_applicability(order: dict) -> str:
+    """Classify durable pair-applicability from the order's own persisted
+    ``pattern`` field. Uses the exact same substring markers as
+    SignalPairManager.register() so this can never diverge from the
+    registration-time pair taxonomy. Returns one of "PAIR", "NON_PAIR",
+    "UNKNOWN". Never returns NON_PAIR when the pattern is missing/blank/
+    unusable — that case is UNKNOWN, not a negative proof."""
+    raw_pattern = order.get("pattern")
+    if raw_pattern is None:
+        return "UNKNOWN"
+    pattern = str(raw_pattern).strip()
+    if not pattern:
+        return "UNKNOWN"
+    if any(marker in pattern for marker in _PAIR_PATTERN_MARKERS):
+        return "PAIR"
+    return "NON_PAIR"
+
+
 def _cancel_pair_opposite(
     order: dict, broker: BrokerAdapter, osm, alert_fn=None
 ) -> tuple[str, str]:
@@ -1645,13 +1686,23 @@ def _cancel_pair_opposite(
     If broker id cannot be resolved, local order is not marked canceled.
 
     Returns ``(pair_resolution_state, detail)`` where state is one of
-    ``NOT_APPLICABLE`` (no opposite pair existed for this fill),
-    ``CONFIRMED`` (an opposite pair existed and its broker+local
-    cancellation was durably confirmed), or ``OUTCOME_UNPROVEN`` (a pair
-    may have existed but cancellation could not be confirmed — the caller
-    must not treat the downstream handoff as safe to complete).  This
-    return value carries no cancel authority itself; it only reports what
-    this call actually did so the caller can persist a durable marker.
+    ``NOT_APPLICABLE`` (durable order evidence proves no opposite pair was
+    ever applicable to this fill), ``CONFIRMED`` (an opposite pair existed
+    and its broker+local cancellation was durably confirmed), or
+    ``OUTCOME_UNPROVEN`` (a pair may have existed but cancellation could not
+    be confirmed, OR the in-process pair registry has no record and durable
+    order evidence cannot rule out that a pair existed — e.g. after a
+    process restart erased the in-memory registry — the caller must not
+    treat the downstream handoff as safe to complete).  This return value
+    carries no cancel authority itself; it only reports what this call
+    actually did so the caller can persist a durable marker.
+
+    CORE INVARIANT: ``pair_manager.on_fill(...) is None`` is process-memory
+    absence, never durable negative proof.  It may only become
+    ``NOT_APPLICABLE`` when the order's own durable ``pattern`` field proves
+    NON_PAIR (see ``_durable_pair_applicability``).  Otherwise it is
+    ``OUTCOME_UNPROVEN`` — this function never speculatively cancels,
+    searches by ticker, or infers an opposite identity in that case.
     """
     if not osm:
         return "OUTCOME_UNPROVEN", "no_osm"
@@ -1679,7 +1730,25 @@ def _cancel_pair_opposite(
         )
 
         if not cancel_local_id:
-            return "NOT_APPLICABLE", "no_opposite_pair"
+            # In-process registry has no opposite recorded for this fill.
+            # This is NEVER by itself durable proof of "no pair existed" —
+            # only durable order evidence can establish that.
+            durable_applicability = _durable_pair_applicability(order)
+            if durable_applicability == "NON_PAIR":
+                return "NOT_APPLICABLE", "DURABLE_NON_PAIR"
+            if durable_applicability == "PAIR":
+                log.warning(
+                    "[%s] PAIR_REGISTRY_MISSING_AFTER_RESTART — durable "
+                    "pattern proves pair-applicable but in-process registry "
+                    "has no opposite recorded for local=%s; holding, no "
+                    "cancel authority exercised",
+                    ticker,
+                    filled_local_id,
+                )
+                return "OUTCOME_UNPROVEN", "PAIR_REGISTRY_MISSING_AFTER_RESTART"
+            # UNKNOWN: pattern missing/blank/unusable — applicability itself
+            # is unprovable. Never default this to NOT_APPLICABLE.
+            return "OUTCOME_UNPROVEN", "PAIR_APPLICABILITY_UNPROVEN"
 
         log.warning(
             "[%s] 1-1 PAIR FILL — canceling opposite local_order_id=%s",

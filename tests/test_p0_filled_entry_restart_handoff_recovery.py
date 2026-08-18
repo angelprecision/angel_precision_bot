@@ -2684,14 +2684,139 @@ def _install_fake_pair_manager(monkeypatch, *, cancel_local_id="opposite-local-i
     return fake_module
 
 
-def test_pair_cancel_returns_not_applicable_when_no_opposite_exists(monkeypatch):
+def test_pair_cancel_returns_outcome_unproven_when_pattern_missing(monkeypatch):
+    """Case D — UNKNOWN durable pair applicability (no pattern field at
+    all). Process-memory absence (on_fill -> None) must NEVER by itself
+    authorize NOT_APPLICABLE; with no durable pattern to fall back on,
+    applicability itself is unprovable."""
     _install_fake_pair_manager(monkeypatch, cancel_local_id=None)
     osm = _FakePairOSM()
     broker = _Broker()
 
     state, detail = fm._cancel_pair_opposite(_order(), broker, osm)
 
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_APPLICABILITY_UNPROVEN"
+    assert broker.mutations == []
+    assert osm.transitions == []
+
+
+@pytest.mark.parametrize("blank_pattern", [None, "", "   "])
+def test_pair_cancel_returns_outcome_unproven_for_blank_or_whitespace_pattern(
+    monkeypatch, blank_pattern
+):
+    """Case D — UNKNOWN applicability for missing/blank/whitespace pattern.
+    Never defaults to NOT_APPLICABLE."""
+    _install_fake_pair_manager(monkeypatch, cancel_local_id=None)
+    osm = _FakePairOSM()
+    broker = _Broker()
+    order = _order(pattern=blank_pattern)
+
+    state, detail = fm._cancel_pair_opposite(order, broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_APPLICABILITY_UNPROVEN"
+    assert broker.mutations == []
+    assert osm.transitions == []
+
+
+def test_pair_cancel_returns_not_applicable_for_durable_non_pair_pattern(monkeypatch):
+    """Case B — durable order evidence (pattern) proves NON_PAIR. This is
+    the ONLY valid route to NOT_APPLICABLE; process-memory absence alone
+    is never sufficient."""
+    _install_fake_pair_manager(monkeypatch, cancel_local_id=None)
+    osm = _FakePairOSM()
+    broker = _Broker()
+    order = _order(pattern="breakout")
+
+    state, detail = fm._cancel_pair_opposite(order, broker, osm)
+
     assert state == "NOT_APPLICABLE"
+    assert detail == "DURABLE_NON_PAIR"
+    assert broker.mutations == []
+    assert osm.transitions == []
+
+
+@pytest.mark.parametrize(
+    "non_pair_pattern", ["breakout", "continuation", "fvg", "orb"]
+)
+def test_pair_cancel_not_applicable_for_various_durable_non_pair_patterns(
+    monkeypatch, non_pair_pattern
+):
+    _install_fake_pair_manager(monkeypatch, cancel_local_id=None)
+    osm = _FakePairOSM()
+    broker = _Broker()
+    order = _order(pattern=non_pair_pattern)
+
+    state, detail = fm._cancel_pair_opposite(order, broker, osm)
+
+    assert state == "NOT_APPLICABLE"
+    assert detail == "DURABLE_NON_PAIR"
+
+
+def test_fail_first_pair_registry_missing_after_restart_never_becomes_not_applicable(
+    monkeypatch,
+):
+    """THE PRIMARY MERGE-GATE REGRESSION (#473 final amendment).
+
+    SignalPairManager is process-memory only. After a process restart its
+    ``_pairs`` registry is empty, so ``on_fill(...)`` returns None for
+    EVERY fill until pairs are freshly re-registered that session -- this
+    is true regardless of whether the fill's ENTRY was actually part of a
+    1-1 pair before the restart.
+
+    A durable ENTRY whose own persisted ``pattern`` field proves it WAS
+    pair-capable ("1-1") must NEVER be concluded NOT_APPLICABLE from
+    in-process registry absence alone. The correct, safe conclusion is
+    OUTCOME_UNPROVEN / PAIR_REGISTRY_MISSING_AFTER_RESTART -- HOLD, not a
+    manufactured negative pair truth.
+    """
+    # Simulate a process restart: brand-new real SignalPairManager, empty
+    # in-memory registry -- on_fill() will return None no matter what.
+    import ap.signal_pair_manager as pair_module
+
+    monkeypatch.setattr(pair_module, "_pair_manager", pair_module.SignalPairManager())
+
+    osm = _FakePairOSM()
+    broker = _Broker()
+    order = _order(
+        client_id="p0-pair-restart-fail-first@example.com",
+        local_order_id="fail-first-473-pair-restart",
+        broker_order_id="fail-first-473-pair-restart-broker",
+        symbol="PEP",
+        contract=CONTRACT,
+        direction="CALL",
+        pattern="1-1",
+    )
+
+    state, detail = fm._cancel_pair_opposite(order, broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_REGISTRY_MISSING_AFTER_RESTART"
+    assert broker.mutations == []
+    assert osm.transitions == []
+
+
+@pytest.mark.parametrize(
+    "pair_pattern",
+    ["1-1", "1-1 continuation", "1_1_break", "inside", "inside_bar"],
+)
+def test_fail_first_pair_restart_across_pattern_taxonomy(monkeypatch, pair_pattern):
+    """Same fail-first proof across the full pair-pattern taxonomy that
+    SignalPairManager.register() itself recognizes ('1-1', '1_1',
+    'inside' substrings)."""
+    import ap.signal_pair_manager as pair_module
+
+    monkeypatch.setattr(pair_module, "_pair_manager", pair_module.SignalPairManager())
+
+    osm = _FakePairOSM()
+    broker = _Broker()
+    order = _order(pattern=pair_pattern)
+
+    state, detail = fm._cancel_pair_opposite(order, broker, osm)
+
+    assert state == "OUTCOME_UNPROVEN"
+    assert detail == "PAIR_REGISTRY_MISSING_AFTER_RESTART"
     assert broker.mutations == []
     assert osm.transitions == []
 
