@@ -4,6 +4,7 @@ from textwrap import indent
 CORE = Path("ap_execution_core.py")
 HELPERS = Path("scripts/pr474_helper_block.txt")
 FINAL_BLOCK = Path("scripts/pr474_final_block.txt")
+SEAM4 = Path("tests/test_p0_seam4_e2e_deferred_lifecycle.py")
 P0_WORKFLOW = Path(".github/workflows/p0_regression.yml")
 
 
@@ -176,6 +177,28 @@ text = replace_once(
 )
 
 CORE.write_text(text)
+
+seam4 = SEAM4.read_text()
+seam4 = replace_once(
+    seam4,
+    '''        master_control=types.SimpleNamespace(mode="LIVE", max_positions=5, _kill_switch_fn=lambda: False),
+''',
+    '''        master_control=types.SimpleNamespace(
+            mode="LIVE",
+            max_positions=5,
+            _kill_switch_fn=lambda: False,
+            # PR #474: this integration harness now crosses the mandatory
+            # final deferred exposure authority. Model the production method
+            # explicitly instead of relying on an incomplete namespace.
+            revalidate_exposure=lambda plan, client_id="default": types.SimpleNamespace(
+                ok=True,
+                reason="",
+            ),
+        ),
+''',
+    "seam4 final Master Control harness",
+)
+SEAM4.write_text(seam4)
 
 p0 = P0_WORKFLOW.read_text()
 p0_anchor = "            tests/test_p0_seam4_e2e_deferred_lifecycle.py \\\n"
