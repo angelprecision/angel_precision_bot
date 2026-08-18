@@ -123,6 +123,8 @@ jobs:
             tests/test_p0_broker_owned_exit_recovery_preflight.py \
             tests/test_fill_monitor_mvp_hardening.py \
             tests/test_p0_filled_entry_durable_identity_handoff.py \
+            tests/test_p0_filled_entry_restart_handoff_recovery.py \
+            tests/test_p0_real_exit_engine_canonical_adoption.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
             tests/test_p0_pending_trigger_restart_recovery.py \

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import math
 import os
 import re
@@ -281,9 +282,346 @@ def get_pending_orders(client_id: str) -> list[dict]:
     return run_with_retry(_fn)
 
 
+def _order_meta_dict(order: dict) -> dict:
+    meta = order.get("meta") if isinstance(order, dict) else None
+    if isinstance(meta, dict):
+        return dict(meta)
+    if isinstance(meta, str) and meta.strip():
+        try:
+            parsed = json.loads(meta)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+_INVALID_DURABLE_META_BOOL = object()
+
+
+def _durable_meta_bool(order: dict, key: str):
+    """Read a durable JSON boolean without accepting truthy coercions."""
+    meta = _order_meta_dict(order)
+    if key not in meta:
+        return None
+    value = meta[key]
+    if type(value) is bool:
+        return value
+    return _INVALID_DURABLE_META_BOOL
+
+
+def _filled_entry_handoff_state(order: dict) -> str:
+    return str(
+        _order_meta_dict(order).get("filled_entry_handoff_state") or ""
+    ).strip().upper()
+
+
+def _merge_order_meta_memory(order: dict, patch: dict) -> None:
+    if not isinstance(order, dict):
+        return
+    meta = _order_meta_dict(order)
+    meta.update(patch)
+    order["meta"] = meta
+
+
+def _persist_filled_entry_handoff_state(
+    order: dict,
+    state: str,
+    *,
+    reason: str = "",
+    retryable: bool = False,
+    position_id: str | None = None,
+    extra_meta: dict | None = None,
+) -> bool:
+    """CAS-like durable state write for the FILLED ENTRY handoff.
+
+    The write is deliberately owned by ``fill_monitor.py`` so the marker can
+    be persisted before OSM terminalization and without a schema migration.
+    Exact client/local/broker/mode/OCC identity is part of the SQL fence.
+    ``COMPLETE`` additionally requires the durable order-to-position bind and
+    refuses to downgrade a row already marked complete.
+    """
+    state = str(state or "").strip().upper()
+    if state not in {"IN_PROGRESS", "COMPLETE", "NONACTIONABLE", "HOLD"}:
+        return False
+    client_id = str(order.get("client_id") or "").strip()
+    local_order_id = str(order.get("local_order_id") or "").strip()
+    broker_order_id = str(order.get("broker_order_id") or "").strip()
+    execution_mode = order.get("execution_mode")
+    contract = str(order.get("contract") or "").strip()
+    kind = str(order.get("kind") or "").strip()
+    if (
+        not client_id
+        or not local_order_id
+        or not _has_proven_broker_order_id(broker_order_id)
+        or execution_mode not in {"live", "paper"}
+        or not re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract)
+        or kind != "ENTRY"
+    ):
+        return False
+    if state == "COMPLETE" and not str(position_id or "").strip():
+        return False
+
+    patch = {
+        "filled_entry_handoff_state": state,
+        "filled_entry_handoff_state_at": now_utc_iso(),
+        "filled_entry_handoff_reason": str(reason or ""),
+        "filled_entry_handoff_retryable": bool(retryable),
+    }
+    if position_id:
+        patch["filled_entry_handoff_position_id"] = str(position_id).strip()
+    if extra_meta:
+        patch.update(dict(extra_meta))
+
+    patch_json = json.dumps(patch, default=str, separators=(",", ":"))
+
+    def _write():
+        with conn() as c:
+            predicates = [
+                "client_id=%s",
+                "local_order_id=%s",
+                "kind='ENTRY'",
+                "broker_order_id=%s",
+                "execution_mode=%s",
+                "contract=%s",
+                "COALESCE(meta->>'filled_entry_handoff_state','') <> 'COMPLETE'",
+            ]
+            params = [
+                patch_json,
+                client_id,
+                local_order_id,
+                broker_order_id,
+                execution_mode,
+                contract,
+            ]
+            if state == "COMPLETE":
+                predicates.extend(
+                    [
+                        "position_id=%s",
+                        "COALESCE(meta->>'filled_entry_handoff_state','') IN ('IN_PROGRESS','HOLD','')",
+                        "meta->'filled_entry_guards_released' = 'true'::jsonb",
+                        # P0 amendment: the opposite 1-1 pair's cancellation
+                        # outcome must be durably proven — NOT_APPLICABLE (no
+                        # pair existed) or CONFIRMED (broker+local cancel
+                        # truth confirmed) — before COMPLETE can be written.
+                        # A crash between OSM FILLED and pair-cancel
+                        # resolution must never be able to reach COMPLETE.
+                        "COALESCE(meta->>'filled_entry_pair_resolution_state','') "
+                        "IN ('NOT_APPLICABLE','CONFIRMED')",
+                    ]
+                )
+                params.append(str(position_id).strip())
+            sql = (
+                "UPDATE orders SET meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                "updated_ts=NOW() WHERE "
+                + " AND ".join(predicates)
+            )
+            cur = c.execute(sql, tuple(params))
+            return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+    try:
+        rowcount = run_with_retry(_write)
+    except Exception as exc:
+        log.warning(
+            "[%s] FILLED_ENTRY_HANDOFF_STATE_WRITE_FAILED local=%s state=%s error=%s",
+            client_id,
+            local_order_id,
+            state,
+            exc,
+        )
+        return False
+    if int(rowcount or 0) != 1:
+        log.warning(
+            "[%s] FILLED_ENTRY_HANDOFF_STATE_WRITE_NOT_CONFIRMED local=%s state=%s rowcount=%s",
+            client_id,
+            local_order_id,
+            state,
+            rowcount,
+        )
+        return False
+    _merge_order_meta_memory(order, patch)
+    if position_id:
+        order["position_id"] = str(position_id).strip()
+    return True
+
+
+_PAIR_RESOLUTION_STATES = frozenset(
+    {"NOT_APPLICABLE", "CONFIRMED", "OUTCOME_UNPROVEN"}
+)
+
+
+def _pair_resolution_state(order: dict) -> str:
+    """Read the durable pair-resolution marker with zero normalization.
+
+    Unlike ``_filled_entry_handoff_state``, this deliberately does not
+    strip or uppercase.  This field only ever gets a canonical value from
+    ``_persist_filled_entry_pair_resolution_state``'s own validated write
+    path, so a value that isn't an exact match for one of
+    ``_PAIR_RESOLUTION_STATES`` (wrong case, trailing whitespace, wrong
+    type, or a genuinely missing key) must be treated as unproven, not
+    coerced into looking proven.
+    """
+    value = _order_meta_dict(order).get("filled_entry_pair_resolution_state")
+    return value if isinstance(value, str) else ""
+
+
+def _persist_filled_entry_pair_resolution_state(
+    order: dict,
+    state: str,
+    *,
+    detail: str = "",
+) -> bool:
+    """Durably record the opposite 1-1 pair's cancellation outcome.
+
+    This piggybacks on the existing handoff-namespace CAS write so no
+    schema migration or second write path is introduced.  The write itself
+    does not gate anything — the COMPLETE CAS predicate in
+    ``_persist_filled_entry_handoff_state`` is what refuses to let a
+    handoff finish while this field is missing or ``OUTCOME_UNPROVEN``.
+    """
+    state = str(state or "").strip().upper()
+    if state not in _PAIR_RESOLUTION_STATES:
+        log.critical(
+            "[%s] FILLED_ENTRY_PAIR_RESOLUTION_STATE_INVALID local=%s state=%r",
+            order.get("client_id"),
+            order.get("local_order_id"),
+            state,
+        )
+        return False
+    current_handoff_state = _filled_entry_handoff_state(order)
+    write_state = current_handoff_state if current_handoff_state in {
+        "IN_PROGRESS", "HOLD",
+    } else "IN_PROGRESS"
+    ok = _persist_filled_entry_handoff_state(
+        order,
+        write_state,
+        reason=f"filled_entry_pair_resolution_{state.lower()}",
+        retryable=(state == "OUTCOME_UNPROVEN"),
+        extra_meta={
+            "filled_entry_pair_resolution_state": state,
+            "filled_entry_pair_resolution_state_at": now_utc_iso(),
+            "filled_entry_pair_resolution_detail": str(detail or ""),
+        },
+    )
+    if not ok:
+        log.error(
+            "[%s] FILLED_ENTRY_PAIR_RESOLUTION_STATE_WRITE_FAILED local=%s state=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+            state,
+        )
+    return ok
+
+
+def get_interrupted_filled_entry_handoffs(client_id: str) -> list[dict]:
+    """Return only terminal FILLED ENTRY rows whose handoff is unfinished.
+
+    This query is intentionally separate from ``get_pending_orders``.  It
+    selects durable IN_PROGRESS/HOLD-retry rows plus narrowly fenced legacy
+    rows with the #470 failure markers or a missing position identity.  A
+    separate processor performs no fresh-fill broker side effects.
+    """
+    if not client_id:
+        raise ValueError("get_interrupted_filled_entry_handoffs requires client_id")
+
+    def _fn():
+        with conn() as c:
+            rows = c.execute(
+                """
+                SELECT
+                    client_id,
+                    local_order_id,
+                    broker_order_id,
+                    position_id,
+                    kind,
+                    symbol,
+                    contract,
+                    direction,
+                    qty,
+                    limit_price,
+                    reserved_cost,
+                    status,
+                    created_ts,
+                    plan_id,
+                    signal_id,
+                    tier,
+                    score,
+                    pattern,
+                    stop_underlying,
+                    target_underlying,
+                    trigger_price,
+                    timeframe,
+                    filled_qty,
+                    fill_price,
+                    execution_mode,
+                    filled_ts,
+                    last_error,
+                    meta,
+                    meta->>'canonical_signal_id' AS canonical_signal_id,
+                    meta->>'underlying_entry' AS underlying_entry_meta,
+                    meta->>'entry_underlying' AS entry_underlying_meta,
+                    meta->>'last_underlying_price' AS last_underlying_price_meta
+                FROM orders
+                WHERE client_id=%s
+                  AND kind='ENTRY'
+                  AND status='FILLED'
+                  AND COALESCE(meta->>'filled_entry_handoff_state','') <> 'COMPLETE'
+                  AND (
+                    meta->>'filled_entry_handoff_state'='IN_PROGRESS'
+                    OR (
+                      meta->>'filled_entry_handoff_state'='HOLD'
+                      AND meta->>'filled_entry_handoff_retryable'='true'
+                    )
+                    OR (
+                      COALESCE(meta->>'filled_entry_handoff_state','')=''
+                      AND (
+                        COALESCE(last_error,'') LIKE 'FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED%'
+                        OR COALESCE(last_error,'') LIKE 'FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN%'
+                        OR NULLIF(BTRIM(COALESCE(position_id,'')),'') IS NULL
+                      )
+                    )
+                  )
+                ORDER BY filled_ts ASC NULLS LAST, created_ts ASC NULLS LAST
+                """,
+                (client_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    return run_with_retry(_fn)
+
+
 def _has_proven_broker_order_id(value) -> bool:
+    if isinstance(value, bool):
+        return False
     broker_id = str(value or "").strip()
-    return bool(broker_id and broker_id.upper() != "N/A")
+    return bool(
+        broker_id
+        and broker_id.upper()
+        not in {"0", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "UNDEFINED", "NIL", "TRUE", "FALSE"}
+    )
+
+
+def _strict_positive_integral(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _strict_positive_finite(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
 
 
 def _mode_source_state(value) -> tuple[str, str]:
@@ -816,15 +1154,22 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             }
             our = "ACKNOWLEDGED" if status in ACTIVE_BROKER_STATUSES else status_map.get(status, "UNKNOWN")
 
-        explicit_filled_qty = raw.get("exec_quantity") or raw.get("filled_quantity")
-        if explicit_filled_qty is not None:
-            filled_qty = int(explicit_filled_qty or 0)
+        if "exec_quantity" in raw and raw.get("exec_quantity") is not None:
+            raw_filled_qty = raw.get("exec_quantity")
+        elif "filled_quantity" in raw and raw.get("filled_quantity") is not None:
+            raw_filled_qty = raw.get("filled_quantity")
         elif our in ("FILLED", "EXIT_FILLED"):
-            filled_qty = int(raw.get("quantity") or 0)
+            raw_filled_qty = raw.get("quantity")
         else:
-            filled_qty = 0
+            raw_filled_qty = 0
+        filled_qty = _strict_positive_integral(raw_filled_qty) or 0
 
-        avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
+        raw_avg_fill = (
+            raw.get("avg_fill_price")
+            if "avg_fill_price" in raw and raw.get("avg_fill_price") is not None
+            else raw.get("price")
+        )
+        avg_fill = _strict_positive_finite(raw_avg_fill) or 0.0
 
         result = {
             "status": our,
@@ -833,6 +1178,14 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             "reason": raw.get("reason") or status,
             "raw": raw,
         }
+
+        # Scope correction (P0 amendment on #473): the strict positive-
+        # integral/positive-finite admission gate belongs only to the
+        # ENTRY-specific handoff boundary (_validate_filled_entry_admission),
+        # not to this shared broker-status mapper.  Applying it here blocked
+        # EXIT_FILLED collaterally, which is outside this PR's one job.  EXIT
+        # terminalization keeps its pre-existing PR #235 hardening below
+        # (filled_qty<=0 guard) unchanged.
 
         # PR #235 (hardening #3): broker FILLED / EXIT_FILLED with cumulative
         # filled_qty <= 0 is impossible truth for filled or partial-fill states.  Block the OSM transition and
@@ -908,11 +1261,23 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 # ENTRY GUARDS / LOCK RELEASE
 # =============================================================================
 
+def _entry_guard_cost(order: dict) -> Optional[float]:
+    """Resolve a positive, finite reservation cost without coercing bad truth."""
+    if "reserved_cost" in order and order.get("reserved_cost") is not None:
+        return _strict_positive_finite(order.get("reserved_cost"))
+
+    limit_price = _strict_positive_finite(order.get("limit_price"))
+    quantity = _strict_positive_integral(order.get("qty"))
+    if limit_price is None or quantity is None:
+        return None
+    cost = limit_price * quantity * OPT_MULTIPLIER
+    return cost if math.isfinite(cost) and cost > 0 else None
+
+
 def _release_entry_guards(order: dict):
     """Release reserved equity and symbol lock for ENTRY orders."""
     client_id = order["client_id"]
     symbol = order.get("symbol")
-
     # PR #235 (hardening #5): compute reserved cost defensively but do NOT
     # let a missing cost skip the symbol lock release.  Pre-#235 an
     # early-return here would leak the entry symbol lock forever if
@@ -935,8 +1300,12 @@ def _release_entry_guards(order: dict):
         except Exception:
             cost = None
 
+    equity_released = False
     if cost and cost > 0:
-        release_equity(client_id, cost)
+        # ``ap.state`` intentionally retains its historical None-returning
+        # public API.  Treat an explicit False as an unconfirmed release, but
+        # accept None from the legacy helper after it completes its mutation.
+        equity_released = release_equity(client_id, cost) is not False
     else:
         log.warning(
             "[%s] _release_entry_guards: cost is zero/unknown for order=%s — equity may not be fully released",
@@ -944,28 +1313,399 @@ def _release_entry_guards(order: dict):
         )
 
     # Always release the symbol lock, regardless of cost resolution.
+    symbol_released = False
     if symbol:
-        release_symbol_lock(client_id, symbol)
+        symbol_released = release_symbol_lock(client_id, symbol) is not False
     else:
         log.warning(
             "[%s] _release_entry_guards: symbol missing for order=%s — symbol lock could not be released",
             order.get("client_id"), order.get("local_order_id"),
         )
+    return equity_released and symbol_released
+
+
+def _release_entry_guards_atomically(order: dict, *, position_id: str) -> bool:
+    """Release both guards and persist their proof in one Postgres transaction.
+
+    The old claim-then-release sequence could crash between the reservation
+    mutation and its durable marker.  Keeping the ``kv`` mutations and the
+    order marker in one transaction makes the operation all-or-nothing and
+    prevents a retry from releasing the same reservation twice.
+    """
+    client_id = str(order.get("client_id") or "").strip()
+    local_order_id = str(order.get("local_order_id") or "").strip()
+    broker_order_id = str(order.get("broker_order_id") or "").strip()
+    execution_mode = order.get("execution_mode")
+    contract = str(order.get("contract") or "").strip()
+    symbol = str(order.get("symbol") or "").strip()
+    cost = _entry_guard_cost(order)
+    if (
+        not client_id
+        or not local_order_id
+        or not _has_proven_broker_order_id(broker_order_id)
+        or execution_mode not in {"live", "paper"}
+        or not re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract)
+        or str(order.get("kind") or "").strip() != "ENTRY"
+        or not str(position_id or "").strip()
+        or not symbol
+        or cost is None
+    ):
+        return False
+
+    release_key = f"reserved_equity:{client_id}"
+    symbol_key = f"lock:{client_id}:{symbol.upper()}" if symbol else None
+    marker_time = now_utc_iso()
+    marker_json = json.dumps(
+        {
+            "filled_entry_guards_release_claimed": True,
+            "filled_entry_guards_release_claimed_at": marker_time,
+            "filled_entry_guards_released": True,
+            "filled_entry_guards_released_at": marker_time,
+        },
+        default=str,
+        separators=(",", ":"),
+    )
+
+    def _write():
+        with conn() as c:
+            c.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+                (release_key,),
+            )
+            lock_row = c.fetchone() or {}
+            if not bool(lock_row.get("pg_try_advisory_xact_lock")):
+                log.warning(
+                    "[%s] FILLED_ENTRY_GUARDS_RELEASE_LOCK_BUSY local=%s",
+                    client_id,
+                    local_order_id,
+                )
+                return False
+
+            # P0: the symbol guard must never be deleted without first
+            # proving -- under the SAME advisory-lock namespace
+            # ap.state.acquire_symbol_lock() uses (pg_try_advisory_xact_lock
+            # on hashtext(symbol_key)) -- that the current symbol-lock row
+            # still belongs to THIS order's pre-fill guard domain. Holding
+            # this lock for the remainder of the transaction serializes
+            # against a concurrent acquire_symbol_lock() call: no new
+            # acquisition can land between inspection and delete.
+            if symbol_key:
+                c.execute(
+                    "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+                    (symbol_key,),
+                )
+                symbol_lock_row = c.fetchone() or {}
+                if not bool(symbol_lock_row.get("pg_try_advisory_xact_lock")):
+                    log.warning(
+                        "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_LOCK_BUSY "
+                        "local=%s symbol_key=%s",
+                        client_id,
+                        local_order_id,
+                        symbol_key,
+                    )
+                    return False
+
+            c.execute(
+                """
+                SELECT meta, filled_ts
+                FROM orders
+                WHERE client_id=%s
+                  AND local_order_id=%s
+                  AND kind='ENTRY'
+                  AND broker_order_id=%s
+                  AND execution_mode=%s
+                  AND contract=%s
+                  AND COALESCE(meta->>'filled_entry_handoff_state','') <> 'COMPLETE'
+                FOR UPDATE
+                """,
+                (
+                    client_id,
+                    local_order_id,
+                    broker_order_id,
+                    execution_mode,
+                    contract,
+                ),
+            )
+            row = c.fetchone()
+            if not row:
+                return False
+            meta = row.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    return False
+            if not isinstance(meta, dict):
+                return False
+            if type(meta.get("filled_entry_guards_released")) is bool:
+                if meta.get("filled_entry_guards_released") is True:
+                    return True
+            elif "filled_entry_guards_released" in meta:
+                return False
+            if type(meta.get("filled_entry_guards_release_claimed")) is bool:
+                if meta.get("filled_entry_guards_release_claimed") is True:
+                    return False
+            elif "filled_entry_guards_release_claimed" in meta:
+                return False
+
+            # Decide the symbol-lock disposition BEFORE any mutation.
+            #
+            # BINDING INVARIANT (P0 — #473 final amendment):
+            # A recovered historical FILLED ENTRY may delete the current
+            # symbol lock ONLY when it can prove that the lock belongs to
+            # that exact order.  Timestamp ordering alone is NOT sufficient
+            # ownership proof.
+            #
+            # Counterexample that timestamp ordering gets wrong:
+            #   t=0   ENTRY A acquires lock (lock_ts = 0)
+            #   t=90  A's lock TTL expires
+            #   t=91  newer same-symbol ENTRY B reacquires lock (lock_ts = 91)
+            #   t=95  ENTRY A finally fills (filled_ts = 95)
+            #   crash before A completes handoff
+            #   restart recovery processes A
+            #   → lock_ts (91) <= filled_ts (95) → old code would DELETE B's lock
+            #
+            # Correct ownership proof: the lock payload written by
+            # ap.state.acquire_symbol_lock() includes an "owner_id" field
+            # equal to the local_order_id of the acquiring order.  If and
+            # only if that field exactly matches this order's local_order_id
+            # may the lock be deleted.  Any other outcome (absent row,
+            # absent owner token, mismatch) is fail-closed: preserve the
+            # lock, still release this order's equity reservation and persist
+            # the durable handoff marker.
+            delete_symbol_lock = False
+            if symbol_key:
+                # Gate: confirm this order has a durable fill timestamp before
+                # touching any KV state.  A missing filled_ts means the order
+                # is not in a confirmed terminal fill state; abort.
+                durable_filled_ts = row.get("filled_ts")
+                if durable_filled_ts is None:
+                    log.critical(
+                        "[%s] FILLED_ENTRY_GUARDS_RELEASE_FILLED_TS_UNPROVEN "
+                        "local=%s",
+                        client_id,
+                        local_order_id,
+                    )
+                    return False
+
+                c.execute("SELECT v FROM kv WHERE k=%s", (symbol_key,))
+                symbol_lock_kv_row = c.fetchone()
+                if symbol_lock_kv_row is None:
+                    # Symbol lock row is already absent — nothing to inspect
+                    # or delete; continue releasing equity and writing marker.
+                    delete_symbol_lock = False
+                else:
+                    raw_lock_v = symbol_lock_kv_row.get("v")
+                    try:
+                        lock_payload = (
+                            json.loads(raw_lock_v)
+                            if isinstance(raw_lock_v, str)
+                            else raw_lock_v
+                        )
+                        if not isinstance(lock_payload, dict):
+                            raise ValueError("lock payload is not a dict")
+                    except Exception:
+                        # Malformed payload: fail closed — preserve the lock,
+                        # but do NOT abort the equity/marker release.
+                        log.critical(
+                            "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_LOCK_"
+                            "PAYLOAD_MALFORMED local=%s symbol_key=%s",
+                            client_id,
+                            local_order_id,
+                            symbol_key,
+                        )
+                        delete_symbol_lock = False
+                    else:
+                        lock_owner_id = str(
+                            lock_payload.get("owner_id") or ""
+                        ).strip()
+                        if lock_owner_id and lock_owner_id == local_order_id:
+                            # Exact ownership proven: this lock was written by
+                            # THIS order's acquire_symbol_lock() call.  Safe
+                            # to delete.
+                            delete_symbol_lock = True
+                        else:
+                            # owner_id absent (legacy lock without token) OR
+                            # owner_id present but belongs to a different order.
+                            # Either way: preserve the current lock.
+                            if lock_owner_id:
+                                log.info(
+                                    "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_"
+                                    "LOCK_OWNER_MISMATCH local=%s "
+                                    "lock_owner=%s — preserving",
+                                    client_id,
+                                    local_order_id,
+                                    lock_owner_id,
+                                )
+                            else:
+                                log.warning(
+                                    "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_"
+                                    "LOCK_NO_OWNER_TOKEN local=%s "
+                                    "symbol_key=%s — preserving (fail-closed)",
+                                    client_id,
+                                    local_order_id,
+                                    symbol_key,
+                                )
+                            delete_symbol_lock = False
+
+            c.execute(
+                "SELECT v FROM kv WHERE k=%s",
+                (release_key,),
+            )
+            reservation_row = c.fetchone()
+            reserved = 0.0
+            if reservation_row:
+                raw_reserved = reservation_row.get("v")
+                reserved = float(
+                    json.loads(raw_reserved)
+                    if isinstance(raw_reserved, str)
+                    else raw_reserved
+                )
+                if not math.isfinite(reserved) or reserved < 0:
+                    raise ValueError("RESERVED_EQUITY_VALUE_MALFORMED")
+            reserved_new = max(0.0, reserved - cost)
+
+            c.execute(
+                """
+                UPDATE orders
+                SET meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                    updated_ts=NOW()
+                WHERE client_id=%s
+                  AND local_order_id=%s
+                  AND kind='ENTRY'
+                  AND broker_order_id=%s
+                  AND execution_mode=%s
+                  AND contract=%s
+                  AND COALESCE(meta->>'filled_entry_handoff_state','') <> 'COMPLETE'
+                """,
+                (
+                    marker_json,
+                    client_id,
+                    local_order_id,
+                    broker_order_id,
+                    execution_mode,
+                    contract,
+                ),
+            )
+            if int(c.rowcount or 0) != 1:
+                return False
+
+            c.execute(
+                """
+                INSERT INTO kv (k, v, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
+                """,
+                (release_key, json_dumps(reserved_new), now_utc_iso()),
+            )
+            if delete_symbol_lock:
+                c.execute("DELETE FROM kv WHERE k=%s", (symbol_key,))
+            return True
+
+    try:
+        released = bool(run_with_retry(_write))
+    except Exception as exc:
+        log.error(
+            "[%s] FILLED_ENTRY_GUARDS_RELEASE_ATOMIC_FAILED local=%s error=%s",
+            client_id,
+            local_order_id,
+            exc,
+        )
+        return False
+    if released:
+        _merge_order_meta_memory(
+            order,
+            json.loads(marker_json),
+        )
+    return released
 
 
 # =============================================================================
 # PAIR MANAGER HELPER — BROKER CANCEL FIRST
 # =============================================================================
 
-def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None) -> None:
+def _broker_cancel_confirmed(result: object) -> bool:
+    """Accept local cancellation only from an explicit broker confirmation."""
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return False
+    return str(result.get("status") or "").strip().lower() in {
+        "canceled",
+        "cancelled",
+    }
+
+
+# P0 — #473 FINAL merge-gate amendment: restart pair-truth fix.
+#
+# SignalPairManager (ap/signal_pair_manager.py) is a process-memory-only
+# registry. A process restart resets it to an empty ``_pairs`` dict. Before
+# this fix, ``pair_manager.on_fill(...) is None`` was treated as durable
+# proof that "no opposite pair ever existed" for this fill — but after a
+# restart it just as easily means "this WAS a 1-1 pair, and the in-memory
+# registry that would have proven it was erased by the restart."
+#
+# CORE INVARIANT: process-memory absence is never durable negative proof.
+# Only durable ENTRY evidence already persisted on the order row may
+# authorize a NOT_APPLICABLE conclusion.
+#
+# _durable_pair_applicability() inspects the order's own durable ``pattern``
+# field — the same field SignalPairManager.register() inspects at signal
+# time — using identical substring matching, so the two are never out of
+# sync. It returns:
+#   PAIR      — pattern durably proves this WAS pair-capable
+#   NON_PAIR  — pattern durably proves this was NOT pair-capable
+#   UNKNOWN   — pattern missing/blank/unusable; applicability unprovable
+_PAIR_PATTERN_MARKERS = ("1-1", "1_1", "inside")
+
+
+def _durable_pair_applicability(order: dict) -> str:
+    """Classify durable pair-applicability from the order's own persisted
+    ``pattern`` field. Uses the exact same substring markers as
+    SignalPairManager.register() so this can never diverge from the
+    registration-time pair taxonomy. Returns one of "PAIR", "NON_PAIR",
+    "UNKNOWN". Never returns NON_PAIR when the pattern is missing/blank/
+    unusable — that case is UNKNOWN, not a negative proof."""
+    raw_pattern = order.get("pattern")
+    if raw_pattern is None:
+        return "UNKNOWN"
+    pattern = str(raw_pattern).strip()
+    if not pattern:
+        return "UNKNOWN"
+    if any(marker in pattern for marker in _PAIR_PATTERN_MARKERS):
+        return "PAIR"
+    return "NON_PAIR"
+
+
+def _cancel_pair_opposite(
+    order: dict, broker: BrokerAdapter, osm, alert_fn=None
+) -> tuple[str, str]:
     """
     On ENTRY fill: cancel the opposite side of a 1-1 pair.
 
     Broker cancel is attempted before local CANCELED transition.
     If broker id cannot be resolved, local order is not marked canceled.
+
+    Returns ``(pair_resolution_state, detail)`` where state is one of
+    ``NOT_APPLICABLE`` (durable order evidence proves no opposite pair was
+    ever applicable to this fill), ``CONFIRMED`` (an opposite pair existed
+    and its broker+local cancellation was durably confirmed), or
+    ``OUTCOME_UNPROVEN`` (a pair may have existed but cancellation could not
+    be confirmed, OR the in-process pair registry has no record and durable
+    order evidence cannot rule out that a pair existed — e.g. after a
+    process restart erased the in-memory registry — the caller must not
+    treat the downstream handoff as safe to complete).  This return value
+    carries no cancel authority itself; it only reports what this call
+    actually did so the caller can persist a durable marker.
+
+    CORE INVARIANT: ``pair_manager.on_fill(...) is None`` is process-memory
+    absence, never durable negative proof.  It may only become
+    ``NOT_APPLICABLE`` when the order's own durable ``pattern`` field proves
+    NON_PAIR (see ``_durable_pair_applicability``).  Otherwise it is
+    ``OUTCOME_UNPROVEN`` — this function never speculatively cancels,
+    searches by ticker, or infers an opposite identity in that case.
     """
     if not osm:
-        return
+        return "OUTCOME_UNPROVEN", "no_osm"
 
     try:
         from ap.signal_pair_manager import get_pair_manager
@@ -976,7 +1716,7 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
         _pair_side, _pair_side_source = _resolve_order_option_side(order)
         if not _pair_side:
             _emit_side_unresolved(order, reason_code="PAIR_CANCEL_SIDE_UNRESOLVED", alert_fn=alert_fn)
-            return
+            return "OUTCOME_UNPROVEN", "PAIR_CANCEL_SIDE_UNRESOLVED"
 
         pair_manager = get_pair_manager()
         ticker = (order.get("symbol") or "").upper()
@@ -990,7 +1730,25 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
         )
 
         if not cancel_local_id:
-            return
+            # In-process registry has no opposite recorded for this fill.
+            # This is NEVER by itself durable proof of "no pair existed" —
+            # only durable order evidence can establish that.
+            durable_applicability = _durable_pair_applicability(order)
+            if durable_applicability == "NON_PAIR":
+                return "NOT_APPLICABLE", "DURABLE_NON_PAIR"
+            if durable_applicability == "PAIR":
+                log.warning(
+                    "[%s] PAIR_REGISTRY_MISSING_AFTER_RESTART — durable "
+                    "pattern proves pair-applicable but in-process registry "
+                    "has no opposite recorded for local=%s; holding, no "
+                    "cancel authority exercised",
+                    ticker,
+                    filled_local_id,
+                )
+                return "OUTCOME_UNPROVEN", "PAIR_REGISTRY_MISSING_AFTER_RESTART"
+            # UNKNOWN: pattern missing/blank/unusable — applicability itself
+            # is unprovable. Never default this to NOT_APPLICABLE.
+            return "OUTCOME_UNPROVEN", "PAIR_APPLICABILITY_UNPROVEN"
 
         log.warning(
             "[%s] 1-1 PAIR FILL — canceling opposite local_order_id=%s",
@@ -1032,13 +1790,13 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
                 },
             )
             _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
-            return
+            return "OUTCOME_UNPROVEN", "PAIR_CANCEL_SKIPPED_NO_BROKER_ID"
 
         try:
             if hasattr(broker, "cancel_order"):
-                broker.cancel_order(resolved_broker_id)
+                cancel_result = broker.cancel_order(resolved_broker_id)
             else:
-                _cancel_with_session(broker, resolved_broker_id)
+                cancel_result = _cancel_with_session(broker, resolved_broker_id)
         except Exception as exc:
             msg = (
                 f"PAIR_CANCEL_BROKER_FAILED | {ticker} | opposite_local={cancel_local_id} "
@@ -1071,7 +1829,41 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
                 },
             )
             _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
-            return
+            return "OUTCOME_UNPROVEN", "PAIR_CANCEL_BROKER_FAILED"
+
+        if not _broker_cancel_confirmed(cancel_result):
+            msg = (
+                f"PAIR_CANCEL_BROKER_UNCONFIRMED | {ticker} | opposite_local={cancel_local_id} "
+                f"broker={resolved_broker_id} result={cancel_result!r}"
+            )
+            log.warning("[%s] %s", ticker, msg)
+            audit(
+                str(order.get("client_id") or "default"),
+                "CRITICAL",
+                "PAIR_CANCEL_BROKER_UNCONFIRMED",
+                {
+                    "filled_local_order_id": filled_local_id,
+                    "opposite_local_order_id": cancel_local_id,
+                    "opposite_broker_order_id": resolved_broker_id,
+                    "symbol": ticker,
+                    "side": side,
+                    "cancel_result": cancel_result,
+                },
+            )
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code="PAIR_CANCEL_BROKER_UNCONFIRMED",
+                explanation=msg,
+                result=cancel_result if isinstance(cancel_result, dict) else {},
+                extra_context={
+                    "filled_local_order_id": filled_local_id,
+                    "opposite_local_order_id": cancel_local_id,
+                    "opposite_broker_order_id": resolved_broker_id,
+                },
+            )
+            _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
+            return "OUTCOME_UNPROVEN", "PAIR_CANCEL_BROKER_UNCONFIRMED"
 
         ok = osm.transition(
             cancel_local_id,
@@ -1098,9 +1890,24 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
                     "side": side,
                 },
             )
+            # Broker cancel succeeded AND the local CANCELED transition was
+            # durably confirmed — both halves of "broker/local cancellation
+            # truth" required for CONFIRMED are now proven.
+            return "CONFIRMED", "PAIR_CANCEL_CONFIRMED"
+
+        # Broker-side cancel succeeded but the local CANCELED transition was
+        # not confirmed (e.g. a concurrent CAS miss).  The opposite order's
+        # local record cannot be trusted, so the pair outcome as a whole is
+        # not durably proven even though the broker call itself landed.
+        return "OUTCOME_UNPROVEN", "PAIR_CANCEL_LOCAL_TRANSITION_UNCONFIRMED"
 
     except ImportError:
-        pass
+        # The pairing subsystem itself is unavailable.  This is
+        # indistinguishable from "no pairing feature in this deployment" at
+        # the code level, but we cannot safely assume that from inside a
+        # fill-handling path — treat it as unproven rather than silently
+        # authorizing a handoff that might still have a live opposite order.
+        return "OUTCOME_UNPROVEN", "PAIR_MANAGER_IMPORT_UNAVAILABLE"
     except Exception as exc:
         msg = f"PAIR_CANCEL_MANAGER_FAILED | {order.get('symbol','?')} | local={order.get('local_order_id')} error={exc}"
         log.warning(msg)
@@ -1116,6 +1923,7 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
             },
         )
         _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
+        return "OUTCOME_UNPROVEN", f"PAIR_CANCEL_MANAGER_FAILED:{type(exc).__name__}"
 
 
 def _cancel_with_session(broker: BrokerAdapter, broker_order_id: str):
@@ -1137,8 +1945,32 @@ def _cancel_with_session(broker: BrokerAdapter, broker_order_id: str):
         headers={"Accept": "application/json"},
         timeout=10,
     )
-    if getattr(resp, "status_code", 500) >= 300:
-        raise RuntimeError(f"broker cancel failed HTTP {resp.status_code}: {getattr(resp, 'text', '')[:200]}")
+    status_code = int(getattr(resp, "status_code", 500) or 500)
+    if status_code >= 300:
+        return {
+            "ok": False,
+            "status": "unknown",
+            "broker_order_id": broker_order_id,
+            "error": f"broker cancel failed HTTP {status_code}",
+        }
+
+    get_order = getattr(broker, "get_order", None)
+    if not callable(get_order):
+        return {
+            "ok": False,
+            "status": "unknown",
+            "broker_order_id": broker_order_id,
+            "error": "cancel confirmation unavailable",
+        }
+    confirmed = get_order(broker_order_id)
+    confirmed_status = confirmed.get("status") if isinstance(confirmed, dict) else ""
+    return {
+        "ok": str(confirmed_status or "").strip().lower()
+        in {"canceled", "cancelled"},
+        "status": confirmed_status,
+        "broker_order_id": broker_order_id,
+        "raw": confirmed,
+    }
 
 
 # =============================================================================
@@ -2572,6 +3404,422 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
 
 
 # =============================================================================
+# TERMINAL FILLED ENTRY HANDOFF RECOVERY
+# =============================================================================
+
+
+def _validate_filled_entry_admission(
+    order: dict,
+    result: dict,
+    runtime_execution_mode: str,
+) -> tuple[bool, str]:
+    """Validate exact broker fill truth before marker/OSM terminalization."""
+    client_id = str(order.get("client_id") or "").strip()
+    local_id = str(order.get("local_order_id") or "").strip()
+    contract = str(order.get("contract") or "").strip()
+    execution_mode = order.get("execution_mode")
+    if not client_id:
+        return False, "FILLED_ENTRY_CLIENT_ID_UNPROVEN"
+    if not local_id:
+        return False, "FILLED_ENTRY_LOCAL_ORDER_ID_UNPROVEN"
+    if not _has_proven_broker_order_id(order.get("broker_order_id")):
+        return False, "FILLED_ENTRY_BROKER_ORDER_ID_UNPROVEN"
+    if order.get("kind") != "ENTRY":
+        return False, "FILLED_ENTRY_KIND_UNPROVEN"
+    if execution_mode not in {"live", "paper"}:
+        return False, "FILLED_ENTRY_EXECUTION_MODE_UNPROVEN"
+    if runtime_execution_mode not in {"live", "paper"}:
+        return False, "FILLED_ENTRY_RUNTIME_MODE_UNPROVEN"
+    if execution_mode != runtime_execution_mode:
+        return False, "FILLED_ENTRY_MODE_CONFLICT"
+    if not re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract):
+        return False, "FILLED_ENTRY_CONTRACT_INVALID"
+    filled_qty_val = _strict_positive_integral(result.get("filled_qty"))
+    if filled_qty_val is None:
+        return False, "FILLED_ENTRY_QUANTITY_INVALID"
+    if _strict_positive_finite(result.get("avg_fill")) is None:
+        return False, "FILLED_ENTRY_FILL_PRICE_INVALID"
+
+    # Terminal state and terminal quantity must agree before any durable
+    # mutation.  A broker FILLED with filled_qty != order.qty is an
+    # unresolvable contradiction: writing IN_PROGRESS, OSM FILLED, position,
+    # or releasing guards based on contradictory quantity truth creates
+    # irreparable money-state mismatches (qty=1 position, reservation released
+    # as if qty=2, orders.filled_qty != orders.qty in terminal state).
+    requested_qty = _strict_positive_integral(order.get("qty"))
+    if requested_qty is None:
+        return False, "FILLED_ENTRY_REQUESTED_QUANTITY_UNPROVEN"
+    if filled_qty_val != requested_qty:
+        return False, "FILLED_ENTRY_TERMINAL_QUANTITY_CONFLICT"
+
+    return True, "FILLED_ENTRY_ADMISSION_PROVEN"
+
+
+def _recovery_failure_retryable(reason: str) -> bool:
+    reason = str(reason or "").upper()
+    return any(
+        token in reason
+        for token in (
+            "LOOKUP_FAILED",
+            "SEED_FAILED",
+            "ADOPTION_ERROR",
+            "OWNER_LOOKUP",
+            "WRITE_FAILED",
+            "NOT_CONFIRMED",
+            "RETRY",
+        )
+    )
+
+
+def _release_entry_guards_once(order: dict, *, position_id: str) -> bool:
+    """Release entry reservations once with atomic durable proof."""
+    released = _durable_meta_bool(order, "filled_entry_guards_released")
+    if released is True:
+        return True
+    if released is _INVALID_DURABLE_META_BOOL:
+        log.critical(
+            "[%s] FILLED_ENTRY_GUARDS_RELEASE_MARKER_INVALID local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+        return False
+    claimed = _durable_meta_bool(order, "filled_entry_guards_release_claimed")
+    if claimed is True or claimed is _INVALID_DURABLE_META_BOOL:
+        log.critical(
+            "[%s] FILLED_ENTRY_GUARDS_RELEASE_OUTCOME_UNPROVEN local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+        return False
+    try:
+        released = _release_entry_guards_atomically(order, position_id=position_id)
+    except Exception as exc:
+        log.error(
+            "[%s] FILLED_ENTRY_GUARDS_RELEASE_FAILED local=%s error=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+            exc,
+        )
+        released = False
+    if not released:
+        log.error(
+            "[%s] FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN local=%s",
+            order.get("client_id"),
+            order.get("local_order_id"),
+        )
+    else:
+        _merge_order_meta_memory(
+            order,
+            {
+                "filled_entry_guards_release_claimed": True,
+                "filled_entry_guards_released": True,
+            },
+        )
+    return released
+
+
+def recover_interrupted_filled_entry_handoff(
+    *,
+    broker: BrokerAdapter,
+    order: dict,
+    osm=None,
+    pm=None,
+    exit_engine=None,
+    data_broker=None,
+    runtime_execution_mode: str | None = None,
+    expected_client_id: str,
+    broker_positions=None,
+    broker_positions_error: Exception | str | None = None,
+) -> dict:
+    """Repair one terminal FILLED ENTRY handoff with zero broker mutation.
+
+    This path intentionally does not call ``check_order_with_broker``, OSM
+    terminal transitions, pair cancellation, standing-stop placement, ENTRY
+    submission, ordinary EXIT submission, or broker cancellation.  The only
+    broker truth it consumes is the current position snapshot established by
+    the read-only authority helper.
+    """
+    from ap.filled_entry_recovery_authority import (
+        evaluate_filled_entry_recovery_authority,
+    )
+
+    authority_kwargs = {
+        "pm": pm,
+        "broker": broker,
+        "order": order,
+        "runtime_execution_mode": runtime_execution_mode,
+        "expected_client_id": expected_client_id,
+    }
+    if broker_positions is not None:
+        authority_kwargs["broker_positions"] = broker_positions
+    if broker_positions_error is not None:
+        authority_kwargs["broker_positions_error"] = broker_positions_error
+    try:
+        authority = evaluate_filled_entry_recovery_authority(**authority_kwargs)
+    except Exception as exc:
+        authority = {
+            "disposition": "HOLD",
+            "reason_code": "FILLED_ENTRY_RECOVERY_AUTHORITY_ERROR",
+            "retryable": True,
+            "exception": str(exc),
+        }
+
+    disposition = authority.get("disposition")
+    reason_code = str(authority.get("reason_code") or "FILLED_ENTRY_RECOVERY_HOLD")
+    if disposition in {"NONACTIONABLE", "HOLD"}:
+        _persist_filled_entry_handoff_state(
+            order,
+            disposition,
+            reason=reason_code,
+            retryable=bool(authority.get("retryable")),
+        )
+        emit_fill_event(
+            order,
+            decision="HOLD" if disposition == "HOLD" else "REJECT",
+            reason_code=reason_code,
+            explanation="Terminal FILLED ENTRY recovery classified before any broker mutation.",
+            result={"filled_qty": order.get("filled_qty"), "avg_fill": order.get("fill_price")},
+            extra_context=authority,
+        )
+        return authority
+
+    if disposition not in {"ACTIVE_EXISTING", "ACTIVE_RECREATE"}:
+        return authority
+
+    handoff_state = _filled_entry_handoff_state(order)
+    if handoff_state == "COMPLETE":
+        if _durable_meta_bool(order, "filled_entry_guards_released") is not True:
+            return {
+                **authority,
+                "disposition": "HOLD",
+                "reason_code": "FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN",
+                "retryable": False,
+            }
+        position_id = str(authority.get("position_id") or order.get("position_id") or "").strip()
+        if not position_id:
+            return {
+                **authority,
+                "disposition": "HOLD",
+                "reason_code": "FILLED_ENTRY_RECOVERY_POSITION_IDENTITY_UNPROVEN",
+                "retryable": False,
+            }
+        return {
+            **authority,
+            "reason_code": "FILLED_ENTRY_HANDOFF_ALREADY_COMPLETE",
+            "completed": True,
+            "position_id": position_id,
+        }
+    if handoff_state not in {"IN_PROGRESS", "HOLD"}:
+        reason = "FILLED_ENTRY_LEGACY_GUARD_RELEASE_UNPROVEN"
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=False,
+        )
+        emit_fill_event(
+            order,
+            decision="HOLD",
+            reason_code=reason,
+            explanation="Legacy FILLED ENTRY handoff lacks durable guard-release authority.",
+            result={"filled_qty": order.get("filled_qty"), "avg_fill": order.get("fill_price")},
+            extra_context={**authority, "handoff_state": handoff_state},
+        )
+        return {
+            **authority,
+            "disposition": "HOLD",
+            "reason_code": reason,
+            "retryable": False,
+        }
+
+    local_id = str(order.get("local_order_id") or "").strip()
+    signal_id = str(order.get("signal_id") or "").strip()
+    plan_id = str(order.get("plan_id") or "").strip()
+    if disposition == "ACTIVE_RECREATE" and (not signal_id or not plan_id):
+        reason = "FILLED_ENTRY_RECOVERY_PROVENANCE_UNPROVEN"
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=False,
+            position_id=str(authority.get("position_id") or order.get("position_id") or "").strip() or None,
+        )
+        emit_fill_event(
+            order,
+            decision="HOLD",
+            reason_code=reason,
+            explanation="ACTIVE_RECREATE requires durable signal_id and plan_id; local order identity is not provenance.",
+            result={"filled_qty": order.get("filled_qty"), "avg_fill": order.get("fill_price")},
+            extra_context={
+                **authority,
+                "signal_id_proven": bool(signal_id),
+                "plan_id_proven": bool(plan_id),
+            },
+        )
+        return {
+            **authority,
+            "disposition": "HOLD",
+            "reason_code": reason,
+            "retryable": False,
+        }
+    result = {
+        "status": "FILLED",
+        "filled_qty": order.get("filled_qty"),
+        "avg_fill": order.get("fill_price"),
+        "broker_order_id": order.get("broker_order_id"),
+        "raw": {"source": "durable_filled_entry_recovery"},
+    }
+    position_id = str(authority.get("position_id") or order.get("position_id") or "").strip()
+
+    if disposition == "ACTIVE_RECREATE":
+        try:
+            position_id = str(
+                _open_position_safe(
+                    pm,
+                    order=order,
+                    result=result,
+                    plan_id=str(plan_id),
+                    signal_id=signal_id,
+                    local_id=local_id,
+                    broker=broker,
+                    quote_broker=data_broker,
+                )
+                or ""
+            ).strip()
+        except Exception as exc:
+            reason = f"FILLED_ENTRY_RECOVERY_POSITION_RECREATE_FAILED:{type(exc).__name__}:{exc}"
+            _record_position_create_failure(order, reason)
+            _persist_filled_entry_handoff_state(
+                order,
+                "HOLD",
+                reason=reason,
+                retryable=True,
+            )
+            return {**authority, "disposition": "HOLD", "reason_code": reason, "exception": str(exc)}
+        if not position_id:
+            reason = "FILLED_ENTRY_RECOVERY_POSITION_RECREATE_UNCONFIRMED"
+            _record_position_create_failure(order, reason)
+            _persist_filled_entry_handoff_state(order, "HOLD", reason=reason, retryable=True)
+            return {**authority, "disposition": "HOLD", "reason_code": reason}
+
+    if not position_id:
+        reason = "FILLED_ENTRY_RECOVERY_POSITION_IDENTITY_UNPROVEN"
+        _persist_filled_entry_handoff_state(order, "HOLD", reason=reason, retryable=False)
+        return {**authority, "disposition": "HOLD", "reason_code": reason}
+
+    bind_ok, bind_reason = _bind_filled_entry_durable_identity(
+        position_id=position_id,
+        order=order,
+        result=result,
+    )
+    if not bind_ok:
+        reason = f"FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED:{bind_reason}"
+        _record_position_create_failure(order, "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED")
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=_recovery_failure_retryable(bind_reason),
+            position_id=position_id,
+        )
+        return {**authority, "disposition": "HOLD", "reason_code": reason}
+    order["position_id"] = position_id
+
+    seed_ok, seed_reason = _seed_exit_engine(
+        exit_engine,
+        position_id,
+        order,
+        result,
+        signal_id,
+    )
+    if not seed_ok:
+        reason = f"FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN:{seed_reason}"
+        _record_position_create_failure(order, "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN")
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=_recovery_failure_retryable(seed_reason),
+            position_id=position_id,
+        )
+        return {**authority, "disposition": "HOLD", "reason_code": reason}
+
+    # Recovery has zero pair-cancel authority. It first establishes the
+    # canonical owner for already-proven broker risk, then gates only guard
+    # release and COMPLETE on durable pair truth. This mirrors the fresh-fill
+    # path: pair truth protects final completion, but an open broker position
+    # must never remain ownerless after a restart.
+    pair_state = _pair_resolution_state(order)
+    if pair_state not in {"NOT_APPLICABLE", "CONFIRMED"}:
+        reason = "FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN"
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=True,
+            position_id=position_id,
+        )
+        emit_fill_event(
+            order,
+            decision="HOLD",
+            reason_code=reason,
+            explanation=(
+                "Canonical ownership was established, but the opposite "
+                "1-1 pair cancellation outcome is not durably proven; "
+                "recovery has zero cancel authority and cannot complete."
+            ),
+            result={"filled_qty": order.get("filled_qty"), "avg_fill": order.get("fill_price")},
+            extra_context={
+                **authority,
+                "position_id": position_id,
+                "pair_resolution_state": pair_state or None,
+                "canonical_owner_proven": True,
+            },
+        )
+        return {
+            **authority,
+            "disposition": "HOLD",
+            "reason_code": reason,
+            "retryable": True,
+            "position_id": position_id,
+            "canonical_owner_proven": True,
+        }
+
+    if not _release_entry_guards_once(order, position_id=position_id):
+        reason = "FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN"
+        _persist_filled_entry_handoff_state(
+            order,
+            "HOLD",
+            reason=reason,
+            retryable=True,
+            position_id=position_id,
+        )
+        return {**authority, "disposition": "HOLD", "reason_code": reason}
+
+    if not _persist_filled_entry_handoff_state(
+        order,
+        "COMPLETE",
+        reason="filled_entry_handoff_complete",
+        retryable=False,
+        position_id=position_id,
+    ):
+        return {
+            **authority,
+            "disposition": "HOLD",
+            "reason_code": "FILLED_ENTRY_HANDOFF_COMPLETE_WRITE_FAILED",
+            "retryable": True,
+            "position_id": position_id,
+        }
+    return {
+        **authority,
+        "disposition": disposition,
+        "reason_code": "FILLED_ENTRY_HANDOFF_COMPLETE",
+        "completed": True,
+        "position_id": position_id,
+    }
+
+
+# =============================================================================
 # BROKER FILL SANITY / ANOMALY ESCALATION
 # =============================================================================
 
@@ -2581,8 +3829,8 @@ def _sanitize_cumulative_filled(order: dict, result: dict) -> tuple[int, bool]:
     local_id = str(order.get("local_order_id") or "")
     broker_id = order.get("broker_order_id")
 
-    raw_filled = int(result.get("filled_qty") or 0)
-    order_qty = int(order.get("qty") or 0)
+    raw_filled = _strict_positive_integral(result.get("filled_qty")) or 0
+    order_qty = _strict_positive_integral(order.get("qty")) or 0
 
     if order_qty > 0 and raw_filled > order_qty:
         clamped = order_qty
@@ -2721,7 +3969,7 @@ def process_pending_order(
     result = check_order_with_broker(broker, order)
     mapped = result.get("status", "UNKNOWN")
 
-    prev_filled = int(order.get("filled_qty") or 0)
+    prev_filled = _strict_positive_integral(order.get("filled_qty")) or 0
     new_filled, overfill_clamped = _sanitize_cumulative_filled(order, result)
 
     if mapped not in ("UNKNOWN", "ERROR"):
@@ -2754,6 +4002,48 @@ def process_pending_order(
 
     # ── FILLED / EXIT_FILLED ────────────────────────────────────────────────
     if mapped in ("FILLED", "EXIT_FILLED"):
+        if kind == "ENTRY":
+            runtime_mode = _resolve_runtime_execution_mode(
+                runtime_execution_mode=runtime_execution_mode,
+                exit_engine=exit_engine,
+            )
+            admission_ok, admission_reason = _validate_filled_entry_admission(
+                order,
+                result,
+                runtime_mode,
+            )
+            if not admission_ok:
+                _record_position_create_failure(order, admission_reason)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=admission_reason,
+                    explanation="Broker FILLED admission is not exact enough for terminalization.",
+                    result=result,
+                    extra_context={"runtime_execution_mode": runtime_mode},
+                )
+                return
+            if not _persist_filled_entry_handoff_state(
+                order,
+                "IN_PROGRESS",
+                reason="filled_entry_handoff_started",
+                retryable=True,
+            ):
+                _record_position_create_failure(
+                    order,
+                    "FILLED_ENTRY_HANDOFF_MARKER_PERSIST_FAILED",
+                )
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code="FILLED_ENTRY_HANDOFF_MARKER_PERSIST_FAILED",
+                    explanation=(
+                        "The durable handoff marker was not confirmed; the order "
+                        "remains nonterminal and pollable for another iteration."
+                    ),
+                    result=result,
+                )
+                return
         emit_fill_event(
             order,
             decision="CONFIRMED",
@@ -2790,12 +4080,15 @@ def process_pending_order(
 
         if ok and kind == "ENTRY" and pm:
             position_id = None
+            bind_ok = False
+            seed_ok = False
+            handoff_complete = False
             try:
                 plan_id = order.get("plan_id") or order.get("signal_id") or local_id
                 signal_id = order.get("signal_id") or local_id
                 ticker = (order.get("symbol") or "").upper()
-                qty = int(new_filled or order.get("qty") or 0)
-                price = float(result.get("avg_fill") or 0.0)
+                qty = _strict_positive_integral(new_filled) or 0
+                price = _strict_positive_finite(result.get("avg_fill")) or 0.0
 
                 trace_gate(
                     str(signal_id),
@@ -2811,10 +4104,20 @@ def process_pending_order(
                     plan_id=str(plan_id or ""),
                 )
 
-                # Pair cancel is broker-first/local-second.
-                _cancel_pair_opposite(order, broker, osm, alert_fn=alert_fn)
-
-                # Persist local position BEFORE placing optional standing stop.
+                # Fresh-fill behavior remains pair-cancel -> local position ->
+                # optional standing stop.  The durable marker was written
+                # before OSM FILLED above; recovery never enters this branch.
+                # P0 amendment: durably record the pair-cancel outcome
+                # immediately.  This does not block position creation on a
+                # non-crash fresh fill — it exists so a crash between here
+                # and the COMPLETE write leaves a fail-closed trail that the
+                # COMPLETE CAS predicate refuses to bypass.
+                _pair_state, _pair_detail = _cancel_pair_opposite(
+                    order, broker, osm, alert_fn=alert_fn
+                )
+                _persist_filled_entry_pair_resolution_state(
+                    order, _pair_state, detail=_pair_detail
+                )
                 position_id = _open_position_safe(
                     pm,
                     order=order,
@@ -2826,7 +4129,6 @@ def process_pending_order(
                     quote_broker=data_broker,
                 )
 
-                # Secondary broker-side stop is best-effort only.
                 _place_standing_stop_best_effort(
                     broker=broker,
                     order=order,
@@ -2844,11 +4146,19 @@ def process_pending_order(
                         order,
                         "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED",
                     )
+                    _persist_filled_entry_handoff_state(
+                        order,
+                        "HOLD",
+                        reason=f"FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED:{bind_reason}",
+                        retryable=_recovery_failure_retryable(bind_reason),
+                        position_id=position_id,
+                    )
                     log.critical(
                         "[%s] filled_entry_identity_bind_failed order=%s position=%s reason=%s",
                         client_id, local_id, position_id, bind_reason,
                     )
                 else:
+                    order["position_id"] = position_id
                     seed_ok, seed_reason = _seed_exit_engine(
                         exit_engine, position_id, order, result, signal_id
                     )
@@ -2857,18 +4167,63 @@ def process_pending_order(
                             order,
                             "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN",
                         )
+                        _persist_filled_entry_handoff_state(
+                            order,
+                            "HOLD",
+                            reason=f"FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN:{seed_reason}",
+                            retryable=_recovery_failure_retryable(seed_reason),
+                            position_id=position_id,
+                        )
                         log.critical(
                             "[%s] filled_entry_canonical_owner_unproven order=%s position=%s reason=%s",
                             client_id, local_id, position_id, seed_reason,
                         )
+                    else:
+                        # Pair proof gates guard release as well as COMPLETE.
+                        # Read the durable marker, rather than trusting the
+                        # in-memory result from _cancel_pair_opposite: a
+                        # failed pair-state persistence must remain HOLD.
+                        pair_state = _pair_resolution_state(order)
+                        if pair_state not in {"NOT_APPLICABLE", "CONFIRMED"}:
+                            _persist_filled_entry_handoff_state(
+                                order,
+                                "HOLD",
+                                reason="FILLED_ENTRY_PAIR_RESOLUTION_UNPROVEN",
+                                retryable=True,
+                                position_id=position_id,
+                            )
+                        elif _release_entry_guards_once(order, position_id=position_id):
+                            handoff_complete = _persist_filled_entry_handoff_state(
+                                order,
+                                "COMPLETE",
+                                reason="filled_entry_handoff_complete",
+                                retryable=False,
+                                position_id=position_id,
+                            )
+                            if not handoff_complete:
+                                log.error(
+                                    "[%s] FILLED_ENTRY_HANDOFF_COMPLETE_WRITE_FAILED local=%s",
+                                    client_id,
+                                    local_id,
+                                )
+                        else:
+                            _persist_filled_entry_handoff_state(
+                                order,
+                                "HOLD",
+                                reason="FILLED_ENTRY_GUARDS_RELEASE_UNPROVEN",
+                                retryable=True,
+                                position_id=position_id,
+                            )
 
                 log.info(
                     "[%s] order_filled_detected order=%s contract=%s qty=%d "
-                    "position_identity_result=%s",
-                    client_id, local_id,
+                    "position_identity_result=%s handoff_complete=%s",
+                    client_id,
+                    local_id,
                     order.get("contract") or order.get("symbol"),
                     int(new_filled or 0),
                     "success" if bind_ok else "FAILED",
+                    handoff_complete,
                 )
 
                 if not position_id:
@@ -2876,26 +4231,22 @@ def process_pending_order(
                         "[%s] filled_order_missing_position_p0 order=%s contract=%s "
                         "(fill confirmed but no position record created — "
                         "exit engine BLIND to this position)",
-                        client_id, local_id,
+                        client_id,
+                        local_id,
                         order.get("contract") or order.get("symbol"),
                     )
 
             except Exception as exc:
                 log.critical(
-                    "[%s] ENTRY fill side-effects FAILED for %s — position NOT created, "
-                    "exit engine BLIND to this position. Error: %s",
-                    client_id, local_id, exc, exc_info=True,
+                    "[%s] ENTRY fill side-effects FAILED for %s — durable handoff remains unfinished. Error: %s",
+                    client_id,
+                    local_id,
+                    exc,
+                    exc_info=True,
                 )
 
         elif ok and kind == "EXIT":
             _sync_exit_price(order, result)
-
-        # Release equity/symbol lock only after OSM confirmed the fill.
-        # If ok=False (OSM transition failed), position is not confirmed —
-        # releasing equity here would let a new trade consume capital that
-        # is still reserved for this unresolved fill.
-        if ok and kind == "ENTRY":
-            _release_entry_guards(order)
 
         audit(
             client_id,
@@ -3297,20 +4648,78 @@ def fill_monitor_loop(
                 exit_engine=exit_engine,
             )
             normal_pending = get_pending_orders(client_id)
-            recovery_pending = get_broker_owned_exit_requests(client_id)
+            broker_owned_exit_pending = get_broker_owned_exit_requests(client_id)
+            try:
+                recovery_pending = get_interrupted_filled_entry_handoffs(client_id)
+            except Exception as exc:
+                recovery_pending = []
+                log.error(
+                    "[%s] interrupted FILLED ENTRY recovery query failed: %s",
+                    client_id,
+                    exc,
+                )
+
             pending = []
             processed_local_order_ids = set()
-            # Prefer the dedicated recovery snapshot when a concurrent query
-            # returns the same local order in both result sets.  It is the
-            # only path allowed to normalize EXIT_REQUESTED ownership.
-            for order in recovery_pending + normal_pending:
+
+            # Recovery of exposed current risk must run before ordinary
+            # polling.  A terminal FILLED ENTRY handoff is the only path here
+            # that can represent already-open broker risk after a restart; it
+            # must not wait behind normal order work.
+            if recovery_pending:
+                recovery_positions = None
+                recovery_positions_error = None
+                try:
+                    from ap.filled_entry_recovery_authority import fetch_current_broker_positions
+
+                    recovery_positions = fetch_current_broker_positions(broker)
+                except Exception as exc:
+                    recovery_positions_error = exc
+                    log.error(
+                        "[%s] current broker-position snapshot unavailable for FILLED ENTRY recovery: %s",
+                        client_id,
+                        exc,
+                    )
+                for order in recovery_pending:
+                    local_order_id = str(order.get("local_order_id") or "").strip()
+                    if local_order_id and local_order_id in processed_local_order_ids:
+                        continue
+                    if local_order_id:
+                        processed_local_order_ids.add(local_order_id)
+                    try:
+                        recover_interrupted_filled_entry_handoff(
+                            broker=broker,
+                            order=order,
+                            osm=osm,
+                            pm=pm,
+                            exit_engine=exit_engine,
+                            data_broker=data_broker,
+                            runtime_execution_mode=resolved_runtime_execution_mode,
+                            expected_client_id=client_id,
+                            broker_positions=recovery_positions,
+                            broker_positions_error=recovery_positions_error,
+                        )
+                    except Exception as exc:
+                        log.exception(
+                            "Failed to recover FILLED ENTRY handoff %s: %s",
+                            local_order_id,
+                            exc,
+                        )
+                pending.extend(recovery_pending)
+
+            # Normal pending orders and broker-owned EXIT_REQUESTED recovery
+            # remain on their existing processor.  Terminal FILLED ENTRY rows
+            # are deliberately not routed through this list.
+            ordinary_pending = []
+            for order in broker_owned_exit_pending + normal_pending:
                 local_order_id = str(order.get("local_order_id") or "").strip()
                 if local_order_id and local_order_id in processed_local_order_ids:
                     continue
                 if local_order_id:
                     processed_local_order_ids.add(local_order_id)
+                ordinary_pending.append(order)
                 pending.append(order)
-            for order in pending:
+            for order in ordinary_pending:
                 try:
                     process_pending_order(
                         broker,

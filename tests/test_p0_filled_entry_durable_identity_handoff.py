@@ -139,6 +139,11 @@ def _order(**overrides):
         "signal_id": SIGNAL_ID,
         "plan_id": PLAN_ID,
         "filled_qty": 1,
+        # #473 amendment: _validate_filled_entry_admission requires a proven
+        # requested quantity before any terminalization mutation is allowed.
+        # orders.qty is a real column; the original fixture omitted it because
+        # the admission gate did not yet exist on main.
+        "qty": 1,
     }
     row.update(overrides)
     return row
@@ -553,9 +558,15 @@ def _process_entry(monkeypatch, *, bind_result, seed_result):
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "trace_gate", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        fm, "_cancel_pair_opposite", lambda *args, **kwargs: ("NOT_APPLICABLE", "test_mock")
+    )
+    monkeypatch.setattr(
+        fm, "_persist_filled_entry_pair_resolution_state", lambda *args, **kwargs: True
+    )
     monkeypatch.setattr(fm, "_place_standing_stop_best_effort", lambda **kwargs: calls.append("standing_stop"))
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: True)
     monkeypatch.setattr(fm, "_record_position_create_failure", lambda order, reason: markers.append((order["client_id"], order["local_order_id"], reason)))
     monkeypatch.setattr(
         fm,
@@ -574,6 +585,7 @@ def _process_entry(monkeypatch, *, bind_result, seed_result):
         osm=osm,
         pm=_PM(),
         exit_engine=object(),
+        runtime_execution_mode=MODE,
     )
     return calls, markers, broker, osm
 
@@ -590,8 +602,14 @@ def test_jason_reconciler_shape_binds_before_seed_and_preserves_plan(monkeypatch
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "trace_gate", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "_cancel_pair_opposite", lambda *args, **kwargs: None)
-    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_persist_filled_entry_handoff_state", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        fm, "_cancel_pair_opposite", lambda *args, **kwargs: ("NOT_APPLICABLE", "test_mock")
+    )
+    monkeypatch.setattr(
+        fm, "_persist_filled_entry_pair_resolution_state", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(fm, "_release_entry_guards_atomically", lambda *args, **kwargs: True)
     monkeypatch.setattr(fm, "_open_position_safe", lambda *args, **kwargs: POSITION_ID)
 
     calls = []
@@ -620,6 +638,7 @@ def test_jason_reconciler_shape_binds_before_seed_and_preserves_plan(monkeypatch
         osm=_OSM(),
         pm=object(),
         exit_engine=object(),
+        runtime_execution_mode=MODE,
     )
 
     assert calls == ["standing_stop", "bind", "seed"]
