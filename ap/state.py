@@ -163,17 +163,29 @@ def get_reserved_equity(client_id: str) -> float:
 # =====================================================================
 
 def acquire_symbol_lock(
-    client_id: str, symbol: str, ttl_seconds: int = 90
+    client_id: str,
+    symbol: str,
+    ttl_seconds: int = 90,
+    owner_id: "str | None" = None,
 ) -> bool:
     """
     Atomically acquire a per-symbol lock with TTL.
     Uses pg_try_advisory_xact_lock for mutual exclusion, kv for TTL tracking.
     Returns True if lock acquired, False if already held by another process.
+
+    ``owner_id`` — when provided (e.g. the caller's ``local_order_id``), it is
+    stored inside the kv payload so that restart-recovery can prove exact
+    ownership and safely delete *only* the lock that belongs to a specific
+    order.  Callers that do not supply an owner_id write a legacy payload
+    containing only ``ts``; recovery will then treat such locks as unowned and
+    will preserve them (fail-closed).
     """
     client_id = (client_id or "default").strip()
     symbol    = (symbol or "").strip().upper()
     if not symbol:
         return False
+
+    _owner_id = str(owner_id or "").strip() or None
 
     key = f"lock:{client_id}:{symbol}"
     now = datetime.now(timezone.utc).timestamp()
@@ -202,7 +214,13 @@ def acquire_symbol_lock(
                     ok = False
                     return
 
-            # Write new lock timestamp
+            # Write new lock payload.  Always include ts (TTL tracking).
+            # Include owner_id when provided so recovery can prove exact
+            # ownership; omit when absent to keep legacy callers unaffected.
+            lock_payload: dict = {"ts": now}
+            if _owner_id:
+                lock_payload["owner_id"] = _owner_id
+
             c.execute(
                 """
                 INSERT INTO kv (k, v, updated_at)
@@ -210,7 +228,7 @@ def acquire_symbol_lock(
                 ON CONFLICT (k) DO UPDATE
                     SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
                 """,
-                (key, json_dumps({"ts": now}), now_utc_iso()),
+                (key, json_dumps(lock_payload), now_utc_iso()),
             )
             ok = True
 

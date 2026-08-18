@@ -1011,7 +1011,18 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             log.info(f"⛔ Trend gate blocked {symbol} {direction}: {trend_reason} (SPY={spy_trend})")
             return {"ok": False, "error": "trend_gate", "details": trend_reason, "spy_trend": spy_trend}
 
-        if not acquire_symbol_lock(client_id, symbol, ttl_seconds=90):
+        # Generate local_order_id here — before lock acquisition — so we can
+        # store it as the durable owner token inside the kv lock payload.
+        # This is the ONLY identity that restart-recovery can use to prove
+        # that a symbol lock belongs to this exact ENTRY (see
+        # _release_entry_guards_atomically).  Moving generation earlier has
+        # no behavioral effect on the order row: nothing reads local_order_id
+        # between here and insert_order().
+        local_order_id = new_local_order_id()
+
+        if not acquire_symbol_lock(
+            client_id, symbol, ttl_seconds=90, owner_id=local_order_id
+        ):
             audit(client_id, "WARNING", "SYMBOL_LOCKED", {"symbol": symbol})
             return {"ok": False, "error": "symbol_locked", "symbol": symbol}
         locked = True
@@ -1419,7 +1430,9 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
                 "reserve_delta": reserve_delta,
             }
 
-        local_order_id = new_local_order_id()
+        # local_order_id was already generated before acquire_symbol_lock above
+        # so the same UUID could be stored as the durable owner token in the
+        # kv lock payload.  Do NOT reassign here.
         # AUDIT PHASE-2: persist meta so admission ordering (score) and re-peg
         # alignment gate (signal_entry_price) have what they need at decision time.
         # PHASE 3: persist selector_ask / submit_ask / submit_limit / quote_age_ms

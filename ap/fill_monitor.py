@@ -1449,13 +1449,35 @@ def _release_entry_guards_atomically(order: dict, *, position_id: str) -> bool:
                 return False
 
             # Decide the symbol-lock disposition BEFORE any mutation.
-            # BINDING INVARIANT: a recovered historical FILLED ENTRY may
-            # never delete a symbol lock that was acquired after that
-            # ENTRY's own durable fill -- doing so could delete a newer,
-            # unrelated same-symbol ENTRY's active guard once its TTL-aged
-            # predecessor's handoff recovery runs.
+            #
+            # BINDING INVARIANT (P0 — #473 final amendment):
+            # A recovered historical FILLED ENTRY may delete the current
+            # symbol lock ONLY when it can prove that the lock belongs to
+            # that exact order.  Timestamp ordering alone is NOT sufficient
+            # ownership proof.
+            #
+            # Counterexample that timestamp ordering gets wrong:
+            #   t=0   ENTRY A acquires lock (lock_ts = 0)
+            #   t=90  A's lock TTL expires
+            #   t=91  newer same-symbol ENTRY B reacquires lock (lock_ts = 91)
+            #   t=95  ENTRY A finally fills (filled_ts = 95)
+            #   crash before A completes handoff
+            #   restart recovery processes A
+            #   → lock_ts (91) <= filled_ts (95) → old code would DELETE B's lock
+            #
+            # Correct ownership proof: the lock payload written by
+            # ap.state.acquire_symbol_lock() includes an "owner_id" field
+            # equal to the local_order_id of the acquiring order.  If and
+            # only if that field exactly matches this order's local_order_id
+            # may the lock be deleted.  Any other outcome (absent row,
+            # absent owner token, mismatch) is fail-closed: preserve the
+            # lock, still release this order's equity reservation and persist
+            # the durable handoff marker.
             delete_symbol_lock = False
             if symbol_key:
+                # Gate: confirm this order has a durable fill timestamp before
+                # touching any KV state.  A missing filled_ts means the order
+                # is not in a confirmed terminal fill state; abort.
                 durable_filled_ts = row.get("filled_ts")
                 if durable_filled_ts is None:
                     log.critical(
@@ -1465,25 +1487,12 @@ def _release_entry_guards_atomically(order: dict, *, position_id: str) -> bool:
                         local_order_id,
                     )
                     return False
-                try:
-                    filled_ts_epoch = durable_filled_ts.timestamp()
-                    if not math.isfinite(filled_ts_epoch):
-                        raise ValueError("non-finite filled_ts")
-                except Exception:
-                    log.critical(
-                        "[%s] FILLED_ENTRY_GUARDS_RELEASE_FILLED_TS_MALFORMED "
-                        "local=%s value=%r",
-                        client_id,
-                        local_order_id,
-                        durable_filled_ts,
-                    )
-                    return False
 
                 c.execute("SELECT v FROM kv WHERE k=%s", (symbol_key,))
                 symbol_lock_kv_row = c.fetchone()
                 if symbol_lock_kv_row is None:
-                    # Old symbol guard is already absent — nothing to
-                    # inspect or delete; continue normally.
+                    # Symbol lock row is already absent — nothing to inspect
+                    # or delete; continue releasing equity and writing marker.
                     delete_symbol_lock = False
                 else:
                     raw_lock_v = symbol_lock_kv_row.get("v")
@@ -1493,26 +1502,51 @@ def _release_entry_guards_atomically(order: dict, *, position_id: str) -> bool:
                             if isinstance(raw_lock_v, str)
                             else raw_lock_v
                         )
-                        lock_ts = float(lock_payload.get("ts"))
-                        if not math.isfinite(lock_ts):
-                            raise ValueError("non-finite lock ts")
+                        if not isinstance(lock_payload, dict):
+                            raise ValueError("lock payload is not a dict")
                     except Exception:
+                        # Malformed payload: fail closed — preserve the lock,
+                        # but do NOT abort the equity/marker release.
                         log.critical(
-                            "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_LOCK_TS_MALFORMED "
-                            "local=%s symbol_key=%s",
+                            "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_LOCK_"
+                            "PAYLOAD_MALFORMED local=%s symbol_key=%s",
                             client_id,
                             local_order_id,
                             symbol_key,
                         )
-                        return False
-                    # A lock timestamped at or before this ENTRY's durable
-                    # fill belongs to this order's own pre-fill guard
-                    # domain and is safe to delete.  Strictly newer means
-                    # the symbol lock was reacquired after this fill (a
-                    # newer same-symbol order) -- preserve it exactly and
-                    # release only this old order's equity reservation and
-                    # durable marker.
-                    delete_symbol_lock = lock_ts <= filled_ts_epoch
+                        delete_symbol_lock = False
+                    else:
+                        lock_owner_id = str(
+                            lock_payload.get("owner_id") or ""
+                        ).strip()
+                        if lock_owner_id and lock_owner_id == local_order_id:
+                            # Exact ownership proven: this lock was written by
+                            # THIS order's acquire_symbol_lock() call.  Safe
+                            # to delete.
+                            delete_symbol_lock = True
+                        else:
+                            # owner_id absent (legacy lock without token) OR
+                            # owner_id present but belongs to a different order.
+                            # Either way: preserve the current lock.
+                            if lock_owner_id:
+                                log.info(
+                                    "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_"
+                                    "LOCK_OWNER_MISMATCH local=%s "
+                                    "lock_owner=%s — preserving",
+                                    client_id,
+                                    local_order_id,
+                                    lock_owner_id,
+                                )
+                            else:
+                                log.warning(
+                                    "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_"
+                                    "LOCK_NO_OWNER_TOKEN local=%s "
+                                    "symbol_key=%s — preserving (fail-closed)",
+                                    client_id,
+                                    local_order_id,
+                                    symbol_key,
+                                )
+                            delete_symbol_lock = False
 
             c.execute(
                 "SELECT v FROM kv WHERE k=%s",

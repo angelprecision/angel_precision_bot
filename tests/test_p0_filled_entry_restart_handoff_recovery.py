@@ -1660,13 +1660,14 @@ def test_atomic_guard_release_commits_marker_with_guard_mutations(monkeypatch):
             elif "SELECT v FROM kv" in sql:
                 key = params[0] if params else ""
                 if str(key).startswith("lock:"):
-                    # Symbol-lock row timestamped BEFORE the durable fill
-                    # above -- belongs to this order's own pre-fill guard
-                    # domain, safe to delete.
+                    # Lock payload includes owner_id == LOCAL_ID: exact
+                    # ownership proven → lock is safe to delete (case A).
                     old_ts = (
                         datetime.now(timezone.utc) - timedelta(seconds=10)
                     ).timestamp()
-                    self.current_row = {"v": json.dumps({"ts": old_ts})}
+                    self.current_row = {
+                        "v": json.dumps({"ts": old_ts, "owner_id": LOCAL_ID})
+                    }
                 else:
                     self.current_row = {"v": "120.0"}
             elif "UPDATE orders" in sql:
@@ -1700,8 +1701,9 @@ def test_atomic_guard_release_commits_marker_with_guard_mutations(monkeypatch):
 
 
 def test_atomic_guard_release_preserves_newer_symbol_lock(monkeypatch):
-    """BINDING INVARIANT: a symbol lock reacquired AFTER this ENTRY's
-    durable fill must never be deleted by that ENTRY's own guard release."""
+    """BINDING INVARIANT (case C): a symbol lock whose owner_id belongs to a
+    different order must never be deleted, regardless of timestamp ordering.
+    Equity reservation and durable marker are still released for this order."""
     class _Conn:
         def __init__(self):
             self.current_row = None
@@ -1726,12 +1728,17 @@ def test_atomic_guard_release_preserves_newer_symbol_lock(monkeypatch):
             elif "SELECT v FROM kv" in sql:
                 key = params[0] if params else ""
                 if str(key).startswith("lock:"):
-                    # Symbol-lock row timestamped AFTER the durable fill —
-                    # a newer same-symbol order reacquired it. Must survive.
+                    # Lock belongs to a DIFFERENT order (ENTRY B).  The
+                    # owner_id does not match LOCAL_ID → must survive.
                     newer_ts = (
                         datetime.now(timezone.utc) - timedelta(seconds=1)
                     ).timestamp()
-                    self.current_row = {"v": json.dumps({"ts": newer_ts})}
+                    self.current_row = {
+                        "v": json.dumps({
+                            "ts": newer_ts,
+                            "owner_id": "other-entry-b-local-order-id",
+                        })
+                    }
                 else:
                     self.current_row = {"v": "120.0"}
             elif "UPDATE orders" in sql:
@@ -1757,7 +1764,7 @@ def test_atomic_guard_release_preserves_newer_symbol_lock(monkeypatch):
     # marker still succeeds ...
     assert any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
     assert any("INSERT INTO kv" in sql for sql, _params in fake_conn.statements)
-    # ... but the newer symbol lock byte-for-byte survives: no DELETE.
+    # ... but the mismatched-owner symbol lock survives: no DELETE.
     assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
 
 
@@ -1813,7 +1820,10 @@ def test_atomic_guard_release_no_symbol_lock_row_releases_normally(monkeypatch):
     assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
 
 
-def test_atomic_guard_release_malformed_symbol_lock_timestamp_fails_closed(monkeypatch):
+def test_atomic_guard_release_legacy_lock_no_owner_token_preserves_lock(monkeypatch):
+    """Case E: a legacy lock payload that has only 'ts' (no owner_id) must
+    never be deleted — ownership is unproven.  The equity reservation and
+    durable marker MUST still succeed so the order's handoff completes."""
     class _Conn:
         def __init__(self):
             self.current_row = None
@@ -1838,7 +1848,12 @@ def test_atomic_guard_release_malformed_symbol_lock_timestamp_fails_closed(monke
             elif "SELECT v FROM kv" in sql:
                 key = params[0] if params else ""
                 if str(key).startswith("lock:"):
-                    self.current_row = {"v": json.dumps({"ts": "not-a-number"})}
+                    # Legacy payload: only "ts", no "owner_id".
+                    # Ownership is unproven → lock must be preserved.
+                    old_ts = (
+                        datetime.now(timezone.utc) - timedelta(seconds=10)
+                    ).timestamp()
+                    self.current_row = {"v": json.dumps({"ts": old_ts})}
                 else:
                     self.current_row = {"v": "120.0"}
             elif "UPDATE orders" in sql:
@@ -1858,10 +1873,13 @@ def test_atomic_guard_release_malformed_symbol_lock_timestamp_fails_closed(monke
     monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
 
     order = _order(reserved_cost=120.0)
-    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is False
+    # Release MUST succeed: equity is released, marker is written.
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is True
+    assert order["meta"]["filled_entry_guards_released"] is True
+    # But the unowned lock must NOT be deleted.
     assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
-    assert not any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
-    assert order.get("meta", {}).get("filled_entry_guards_released") is not True
+    assert any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
+    assert any("INSERT INTO kv" in sql for sql, _params in fake_conn.statements)
 
 
 def test_atomic_guard_release_missing_filled_ts_fails_closed(monkeypatch):
@@ -1913,6 +1931,149 @@ def test_atomic_guard_release_missing_filled_ts_fails_closed(monkeypatch):
     assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is False
     assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
     assert not any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
+
+
+def test_atomic_guard_release_ttl_reacquire_before_old_fill_preserved(monkeypatch):
+    """Case D — CRITICAL TTL scenario:
+
+    t=0   ENTRY A acquires lock (lock_ts = 0, owner_id = LOCAL_ID)
+    t=90  A's lock TTL expires
+    t=91  newer same-symbol ENTRY B reacquires lock (owner_id = ENTRY_B_ID)
+    t=95  ENTRY A finally fills (filled_ts = epoch+95)
+    crash before A completes handoff
+    restart recovery processes A
+
+    The current lock belongs to ENTRY B (lock_ts=91, filled_ts=95).
+    Under the old code: lock_ts (91) <= filled_ts (95) → DELETE B's lock (BUG).
+    Under the new code: lock owner_id is ENTRY_B_ID ≠ LOCAL_ID → PRESERVE.
+
+    Equity release and durable marker for ENTRY A must still succeed.
+    """
+    # Simulate absolute epoch values matching the spec scenario.
+    _epoch_base = 1_000_000_000.0          # arbitrary but reproducible
+    _filled_ts_epoch = _epoch_base + 95     # ENTRY A filled at t=95
+    _lock_ts_epoch   = _epoch_base + 91     # ENTRY B reacquired at t=91
+    _filled_dt = datetime.fromtimestamp(_filled_ts_epoch, tz=timezone.utc)
+
+    _ENTRY_B_LOCAL_ID = "entry-b-local-order-id-ttl-reacquire-scenario"
+
+    class _Conn:
+        def __init__(self):
+            self.current_row = None
+            self.rowcount = 1
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+            if "pg_try_advisory_xact_lock" in sql:
+                self.current_row = {"pg_try_advisory_xact_lock": True}
+            elif "SELECT meta" in sql:
+                self.current_row = {
+                    "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+                    "filled_ts": _filled_dt,
+                }
+            elif "SELECT v FROM kv" in sql:
+                key = params[0] if params else ""
+                if str(key).startswith("lock:"):
+                    # ENTRY B's lock: timestamp t=91 (numerically < filled_ts
+                    # t=95), owner_id belongs to ENTRY B — NOT to LOCAL_ID.
+                    # Old timestamp logic would DELETE this (bug).
+                    # New owner_id logic must PRESERVE it.
+                    self.current_row = {
+                        "v": json.dumps({
+                            "ts": _lock_ts_epoch,
+                            "owner_id": _ENTRY_B_LOCAL_ID,
+                        })
+                    }
+                else:
+                    self.current_row = {"v": "120.0"}
+            elif "UPDATE orders" in sql:
+                self.rowcount = 1
+                self.current_row = None
+            else:
+                self.current_row = None
+            return self
+
+        def fetchone(self):
+            row = self.current_row
+            self.current_row = None
+            return row
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(fm, "conn", lambda: fake_conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
+
+    order = _order(reserved_cost=120.0)
+    # ENTRY A's guard release must SUCCEED (equity released, marker written) …
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is True
+    assert order["meta"]["filled_entry_guards_released"] is True
+    assert any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
+    assert any("INSERT INTO kv" in sql for sql, _params in fake_conn.statements)
+    # … but ENTRY B's lock must NOT be deleted.
+    assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
+
+
+def test_atomic_guard_release_malformed_lock_payload_preserves_lock(monkeypatch):
+    """Case F: unparseable JSON in the kv lock row must be treated as
+    unproven ownership → lock preserved, equity + marker still released."""
+    class _Conn:
+        def __init__(self):
+            self.current_row = None
+            self.rowcount = 1
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+            if "pg_try_advisory_xact_lock" in sql:
+                self.current_row = {"pg_try_advisory_xact_lock": True}
+            elif "SELECT meta" in sql:
+                self.current_row = {
+                    "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+                    "filled_ts": datetime.now(timezone.utc) - timedelta(seconds=5),
+                }
+            elif "SELECT v FROM kv" in sql:
+                key = params[0] if params else ""
+                if str(key).startswith("lock:"):
+                    # Corrupt / unparseable payload.
+                    self.current_row = {"v": "{{not valid json}}"}
+                else:
+                    self.current_row = {"v": "120.0"}
+            elif "UPDATE orders" in sql:
+                self.rowcount = 1
+                self.current_row = None
+            else:
+                self.current_row = None
+            return self
+
+        def fetchone(self):
+            row = self.current_row
+            self.current_row = None
+            return row
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(fm, "conn", lambda: fake_conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
+
+    order = _order(reserved_cost=120.0)
+    # Release must succeed — equity freed, marker written.
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is True
+    assert order["meta"]["filled_entry_guards_released"] is True
+    # Corrupt payload → lock preserved, not deleted.
+    assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
+    assert any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
+    assert any("INSERT INTO kv" in sql for sql, _params in fake_conn.statements)
 
 
 def test_atomic_guard_release_symbol_lock_busy_fails_closed(monkeypatch):
