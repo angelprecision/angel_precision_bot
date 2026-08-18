@@ -64,8 +64,6 @@ jobs:
             -tAc "SELECT execution_mode FROM positions WHERE id='unique'" \
             | grep -qx live
           psql -h localhost -U postgres -d position_mode_migration_test \
-            -tAc "SELECT count(*) FROM positions WHERE id IN ('unique','ambiguous') AND execution_mode IS NULL" >/dev/null || true
-          psql -h localhost -U postgres -d position_mode_migration_test \
             -tAc "SELECT count(*) FROM positions WHERE id IN ('unknown','ambiguous') AND execution_mode IS NULL" \
             | grep -qx 2
           dropdb -h localhost -U postgres position_mode_migration_test
