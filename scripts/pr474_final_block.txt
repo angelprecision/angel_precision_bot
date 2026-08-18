@@ -2,7 +2,7 @@
 # The selector-era price is only the drift baseline. For a deferred entry,
 # Master Control must see the FINAL submit_limit after the fresh exact-OCC
 # quote, spread/drift gates, and any PR180 repricing. This block runs before
-# persist_deferred_broker_ready() and therefore before any broker POST.
+# the broker-ready CAS and therefore before any broker POST.
 if _deferred and _handoff_snapshot.get("captured"):
     _identity_row, _identity_read_error, _identity_read_attempts = (
         _read_order_row_for_handoff_proof(
@@ -105,6 +105,7 @@ if _deferred and _handoff_snapshot.get("captured"):
             "mc_seen_cost": _final_reval.get("mc_seen_cost"),
             "mc_block_reason": _final_reval.get("mc_reason"),
             "exception_type": _final_reval.get("exception_type"),
+            "exception_message": _final_reval.get("exception_message"),
             "client_id": _final_identity.get("client_id"),
             "execution_mode": _final_identity.get("execution_mode"),
             "local_order_id": queue_local_order_id,
@@ -112,13 +113,14 @@ if _deferred and _handoff_snapshot.get("captured"):
         }
         log.critical(
             "[%s] DEFERRED_FINAL_EXPOSURE_BLOCK contract=%s "
-            "limit=%.2f qty=%s cost=$%.2f reason=%s — no broker POST",
+            "limit=%.2f qty=%s cost=$%.2f reason=%s exception=%r — no broker POST",
             ticker,
             approved_contract,
             float(submit_limit),
             _reval_meta["final_qty"],
             _reval_meta["actual_contract_cost"],
             _reval_reason,
+            _reval_meta.get("exception_message"),
         )
         _emit_deferred_outcome(
             "BREACH_SUBMISSION_SKIPPED",
