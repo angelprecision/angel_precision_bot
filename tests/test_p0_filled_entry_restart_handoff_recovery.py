@@ -2352,14 +2352,26 @@ def _real_postgres_filled_entry_guard_case():
                 ON CONFLICT (k) DO UPDATE
                     SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
                 """,
-                # #P0 symbol-lock safety: this row must be shaped exactly
-                # like ap.state.acquire_symbol_lock()'s payload ({"ts": ...})
-                # and timestamped BEFORE this order's filled_ts above, so
-                # the guard-release fix classifies it as this order's own
-                # old pre-fill lock -- safe to delete -- preserving this
-                # test's existing "release succeeds, race resolves to one
-                # COMPLETE + one HOLD" assertions.
-                (symbol_key, json.dumps({"ts": (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()})),
+                # P0 symbol-lock ownership fix (#473 final amendment): this
+                # row must be shaped exactly like ap.state.acquire_symbol_lock()'s
+                # owned payload ({"ts": ..., "owner_id": <local_order_id>}).
+                # owner_id must exactly equal this order's local_order_id so
+                # the guard-release fix can prove exact ownership and safely
+                # delete it -- preserving this test's existing "release
+                # succeeds, race resolves to one COMPLETE + one HOLD"
+                # assertions. Timestamp ordering alone is no longer sufficient
+                # proof; only owner_id is authoritative.
+                (
+                    symbol_key,
+                    json.dumps(
+                        {
+                            "ts": (
+                                datetime.now(timezone.utc) - timedelta(seconds=10)
+                            ).timestamp(),
+                            "owner_id": local_order_id,
+                        }
+                    ),
+                ),
             )
 
         yield {
