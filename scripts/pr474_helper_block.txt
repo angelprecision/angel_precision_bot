@@ -1,0 +1,322 @@
+def _classify_deferred_plan(plan, signal: dict | None = None) -> tuple[bool, bool]:
+    """Return (is_canonical_deferred, malformed_blank_contract).
+
+    A blank contract is not itself deferred authority. Deferred state must be
+    proven by explicit metadata/signal provenance or a DEFERRED:<ticker>
+    placeholder contract.
+    """
+    signal = signal if isinstance(signal, dict) else {}
+    plan_meta = getattr(plan, "metadata", None) or {}
+    if not isinstance(plan_meta, dict):
+        plan_meta = {}
+    signal_meta = signal.get("metadata") or {}
+    if not isinstance(signal_meta, dict):
+        signal_meta = {}
+    contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+    is_deferred = bool(
+        plan_meta.get("contract_deferred")
+        or signal.get("contract_deferred")
+        or signal_meta.get("contract_deferred")
+        or contract.upper().startswith("DEFERRED:")
+    )
+    return is_deferred, bool(not contract and not is_deferred)
+
+
+def _validate_deferred_final_identity(
+    *,
+    order_row: object,
+    approved_plan,
+    signal: dict | None,
+    expected_local_order_id: str,
+    runtime_client_ids: tuple[object, ...] = (),
+    runtime_modes: tuple[object, ...] = (),
+) -> dict:
+    """Fail-closed identity proof for the final deferred capital authority."""
+    signal = signal if isinstance(signal, dict) else {}
+    if not isinstance(order_row, dict):
+        return {"ok": False, "reason_code": "DEFERRED_FINAL_IDENTITY_ORDER_UNREADABLE"}
+
+    row_local = str(order_row.get("local_order_id") or "").strip()
+    expected_local = str(expected_local_order_id or "").strip()
+    if not row_local:
+        return {"ok": False, "reason_code": "DEFERRED_FINAL_IDENTITY_LOCAL_ORDER_MISSING"}
+    if not expected_local or row_local != expected_local:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_LOCAL_ORDER_MISMATCH",
+            "row_local_order_id": row_local,
+            "expected_local_order_id": expected_local,
+        }
+
+    row_client = str(order_row.get("client_id") or "").strip()
+    plan_client = str(getattr(approved_plan, "client_id", "") or "").strip()
+    signal_client = str(signal.get("client_id") or signal.get("client_email") or "").strip()
+    runtime_clients = [
+        str(value or "").strip()
+        for value in runtime_client_ids
+        if str(value or "").strip()
+    ]
+    if not row_client or not plan_client or not runtime_clients:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_CLIENT_MISSING",
+            "row_client_id": row_client,
+            "plan_client_id": plan_client,
+            "runtime_client_ids": runtime_clients,
+        }
+    canonical_client = row_client.lower()
+    client_sources = [plan_client, *runtime_clients]
+    if signal_client:
+        client_sources.append(signal_client)
+    if any(value.lower() != canonical_client for value in client_sources):
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_CLIENT_MISMATCH",
+            "row_client_id": row_client,
+            "plan_client_id": plan_client,
+            "signal_client_id": signal_client,
+            "runtime_client_ids": runtime_clients,
+        }
+
+    row_mode_raw = order_row.get("execution_mode")
+    row_mode = _normalize_execution_mode(row_mode_raw)
+    plan_mode_values = [
+        value for value in (
+            getattr(approved_plan, "execution_mode", None),
+            getattr(approved_plan, "mode", None),
+        )
+        if str(value or "").strip()
+    ]
+    runtime_mode_values = [
+        value for value in runtime_modes if str(value or "").strip()
+    ]
+    signal_mode_values = [
+        value for value in (
+            signal.get("execution_mode"),
+            signal.get("mode"),
+        )
+        if str(value or "").strip()
+    ]
+    if row_mode is None or not plan_mode_values or not runtime_mode_values:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_MODE_MISSING",
+            "row_execution_mode": row_mode_raw,
+            "plan_modes": [str(v) for v in plan_mode_values],
+            "runtime_modes": [str(v) for v in runtime_mode_values],
+        }
+
+    normalized_plan_modes = [_normalize_execution_mode(v) for v in plan_mode_values]
+    normalized_runtime_modes = [_normalize_execution_mode(v) for v in runtime_mode_values]
+    normalized_signal_modes = [_normalize_execution_mode(v) for v in signal_mode_values]
+    if (
+        any(v is None for v in normalized_plan_modes)
+        or any(v is None for v in normalized_runtime_modes)
+        or any(v is None for v in normalized_signal_modes)
+    ):
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_MODE_INVALID",
+            "row_execution_mode": row_mode_raw,
+            "plan_modes": [str(v) for v in plan_mode_values],
+            "runtime_modes": [str(v) for v in runtime_mode_values],
+            "signal_modes": [str(v) for v in signal_mode_values],
+        }
+
+    all_modes = [*normalized_plan_modes, *normalized_runtime_modes, *normalized_signal_modes]
+    if any(mode != row_mode for mode in all_modes):
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_MODE_MISMATCH",
+            "row_execution_mode": row_mode,
+            "plan_modes": normalized_plan_modes,
+            "runtime_modes": normalized_runtime_modes,
+            "signal_modes": normalized_signal_modes,
+        }
+
+    row_signal_id = str(order_row.get("signal_id") or "").strip()
+    plan_signal_id = str(getattr(approved_plan, "signal_id", "") or "").strip()
+    signal_signal_id = str(signal.get("signal_id") or "").strip()
+    signal_ids = [value for value in (row_signal_id, plan_signal_id, signal_signal_id) if value]
+    if len(signal_ids) >= 2 and len(set(signal_ids)) != 1:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_SIGNAL_MISMATCH",
+            "row_signal_id": row_signal_id,
+            "plan_signal_id": plan_signal_id,
+            "signal_signal_id": signal_signal_id,
+        }
+
+    return {
+        "ok": True,
+        "reason_code": "DEFERRED_FINAL_IDENTITY_OK",
+        "client_id": row_client,
+        "execution_mode": row_mode,
+        "local_order_id": row_local,
+        "signal_id": row_signal_id or plan_signal_id or signal_signal_id,
+    }
+
+
+def _build_deferred_final_revalidation_plan(
+    approved_plan,
+    *,
+    submit_limit: float,
+    qty: int,
+):
+    """Clone a plan so Master Control sees final submit economics.
+
+    Selector evidence on the original plan is never rewritten.
+    """
+    final_qty = _strict_positive_integral(qty)
+    try:
+        final_limit = float(submit_limit)
+    except (TypeError, ValueError):
+        final_limit = 0.0
+    if final_qty is None or not math.isfinite(final_limit) or final_limit <= 0:
+        raise ValueError("invalid_final_submit_economics")
+
+    reval_plan = copy.copy(approved_plan)
+    original_meta = getattr(approved_plan, "metadata", None) or {}
+    if isinstance(original_meta, dict):
+        try:
+            reval_plan.metadata = copy.deepcopy(original_meta)
+        except Exception:
+            reval_plan.metadata = dict(original_meta)
+
+    selector_meta = getattr(approved_plan, "selector_metadata", None) or {}
+    if isinstance(selector_meta, dict):
+        try:
+            selector_meta = copy.deepcopy(selector_meta)
+        except Exception:
+            selector_meta = dict(selector_meta)
+    else:
+        selector_meta = {}
+    selector_meta["premium_per_contract"] = round(final_limit * 100.0, 2)
+    selector_meta["execution_price_per_share"] = final_limit
+
+    reval_plan.selector_metadata = selector_meta
+    reval_plan.selector_execution_price = final_limit
+    reval_plan.limit_price = final_limit
+    reval_plan.contracts = final_qty
+    reval_plan.max_position_usd = round(final_limit * final_qty * 100.0, 2)
+    return reval_plan
+
+
+def _revalidate_deferred_final_cost(
+    master_control,
+    approved_plan,
+    *,
+    client_id: str,
+    execution_mode: str,
+    submit_limit: float,
+    qty: int,
+) -> dict:
+    """Run final MC authority against the exact broker-ready price and qty."""
+    normalized_mode = _normalize_execution_mode(execution_mode)
+    if normalized_mode is None:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_MODE_INVALID",
+            "final_qty": 0,
+            "actual_cost": 0.0,
+        }
+    try:
+        reval_plan = _build_deferred_final_revalidation_plan(
+            approved_plan,
+            submit_limit=submit_limit,
+            qty=qty,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_REVALIDATION_INPUT_INVALID",
+            "exception_type": type(exc).__name__,
+            "final_qty": 0,
+            "actual_cost": 0.0,
+        }
+
+    initial_qty = int(reval_plan.contracts)
+    initial_cost = round(float(submit_limit) * initial_qty * 100.0, 2)
+
+    if master_control is None:
+        if normalized_mode == "live":
+            return {
+                "ok": False,
+                "reason_code": "DEFERRED_FINAL_MASTER_CONTROL_MISSING",
+                "final_qty": initial_qty,
+                "actual_cost": initial_cost,
+            }
+        return {
+            "ok": True,
+            "reason_code": "PAPER_DEFERRED_FINAL_REVALIDATION_MISSING_FAIL_OPEN",
+            "final_qty": initial_qty,
+            "actual_cost": initial_cost,
+            "mc_reason": "master_control_missing",
+        }
+
+    try:
+        reval = master_control.revalidate_exposure(
+            reval_plan,
+            client_id=str(client_id or ""),
+        )
+    except Exception as exc:
+        if normalized_mode == "live":
+            return {
+                "ok": False,
+                "reason_code": "DEFERRED_FINAL_EXPOSURE_REVALIDATION_ERROR",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+                "final_qty": initial_qty,
+                "actual_cost": initial_cost,
+            }
+        return {
+            "ok": True,
+            "reason_code": "PAPER_DEFERRED_FINAL_REVALIDATION_ERROR_FAIL_OPEN",
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "final_qty": initial_qty,
+            "actual_cost": initial_cost,
+            "mc_reason": "paper_fail_open",
+        }
+
+    if not getattr(reval, "ok", False):
+        mc_reason = str(getattr(reval, "reason", "revalidation_failed") or "revalidation_failed")
+        return {
+            "ok": False,
+            "reason_code": f"DEFERRED_FINAL_EXPOSURE_REVALIDATION:{mc_reason}",
+            "mc_reason": mc_reason,
+            "final_qty": int(getattr(reval_plan, "contracts", initial_qty) or 0),
+            "actual_cost": float(getattr(reval_plan, "max_position_usd", initial_cost) or 0),
+        }
+
+    final_qty = _strict_positive_integral(getattr(reval_plan, "contracts", None))
+    if final_qty is None:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_REVALIDATION_QTY_INVALID",
+            "final_qty": 0,
+            "actual_cost": 0.0,
+        }
+
+    final_cost = round(float(submit_limit) * final_qty * 100.0, 2)
+    try:
+        mc_cost = float(getattr(reval_plan, "max_position_usd", 0) or 0)
+    except (TypeError, ValueError):
+        mc_cost = 0.0
+    if not math.isfinite(mc_cost) or abs(mc_cost - final_cost) > 0.01:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_REVALIDATION_COST_DRIFT",
+            "final_qty": final_qty,
+            "actual_cost": final_cost,
+            "mc_seen_cost": mc_cost,
+        }
+
+    return {
+        "ok": True,
+        "reason_code": "DEFERRED_FINAL_EXPOSURE_REVALIDATION_OK",
+        "mc_reason": str(getattr(reval, "reason", "") or ""),
+        "final_qty": final_qty,
+        "actual_cost": final_cost,
+        "mc_seen_cost": mc_cost,
+    }
