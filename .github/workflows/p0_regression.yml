@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   p0-tests:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -68,26 +69,11 @@ jobs:
             tests/test_p0_live_submit_gates.py \
             -v --tb=short --color=yes
 
-      - name: Commit production implementation and restore permanent P0 workflow
+      - name: Commit proven production implementation
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git show origin/main:.github/workflows/p0_regression.yml > .github/workflows/p0_regression.yml
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('.github/workflows/p0_regression.yml')
-          text = p.read_text()
-          anchor = '            tests/test_p0_seam4_e2e_deferred_lifecycle.py \\\n'
-          if text.count(anchor) != 1:
-              raise SystemExit(f'P0 registration anchor count={text.count(anchor)}')
-          text = text.replace(
-              anchor,
-              anchor + '            tests/test_p0_deferred_real_cost_revalidation.py \\\n',
-              1,
-          )
-          p.write_text(text)
-          PY
-          git add ap_execution_core.py tests/test_p0_seam4_e2e_deferred_lifecycle.py .github/workflows/p0_regression.yml
+          git add ap_execution_core.py tests/test_p0_seam4_e2e_deferred_lifecycle.py
           git diff --cached --exit-code && { echo 'No implementation diff produced'; exit 1; } || true
           git commit -m 'fix(pr474): revalidate deferred entries at final broker-ready cost'
           git push origin HEAD:spec/p0-deferred-real-cost-revalidation-20260814
