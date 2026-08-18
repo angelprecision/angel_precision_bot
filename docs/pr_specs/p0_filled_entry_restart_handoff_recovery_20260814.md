@@ -5,11 +5,13 @@
 **IMPLEMENTED / DRAFT / REVIEW REQUIRED / DO NOT MERGE OR DEPLOY.**
 
 Amended after independent audit to close the Window-A pair-cancel durability
-gap, narrow the EXIT-scope validation change back to ENTRY-only, and add a
-behavioral Window-E owner-rehydration test. See the "P0 AMENDMENT" and
-"WINDOW E" sections below for the added durable pair-resolution state
-contract and its required crash-window tests. No merge, deploy, or
-production-data mutation is authorized by this amendment.
+gap, narrow the EXIT-scope validation change back to ENTRY-only, add a
+behavioral Window-E owner-rehydration test, expand the production file
+budget for exact symbol-lock ownership proof, and close the restart
+pair-truth hole. See the "P0 AMENDMENT" and "WINDOW E" sections, the
+"FINAL AMENDMENT: symbol-lock ownership" section, and the "FINAL AMENDMENT:
+restart pair-truth" section below for the complete, current contract. No
+merge, deploy, or production-data mutation is authorized by this amendment.
 
 Base at spec creation:
 
@@ -246,6 +248,204 @@ mechanism, unmodified.
 
 ---
 
+# FINAL AMENDMENT: symbol-lock ownership
+
+Independent audit found a second, separate money-path defect after the
+Window A–E amendments above: `_release_entry_guards_atomically()` decided
+whether to delete the per-symbol advisory lock (`ap/state.py`'s
+`acquire_symbol_lock()`) using timestamp ordering as a proxy for ownership:
+
+```text
+delete_symbol_lock = lock_ts <= filled_ts_epoch
+```
+
+This is not ownership proof. Concrete counterexample:
+
+```text
+t=0   ENTRY A acquires the symbol lock (lock_ts = 0)
+t=90  A's lock TTL (90s) expires
+t=91  a newer, unrelated same-symbol ENTRY B reacquires the lock
+t=95  ENTRY A finally FILLS; process crashes before A completes handoff
+      restart recovery processes A
+      -> lock_ts (91) <= filled_ts (95) -> old code DELETEs B's live lock
+```
+
+Deleting another in-flight ENTRY's active symbol lock is unrecoverable
+money-path corruption (it would allow a second concurrent same-symbol
+ENTRY to bypass the lock's intended mutual exclusion).
+
+## Fix: exact owner_id proof, not timestamp inference
+
+`ap/state.py`'s `acquire_symbol_lock()` gained an optional `owner_id`
+parameter. When supplied, the kv lock payload becomes
+`{"ts": ..., "owner_id": <exact local_order_id>}` instead of the legacy
+`{"ts": ...}`. `ap/execution.py` was changed to generate `local_order_id`
+*before* calling `acquire_symbol_lock()` (moved earlier than its prior
+call site; no other behavioral effect, since nothing read
+`local_order_id` between the old and new assignment points) and pass that
+same id as `owner_id`, and the identical id is later persisted on the
+ENTRY order row as before.
+
+`_release_entry_guards_atomically()` in `ap/fill_monitor.py` now requires
+an **exact** match between the current lock's `owner_id` and this order's
+own `local_order_id` before it may delete the lock:
+
+```text
+current lock row absent                    -> nothing to delete, proceed
+current lock owner_id == this local_order_id -> exact ownership proven, delete
+current lock owner_id belongs to another order -> PRESERVE
+current lock has no owner_id (legacy payload)  -> PRESERVE
+current lock payload is malformed/unparseable  -> PRESERVE
+```
+
+Timestamp ordering is never consulted for this decision. In every
+PRESERVE case, this order's own equity reservation release and durable
+`filled_entry_guards_release_claimed` / `filled_entry_guards_released`
+marker persistence still proceed normally — only the lock DELETE itself
+is withheld. A preserved lock is bounded by its own TTL and expires on
+its own; the worst outcome is a bounded symbol-reuse delay, never another
+order's corrupted risk state.
+
+## File budget consequence
+
+This fix required touching `ap/state.py` and `ap/execution.py` in
+addition to `ap/fill_monitor.py`, expanding the original two-file budget
+to four files (see "HARD FILE BUDGET" above). No other production file
+was touched; `ap/filled_entry_recovery_authority.py` is unaffected by
+this amendment.
+
+## Test evidence
+
+`tests/test_p0_filled_entry_restart_handoff_recovery.py` proves, among
+others:
+
+- exact `owner_id == local_order_id` match -> lock deleted
+- current lock row absent -> handoff completes normally, nothing to delete
+- mismatched `owner_id` (belongs to a different order) -> preserved
+- missing `owner_id` (legacy `{"ts": ...}` payload) -> preserved
+- malformed/unparseable lock payload -> preserved
+- the exact TTL-reacquire-before-old-fill counterexample above,
+  reproduced directly: ENTRY A's lock TTL expires, ENTRY B reacquires the
+  same symbol, ENTRY A's restart-recovery later runs -> B's lock survives
+- a dedicated real-Postgres integration test exercises two concurrent
+  real DB sessions racing `recover_interrupted_filled_entry_handoff()`
+  for the same order, seeding the symbol-lock kv row with the exact
+  owner-tagged shape `acquire_symbol_lock()` would have written, and
+  proves the race still converges to exactly one `COMPLETE` outcome and
+  one `HOLD`
+- in every preserve case, equity reservation release and the durable
+  guard-release marker are proven to still complete
+
+---
+
+# FINAL AMENDMENT: restart pair-truth
+
+Independent audit found a third money-path defect, in
+`_cancel_pair_opposite()` (`ap/fill_monitor.py`), separate from the
+Window A pair-cancel *durability* fix above (which governs what happens
+once a pair *is* found) and the symbol-lock fix above. This defect is
+about how the function decided a pair was never present at all:
+
+```text
+cancel_local_id = pair_manager.on_fill(...)
+
+if not cancel_local_id:
+    return "NOT_APPLICABLE", "no_opposite_pair"
+```
+
+`SignalPairManager` (`ap/signal_pair_manager.py`) is a process-memory-only
+registry — its `_pairs` dict is empty on every fresh process start. After
+a restart, `pair_manager.on_fill(...)` returns `None` for **every** fill
+until pairs are freshly re-registered that session, regardless of whether
+the fill's ENTRY actually was part of a live 1-1 CALL/PUT pair before the
+restart. The code above manufactured durable negative pair truth
+(`NOT_APPLICABLE`) from that in-memory absence — meaning a genuine 1-1
+pair with two still-live broker orders could be wrongly concluded to have
+"no opposite pair," allowing the handoff to reach `COMPLETE` while a live
+opposite-side order remained unaddressed.
+
+## Core invariant
+
+**Process-memory absence is never durable negative proof.** Only durable
+evidence already persisted on the order row may authorize
+`NOT_APPLICABLE`.
+
+## Fix: durable pattern-based applicability classification
+
+A new local helper, `_durable_pair_applicability(order)`, classifies
+durable pair-applicability from the order's own persisted `pattern`
+field, using the exact same substring markers `SignalPairManager.register()`
+already uses (`"1-1"`, `"1_1"`, `"inside"`), so the two can never diverge.
+It returns exactly one of `PAIR`, `NON_PAIR`, `UNKNOWN` — a missing,
+blank, or otherwise unusable pattern is always `UNKNOWN`, never defaulted
+to `NON_PAIR`.
+
+`_cancel_pair_opposite()`'s behavior when `pair_manager.on_fill(...)`
+returns `None` is now:
+
+```text
+durable NON_PAIR -> NOT_APPLICABLE / DURABLE_NON_PAIR
+durable PAIR     -> OUTCOME_UNPROVEN / PAIR_REGISTRY_MISSING_AFTER_RESTART
+UNKNOWN          -> OUTCOME_UNPROVEN / PAIR_APPLICABILITY_UNPROVEN
+```
+
+No speculative broker cancel, no loose ticker search, and no inferred
+opposite identity are performed in either `OUTCOME_UNPROVEN` branch —
+pure HOLD. The pre-existing CASE-A path (pair manager DID return an exact
+opposite `local_order_id`) — broker-cancel-first, explicit confirmation
+required, local OSM transition only after confirmation, `CONFIRMED` only
+on full success — is untouched.
+
+## Lifecycle: uncertainty blocks completion, not position protection
+
+`OUTCOME_UNPROVEN` pair state does not mean the filled position goes
+unmanaged. The existing fresh-fill caller already gates only `COMPLETE`
+and guard-release on `pair_state in {NOT_APPLICABLE, CONFIRMED}`; canonical
+DB position creation/recreation, exact durable ENTRY-position identity
+bind, and canonical exit-engine owner seed/adoption all proceed above
+that gate regardless of pair state. Pair uncertainty blocks handoff
+*completion authority* — it does not block position risk management. No
+caller changes were required for this amendment; the existing gate
+already implements this distinction correctly once
+`_cancel_pair_opposite()` stopped manufacturing false `NOT_APPLICABLE`.
+
+`recover_interrupted_filled_entry_handoff()` was independently confirmed
+(via the existing AST-based static guard test,
+`test_recovery_never_calls_cancel_pair_opposite_statically`, unmodified
+and still passing) to never call `_cancel_pair_opposite` or reference
+`pair_manager` at all — recovery only ever reads the already-persisted
+`filled_entry_pair_resolution_state` marker. Zero pair-cancel authority
+in recovery, unchanged by this amendment.
+
+## Test evidence
+
+`tests/test_p0_filled_entry_restart_handoff_recovery.py` proves, among
+others:
+
+- the primary merge-gate regression: a real (not mocked)
+  `SignalPairManager` with an empty `_pairs` registry (simulating a
+  process restart) combined with a durable `pattern="1-1"` ENTRY yields
+  `OUTCOME_UNPROVEN` / `PAIR_REGISTRY_MISSING_AFTER_RESTART`, with zero
+  broker-cancel calls and zero OSM transition calls
+- the same proof repeated across the full pair-pattern taxonomy
+  (`"1-1"`, `"1-1 continuation"`, `"1_1_break"`, `"inside"`,
+  `"inside_bar"`)
+- durable non-pair patterns (`"breakout"`, `"continuation"`, `"fvg"`,
+  `"orb"`) still resolve `NOT_APPLICABLE` / `DURABLE_NON_PAIR` — ordinary
+  trades are not stuck
+- missing/blank/whitespace-only pattern resolves `OUTCOME_UNPROVEN` /
+  `PAIR_APPLICABILITY_UNPROVEN`, never `NOT_APPLICABLE`
+- all pre-existing CASE-A (registered pair found) tests, negative
+  broker-cancel controls, crash-window tests, and the fresh-fill
+  `OUTCOME_UNPROVEN` / `CONFIRMED` / `NOT_APPLICABLE` lifecycle tests
+  (including the test proving canonical position/bind/exit-owner still
+  proceed while guards remain unreleased under `OUTCOME_UNPROVEN`)
+  remain unchanged and passing
+
+Production change for this amendment: `ap/fill_monitor.py` only.
+
+---
+
 # HISTORICAL EVIDENCE: USE, DO NOT CHERRY-PICK
 
 ## Historical #429
@@ -307,7 +507,19 @@ PR or this amendment.
 
 # HARD FILE BUDGET
 
-## Production: maximum TWO files
+## SUPERSEDED — see "FINAL AMENDMENT: symbol-lock ownership" below
+
+The original budget below (maximum TWO production files) governed this PR
+through its Window A–E amendments. It was intentionally superseded by a
+later, independently-audited amendment that expanded the budget to FOUR
+production files in order to close a real money-path defect: restart
+recovery could delete a live, active symbol lock belonging to a different
+in-flight ENTRY (see the dedicated section below for the full defect,
+fix, and evidence). That expansion is final and accepted. The two-file
+figure below is preserved for history only and must not be treated as
+the current constraint.
+
+## Original (superseded): Production: maximum TWO files
 
 ```text
 1. ap/fill_monitor.py
@@ -317,6 +529,21 @@ PR or this amendment.
 `ap/filled_entry_recovery_authority.py` may be newly created if it does not exist on current main.
 
 If a third production file appears necessary, **STOP and explain exactly why. Do not expand scope.**
+
+## FINAL (current): Production: FOUR files
+
+```text
+1. ap/fill_monitor.py
+2. ap/filled_entry_recovery_authority.py
+3. ap/state.py
+4. ap/execution.py
+```
+
+`ap/state.py` and `ap/execution.py` were added solely to carry an exact
+`owner_id` token from symbol-lock acquisition through to restart-recovery
+deletion authority — see "FINAL AMENDMENT: symbol-lock ownership" below.
+No other change was made to either file. Any further production file
+beyond these four still requires the original STOP-and-explain discipline.
 
 ## P0 AMENDMENT: EXIT scope correction
 
@@ -344,12 +571,20 @@ the new hard error/short-circuit behavior was removed.
 
 ## Tests
 
-Expected focused files:
+Final focused files:
 
 ```text
 tests/test_p0_filled_entry_restart_handoff_recovery.py
-tests/test_p0_historical_filled_recovery_authority.py
+tests/test_p0_real_exit_engine_canonical_adoption.py
+tests/test_p0_filled_entry_durable_identity_handoff.py
+tests/test_fill_monitor_mvp_hardening.py
 ```
+
+`tests/test_p0_historical_filled_recovery_authority.py`, listed in an
+earlier draft of this spec, was superseded — its intended coverage is
+provided by `tests/test_p0_filled_entry_restart_handoff_recovery.py`,
+which already exercises `ap/filled_entry_recovery_authority.py` directly.
+No separate file was created for it.
 
 `.github/workflows/p0_regression.yml` may change only to register the exact new focused test files if not already present.
 
