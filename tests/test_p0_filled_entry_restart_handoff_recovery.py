@@ -2059,7 +2059,8 @@ def _real_postgres_filled_entry_guard_case():
                     fill_price NUMERIC,
                     qty INTEGER,
                     signal_id TEXT,
-                    plan_id TEXT
+                    plan_id TEXT,
+                    filled_ts TIMESTAMPTZ
                 )
                 """
             )
@@ -2080,6 +2081,7 @@ def _real_postgres_filled_entry_guard_case():
                 ("qty", "INTEGER"),
                 ("signal_id", "TEXT"),
                 ("plan_id", "TEXT"),
+                ("filled_ts", "TIMESTAMPTZ"),
             ):
                 cur.execute(
                     f"ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS {column} {column_type}"
@@ -2158,9 +2160,9 @@ def _real_postgres_filled_entry_guard_case():
                 INSERT INTO public.orders
                     (local_order_id, broker_order_id, client_id, position_id,
                      kind, status, meta, contract, execution_mode, filled_qty,
-                     fill_price, qty, signal_id, plan_id)
+                     fill_price, qty, signal_id, plan_id, filled_ts)
                 VALUES (%s, %s, %s, %s, 'ENTRY', 'FILLED', %s::jsonb,
-                        %s, 'live', 1, 1.58, 1, %s, %s)
+                        %s, 'live', 1, 1.58, 1, %s, %s, NOW() - INTERVAL '5 seconds')
                 """,
                 (
                     local_order_id,
@@ -2189,7 +2191,14 @@ def _real_postgres_filled_entry_guard_case():
                 ON CONFLICT (k) DO UPDATE
                     SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
                 """,
-                (symbol_key, json.dumps({"token": token})),
+                # #P0 symbol-lock safety: this row must be shaped exactly
+                # like ap.state.acquire_symbol_lock()'s payload ({"ts": ...})
+                # and timestamped BEFORE this order's filled_ts above, so
+                # the guard-release fix classifies it as this order's own
+                # old pre-fill lock -- safe to delete -- preserving this
+                # test's existing "release succeeds, race resolves to one
+                # COMPLETE + one HOLD" assertions.
+                (symbol_key, json.dumps({"ts": (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()})),
             )
 
         yield {
