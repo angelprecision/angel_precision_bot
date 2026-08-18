@@ -357,8 +357,13 @@ def test_no_new_broker_submit_or_cancel_authority_introduced():
     assert "broker.cancel" not in body
 
 
-def test_master_control_module_imports_cleanly():
-    import importlib
-    importlib.reload(mc_mod)
+def test_master_control_class_has_expected_sector_surface():
+    """Confirms the module loaded successfully and exposes the expected
+    sector-identity surface — the same guarantee test_master_control_
+    module_imports_cleanly aimed for, without importlib.reload(), which
+    is unsafe to run inside the full test suite where other tests may
+    manipulate sys.modules for this same module."""
     assert hasattr(mc_mod, "APMasterControl")
     assert hasattr(mc_mod.APMasterControl, "SECTOR_MAP")
+    assert hasattr(mc_mod.APMasterControl, "_sector_telemetry")
+    assert hasattr(mc_mod.APMasterControl, "_sector_capital_deployed")
