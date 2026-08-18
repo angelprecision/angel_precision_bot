@@ -1,0 +1,173 @@
+# ── P0 (PR #474): final deferred capital authority at broker-ready economics.
+# The selector-era price is only the drift baseline. For a deferred entry,
+# Master Control must see the FINAL submit_limit after the fresh exact-OCC
+# quote, spread/drift gates, and any PR180 repricing. This block runs before
+# persist_deferred_broker_ready() and therefore before any broker POST.
+if _deferred and _handoff_snapshot.get("captured"):
+    _identity_row, _identity_read_error, _identity_read_attempts = (
+        _read_order_row_for_handoff_proof(
+            self.order_state_machine,
+            str(queue_local_order_id or ""),
+            attempts=3,
+            delay_s=0.05,
+        )
+    )
+    _final_identity = _validate_deferred_final_identity(
+        order_row=_identity_row,
+        approved_plan=approved_plan,
+        signal=sig,
+        expected_local_order_id=str(queue_local_order_id or ""),
+        runtime_client_ids=(
+            getattr(self, "client_id", None),
+            getattr(self, "email", None),
+        ),
+        runtime_modes=(
+            getattr(self, "execution_mode", None),
+            getattr(self, "mode", None),
+        ),
+    )
+    if not _final_identity.get("ok"):
+        _identity_reason = str(
+            _final_identity.get("reason_code")
+            or "DEFERRED_FINAL_IDENTITY_INVALID"
+        )
+        _identity_meta = {
+            "failure_stage": "deferred_final_identity",
+            "selected_contract": approved_contract,
+            "final_submit_limit": float(submit_limit),
+            "identity_read_error": _identity_read_error,
+            "identity_read_attempts": int(_identity_read_attempts or 0),
+            "identity_audit": _final_identity,
+            "broker_post_count": 0,
+        }
+        log.critical(
+            "[%s] %s — final deferred identity proof failed; no broker POST",
+            ticker,
+            _identity_reason,
+        )
+        _emit_deferred_outcome(
+            "BREACH_SUBMISSION_SKIPPED",
+            reason=_identity_reason,
+            contract=approved_contract,
+            extra=_identity_meta,
+        )
+        return _terminalize_deferred_breach_failure(
+            _identity_reason,
+            extra_meta=_identity_meta,
+        )
+
+    _pre_mc_qty = _strict_positive_integral(
+        getattr(approved_plan, "contracts", None)
+    )
+    if _pre_mc_qty is None:
+        _qty_reason = "DEFERRED_FINAL_REVALIDATION_QTY_INVALID"
+        _qty_meta = {
+            "failure_stage": "deferred_final_exposure_revalidation",
+            "selected_contract": approved_contract,
+            "final_submit_limit": float(submit_limit),
+            "final_qty": getattr(approved_plan, "contracts", None),
+            "client_id": _final_identity.get("client_id"),
+            "execution_mode": _final_identity.get("execution_mode"),
+            "broker_post_count": 0,
+        }
+        _emit_deferred_outcome(
+            "BREACH_SUBMISSION_SKIPPED",
+            reason=_qty_reason,
+            contract=approved_contract,
+            extra=_qty_meta,
+        )
+        return _terminalize_deferred_breach_failure(
+            _qty_reason,
+            extra_meta=_qty_meta,
+        )
+
+    _final_reval = _revalidate_deferred_final_cost(
+        getattr(self, "master_control", None),
+        approved_plan,
+        client_id=str(_final_identity.get("client_id") or ""),
+        execution_mode=str(_final_identity.get("execution_mode") or ""),
+        submit_limit=float(submit_limit),
+        qty=int(_pre_mc_qty),
+    )
+    if not _final_reval.get("ok"):
+        _reval_reason = str(
+            _final_reval.get("reason_code")
+            or "DEFERRED_FINAL_EXPOSURE_REVALIDATION_FAILED"
+        )
+        _reval_meta = {
+            "failure_stage": "deferred_final_exposure_revalidation",
+            "selected_contract": approved_contract,
+            "final_submit_limit": float(submit_limit),
+            "final_qty": int(_final_reval.get("final_qty") or 0),
+            "actual_contract_cost": float(
+                _final_reval.get("actual_cost") or 0
+            ),
+            "mc_seen_cost": _final_reval.get("mc_seen_cost"),
+            "mc_block_reason": _final_reval.get("mc_reason"),
+            "exception_type": _final_reval.get("exception_type"),
+            "client_id": _final_identity.get("client_id"),
+            "execution_mode": _final_identity.get("execution_mode"),
+            "local_order_id": queue_local_order_id,
+            "broker_post_count": 0,
+        }
+        log.critical(
+            "[%s] DEFERRED_FINAL_EXPOSURE_BLOCK contract=%s "
+            "limit=%.2f qty=%s cost=$%.2f reason=%s — no broker POST",
+            ticker,
+            approved_contract,
+            float(submit_limit),
+            _reval_meta["final_qty"],
+            _reval_meta["actual_contract_cost"],
+            _reval_reason,
+        )
+        _emit_deferred_outcome(
+            "BREACH_SUBMISSION_SKIPPED",
+            reason=_reval_reason,
+            contract=approved_contract,
+            extra=_reval_meta,
+        )
+        return _terminalize_deferred_breach_failure(
+            _reval_reason,
+            extra_meta=_reval_meta,
+        )
+
+    approved_qty = int(_final_reval["final_qty"])
+    _final_actual_cost = round(
+        float(submit_limit) * approved_qty * 100.0,
+        2,
+    )
+    approved_plan.contracts = approved_qty
+    approved_plan.max_position_usd = _final_actual_cost
+
+    _final_reval_audit = {
+        "status": str(_final_reval.get("reason_code") or ""),
+        "client_id": str(_final_identity.get("client_id") or ""),
+        "execution_mode": str(
+            _final_identity.get("execution_mode") or ""
+        ),
+        "selected_contract": approved_contract,
+        "final_submit_limit": float(submit_limit),
+        "final_qty": approved_qty,
+        "actual_contract_cost": _final_actual_cost,
+        "mc_seen_cost": _final_reval.get("mc_seen_cost"),
+        "mc_reason": _final_reval.get("mc_reason"),
+        "identity_read_attempts": int(_identity_read_attempts or 0),
+    }
+    try:
+        if isinstance(_selector_materialization_meta, dict):
+            _selector_materialization_meta[
+                "final_exposure_revalidation"
+            ] = _final_reval_audit
+    except Exception:
+        pass
+    log.info(
+        "[%s] DEFERRED_FINAL_EXPOSURE_APPROVED contract=%s "
+        "limit=%.2f qty=%d cost=$%.2f client_id=%s mode=%s",
+        ticker,
+        approved_contract,
+        float(submit_limit),
+        approved_qty,
+        _final_actual_cost,
+        _final_identity.get("client_id"),
+        _final_identity.get("execution_mode"),
+    )
