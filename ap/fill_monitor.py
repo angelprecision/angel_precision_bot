@@ -1381,9 +1381,33 @@ def _release_entry_guards_atomically(order: dict, *, position_id: str) -> bool:
                 )
                 return False
 
+            # P0: the symbol guard must never be deleted without first
+            # proving -- under the SAME advisory-lock namespace
+            # ap.state.acquire_symbol_lock() uses (pg_try_advisory_xact_lock
+            # on hashtext(symbol_key)) -- that the current symbol-lock row
+            # still belongs to THIS order's pre-fill guard domain. Holding
+            # this lock for the remainder of the transaction serializes
+            # against a concurrent acquire_symbol_lock() call: no new
+            # acquisition can land between inspection and delete.
+            if symbol_key:
+                c.execute(
+                    "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+                    (symbol_key,),
+                )
+                symbol_lock_row = c.fetchone() or {}
+                if not bool(symbol_lock_row.get("pg_try_advisory_xact_lock")):
+                    log.warning(
+                        "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_LOCK_BUSY "
+                        "local=%s symbol_key=%s",
+                        client_id,
+                        local_order_id,
+                        symbol_key,
+                    )
+                    return False
+
             c.execute(
                 """
-                SELECT meta
+                SELECT meta, filled_ts
                 FROM orders
                 WHERE client_id=%s
                   AND local_order_id=%s
@@ -1423,6 +1447,72 @@ def _release_entry_guards_atomically(order: dict, *, position_id: str) -> bool:
                     return False
             elif "filled_entry_guards_release_claimed" in meta:
                 return False
+
+            # Decide the symbol-lock disposition BEFORE any mutation.
+            # BINDING INVARIANT: a recovered historical FILLED ENTRY may
+            # never delete a symbol lock that was acquired after that
+            # ENTRY's own durable fill -- doing so could delete a newer,
+            # unrelated same-symbol ENTRY's active guard once its TTL-aged
+            # predecessor's handoff recovery runs.
+            delete_symbol_lock = False
+            if symbol_key:
+                durable_filled_ts = row.get("filled_ts")
+                if durable_filled_ts is None:
+                    log.critical(
+                        "[%s] FILLED_ENTRY_GUARDS_RELEASE_FILLED_TS_UNPROVEN "
+                        "local=%s",
+                        client_id,
+                        local_order_id,
+                    )
+                    return False
+                try:
+                    filled_ts_epoch = durable_filled_ts.timestamp()
+                    if not math.isfinite(filled_ts_epoch):
+                        raise ValueError("non-finite filled_ts")
+                except Exception:
+                    log.critical(
+                        "[%s] FILLED_ENTRY_GUARDS_RELEASE_FILLED_TS_MALFORMED "
+                        "local=%s value=%r",
+                        client_id,
+                        local_order_id,
+                        durable_filled_ts,
+                    )
+                    return False
+
+                c.execute("SELECT v FROM kv WHERE k=%s", (symbol_key,))
+                symbol_lock_kv_row = c.fetchone()
+                if symbol_lock_kv_row is None:
+                    # Old symbol guard is already absent — nothing to
+                    # inspect or delete; continue normally.
+                    delete_symbol_lock = False
+                else:
+                    raw_lock_v = symbol_lock_kv_row.get("v")
+                    try:
+                        lock_payload = (
+                            json.loads(raw_lock_v)
+                            if isinstance(raw_lock_v, str)
+                            else raw_lock_v
+                        )
+                        lock_ts = float(lock_payload.get("ts"))
+                        if not math.isfinite(lock_ts):
+                            raise ValueError("non-finite lock ts")
+                    except Exception:
+                        log.critical(
+                            "[%s] FILLED_ENTRY_GUARDS_RELEASE_SYMBOL_LOCK_TS_MALFORMED "
+                            "local=%s symbol_key=%s",
+                            client_id,
+                            local_order_id,
+                            symbol_key,
+                        )
+                        return False
+                    # A lock timestamped at or before this ENTRY's durable
+                    # fill belongs to this order's own pre-fill guard
+                    # domain and is safe to delete.  Strictly newer means
+                    # the symbol lock was reacquired after this fill (a
+                    # newer same-symbol order) -- preserve it exactly and
+                    # release only this old order's equity reservation and
+                    # durable marker.
+                    delete_symbol_lock = lock_ts <= filled_ts_epoch
 
             c.execute(
                 "SELECT v FROM kv WHERE k=%s",
@@ -1475,7 +1565,7 @@ def _release_entry_guards_atomically(order: dict, *, position_id: str) -> bool:
                 """,
                 (release_key, json_dumps(reserved_new), now_utc_iso()),
             )
-            if symbol_key:
+            if delete_symbol_lock:
                 c.execute("DELETE FROM kv WHERE k=%s", (symbol_key,))
             return True
 

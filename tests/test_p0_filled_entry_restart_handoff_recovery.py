@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 import inspect
 import json
 import threading
@@ -1649,9 +1649,26 @@ def test_atomic_guard_release_commits_marker_with_guard_mutations(monkeypatch):
                     "pg_try_advisory_xact_lock": self.lock_acquired,
                 }
             elif "SELECT meta" in sql:
-                self.current_row = {"meta": {"filled_entry_handoff_state": "IN_PROGRESS"}}
+                # filled_ts is durable/fenced and always precedes guard
+                # release; here it is 5s ago, older than the symbol-lock
+                # timestamp provisioned below, so the old lock is safe to
+                # delete.
+                self.current_row = {
+                    "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+                    "filled_ts": datetime.now(timezone.utc) - timedelta(seconds=5),
+                }
             elif "SELECT v FROM kv" in sql:
-                self.current_row = {"v": "120.0"}
+                key = params[0] if params else ""
+                if str(key).startswith("lock:"):
+                    # Symbol-lock row timestamped BEFORE the durable fill
+                    # above -- belongs to this order's own pre-fill guard
+                    # domain, safe to delete.
+                    old_ts = (
+                        datetime.now(timezone.utc) - timedelta(seconds=10)
+                    ).timestamp()
+                    self.current_row = {"v": json.dumps({"ts": old_ts})}
+                else:
+                    self.current_row = {"v": "120.0"}
             elif "UPDATE orders" in sql:
                 self.rowcount = 1
                 self.current_row = None
@@ -1680,6 +1697,271 @@ def test_atomic_guard_release_commits_marker_with_guard_mutations(monkeypatch):
     order = _order(reserved_cost=120.0)
     assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is False
     assert not any("UPDATE orders" in sql for sql, _params in busy_conn.statements)
+
+
+def test_atomic_guard_release_preserves_newer_symbol_lock(monkeypatch):
+    """BINDING INVARIANT: a symbol lock reacquired AFTER this ENTRY's
+    durable fill must never be deleted by that ENTRY's own guard release."""
+    class _Conn:
+        def __init__(self):
+            self.current_row = None
+            self.rowcount = 1
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+            if "pg_try_advisory_xact_lock" in sql:
+                self.current_row = {"pg_try_advisory_xact_lock": True}
+            elif "SELECT meta" in sql:
+                self.current_row = {
+                    "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+                    "filled_ts": datetime.now(timezone.utc) - timedelta(seconds=10),
+                }
+            elif "SELECT v FROM kv" in sql:
+                key = params[0] if params else ""
+                if str(key).startswith("lock:"):
+                    # Symbol-lock row timestamped AFTER the durable fill —
+                    # a newer same-symbol order reacquired it. Must survive.
+                    newer_ts = (
+                        datetime.now(timezone.utc) - timedelta(seconds=1)
+                    ).timestamp()
+                    self.current_row = {"v": json.dumps({"ts": newer_ts})}
+                else:
+                    self.current_row = {"v": "120.0"}
+            elif "UPDATE orders" in sql:
+                self.rowcount = 1
+                self.current_row = None
+            else:
+                self.current_row = None
+            return self
+
+        def fetchone(self):
+            row = self.current_row
+            self.current_row = None
+            return row
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(fm, "conn", lambda: fake_conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
+
+    order = _order(reserved_cost=120.0)
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is True
+    assert order["meta"]["filled_entry_guards_released"] is True
+    # Old order's own equity reservation is still released and the durable
+    # marker still succeeds ...
+    assert any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
+    assert any("INSERT INTO kv" in sql for sql, _params in fake_conn.statements)
+    # ... but the newer symbol lock byte-for-byte survives: no DELETE.
+    assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
+
+
+def test_atomic_guard_release_no_symbol_lock_row_releases_normally(monkeypatch):
+    """No symbol-lock row present: nothing to inspect or delete; normal
+    successful release."""
+    class _Conn:
+        def __init__(self):
+            self.current_row = None
+            self.rowcount = 1
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+            if "pg_try_advisory_xact_lock" in sql:
+                self.current_row = {"pg_try_advisory_xact_lock": True}
+            elif "SELECT meta" in sql:
+                self.current_row = {
+                    "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+                    "filled_ts": datetime.now(timezone.utc) - timedelta(seconds=5),
+                }
+            elif "SELECT v FROM kv" in sql:
+                key = params[0] if params else ""
+                if str(key).startswith("lock:"):
+                    self.current_row = None  # no symbol-lock row exists
+                else:
+                    self.current_row = {"v": "120.0"}
+            elif "UPDATE orders" in sql:
+                self.rowcount = 1
+                self.current_row = None
+            else:
+                self.current_row = None
+            return self
+
+        def fetchone(self):
+            row = self.current_row
+            self.current_row = None
+            return row
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(fm, "conn", lambda: fake_conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
+
+    order = _order(reserved_cost=120.0)
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is True
+    assert order["meta"]["filled_entry_guards_released"] is True
+    assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
+
+
+def test_atomic_guard_release_malformed_symbol_lock_timestamp_fails_closed(monkeypatch):
+    class _Conn:
+        def __init__(self):
+            self.current_row = None
+            self.rowcount = 1
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+            if "pg_try_advisory_xact_lock" in sql:
+                self.current_row = {"pg_try_advisory_xact_lock": True}
+            elif "SELECT meta" in sql:
+                self.current_row = {
+                    "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+                    "filled_ts": datetime.now(timezone.utc) - timedelta(seconds=5),
+                }
+            elif "SELECT v FROM kv" in sql:
+                key = params[0] if params else ""
+                if str(key).startswith("lock:"):
+                    self.current_row = {"v": json.dumps({"ts": "not-a-number"})}
+                else:
+                    self.current_row = {"v": "120.0"}
+            elif "UPDATE orders" in sql:
+                self.rowcount = 1
+                self.current_row = None
+            else:
+                self.current_row = None
+            return self
+
+        def fetchone(self):
+            row = self.current_row
+            self.current_row = None
+            return row
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(fm, "conn", lambda: fake_conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
+
+    order = _order(reserved_cost=120.0)
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is False
+    assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
+    assert not any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
+    assert order.get("meta", {}).get("filled_entry_guards_released") is not True
+
+
+def test_atomic_guard_release_missing_filled_ts_fails_closed(monkeypatch):
+    class _Conn:
+        def __init__(self):
+            self.current_row = None
+            self.rowcount = 1
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+            if "pg_try_advisory_xact_lock" in sql:
+                self.current_row = {"pg_try_advisory_xact_lock": True}
+            elif "SELECT meta" in sql:
+                # filled_ts is missing/unproven despite an existing symbol lock.
+                self.current_row = {
+                    "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+                    "filled_ts": None,
+                }
+            elif "SELECT v FROM kv" in sql:
+                key = params[0] if params else ""
+                if str(key).startswith("lock:"):
+                    self.current_row = {"v": json.dumps({"ts": 1000.0})}
+                else:
+                    self.current_row = {"v": "120.0"}
+            elif "UPDATE orders" in sql:
+                self.rowcount = 1
+                self.current_row = None
+            else:
+                self.current_row = None
+            return self
+
+        def fetchone(self):
+            row = self.current_row
+            self.current_row = None
+            return row
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(fm, "conn", lambda: fake_conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
+
+    order = _order(reserved_cost=120.0)
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is False
+    assert not any("DELETE FROM kv" in sql for sql, _params in fake_conn.statements)
+    assert not any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
+
+
+def test_atomic_guard_release_symbol_lock_busy_fails_closed(monkeypatch):
+    """A concurrent acquire_symbol_lock() holding the same advisory-lock
+    namespace must block guard release rather than racing past it."""
+    class _Conn:
+        def __init__(self):
+            self.current_row = None
+            self.rowcount = 1
+            self.statements = []
+            self._advisory_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+            if "pg_try_advisory_xact_lock" in sql:
+                self._advisory_calls += 1
+                # First call (release_key) succeeds; second (symbol_key)
+                # is busy — simulating a concurrent acquire_symbol_lock().
+                acquired = self._advisory_calls == 1
+                self.current_row = {"pg_try_advisory_xact_lock": acquired}
+            elif "SELECT meta" in sql:
+                self.current_row = {
+                    "meta": {"filled_entry_handoff_state": "IN_PROGRESS"},
+                    "filled_ts": datetime.now(timezone.utc) - timedelta(seconds=5),
+                }
+            else:
+                self.current_row = None
+            return self
+
+        def fetchone(self):
+            row = self.current_row
+            self.current_row = None
+            return row
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(fm, "conn", lambda: fake_conn)
+    monkeypatch.setattr(fm, "run_with_retry", lambda operation: operation())
+
+    order = _order(reserved_cost=120.0)
+    assert fm._release_entry_guards_atomically(order, position_id=POSITION_ID) is False
+    # Never even reached the row fence / mutation statements.
+    assert not any("SELECT meta" in sql for sql, _params in fake_conn.statements)
+    assert not any("UPDATE orders" in sql for sql, _params in fake_conn.statements)
 
 
 def test_repeated_recovery_is_idempotent_for_position_open_and_guard_release(monkeypatch):
