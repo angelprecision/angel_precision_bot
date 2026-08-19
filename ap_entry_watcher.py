@@ -889,21 +889,38 @@ class WatchedSignal:
             # established that the confirmed path must not reset anything).
             _suppress_entry_breach_evidence = True
             if not _already_confirmed:
-                # Pre-confirmation: an unavailable poll breaks continuity.
-                # Do not let a valid first observation combine with a later
-                # valid observation. This no longer returns early — see
-                # amendment 3 note above.
-                self.breach_count = 0
-                self._pending_first_breach_at = None
-                self.breach_price = 0.0
-                self.first_breach_bid = 0.0
-                self.first_breach_ask = 0.0
-                self.trigger_price = None
+                # PR #494: pre-confirmation absence of usable required-side
+                # trigger evidence must HOLD existing breach continuity, not
+                # reset it. Known-good behavior (pre-hardening) simply
+                # skipped a poll when no usable quote was present, which
+                # never mutated continuity. The prior hardening pass here
+                # correctly refuses to use unavailable required-side
+                # evidence as trigger proof, but incorrectly treated that
+                # absence the same as a *valid contradictory* observation
+                # (which does legitimately reset — see the "else: breach
+                # reset" branch further down, independently gated on
+                # `_ask_quote is not None` / `_bid_quote is not None`).
+                # Absence of truth is not contradictory truth:
+                #   valid breach                       -> increment
+                #   valid non-breach / contradiction    -> reset
+                #   no usable required-side observation -> HOLD (this branch)
+                # HOLD means: do not increment, do not reset, do not clear
+                # first-breach evidence, do not manufacture a trigger price,
+                # and do not advance any state as though a real canonical
+                # observation occurred. Entry-breach evidence is still
+                # suppressed for this poll only (via
+                # _suppress_entry_breach_evidence above) — this poll simply
+                # contributes nothing, neither positive nor negative, to
+                # confirmation continuity. Only a genuine valid contradictory
+                # observation may reset breach_count / _pending_first_breach_at
+                # / breach_price / first_breach_bid / first_breach_ask /
+                # trigger_price pre-confirmation.
                 log.debug(
                     "[%s] %s — side=%s raw_bid=%r raw_ask=%r "
-                    "trigger_valid=%s pending_breach_reset=True "
-                    "(continuing to lifecycle-safety checks; not an "
-                    "early return)",
+                    "trigger_valid=%s pending_breach_hold=True "
+                    "(no usable required-side observation; breach "
+                    "continuity held unchanged; continuing to "
+                    "lifecycle-safety checks; not an early return)",
                     self.ticker,
                     _reason_code,
                     self.side,
