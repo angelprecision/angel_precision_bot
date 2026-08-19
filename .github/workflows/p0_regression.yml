@@ -126,6 +126,9 @@ jobs:
             tests/test_p0_filled_entry_restart_handoff_recovery.py \
             tests/test_p0_real_exit_engine_canonical_adoption.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
+            tests/test_p0_deferred_real_cost_revalidation.py \
+            tests/test_p0_474_production_recovery_runtime_replay.py \
+            tests/test_p0_474_real_master_control_integration.py \
             tests/test_p0_intelligence_postgres.py \
             tests/test_p0_pending_trigger_restart_recovery.py \
             tests/test_entry_watcher_audit.py \

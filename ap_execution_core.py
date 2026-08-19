@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -157,6 +158,330 @@ def _validate_deferred_selector_result(selection, ticker: str = "") -> tuple[boo
     except (TypeError, ValueError):
         qty = 0
     return bool(is_occ and price > 0 and qty > 0), contract, price, qty
+
+
+def _classify_deferred_plan(plan, signal: dict | None = None) -> tuple[bool, bool]:
+    """Return (is_canonical_deferred, malformed_blank_contract).
+
+    A blank contract is not itself deferred authority. Deferred state must be
+    proven by explicit metadata/signal provenance or a DEFERRED:<ticker>
+    placeholder contract.
+    """
+    signal = signal if isinstance(signal, dict) else {}
+    plan_meta = getattr(plan, "metadata", None) or {}
+    if not isinstance(plan_meta, dict):
+        plan_meta = {}
+    signal_meta = signal.get("metadata") or {}
+    if not isinstance(signal_meta, dict):
+        signal_meta = {}
+    contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+    is_deferred = bool(
+        plan_meta.get("contract_deferred")
+        or signal.get("contract_deferred")
+        or signal_meta.get("contract_deferred")
+        or contract.upper().startswith("DEFERRED:")
+    )
+    return is_deferred, bool(not contract and not is_deferred)
+
+
+def _validate_deferred_final_identity(
+    *,
+    order_row: object,
+    approved_plan,
+    signal: dict | None,
+    expected_local_order_id: str,
+    runtime_client_ids: tuple[object, ...] = (),
+    runtime_modes: tuple[object, ...] = (),
+) -> dict:
+    """Fail-closed identity proof for the final deferred capital authority."""
+    signal = signal if isinstance(signal, dict) else {}
+    if not isinstance(order_row, dict):
+        return {"ok": False, "reason_code": "DEFERRED_FINAL_IDENTITY_ORDER_UNREADABLE"}
+
+    row_local = str(order_row.get("local_order_id") or "").strip()
+    expected_local = str(expected_local_order_id or "").strip()
+    if not row_local:
+        return {"ok": False, "reason_code": "DEFERRED_FINAL_IDENTITY_LOCAL_ORDER_MISSING"}
+    if not expected_local or row_local != expected_local:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_LOCAL_ORDER_MISMATCH",
+            "row_local_order_id": row_local,
+            "expected_local_order_id": expected_local,
+        }
+
+    row_client = str(order_row.get("client_id") or "").strip()
+    plan_client = str(getattr(approved_plan, "client_id", "") or "").strip()
+    signal_client = str(signal.get("client_id") or signal.get("client_email") or "").strip()
+    runtime_clients = [
+        str(value or "").strip()
+        for value in runtime_client_ids
+        if str(value or "").strip()
+    ]
+    if not row_client or not plan_client or not runtime_clients:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_CLIENT_MISSING",
+            "row_client_id": row_client,
+            "plan_client_id": plan_client,
+            "runtime_client_ids": runtime_clients,
+        }
+    canonical_client = row_client.lower()
+    client_sources = [plan_client, *runtime_clients]
+    if signal_client:
+        client_sources.append(signal_client)
+    if any(value.lower() != canonical_client for value in client_sources):
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_CLIENT_MISMATCH",
+            "row_client_id": row_client,
+            "plan_client_id": plan_client,
+            "signal_client_id": signal_client,
+            "runtime_client_ids": runtime_clients,
+        }
+
+    row_mode_raw = order_row.get("execution_mode")
+    row_mode = _normalize_execution_mode(row_mode_raw)
+    plan_mode_values = [
+        value for value in (
+            getattr(approved_plan, "execution_mode", None),
+            getattr(approved_plan, "mode", None),
+        )
+        if str(value or "").strip()
+    ]
+    runtime_mode_values = [
+        value for value in runtime_modes if str(value or "").strip()
+    ]
+    signal_mode_values = [
+        value for value in (
+            signal.get("execution_mode"),
+            signal.get("mode"),
+        )
+        if str(value or "").strip()
+    ]
+    if row_mode is None or not plan_mode_values or not runtime_mode_values:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_MODE_MISSING",
+            "row_execution_mode": row_mode_raw,
+            "plan_modes": [str(v) for v in plan_mode_values],
+            "runtime_modes": [str(v) for v in runtime_mode_values],
+        }
+
+    normalized_plan_modes = [_normalize_execution_mode(v) for v in plan_mode_values]
+    normalized_runtime_modes = [_normalize_execution_mode(v) for v in runtime_mode_values]
+    normalized_signal_modes = [_normalize_execution_mode(v) for v in signal_mode_values]
+    if (
+        any(v is None for v in normalized_plan_modes)
+        or any(v is None for v in normalized_runtime_modes)
+        or any(v is None for v in normalized_signal_modes)
+    ):
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_MODE_INVALID",
+            "row_execution_mode": row_mode_raw,
+            "plan_modes": [str(v) for v in plan_mode_values],
+            "runtime_modes": [str(v) for v in runtime_mode_values],
+            "signal_modes": [str(v) for v in signal_mode_values],
+        }
+
+    all_modes = [*normalized_plan_modes, *normalized_runtime_modes, *normalized_signal_modes]
+    if any(mode != row_mode for mode in all_modes):
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_MODE_MISMATCH",
+            "row_execution_mode": row_mode,
+            "plan_modes": normalized_plan_modes,
+            "runtime_modes": normalized_runtime_modes,
+            "signal_modes": normalized_signal_modes,
+        }
+
+    row_signal_id = str(order_row.get("signal_id") or "").strip()
+    plan_signal_id = str(getattr(approved_plan, "signal_id", "") or "").strip()
+    signal_signal_id = str(signal.get("signal_id") or "").strip()
+    signal_ids = [value for value in (row_signal_id, plan_signal_id, signal_signal_id) if value]
+    if len(signal_ids) >= 2 and len(set(signal_ids)) != 1:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_SIGNAL_MISMATCH",
+            "row_signal_id": row_signal_id,
+            "plan_signal_id": plan_signal_id,
+            "signal_signal_id": signal_signal_id,
+        }
+
+    return {
+        "ok": True,
+        "reason_code": "DEFERRED_FINAL_IDENTITY_OK",
+        "client_id": row_client,
+        "execution_mode": row_mode,
+        "local_order_id": row_local,
+        "signal_id": row_signal_id or plan_signal_id or signal_signal_id,
+    }
+
+
+def _build_deferred_final_revalidation_plan(
+    approved_plan,
+    *,
+    submit_limit: float,
+    qty: int,
+):
+    """Clone a plan so Master Control sees final submit economics.
+
+    Selector evidence on the original plan is never rewritten.
+    """
+    final_qty = _strict_positive_integral(qty)
+    try:
+        final_limit = float(submit_limit)
+    except (TypeError, ValueError):
+        final_limit = 0.0
+    if final_qty is None or not math.isfinite(final_limit) or final_limit <= 0:
+        raise ValueError("invalid_final_submit_economics")
+
+    reval_plan = copy.copy(approved_plan)
+    original_meta = getattr(approved_plan, "metadata", None) or {}
+    if isinstance(original_meta, dict):
+        try:
+            reval_plan.metadata = copy.deepcopy(original_meta)
+        except Exception:
+            reval_plan.metadata = dict(original_meta)
+
+    selector_meta = getattr(approved_plan, "selector_metadata", None) or {}
+    if isinstance(selector_meta, dict):
+        try:
+            selector_meta = copy.deepcopy(selector_meta)
+        except Exception:
+            selector_meta = dict(selector_meta)
+    else:
+        selector_meta = {}
+    selector_meta["premium_per_contract"] = round(final_limit * 100.0, 2)
+    selector_meta["execution_price_per_share"] = final_limit
+
+    reval_plan.selector_metadata = selector_meta
+    reval_plan.selector_execution_price = final_limit
+    reval_plan.limit_price = final_limit
+    reval_plan.contracts = final_qty
+    reval_plan.max_position_usd = round(final_limit * final_qty * 100.0, 2)
+    return reval_plan
+
+
+def _revalidate_deferred_final_cost(
+    master_control,
+    approved_plan,
+    *,
+    client_id: str,
+    execution_mode: str,
+    submit_limit: float,
+    qty: int,
+) -> dict:
+    """Run final MC authority against the exact broker-ready price and qty."""
+    normalized_mode = _normalize_execution_mode(execution_mode)
+    if normalized_mode is None:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_IDENTITY_MODE_INVALID",
+            "final_qty": 0,
+            "actual_cost": 0.0,
+        }
+    try:
+        reval_plan = _build_deferred_final_revalidation_plan(
+            approved_plan,
+            submit_limit=submit_limit,
+            qty=qty,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_REVALIDATION_INPUT_INVALID",
+            "exception_type": type(exc).__name__,
+            "final_qty": 0,
+            "actual_cost": 0.0,
+        }
+
+    initial_qty = int(reval_plan.contracts)
+    initial_cost = round(float(submit_limit) * initial_qty * 100.0, 2)
+
+    if master_control is None:
+        if normalized_mode == "live":
+            return {
+                "ok": False,
+                "reason_code": "DEFERRED_FINAL_MASTER_CONTROL_MISSING",
+                "final_qty": initial_qty,
+                "actual_cost": initial_cost,
+            }
+        return {
+            "ok": True,
+            "reason_code": "PAPER_DEFERRED_FINAL_REVALIDATION_MISSING_FAIL_OPEN",
+            "final_qty": initial_qty,
+            "actual_cost": initial_cost,
+            "mc_reason": "master_control_missing",
+        }
+
+    try:
+        reval = master_control.revalidate_exposure(
+            reval_plan,
+            client_id=str(client_id or ""),
+        )
+    except Exception as exc:
+        if normalized_mode == "live":
+            return {
+                "ok": False,
+                "reason_code": "DEFERRED_FINAL_EXPOSURE_REVALIDATION_ERROR",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+                "final_qty": initial_qty,
+                "actual_cost": initial_cost,
+            }
+        return {
+            "ok": True,
+            "reason_code": "PAPER_DEFERRED_FINAL_REVALIDATION_ERROR_FAIL_OPEN",
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "final_qty": initial_qty,
+            "actual_cost": initial_cost,
+            "mc_reason": "paper_fail_open",
+        }
+
+    if not getattr(reval, "ok", False):
+        mc_reason = str(getattr(reval, "reason", "revalidation_failed") or "revalidation_failed")
+        return {
+            "ok": False,
+            "reason_code": f"DEFERRED_FINAL_EXPOSURE_REVALIDATION:{mc_reason}",
+            "mc_reason": mc_reason,
+            "final_qty": int(getattr(reval_plan, "contracts", initial_qty) or 0),
+            "actual_cost": float(getattr(reval_plan, "max_position_usd", initial_cost) or 0),
+        }
+
+    final_qty = _strict_positive_integral(getattr(reval_plan, "contracts", None))
+    if final_qty is None:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_REVALIDATION_QTY_INVALID",
+            "final_qty": 0,
+            "actual_cost": 0.0,
+        }
+
+    final_cost = round(float(submit_limit) * final_qty * 100.0, 2)
+    try:
+        mc_cost = float(getattr(reval_plan, "max_position_usd", 0) or 0)
+    except (TypeError, ValueError):
+        mc_cost = 0.0
+    if not math.isfinite(mc_cost) or abs(mc_cost - final_cost) > 0.01:
+        return {
+            "ok": False,
+            "reason_code": "DEFERRED_FINAL_REVALIDATION_COST_DRIFT",
+            "final_qty": final_qty,
+            "actual_cost": final_cost,
+            "mc_seen_cost": mc_cost,
+        }
+
+    return {
+        "ok": True,
+        "reason_code": "DEFERRED_FINAL_EXPOSURE_REVALIDATION_OK",
+        "mc_reason": str(getattr(reval, "reason", "") or ""),
+        "final_qty": final_qty,
+        "actual_cost": final_cost,
+        "mc_seen_cost": mc_cost,
+    }
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
@@ -2203,7 +2528,23 @@ class APExecutionCore:
                     "context_notes": msg + "_paper_fail_open",
                 })
 
-        if approved_plan is not None and self.master_control is not None:
+        _deferred_placeholder = False
+        if approved_plan is not None:
+            _deferred_placeholder, _blank_contract_malformed = (
+                _classify_deferred_plan(approved_plan, sig)
+            )
+            if _deferred_placeholder:
+                log.info(
+                    "[%s] Breach exposure cost revalidation deferred until "
+                    "real OCC materialization; kill-switch and slot checks passed",
+                    ticker,
+                )
+
+        if (
+            approved_plan is not None
+            and self.master_control is not None
+            and not _deferred_placeholder
+        ):
             try:
                 reval = self.master_control.revalidate_exposure(
                     approved_plan,
@@ -4630,12 +4971,28 @@ class APExecutionCore:
         )
         _candidate_audit = None  # Item 3 — set if breach-time selection runs
         _contract_sym_raw = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
-        _deferred   = (
-            bool(_sig_meta.get("contract_deferred"))
-            or bool(_sig_dict.get("contract_deferred"))
-            or not _contract_sym_raw
-            or _contract_sym_raw.upper().startswith("DEFERRED:")  # safety: never submit placeholder
+        _deferred, _blank_contract_malformed = _classify_deferred_plan(
+            approved_plan,
+            sig,
         )
+        if _blank_contract_malformed:
+            _blank_reason = "MALFORMED_BLANK_CONTRACT_WITHOUT_DEFERRED_PROVENANCE"
+            log.critical(
+                "[%s] PRODUCTION_ENTRY_BLOCK — %s; refusing to treat a missing "
+                "contract as deferred authority",
+                ticker,
+                _blank_reason,
+            )
+            return _terminalize_breach_failure(
+                _blank_reason,
+                cleanup_action="expire",
+                meta_patch={
+                    "failure_stage": "deferred_classification",
+                    "contract_symbol": _contract_sym_raw,
+                    "contract_deferred": False,
+                },
+                context_notes=_blank_reason,
+            )
         # Enable deferred-outcome emission only for deferred triggers (amendment:
         # guard deferred logs with _deferred). Non-deferred entries never emit a
         # deferred terminal outcome.
@@ -5540,9 +5897,12 @@ class APExecutionCore:
                         _sel_qty = _sel_qty_candidate
                         if _sel_qty > 0:
                             approved_plan.contracts = _sel_qty
-                            _prem_per_contract = float(getattr(_sel, "premium_per_contract", 0) or 0)
-                            if _prem_per_contract > 0:
-                                approved_plan.max_position_usd = _sel_qty * _prem_per_contract
+                            approved_plan.max_position_usd = round(
+                                float(_sel_price_candidate)
+                                * int(_sel_qty)
+                                * 100.0,
+                                2,
+                            )
                         _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
                         # P0 amendment #3 (PR #294): capture stages 1 & 2 of
                         # the handoff snapshot the moment copy-back completes.
@@ -5692,13 +6052,18 @@ class APExecutionCore:
                     # contract at the selected premium.
                     try:
                         approved_plan.contracts = 1
-                        _prem = float(getattr(_sel, "premium_per_contract", 0) or 0)
-                        if _prem > 0:
-                            approved_plan.max_position_usd = _prem
+                        approved_plan.max_position_usd = round(
+                            float(_sel_price_candidate) * 1 * 100.0,
+                            2,
+                        )
                         log.info(
                             "[%s] DEFERRED_ACCEPTANCE_CAP_PASS contract=%s "
-                            "ask=%.2f cap=%.2f qty=1",
-                            ticker, _sel_contract, _sel_ask, _accept_cap,
+                            "ask=%.2f cap=%.2f qty=1 cost=$%.2f",
+                            ticker,
+                            _sel_contract,
+                            _sel_ask,
+                            _accept_cap,
+                            float(approved_plan.max_position_usd),
                         )
                     except Exception as _cap_exc:
                         log.warning(
@@ -6987,6 +7352,234 @@ class APExecutionCore:
             approved_plan.limit_price = submit_limit
         except Exception:
             pass  # plan is a namespace; attribute assignment is always valid
+
+        # ── P0 (PR #474): final deferred capital authority at broker-ready economics.
+        # The selector-era price is only the drift baseline. For a deferred entry,
+        # Master Control must see the FINAL submit_limit after the fresh exact-OCC
+        # quote, spread/drift gates, and any PR180 repricing. This block runs before
+        # the broker-ready CAS and therefore before any broker POST.
+        #
+        # INVARIANT (PR #474 amendment): once breach-time capital-cost revalidation
+        # is deliberately skipped for a canonical deferred entry, the final capital-cost
+        # authority becomes MANDATORY — not conditional on an observability flag.
+        # If the handoff proof is missing we FAIL CLOSED rather than silently proceeding.
+        #
+        # There are exactly two valid outcomes for a deferred LIVE entry:
+        #   A) final MC explicitly approves → broker-ready CAS proceeds
+        #   B) final MC blocks, or proof is missing → terminalize, zero broker POST
+        # There is no third state.
+        requires_final_cost_revalidation = bool(_deferred)
+
+        if requires_final_cost_revalidation:
+            if not _handoff_snapshot.get("captured"):
+                _proof_missing_reason = "DEFERRED_FINAL_HANDOFF_PROOF_MISSING"
+                _proof_missing_meta = {
+                    "failure_stage": "deferred_final_handoff_proof",
+                    "local_order_id": queue_local_order_id,
+                    "client_id": getattr(self, "client_id", None),
+                    "execution_mode": getattr(self, "execution_mode",
+                                              getattr(self, "mode", None)),
+                    "ticker": ticker,
+                    "selected_contract": approved_contract,
+                    "deferred": True,
+                    "handoff_snapshot_captured": bool(
+                        _handoff_snapshot.get("captured") if _handoff_snapshot else False
+                    ),
+                    "broker_post_count": 0,
+                }
+                log.critical(
+                    "[%s] %s — deferred entry reached final authority gate with no "
+                    "handoff proof; fail closed, zero broker POST "
+                    "local=%s client_id=%s mode=%s contract=%s",
+                    ticker,
+                    _proof_missing_reason,
+                    queue_local_order_id,
+                    _proof_missing_meta["client_id"],
+                    _proof_missing_meta["execution_mode"],
+                    approved_contract,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SUBMISSION_SKIPPED",
+                    reason=_proof_missing_reason,
+                    contract=approved_contract,
+                    extra=_proof_missing_meta,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _proof_missing_reason,
+                    extra_meta=_proof_missing_meta,
+                )
+
+            # Handoff proof is confirmed present — proceed with mandatory final
+            # identity proof and final Master Control capital authority.
+            _identity_row, _identity_read_error, _identity_read_attempts = (
+                _read_order_row_for_handoff_proof(
+                    self.order_state_machine,
+                    str(queue_local_order_id or ""),
+                    attempts=3,
+                    delay_s=0.05,
+                )
+            )
+            _final_identity = _validate_deferred_final_identity(
+                order_row=_identity_row,
+                approved_plan=approved_plan,
+                signal=sig,
+                expected_local_order_id=str(queue_local_order_id or ""),
+                runtime_client_ids=(
+                    getattr(self, "client_id", None),
+                    getattr(self, "email", None),
+                ),
+                runtime_modes=(
+                    getattr(self, "execution_mode", None),
+                    getattr(self, "mode", None),
+                ),
+            )
+            if not _final_identity.get("ok"):
+                _identity_reason = str(
+                    _final_identity.get("reason_code")
+                    or "DEFERRED_FINAL_IDENTITY_INVALID"
+                )
+                _identity_meta = {
+                    "failure_stage": "deferred_final_identity",
+                    "selected_contract": approved_contract,
+                    "final_submit_limit": float(submit_limit),
+                    "identity_read_error": _identity_read_error,
+                    "identity_read_attempts": int(_identity_read_attempts or 0),
+                    "identity_audit": _final_identity,
+                    "broker_post_count": 0,
+                }
+                log.critical(
+                    "[%s] %s — final deferred identity proof failed; no broker POST",
+                    ticker,
+                    _identity_reason,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SUBMISSION_SKIPPED",
+                    reason=_identity_reason,
+                    contract=approved_contract,
+                    extra=_identity_meta,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _identity_reason,
+                    extra_meta=_identity_meta,
+                )
+
+            _pre_mc_qty = _strict_positive_integral(
+                getattr(approved_plan, "contracts", None)
+            )
+            if _pre_mc_qty is None:
+                _qty_reason = "DEFERRED_FINAL_REVALIDATION_QTY_INVALID"
+                _qty_meta = {
+                    "failure_stage": "deferred_final_exposure_revalidation",
+                    "selected_contract": approved_contract,
+                    "final_submit_limit": float(submit_limit),
+                    "final_qty": getattr(approved_plan, "contracts", None),
+                    "client_id": _final_identity.get("client_id"),
+                    "execution_mode": _final_identity.get("execution_mode"),
+                    "broker_post_count": 0,
+                }
+                _emit_deferred_outcome(
+                    "BREACH_SUBMISSION_SKIPPED",
+                    reason=_qty_reason,
+                    contract=approved_contract,
+                    extra=_qty_meta,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _qty_reason,
+                    extra_meta=_qty_meta,
+                )
+
+            _final_reval = _revalidate_deferred_final_cost(
+                getattr(self, "master_control", None),
+                approved_plan,
+                client_id=str(_final_identity.get("client_id") or ""),
+                execution_mode=str(_final_identity.get("execution_mode") or ""),
+                submit_limit=float(submit_limit),
+                qty=int(_pre_mc_qty),
+            )
+            if not _final_reval.get("ok"):
+                _reval_reason = str(
+                    _final_reval.get("reason_code")
+                    or "DEFERRED_FINAL_EXPOSURE_REVALIDATION_FAILED"
+                )
+                _reval_meta = {
+                    "failure_stage": "deferred_final_exposure_revalidation",
+                    "selected_contract": approved_contract,
+                    "final_submit_limit": float(submit_limit),
+                    "final_qty": int(_final_reval.get("final_qty") or 0),
+                    "actual_contract_cost": float(
+                        _final_reval.get("actual_cost") or 0
+                    ),
+                    "mc_seen_cost": _final_reval.get("mc_seen_cost"),
+                    "mc_block_reason": _final_reval.get("mc_reason"),
+                    "exception_type": _final_reval.get("exception_type"),
+                    "exception_message": _final_reval.get("exception_message"),
+                    "client_id": _final_identity.get("client_id"),
+                    "execution_mode": _final_identity.get("execution_mode"),
+                    "local_order_id": queue_local_order_id,
+                    "broker_post_count": 0,
+                }
+                log.critical(
+                    "[%s] DEFERRED_FINAL_EXPOSURE_BLOCK contract=%s "
+                    "limit=%.2f qty=%s cost=$%.2f reason=%s exception=%r — no broker POST",
+                    ticker,
+                    approved_contract,
+                    float(submit_limit),
+                    _reval_meta["final_qty"],
+                    _reval_meta["actual_contract_cost"],
+                    _reval_reason,
+                    _reval_meta.get("exception_message"),
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SUBMISSION_SKIPPED",
+                    reason=_reval_reason,
+                    contract=approved_contract,
+                    extra=_reval_meta,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reval_reason,
+                    extra_meta=_reval_meta,
+                )
+
+            approved_qty = int(_final_reval["final_qty"])
+            _final_actual_cost = round(
+                float(submit_limit) * approved_qty * 100.0,
+                2,
+            )
+            approved_plan.contracts = approved_qty
+            approved_plan.max_position_usd = _final_actual_cost
+
+            _final_reval_audit = {
+                "status": str(_final_reval.get("reason_code") or ""),
+                "client_id": str(_final_identity.get("client_id") or ""),
+                "execution_mode": str(
+                    _final_identity.get("execution_mode") or ""
+                ),
+                "selected_contract": approved_contract,
+                "final_submit_limit": float(submit_limit),
+                "final_qty": approved_qty,
+                "actual_contract_cost": _final_actual_cost,
+                "mc_seen_cost": _final_reval.get("mc_seen_cost"),
+                "mc_reason": _final_reval.get("mc_reason"),
+                "identity_read_attempts": int(_identity_read_attempts or 0),
+            }
+            try:
+                if isinstance(_selector_materialization_meta, dict):
+                    _selector_materialization_meta[
+                        "final_exposure_revalidation"
+                    ] = _final_reval_audit
+            except Exception:
+                pass
+            log.info(
+                "[%s] DEFERRED_FINAL_EXPOSURE_APPROVED contract=%s "
+                "limit=%.2f qty=%d cost=$%.2f client_id=%s mode=%s",
+                ticker,
+                approved_contract,
+                float(submit_limit),
+                approved_qty,
+                _final_actual_cost,
+                _final_identity.get("client_id"),
+                _final_identity.get("execution_mode"),
+            )
 
         # Build the entry pricing audit to persist in orders.meta post-submit.
         _entry_pricing_audit = {

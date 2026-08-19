@@ -817,7 +817,18 @@ def _build_core(osm: _StatefulOSM, broker: _Broker, selector: _Selector):
         broker=broker,
         order_state_machine=osm,
         contract_selector=selector,
-        master_control=types.SimpleNamespace(mode="LIVE", max_positions=5, _kill_switch_fn=lambda: False),
+        master_control=types.SimpleNamespace(
+            mode="LIVE",
+            max_positions=5,
+            _kill_switch_fn=lambda: False,
+            # PR #474: this integration harness now crosses the mandatory
+            # final deferred exposure authority. Model the production method
+            # explicitly instead of relying on an incomplete namespace.
+            revalidate_exposure=lambda plan, client_id="default": types.SimpleNamespace(
+                ok=True,
+                reason="",
+            ),
+        ),
         _kill_switch=False,
         _max_positions=5,
     )
