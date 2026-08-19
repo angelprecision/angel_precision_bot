@@ -281,6 +281,15 @@ class TestPreBreachStopActivationPut:
         watched._pending_first_breach_at = prior_ts
         watched.first_breach_bid = 61.85
         watched.first_breach_ask = 61.95
+        # PR #494 final amendment: the staged partial breach above needs a
+        # matching continuity anchor, or the new bounded-continuity check
+        # in WatchedSignal.check() correctly treats a breach_count > 0 with
+        # no recorded _last_valid_breach_observation_at as STALE (this is
+        # explicit, intentional behavior — see amendment section 7C) and
+        # would discard it as a new first observation instead of letting
+        # this poll confirm. Set it to the same prior_ts this staged state
+        # is meant to represent.
+        watched._last_valid_breach_observation_at = prior_ts
 
         # Drive the confirming poll through the production dispatch path.
         # The quote leaves bid strictly above scanner stop (no collision).
