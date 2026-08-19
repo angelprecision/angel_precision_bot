@@ -9,8 +9,14 @@ must never be treated as selected-contract cost before a real OCC contract
 exists, and the final capital authority must validate the exact broker-ready
 price rather than the older selector price.
 
-A fresh audit is still required after any overlapping Master Control authority
-work, including #483, is merged/rebased.
+#474 is self-contained and does not depend on #483. It presents final
+deferred broker-bound economics to whatever Master Control implementation
+exists on current main and honors any rejection without interpreting the
+rejection taxonomy — #474 owns deferred cost sequencing; #483 owns sector
+classification. Those are independent concerns and #474 has zero coupling
+to sector-specific fields or reason-code strings (verified: the only
+fields #474 reads off Master Control's decision are `.ok` and `.reason`,
+treated as opaque).
 
 ## Binding lifecycle
 
