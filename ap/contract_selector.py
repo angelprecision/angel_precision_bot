@@ -4132,6 +4132,16 @@ class APContractSelectionEngine:
                             )
                         ),
                         "market_truth_reason": None,
+                        # PR #491: preserve the selector's own already-
+                        # established pre-reducer reason as fallback truth.
+                        # This is the canonical selector observation
+                        # (_obs_reason), captured above BEFORE this reducer
+                        # can overwrite it -- deliberately NOT the separate
+                        # operational/request-budget reason, which is
+                        # threaded through its own operational_reason field
+                        # at the call site below and must never be conflated
+                        # with canonical selector truth.
+                        "fallback_selector_reason": _obs_reason,
                     })
                 except Exception:
                     pass
