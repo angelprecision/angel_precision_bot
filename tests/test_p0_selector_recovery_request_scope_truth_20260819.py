@@ -218,6 +218,139 @@ class TestMixedStructuralWithFallback:
         )
 
 
+# ── Escape-hatch closure: fallback must not resurrect a structural reason ───
+# that the exhaustive helper already declined to prove for this exact
+# evidence. Found in post-implementation review: DELTA_OUT_OF_RANGE and
+# DTE_OUT_OF_RANGE are registered TERMINAL_QUALITY codes in the retry-policy
+# table, so a mixed-structural request whose selector pre-reducer
+# observation (fallback_selector_reason) happened to equal one of those two
+# codes could resurrect it through Step 8.5's fallback -- reopening the
+# exact false request-level claim Step 3's exhaustive proof had just
+# correctly declined. (MONEYNESS_OUT_OF_RANGE and TERMINAL_POLICY_REJECT are
+# NOT registered in the retry-policy table at all, so those two specific
+# strings already failed closed via get_policy() by coincidence -- not by
+# design -- which is why the guard below is necessary for ALL FOUR governed
+# reasons, not simply the two that happened to already be safe.)
+#
+# Real production evidence motivating this: WDAY, 2026-08-18,
+# jasoncosby1@gmail.com, LIVE, deferred-breach materialization. Persisted
+# selector diagnostics contain both STRUCTURAL_DELTA_OUT_OF_RANGE and
+# STRUCTURAL_MONEYNESS_OUT_OF_RANGE candidates across the DTE-ladder's
+# probed expirations, direct_quote_unattempted_symbols=[] (fully attempted,
+# non-exhaustive-by-mixing), yet the persisted final historical reason was
+# MONEYNESS_OUT_OF_RANGE. That exact evidence shape is replayed below with
+# fallback_selector_reason set to each of the four governed reasons in turn.
+
+class TestFallbackCannotResurrectUnprovenStructuralReason:
+    # Real WDAY 2026-08-18 jasoncosby1@gmail.com LIVE structural evidence
+    # shape (abbreviated from the persisted selection_diagnostics.structural_skips
+    # -- 5 delta-invalid + 33 moneyness-invalid candidates, zero unattempted).
+    _WDAY_MIXED_STRUCTURAL = {
+        **{f"WDAY260821C00{205 + i}000": "STRUCTURAL_DELTA_OUT_OF_RANGE" for i in range(5)},
+        **{f"WDAY260821C00{220 + i * 2}500": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE" for i in range(33)},
+    }
+
+    def test_mixed_moneyness_and_delta_structural_fallback_moneyness_must_not_resurrect(self):
+        evidence = _evidence(
+            structural_skip_results=self._WDAY_MIXED_STRUCTURAL,
+            eligible_unattempted_symbols=[],
+            fallback_selector_reason="MONEYNESS_OUT_OF_RANGE",
+        )
+        assert resolve_selector_recovery_final_reason(evidence) != "MONEYNESS_OUT_OF_RANGE"
+
+    def test_mixed_moneyness_and_delta_structural_fallback_delta_must_not_resurrect(self):
+        # This is the genuinely exploitable case pre-amendment: DELTA_OUT_OF_RANGE
+        # IS a registered TERMINAL_QUALITY code in the retry-policy table, so
+        # get_policy() alone does not fail it closed -- only the new governed-
+        # reason guard in Step 8.5 does.
+        evidence = _evidence(
+            structural_skip_results=self._WDAY_MIXED_STRUCTURAL,
+            eligible_unattempted_symbols=[],
+            fallback_selector_reason="DELTA_OUT_OF_RANGE",
+        )
+        assert resolve_selector_recovery_final_reason(evidence) != "DELTA_OUT_OF_RANGE"
+
+    def test_mixed_moneyness_and_dte_structural_fallback_dte_must_not_resurrect(self):
+        evidence = _evidence(
+            structural_skip_results={
+                _AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                _AAPL_155C: "STRUCTURAL_DTE_OUT_OF_RANGE",
+            },
+            fallback_selector_reason="DTE_OUT_OF_RANGE",
+        )
+        assert resolve_selector_recovery_final_reason(evidence) != "DTE_OUT_OF_RANGE"
+
+    def test_structural_moneyness_plus_eligible_unattempted_fallback_moneyness_must_not_resurrect(self):
+        evidence = _evidence(
+            structural_skip_results={_AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"},
+            eligible_unattempted_symbols=[_AAPL_160C],
+            fallback_selector_reason="MONEYNESS_OUT_OF_RANGE",
+        )
+        assert resolve_selector_recovery_final_reason(evidence) != "MONEYNESS_OUT_OF_RANGE"
+
+    def test_structural_moneyness_plus_retryable_attempt_fallback_moneyness_must_not_resurrect(self):
+        evidence = _evidence(
+            structural_skip_results={_AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"},
+            attempted_results={_AAPL_160C: _attempted_record("DIRECT_QUOTE_ZERO_BID_ASK")},
+            fallback_selector_reason="MONEYNESS_OUT_OF_RANGE",
+        )
+        result = resolve_selector_recovery_final_reason(evidence)
+        assert result != "MONEYNESS_OUT_OF_RANGE"
+        # The truthful retryable reason must still win -- the guard closes
+        # the false structural door without breaking the true survivor door.
+        assert result == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+    def test_fully_exhaustive_homogeneous_moneyness_with_fallback_still_valid(self):
+        # Complementary control: when the SAME reason genuinely IS exhaustively
+        # proven by Step 3, it must still be returned -- the guard only blocks
+        # the fallback DOOR, it does not weaken the exhaustive-proof door.
+        evidence = _evidence(
+            structural_skip_results={
+                _AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                _AAPL_155C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            fallback_selector_reason="MONEYNESS_OUT_OF_RANGE",
+        )
+        assert resolve_selector_recovery_final_reason(evidence) == "MONEYNESS_OUT_OF_RANGE"
+
+    def test_mixed_structural_with_non_structural_fallback_still_preserved(self):
+        # Control: non-structural known fallbacks are NOT affected by this
+        # guard and continue through exactly as before.
+        evidence = _evidence(
+            structural_skip_results=self._WDAY_MIXED_STRUCTURAL,
+            fallback_selector_reason="NO_CONTRACT_AFTER_FILTERS",
+        )
+        assert (
+            resolve_selector_recovery_final_reason(evidence)
+            == "NO_CONTRACT_AFTER_FILTERS"
+        )
+
+    def test_wday_20260818_jasoncosby_live_production_replay(self):
+        """Direct replay of the real production shape (Supabase orders row
+        e066bb1d-8284-4721-b5eb-dfcd0bd138b7, WDAY, 2026-08-18T13:31:18Z,
+        client_id=jasoncosby1@gmail.com, execution_mode=live,
+        entry_path=DEFERRED_BREACH_MATERIALIZATION). Persisted
+        last_deferred_selector_reason_code was MONEYNESS_OUT_OF_RANGE with
+        direct_quote_unattempted_symbols=[] and mixed
+        STRUCTURAL_DELTA_OUT_OF_RANGE / STRUCTURAL_MONEYNESS_OUT_OF_RANGE
+        candidates. Proves the exhaustive helper correctly refuses to prove
+        MONEYNESS_OUT_OF_RANGE for this exact mixed set, AND that the
+        fallback path (fed from the selector's own _obs_reason, which for
+        this production request evaluated to MONEYNESS_OUT_OF_RANGE) cannot
+        resurrect it either."""
+        evidence = _evidence(
+            structural_skip_results=self._WDAY_MIXED_STRUCTURAL,
+            attempted_results={},
+            eligible_unattempted_symbols=[],
+            fallback_selector_reason="MONEYNESS_OUT_OF_RANGE",
+        )
+        result = resolve_selector_recovery_final_reason(evidence)
+        assert result != "MONEYNESS_OUT_OF_RANGE", (
+            "PR #491 regression: real WDAY 2026-08-18 production shape "
+            "resurrected an unproven structural reason through fallback"
+        )
+
+
 # ── 10/11/12. Known fallback preservation by classification ────────────────
 
 class TestKnownFallbackPreservation:

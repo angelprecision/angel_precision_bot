@@ -1186,6 +1186,21 @@ _STRUCTURAL_TO_CANONICAL_REQUEST_REASON: dict[str, str] = {
     "STRUCTURAL_TERMINAL_POLICY_REJECT": "TERMINAL_POLICY_REJECT",
 }
 
+# The set of canonical request-level reasons governed EXCLUSIVELY by
+# _resolve_exhaustive_structural_terminal_reason() above. These reasons may
+# only become request-level truth via that helper's exhaustive proof -- the
+# fallback_selector_reason path (Step 8.5 below) must never be able to
+# resurrect one of them merely because the selector's own pre-reducer
+# observation happened to be one of these codes. Doing so would silently
+# defeat the entire point of PR #491: a candidate-level structural skip
+# that failed exhaustive proof must not become request-level terminal
+# truth through a side door immediately next to the door that just denied
+# it. Derived from the same mapping the helper uses, so the two can never
+# drift apart.
+_STRUCTURAL_REQUEST_LEVEL_REASONS: frozenset = frozenset(
+    _STRUCTURAL_TO_CANONICAL_REQUEST_REASON.values()
+)
+
 
 def _normalize_recovery_symbol(raw) -> str | None:
     """Canonical OCC identity, matching the durable cursor's own normalizer.
@@ -1482,11 +1497,37 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     # on. A blank, malformed, unmapped, or UNKNOWN_FAIL_CLOSED fallback does
     # NOT get preserved -- the resolver still fails closed to UNKNOWN in that
     # case, exactly as before this amendment.
+    #
+    # AMENDMENT (post-review escape-hatch closure): a fallback must NEVER be
+    # allowed to resurrect one of the canonical structural request-level
+    # reasons (_STRUCTURAL_REQUEST_LEVEL_REASONS) that
+    # _resolve_exhaustive_structural_terminal_reason() governs. By the time
+    # execution reaches this line, that helper has already run (at Step 3)
+    # and did NOT prove a specific structural reason for this exact
+    # evidence -- otherwise the function would have returned already. If
+    # the selector's pre-reducer observation (_obs_reason in
+    # ap/contract_selector.py) happened to be, say, MONEYNESS_OUT_OF_RANGE
+    # because one candidate was structurally invalid, honoring it here
+    # would resurrect the exact false request-level claim the exhaustive
+    # helper just correctly declined to prove -- reopening the defect this
+    # PR exists to close, via a side door next to the one that was just
+    # locked. Real production evidence (WDAY, 2026-08-18,
+    # jasoncosby1@gmail.com, LIVE) showed exactly this shape: mixed
+    # STRUCTURAL_DELTA_OUT_OF_RANGE + STRUCTURAL_MONEYNESS_OUT_OF_RANGE
+    # candidates with zero unattempted symbols, non-exhaustive by
+    # definition, yet the selector's pre-reducer observation was
+    # MONEYNESS_OUT_OF_RANGE. Governed structural reasons therefore may
+    # NOT flow through this fallback at all -- only through the exhaustive
+    # helper. Non-structural known fallbacks (NO_CONTRACT_AFTER_FILTERS,
+    # DIRECT_QUOTE_ZERO_BID_ASK, SELECTOR_REQUEST_BUDGET_EXHAUSTED,
+    # OI_TOO_LOW, etc.) are unaffected and continue through unchanged.
     fallback_reason = data.get("fallback_selector_reason")
     if fallback_reason:
         fallback_policy = get_policy(fallback_reason)
         if fallback_policy.classification != UNKNOWN_FAIL_CLOSED:
-            return fallback_policy.final_reason_code
+            _fallback_final = fallback_policy.final_reason_code
+            if _fallback_final not in _STRUCTURAL_REQUEST_LEVEL_REASONS:
+                return _fallback_final
 
     # ── Step 9: unknown recovery failure ─────────────────────────────────────
     return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
