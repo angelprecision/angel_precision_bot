@@ -99,6 +99,7 @@ jobs:
             tests/test_p0_watcher_conflict_cancellation_proof.py \
             tests/test_p0_watcher_zero_quote_breach_guard.py \
             tests/test_p0_watcher_missing_observation_hold.py \
+            tests/test_p0_watcher_breach_continuity_bounded_gap.py \
             tests/test_p0_seam1_pre_submit_proof_retry.py \
             tests/test_p0_seam2_timing_boundary.py \
             tests/test_p0_selector_retry_taxonomy.py \
