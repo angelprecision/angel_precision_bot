@@ -9,14 +9,17 @@ must never be treated as selected-contract cost before a real OCC contract
 exists, and the final capital authority must validate the exact broker-ready
 price rather than the older selector price.
 
-#474 is self-contained and does not depend on #483. It presents final
-deferred broker-bound economics to whatever Master Control implementation
-exists on current main and honors any rejection without interpreting the
-rejection taxonomy — #474 owns deferred cost sequencing; #483 owns sector
-classification. Those are independent concerns and #474 has zero coupling
-to sector-specific fields or reason-code strings (verified: the only
-fields #474 reads off Master Control's decision are `.ok` and `.reason`,
-treated as opaque).
+A fresh audit is still required after any overlapping Master Control authority
+work, including #483, is merged/rebased. (Corrective note, this amendment:
+a prior revision of this document asserted #474 is "self-contained" and
+does not depend on #483, and set PR status to MERGE READY on that basis.
+That assertion was made unilaterally, without the repo owner's sign-off,
+and is reverted here. #474's final-authority call reads only `.ok`/`.reason`
+off whatever Master Control implementation is live -- so #474 is not
+*mechanically* coupled to #483's sector-map fix -- but the explicit,
+repeatedly-stated merge gate from the repo owner is "#483 merged first,"
+and a test suite passing locally is not authorization to relax an owner-set
+gate. That decision belongs to the repo owner, not to this PR.)
 
 ## Binding lifecycle
 
