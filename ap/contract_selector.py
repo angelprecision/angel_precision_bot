@@ -240,6 +240,10 @@ class SelectorRequestContext:
     recovery_cursor: dict | None = None
     recovery_cursor_persist: object | None = None
     structural_skips: list[dict] = field(default_factory=list)
+    # Complete per-candidate quality-rejection evidence for deferred request
+    # reduction. Aggregate counts alone cannot prove that the candidate
+    # universe was exhaustively structural.
+    quality_rejection_records: list[dict] = field(default_factory=list)
     affordability_headroom_pct: float = 0.10
     symbol_refresh_seconds: int = 20
 
@@ -1179,7 +1183,8 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         ),
         "selector_request_kind": str(ctx.selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY),
         "recovery_attempt_number": int(ctx.recovery_attempt_number or 1),
-        "structural_skips": list(ctx.structural_skips[:200]),
+        "structural_skips": list(ctx.structural_skips),
+        "quality_rejection_records": list(ctx.quality_rejection_records),
         "limits": {
             "max_expiration_calls": int(ctx.max_expiration_calls),
             "max_chain_calls": int(ctx.max_chain_calls),
@@ -1483,7 +1488,6 @@ def _structural_direct_quote_skip(
     }
     if request_context is not None:
         request_context.structural_skips.append(diagnostic)
-        request_context.structural_skips[:] = request_context.structural_skips[-200:]
         from ap.selector_retry_policy import record_selector_structural_skip
         request_context.recovery_cursor = record_selector_structural_skip(
             request_context.recovery_cursor or {},
@@ -3576,9 +3580,19 @@ class APContractSelectionEngine:
                 _symbol, "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
             )
 
+        def _record_quality_rejection(opt: dict, reason: str) -> None:
+            """Retain candidate identity alongside aggregate reject counts."""
+            request_context.quality_rejection_records.append({
+                "symbol": opt.get("symbol") or opt.get("contract"),
+                "reason": _normalize_reason_code(reason),
+            })
+            _ctx_refresh_diagnostics(request_context)
+
         for opt in _quality_chain:
+            _structural_skip_recorded = False
             opt, _duplicate_authority_reason = _apply_duplicate_quote_authority(opt)
             if _duplicate_authority_reason:
+                _record_quality_rejection(opt, _duplicate_authority_reason)
                 _rejections[_duplicate_authority_reason] = _rejections.get(
                     _duplicate_authority_reason, 0
                 ) + 1
@@ -3626,6 +3640,8 @@ class APContractSelectionEngine:
                         selector_budget=float(budget or 0.0),
                         request_context=request_context,
                     )
+                    if _structural_skip_pro:
+                        _structural_skip_recorded = True
                     _rv_pro = (
                         {
                             "action": "SKIP_STRUCTURAL",
@@ -3723,6 +3739,8 @@ class APContractSelectionEngine:
                 # ── end P0A/FIX-2 ────────────────────────────────────────────
 
                 if pro_tier == "REJECT":
+                    if not _structural_skip_recorded:
+                        _record_quality_rejection(opt, pro_reason)
                     _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
                     try:
                         self._emit_selector_event(
@@ -3796,6 +3814,8 @@ class APContractSelectionEngine:
                     selector_budget=float(budget or 0.0),
                     request_context=request_context,
                 )
+                if _structural_skip:
+                    _structural_skip_recorded = True
                 _rv = (
                     {
                         "action": "SKIP_STRUCTURAL",
@@ -3949,6 +3969,8 @@ class APContractSelectionEngine:
             if result is None:
                 survivors.append(opt)
             else:
+                if not _structural_skip_recorded:
+                    _record_quality_rejection(opt, result)
                 _rejections[result] = _rejections.get(result, 0) + 1
                 log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
                 # P0 (PR #299): track the best rejected candidate — the one with
@@ -4105,11 +4127,6 @@ class APContractSelectionEngine:
                         )
                         or {}
                     )
-                    _structural_reasons = {
-                        item.get("symbol"): item.get("skip_reason")
-                        for item in request_context.structural_skips
-                        if isinstance(item, dict) and item.get("symbol")
-                    }
                     _final_reason = resolve_selector_recovery_final_reason({
                         "budget_exhausted_stage": request_context.budget_exhausted_stage,
                         "budget_exhausted_detail": request_context.budget_exhausted_detail,
@@ -4121,11 +4138,24 @@ class APContractSelectionEngine:
                             request_context.direct_quote_unattempted_symbols
                         ),
                         "attempted_results": _cursor_attempted,
-                        "structural_skip_results": _structural_reasons,
+                        # Preserve the complete ordered record stream through
+                        # validation. A dict keyed by OCC would silently
+                        # overwrite conflicting duplicate evidence before the
+                        # resolver can fail closed.
+                        "structural_skip_records": list(
+                            request_context.structural_skips
+                        ),
                         "quality_rejections": {
                             _normalize_reason_code(key): value
                             for key, value in _rejections.items()
                         },
+                        # Aggregate quality counts are diagnostic only; the
+                        # reducer also needs candidate identity so an ordinary
+                        # OI/spread reject remains in the complete universe
+                        # and blocks a false exhaustive structural claim.
+                        "quality_rejection_records": list(
+                            request_context.quality_rejection_records
+                        ),
                         "market_truth_outcome": (
                             (request_context.recovery_cursor or {}).get(
                                 "last_market_truth_outcome"

@@ -51,6 +51,7 @@ import pytest
 from ap.contract_selector import (
     APContractSelectionEngine,
     SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+    _structural_direct_quote_skip,
     _new_selector_request_context,
 )
 from ap.selector_retry_policy import (
@@ -78,6 +79,8 @@ def _evidence(
     budget_exhausted_detail: str | None = None,
     actual_limit_reached: bool = False,
     direct_quote_known_eligible_symbols: list | None = None,
+    structural_skip_records: list | None = None,
+    quality_rejection_records: list | None = None,
 ) -> dict:
     return {
         "structural_skip_results": structural_skip_results or {},
@@ -90,6 +93,8 @@ def _evidence(
         "actual_limit_reached": actual_limit_reached,
         "market_truth_outcome": None,
         "market_truth_reason": None,
+        "structural_skip_records": structural_skip_records,
+        "quality_rejection_records": quality_rejection_records,
         # Deliberately omitted from the dict unless explicitly provided below
         # would change dict-equality-based tests elsewhere; instead default
         # to None so absence is explicit and matches production's "field
@@ -481,6 +486,100 @@ class TestOrderingAndNormalization:
         )
         assert result is None
 
+    def test_conflicting_duplicate_records_survive_handoff_and_fail_closed(self):
+        """The live caller must not collapse same-OCC structural evidence."""
+        evidence = _evidence(
+            # This is the value the old dict comprehension could leave behind;
+            # the record stream is the authoritative input now.
+            structural_skip_results={
+                _AAPL_150C: "STRUCTURAL_DTE_OUT_OF_RANGE",
+            },
+            structural_skip_records=[
+                {
+                    "symbol": _AAPL_150C,
+                    "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                },
+                {
+                    "symbol": "  aapl260101c00150000  ",
+                    "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+                },
+            ],
+            direct_quote_known_eligible_symbols=[_AAPL_150C],
+        )
+        assert (
+            resolve_selector_recovery_final_reason(evidence)
+            == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+        )
+
+
+class TestCompleteCandidateAccounting:
+    def test_two_hundred_first_structural_candidate_is_not_dropped(self):
+        """A complete 201-row structural set may terminalize structurally."""
+        selector = object.__new__(APContractSelectionEngine)
+        selector.min_dte = 1
+        selector.max_dte = 90
+        selector.target_delta = 0.50
+        selector.delta_band = 0.10
+        request_context = _new_selector_request_context(
+            "AAPL",
+            "live",
+            selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+        )
+        expiration = date.today() + timedelta(days=30)
+        expiry_code = expiration.strftime("%y%m%d")
+
+        for index in range(201):
+            symbol = f"AAPL{expiry_code}C{150000 + index:08d}"
+            request_context.direct_quote_eligible_symbols.add(symbol)
+            diagnostic = _structural_direct_quote_skip(
+                selector,
+                {
+                    "symbol": symbol,
+                    "option_type": "CALL",
+                    "expiration_date": expiration.isoformat(),
+                    "strike": 150.0 + index / 1000.0,
+                    "bid": 0.0,
+                    "ask": 0.0,
+                },
+                direction="CALL",
+                ticker="AAPL",
+                underlying_price=100.0,
+                today=date.today(),
+                selector_budget=1000.0,
+                request_context=request_context,
+            )
+            assert diagnostic is not None
+
+        assert len(request_context.structural_skips) == 201
+        assert (
+            resolve_selector_recovery_final_reason(_evidence(
+                structural_skip_records=list(request_context.structural_skips),
+                direct_quote_known_eligible_symbols=list(
+                    request_context.direct_quote_eligible_symbols
+                ),
+                fallback_selector_reason="CHAIN_ROW_ZERO_BID_ASK",
+            ))
+            == "MONEYNESS_OUT_OF_RANGE"
+        )
+
+    @pytest.mark.parametrize("quality_reason", ["OI_TOO_LOW", "SPREAD_TOO_WIDE"])
+    def test_ordinary_quality_candidate_blocks_structural_terminality(
+        self, quality_reason
+    ):
+        """Aggregate OI/spread counts cannot stand in for candidate identity."""
+        evidence = _evidence(
+            structural_skip_results={
+                _AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            quality_rejections={quality_reason: 1},
+            quality_rejection_records=[
+                {"symbol": _AAPL_155C, "reason": quality_reason},
+            ],
+            # The ordinary quality row never entered direct-quote eligibility.
+            direct_quote_known_eligible_symbols=[_AAPL_150C],
+        )
+        assert resolve_selector_recovery_final_reason(evidence) == quality_reason
+
 
 # ── 18. Conflicting same-OCC evidence (structural + transient) ─────────────
 
@@ -568,6 +667,18 @@ class TestOrdinarySelectorControlUnaffected:
         preceding = source[:call_index]
         # The nearest preceding guard must reference the deferred-breach kind.
         assert "SELECTOR_REQUEST_KIND_DEFERRED_BREACH" in preceding[-1200:]
+
+
+class TestDeferredEvidenceHandoff:
+    def test_handoff_preserves_structural_and_quality_candidate_streams(self):
+        import inspect
+
+        import ap.contract_selector as selector_module
+
+        source = inspect.getsource(selector_module.APContractSelectionEngine.select)
+        assert '"structural_skip_records": list(' in source
+        assert '"quality_rejection_records": list(' in source
+        assert "_structural_reasons =" not in source
 
 
 # ── 21. Deferred-only scope control ─────────────────────────────────────────
@@ -708,7 +819,7 @@ class TestAffordabilityFullSetAccountingUnchanged:
 
 
 # ── Accounting-gap closure (found via external review + real CRM evidence) ──
-# The three reducer evidence collections (structural_skip_results,
+# The original reducer evidence collections (structural_skip_results,
 # attempted_results, eligible_unattempted_symbols) are not sufficient on
 # their own to prove request completeness. Real historical production
 # evidence proves this directly: CRM, 2026-08-12, jasoncosby1@gmail.com,

@@ -95,15 +95,28 @@ Use these evidence collections already present in current recovery flow:
 - `attempted_results: {normalized_occ: result_dict}`
 - `eligible_unattempted_symbols: [normalized_occ, ...]`
 
+The live deferred handoff must preserve the complete candidate records before
+validation:
+
+- `structural_skip_records: [{symbol, skip_reason}, ...]` is the authoritative
+  structural stream. It must not be truncated or collapsed into an OCC-keyed
+  dict before validation; duplicate normalized OCC records with conflicting
+  reasons are malformed evidence and must fail closed.
+- `quality_rejection_records: [{symbol, reason}, ...]` is the per-candidate
+  ordinary-quality stream. Aggregate `quality_rejections` counts are
+  diagnostic only and cannot represent candidate-universe membership.
+
 Normalize OCC keys with the same canonical whitespace/case rules already used by the selector. Do not invent ticker-only identity.
 
-Build the known candidate universe as the normalized union of keys from those three sources. Then apply this rule:
+Build the known candidate universe as the normalized union of identities from
+the structural, attempted, eligible-unattempted, and per-candidate quality
+sources above. Then apply this rule:
 
 > **AMENDMENT (2026-08-20, post-implementation review + real production evidence):** the three evidence collections above are **not sufficient on their own** to prove request completeness. Real production evidence proved this directly: a Supabase order row (CRM, `local_order_id=fa787602-2871-42fa-b579-df25feafb237`, `jasoncosby1@gmail.com`, LIVE, 2026-08-12) shows `direct_quote_eligible_candidates=48`, `47` candidates represented in `structural_skip_results`, and one genuinely direct-quote-attempted candidate (`CRM260814P00172500`, real outcome `DIRECT_QUOTE_ZERO_BID_ASK`) that was **not** represented in the reducer evidence used for that historical lifecycle. Historical persisted diagnostics prove the candidate was attempted but omitted from the evidence actually available to the reducer at that point in the historical flow; regardless of the specific historical cause, the fix is independent in-pass candidate accounting that prevents such an omission from ever falsely strengthening exhaustive structural proof.
 >
 > The implementation therefore adds a **fourth, independent accounting source**: `direct_quote_known_eligible_symbols` — every candidate symbol that reached direct-quote eligibility this pass, regardless of its eventual fate (structurally skipped, genuinely attempted, or otherwise). At the real call site this is `request_context.direct_quote_eligible_symbols`, which is populated unconditionally, in-pass, before either the structural-skip or the direct-quote-attempt branch runs — by construction it always equals `structural_skip_results.keys() ∪ {genuinely-attempted candidates}` (exactly matching CRM's real `48 = 47 + 1`).
 >
-> **Updated rule:** when `direct_quote_known_eligible_symbols` is supplied, every symbol in that set must be represented by `structural_skip_results`, `attempted_results`, or `eligible_unattempted_symbols` before exhaustive structural proof can succeed. If any named symbol is unaccounted for by those three sources, the helper must return `None` (no exhaustive proof) regardless of what the three-source union alone would otherwise conclude. When the field is absent (`None`), this check is skipped entirely — this is an additive, opt-in strengthening of the original three-source model, not a replacement for it; existing callers/evidence shapes that do not supply it are unaffected.
+> **Updated rule:** when `direct_quote_known_eligible_symbols` is supplied, every symbol in that set must be represented by the structural, attempted, eligible-unattempted, or per-candidate quality evidence before exhaustive structural proof can succeed. If any named symbol is unaccounted for by those sources, the helper must return `None` (no exhaustive proof) regardless of what the union alone would otherwise conclude. When the field is absent (`None`), this check is skipped entirely — this is an additive, opt-in strengthening of the original model, not a replacement for it; existing callers/evidence shapes that do not supply it are unaffected.
 
 A specific canonical structural reason (`DTE_OUT_OF_RANGE`, `MONEYNESS_OUT_OF_RANGE`, `DELTA_OUT_OF_RANGE`, `TERMINAL_POLICY_REJECT`) may be returned at request level only when:
 
@@ -112,7 +125,15 @@ A specific canonical structural reason (`DTE_OUT_OF_RANGE`, `MONEYNESS_OUT_OF_RA
 3. there are **zero** attempted candidates that are retryable/transient/success/otherwise non-structural;
 4. every candidate in the known candidate universe is represented by a structural skip; and
 5. every structural skip in that exhaustive candidate set maps to the **same** canonical request-level reason; and
-6. *(added 2026-08-20)* when an independent `direct_quote_known_eligible_symbols` accounting is supplied, every symbol it names is represented by one of the three evidence collections above — otherwise the candidate universe is not actually known to be complete, and exhaustive proof must be refused regardless of conditions 1–5.
+6. *(added 2026-08-20)* when an independent `direct_quote_known_eligible_symbols` accounting is supplied, every symbol it names is represented by the structural, attempted, eligible-unattempted, or per-candidate quality evidence — otherwise the candidate universe is not actually known to be complete, and exhaustive proof must be refused regardless of conditions 1–5.
+
+An ordinary quality-rejected candidate (for example `OI_TOO_LOW` or
+`SPREAD_TOO_WIDE`) is therefore part of the known universe and is not a
+structural skip. Its presence blocks exhaustive structural terminality even
+when the aggregate quality count is otherwise only one entry. The complete
+structural record stream is the only input eligible for the homogeneous
+structural-reason check; conflicting duplicate OCC records must never be
+silently overwritten.
 
 If any candidate survives those conditions, return `None` from the helper and continue the existing reducer.
 

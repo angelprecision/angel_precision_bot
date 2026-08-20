@@ -1214,11 +1214,66 @@ def _normalize_recovery_symbol(raw) -> str | None:
     return canonical or None
 
 
+def _coerce_structural_skip_records(raw) -> list[tuple[object, object]] | None:
+    """Return structural records without discarding duplicate identities."""
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return list(raw.items())
+    if not isinstance(raw, (list, tuple)):
+        return None
+
+    records: list[tuple[object, object]] = []
+    for record in raw:
+        if isinstance(record, dict):
+            records.append((
+                record.get("symbol", record.get("contract")),
+                record.get("skip_reason", record.get("reason")),
+            ))
+        elif isinstance(record, (list, tuple)) and len(record) == 2:
+            records.append((record[0], record[1]))
+        else:
+            return None
+    return records
+
+
+def _normalize_quality_rejection_symbols(raw) -> set[str] | None:
+    """Normalize candidate identities from per-candidate quality evidence."""
+    if raw is None:
+        return set()
+    if isinstance(raw, dict):
+        records = list(raw.items())
+    elif isinstance(raw, (list, tuple)):
+        records = []
+        for record in raw:
+            if not isinstance(record, dict):
+                return None
+            records.append((
+                record.get("symbol", record.get("contract")),
+                record.get(
+                    "reason",
+                    record.get("rejection_reason", record.get("result_reason")),
+                ),
+            ))
+    else:
+        return None
+
+    normalized: set[str] = set()
+    for raw_symbol, raw_reason in records:
+        norm = _normalize_recovery_symbol(raw_symbol)
+        reason = str(raw_reason or "").strip()
+        if norm is None or not reason:
+            return None
+        normalized.add(norm)
+    return normalized
+
+
 def _resolve_exhaustive_structural_terminal_reason(
-    skipped: dict,
+    skipped: dict | list,
     attempted: dict,
     eligible_raw,
     known_eligible_raw=None,
+    quality_rejection_raw=None,
 ) -> str | None:
     """Return a request-level structural reason ONLY when the full relevant
     candidate set exhaustively proves that single structural condition.
@@ -1251,11 +1306,18 @@ def _resolve_exhaustive_structural_terminal_reason(
     independent in-pass accounting closes the gap directly: it does not
     depend on -- and makes no claim about -- how or when the durable
     recovery cursor gets updated. When provided, this parameter requires
-    every named symbol to be accounted for by structural_skip_results ∪
-    attempted ∪ eligible_unattempted before exhaustive proof can succeed;
-    if any is not, exhaustive proof is refused. When absent (None), this
-    check is skipped entirely -- existing callers and evidence shapes that
-    do not supply it are unaffected.
+    every named symbol to be accounted for by structural, attempted,
+    eligible-unattempted, or per-candidate quality evidence before exhaustive
+    proof can succeed; if any is not, exhaustive proof is refused. When
+    absent (None), this check is skipped entirely -- existing callers and
+    evidence shapes that do not supply it are unaffected.
+
+    quality_rejection_raw (optional): complete per-candidate ordinary-quality
+    evidence. Aggregate quality counts are not sufficient to establish the
+    candidate universe; any normalized symbol in this source is therefore
+    included in the universe and prevents a structural-only proof unless it
+    is itself represented by structural evidence (which is contradictory and
+    fails closed).
     """
     # ── Eligible-unattempted container: a real container is authoritative;
     # missing/absent is a legitimate "none eligible" signal; anything else
@@ -1280,9 +1342,14 @@ def _resolve_exhaustive_structural_terminal_reason(
         return None
 
     # ── Normalize structural-skip evidence: normalized_symbol -> reason.
+    # The live deferred caller passes a record list, not a dict, so duplicate
+    # OCC rows remain visible until this conflict check.
+    structural_records = _coerce_structural_skip_records(skipped)
+    if structural_records is None:
+        return None
 
     normalized_skipped: dict[str, str] = {}
-    for raw_symbol, raw_reason in (skipped or {}).items():
+    for raw_symbol, raw_reason in structural_records:
         norm = _normalize_recovery_symbol(raw_symbol)
         reason = str(raw_reason or "").strip()
         if norm is None or not reason:
@@ -1315,8 +1382,24 @@ def _resolve_exhaustive_structural_terminal_reason(
     if set(normalized_skipped) & set(normalized_attempted):
         return None
 
+    # Ordinary quality rejects are candidate evidence, not merely aggregate
+    # counters. If one shares an OCC with a structural record, the evidence
+    # is contradictory and cannot strengthen a structural claim.
+    normalized_quality = _normalize_quality_rejection_symbols(
+        quality_rejection_raw
+    )
+    if normalized_quality is None:
+        return None
+    if set(normalized_skipped) & normalized_quality:
+        return None
+
     # Rule 1: at least one known candidate.
-    universe = set(normalized_skipped) | set(normalized_attempted) | normalized_eligible
+    universe = (
+        set(normalized_skipped)
+        | set(normalized_attempted)
+        | normalized_eligible
+        | normalized_quality
+    )
     if not universe:
         return None
 
@@ -1394,6 +1477,9 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     attempted = attempted if isinstance(attempted, dict) else {}
     skipped = data.get("structural_skip_results")
     skipped = skipped if isinstance(skipped, dict) else {}
+    structural_evidence = data.get("structural_skip_records")
+    if structural_evidence is None:
+        structural_evidence = skipped
 
     # This amendment is surgical: it demotes ONLY affordability so that one
     # unaffordable candidate cannot terminalize a request while retryable
@@ -1447,10 +1533,11 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     # structural skip to request-level truth. See
     # _resolve_exhaustive_structural_terminal_reason() above.
     exhaustive_structural_reason = _resolve_exhaustive_structural_terminal_reason(
-        skipped,
+        structural_evidence,
         attempted,
         data.get("eligible_unattempted_symbols"),
         data.get("direct_quote_known_eligible_symbols"),
+        data.get("quality_rejection_records"),
     )
     if exhaustive_structural_reason is not None:
         return exhaustive_structural_reason
