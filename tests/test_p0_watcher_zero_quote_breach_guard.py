@@ -142,33 +142,46 @@ def test_two_consecutive_valid_side_quotes_confirm_normally(
     assert watched.trigger_crossed_at is not None
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# PR #494: missing/unusable required-side observation must HOLD breach
+# continuity, not reset it. Absence of truth is not contradictory truth.
+# These two tests previously asserted RESET semantics (pre-#494) and are
+# updated here to assert the corrected HOLD semantics. A genuine valid
+# contradictory observation (required side present but on the wrong side
+# of trigger) still resets — see the separate contradiction tests below.
+# ─────────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize(
-    ("side", "first_quote", "invalid_quote", "next_valid_quote"),
+    ("side", "first_quote", "missing_quote", "next_valid_quote"),
     [
         ("CALL", (99.0, 100.0), (99.0, None), (99.0, 100.0)),
         ("PUT", (100.0, 101.0), (None, 101.0), (100.0, 101.0)),
     ],
 )
-def test_invalid_observation_resets_pending_two_poll_confirmation(
-    side, first_quote, invalid_quote, next_valid_quote
+def test_missing_observation_holds_pending_two_poll_confirmation(
+    side, first_quote, missing_quote, next_valid_quote
 ):
     watched = WatchedSignal(_signal(side=side), overnight=False)
 
     assert watched.check(*first_quote) == WatchState.PENDING
     assert watched.breach_count == 1
-    assert watched._pending_first_breach_at is not None
+    first_pending_at = watched._pending_first_breach_at
+    assert first_pending_at is not None
+    first_breach_price = watched.breach_price
 
-    assert watched.check(*invalid_quote) == WatchState.PENDING
-    assert watched.breach_count == 0
-    assert watched._pending_first_breach_at is None
-    assert watched.breach_price == 0.0
+    # HOLD: missing required-side quote must not touch continuity.
+    assert watched.check(*missing_quote) == WatchState.PENDING
+    assert watched.breach_count == 1
+    assert watched._pending_first_breach_at == first_pending_at
+    assert watched.breach_price == first_breach_price
     assert watched.trigger_price is None
     assert watched.trigger_crossed_at is None
 
-    # This is a new first observation, not confirmation using poll 1.
-    assert watched.check(*next_valid_quote) == WatchState.PENDING
-    assert watched.breach_count == 1
+    # This is confirmation of the ORIGINAL poll-1 streak (breach_count
+    # goes 1 -> 2 and confirms on this single poll), not a new first
+    # observation — continuity was held, not erased.
     assert watched.check(*next_valid_quote) == WatchState.TRIGGERED
+    assert watched.breach_count == 2
+    assert watched.trigger_crossed_at == first_pending_at
 
 
 @pytest.mark.parametrize(
@@ -180,7 +193,6 @@ def test_invalid_observation_resets_pending_two_poll_confirmation(
                 {"bid": 99.0, "ask": 100.0, "last": 100.0},
                 {"bid": 99.0, "ask": None, "last": 105.0},
                 {"bid": 99.0, "ask": 100.0, "last": 100.0},
-                {"bid": 99.0, "ask": 100.0, "last": 100.0},
             ],
         ),
         (
@@ -189,12 +201,11 @@ def test_invalid_observation_resets_pending_two_poll_confirmation(
                 {"bid": 100.0, "ask": 101.0, "last": 100.0},
                 {"bid": None, "ask": 101.0, "last": 95.0},
                 {"bid": 100.0, "ask": 101.0, "last": 100.0},
-                {"bid": 100.0, "ask": 101.0, "last": 100.0},
             ],
         ),
     ],
 )
-def test_real_active_poll_resets_invalid_side_and_calls_callback_only_after_new_streak(
+def test_real_active_poll_holds_missing_side_and_confirms_on_next_valid_poll(
     side, quote_sequence
 ):
     watcher, watched = _poll_watched(side, quote_sequence)
@@ -204,13 +215,13 @@ def test_real_active_poll_resets_invalid_side_and_calls_callback_only_after_new_
     watcher._poll_active_signals(open_protect_active=False)
     assert watched.breach_count == 1
     watcher._poll_active_signals(open_protect_active=False)
-    assert watched.breach_count == 0
+    # HOLD: missing side must not reset continuity.
+    assert watched.breach_count == 1
     assert watched.last_trigger_evidence_reason.endswith(
         "_ASK" if side == "CALL" else "_BID"
     )
-    watcher._poll_active_signals(open_protect_active=False)
-    assert watched.breach_count == 1
     assert callback.call_count == 0
+
     watcher._poll_active_signals(open_protect_active=False)
 
     assert callback.call_count == 1
@@ -446,19 +457,20 @@ def test_put_confirmed_retry_pending_missing_bid_stays_pending_when_stop_intact(
 
 
 @pytest.mark.parametrize("side", ["CALL", "PUT"])
-def test_pre_confirmation_missing_quote_still_returns_early_and_resets(side):
+def test_pre_confirmation_missing_quote_holds_and_falls_through(side):
     """Regression guard: the PRE-confirmation path (trigger_crossed_at is
-    still None) must retain its original OBSERVABLE outcome exactly —
-    pending-breach continuity reset, state PENDING, no trigger evidence.
+    still None) must retain its original OBSERVABLE non-early-return
+    behavior — falling through to intraday stale-move / lifecycle-safety
+    checks — while breach continuity itself is HELD, not reset (PR #494).
 
-    NOTE (amendment 3 / Blocker 2): internally this path no longer
-    `return`s immediately — it now falls through to the intraday
-    stale-move check and other lifecycle-safety checks (see
+    NOTE (amendment 3 / Blocker 2): internally this path does not
+    `return` immediately — it falls through to the intraday stale-move
+    check and other lifecycle-safety checks (see
     test_pre_confirm_call_stale_safety_reachable_despite_missing_ask and
     its PUT mirror below). For a signal with no stale-move condition
-    present (as here), the externally observable result is identical to
-    the pre-amendment-3 behavior, which is exactly what this test still
-    asserts.
+    present (as here), the externally observable state is PENDING with
+    the pending breach streak preserved (PR #494 HOLD semantics), not
+    reset as it was pre-#494.
     """
     watched = WatchedSignal(_signal(side=side), overnight=False)
     first_quote = (99.0, 100.0) if side == "CALL" else (100.0, 101.0)
@@ -471,9 +483,8 @@ def test_pre_confirmation_missing_quote_still_returns_early_and_resets(side):
     result = watched.check(*invalid_quote)
 
     assert result == WatchState.PENDING
-    assert watched.breach_count == 0
-    assert watched._pending_first_breach_at is None
-    assert watched.breach_price == 0.0
+    assert watched.breach_count == 1
+    assert watched._pending_first_breach_at is not None
     assert watched.trigger_price is None
     assert watched.trigger_crossed_at is None
 
@@ -651,8 +662,9 @@ def test_pre_confirm_put_stale_safety_reachable_despite_missing_bid():
 
 
 @pytest.mark.parametrize("side", ["CALL", "PUT"])
-def test_pre_confirm_invalid_quote_no_stale_condition_stays_pending(side):
-    """PRE-CONFIRM INVALID QUOTE, NO STALE CONDITION (regression test 9)."""
+def test_pre_confirm_missing_quote_no_stale_condition_holds_pending(side):
+    """PRE-CONFIRM MISSING QUOTE, NO STALE CONDITION (regression test 9,
+    updated for PR #494 HOLD semantics)."""
     watched = WatchedSignal(_signal(side=side), overnight=False)
     first_quote = (99.0, 100.0) if side == "CALL" else (100.0, 101.0)
     watched.check(*first_quote)
@@ -660,12 +672,12 @@ def test_pre_confirm_invalid_quote_no_stale_condition_stays_pending(side):
     assert watched._pending_first_breach_at is not None
 
     # Not enough time watching to trip the stale-move check at all.
-    invalid_quote = (99.0, None) if side == "CALL" else (None, 101.0)
-    result = watched.check(*invalid_quote)
+    missing_quote = (99.0, None) if side == "CALL" else (None, 101.0)
+    result = watched.check(*missing_quote)
 
     assert result == WatchState.PENDING
-    assert watched.breach_count == 0
-    assert watched._pending_first_breach_at is None
+    assert watched.breach_count == 1
+    assert watched._pending_first_breach_at is not None
     assert watched.trigger_crossed_at is None
 
 

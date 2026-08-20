@@ -588,6 +588,26 @@ class WatchState:
     CANCELLED = "CANCELLED"
 
 
+# PR #494 final merge-gate amendment: pre-confirmation partial breach
+# continuity (see WatchedSignal.check()) may HOLD across a missing/unusable
+# canonical quote observation only within this bounded gap, measured from
+# the most recent VALID authoritative canonical breach observation — not
+# from the number of missing polls encountered. Beyond this gap, stale
+# partial breach evidence is discarded and a later valid breach begins a
+# brand-new first-observation streak rather than combining with the stale
+# one. This is a safety invariant, not an operational trade-frequency
+# knob, so it is a fixed module constant rather than env-tunable (unlike
+# most other watcher thresholds in this file) — see amendment section 4.
+#
+# 45s default: the watcher poll loop does work then sleeps ~POLL_INTERVAL_SEC
+# (~15s), so real observation spacing is ~15s plus poll/work duration, not an
+# exact 15.000s cadence. 45s comfortably covers two-to-three ordinary poll
+# intervals plus jitter/one transient canonical-quote interruption, while
+# still bounding how long stale partial evidence can survive a meaningfully
+# prolonged outage before LIVE entry confirmation.
+WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC = 45
+
+
 class WatchedSignal:
     MOMENTUM_POLLS_REQUIRED = 2
 
@@ -682,6 +702,16 @@ class WatchedSignal:
 
         self.breach_count = 0
         self.breach_price = 0.0
+        # PR #494 final amendment: process-local, non-durable timestamp of
+        # the most recent VALID authoritative canonical breach observation
+        # that contributed to the current pre-confirmation breach streak.
+        # Used only to bound how long a missing/unusable canonical
+        # observation (or a delayed-but-valid later observation) may still
+        # combine with prior partial breach continuity — see check() for
+        # the bounded-continuity state model. Never persisted; a restart
+        # without a confirmed trigger_crossed_at naturally loses this, which
+        # is intentional (see amendment section 5).
+        self._last_valid_breach_observation_at: Optional[datetime] = None
         self.last_quote_bid = 0.0
         self.last_quote_ask = 0.0
         self.last_quote_bid_raw = None
@@ -806,6 +836,43 @@ class WatchedSignal:
         except Exception:
             pass
 
+    def _reset_pending_breach_continuity(self) -> None:
+        """PR #494 final merge-gate amendment: discard PRE-CONFIRMATION
+        partial breach evidence.
+
+        Scoped exclusively to abandoning stale or superseded pre-
+        confirmation breach continuity inside check(). Must NOT be reused
+        for post-confirmation lifecycle, trigger/stop collision, late-
+        attachment, rearm, or invalidation resets elsewhere in this file —
+        those have independent semantics and must keep their own explicit
+        assignments (see amendment section 6: "audit every changed call
+        site individually; do not blindly replace every breach_count = 0").
+        """
+        self.breach_count = 0
+        self._pending_first_breach_at = None
+        self.breach_price = 0.0
+        self.first_breach_bid = 0.0
+        self.first_breach_ask = 0.0
+        self.trigger_price = None
+        self._last_valid_breach_observation_at = None
+
+    def _get_watcher_now(self) -> datetime:
+        """PR #494 final merge-gate amendment: single, narrow clock seam
+        used only by check()'s bounded-continuity comparisons.
+
+        Default behavior is exactly datetime.now(timezone.utc) — identical
+        to every other timestamp call in this file. Exists solely so
+        deterministic tests can freeze/control time for one WatchedSignal
+        instance (via instance-level monkeypatching of this bound method)
+        without needing to patch the module-level `datetime` name, which
+        interacts unreliably with CPython's specialized global-lookup
+        bytecode caching for this kind of module-level class rebinding.
+        This is intentionally NOT a general clock abstraction: it has no
+        side effects, is not used anywhere else in this file, and does not
+        modify any other module (see amendment section 11).
+        """
+        return datetime.now(timezone.utc)
+
     def check(self, bid: float, ask: float, quote_age_ms: Optional[int] = None) -> str:
         # PR-C precedence note: when ask >= trigger AND bid <= stop on the
         # SAME poll tick, the breach check runs FIRST (may set
@@ -816,7 +883,7 @@ class WatchedSignal:
         # add an early-return after TRIGGERED — the current precedence is
         # intentional. See tests/test_entry_watcher_audit.py
         # TestPrecedenceTriggerVsStop for the structural guarantee.
-        now = datetime.now(timezone.utc)
+        now = self._get_watcher_now()
         _raw_bid = bid
         _raw_ask = ask
         _bid_quote = _valid_positive_finite_quote(bid)
@@ -889,28 +956,116 @@ class WatchedSignal:
             # established that the confirmed path must not reset anything).
             _suppress_entry_breach_evidence = True
             if not _already_confirmed:
-                # Pre-confirmation: an unavailable poll breaks continuity.
-                # Do not let a valid first observation combine with a later
-                # valid observation. This no longer returns early — see
-                # amendment 3 note above.
-                self.breach_count = 0
-                self._pending_first_breach_at = None
-                self.breach_price = 0.0
-                self.first_breach_bid = 0.0
-                self.first_breach_ask = 0.0
-                self.trigger_price = None
-                log.debug(
-                    "[%s] %s — side=%s raw_bid=%r raw_ask=%r "
-                    "trigger_valid=%s pending_breach_reset=True "
-                    "(continuing to lifecycle-safety checks; not an "
-                    "early return)",
-                    self.ticker,
-                    _reason_code,
-                    self.side,
-                    _raw_bid,
-                    _raw_ask,
-                    _entry_trigger is not None,
-                )
+                # PR #494 (final amendment): pre-confirmation absence of
+                # usable required-side trigger evidence must HOLD existing
+                # breach continuity ONLY within a bounded temporal window
+                # (WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC), measured from the
+                # most recent VALID authoritative canonical breach
+                # observation — not from the number of missing polls. Absence
+                # of truth is not contradictory truth, so a missing poll
+                # never RESETS on its own; but stale partial evidence must
+                # not survive an unbounded outage either. Three cases:
+                #   (8A) no partial breach exists (breach_count == 0):
+                #        remain PENDING; nothing to hold or expire.
+                #   (8B) partial breach exists and is still within the
+                #        bounded gap: HOLD — do not increment, do not
+                #        reset, do not clear first-breach evidence, do not
+                #        manufacture a trigger price.
+                #   (8C) partial breach exists but has gone stale (no
+                #        recorded last-valid-observation time, or elapsed
+                #        exceeds the bounded gap): discard the stale partial
+                #        continuity now via _reset_pending_breach_continuity
+                #        so a later valid breach begins a brand-new first
+                #        observation rather than silently combining with
+                #        expired evidence (see the CALL/PUT breach blocks
+                #        below, which independently re-check staleness on
+                #        the next valid observation as a defense-in-depth
+                #        backstop for the case where the very next poll
+                #        after expiry is itself already a valid breach).
+                # Entry-breach evidence is suppressed for this poll only
+                # (via _suppress_entry_breach_evidence above) in every case.
+                if self.breach_count == 0:
+                    # (8A) Fail-safe: clear an inconsistent stale timer if
+                    # one somehow exists while there is no partial breach
+                    # to anchor it to. Should not occur in normal operation.
+                    if self._last_valid_breach_observation_at is not None:
+                        self._last_valid_breach_observation_at = None
+                    log.debug(
+                        "[%s] %s — side=%s raw_bid=%r raw_ask=%r "
+                        "trigger_valid=%s no_partial_breach_pending=True "
+                        "(nothing to hold or expire; continuing to "
+                        "lifecycle-safety checks; not an early return)",
+                        self.ticker,
+                        _reason_code,
+                        self.side,
+                        _raw_bid,
+                        _raw_ask,
+                        _entry_trigger is not None,
+                    )
+                else:
+                    _continuity_elapsed_sec = None
+                    if self._last_valid_breach_observation_at is not None:
+                        _continuity_elapsed_sec = (
+                            now - self._last_valid_breach_observation_at
+                        ).total_seconds()
+                    # Fail-closed against backward clock movement (audit
+                    # blocker 3): a negative elapsed value — wall-clock
+                    # correction, VM state restore, clock-sync anomaly —
+                    # must never be treated as "fresh." Require
+                    # 0 <= elapsed <= MAX_GAP explicitly rather than only
+                    # elapsed <= MAX_GAP; an unbounded-below freshness
+                    # check is fail-open for a LIVE confirmation timer.
+                    _continuity_fresh = (
+                        _continuity_elapsed_sec is not None
+                        and 0.0
+                        <= _continuity_elapsed_sec
+                        <= WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
+                    )
+                    if _continuity_fresh:
+                        # (8B) HOLD — contributes nothing, neither positive
+                        # nor negative, to confirmation continuity.
+                        log.debug(
+                            "[%s] %s — side=%s raw_bid=%r raw_ask=%r "
+                            "trigger_valid=%s pending_breach_hold=True "
+                            "continuity_age_sec=%.1f continuity_max_gap_sec=%d "
+                            "(no usable required-side observation; breach "
+                            "continuity held unchanged within bounded gap; "
+                            "continuing to lifecycle-safety checks; not an "
+                            "early return)",
+                            self.ticker,
+                            _reason_code,
+                            self.side,
+                            _raw_bid,
+                            _raw_ask,
+                            _entry_trigger is not None,
+                            _continuity_elapsed_sec,
+                            WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC,
+                        )
+                    else:
+                        # (8C) Stale — discard partial continuity now. The
+                        # watcher remains PENDING (not terminalized) and
+                        # waits for a completely fresh valid first breach.
+                        log.info(
+                            "[%s] WATCHER_BREACH_CONTINUITY_EXPIRED — side=%s "
+                            "raw_bid=%r raw_ask=%r continuity_age_sec=%s "
+                            "continuity_max_gap_sec=%d stale_breach_count=%d "
+                            "(missing canonical evidence and prior partial "
+                            "breach exceeded bounded continuity; discarding "
+                            "stale partial evidence; watcher remains PENDING "
+                            "awaiting a fresh first breach)",
+                            self.ticker,
+                            self.side,
+                            _raw_bid,
+                            _raw_ask,
+                            (
+                                f"{_continuity_elapsed_sec:.1f}"
+                                if _continuity_elapsed_sec is not None
+                                else "unknown"
+                            ),
+                            WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC,
+                            self.breach_count,
+                        )
+                        self._reset_pending_breach_continuity()
             else:
                 # Already-confirmed lifecycle (e.g. a callback-driven retry
                 # returned this watcher to PENDING): do NOT reset breach
@@ -1278,6 +1433,53 @@ class WatchedSignal:
             # which is independently gated on _bid_quote validity.
             if not _suppress_entry_breach_evidence:
                 if _ask_quote is not None and ask >= self.entry_trigger:
+                    # PR #494 (final amendment): before treating this valid
+                    # breach as continuing the existing pre-confirmation
+                    # streak, verify that streak's continuity has not gone
+                    # stale. This is the backstop for the case where the
+                    # very next processed observation after a prolonged gap
+                    # is itself already a valid breach — the timeout must
+                    # apply on ELAPSED TIME regardless of whether an
+                    # intermediate missing poll was ever processed. If
+                    # stale, discard the old partial evidence FIRST so this
+                    # observation begins a brand-new first-breach streak
+                    # rather than silently combining with expired evidence.
+                    if self.trigger_crossed_at is None and self.breach_count > 0:
+                        _continuity_elapsed_sec = None
+                        if self._last_valid_breach_observation_at is not None:
+                            _continuity_elapsed_sec = (
+                                now - self._last_valid_breach_observation_at
+                            ).total_seconds()
+                        # Fail-closed against backward clock movement
+                        # (audit blocker 3): stale on missing anchor, on
+                        # exceeding the gap, OR on a negative elapsed value
+                        # — never let backward clock movement be read as
+                        # "fresh" and silently confirm a LIVE entry.
+                        if (
+                            _continuity_elapsed_sec is None
+                            or _continuity_elapsed_sec < 0.0
+                            or _continuity_elapsed_sec
+                            > WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
+                        ):
+                            log.info(
+                                "[%s] WATCHER_BREACH_CONTINUITY_EXPIRED — "
+                                "side=CALL ask=$%.2f continuity_age_sec=%s "
+                                "continuity_max_gap_sec=%d stale_breach_count=%d "
+                                "(next observation is itself a valid breach "
+                                "but prior partial continuity exceeded the "
+                                "bounded gap; discarding stale evidence; this "
+                                "observation becomes a new first breach)",
+                                self.ticker,
+                                ask,
+                                (
+                                    f"{_continuity_elapsed_sec:.1f}"
+                                    if _continuity_elapsed_sec is not None
+                                    else "unknown"
+                                ),
+                                WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC,
+                                self.breach_count,
+                            )
+                            self._reset_pending_breach_continuity()
                     if self.breach_count == 0:
                         self.breach_price = ask
                         # PR #407: durable trigger_crossed_at proof is issued ONLY
@@ -1294,6 +1496,11 @@ class WatchedSignal:
                             self.entry_trigger,
                         )
                     self.breach_count += 1
+                    # PR #494: record this valid observation as the anchor
+                    # for the bounded continuity window. Harmless to set
+                    # post-confirmation too — the timer is ignored once
+                    # trigger_crossed_at is set (amendment section 13).
+                    self._last_valid_breach_observation_at = now
                     if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
                         # PR #407: confirmation promotes the pending first-breach
                         # timestamp into the durable trigger_crossed_at proof.
@@ -1320,6 +1527,12 @@ class WatchedSignal:
                     if self.breach_count > 0:
                         log.debug("[%s] CALL breach reset — ask=$%.2f pulled back", self.ticker, ask)
                     self.breach_count = 0
+                    # PR #494: a genuine valid contradiction always defeats
+                    # prior partial momentum immediately — no grace period,
+                    # no bounded-gap consideration. Clear the continuity
+                    # anchor along with breach_count (existing minimal-reset
+                    # scope preserved; see amendment section 9).
+                    self._last_valid_breach_observation_at = None
 
             # FUNNEL FIX (2026-05-20): for overnight + daily setups, do NOT
             # invalidate on a pre-market stop touch. Pre-open spreads are wide
@@ -1446,6 +1659,42 @@ class WatchedSignal:
             # check, which is independently gated on _ask_quote validity.
             if not _suppress_entry_breach_evidence:
                 if _bid_quote is not None and bid <= self.entry_trigger:
+                    # PR #494 (final amendment): mirror of the CALL staleness
+                    # backstop above — see that block's comment for the full
+                    # rationale.
+                    if self.trigger_crossed_at is None and self.breach_count > 0:
+                        _continuity_elapsed_sec = None
+                        if self._last_valid_breach_observation_at is not None:
+                            _continuity_elapsed_sec = (
+                                now - self._last_valid_breach_observation_at
+                            ).total_seconds()
+                        # Fail-closed against backward clock movement
+                        # (audit blocker 3) — see CALL branch above.
+                        if (
+                            _continuity_elapsed_sec is None
+                            or _continuity_elapsed_sec < 0.0
+                            or _continuity_elapsed_sec
+                            > WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
+                        ):
+                            log.info(
+                                "[%s] WATCHER_BREACH_CONTINUITY_EXPIRED — "
+                                "side=PUT bid=$%.2f continuity_age_sec=%s "
+                                "continuity_max_gap_sec=%d stale_breach_count=%d "
+                                "(next observation is itself a valid breach "
+                                "but prior partial continuity exceeded the "
+                                "bounded gap; discarding stale evidence; this "
+                                "observation becomes a new first breach)",
+                                self.ticker,
+                                bid,
+                                (
+                                    f"{_continuity_elapsed_sec:.1f}"
+                                    if _continuity_elapsed_sec is not None
+                                    else "unknown"
+                                ),
+                                WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC,
+                                self.breach_count,
+                            )
+                            self._reset_pending_breach_continuity()
                     if self.breach_count == 0:
                         self.breach_price = bid
                         # PR #407: see CALL branch — pending until confirmed.
@@ -1459,6 +1708,9 @@ class WatchedSignal:
                             self.entry_trigger,
                         )
                     self.breach_count += 1
+                    # PR #494: see CALL branch — anchor for the bounded
+                    # continuity window; ignored post-confirmation.
+                    self._last_valid_breach_observation_at = now
                     if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
                         # PR #407: confirmation promotes pending timestamp.
                         if self.trigger_crossed_at is None:
@@ -1481,6 +1733,9 @@ class WatchedSignal:
                     if self.breach_count > 0:
                         log.debug("[%s] PUT breach reset — bid=$%.2f pulled back", self.ticker, bid)
                     self.breach_count = 0
+                    # PR #494: see CALL branch — valid contradiction always
+                    # resets immediately, no bounded-gap grace period.
+                    self._last_valid_breach_observation_at = None
 
             # FUNNEL FIX (2026-05-20): same pre-open guard for PUT setups.
             # HOTFIX (2026-08-05): see CALL branch — dormant only pre-breach;

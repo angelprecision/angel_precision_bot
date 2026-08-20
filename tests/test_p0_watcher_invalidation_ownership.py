@@ -1274,6 +1274,15 @@ class TestProductionPathRegressions:
         watched.entry_trigger = 450.0
         watched.stop_level = 440.0
         watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+        # PR #494 final amendment: this staged partial breach needs a
+        # matching continuity anchor, or the new bounded-continuity check
+        # in WatchedSignal.check() correctly treats a breach_count > 0 with
+        # no recorded _last_valid_breach_observation_at as STALE (explicit,
+        # intentional behavior — see amendment section 7C) and discards it
+        # as a new first observation before the confirming poll below,
+        # which would leave new_state at PENDING instead of TRIGGERED and
+        # never reach the open-protection-block path this test exercises.
+        watched._last_valid_breach_observation_at = datetime.now(timezone.utc)
         w._open_trigger_tickers.add("SPY")
 
         def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:
