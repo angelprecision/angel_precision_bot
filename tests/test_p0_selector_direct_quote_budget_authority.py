@@ -1312,6 +1312,31 @@ class TestJuly23FleetAcceptanceReplay:
                 if selected is None:
                     failure = plan["metadata"]["selector_failure"]
                     diagnostics = failure["selection_diagnostics"]
+                    # PR #491 accounting-gap closure (2026-08-20): this test's
+                    # own request_context construction above does not thread
+                    # recovery_cursor_persist, so any candidate genuinely
+                    # direct-quote-attempted within this real select() pass
+                    # was already invisible to the durable recovery cursor --
+                    # and therefore to resolve_selector_recovery_final_reason's
+                    # attempted_results evidence -- even before this PR. #491
+                    # now also threads request_context.direct_quote_eligible_
+                    # symbols (populated live, unconditionally, at both the
+                    # structural-skip and direct-quote-attempt branches) as
+                    # an independent accounting cross-check; when it reveals
+                    # a candidate unaccounted for by structural/attempted/
+                    # eligible evidence, the resolver correctly refuses to
+                    # claim exhaustive structural/budget proof and instead
+                    # surfaces the truthful CHAIN_ROW_ZERO_BID_ASK reason
+                    # (a real, correctly-classified RETRYABLE_DATA code --
+                    # see ap/selector_retry_policy.py's policy table) rather
+                    # than the (potentially false, evidence-incomplete)
+                    # structural/budget conclusion this assertion set
+                    # previously accepted unconditionally. This is a
+                    # truthfulness improvement, not a weakening: the fixture
+                    # logs above ("rejections: zero_bid_or_ask(40),
+                    # DIRECT_QUOTE_ZERO_BID_ASK(8)") show real attempted
+                    # candidates existed and were previously silently
+                    # unaccounted for by this test's evidence flow.
                     assert failure["reason_code"] in {
                         "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                         "MONEYNESS_OUT_OF_RANGE",
@@ -1319,6 +1344,7 @@ class TestJuly23FleetAcceptanceReplay:
                         "DTE_OUT_OF_RANGE",
                         "NO_AFFORDABLE_CONTRACT",
                         "PREMIUM_CAP_EXCEEDED",
+                        "CHAIN_ROW_ZERO_BID_ASK",
                     }
                     assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
                     assert (

@@ -699,3 +699,115 @@ def test_july27_replay_is_runtime_not_a_typed_expected_table():
     assert "broker.get_quote.call_count" in source
     assert "record_selector_recovery_attempt" in source
     assert "resolve_selector_recovery_final_reason" in source
+
+
+# ── PR #491 adjacency: #491 owns selector-recovery TRUTH only; #474's ───────
+# real-cost/broker authority remains entirely downstream, untouched, and
+# authoritative. Narrow, uses the existing deferred-lifecycle harness in
+# this file (resolve_selector_recovery_final_reason + the real production
+# downstream classifier _classify_deferred_breach_retry_decision) rather
+# than duplicating the full #474 test suite.
+
+def test_pr491_survivor_reason_continues_existing_durable_retry_lifecycle():
+    """A candidate-level structural reject that does NOT exhaust the full
+    candidate set (PR #491's fix) must still flow into the SAME existing
+    downstream retry classifier #474 depends on, and must be scheduled for
+    retry rather than terminalized -- proving #491 only changed which
+    reason the resolver reports, not how the rest of the deferred lifecycle
+    consumes that reason."""
+    evidence = {
+        "structural_skip_results": {
+            "SPY260102C00500000": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        },
+        "attempted_results": {
+            "SPY260102C00505000": {
+                "result_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
+                "attempt_number": 1,
+            },
+        },
+        "eligible_unattempted_symbols": [],
+    }
+    reason = resolve_selector_recovery_final_reason(evidence)
+    # Pre-#491, this evidence shape produced the false request-level
+    # MONEYNESS_OUT_OF_RANGE terminal reason.
+    assert reason == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+    decision = _classify_deferred_breach_retry_decision(
+        reason,
+        queue_local_order_id="jason-491-adjacency-1",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+    # The survivor continues into the EXISTING durable retry lifecycle --
+    # #491 does not invent a new lifecycle action, own a new retry owner,
+    # or touch retry-count/cutoff/enabled semantics.
+    assert decision["action"] == "retry_schedule"
+    assert decision["retryable_reason"] is True
+
+
+def test_pr491_exhaustive_structural_set_still_terminalizes_downstream():
+    """The complementary case: when PR #491's exhaustive-proof condition IS
+    met (every known candidate agrees on the same structural reason), the
+    resulting reason must still correctly terminalize downstream -- PR #491
+    did not weaken any quality gate, it only tightened WHEN a structural
+    reason may be promoted to request-level truth."""
+    evidence = {
+        "structural_skip_results": {
+            "SPY260102C00500000": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            "SPY260102C00505000": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        },
+    }
+    reason = resolve_selector_recovery_final_reason(evidence)
+    assert reason == "MONEYNESS_OUT_OF_RANGE"
+
+    decision = _classify_deferred_breach_retry_decision(
+        reason,
+        queue_local_order_id="jason-491-adjacency-2",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+    assert decision["action"] == "terminal_quality"
+    assert decision["retryable_reason"] is False
+
+
+def test_pr491_resolver_module_has_zero_broker_or_mutation_authority():
+    """Static adjacency proof: the module implementing PR #491 must import
+    nothing from the broker, order-mutation, position, proof-trade, or
+    queue-ownership surfaces. #474's final real-cost/broker authority stays
+    entirely downstream of this resolver."""
+    import ap.selector_retry_policy as srp
+
+    source = inspect.getsource(srp)
+    forbidden_substrings = (
+        "import tradier",
+        "from ap.brokers",
+        "place_order",
+        "submit_order",
+        "cancel_order",
+        "positions.py",
+        "proof_trades",
+        "master_control",
+        "order_state_machine",
+    )
+    lowered = source.lower()
+    for forbidden in forbidden_substrings:
+        assert forbidden not in lowered, f"unexpected authority reference: {forbidden}"
+
+
+def test_pr491_only_production_call_site_is_deferred_breach_gated():
+    """Repository-wide static control: resolve_selector_recovery_final_reason
+    must have exactly one real production call site, and it must be gated on
+    SELECTOR_REQUEST_KIND_DEFERRED_BREACH so ordinary (non-deferred) selector
+    requests never reach this reducer at all."""
+    import ap.contract_selector as cs
+
+    source = inspect.getsource(cs)
+    call_count = source.count("resolve_selector_recovery_final_reason(")
+    assert call_count == 1
+    call_index = source.index("resolve_selector_recovery_final_reason(")
+    preceding = source[:call_index]
+    assert "SELECTOR_REQUEST_KIND_DEFERRED_BREACH" in preceding[-1200:]
