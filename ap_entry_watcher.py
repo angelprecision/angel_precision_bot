@@ -1008,9 +1008,17 @@ class WatchedSignal:
                         _continuity_elapsed_sec = (
                             now - self._last_valid_breach_observation_at
                         ).total_seconds()
+                    # Fail-closed against backward clock movement (audit
+                    # blocker 3): a negative elapsed value — wall-clock
+                    # correction, VM state restore, clock-sync anomaly —
+                    # must never be treated as "fresh." Require
+                    # 0 <= elapsed <= MAX_GAP explicitly rather than only
+                    # elapsed <= MAX_GAP; an unbounded-below freshness
+                    # check is fail-open for a LIVE confirmation timer.
                     _continuity_fresh = (
                         _continuity_elapsed_sec is not None
-                        and _continuity_elapsed_sec
+                        and 0.0
+                        <= _continuity_elapsed_sec
                         <= WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
                     )
                     if _continuity_fresh:
@@ -1442,8 +1450,14 @@ class WatchedSignal:
                             _continuity_elapsed_sec = (
                                 now - self._last_valid_breach_observation_at
                             ).total_seconds()
+                        # Fail-closed against backward clock movement
+                        # (audit blocker 3): stale on missing anchor, on
+                        # exceeding the gap, OR on a negative elapsed value
+                        # — never let backward clock movement be read as
+                        # "fresh" and silently confirm a LIVE entry.
                         if (
                             _continuity_elapsed_sec is None
+                            or _continuity_elapsed_sec < 0.0
                             or _continuity_elapsed_sec
                             > WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
                         ):
@@ -1654,8 +1668,11 @@ class WatchedSignal:
                             _continuity_elapsed_sec = (
                                 now - self._last_valid_breach_observation_at
                             ).total_seconds()
+                        # Fail-closed against backward clock movement
+                        # (audit blocker 3) — see CALL branch above.
                         if (
                             _continuity_elapsed_sec is None
+                            or _continuity_elapsed_sec < 0.0
                             or _continuity_elapsed_sec
                             > WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
                         ):

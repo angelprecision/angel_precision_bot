@@ -317,6 +317,94 @@ def test_K_exact_boundary_fresh_vs_stale():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# TEST K2 (audit blocker 3) — backward clock movement must never be read
+# as "fresh." A negative elapsed value (wall-clock correction, VM state
+# restore, clock-sync anomaly between polls) must fail closed to STALE on
+# both the missing-observation HOLD path and the valid-breach staleness
+# backstop, for both CALL and PUT. Without this, a first breach at T0
+# followed by a second valid breach observed at a wall-clock time BEFORE
+# T0 would satisfy `elapsed <= MAX_GAP` (since -10 <= 45) and could
+# silently confirm a LIVE entry — the exact scenario identified in the
+# final merge-gate audit.
+# ─────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    ("side", "breach_quote", "second_breach_quote"),
+    [
+        ("CALL", (99.0, 100.05), (99.0, 100.06)),
+        ("PUT", (100.0, 101.0), (99.94, 101.0)),
+    ],
+)
+def test_K2_negative_elapsed_valid_breach_backstop_fails_closed(
+    side, breach_quote, second_breach_quote
+):
+    """First breach at T0; second valid breach observed at a wall-clock
+    time BEFORE T0 (backward clock movement). Must be treated as stale —
+    new first breach, no confirmation — never as fresh."""
+    watched = WatchedSignal(_signal(side=side), overnight=False)
+
+    r1 = _check_at(watched, T0, *breach_quote)
+    assert r1 == WatchState.PENDING
+    assert watched.breach_count == 1
+
+    t_backward = T0 - _dt.timedelta(seconds=10)  # 10s BEFORE the first breach
+    r2 = _check_at(watched, t_backward, *second_breach_quote)
+
+    assert r2 == WatchState.PENDING  # must NOT confirm
+    assert watched.breach_count == 1  # new first breach, not count=2
+    assert watched.trigger_crossed_at is None
+    assert watched._pending_first_breach_at == t_backward
+    assert watched._last_valid_breach_observation_at == t_backward
+
+
+@pytest.mark.parametrize(
+    ("side", "breach_quote", "missing_quote"),
+    [
+        ("CALL", (99.0, 100.05), (99.0, None)),
+        ("PUT", (100.0, 101.0), (None, 101.0)),
+    ],
+)
+def test_K2_negative_elapsed_missing_observation_path_fails_closed(
+    side, breach_quote, missing_quote
+):
+    """First breach at T0; a missing/unusable observation is then
+    processed at a wall-clock time BEFORE T0 (backward clock movement).
+    Must be treated as stale and reset — never held as fresh."""
+    watched = WatchedSignal(_signal(side=side), overnight=False)
+
+    _check_at(watched, T0, *breach_quote)
+    assert watched.breach_count == 1
+
+    t_backward = T0 - _dt.timedelta(seconds=10)
+    r2 = _check_at(watched, t_backward, *missing_quote)
+
+    assert r2 == WatchState.PENDING
+    assert watched.breach_count == 0  # reset, not held
+    assert watched._last_valid_breach_observation_at is None
+
+
+@pytest.mark.parametrize("side", ["CALL", "PUT"])
+def test_K2_negative_elapsed_within_absolute_value_of_gap_still_stale(side):
+    """Sanity check that the fail-closed comparison is a genuine `>= 0`
+    floor and not merely `abs(elapsed) <= MAX_GAP` in disguise: an
+    elapsed value whose magnitude is well within the bounded gap, but
+    whose sign is negative, must still be stale."""
+    watched = WatchedSignal(_signal(side=side), overnight=False)
+    breach_quote = (99.0, 100.05) if side == "CALL" else (100.0, 101.0)
+    second_quote = (99.0, 100.06) if side == "CALL" else (99.94, 101.0)
+
+    _check_at(watched, T0, *breach_quote)
+    assert watched.breach_count == 1
+
+    # Only 1 second backward — well within the 45s magnitude, but negative.
+    t_backward_small = T0 - _dt.timedelta(seconds=1)
+    r2 = _check_at(watched, t_backward_small, *second_quote)
+
+    assert r2 == WatchState.PENDING
+    assert watched.breach_count == 1  # new first breach, NOT count=2
+    assert watched.trigger_crossed_at is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # TEST L — confirmed lifecycle is unaffected by the bounded-gap timer even
 # across a span far exceeding MAX_GAP.
 # ─────────────────────────────────────────────────────────────────────────
@@ -445,6 +533,130 @@ def test_O_exported_package_path_short_gap_and_long_gap():
     assert r2 == fresh_module.WatchState.PENDING
     assert w2.breach_count == 1  # new first breach, not confirmation
     assert w2.trigger_crossed_at is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# TEST O2 (audit blocker 2) — the real shim poll-loop path for LAST-only
+# quotes, not just a direct WatchedSignal.check() call.
+#
+# APEntryWatcher._poll_active_signals() (the shim override in
+# ap_entry_watcher/__init__.py) wraps _fetch_quotes so that any LAST-only
+# quote (bid<=0 and ask<=0 and last>0) is replaced with an empty dict for
+# that ticker before the base poll loop runs. The shim's own inline
+# comment claims this "makes the legacy poll loop skip this ticker" — that
+# claim was verified EMPIRICALLY DURING AUDIT to be stale/inaccurate: the
+# base loop does not skip the ticker. It coerces the empty quote to {},
+# extracts bid=None/ask=None, and calls WatchedSignal.check(None, None,
+# ...) exactly as it would for any other missing-observation poll (proven
+# by spying directly on check() call arguments through the real
+# _poll_active_signals() -> hardened _fetch_quotes -> base-loop path).
+# Expiry is therefore immediate/active on the LAST-only poll itself, not
+# lazily deferred to a later poll. This test drives the real production
+# entrypoint end to end (not a direct check() call) for both the
+# short-gap-holds and long-gap-expires-immediately cases.
+# ─────────────────────────────────────────────────────────────────────────
+def _shim_watcher(side="CALL", quote_sequence=None):
+    osm = MagicMock()
+    osm.update_order_meta.return_value = True
+    broker = MagicMock()
+    watcher = APEntryWatcher(
+        broker, order_state_machine=osm, require_on_trigger=False, mode="PAPER"
+    )
+    watched = WatchedSignal(_signal(side=side), overnight=False)
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    watcher._dedup_set.add(watched.signal_id)
+    watcher._persist_watcher_audit = MagicMock()
+    if quote_sequence is not None:
+        seq = iter(quote_sequence)
+        watcher._fetch_quotes = lambda tickers: {"SPY": next(seq)}
+    return watcher, watched
+
+
+def test_O2_real_shim_poll_loop_last_only_short_gap_holds():
+    quotes = [
+        {"bid": 99.0, "ask": 100.05},          # t=0: valid breach
+        {"bid": 0, "ask": 0, "last": 105.0},   # t=+20s: LAST-only, within gap
+        {"bid": 99.0, "ask": 100.06},          # t=+30s: confirms
+    ]
+    watcher, watched = _shim_watcher("CALL", quotes)
+    callback = MagicMock(return_value={"disposition": "KEEP_WATCHER"})
+    watcher.on_trigger = callback
+
+    # Spy on check() to prove it IS called on the LAST-only poll — not
+    # skipped — with the exact arguments the shim's hardened fetch
+    # produces (None, None), disproving the shim's own stale comment.
+    orig_check = watched.check
+    call_log = []
+
+    def _spy_check(bid, ask, quote_age_ms=None):
+        call_log.append((bid, ask))
+        return orig_check(bid, ask, quote_age_ms=quote_age_ms)
+
+    watched.check = _spy_check
+
+    with patch.object(watched, "_get_watcher_now", return_value=T0):
+        watcher._poll_active_signals(open_protect_active=False)
+    assert watched.breach_count == 1
+
+    with patch.object(
+        watched, "_get_watcher_now", return_value=T0 + _dt.timedelta(seconds=20)
+    ):
+        watcher._poll_active_signals(open_protect_active=False)
+    # Proves check() WAS called (not skipped) with the hardened (None, None).
+    assert call_log[-1] == (None, None)
+    assert watched.breach_count == 1  # HOLD — within the bounded gap
+    assert callback.call_count == 0
+
+    with patch.object(
+        watched, "_get_watcher_now", return_value=T0 + _dt.timedelta(seconds=30)
+    ):
+        watcher._poll_active_signals(open_protect_active=False)
+
+    assert callback.call_count == 1
+    assert watched.breach_count == 2
+    assert watched.trigger_crossed_at is not None
+
+
+def test_O2_real_shim_poll_loop_last_only_long_gap_expires_immediately():
+    quotes = [
+        {"bid": 99.0, "ask": 100.05},          # t=0: valid breach
+        {"bid": 0, "ask": 0, "last": 105.0},   # t=+60s: LAST-only, beyond gap
+        {"bid": 99.0, "ask": 100.06},          # t=+61s: fresh first breach
+    ]
+    watcher, watched = _shim_watcher("CALL", quotes)
+    callback = MagicMock(return_value={"disposition": "KEEP_WATCHER"})
+    watcher.on_trigger = callback
+
+    with patch.object(watched, "_get_watcher_now", return_value=T0):
+        watcher._poll_active_signals(open_protect_active=False)
+    assert watched.breach_count == 1
+
+    with patch.object(
+        watched,
+        "_get_watcher_now",
+        return_value=T0 + _dt.timedelta(seconds=MAX_GAP + 15),
+    ):
+        watcher._poll_active_signals(open_protect_active=False)
+    # Stale continuity is discarded IMMEDIATELY on this LAST-only poll
+    # itself — not lazily deferred to the next real observation.
+    assert watched.breach_count == 0
+    assert callback.call_count == 0
+    assert watched.trigger_crossed_at is None
+
+    with patch.object(
+        watched,
+        "_get_watcher_now",
+        return_value=T0 + _dt.timedelta(seconds=MAX_GAP + 16),
+    ):
+        watcher._poll_active_signals(open_protect_active=False)
+
+    # LAST never triggers; the next valid ASK is a fresh first breach, not
+    # a second confirming observation combined with stale evidence.
+    assert watched.breach_count == 1
+    assert watched.state == WatchState.PENDING
+    assert callback.call_count == 0
+    assert watched.trigger_crossed_at is None
 
 
 # ─────────────────────────────────────────────────────────────────────────
