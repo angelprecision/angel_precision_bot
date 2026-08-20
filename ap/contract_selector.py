@@ -4142,6 +4142,25 @@ class APContractSelectionEngine:
                         # at the call site below and must never be conflated
                         # with canonical selector truth.
                         "fallback_selector_reason": _obs_reason,
+                        # PR #491 (accounting-gap closure): an independent
+                        # this-pass accounting of every candidate that
+                        # reached direct-quote eligibility, regardless of
+                        # its eventual fate. This is populated
+                        # unconditionally -- before either the structural-
+                        # skip or the direct-quote-attempt branch runs --
+                        # at every point in this module that adds to
+                        # direct_quote_eligible_symbols, so it independently
+                        # catches any candidate whose real attempted outcome
+                        # never reached the durable recovery cursor (the
+                        # cursor is only updated on cross-attempt retries;
+                        # recovery_cursor_persist is threaded into the
+                        # request context but is not invoked within a
+                        # single selection pass). Without this, a genuinely
+                        # direct-quote-attempted candidate could be silently
+                        # erased from the exhaustive-proof accounting.
+                        "direct_quote_known_eligible_symbols": list(
+                            request_context.direct_quote_eligible_symbols
+                        ),
                     })
                 except Exception:
                     pass

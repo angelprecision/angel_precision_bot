@@ -61,6 +61,7 @@ def _evidence(
     budget_exhausted_stage: str | None = None,
     budget_exhausted_detail: str | None = None,
     actual_limit_reached: bool = False,
+    direct_quote_known_eligible_symbols: list | None = None,
 ) -> dict:
     return {
         "structural_skip_results": structural_skip_results or {},
@@ -73,6 +74,11 @@ def _evidence(
         "actual_limit_reached": actual_limit_reached,
         "market_truth_outcome": None,
         "market_truth_reason": None,
+        # Deliberately omitted from the dict unless explicitly provided below
+        # would change dict-equality-based tests elsewhere; instead default
+        # to None so absence is explicit and matches production's "field
+        # not supplied -> skip the accounting-gap check" contract.
+        "direct_quote_known_eligible_symbols": direct_quote_known_eligible_symbols,
     }
 
 
@@ -232,27 +238,34 @@ class TestMixedStructuralWithFallback:
 # design -- which is why the guard below is necessary for ALL FOUR governed
 # reasons, not simply the two that happened to already be safe.)
 #
-# Real production evidence motivating this: WDAY, 2026-08-18,
-# jasoncosby1@gmail.com, LIVE, deferred-breach materialization. Persisted
-# selector diagnostics contain both STRUCTURAL_DELTA_OUT_OF_RANGE and
-# STRUCTURAL_MONEYNESS_OUT_OF_RANGE candidates across the DTE-ladder's
-# probed expirations, direct_quote_unattempted_symbols=[] (fully attempted,
-# non-exhaustive-by-mixing), yet the persisted final historical reason was
-# MONEYNESS_OUT_OF_RANGE. That exact evidence shape is replayed below with
-# fallback_selector_reason set to each of the four governed reasons in turn.
+# The fixture below is a SYNTHETIC, WDAY-SHAPED regression fixture -- loosely
+# modeled on (5 delta-invalid + 33 moneyness-invalid candidates,
+# WDAY-prefixed OCC symbols) but NOT identical to, the real persisted
+# evidence from Supabase orders row e066bb1d-8284-4721-b5eb-dfcd0bd138b7
+# (WDAY, 2026-08-18, jasoncosby1@gmail.com, live). It exists purely to make
+# these unit tests readable with a realistic-looking shape. It is
+# deliberately NOT presented as an exact production replay -- for that, see
+# tests/test_p0_selector_recovery_production_replay_491.py, which replays
+# the resolver against the exact persisted candidate identities pulled live
+# from Supabase (WDAY, DDOG, and CRM), including a side-by-side historical/
+# pre-#491/post-#491 comparison. An earlier version of this file's
+# `test_wday_...production_replay` test used this same synthetic map while
+# describing itself as a production replay, which was inaccurate and has
+# since been renamed below to avoid exactly the ambiguity a synthetic
+# fixture and a real replay sitting side by side would otherwise create.
 
 class TestFallbackCannotResurrectUnprovenStructuralReason:
-    # Real WDAY 2026-08-18 jasoncosby1@gmail.com LIVE structural evidence
-    # shape (abbreviated from the persisted selection_diagnostics.structural_skips
-    # -- 5 delta-invalid + 33 moneyness-invalid candidates, zero unattempted).
-    _WDAY_MIXED_STRUCTURAL = {
+    # SYNTHETIC, WDAY-shaped fixture (NOT exact persisted data -- see the
+    # module-level comment above and tests/test_p0_selector_recovery_
+    # production_replay_491.py for the real thing).
+    _WDAY_SHAPED_SYNTHETIC_MIXED_STRUCTURAL = {
         **{f"WDAY260821C00{205 + i}000": "STRUCTURAL_DELTA_OUT_OF_RANGE" for i in range(5)},
         **{f"WDAY260821C00{220 + i * 2}500": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE" for i in range(33)},
     }
 
     def test_mixed_moneyness_and_delta_structural_fallback_moneyness_must_not_resurrect(self):
         evidence = _evidence(
-            structural_skip_results=self._WDAY_MIXED_STRUCTURAL,
+            structural_skip_results=self._WDAY_SHAPED_SYNTHETIC_MIXED_STRUCTURAL,
             eligible_unattempted_symbols=[],
             fallback_selector_reason="MONEYNESS_OUT_OF_RANGE",
         )
@@ -264,7 +277,7 @@ class TestFallbackCannotResurrectUnprovenStructuralReason:
         # get_policy() alone does not fail it closed -- only the new governed-
         # reason guard in Step 8.5 does.
         evidence = _evidence(
-            structural_skip_results=self._WDAY_MIXED_STRUCTURAL,
+            structural_skip_results=self._WDAY_SHAPED_SYNTHETIC_MIXED_STRUCTURAL,
             eligible_unattempted_symbols=[],
             fallback_selector_reason="DELTA_OUT_OF_RANGE",
         )
@@ -317,7 +330,7 @@ class TestFallbackCannotResurrectUnprovenStructuralReason:
         # Control: non-structural known fallbacks are NOT affected by this
         # guard and continue through exactly as before.
         evidence = _evidence(
-            structural_skip_results=self._WDAY_MIXED_STRUCTURAL,
+            structural_skip_results=self._WDAY_SHAPED_SYNTHETIC_MIXED_STRUCTURAL,
             fallback_selector_reason="NO_CONTRACT_AFTER_FILTERS",
         )
         assert (
@@ -325,29 +338,28 @@ class TestFallbackCannotResurrectUnprovenStructuralReason:
             == "NO_CONTRACT_AFTER_FILTERS"
         )
 
-    def test_wday_20260818_jasoncosby_live_production_replay(self):
-        """Direct replay of the real production shape (Supabase orders row
-        e066bb1d-8284-4721-b5eb-dfcd0bd138b7, WDAY, 2026-08-18T13:31:18Z,
-        client_id=jasoncosby1@gmail.com, execution_mode=live,
-        entry_path=DEFERRED_BREACH_MATERIALIZATION). Persisted
-        last_deferred_selector_reason_code was MONEYNESS_OUT_OF_RANGE with
-        direct_quote_unattempted_symbols=[] and mixed
-        STRUCTURAL_DELTA_OUT_OF_RANGE / STRUCTURAL_MONEYNESS_OUT_OF_RANGE
-        candidates. Proves the exhaustive helper correctly refuses to prove
-        MONEYNESS_OUT_OF_RANGE for this exact mixed set, AND that the
-        fallback path (fed from the selector's own _obs_reason, which for
-        this production request evaluated to MONEYNESS_OUT_OF_RANGE) cannot
-        resurrect it either."""
+    def test_wday_shaped_synthetic_fixture_agrees_with_exact_replay_conclusion(self):
+        """This is a SYNTHETIC, WDAY-shaped regression fixture (see the
+        module-level comment above) -- it is NOT an exact production
+        replay. It exercises the same conceptual shape as the real WDAY
+        case (mixed structural delta+moneyness, zero unattempted,
+        fallback_selector_reason=MONEYNESS_OUT_OF_RANGE) for unit-test
+        readability. For the exact, faithful production replay using the
+        real persisted candidate identities pulled live from Supabase, see
+        tests/test_p0_selector_recovery_production_replay_491.py::
+        TestExactProductionReplay::
+        test_wday_20260818_jasoncosby1_live_mixed_structural, which is the
+        authoritative source of truth for this production case."""
         evidence = _evidence(
-            structural_skip_results=self._WDAY_MIXED_STRUCTURAL,
+            structural_skip_results=self._WDAY_SHAPED_SYNTHETIC_MIXED_STRUCTURAL,
             attempted_results={},
             eligible_unattempted_symbols=[],
             fallback_selector_reason="MONEYNESS_OUT_OF_RANGE",
         )
         result = resolve_selector_recovery_final_reason(evidence)
         assert result != "MONEYNESS_OUT_OF_RANGE", (
-            "PR #491 regression: real WDAY 2026-08-18 production shape "
-            "resurrected an unproven structural reason through fallback"
+            "PR #491 regression: WDAY-shaped synthetic fixture resurrected "
+            "an unproven structural reason through fallback"
         )
 
 
@@ -677,6 +689,121 @@ class TestAffordabilityFullSetAccountingUnchanged:
             quality_rejections={"PREMIUM_CAP_EXCEEDED": 2},
         )
         assert resolve_selector_recovery_final_reason(evidence) == "PREMIUM_CAP_EXCEEDED"
+
+
+# ── Accounting-gap closure (found via external review + real CRM evidence) ──
+# recovery_cursor_persist is threaded into request_context in
+# ap/contract_selector.py but is never actually invoked within a single
+# selection pass -- confirmed by reading the current-main source, not
+# assumed. This means a candidate that was genuinely direct-quote-attempted
+# THIS pass, with a real (possibly non-structural) outcome, can be entirely
+# invisible to `attempted_results`, silently erased from the exhaustive-
+# proof accounting. Real production evidence: CRM, 2026-08-12,
+# jasoncosby1@gmail.com, LIVE -- persisted direct_quote_eligible_candidates
+# = 48, structural candidates = 47, direct_quote_attempted_symbols =
+# ["CRM260814P00172500"] with real outcome DIRECT_QUOTE_ZERO_BID_ASK. CRM's
+# own mixed structural evidence happened not to falsely terminalize even
+# with the erasure (a second structural reason already blocked exhaustive
+# proof) -- but a request with only ONE structural reason plus one erased
+# attempted candidate would not have been so lucky. See
+# _resolve_exhaustive_structural_terminal_reason's Rule 1.5 and the
+# `direct_quote_known_eligible_symbols` evidence field in
+# ap/selector_retry_policy.py / ap/contract_selector.py.
+
+class TestAccountingGapClosure:
+    def test_erased_attempted_candidate_without_closure_field_falsely_terminalizes(self):
+        """Fail-first: reproduces the confirmed defect exactly. One
+        candidate (A) is structurally skipped; a second real candidate (B)
+        was genuinely attempted this pass but its outcome never reached
+        attempted_results (the historical/pre-closure evidence shape --
+        i.e. direct_quote_known_eligible_symbols is NOT supplied). Before
+        the accounting-gap closure, this falsely proves exhaustive
+        MONEYNESS_OUT_OF_RANGE. This test documents the shape of evidence
+        that WOULD be dangerous if a real call site failed to supply
+        direct_quote_known_eligible_symbols -- it is not itself a
+        regression the closure can prevent (the closure is opt-in by
+        design, matching production's real call-site behavior), but it is
+        the exact scenario the closure exists to guard against once the
+        field IS supplied (see the next test)."""
+        evidence_without_closure = _evidence(
+            structural_skip_results={_AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"},
+            attempted_results={},  # candidate B erased -- no accounting of it at all
+            eligible_unattempted_symbols=[],
+            # direct_quote_known_eligible_symbols intentionally NOT supplied
+        )
+        result = resolve_selector_recovery_final_reason(evidence_without_closure)
+        assert result == "MONEYNESS_OUT_OF_RANGE", (
+            "This documents the defect shape; if this assertion starts "
+            "failing, the resolver's default (no-closure-field) behavior "
+            "has changed and this test's purpose should be revisited."
+        )
+
+    def test_known_eligible_field_closes_the_gap(self):
+        """The same shape as above, but with direct_quote_known_eligible_
+        symbols supplied naming both A and B -- exactly what the real
+        production call site now provides
+        (request_context.direct_quote_eligible_symbols). Exhaustive proof
+        must now correctly be refused."""
+        evidence_with_closure = _evidence(
+            structural_skip_results={_AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"},
+            attempted_results={},
+            eligible_unattempted_symbols=[],
+            direct_quote_known_eligible_symbols=[_AAPL_150C, _AAPL_160C],
+        )
+        result = resolve_selector_recovery_final_reason(evidence_with_closure)
+        assert result != "MONEYNESS_OUT_OF_RANGE"
+
+    def test_known_eligible_matching_universe_still_terminalizes(self):
+        """Control: when the known-eligible accounting agrees exactly with
+        the accounted universe (no erased candidate), exhaustive proof
+        must still succeed -- the closure only blocks the false claim, it
+        does not weaken a genuinely complete one."""
+        evidence = _evidence(
+            structural_skip_results={_AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"},
+            attempted_results={},
+            eligible_unattempted_symbols=[],
+            direct_quote_known_eligible_symbols=[_AAPL_150C],
+        )
+        assert resolve_selector_recovery_final_reason(evidence) == "MONEYNESS_OUT_OF_RANGE"
+
+    def test_known_eligible_absent_preserves_prior_behavior(self):
+        """Backward-compatibility control: when the field is absent
+        entirely (None, the default), behavior is identical to before this
+        amendment -- existing evidence shapes and callers that do not
+        supply it are unaffected."""
+        evidence = _evidence(
+            structural_skip_results={_AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"},
+        )
+        assert evidence["direct_quote_known_eligible_symbols"] is None
+        assert resolve_selector_recovery_final_reason(evidence) == "MONEYNESS_OUT_OF_RANGE"
+
+    def test_known_eligible_malformed_container_fails_closed(self):
+        """A present-but-non-container known-eligible value must not be
+        silently treated as 'no additional accounting' -- that would let
+        malformed input manufacture a false exhaustive claim, matching the
+        existing eligible_raw malformed-container handling."""
+        evidence = _evidence(
+            structural_skip_results={_AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"},
+            direct_quote_known_eligible_symbols="not-a-container",  # type: ignore[arg-type]
+        )
+        result = resolve_selector_recovery_final_reason(evidence)
+        assert result != "MONEYNESS_OUT_OF_RANGE"
+
+    def test_known_eligible_with_survivor_matches_real_crm_shape(self):
+        """Mirrors the real CRM production shape at unit-test scale: one
+        structural candidate, one genuinely attempted candidate with a
+        retryable outcome, both named in the known-eligible accounting.
+        Must not terminalize structurally, and the real attempted
+        candidate's truthful outcome should surface directly."""
+        evidence = _evidence(
+            structural_skip_results={_AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"},
+            attempted_results={_AAPL_160C: _attempted_record("DIRECT_QUOTE_ZERO_BID_ASK")},
+            eligible_unattempted_symbols=[],
+            direct_quote_known_eligible_symbols=[_AAPL_150C, _AAPL_160C],
+        )
+        result = resolve_selector_recovery_final_reason(evidence)
+        assert result != "MONEYNESS_OUT_OF_RANGE"
+        assert result == "DIRECT_QUOTE_ZERO_BID_ASK"
 
 
 if __name__ == "__main__":

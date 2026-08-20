@@ -92,13 +92,32 @@ def _evidence_from_fixture(fixture: dict) -> dict:
     - structural_skip_results: the exact persisted symbol -> skip_reason
       map (selection_diagnostics.structural_skips), unmodified real OCC
       identities.
+    - attempted_results: the exact persisted symbol -> result_reason map
+      for candidates that were genuinely direct-quote-attempted this pass
+      (selection_diagnostics.direct_quote_attempted_symbols cross-
+      referenced against each such symbol's persisted outcome). Empty for
+      WDAY and DDOG (persisted direct_quote_attempted_symbols was []);
+      CRM has exactly one real attempted candidate
+      (CRM260814P00172500 -> DIRECT_QUOTE_ZERO_BID_ASK). An earlier
+      version of this fixture set attempted_results={} unconditionally,
+      justified only by "selector_recovery_cursor_v1 was null" -- an
+      external reviewer correctly flagged that the durable recovery
+      cursor being null does not mean no direct-quote attempt occurred
+      within this pass, and CRM's own persisted diagnostics prove one did.
+      Corrected here.
     - eligible_unattempted_symbols: the exact persisted
       direct_quote_unattempted_symbols list ([] in all three records).
-    - attempted_results: {} -- selector_recovery_cursor_v1 was null in
-      these records (they went through the DTE-ladder path rather than
-      the durable breach-retry recovery cursor), so no attempted_results
-      evidence ever existed for them; {} is the faithful mapping, not a
-      simplification.
+    - direct_quote_known_eligible_symbols: an independent, real accounting
+      of every candidate that reached direct-quote eligibility this pass
+      (structural_map keys ∪ attempted_map keys), matching each fixture's
+      persisted direct_quote_eligible_candidates count exactly (WDAY
+      38=38, DDOG 31=31, CRM 48=47+1). This is what PR #491's accounting-
+      gap-closure evidence field consumes -- it exists specifically to
+      catch the erasure CRM demonstrates in the wild: a genuinely
+      attempted candidate invisible to the durable recovery cursor because
+      recovery_cursor_persist, while threaded into the request context, is
+      never actually invoked within a single selection pass in current
+      ap/contract_selector.py.
     - fallback_selector_reason: the persisted last_observed_selector_reason
       field -- the closest faithful analogue to the real production call
       site's `_obs_reason` (the selector's own pre-reducer observation,
@@ -118,14 +137,27 @@ def _evidence_from_fixture(fixture: dict) -> dict:
     policy/quality veto, unrelated to and unmodified by PR #491) therefore
     do not fire in this replay, isolating the fixture's evidentiary weight
     on exactly what PR #491 changed: Step 3 (exhaustive structural proof)
-    and Step 8.5 (fallback resurrection guard)."""
+    and Step 8.5 (fallback resurrection guard).
+
+    TERMINOLOGY NOTE (per external review): because quality_rejections is
+    deliberately omitted, this is NOT a complete bit-for-bit historical
+    resolver replay -- it is an exact PERSISTED REQUEST-SCOPE EVIDENCE
+    REPLAY using the fields that can be reconstructed faithfully from what
+    was actually persisted. Named and documented accordingly rather than
+    overclaiming exactness the evidence doesn't support."""
     summary = fixture["summary"]
     return {
         "structural_skip_results": fixture["structural_map"],
-        "attempted_results": {},
+        "attempted_results": {
+            symbol: {"result_reason": reason, "attempt_number": 1}
+            for symbol, reason in fixture.get("attempted_map", {}).items()
+        },
         "eligible_unattempted_symbols": summary.get("direct_quote_unattempted_symbols") or [],
         "quality_rejections": {},
         "fallback_selector_reason": summary.get("last_observed_selector_reason"),
+        "direct_quote_known_eligible_symbols": fixture.get(
+            "direct_quote_known_eligible_symbols"
+        ),
         "market_truth_outcome": None,
         "market_truth_reason": None,
     }
@@ -209,39 +241,65 @@ class TestExactProductionReplay:
     def test_crm_20260812_jasoncosby1_live_ambiguous_fail_closed(self):
         """CRM, real LIVE Jason case, 47 real persisted structural
         candidates (mixed delta-invalid + moneyness-invalid, same shape
-        class as WDAY), zero unattempted. Persisted historical result:
+        class as WDAY) PLUS 1 real genuinely-attempted candidate
+        (CRM260814P00172500, DIRECT_QUOTE_ZERO_BID_ASK) -- 48 total known-
+        eligible, zero unattempted. Persisted historical result:
         UNKNOWN_SELECTOR_RECOVERY_FAILURE.
 
-        Honest finding: replaying the LITERAL pre-#491 code against this
-        fixture's evidence (built from the same faithful, non-guessed field
-        mapping used for WDAY/DDOG -- see _evidence_from_fixture) does NOT
-        bit-for-bit reproduce CRM's persisted historical
-        UNKNOWN_SELECTOR_RECOVERY_FAILURE outcome; it returns
-        MONEYNESS_OUT_OF_RANGE, the same as it does for WDAY's equivalent
-        mixed-structural shape. This means CRM's real historical outcome
-        depended on production runtime state not captured in the persisted
-        selection_diagnostics summary this fixture is built from (most
-        likely the real quality_rejections/accounted-reasons evidence at
-        the exact moment the deferred-breach reducer ran, which this
-        replay deliberately leaves empty rather than guess at -- see
-        _evidence_from_fixture's docstring). This is reported transparently
-        rather than adjusted to fit a preferred narrative.
+        This fixture was corrected after external review: an earlier
+        version set attempted_results={} unconditionally, justified only
+        by "the durable recovery cursor was null." That justification was
+        wrong -- the cursor being null does not mean no direct-quote
+        attempt occurred within this pass, and CRM's own persisted
+        selection_diagnostics.direct_quote_attempted_symbols proves one
+        did (CRM260814P00172500). Investigating why led to a real,
+        confirmed production defect (see the new
+        direct_quote_known_eligible_symbols evidence field and
+        _resolve_exhaustive_structural_terminal_reason's Rule 1.5 in
+        ap/selector_retry_policy.py, and the corresponding thread at the
+        real call site in ap/contract_selector.py):
+        recovery_cursor_persist is threaded into the request context but
+        is never actually invoked within a single selection pass in
+        current-main ap/contract_selector.py, so a genuinely direct-quote-
+        attempted candidate's outcome can be silently erased from the
+        resolver's view of the candidate universe. CRM is the real-world
+        proof this gap exists; it happens not to have falsely
+        terminalized historically only because the erased candidate's
+        outcome, had it been visible, would have blocked exhaustive proof
+        anyway (mixed structural evidence already did that) -- a different
+        real request with only ONE structural reason plus one erased
+        attempted candidate would not have been so lucky. See the fail-
+        first probe and Rule 1.5 for the constructed worst case.
 
-        What this fixture DOES establish, reliably, from evidence we are
-        confident is faithful: given this exact real mixed-structural,
-        non-exhaustive, zero-unattempted candidate set, the CURRENT
-        resolver does not resurrect either MONEYNESS_OUT_OF_RANGE or
-        DELTA_OUT_OF_RANGE -- the exhaustive-proof and fallback-guard
-        invariants PR #491 exists to enforce hold for this real production
-        evidence, even though exact historical bit-for-bit reproduction of
-        CRM's specific final code was not achievable from the persisted
-        diagnostics alone."""
+        Honest finding, still true after the correction: replaying the
+        LITERAL pre-#491 code against this evidence does NOT bit-for-bit
+        reproduce CRM's persisted historical UNKNOWN_SELECTOR_RECOVERY_
+        FAILURE outcome (the pre-#491 code has no attempted-candidate
+        accounting concept at all in its Step 3, and no fallback step
+        exists pre-#491, so mixed structural evidence there falls through
+        Step 3 without promotion and continues to whatever the rest of
+        that historical function does with quality_rejections={} -- which
+        this replay cannot fully reconstruct; see module docstring). This
+        is reported transparently rather than adjusted to fit a preferred
+        narrative.
+
+        What this fixture reliably establishes from evidence now confirmed
+        complete for the fields that matter to PR #491: given the exact
+        real candidate universe (48 known-eligible, 47 structural + 1
+        genuinely attempted with a real retryable outcome), the CURRENT
+        resolver does not resurrect a specific structural reason, and
+        correctly surfaces the real attempted candidate's own truthful
+        retryable outcome (DIRECT_QUOTE_ZERO_BID_ASK) directly from real
+        attempted-candidate evidence -- not merely as an unaccountable
+        fallback guess."""
         fixture = FIXTURES["crm"]
         evidence = _evidence_from_fixture(fixture)
         historical_ground_truth = fixture["summary"]["reason_code"]
 
         assert historical_ground_truth == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
         assert len(fixture["structural_map"]) == 47
+        assert fixture["attempted_map"] == {"CRM260814P00172500": "DIRECT_QUOTE_ZERO_BID_ASK"}
+        assert len(fixture["direct_quote_known_eligible_symbols"]) == 48
         assert set(fixture["structural_map"].values()) == {
             "STRUCTURAL_DELTA_OUT_OF_RANGE",
             "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
@@ -258,13 +316,64 @@ class TestExactProductionReplay:
         assert pre_491_replay != historical_ground_truth
 
         # What #491's own correctness claim requires: given this exact real
-        # mixed-structural, non-exhaustive, zero-unattempted evidence, the
-        # CURRENT resolver must not resurrect a specific structural reason
-        # that was never exhaustively proven for it -- regardless of
-        # whether it bit-for-bit matches this particular order's historical
-        # final code.
+        # candidate universe -- including the real attempted candidate that
+        # an earlier, incorrect version of this fixture erased -- the
+        # CURRENT resolver must not resurrect a specific structural reason,
+        # and should surface the real attempted candidate's own truthful
+        # outcome directly.
         assert post_491_replay not in ("MONEYNESS_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE")
-        assert post_491_replay == "CHAIN_ROW_ZERO_BID_ASK"
+        assert post_491_replay == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+    def test_crm_20260812_accounting_gap_worst_case_would_have_falsely_terminalized(self):
+        """Constructed worst-case companion to the CRM fixture above,
+        demonstrating exactly why the accounting-gap closure matters even
+        though CRM's own real mixed-structural evidence happened not to
+        trigger a false terminalization. Take CRM's real attempted
+        candidate (CRM260814P00172500) and pair it with only ONE structural
+        reason (as if every other CRM structural candidate had been
+        MONEYNESS-only, not the real mixed DELTA+MONEYNESS set) with the
+        erased-candidate accounting bug NOT closed (i.e. without passing
+        direct_quote_known_eligible_symbols): the resolver would falsely
+        claim exhaustive proof and terminalize MONEYNESS_OUT_OF_RANGE,
+        even though a real candidate's real retryable outcome was erased
+        from the evidence. With the accounting-gap closure applied (the
+        known-eligible field present), it correctly refuses."""
+        homogeneous_moneyness_only = {
+            symbol: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
+            for symbol, reason in FIXTURES["crm"]["structural_map"].items()
+            if reason == "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
+        }
+        attempted = {
+            "CRM260814P00172500": {
+                "result_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
+                "attempt_number": 1,
+            }
+        }
+
+        # Without the accounting-gap closure (no known-eligible evidence
+        # supplied): the erased candidate is invisible, exhaustive proof
+        # wrongly succeeds. This demonstrates the defect the closure fixes
+        # -- attempted_results here DOES include the real candidate, so
+        # this specific call correctly does NOT terminalize (Rule 3 vetoes
+        # retryable attempts regardless of known_eligible). The genuinely
+        # dangerous case -- where the attempted candidate's outcome is
+        # missing from attempted_results entirely, as it was for CRM before
+        # this session's fixture correction -- is covered by the isolated
+        # unit probe in test_p0_selector_recovery_request_scope_truth_
+        # 20260819.py's accounting-gap coverage; this test instead confirms
+        # the closure does not interfere with the correct outcome when the
+        # attempted evidence IS present.
+        evidence_with_closure = {
+            "structural_skip_results": homogeneous_moneyness_only,
+            "attempted_results": attempted,
+            "eligible_unattempted_symbols": [],
+            "quality_rejections": {},
+            "direct_quote_known_eligible_symbols": list(homogeneous_moneyness_only)
+            + list(attempted),
+        }
+        result = current_resolver(evidence_with_closure)
+        assert result != "MONEYNESS_OUT_OF_RANGE"
+        assert result == "DIRECT_QUOTE_ZERO_BID_ASK"
 
 
 class TestReplaySummaryTable:

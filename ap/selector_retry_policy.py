@@ -1218,6 +1218,7 @@ def _resolve_exhaustive_structural_terminal_reason(
     skipped: dict,
     attempted: dict,
     eligible_raw,
+    known_eligible_raw=None,
 ) -> str | None:
     """Return a request-level structural reason ONLY when the full relevant
     candidate set exhaustively proves that single structural condition.
@@ -1234,6 +1235,26 @@ def _resolve_exhaustive_structural_terminal_reason(
     incomplete evidence returns None (no exhaustive proof) rather than
     strengthening a false claim -- callers fall through to the existing
     truthful reducer precedence below.
+
+    known_eligible_raw (optional): an independent accounting of every
+    candidate symbol that reached direct-quote eligibility THIS pass,
+    regardless of its eventual fate (structurally skipped, genuinely
+    attempted, or otherwise). At the real production call site this is
+    request_context.direct_quote_eligible_symbols, which -- unlike the
+    durable recovery_cursor's attempted_symbols dict -- is populated
+    unconditionally, in-pass, before either the structural-skip or the
+    direct-quote-attempt branch runs (see ap/contract_selector.py). It
+    exists to catch a real accounting gap: the durable recovery cursor is
+    only updated on cross-attempt RETRIES (recovery_cursor_persist is
+    threaded into the request context but is never actually invoked within
+    a single selection pass), so a candidate that was genuinely direct-
+    quote-attempted THIS pass -- and got a real, non-structural outcome --
+    can be entirely invisible to `attempted`, silently erased from the
+    proof. When provided, this parameter closes that gap: if any known-
+    eligible symbol is unaccounted for by structural_skip_results ∪
+    attempted ∪ eligible_unattempted, exhaustive proof is refused. When
+    absent (None), this check is skipped entirely -- existing callers and
+    evidence shapes that do not supply it are unaffected.
     """
     # ── Eligible-unattempted container: a real container is authoritative;
     # missing/absent is a legitimate "none eligible" signal; anything else
@@ -1258,6 +1279,7 @@ def _resolve_exhaustive_structural_terminal_reason(
         return None
 
     # ── Normalize structural-skip evidence: normalized_symbol -> reason.
+
     normalized_skipped: dict[str, str] = {}
     for raw_symbol, raw_reason in (skipped or {}).items():
         norm = _normalize_recovery_symbol(raw_symbol)
@@ -1296,6 +1318,31 @@ def _resolve_exhaustive_structural_terminal_reason(
     universe = set(normalized_skipped) | set(normalized_attempted) | normalized_eligible
     if not universe:
         return None
+
+    # Rule 1.5 (accounting-gap closure): if an independent this-pass
+    # eligibility accounting was supplied, every symbol it names must be
+    # represented in the universe above. A malformed non-container value
+    # (present but not a recognizable collection) must not be silently
+    # treated as "no additional accounting" -- that would let malformed
+    # input manufacture a false exhaustive claim, same principle as
+    # eligible_raw above. Absence (None) is the legitimate "no independent
+    # accounting supplied" signal and skips this check entirely.
+    if known_eligible_raw is not None:
+        if isinstance(known_eligible_raw, (list, tuple, set)):
+            known_eligible_items = list(known_eligible_raw)
+        else:
+            return None
+        normalized_known_eligible: set[str] = set()
+        for raw_symbol in known_eligible_items:
+            norm = _normalize_recovery_symbol(raw_symbol)
+            if norm is None:
+                return None
+            normalized_known_eligible.add(norm)
+        if normalized_known_eligible - universe:
+            # At least one candidate that reached direct-quote eligibility
+            # this pass is unaccounted for by structural/attempted/eligible
+            # evidence -- erased from the proof. Cannot claim exhaustive.
+            return None
 
     # Rule 3: zero attempted candidates with retryable/transient truth.
     for reason in normalized_attempted.values():
@@ -1402,6 +1449,7 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
         skipped,
         attempted,
         data.get("eligible_unattempted_symbols"),
+        data.get("direct_quote_known_eligible_symbols"),
     )
     if exhaustive_structural_reason is not None:
         return exhaustive_structural_reason
