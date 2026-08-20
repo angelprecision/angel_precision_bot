@@ -2,7 +2,7 @@
 
 **STATUS: SPEC ONLY / HARD HOLD / DO NOT MERGE OR DEPLOY UNTIL IMPLEMENTED, REPLAYED, AND REVIEWED.**
 
-Base: `main@462106c8839769ef6b3137867839a44aec39ad09`
+Base: `main@b8e25dc1c19c969ac595685f3cc302d3b9c830da`
 
 ## One job
 
@@ -47,7 +47,7 @@ That fallback can overwrite a selector reason that was already known and classif
 ## Current-main seams to inspect before editing
 
 1. `ap/selector_retry_policy.py::resolve_selector_recovery_final_reason()`
-2. Both deferred-breach call sites in `ap/contract_selector.py` that build evidence and invoke `resolve_selector_recovery_final_reason()`
+2. The current deferred-breach call site in `ap/contract_selector.py` that builds evidence and invokes `resolve_selector_recovery_final_reason()`
 3. Existing production-shaped tests:
    - `tests/test_p0_selector_recovery_capacity_and_validity.py`
    - `tests/test_p0_selector_terminal_truth_ranked_quotes_current_main.py`
@@ -127,7 +127,7 @@ Add an optional evidence field named exactly one of:
 - `original_selector_reason`, or
 - `fallback_selector_reason`
 
-Choose one name and use it consistently at both `contract_selector.py` call sites and tests.
+Choose one name and use it consistently at the `contract_selector.py` call site and tests.
 
 Immediately before the final unknown fallback:
 
@@ -138,18 +138,18 @@ Immediately before the final unknown fallback:
 
 Do not convert a known terminal quality reason into retryable data. Do not convert known retryable data into terminal quality. The reducer may choose a **stronger proven reason** earlier in its existing precedence; this fallback applies only when the reducer otherwise reaches unknown.
 
-### 3. `ap/contract_selector.py` — thread the truthful pre-reducer reason into both deferred resolver calls
+### 3. `ap/contract_selector.py` — thread the truthful pre-reducer reason into the deferred resolver call
 
-There are two current deferred-breach branches that import and call `resolve_selector_recovery_final_reason()`.
+The current production tree has one deferred-breach branch that imports and calls `resolve_selector_recovery_final_reason()`.
 
-At each call site:
+At that call site:
 
 - capture the selector's already-established canonical reason **before** the recovery reducer can overwrite it;
 - pass it as the new fallback evidence field;
 - do not use `operational_reason` (for example `SELECTOR_REQUEST_BUDGET_EXHAUSTED`) as a substitute for canonical selector truth when those fields intentionally differ;
 - preserve `canonical_selector_reason`, `last_observed_selector_reason`, `selector_terminal_reason`, and operational diagnostics as separate fields.
 
-If the two call sites currently duplicate evidence-building logic, a tiny local helper may be extracted only if behavior remains identical. Do not refactor the selector broadly.
+If evidence-building logic is ever duplicated across deferred branches, a tiny local helper may be extracted only if behavior remains identical. Do not refactor the selector broadly.
 
 ### 4. ExecutionCore consumer behavior
 
