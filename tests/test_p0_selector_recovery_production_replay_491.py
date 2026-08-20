@@ -1,10 +1,23 @@
-"""P0 — PR #491 §18: exact production-shaped replay.
+"""P0 — PR #491 §18: exact persisted request-scope evidence replay.
 
 EVIDENCE-ONLY. This file makes NO production code changes. It replays the
 resolver (both the pre-#491 historical version and the current #491
 version) against exact, persisted production evidence pulled live from
 Supabase (project jhawzqnhcihevkhehogm, `orders` table) on 2026-08-19/20 --
 not synthetic, not abbreviated, not hand-generated.
+
+TERMINOLOGY: this is an exact PERSISTED REQUEST-SCOPE EVIDENCE REPLAY, not
+a claimed complete bit-for-bit historical resolver replay. The resolver's
+quality_rejections evidence field is deliberately left empty in every
+fixture below -- the persisted `top_reject_buckets` field is a per-
+candidate rejection-count histogram across the whole explored candidate
+universe, a materially different concept, and we do not have confidence in
+a faithful mapping between the two. Guessing one risks manufacturing a
+false replay result, so it is omitted rather than approximated. This means
+Steps 2 and 4 of the resolver (terminal policy/quality veto, unrelated to
+and unmodified by PR #491) do not fire in these replays -- see
+_evidence_from_fixture's docstring for the complete field-by-field
+mapping rationale.
 
 Per binding spec docs/pr_specs/p0_selector_recovery_request_scope_truth_20260819.md
 section 18, this replays three real post-Aug-6 production failure shapes and
@@ -112,12 +125,12 @@ def _evidence_from_fixture(fixture: dict) -> dict:
       (structural_map keys ∪ attempted_map keys), matching each fixture's
       persisted direct_quote_eligible_candidates count exactly (WDAY
       38=38, DDOG 31=31, CRM 48=47+1). This is what PR #491's accounting-
-      gap-closure evidence field consumes -- it exists specifically to
-      catch the erasure CRM demonstrates in the wild: a genuinely
-      attempted candidate invisible to the durable recovery cursor because
-      recovery_cursor_persist, while threaded into the request context, is
-      never actually invoked within a single selection pass in current
-      ap/contract_selector.py.
+      gap-closure evidence field consumes. CRM's real persisted diagnostics
+      prove a genuinely attempted candidate was not represented in the
+      reducer evidence used for that historical lifecycle. Regardless of
+      the specific historical cause, this independent in-pass accounting
+      now prevents such an omission from falsely strengthening exhaustive
+      structural proof.
     - fallback_selector_reason: the persisted last_observed_selector_reason
       field -- the closest faithful analogue to the real production call
       site's `_obs_reason` (the selector's own pre-reducer observation,
@@ -166,11 +179,12 @@ def _evidence_from_fixture(fixture: dict) -> dict:
 FIXTURES = _load_fixtures()
 
 
-class TestExactProductionReplay:
-    """Three exact production-shaped replays per spec §18. Each test
-    documents: real candidate identities, real persisted historical result,
-    pre-#491 replay result, current (#491) replay result, and whether each
-    matches persisted ground truth."""
+class TestPersistedRequestScopeEvidenceReplay:
+    """Three exact PERSISTED REQUEST-SCOPE EVIDENCE replays per spec §18
+    (not claimed complete bit-for-bit historical resolver replays -- see
+    module docstring). Each test documents: real candidate identities, real
+    persisted historical result, pre-#491 replay result, current (#491)
+    replay result, and whether each matches persisted ground truth."""
 
     def test_wday_20260818_jasoncosby1_live_mixed_structural(self):
         """WDAY, real LIVE Jason case, 38 real persisted structural
@@ -257,18 +271,19 @@ class TestExactProductionReplay:
         direct_quote_known_eligible_symbols evidence field and
         _resolve_exhaustive_structural_terminal_reason's Rule 1.5 in
         ap/selector_retry_policy.py, and the corresponding thread at the
-        real call site in ap/contract_selector.py):
-        recovery_cursor_persist is threaded into the request context but
-        is never actually invoked within a single selection pass in
-        current-main ap/contract_selector.py, so a genuinely direct-quote-
-        attempted candidate's outcome can be silently erased from the
-        resolver's view of the candidate universe. CRM is the real-world
-        proof this gap exists; it happens not to have falsely
-        terminalized historically only because the erased candidate's
-        outcome, had it been visible, would have blocked exhaustive proof
-        anyway (mixed structural evidence already did that) -- a different
-        real request with only ONE structural reason plus one erased
-        attempted candidate would not have been so lucky. See the fail-
+        real call site in ap/contract_selector.py): historical persisted
+        diagnostics prove this candidate was attempted but was not
+        represented in the reducer evidence used for that historical
+        lifecycle. Regardless of the specific historical cause, this
+        independent in-pass candidate accounting now prevents such an
+        omission from falsely strengthening exhaustive structural proof.
+        CRM is the real-world proof this gap exists; it happens not to
+        have falsely terminalized historically only because the omitted
+        candidate's outcome, had it been visible, would have blocked
+        exhaustive proof anyway (mixed structural evidence already did
+        that) -- a different real request with only ONE structural reason
+        plus one omitted attempted candidate would not have been so
+        lucky. See the fail-
         first probe and Rule 1.5 for the constructed worst case.
 
         Honest finding, still true after the correction: replaying the

@@ -4149,14 +4149,18 @@ class APContractSelectionEngine:
                         # unconditionally -- before either the structural-
                         # skip or the direct-quote-attempt branch runs --
                         # at every point in this module that adds to
-                        # direct_quote_eligible_symbols, so it independently
-                        # catches any candidate whose real attempted outcome
-                        # never reached the durable recovery cursor (the
-                        # cursor is only updated on cross-attempt retries;
-                        # recovery_cursor_persist is threaded into the
-                        # request context but is not invoked within a
-                        # single selection pass). Without this, a genuinely
-                        # direct-quote-attempted candidate could be silently
+                        # direct_quote_eligible_symbols. It does not depend
+                        # on, and makes no claim about, how or when the
+                        # durable recovery cursor gets updated. Real
+                        # historical production evidence (see the CRM
+                        # production replay fixture in
+                        # tests/test_p0_selector_recovery_production_
+                        # replay_491.py) proves a genuinely direct-quote-
+                        # attempted candidate can end up unrepresented in
+                        # the evidence a given resolver invocation actually
+                        # used. Independent of the specific historical
+                        # cause, this accounting closes that gap directly:
+                        # without it, such a candidate could be silently
                         # erased from the exhaustive-proof accounting.
                         "direct_quote_known_eligible_symbols": list(
                             request_context.direct_quote_eligible_symbols

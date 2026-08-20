@@ -12,11 +12,21 @@ still present after rebase onto main@b8e25dc1c19c969ac595685f3cc302d3b9c830da):
     request was still eligible, unattempted, or transiently retryable.
 
 Fix under test: a structural skip may become request-level terminal truth
-ONLY when the full known candidate set (structural_skip_results ∪
-attempted_results ∪ eligible_unattempted_symbols, normalized OCC identity)
-exhaustively proves that single structural condition. Otherwise the
-resolver falls through to the existing truthful precedence, and -- new in
-this PR -- an already-known original selector reason
+ONLY when the full known candidate set exhaustively proves that single
+structural condition (normalized OCC identity throughout). The candidate
+set is the union of structural_skip_results ∪ attempted_results ∪
+eligible_unattempted_symbols, PLUS -- when supplied --
+direct_quote_known_eligible_symbols, an independent in-pass accounting of
+every candidate that reached direct-quote eligibility regardless of its
+eventual fate. This fourth source was added after real production evidence
+(CRM, see TestAccountingGapClosure below) proved the first three are not
+sufficient on their own: a genuinely attempted candidate can end up
+unrepresented in the reducer evidence a given resolver invocation actually
+receives. When direct_quote_known_eligible_symbols is supplied, every
+symbol it names must be represented by one of the other three sources
+before exhaustive structural proof can succeed. Otherwise the resolver
+falls through to the existing truthful precedence, and -- new in this PR
+-- an already-known original selector reason
 (``fallback_selector_reason``) is preserved instead of collapsing to
 UNKNOWN_SELECTOR_RECOVERY_FAILURE merely because no exhaustive/aggregate
 proof was found.
@@ -692,19 +702,20 @@ class TestAffordabilityFullSetAccountingUnchanged:
 
 
 # ── Accounting-gap closure (found via external review + real CRM evidence) ──
-# recovery_cursor_persist is threaded into request_context in
-# ap/contract_selector.py but is never actually invoked within a single
-# selection pass -- confirmed by reading the current-main source, not
-# assumed. This means a candidate that was genuinely direct-quote-attempted
-# THIS pass, with a real (possibly non-structural) outcome, can be entirely
-# invisible to `attempted_results`, silently erased from the exhaustive-
-# proof accounting. Real production evidence: CRM, 2026-08-12,
-# jasoncosby1@gmail.com, LIVE -- persisted direct_quote_eligible_candidates
-# = 48, structural candidates = 47, direct_quote_attempted_symbols =
-# ["CRM260814P00172500"] with real outcome DIRECT_QUOTE_ZERO_BID_ASK. CRM's
+# The three reducer evidence collections (structural_skip_results,
+# attempted_results, eligible_unattempted_symbols) are not sufficient on
+# their own to prove request completeness. Real historical production
+# evidence proves this directly: CRM, 2026-08-12, jasoncosby1@gmail.com,
+# LIVE -- persisted direct_quote_eligible_candidates = 48, structural
+# candidates = 47, direct_quote_attempted_symbols =
+# ["CRM260814P00172500"] with real outcome DIRECT_QUOTE_ZERO_BID_ASK. That
+# genuinely attempted candidate was not represented in the reducer evidence
+# used for that historical lifecycle. Regardless of the specific historical
+# cause, independent in-pass candidate accounting now prevents such an
+# omission from falsely strengthening exhaustive structural proof. CRM's
 # own mixed structural evidence happened not to falsely terminalize even
-# with the erasure (a second structural reason already blocked exhaustive
-# proof) -- but a request with only ONE structural reason plus one erased
+# with the omission (a second structural reason already blocked exhaustive
+# proof) -- but a request with only ONE structural reason plus one omitted
 # attempted candidate would not have been so lucky. See
 # _resolve_exhaustive_structural_terminal_reason's Rule 1.5 and the
 # `direct_quote_known_eligible_symbols` evidence field in

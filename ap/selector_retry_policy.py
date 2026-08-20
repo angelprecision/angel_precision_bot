@@ -1240,21 +1240,22 @@ def _resolve_exhaustive_structural_terminal_reason(
     candidate symbol that reached direct-quote eligibility THIS pass,
     regardless of its eventual fate (structurally skipped, genuinely
     attempted, or otherwise). At the real production call site this is
-    request_context.direct_quote_eligible_symbols, which -- unlike the
-    durable recovery_cursor's attempted_symbols dict -- is populated
+    request_context.direct_quote_eligible_symbols, which is populated
     unconditionally, in-pass, before either the structural-skip or the
     direct-quote-attempt branch runs (see ap/contract_selector.py). It
-    exists to catch a real accounting gap: the durable recovery cursor is
-    only updated on cross-attempt RETRIES (recovery_cursor_persist is
-    threaded into the request context but is never actually invoked within
-    a single selection pass), so a candidate that was genuinely direct-
-    quote-attempted THIS pass -- and got a real, non-structural outcome --
-    can be entirely invisible to `attempted`, silently erased from the
-    proof. When provided, this parameter closes that gap: if any known-
-    eligible symbol is unaccounted for by structural_skip_results ∪
-    attempted ∪ eligible_unattempted, exhaustive proof is refused. When
-    absent (None), this check is skipped entirely -- existing callers and
-    evidence shapes that do not supply it are unaffected.
+    exists to catch a real accounting gap: real historical production
+    evidence (see the CRM production replay fixture) proves that a
+    genuinely direct-quote-attempted candidate can end up unrepresented in
+    the `attempted` evidence actually used for a given resolver
+    invocation. Regardless of the specific historical cause, this
+    independent in-pass accounting closes the gap directly: it does not
+    depend on -- and makes no claim about -- how or when the durable
+    recovery cursor gets updated. When provided, this parameter requires
+    every named symbol to be accounted for by structural_skip_results ∪
+    attempted ∪ eligible_unattempted before exhaustive proof can succeed;
+    if any is not, exhaustive proof is refused. When absent (None), this
+    check is skipped entirely -- existing callers and evidence shapes that
+    do not supply it are unaffected.
     """
     # ── Eligible-unattempted container: a real container is authoritative;
     # missing/absent is a legitimate "none eligible" signal; anything else
