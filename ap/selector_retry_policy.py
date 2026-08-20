@@ -1237,10 +1237,30 @@ def _coerce_structural_skip_records(raw) -> list[tuple[object, object]] | None:
     return records
 
 
-def _normalize_quality_rejection_symbols(raw) -> set[str] | None:
-    """Normalize candidate identities from per-candidate quality evidence."""
+def _normalize_structural_skip_reasons(raw) -> dict[str, str] | None:
+    """Normalize structural records while preserving conflicting evidence."""
+    records = _coerce_structural_skip_records(raw)
+    if records is None:
+        return None
+
+    normalized: dict[str, str] = {}
+    for raw_symbol, raw_reason in records:
+        norm = _normalize_recovery_symbol(raw_symbol)
+        reason = str(raw_reason or "").strip()
+        if norm is None or not reason:
+            return None
+        if norm in normalized and normalized[norm] != reason:
+            # Conflicting duplicate evidence for one OCC must remain
+            # untrusted; never let a later record overwrite the first.
+            return None
+        normalized[norm] = reason
+    return normalized
+
+
+def _normalize_quality_rejection_records(raw) -> dict[str, str] | None:
+    """Normalize candidate identities and reasons from quality evidence."""
     if raw is None:
-        return set()
+        return {}
     if isinstance(raw, dict):
         records = list(raw.items())
     elif isinstance(raw, (list, tuple)):
@@ -1258,13 +1278,17 @@ def _normalize_quality_rejection_symbols(raw) -> set[str] | None:
     else:
         return None
 
-    normalized: set[str] = set()
+    normalized: dict[str, str] = {}
     for raw_symbol, raw_reason in records:
         norm = _normalize_recovery_symbol(raw_symbol)
         reason = str(raw_reason or "").strip()
         if norm is None or not reason:
             return None
-        normalized.add(norm)
+        if norm in normalized and normalized[norm] != reason:
+            # Conflicting quality records for one OCC are just as ambiguous
+            # as conflicting structural records and must fail closed.
+            return None
+        normalized[norm] = reason
     return normalized
 
 
@@ -1278,13 +1302,14 @@ def _resolve_exhaustive_structural_terminal_reason(
     """Return a request-level structural reason ONLY when the full relevant
     candidate set exhaustively proves that single structural condition.
 
-    A candidate-level structural skip (e.g. one far-OTM contract) is valid
-    candidate truth, but it is NOT by itself proof that the entire deferred
-    selector request should terminalize with that reason -- another
-    candidate may still be eligible, unattempted, or transiently retryable.
-    This helper is the ONLY place that may promote a structural skip to
-    request-level truth, and it does so only when every known candidate in
-    the request is accounted for and agrees on the same structural reason.
+    A candidate-level structural skip (e.g. one far-OTM contract) or governed
+    ordinary-quality rejection is valid candidate truth, but it is NOT by
+    itself proof that the entire deferred selector request should terminalize
+    with that reason -- another candidate may still be eligible, unattempted,
+    transiently retryable, or rejected for a different condition. This helper
+    is the ONLY place that may promote one of the four governed reasons to
+    request-level truth, and it does so only when every known candidate in the
+    request is accounted for and agrees on the same canonical reason.
 
     Pure and side-effect-free. Never raises. Any malformed, conflicting, or
     incomplete evidence returns None (no exhaustive proof) rather than
@@ -1314,10 +1339,11 @@ def _resolve_exhaustive_structural_terminal_reason(
 
     quality_rejection_raw (optional): complete per-candidate ordinary-quality
     evidence. Aggregate quality counts are not sufficient to establish the
-    candidate universe; any normalized symbol in this source is therefore
-    included in the universe and prevents a structural-only proof unless it
-    is itself represented by structural evidence (which is contradictory and
-    fails closed).
+    candidate universe. Every normalized symbol in this source is included in
+    the universe; only a governed canonical reason can participate in the
+    homogeneous proof, while OI/spread/volume/premium/affordability and other
+    ordinary reasons block that proof. A symbol represented by both structural
+    and quality records is contradictory and fails closed.
     """
     # ── Eligible-unattempted container: a real container is authoritative;
     # missing/absent is a legitimate "none eligible" signal; anything else
@@ -1344,21 +1370,9 @@ def _resolve_exhaustive_structural_terminal_reason(
     # ── Normalize structural-skip evidence: normalized_symbol -> reason.
     # The live deferred caller passes a record list, not a dict, so duplicate
     # OCC rows remain visible until this conflict check.
-    structural_records = _coerce_structural_skip_records(skipped)
-    if structural_records is None:
+    normalized_skipped = _normalize_structural_skip_reasons(skipped)
+    if normalized_skipped is None:
         return None
-
-    normalized_skipped: dict[str, str] = {}
-    for raw_symbol, raw_reason in structural_records:
-        norm = _normalize_recovery_symbol(raw_symbol)
-        reason = str(raw_reason or "").strip()
-        if norm is None or not reason:
-            return None
-        if norm in normalized_skipped and normalized_skipped[norm] != reason:
-            # Conflicting evidence for the same normalized OCC -- laundered
-            # duplicate identity. Fail closed rather than picking one.
-            return None
-        normalized_skipped[norm] = reason
 
     # ── Normalize attempted evidence: normalized_symbol -> result reason.
     normalized_attempted: dict[str, str] = {}
@@ -1385,12 +1399,12 @@ def _resolve_exhaustive_structural_terminal_reason(
     # Ordinary quality rejects are candidate evidence, not merely aggregate
     # counters. If one shares an OCC with a structural record, the evidence
     # is contradictory and cannot strengthen a structural claim.
-    normalized_quality = _normalize_quality_rejection_symbols(
+    normalized_quality = _normalize_quality_rejection_records(
         quality_rejection_raw
     )
     if normalized_quality is None:
         return None
-    if set(normalized_skipped) & normalized_quality:
+    if set(normalized_skipped) & set(normalized_quality):
         return None
 
     # Rule 1: at least one known candidate.
@@ -1398,7 +1412,7 @@ def _resolve_exhaustive_structural_terminal_reason(
         set(normalized_skipped)
         | set(normalized_attempted)
         | normalized_eligible
-        | normalized_quality
+        | set(normalized_quality)
     )
     if not universe:
         return None
@@ -1434,26 +1448,32 @@ def _resolve_exhaustive_structural_terminal_reason(
             return None
 
     # Rules 4 & 5: every candidate in the known universe must be represented
-    # by structural terminal evidence. An attempted candidate -- retryable
-    # or not -- is not structural proof; its mere presence means the
-    # candidate set is not exhaustively structural. (Rule 3 already vetoed
-    # retryable attempts; this also vetoes non-retryable attempted candidates,
-    # which contradict an exhaustive structural claim just as surely.)
-    if set(normalized_skipped) != universe:
-        return None
-
-    # Rule 6: every structural skip must resolve to the SAME canonical
-    # request-level reason -- no picking whichever is encountered first.
-    canonical_reasons: set[str] = set()
-    for reason in normalized_skipped.values():
+    # by either a structural skip or a governed candidate-level quality
+    # rejection. An attempted candidate -- retryable or not -- is not
+    # structural proof; its mere presence means the candidate set is not
+    # exhaustively governed by one structural condition. Likewise, an
+    # ordinary quality rejection (OI, spread, volume, premium, affordability,
+    # etc.) is accounted candidate truth but cannot prove one of the four
+    # request-level structural reasons.
+    represented_by_governed_evidence: dict[str, str] = {}
+    for symbol, reason in normalized_skipped.items():
         canonical = _STRUCTURAL_TO_CANONICAL_REQUEST_REASON.get(reason)
         if canonical is None:
-            # Not a recognized non-affordability structural terminal code
-            # (e.g. an affordability structural skip, handled separately by
-            # the full-set affordability accounting elsewhere). Cannot prove
-            # a specific non-affordability structural reason from this.
             return None
-        canonical_reasons.add(canonical)
+        represented_by_governed_evidence[symbol] = canonical
+    for symbol, reason in normalized_quality.items():
+        if reason not in _STRUCTURAL_REQUEST_LEVEL_REASONS:
+            return None
+        represented_by_governed_evidence[symbol] = reason
+
+    if set(represented_by_governed_evidence) != universe:
+        return None
+
+    # Rule 6: every governed candidate record must resolve to the SAME
+    # canonical request-level reason -- no picking whichever is encountered
+    # first, and no shortcut from the aggregate quality histogram.
+    canonical_reasons: set[str] = set()
+    canonical_reasons.update(represented_by_governed_evidence.values())
 
     if len(canonical_reasons) != 1:
         return None
@@ -1512,6 +1532,7 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
             reason
             for reason in quality
             if reason not in affordability_reasons
+            and reason not in _STRUCTURAL_REQUEST_LEVEL_REASONS
             and get_policy(reason).classification == TERMINAL_POLICY
         ),
         None,
@@ -1528,9 +1549,9 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     # is not by itself proof of REQUEST-level terminal truth. One far-OTM
     # candidate must not terminalize a request while another candidate is
     # still eligible, unattempted, or transiently retryable. Only an
-    # exhaustive structural proof (every known candidate agrees on the same
-    # structural reason, none eligible, none retryable) may promote a
-    # structural skip to request-level truth. See
+    # exhaustive governed proof (every known candidate agrees on the same
+    # governed reason, none eligible, none retryable) may promote candidate
+    # evidence to request-level truth. See
     # _resolve_exhaustive_structural_terminal_reason() above.
     exhaustive_structural_reason = _resolve_exhaustive_structural_terminal_reason(
         structural_evidence,
@@ -1542,12 +1563,17 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     if exhaustive_structural_reason is not None:
         return exhaustive_structural_reason
 
-    # ── Step 4: terminal quality veto (excluding affordability) ──────────────
+    # ── Step 4: terminal quality veto (excluding affordability and governed
+    # structural request-level reasons) ──────────────────────────────────────
+    # DTE/delta/moneyness/policy request truth is never promoted from an
+    # aggregate quality histogram. Those candidate-level records must first
+    # pass the same exhaustive homogeneous proof as structural records above.
     terminal_quality = next(
         (
             reason
             for reason in quality
             if reason not in affordability_reasons
+            and reason not in _STRUCTURAL_REQUEST_LEVEL_REASONS
             and get_policy(reason).classification == TERMINAL_QUALITY
         ),
         None,
@@ -1593,13 +1619,78 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     # (no_affordable_reasons / premium_cap_reasons / affordability_reasons are
     # declared once near the top of this function.)
     accounted_reasons: list[str] = []
-    for record in attempted.values():
+    accounted_symbols: set[str] = set()
+    accounting_valid = True
+
+    # The live deferred handoff uses structural_skip_records as the
+    # authoritative stream. Do not fall back to the legacy dict here: that
+    # dict is intentionally absent/empty on the corrected production path,
+    # and using it would erase structural candidates from full-set accounting.
+    normalized_structural_accounting = _normalize_structural_skip_reasons(
+        structural_evidence
+    )
+    if normalized_structural_accounting is None:
+        accounting_valid = False
+    else:
+        accounted_symbols.update(normalized_structural_accounting)
+        accounted_reasons.extend(normalized_structural_accounting.values())
+
+    for raw_symbol, record in attempted.items():
+        norm = _normalize_recovery_symbol(raw_symbol)
+        if norm is None:
+            accounting_valid = False
+            continue
         if isinstance(record, dict):
-            accounted_reasons.append(str(record.get("result_reason") or ""))
+            reason = str(record.get("result_reason") or "")
         else:
-            accounted_reasons.append(str(record or ""))
-    accounted_reasons.extend(str(value or "") for value in skipped.values())
-    accounted_reasons.extend(str(reason or "") for reason in quality.keys())
+            reason = str(record or "")
+        if not reason:
+            accounting_valid = False
+            continue
+        accounted_symbols.add(norm)
+        accounted_reasons.append(reason)
+
+    for raw_symbol in eligible:
+        norm = _normalize_recovery_symbol(raw_symbol)
+        if norm is None:
+            accounting_valid = False
+            continue
+        accounted_symbols.add(norm)
+
+    raw_quality_records = data.get("quality_rejection_records")
+    if raw_quality_records is not None:
+        normalized_quality_accounting = _normalize_quality_rejection_records(
+            raw_quality_records
+        )
+        if normalized_quality_accounting is None:
+            accounting_valid = False
+        else:
+            accounted_symbols.update(normalized_quality_accounting)
+            accounted_reasons.extend(normalized_quality_accounting.values())
+    else:
+        # Backward-compatible evidence shapes may only have the aggregate
+        # histogram. It remains usable for legacy affordability tests, but it
+        # carries no candidate identities and therefore cannot satisfy an
+        # independent known-eligible completeness check below.
+        accounted_reasons.extend(str(reason or "") for reason in quality.keys())
+
+    known_eligible_for_accounting = data.get(
+        "direct_quote_known_eligible_symbols"
+    )
+    if known_eligible_for_accounting is not None:
+        if not isinstance(known_eligible_for_accounting, (list, tuple, set)):
+            accounting_valid = False
+        else:
+            normalized_known_eligible = set()
+            for raw_symbol in known_eligible_for_accounting:
+                norm = _normalize_recovery_symbol(raw_symbol)
+                if norm is None:
+                    accounting_valid = False
+                    continue
+                normalized_known_eligible.add(norm)
+            if normalized_known_eligible - accounted_symbols:
+                accounting_valid = False
+
     accounted_reasons = [reason for reason in accounted_reasons if reason]
 
     # Affordability is the terminal reason ONLY when the entire candidate set is
@@ -1608,14 +1699,15 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     #   * no retryable attempted-data failure remains (returned at step 6);
     #   * no retryable quality failure remains (returned at step 7);
     #   * at least one accounted reason exists;
-    #   * every accounted attempted, structural, and aggregated-quality reason
-    #     is an affordability reason.
+    #   * every accounted attempted, structural, and quality-record reason is
+    #     an affordability reason.
     # There is deliberately NO structural fallback below this block: a partial
     # affordability set (candidates still eligible, or non-affordability reasons
     # present) must never terminalize as affordability. It falls through to the
     # truthful higher-priority reason above or to UNKNOWN.
     if (
-        not eligible
+        accounting_valid
+        and not eligible
         and accounted_reasons
         and all(reason in affordability_reasons for reason in accounted_reasons)
     ):

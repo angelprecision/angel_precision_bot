@@ -123,21 +123,30 @@ A specific canonical structural reason (`DTE_OUT_OF_RANGE`, `MONEYNESS_OUT_OF_RA
 1. the known candidate universe is non-empty;
 2. there are **zero** eligible-unattempted candidates;
 3. there are **zero** attempted candidates that are retryable/transient/success/otherwise non-structural;
-4. every candidate in the known candidate universe is represented by a structural skip; and
-5. every structural skip in that exhaustive candidate set maps to the **same** canonical request-level reason; and
+4. every candidate in the known candidate universe is represented by either a structural skip or a per-candidate ordinary-quality record whose reason is one of the four governed canonical reasons; and
+5. every represented candidate record in that exhaustive set maps to the **same** canonical request-level reason; and
 6. *(added 2026-08-20)* when an independent `direct_quote_known_eligible_symbols` accounting is supplied, every symbol it names is represented by the structural, attempted, eligible-unattempted, or per-candidate quality evidence — otherwise the candidate universe is not actually known to be complete, and exhaustive proof must be refused regardless of conditions 1–5.
+7. duplicate normalized OCC evidence is consistent within each source, and an OCC represented by both structural and quality sources is conflicting evidence that fails closed.
 
 An ordinary quality-rejected candidate (for example `OI_TOO_LOW` or
 `SPREAD_TOO_WIDE`) is therefore part of the known universe and is not a
 structural skip. Its presence blocks exhaustive structural terminality even
-when the aggregate quality count is otherwise only one entry. The complete
-structural record stream is the only input eligible for the homogeneous
-structural-reason check; conflicting duplicate OCC records must never be
+when the aggregate quality count is otherwise only one entry. A governed
+candidate-level quality reason (`DTE_OUT_OF_RANGE`, `MONEYNESS_OUT_OF_RANGE`,
+`DELTA_OUT_OF_RANGE`, or `TERMINAL_POLICY_REJECT`) participates in the same
+homogeneous proof as its equivalent structural reason; aggregate
+`quality_rejections` counts never do. The complete structural and quality
+record streams are authoritative for both exhaustive proof and full-set
+affordability accounting; conflicting duplicate OCC records must never be
 silently overwritten.
 
 If any candidate survives those conditions, return `None` from the helper and continue the existing reducer.
 
-If the set is fully structural but contains mixed structural reasons, do **not** pick the first matching reason. Prefer an already-truthful selector fallback (Step 2 below). If no known fallback exists, retain fail-closed unknown behavior rather than manufacturing a specific false reason.
+If the set is fully represented by governed evidence but contains mixed
+canonical reasons, do **not** pick the first matching reason. Prefer an
+already-truthful selector fallback (Step 2 below) only for a non-governed
+reason. If no such fallback exists, retain fail-closed unknown behavior rather
+than manufacturing a specific false reason.
 
 Do not alter `_structural_direct_quote_skip()` thresholds. Do not make an out-of-band candidate eligible for quote recovery. This PR changes only **reduction scope**, not candidate admission.
 
@@ -167,6 +176,13 @@ reason may be returned only when the exhaustive helper already proved the
 complete, homogeneous candidate set; otherwise the resolver remains fail-closed
 as `UNKNOWN_SELECTOR_RECOVERY_FAILURE`. Known non-structural fallback reasons
 continue to follow the preservation rule above.
+
+The same exclusivity applies to aggregate terminal-policy/terminal-quality
+reduction: Step 2 and Step 4 MUST NOT independently return one of the four
+governed reasons from `quality_rejections`. Such a reason may return only from
+the exhaustive helper after it consumes complete candidate-level structural
+and quality records. This prevents one ordinary DTE/delta/moneyness observation
+from resurrecting request truth after mixed evidence already failed proof.
 
 Do not convert a known terminal quality reason into retryable data. Do not convert known retryable data into terminal quality. The reducer may choose a **stronger proven reason** earlier in its existing precedence; this fallback applies only when the reducer otherwise reaches unknown.
 

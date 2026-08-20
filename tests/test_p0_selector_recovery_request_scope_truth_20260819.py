@@ -581,6 +581,177 @@ class TestCompleteCandidateAccounting:
         assert resolve_selector_recovery_final_reason(evidence) == quality_reason
 
 
+# ── Governed quality evidence must use the exhaustive-proof path ────────────
+
+class TestGovernedQualityEvidence:
+    @pytest.mark.parametrize(
+        ("quality_reason", "fallback_reason"),
+        [
+            ("DELTA_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE"),
+            ("DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
+        ],
+    )
+    def test_structural_moneyness_plus_governed_quality_never_resurrects(
+        self, quality_reason, fallback_reason
+    ):
+        """A governed quality reject is a candidate, not a Step 4 shortcut."""
+        evidence = _evidence(
+            structural_skip_results={
+                _AAPL_150C: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            },
+            structural_skip_records=[
+                {
+                    "symbol": _AAPL_150C,
+                    "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                },
+            ],
+            quality_rejections={quality_reason: 1},
+            quality_rejection_records=[
+                {"symbol": _AAPL_155C, "reason": quality_reason},
+            ],
+            fallback_selector_reason=fallback_reason,
+        )
+        result = resolve_selector_recovery_final_reason(evidence)
+        assert result not in {
+            "MONEYNESS_OUT_OF_RANGE",
+            "DELTA_OUT_OF_RANGE",
+            "DTE_OUT_OF_RANGE",
+        }
+
+    def test_structural_delta_plus_quality_delta_proves_only_when_complete(self):
+        quality_records = [
+            {"symbol": _AAPL_155C, "reason": "DELTA_OUT_OF_RANGE"},
+        ]
+        helper_result = _resolve_exhaustive_structural_terminal_reason(
+            [
+                {
+                    "symbol": _AAPL_150C,
+                    "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+                },
+            ],
+            {},
+            [],
+            [_AAPL_150C, _AAPL_155C],
+            quality_records,
+        )
+        assert helper_result == "DELTA_OUT_OF_RANGE"
+        evidence = _evidence(
+            structural_skip_records=[
+                {
+                    "symbol": _AAPL_150C,
+                    "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+                },
+            ],
+            quality_rejections={"DELTA_OUT_OF_RANGE": 1},
+            quality_rejection_records=quality_records,
+            direct_quote_known_eligible_symbols=[_AAPL_150C, _AAPL_155C],
+        )
+        assert resolve_selector_recovery_final_reason(evidence) == "DELTA_OUT_OF_RANGE"
+
+    def test_all_ordinary_quality_delta_uses_exhaustive_proof(self):
+        quality_records = [
+            {"symbol": _AAPL_150C, "reason": "DELTA_OUT_OF_RANGE"},
+            {"symbol": _AAPL_155C, "reason": "DELTA_OUT_OF_RANGE"},
+        ]
+        assert _resolve_exhaustive_structural_terminal_reason(
+            [], {}, [], None, quality_records
+        ) == "DELTA_OUT_OF_RANGE"
+        assert resolve_selector_recovery_final_reason(_evidence(
+            quality_rejections={"DELTA_OUT_OF_RANGE": 2},
+            quality_rejection_records=quality_records,
+        )) == "DELTA_OUT_OF_RANGE"
+
+    def test_all_ordinary_quality_policy_records_use_exhaustive_proof(self):
+        quality_records = [
+            {"symbol": _AAPL_150C, "reason": "TERMINAL_POLICY_REJECT"},
+            {"symbol": _AAPL_155C, "reason": "TERMINAL_POLICY_REJECT"},
+        ]
+        assert _resolve_exhaustive_structural_terminal_reason(
+            [], {}, [], None, quality_records
+        ) == "TERMINAL_POLICY_REJECT"
+
+    def test_structural_moneyness_plus_no_affordable_is_not_full_set_affordability(self):
+        evidence = _evidence(
+            # The corrected production handoff supplies the structural stream;
+            # the legacy dict is intentionally empty here.
+            structural_skip_records=[
+                {
+                    "symbol": _AAPL_150C,
+                    "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                },
+            ],
+            quality_rejections={"NO_AFFORDABLE_CONTRACT": 1},
+            quality_rejection_records=[
+                {"symbol": _AAPL_155C, "reason": "NO_AFFORDABLE_CONTRACT"},
+            ],
+        )
+        assert (
+            resolve_selector_recovery_final_reason(evidence)
+            != "NO_AFFORDABLE_CONTRACT"
+        )
+
+    def test_structural_delta_plus_premium_cap_is_not_full_set_affordability(self):
+        evidence = _evidence(
+            structural_skip_records=[
+                {
+                    "symbol": _AAPL_150C,
+                    "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+                },
+            ],
+            quality_rejections={"PREMIUM_CAP_EXCEEDED": 1},
+            quality_rejection_records=[
+                {"symbol": _AAPL_155C, "reason": "PREMIUM_CAP_EXCEEDED"},
+            ],
+        )
+        assert (
+            resolve_selector_recovery_final_reason(evidence)
+            != "PREMIUM_CAP_EXCEEDED"
+        )
+
+    def test_all_candidates_genuinely_affordability_rejected_still_terminalize(self):
+        quality_records = [
+            {"symbol": _AAPL_150C, "reason": "NO_AFFORDABLE_CONTRACT"},
+            {"symbol": _AAPL_155C, "reason": "PREMIUM_CAP_EXCEEDED"},
+        ]
+        evidence = _evidence(
+            quality_rejections={
+                "NO_AFFORDABLE_CONTRACT": 1,
+                "PREMIUM_CAP_EXCEEDED": 1,
+            },
+            quality_rejection_records=quality_records,
+        )
+        assert resolve_selector_recovery_final_reason(evidence) == "NO_AFFORDABLE_CONTRACT"
+
+    def test_same_occ_conflicting_governed_structural_and_quality_fails_closed(self):
+        evidence = _evidence(
+            structural_skip_records=[
+                {
+                    "symbol": _AAPL_150C,
+                    "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                },
+            ],
+            quality_rejections={"DELTA_OUT_OF_RANGE": 1},
+            quality_rejection_records=[
+                {
+                    "symbol": "  aapl260101c00150000  ",
+                    "reason": "DELTA_OUT_OF_RANGE",
+                },
+            ],
+            fallback_selector_reason="DELTA_OUT_OF_RANGE",
+        )
+        assert _resolve_exhaustive_structural_terminal_reason(
+            evidence["structural_skip_records"],
+            {},
+            [],
+            None,
+            evidence["quality_rejection_records"],
+        ) is None
+        assert resolve_selector_recovery_final_reason(evidence) not in {
+            "MONEYNESS_OUT_OF_RANGE",
+            "DELTA_OUT_OF_RANGE",
+        }
+
+
 # ── 18. Conflicting same-OCC evidence (structural + transient) ─────────────
 
 class TestConflictingSameOccEvidence:
