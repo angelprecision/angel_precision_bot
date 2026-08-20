@@ -41,12 +41,18 @@ premium/policy/affordability gates) is untouched.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 import os
 
 os.environ.setdefault("DATABASE_URL", "postgresql://fake")
 
 import pytest
 
+from ap.contract_selector import (
+    APContractSelectionEngine,
+    SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+    _new_selector_request_context,
+)
 from ap.selector_retry_policy import (
     UNKNOWN_FAIL_CLOSED,
     _resolve_exhaustive_structural_terminal_reason,
@@ -815,6 +821,124 @@ class TestAccountingGapClosure:
         result = resolve_selector_recovery_final_reason(evidence)
         assert result != "MONEYNESS_OUT_OF_RANGE"
         assert result == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+
+# ── DTE-ladder request-scope accumulation regression ───────────────────────
+
+class TestDteLadderRequestContextAccumulation:
+    def test_bucket_a_eligibility_survives_bucket_b_and_final_reduction(self):
+        """A deferred request owns one context across every DTE bucket.
+
+        The direct-quote eligibility ledger is populated during the bucket-A
+        sub-call. Bucket B must receive that same context, retain bucket A's
+        symbol, and carry both symbols into the request-level reducer rather
+        than starting a fresh accounting universe for the later expiration.
+        """
+        today = date.today()
+        bucket_a = today + timedelta(days=1)
+        while bucket_a.weekday() >= 5:
+            bucket_a += timedelta(days=1)
+        bucket_b = bucket_a + timedelta(days=3)
+        while bucket_b.weekday() >= 5:
+            bucket_b += timedelta(days=1)
+        bucket_a_exp = bucket_a.isoformat()
+        bucket_b_exp = bucket_b.isoformat()
+
+        # Use the real ladder method, with only provider expiration discovery
+        # and per-expiration selection stubbed. The context is the production
+        # SelectorRequestContext instance threaded through both sub-calls.
+        selector = object.__new__(APContractSelectionEngine)
+        selector.mode = "LIVE"
+        selector.dte_bucket_a_max = (bucket_a - today).days
+        selector.dte_bucket_b_max = (bucket_b - today).days
+        selector.dte_ladder_probe_per_bucket = 1
+        selector._last_failure = None
+        selector._last_dte_ladder_audit = None
+
+        plan = {
+            "ticker": "SPY",
+            "side": "CALL",
+            "execution_mode": "LIVE",
+            "timeframe": "5m",
+            "metadata": {},
+        }
+        request_context = _new_selector_request_context(
+            "SPY",
+            "live",
+            selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+        )
+        bucket_a_symbol = "SPY260821C00450000"
+        bucket_b_symbol = "SPY260824C00455000"
+        seen_contexts = []
+        final_reduction = {}
+
+        def _fetch_expirations(_ticker, *, request_context=None):
+            request_context.expirations = [bucket_a_exp, bucket_b_exp]
+            return [bucket_a_exp, bucket_b_exp], {"expiration_fetch_attempts": 1}
+
+        def _select_one_expiration(
+            _plan, *, expiration_override=None, request_context=None
+        ):
+            seen_contexts.append(request_context)
+            if expiration_override == bucket_a_exp:
+                request_context.direct_quote_eligible_symbols.add(bucket_a_symbol)
+                request_context.direct_quote_eligible_candidates = len(
+                    request_context.direct_quote_eligible_symbols
+                )
+                request_context.structural_skips.append({
+                    "symbol": bucket_a_symbol,
+                    "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                })
+                return None
+
+            assert expiration_override == bucket_b_exp
+            assert request_context is request_context_outer
+            assert bucket_a_symbol in request_context.direct_quote_eligible_symbols
+
+            request_context.direct_quote_eligible_symbols.add(bucket_b_symbol)
+            request_context.direct_quote_eligible_candidates = len(
+                request_context.direct_quote_eligible_symbols
+            )
+            request_context.direct_quote_unattempted_symbols.append(bucket_b_symbol)
+            request_context.direct_quote_unattempted_count = 1
+            final_reduction["reason"] = resolve_selector_recovery_final_reason({
+                "structural_skip_results": {
+                    bucket_a_symbol: "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+                },
+                "attempted_results": {},
+                "eligible_unattempted_symbols": list(
+                    request_context.direct_quote_unattempted_symbols
+                ),
+                "direct_quote_known_eligible_symbols": list(
+                    request_context.direct_quote_eligible_symbols
+                ),
+                "quality_rejections": {},
+                "fallback_selector_reason": "MONEYNESS_OUT_OF_RANGE",
+            })
+            return None
+
+        request_context_outer = request_context
+        selector._fetch_expirations_list = _fetch_expirations
+        selector.select = _select_one_expiration
+
+        assert selector._select_with_dte_ladder(
+            plan,
+            request_context=request_context,
+        ) is None
+        assert seen_contexts == [request_context, request_context]
+        assert request_context.direct_quote_eligible_symbols == {
+            bucket_a_symbol,
+            bucket_b_symbol,
+        }
+        assert final_reduction["reason"] != "MONEYNESS_OUT_OF_RANGE"
+        ladder_audit = selector.get_last_dte_ladder_audit()
+        assert ladder_audit["selection_diagnostics"][
+            "direct_quote_eligible_candidates"
+        ] == 2
+        assert ladder_audit["selection_diagnostics"]["expirations_probed"] == [
+            bucket_a_exp,
+            bucket_b_exp,
+        ]
 
 
 if __name__ == "__main__":

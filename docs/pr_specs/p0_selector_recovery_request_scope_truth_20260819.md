@@ -136,6 +136,17 @@ Immediately before the final unknown fallback:
 3. if it is known, return it unchanged/canonicalized;
 4. if it is blank, malformed, or classified `UNKNOWN_FAIL_CLOSED`, return `UNKNOWN_SELECTOR_RECOVERY_FAILURE` exactly as today.
 
+There is one binding exception to that known-reason fallback: the canonical
+structural request-level reasons `DTE_OUT_OF_RANGE`, `MONEYNESS_OUT_OF_RANGE`,
+`DELTA_OUT_OF_RANGE`, and `TERMINAL_POLICY_REJECT` are governed exclusively by
+the exhaustive structural-proof helper. Even if taxonomy lookup classifies one
+of these values as known, `fallback_selector_reason` MUST NOT resurrect it at
+Step 8.5 after exhaustive structural proof has failed. Such a structural
+reason may be returned only when the exhaustive helper already proved the
+complete, homogeneous candidate set; otherwise the resolver remains fail-closed
+as `UNKNOWN_SELECTOR_RECOVERY_FAILURE`. Known non-structural fallback reasons
+continue to follow the preservation rule above.
+
 Do not convert a known terminal quality reason into retryable data. Do not convert known retryable data into terminal quality. The reducer may choose a **stronger proven reason** earlier in its existing precedence; this fallback applies only when the reducer otherwise reaches unknown.
 
 ### 3. `ap/contract_selector.py` — thread the truthful pre-reducer reason into the deferred resolver call
