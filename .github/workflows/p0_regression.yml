@@ -110,6 +110,9 @@ jobs:
             tests/test_p0_selector_recovery_capacity_and_validity.py \
             tests/test_p0_selector_recovery_cursor.py \
             tests/test_p0_selector_recovery_july27_replay.py \
+            tests/test_p0_request_scope_moneyness_terminalization.py \
+            tests/test_p0_selector_recovery_production_replay_491.py \
+            tests/test_p0_jason_live_moneyness_replay_20260819_21.py \
             tests/test_p0_item11_behavioral_regressions.py \
             tests/test_p0_audit_blockers_401.py \
             tests/test_p0_selector_recovery_deploy_preflight.py \

@@ -237,6 +237,9 @@ def test_duplicate_conflict_reason_has_runtime_restart_materializer_parity():
     )
     restart_reduced = resolve_selector_recovery_final_reason({
         "quality_rejections": {reason: 2},
+        "quality_rejection_records": [
+            {"symbol": "SPY270101C00100000", "reason": reason}
+        ],
         "attempted_results": {},
         "structural_skip_results": {},
         "eligible_unattempted_symbols": [],

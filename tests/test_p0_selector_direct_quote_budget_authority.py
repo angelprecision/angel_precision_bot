@@ -1147,6 +1147,8 @@ class TestJuly23FleetAcceptanceReplay:
                     diagnostics = failure["selection_diagnostics"]
                     assert failure["reason_code"] in {
                         "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                        "CHAIN_ROW_ZERO_BID_ASK",
+                        "DIRECT_QUOTE_ZERO_BID_ASK",
                         "MONEYNESS_OUT_OF_RANGE",
                         "DELTA_OUT_OF_RANGE",
                         "DTE_OUT_OF_RANGE",
