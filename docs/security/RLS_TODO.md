@@ -13,6 +13,8 @@ production authorization or a replacement for the tenant-policy follow-up.
   unsafe policies removed.
 - 7 public security-definer views: public/anon/authenticated access revoked;
   service-role read access retained explicitly.
+- 24 existing public sequences with anon/authenticated privileges: access
+  revoked and service-role sequence privileges retained explicitly.
 - Future `postgres`-owned public table, sequence, and function defaults no
   longer grant PUBLIC/anon/authenticated access.
 
@@ -36,6 +38,8 @@ application `postgres` role is not a member of `supabase_admin`.
       authenticated role.
 - [ ] Dashboard writes have both owner `USING` and `WITH CHECK` predicates.
 - [ ] Anonymous reads and writes remain denied.
+- [ ] Anonymous and authenticated roles have no access to public sequences;
+      the bot service role retains the required sequence privileges.
 - [ ] Public views are either kept privileged-only or converted to tested
       `security_invoker` views with owner-scoped base policies.
 - [ ] Staging proves dashboard own-row access, cross-tenant denial, bot

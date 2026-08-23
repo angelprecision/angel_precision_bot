@@ -3,8 +3,9 @@
 -- Phase 1 of the Supabase RLS remediation.  The live project has 22 public
 -- tables with RLS disabled and grants to anon/authenticated.  It also has
 -- seven public security-definer views and 18 permissive public/anon policies
--- that would remain reachable after a table-only lockdown.  This migration
--- closes those known public paths without inventing tenant policies: the
+-- plus 24 public sequences with anon/authenticated privileges that would
+-- remain reachable after a table-only lockdown.  This migration closes those
+-- known public paths without inventing tenant policies: the
 -- dashboard auth model and the client_email/client_id ownership bridge are
 -- not finalized.
 --
@@ -14,8 +15,11 @@
 --   * anon/authenticated receive no table or view access on the reviewed
 --     public surface, so the Data API is deny-by-default until explicit,
 --     owner-scoped policies are approved.
---   * the preflight fails before DDL if the reviewed table/view/policy scope,
---     owner, or service_role access has drifted.
+--   * anon/authenticated receive no access to the reviewed public sequences;
+--     service_role retains the sequence privileges required by inserts.
+--   * the preflight fails before DDL if the reviewed table/view/sequence/policy
+--     scope, owner, or service_role access has drifted, including unexpected
+--     exposed sequences or permissive public/anon policies.
 --   * only the exact, live-verified permissive public/anon policies are
 --     removed.  The service_role-only client_health policy is preserved.
 --
@@ -24,10 +28,40 @@
 
 DO $$
 DECLARE
+    _sequence_names CONSTANT TEXT[] := ARRAY[
+        'ap_admin_audit_id_seq',
+        'ap_audit_log_id_seq',
+        'ap_client_account_snapshots_id_seq',
+        'ap_intelligence_outcome_bindings_id_seq',
+        'ap_system_events_id_seq',
+        'applications_id_seq',
+        'audit_log_id_seq',
+        'blocked_signal_counterfactuals_id_seq',
+        'bot_status_id_seq',
+        'broker_order_audit_id_seq',
+        'client_signal_opportunities_id_seq',
+        'daily_performance_id_seq',
+        'decision_events_id_seq',
+        'exit_decision_ledger_id_seq',
+        'market_data_id_seq',
+        'operator_audit_log_id_seq',
+        'option_outcomes_id_seq',
+        'orders_id_seq',
+        'proof_daily_summary_id_seq',
+        'proof_trades_id_seq',
+        'signal_outcomes_id_seq',
+        'signals_id_seq',
+        'trade_queue_id_seq',
+        'trades_id_seq'
+    ];
     _missing_tables TEXT;
+    _missing_sequences TEXT;
     _owner_drift TEXT;
+    _sequence_owner_drift TEXT;
     _service_access_gap TEXT;
+    _sequence_service_access_gap TEXT;
     _unexpected_disabled TEXT;
+    _unexpected_sequence_access TEXT;
     _unexpected_view_access TEXT;
 BEGIN
     SELECT string_agg(v.table_name, ', ' ORDER BY v.table_name)
@@ -142,6 +176,73 @@ BEGIN
         RAISE EXCEPTION
             'RLS hardening preflight failed: service_role access gap(s): %',
             _service_access_gap;
+    END IF;
+
+    SELECT string_agg(v.sequence_name, ', ' ORDER BY v.sequence_name)
+      INTO _missing_sequences
+      FROM unnest(_sequence_names) AS v(sequence_name)
+      LEFT JOIN pg_class c
+        ON c.relname = v.sequence_name
+       AND c.relnamespace = 'public'::regnamespace
+       AND c.relkind = 'S'
+     WHERE c.oid IS NULL;
+
+    IF _missing_sequences IS NOT NULL THEN
+        RAISE EXCEPTION
+            'RLS hardening preflight failed: missing public sequences: %',
+            _missing_sequences;
+    END IF;
+
+    SELECT string_agg(v.sequence_name, ', ' ORDER BY v.sequence_name)
+      INTO _sequence_owner_drift
+      FROM unnest(_sequence_names) AS v(sequence_name)
+      JOIN pg_class c
+        ON c.relname = v.sequence_name
+       AND c.relnamespace = 'public'::regnamespace
+       AND c.relkind = 'S'
+     WHERE pg_get_userbyid(c.relowner) <> 'postgres';
+
+    IF _sequence_owner_drift IS NOT NULL THEN
+        RAISE EXCEPTION
+            'RLS hardening preflight failed: unexpected sequence owner(s): %',
+            _sequence_owner_drift;
+    END IF;
+
+    SELECT string_agg(v.sequence_name, ', ' ORDER BY v.sequence_name)
+      INTO _sequence_service_access_gap
+      FROM unnest(_sequence_names) AS v(sequence_name)
+     WHERE NOT (
+         has_sequence_privilege('service_role', format('public.%I', v.sequence_name), 'USAGE')
+         AND has_sequence_privilege('service_role', format('public.%I', v.sequence_name), 'SELECT')
+         AND has_sequence_privilege('service_role', format('public.%I', v.sequence_name), 'UPDATE')
+     );
+
+    IF _sequence_service_access_gap IS NOT NULL THEN
+        RAISE EXCEPTION
+            'RLS hardening preflight failed: service_role sequence access gap(s): %',
+            _sequence_service_access_gap;
+    END IF;
+
+    SELECT string_agg(c.relname, ', ' ORDER BY c.relname)
+      INTO _unexpected_sequence_access
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind = 'S'
+       AND (
+           has_sequence_privilege('anon', c.oid, 'USAGE')
+           OR has_sequence_privilege('anon', c.oid, 'SELECT')
+           OR has_sequence_privilege('anon', c.oid, 'UPDATE')
+           OR has_sequence_privilege('authenticated', c.oid, 'USAGE')
+           OR has_sequence_privilege('authenticated', c.oid, 'SELECT')
+           OR has_sequence_privilege('authenticated', c.oid, 'UPDATE')
+       )
+       AND c.relname <> ALL (_sequence_names);
+
+    IF _unexpected_sequence_access IS NOT NULL THEN
+        RAISE EXCEPTION
+            'RLS hardening preflight failed: unreviewed public sequences with anon/authenticated access: %',
+            _unexpected_sequence_access;
     END IF;
 
     SELECT string_agg(c.relname, ', ' ORDER BY c.relname)
@@ -268,6 +369,7 @@ END $$;
 DO $$
 DECLARE
     _policy_drift TEXT;
+    _unexpected_permissive_policy TEXT;
     _policy_table_gap TEXT;
 BEGIN
     SELECT string_agg(format('%s.%s', e.table_name, e.policy_name), ', '
@@ -308,6 +410,50 @@ BEGIN
         RAISE EXCEPTION
             'RLS hardening preflight failed: permissive policy drift: %',
             _policy_drift;
+    END IF;
+
+    SELECT string_agg(format('%s.%s', p.tablename, p.policyname), ', '
+                      ORDER BY p.tablename, p.policyname)
+      INTO _unexpected_permissive_policy
+      FROM pg_policies p
+     WHERE p.schemaname = 'public'
+       AND p.roles && ARRAY['public', 'anon', 'authenticated']::name[]
+       AND (p.qual = 'true' OR p.with_check = 'true')
+       AND NOT EXISTS (
+           SELECT 1
+             FROM (VALUES
+               ('alert_routes', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
+               ('ap_admin_audit', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
+               ('ap_signal_underlying_outcomes', 'anon_all_underlying', '{anon}', 'ALL', 'true', 'true'),
+               ('ap_system_control', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
+               ('bot_status', 'anon_all_bot_status', '{anon}', 'ALL', 'true', 'true'),
+               ('client_health', 'anon_read_client_health', '{anon}', 'SELECT', 'true', '<null>'),
+               ('content_queue', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
+               ('daily_cadence_logs', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
+               ('incidents', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
+               ('market_data', 'Anyone can read market data', '{anon}', 'SELECT', 'true', '<null>'),
+               ('option_outcomes', 'anon_all_option_outcomes', '{anon}', 'ALL', 'true', 'true'),
+               ('proof_daily_summary', 'anon_all_proof_daily', '{anon}', 'ALL', 'true', 'true'),
+               ('proof_trades', 'anon_all_proof_trades', '{anon}', 'ALL', 'true', 'true'),
+               ('proof_trades', 'service_role_all', '{public}', 'ALL', 'true', '<null>'),
+               ('proof_vault', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
+               ('signal_outcomes', 'anon_all_signal_outcomes', '{anon}', 'ALL', 'true', 'true'),
+               ('signals', 'Anyone can read signals', '{anon}', 'SELECT', 'true', '<null>'),
+               ('system_health_events', 'anon_read', '{public}', 'SELECT', 'true', '<null>')
+             ) AS e(table_name, policy_name, expected_roles, expected_cmd,
+                    expected_qual, expected_with_check)
+            WHERE p.tablename = e.table_name
+              AND p.policyname = e.policy_name
+              AND p.roles::text = e.expected_roles
+              AND p.cmd = e.expected_cmd
+              AND COALESCE(p.qual, '<null>') = e.expected_qual
+              AND COALESCE(p.with_check, '<null>') = e.expected_with_check
+       );
+
+    IF _unexpected_permissive_policy IS NOT NULL THEN
+        RAISE EXCEPTION
+            'RLS hardening preflight failed: unreviewed permissive public/anon policy drift: %',
+            _unexpected_permissive_policy;
     END IF;
 
     SELECT string_agg(v.table_name, ', ' ORDER BY v.table_name)
@@ -452,6 +598,61 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
     public.processed_signals,
     public.schema_migrations,
     public.trade_fills
+TO service_role;
+
+-- Sequences are a separate privilege surface from their owning tables.  The
+-- live project grants anon/authenticated sequence access through defaults, so
+-- close the existing 24 sequences while retaining the bot's nextval path.
+REVOKE ALL ON SEQUENCE public.ap_admin_audit_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.ap_audit_log_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.ap_client_account_snapshots_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.ap_intelligence_outcome_bindings_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.ap_system_events_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.applications_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.audit_log_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.blocked_signal_counterfactuals_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.bot_status_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.broker_order_audit_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.client_signal_opportunities_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.daily_performance_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.decision_events_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.exit_decision_ledger_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.market_data_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.operator_audit_log_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.option_outcomes_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.orders_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.proof_daily_summary_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.proof_trades_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.signal_outcomes_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.signals_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.trade_queue_id_seq FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE public.trades_id_seq FROM PUBLIC, anon, authenticated;
+
+GRANT USAGE, SELECT, UPDATE ON SEQUENCE
+    public.ap_admin_audit_id_seq,
+    public.ap_audit_log_id_seq,
+    public.ap_client_account_snapshots_id_seq,
+    public.ap_intelligence_outcome_bindings_id_seq,
+    public.ap_system_events_id_seq,
+    public.applications_id_seq,
+    public.audit_log_id_seq,
+    public.blocked_signal_counterfactuals_id_seq,
+    public.bot_status_id_seq,
+    public.broker_order_audit_id_seq,
+    public.client_signal_opportunities_id_seq,
+    public.daily_performance_id_seq,
+    public.decision_events_id_seq,
+    public.exit_decision_ledger_id_seq,
+    public.market_data_id_seq,
+    public.operator_audit_log_id_seq,
+    public.option_outcomes_id_seq,
+    public.orders_id_seq,
+    public.proof_daily_summary_id_seq,
+    public.proof_trades_id_seq,
+    public.signal_outcomes_id_seq,
+    public.signals_id_seq,
+    public.trade_queue_id_seq,
+    public.trades_id_seq
 TO service_role;
 
 -- Close the separately audited public/anon policy tables.  RLS is already

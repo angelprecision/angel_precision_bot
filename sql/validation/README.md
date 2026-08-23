@@ -32,7 +32,7 @@ what it just printed.
 | `04_phase5_post_cancel_retry.sql` | Post-cancel retry events show ARMED → SUBMITTED → (FILLED or ABORTED) progression; no infinite retry loops; max 2 attempts honored. |
 | `05_phase6_dashboard_telemetry.sql` | The 23-field telemetry projection is exposable for every entry; no gaps in core fields. |
 | `06_phase7_exit_pricing.sql` | Exit prices come from option contract quotes, fill prices are sane, and partial exits do not leave the position unfunded. |
-| `07_rls_hardening.sql` | Read-only catalog proof for the 22-table RLS/grant lockdown, privileged-path preservation, public views, permissive policies, and remaining default privileges. |
+| `07_rls_hardening.sql` | Read-only catalog proof for the 22-table RLS/grant lockdown, 24-sequence grant lockdown, privileged-path preservation, public views, permissive-policy drift, and remaining default privileges. |
 | `99_health_summary.sql` | One-pager: entry funnel by reason_bucket, average fill latency, sizing distribution, retry success rate. |
 
 ## Safety guarantees

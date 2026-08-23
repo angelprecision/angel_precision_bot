@@ -34,6 +34,33 @@ EXPECTED_TABLES = {
     "trade_fills",
 }
 
+EXPECTED_SEQUENCES = {
+    "ap_admin_audit_id_seq",
+    "ap_audit_log_id_seq",
+    "ap_client_account_snapshots_id_seq",
+    "ap_intelligence_outcome_bindings_id_seq",
+    "ap_system_events_id_seq",
+    "applications_id_seq",
+    "audit_log_id_seq",
+    "blocked_signal_counterfactuals_id_seq",
+    "bot_status_id_seq",
+    "broker_order_audit_id_seq",
+    "client_signal_opportunities_id_seq",
+    "daily_performance_id_seq",
+    "decision_events_id_seq",
+    "exit_decision_ledger_id_seq",
+    "market_data_id_seq",
+    "operator_audit_log_id_seq",
+    "option_outcomes_id_seq",
+    "orders_id_seq",
+    "proof_daily_summary_id_seq",
+    "proof_trades_id_seq",
+    "signal_outcomes_id_seq",
+    "signals_id_seq",
+    "trade_queue_id_seq",
+    "trades_id_seq",
+}
+
 EXPECTED_POLICY_TABLES = {
     "alert_routes",
     "ap_admin_audit",
@@ -102,11 +129,25 @@ def test_migration_targets_exact_live_scope() -> None:
         sql,
         flags=re.IGNORECASE | re.MULTILINE,
     )
+    sequence_revoked = re.findall(
+        r"^REVOKE ALL ON SEQUENCE public\.([a-z0-9_]+) FROM PUBLIC, anon, authenticated;$",
+        sql,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    sequence_grant = re.search(
+        r"GRANT USAGE, SELECT, UPDATE ON SEQUENCE(?P<body>.*?)TO service_role;",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
     assert set(enabled) == EXPECTED_TABLES
     assert set(revoked) == EXPECTED_TABLES | EXPECTED_POLICY_TABLES | EXPECTED_VIEWS
+    assert set(sequence_revoked) == EXPECTED_SEQUENCES
+    assert sequence_grant is not None
+    assert set(re.findall(r"public\.([a-z0-9_]+)", sequence_grant.group("body"))) == EXPECTED_SEQUENCES
     assert len(enabled) == len(EXPECTED_TABLES)
     assert len(revoked) == len(EXPECTED_TABLES | EXPECTED_POLICY_TABLES | EXPECTED_VIEWS)
+    assert len(sequence_revoked) == len(EXPECTED_SEQUENCES)
 
 
 def test_migration_drops_only_live_verified_public_policy_rows() -> None:
@@ -133,6 +174,8 @@ def test_migration_is_fail_closed_without_guessing_tenant_policies() -> None:
     )
     assert "roles::text IS DISTINCT FROM" in sql
     assert "unreviewed public tables with RLS disabled" in sql
+    assert "unreviewed public sequences with anon/authenticated access" in sql
+    assert "unreviewed permissive public/anon policy drift" in sql
 
 
 def test_migration_leaves_privileged_paths_and_runner_transaction_control_alone() -> None:
@@ -155,6 +198,8 @@ def test_validation_is_read_only_and_has_hard_gates() -> None:
     assert "anon', format('public.%I', e.table_name), 'INSERT'" in sql
     assert "authenticated', format('public.%I', e.table_name), 'DELETE'" in sql
     assert "roles && ARRAY['public', 'anon', 'authenticated']::name[]" in sql
+    assert "has_sequence_privilege('anon'" in sql
+    assert "Public sequences remain reachable by anon/authenticated" in sql
     assert not re.search(r"^\s*(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b", sql, re.IGNORECASE | re.MULTILINE)
 
 

@@ -152,6 +152,104 @@ BEGIN
     END IF;
 END $$;
 
+
+\echo '== Public sequence privilege matrix =='
+WITH expected(sequence_name) AS (
+    VALUES
+        ('ap_admin_audit_id_seq'), ('ap_audit_log_id_seq'),
+        ('ap_client_account_snapshots_id_seq'),
+        ('ap_intelligence_outcome_bindings_id_seq'), ('ap_system_events_id_seq'),
+        ('applications_id_seq'), ('audit_log_id_seq'),
+        ('blocked_signal_counterfactuals_id_seq'), ('bot_status_id_seq'),
+        ('broker_order_audit_id_seq'), ('client_signal_opportunities_id_seq'),
+        ('daily_performance_id_seq'), ('decision_events_id_seq'),
+        ('exit_decision_ledger_id_seq'), ('market_data_id_seq'),
+        ('operator_audit_log_id_seq'), ('option_outcomes_id_seq'),
+        ('orders_id_seq'), ('proof_daily_summary_id_seq'),
+        ('proof_trades_id_seq'), ('signal_outcomes_id_seq'),
+        ('signals_id_seq'), ('trade_queue_id_seq'), ('trades_id_seq')
+)
+SELECT e.sequence_name,
+       c.oid IS NOT NULL AS sequence_present,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE pg_get_userbyid(c.relowner) END AS owner,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('anon', c.oid, 'USAGE') END AS anon_usage,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('anon', c.oid, 'SELECT') END AS anon_select,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('anon', c.oid, 'UPDATE') END AS anon_update,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('authenticated', c.oid, 'USAGE') END AS authenticated_usage,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('authenticated', c.oid, 'SELECT') END AS authenticated_select,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('authenticated', c.oid, 'UPDATE') END AS authenticated_update,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('service_role', c.oid, 'USAGE') END AS service_usage,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('service_role', c.oid, 'SELECT') END AS service_select,
+       CASE WHEN c.oid IS NULL THEN NULL ELSE has_sequence_privilege('service_role', c.oid, 'UPDATE') END AS service_update
+FROM expected e
+LEFT JOIN pg_class c
+  ON c.relname = e.sequence_name
+ AND c.relnamespace = 'public'::regnamespace
+ AND c.relkind = 'S'
+ORDER BY e.sequence_name;
+
+DO $$
+DECLARE
+    _bad TEXT;
+BEGIN
+    WITH expected(sequence_name) AS (
+        VALUES
+            ('ap_admin_audit_id_seq'), ('ap_audit_log_id_seq'),
+            ('ap_client_account_snapshots_id_seq'),
+            ('ap_intelligence_outcome_bindings_id_seq'), ('ap_system_events_id_seq'),
+            ('applications_id_seq'), ('audit_log_id_seq'),
+            ('blocked_signal_counterfactuals_id_seq'), ('bot_status_id_seq'),
+            ('broker_order_audit_id_seq'), ('client_signal_opportunities_id_seq'),
+            ('daily_performance_id_seq'), ('decision_events_id_seq'),
+            ('exit_decision_ledger_id_seq'), ('market_data_id_seq'),
+            ('operator_audit_log_id_seq'), ('option_outcomes_id_seq'),
+            ('orders_id_seq'), ('proof_daily_summary_id_seq'),
+            ('proof_trades_id_seq'), ('signal_outcomes_id_seq'),
+            ('signals_id_seq'), ('trade_queue_id_seq'), ('trades_id_seq')
+    )
+    SELECT string_agg(e.sequence_name, ', ' ORDER BY e.sequence_name)
+      INTO _bad
+      FROM expected e
+      LEFT JOIN pg_class c
+        ON c.relname = e.sequence_name
+       AND c.relnamespace = 'public'::regnamespace
+       AND c.relkind = 'S'
+     WHERE c.oid IS NULL
+        OR pg_get_userbyid(c.relowner) <> 'postgres'
+        OR CASE WHEN c.oid IS NULL THEN false ELSE has_sequence_privilege('anon', c.oid, 'USAGE') END
+        OR CASE WHEN c.oid IS NULL THEN false ELSE has_sequence_privilege('anon', c.oid, 'SELECT') END
+        OR CASE WHEN c.oid IS NULL THEN false ELSE has_sequence_privilege('anon', c.oid, 'UPDATE') END
+        OR CASE WHEN c.oid IS NULL THEN false ELSE has_sequence_privilege('authenticated', c.oid, 'USAGE') END
+        OR CASE WHEN c.oid IS NULL THEN false ELSE has_sequence_privilege('authenticated', c.oid, 'SELECT') END
+        OR CASE WHEN c.oid IS NULL THEN false ELSE has_sequence_privilege('authenticated', c.oid, 'UPDATE') END
+        OR CASE WHEN c.oid IS NULL THEN false ELSE NOT has_sequence_privilege('service_role', c.oid, 'USAGE') END
+        OR CASE WHEN c.oid IS NULL THEN false ELSE NOT has_sequence_privilege('service_role', c.oid, 'SELECT') END
+        OR CASE WHEN c.oid IS NULL THEN false ELSE NOT has_sequence_privilege('service_role', c.oid, 'UPDATE') END;
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'Public sequence gate failed: %', _bad;
+    END IF;
+
+    SELECT string_agg(c.relname, ', ' ORDER BY c.relname)
+      INTO _bad
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind = 'S'
+       AND (
+           has_sequence_privilege('anon', c.oid, 'USAGE')
+           OR has_sequence_privilege('anon', c.oid, 'SELECT')
+           OR has_sequence_privilege('anon', c.oid, 'UPDATE')
+           OR has_sequence_privilege('authenticated', c.oid, 'USAGE')
+           OR has_sequence_privilege('authenticated', c.oid, 'SELECT')
+           OR has_sequence_privilege('authenticated', c.oid, 'UPDATE')
+       );
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'Public sequences remain reachable by anon/authenticated: %', _bad;
+    END IF;
+END $$;
+
 \echo '== Policy-lockdown table matrix =='
 WITH expected(table_name) AS (
     VALUES

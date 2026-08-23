@@ -20,11 +20,15 @@ baseline for the live public security surface. It:
   preserved;
 - revokes `PUBLIC`, `anon`, and `authenticated` access to all seven currently
   exposed public views and grants explicit `service_role` read access;
+- revokes existing `PUBLIC`, `anon`, and `authenticated` access to the 24
+  currently exposed public sequences and grants explicit `service_role`
+  `USAGE`, `SELECT`, and `UPDATE` access;
 - removes those roles from future table, sequence, and function defaults
   created by `postgres` in `public`; the preflight refuses to proceed while
   Supabase-managed `supabase_admin` defaults remain broad;
-- fails before DDL if the table, view, policy, owner, privilege, or public-RLS
-  scope has drifted.
+- fails before DDL if the table, view, sequence, policy, owner, privilege, or
+  public-RLS scope has drifted, including unexpected exposed sequences or
+  permissive public/anon policies.
 
 No guessed tenant policies are created. The dashboard auth model and the
 `client_email`/`client_id` ownership bridge remain unresolved. The bot’s direct
@@ -40,17 +44,21 @@ and staging must additionally prove:
    disabled.
 2. `anon` and `authenticated` have no SELECT/INSERT/UPDATE/DELETE privileges
    on either lockdown table scope.
-3. `service_role` retains SELECT/INSERT/UPDATE/DELETE on every lockdown table
+3. `anon` and `authenticated` have no USAGE/SELECT/UPDATE privileges on any
+   reviewed public sequence.
+4. `service_role` retains SELECT/INSERT/UPDATE/DELETE on every lockdown table
    and SELECT on every lockdown view.
-4. Anonymous and authenticated Data API requests are denied for the
+5. `service_role` retains USAGE/SELECT/UPDATE on every reviewed public
+   sequence.
+6. Anonymous and authenticated Data API requests are denied for the
    fail-closed phase-1 scope, including the seven views.
-5. The bot’s direct PostgreSQL lifecycle paths still read and write orders,
+7. The bot’s direct PostgreSQL lifecycle paths still read and write orders,
    client state, fills, signals, proof records, and migration history.
-6. Every dashboard operation that must remain available has an explicit,
+8. Every dashboard operation that must remain available has an explicit,
    reviewed owner predicate before an authenticated policy is added.
-7. No public/anon/authenticated permissive policy remains. Service-role-only
+9. No public/anon/authenticated permissive policy remains. Service-role-only
    policies require a separate owner review but do not expose the Data API.
-8. An owner-authorized follow-up removes the remaining `supabase_admin`
+10. An owner-authorized follow-up removes the remaining `supabase_admin`
    default privileges before this migration is applied, because the
    application `postgres` role is not a member of `supabase_admin`.
 
