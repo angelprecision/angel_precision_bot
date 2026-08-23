@@ -1,85 +1,55 @@
 # Supabase RLS — TODO
 
-Status: **NOT YET IMPLEMENTED.** Tracked for a follow-up PR after the
-dashboard auth model is locked.
+Status: **REVIEW DRAFT — PHASE 1 NOT APPLIED.** PR #499 contains a
+fail-closed public-surface lockdown for the exact live findings. It is not a
+production authorization or a replacement for the tenant-policy follow-up.
 
-## Tables that need Row-Level Security
+## Phase 1 scope in PR #499
 
-The post-audit recommendation calls for RLS on these four tables (all
-Supabase-managed):
+- 22 public tables with RLS disabled: RLS enabled, public/anon/authenticated
+  table privileges revoked, and service-role CRUD made explicit.
+- 17 additional RLS-enabled tables with live-verified permissive public/anon
+  policies: public/anon/authenticated table access revoked and the exact
+  unsafe policies removed.
+- 7 public security-definer views: public/anon/authenticated access revoked;
+  service-role read access retained explicitly.
+- 24 existing public sequences with anon/authenticated privileges: access
+  revoked and service-role sequence privileges retained explicitly.
+- Future `postgres`-owned public table, sequence, and function defaults no
+  longer grant PUBLIC/anon/authenticated access.
 
-| Table | Why | Owner column |
-|---|---|---|
-| `proof_trades` | Per-client proof artifacts — must not leak across tenants. | `client_email` or `email` |
-| `ap_signals` | Per-client signal log — visible only to the owning client. | `client_email` or `client_id` |
-| `members` | Authenticated user list — read-self only. | `email` |
-| `client_risk_profiles` | Risk caps, position size policy, kill-switch state. | `client_id` |
+## Intentionally unresolved
 
-## Why we are not pasting RLS SQL in this PR
+No authenticated tenant policies are guessed in this phase. Before any
+dashboard access is restored, verify the live ownership bridge for each
+operation (`auth.uid()`/application identity to `client_id` or
+`client_email`) and add explicit `TO authenticated` policies with both
+`USING` and `WITH CHECK` where writes are required. Service-role and direct
+PostgreSQL paths remain privileged paths and do not need a public RLS policy.
 
-1. **Owner-column mapping is not finalized.** Several of these tables use
-   `client_email` while others use `client_id`. The mapping between
-   Supabase Auth `auth.uid()` / `auth.email()` and these columns must be
-   confirmed against the live schema before policies are written.
-2. **Service-role writes must remain unaffected.** The bot writes to
-   these tables via `SUPABASE_SERVICE_KEY`. Policies must explicitly
-   allow `auth.role() = 'service_role'` or all bot writes break.
-3. **Anon reads need explicit scoping.** The current default in some
-   Supabase projects allows public anon reads on tables not yet locked
-   down. RLS must be enabled AND a deny-by-default policy added — RLS
-   without policies leaves the table effectively closed only if RLS is
-   in `enforce` mode.
-4. **Untested RLS SQL breaks the dashboard.** Policies that look
-   superficially correct can lock out the dashboard backend (which signs
-   in as a particular role) if the role/claim mapping is off by one.
+The migration preflight refuses to proceed while the `supabase_admin` default
+privileges remain broad. They require owner-authorized follow-up because the
+application `postgres` role is not a member of `supabase_admin`.
 
-## Acceptance criteria for the follow-up PR
+## Acceptance criteria for the follow-up policy PR
 
-When the follow-up RLS PR is written, it must satisfy all of:
+- [ ] Owner columns and identity mapping are verified against the live schema.
+- [ ] Dashboard reads are limited to the authenticated owner, not merely the
+      authenticated role.
+- [ ] Dashboard writes have both owner `USING` and `WITH CHECK` predicates.
+- [ ] Anonymous reads and writes remain denied.
+- [ ] Anonymous and authenticated roles have no access to public sequences;
+      the bot service role retains the required sequence privileges and
+      `rolbypassrls = true`.
+- [ ] The reviewed policy rows match the expected roles, command, predicates,
+      and `PERMISSIVE` mode before any policy is dropped; retained public-role
+      owner policies are exact-contract checked and unknown policy identities
+      fail closed.
+- [ ] Public views are either kept privileged-only or converted to tested
+      `security_invoker` views with owner-scoped base policies.
+- [ ] Staging proves dashboard own-row access, cross-tenant denial, bot
+      service-role CRUD, and anonymous Data API denial.
+- [ ] The `supabase_admin` default privilege owner authorizes the follow-up.
 
-- [ ] Owner-column verified against the live schema (`\d <table>` output
-      attached to the PR).
-- [ ] `auth.role() = 'service_role'` explicitly allowed on all four
-      tables (bypass policy or wide-open service-role policy).
-- [ ] `auth.email()` (or `auth.uid()`) compared against the owner column
-      in the SELECT/UPDATE/DELETE policies.
-- [ ] Anonymous (`anon`) reads explicitly denied.
-- [ ] Tested against a staging Supabase project (NOT prod) with at least:
-      - The dashboard backend signed in as a real authenticated user can
-        SELECT its own rows and CANNOT select another user's rows.
-      - The bot using `SUPABASE_SERVICE_KEY` can still INSERT / UPDATE /
-        DELETE freely.
-      - Anonymous Supabase client returns 0 rows / 401.
-- [ ] Reversible: a `DROP POLICY` companion is provided in the PR body
-      so policies can be backed out fast if the dashboard misbehaves.
-
-## Suggested policy shapes (illustrative — DO NOT apply blindly)
-
-These are **starting points**, not production SQL. Verify against the live
-schema and the dashboard auth model first.
-
-```sql
--- proof_trades: per-client read access by authenticated email
-ALTER TABLE proof_trades ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY proof_trades_select_own
-  ON proof_trades
-  FOR SELECT
-  USING ( auth.email() = client_email );
-
-CREATE POLICY proof_trades_service_role_all
-  ON proof_trades
-  FOR ALL
-  USING ( auth.role() = 'service_role' )
-  WITH CHECK ( auth.role() = 'service_role' );
-```
-
-The same shape with the right owner column applies to `ap_signals`,
-`members`, and `client_risk_profiles`. The exact column names must be
-confirmed before SQL is run.
-
-## Out of scope for the credential/auth/client-scope hardening PR
-
-This file is the only RLS-related change in this PR. The actual policy
-SQL will live in a follow-up PR once the dashboard auth model is locked.
-No destructive migrations are added here.
+No production SQL should be applied until the rollout plan and validation
+assertions pass on isolated staging.
