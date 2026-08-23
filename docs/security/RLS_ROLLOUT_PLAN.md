@@ -28,7 +28,8 @@ baseline for the live public security surface. It:
   Supabase-managed `supabase_admin` defaults remain broad;
 - fails before DDL if the table, view, sequence, policy, owner, privilege, or
   public-RLS scope has drifted, including unexpected exposed sequences or
-  permissive public/anon policies.
+  permissive public/anon policies; it also fails unless `service_role` retains
+  `rolbypassrls = true` and every expected policy remains `PERMISSIVE`.
 
 No guessed tenant policies are created. The dashboard auth model and the
 `client_email`/`client_id` ownership bridge remain unresolved. The bot’s direct
@@ -46,8 +47,8 @@ and staging must additionally prove:
    on either lockdown table scope.
 3. `anon` and `authenticated` have no USAGE/SELECT/UPDATE privileges on any
    reviewed public sequence.
-4. `service_role` retains SELECT/INSERT/UPDATE/DELETE on every lockdown table
-   and SELECT on every lockdown view.
+4. `service_role` retains `rolbypassrls = true`, SELECT/INSERT/UPDATE/DELETE
+   on every lockdown table, and SELECT on every lockdown view.
 5. `service_role` retains USAGE/SELECT/UPDATE on every reviewed public
    sequence.
 6. Anonymous and authenticated Data API requests are denied for the
@@ -56,8 +57,9 @@ and staging must additionally prove:
    client state, fills, signals, proof records, and migration history.
 8. Every dashboard operation that must remain available has an explicit,
    reviewed owner predicate before an authenticated policy is added.
-9. No public/anon/authenticated permissive policy remains. Service-role-only
-   policies require a separate owner review but do not expose the Data API.
+9. No public/anon/authenticated permissive policy remains, and the exact policy
+   permissiveness matches the reviewed baseline. Service-role-only policies
+   require a separate owner review but do not expose the Data API.
 10. An owner-authorized follow-up removes the remaining `supabase_admin`
    default privileges before this migration is applied, because the
    application `postgres` role is not a member of `supabase_admin`.

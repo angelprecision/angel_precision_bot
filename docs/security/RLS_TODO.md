@@ -39,7 +39,10 @@ application `postgres` role is not a member of `supabase_admin`.
 - [ ] Dashboard writes have both owner `USING` and `WITH CHECK` predicates.
 - [ ] Anonymous reads and writes remain denied.
 - [ ] Anonymous and authenticated roles have no access to public sequences;
-      the bot service role retains the required sequence privileges.
+      the bot service role retains the required sequence privileges and
+      `rolbypassrls = true`.
+- [ ] The reviewed policy rows match the expected roles, command, predicates,
+      and `PERMISSIVE` mode before any policy is dropped.
 - [ ] Public views are either kept privileged-only or converted to tested
       `security_invoker` views with owner-scoped base policies.
 - [ ] Staging proves dashboard own-row access, cross-tenant denial, bot

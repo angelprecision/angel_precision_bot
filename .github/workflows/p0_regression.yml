@@ -68,6 +68,27 @@ jobs:
             | grep -qx 2
           dropdb -h localhost -U postgres position_mode_migration_test
 
+      - name: Execute and validate RLS hardening migration
+        env:
+          PGPASSWORD: postgres
+        run: |
+          set -e
+          cleanup() {
+            dropdb -h localhost -U postgres --if-exists rls_hardening_test >/dev/null 2>&1 || true
+          }
+          cleanup
+          trap cleanup EXIT
+          createdb -h localhost -U postgres rls_hardening_test
+          psql -h localhost -U postgres -d rls_hardening_test \
+            -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/rls_hardening_migration_fixture.sql
+          psql -h localhost -U postgres -d rls_hardening_test \
+            --single-transaction -v ON_ERROR_STOP=1 \
+            -f migrations/20260823_rls_public_surface_lockdown.sql
+          psql -h localhost -U postgres -d rls_hardening_test \
+            -v ON_ERROR_STOP=1 \
+            -f sql/validation/07_rls_hardening.sql
+
       - name: Run P0 plus cohesion tests
         env:
           # PR #388 CI fix: PGSSLMODE=disable so ap.db never tries SSL

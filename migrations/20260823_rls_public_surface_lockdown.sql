@@ -59,6 +59,7 @@ DECLARE
     _owner_drift TEXT;
     _sequence_owner_drift TEXT;
     _service_access_gap TEXT;
+    _service_role_bypass_gap TEXT;
     _sequence_service_access_gap TEXT;
     _unexpected_disabled TEXT;
     _unexpected_sequence_access TEXT;
@@ -176,6 +177,24 @@ BEGIN
         RAISE EXCEPTION
             'RLS hardening preflight failed: service_role access gap(s): %',
             _service_access_gap;
+    END IF;
+
+    SELECT string_agg(
+               CASE
+                   WHEN r.oid IS NULL THEN e.role_name || ' (missing)'
+                   ELSE e.role_name || ' (BYPASSRLS=false)'
+               END,
+               ', ' ORDER BY e.role_name
+           )
+      INTO _service_role_bypass_gap
+      FROM (VALUES ('service_role')) AS e(role_name)
+      LEFT JOIN pg_roles r ON r.rolname = e.role_name
+     WHERE r.oid IS NULL OR NOT r.rolbypassrls;
+
+    IF _service_role_bypass_gap IS NOT NULL THEN
+        RAISE EXCEPTION
+            'RLS hardening preflight failed: service_role must retain BYPASSRLS: %',
+            _service_role_bypass_gap;
     END IF;
 
     SELECT string_agg(v.sequence_name, ', ' ORDER BY v.sequence_name)
@@ -376,26 +395,26 @@ BEGIN
                       ORDER BY e.table_name, e.policy_name)
       INTO _policy_drift
       FROM (VALUES
-        ('alert_routes', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-        ('ap_admin_audit', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-        ('ap_signal_underlying_outcomes', 'anon_all_underlying', '{anon}', 'ALL', 'true', 'true'),
-        ('ap_system_control', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-        ('bot_status', 'anon_all_bot_status', '{anon}', 'ALL', 'true', 'true'),
-        ('client_health', 'anon_read_client_health', '{anon}', 'SELECT', 'true', '<null>'),
-        ('content_queue', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-        ('daily_cadence_logs', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-        ('incidents', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-        ('market_data', 'Anyone can read market data', '{anon}', 'SELECT', 'true', '<null>'),
-        ('option_outcomes', 'anon_all_option_outcomes', '{anon}', 'ALL', 'true', 'true'),
-        ('proof_daily_summary', 'anon_all_proof_daily', '{anon}', 'ALL', 'true', 'true'),
-        ('proof_trades', 'anon_all_proof_trades', '{anon}', 'ALL', 'true', 'true'),
-        ('proof_trades', 'service_role_all', '{public}', 'ALL', 'true', '<null>'),
-        ('proof_vault', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-        ('signal_outcomes', 'anon_all_signal_outcomes', '{anon}', 'ALL', 'true', 'true'),
-        ('signals', 'Anyone can read signals', '{anon}', 'SELECT', 'true', '<null>'),
-        ('system_health_events', 'anon_read', '{public}', 'SELECT', 'true', '<null>')
+        ('alert_routes', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('ap_admin_audit', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('ap_signal_underlying_outcomes', 'anon_all_underlying', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+        ('ap_system_control', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('bot_status', 'anon_all_bot_status', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+        ('client_health', 'anon_read_client_health', '{anon}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('content_queue', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('daily_cadence_logs', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('incidents', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('market_data', 'Anyone can read market data', '{anon}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('option_outcomes', 'anon_all_option_outcomes', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+        ('proof_daily_summary', 'anon_all_proof_daily', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+        ('proof_trades', 'anon_all_proof_trades', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+        ('proof_trades', 'service_role_all', '{public}', 'ALL', 'true', '<null>', 'PERMISSIVE'),
+        ('proof_vault', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('signal_outcomes', 'anon_all_signal_outcomes', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+        ('signals', 'Anyone can read signals', '{anon}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+        ('system_health_events', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE')
       ) AS e(table_name, policy_name, expected_roles, expected_cmd,
-             expected_qual, expected_with_check)
+             expected_qual, expected_with_check, expected_permissive)
       LEFT JOIN pg_policies p
         ON p.schemaname = 'public'
        AND p.tablename = e.table_name
@@ -404,7 +423,8 @@ BEGIN
         OR p.roles::text IS DISTINCT FROM e.expected_roles
         OR p.cmd IS DISTINCT FROM e.expected_cmd
         OR COALESCE(p.qual, '<null>') IS DISTINCT FROM e.expected_qual
-        OR COALESCE(p.with_check, '<null>') IS DISTINCT FROM e.expected_with_check;
+        OR COALESCE(p.with_check, '<null>') IS DISTINCT FROM e.expected_with_check
+        OR p.permissive IS DISTINCT FROM e.expected_permissive;
 
     IF _policy_drift IS NOT NULL THEN
         RAISE EXCEPTION
@@ -422,32 +442,33 @@ BEGIN
        AND NOT EXISTS (
            SELECT 1
              FROM (VALUES
-               ('alert_routes', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-               ('ap_admin_audit', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-               ('ap_signal_underlying_outcomes', 'anon_all_underlying', '{anon}', 'ALL', 'true', 'true'),
-               ('ap_system_control', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-               ('bot_status', 'anon_all_bot_status', '{anon}', 'ALL', 'true', 'true'),
-               ('client_health', 'anon_read_client_health', '{anon}', 'SELECT', 'true', '<null>'),
-               ('content_queue', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-               ('daily_cadence_logs', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-               ('incidents', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-               ('market_data', 'Anyone can read market data', '{anon}', 'SELECT', 'true', '<null>'),
-               ('option_outcomes', 'anon_all_option_outcomes', '{anon}', 'ALL', 'true', 'true'),
-               ('proof_daily_summary', 'anon_all_proof_daily', '{anon}', 'ALL', 'true', 'true'),
-               ('proof_trades', 'anon_all_proof_trades', '{anon}', 'ALL', 'true', 'true'),
-               ('proof_trades', 'service_role_all', '{public}', 'ALL', 'true', '<null>'),
-               ('proof_vault', 'anon_read', '{public}', 'SELECT', 'true', '<null>'),
-               ('signal_outcomes', 'anon_all_signal_outcomes', '{anon}', 'ALL', 'true', 'true'),
-               ('signals', 'Anyone can read signals', '{anon}', 'SELECT', 'true', '<null>'),
-               ('system_health_events', 'anon_read', '{public}', 'SELECT', 'true', '<null>')
+               ('alert_routes', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('ap_admin_audit', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('ap_signal_underlying_outcomes', 'anon_all_underlying', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+               ('ap_system_control', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('bot_status', 'anon_all_bot_status', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+               ('client_health', 'anon_read_client_health', '{anon}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('content_queue', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('daily_cadence_logs', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('incidents', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('market_data', 'Anyone can read market data', '{anon}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('option_outcomes', 'anon_all_option_outcomes', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+               ('proof_daily_summary', 'anon_all_proof_daily', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+               ('proof_trades', 'anon_all_proof_trades', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+               ('proof_trades', 'service_role_all', '{public}', 'ALL', 'true', '<null>', 'PERMISSIVE'),
+               ('proof_vault', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('signal_outcomes', 'anon_all_signal_outcomes', '{anon}', 'ALL', 'true', 'true', 'PERMISSIVE'),
+               ('signals', 'Anyone can read signals', '{anon}', 'SELECT', 'true', '<null>', 'PERMISSIVE'),
+               ('system_health_events', 'anon_read', '{public}', 'SELECT', 'true', '<null>', 'PERMISSIVE')
              ) AS e(table_name, policy_name, expected_roles, expected_cmd,
-                    expected_qual, expected_with_check)
+                    expected_qual, expected_with_check, expected_permissive)
             WHERE p.tablename = e.table_name
               AND p.policyname = e.policy_name
               AND p.roles::text = e.expected_roles
               AND p.cmd = e.expected_cmd
               AND COALESCE(p.qual, '<null>') = e.expected_qual
               AND COALESCE(p.with_check, '<null>') = e.expected_with_check
+              AND p.permissive = e.expected_permissive
        );
 
     IF _unexpected_permissive_policy IS NOT NULL THEN

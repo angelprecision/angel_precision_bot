@@ -173,6 +173,11 @@ def test_migration_is_fail_closed_without_guessing_tenant_policies() -> None:
         re.IGNORECASE | re.MULTILINE,
     )
     assert "roles::text IS DISTINCT FROM" in sql
+    assert "rolbypassrls" in sql
+    assert "service_role must retain BYPASSRLS" in sql
+    assert "expected_permissive" in sql
+    assert "p.permissive IS DISTINCT FROM" in sql
+    assert "p.permissive = e.expected_permissive" in sql
     assert "unreviewed public tables with RLS disabled" in sql
     assert "unreviewed public sequences with anon/authenticated access" in sql
     assert "unreviewed permissive public/anon policy drift" in sql
@@ -200,9 +205,15 @@ def test_validation_is_read_only_and_has_hard_gates() -> None:
     assert "roles && ARRAY['public', 'anon', 'authenticated']::name[]" in sql
     assert "has_sequence_privilege('anon'" in sql
     assert "Public sequences remain reachable by anon/authenticated" in sql
+    assert "rolbypassrls" in sql
+    assert "service_role RLS bypass gate failed" in sql
     assert not re.search(r"^\s*(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b", sql, re.IGNORECASE | re.MULTILINE)
 
 
 def test_p0_workflow_runs_the_migration_static_test() -> None:
     workflow = P0_WORKFLOW.read_text(encoding="utf-8")
     assert workflow.count("tests/test_rls_hardening_migration.py") == 1
+    assert "Execute and validate RLS hardening migration" in workflow
+    assert "tests/fixtures/rls_hardening_migration_fixture.sql" in workflow
+    assert workflow.count("migrations/20260823_rls_public_surface_lockdown.sql") == 1
+    assert workflow.count("sql/validation/07_rls_hardening.sql") == 1

@@ -62,6 +62,32 @@ LEFT JOIN (
 ) p ON p.tablename = e.table_name
 ORDER BY e.table_name;
 
+\echo '== Privileged RLS bypass prerequisite =='
+SELECT rolname, rolbypassrls
+FROM pg_roles
+WHERE rolname = 'service_role';
+
+DO $$
+DECLARE
+    _bad TEXT;
+BEGIN
+    SELECT string_agg(
+               CASE
+                   WHEN r.oid IS NULL THEN e.role_name || ' (missing)'
+                   ELSE e.role_name || ' (BYPASSRLS=false)'
+               END,
+               ', ' ORDER BY e.role_name
+           )
+      INTO _bad
+      FROM (VALUES ('service_role')) AS e(role_name)
+      LEFT JOIN pg_roles r ON r.rolname = e.role_name
+     WHERE r.oid IS NULL OR NOT r.rolbypassrls;
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'service_role RLS bypass gate failed: %', _bad;
+    END IF;
+END $$;
+
 \echo '== RLS hardening target summary =='
 WITH expected(table_name) AS (
     VALUES
