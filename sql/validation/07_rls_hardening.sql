@@ -446,7 +446,7 @@ BEGIN
     END IF;
 END $$;
 
-\echo '== Reviewed public-role policy contracts and identity allowlist =='
+\echo '== Reviewed public-role policy contracts and post-deploy identity allowlist =='
 DO $$
 DECLARE
     _bad TEXT;
@@ -486,24 +486,6 @@ BEGIN
        AND NOT EXISTS (
            SELECT 1
              FROM (VALUES
-               ('alert_routes', 'anon_read'),
-               ('ap_admin_audit', 'anon_read'),
-               ('ap_signal_underlying_outcomes', 'anon_all_underlying'),
-               ('ap_system_control', 'anon_read'),
-               ('bot_status', 'anon_all_bot_status'),
-               ('client_health', 'anon_read_client_health'),
-               ('content_queue', 'anon_read'),
-               ('daily_cadence_logs', 'anon_read'),
-               ('incidents', 'anon_read'),
-               ('market_data', 'Anyone can read market data'),
-               ('option_outcomes', 'anon_all_option_outcomes'),
-               ('proof_daily_summary', 'anon_all_proof_daily'),
-               ('proof_trades', 'anon_all_proof_trades'),
-               ('proof_trades', 'service_role_all'),
-               ('proof_vault', 'anon_read'),
-               ('signal_outcomes', 'anon_all_signal_outcomes'),
-               ('signals', 'Anyone can read signals'),
-               ('system_health_events', 'anon_read'),
                ('members', 'members_read_own'),
                ('proof_trades', 'client_sees_own_trades')
              ) AS e(table_name, policy_name)
@@ -513,7 +495,7 @@ BEGIN
 
     IF _bad IS NOT NULL THEN
         RAISE EXCEPTION
-            'Unreviewed public/anon/authenticated policy identity drift: %', _bad;
+            'Unreviewed post-deploy public/anon/authenticated policy identity drift: %', _bad;
     END IF;
 END $$;
 

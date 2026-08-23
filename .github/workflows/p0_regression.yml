@@ -92,6 +92,66 @@ jobs:
             -v ON_ERROR_STOP=1 \
             -f tests/fixtures/rls_hardening_role_access.sql
 
+      - name: Exercise RLS hardening negative drift gates
+        env:
+          PGPASSWORD: postgres
+        run: |
+          set -e
+          cleanup() {
+            dropdb -h localhost -U postgres --if-exists rls_hardening_unknown_policy_test >/dev/null 2>&1 || true
+            dropdb -h localhost -U postgres --if-exists rls_hardening_preserved_policy_test >/dev/null 2>&1 || true
+          }
+          cleanup
+          trap cleanup EXIT
+
+          createdb -h localhost -U postgres rls_hardening_unknown_policy_test
+          psql -h localhost -U postgres -d rls_hardening_unknown_policy_test \
+            -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/rls_hardening_migration_fixture.sql
+          psql -h localhost -U postgres -d rls_hardening_unknown_policy_test \
+            -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/rls_hardening_unknown_policy_fixture.sql
+          if output="$(psql -h localhost -U postgres -d rls_hardening_unknown_policy_test \
+            --single-transaction -v ON_ERROR_STOP=1 \
+            -f migrations/20260823_rls_public_surface_lockdown.sql 2>&1)"; then
+            echo "unknown-policy migration unexpectedly succeeded" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -F "unreviewed public/anon/authenticated policy identity drift"
+          psql -h localhost -U postgres -d rls_hardening_unknown_policy_test \
+            -tAc "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relrowsecurity" \
+            | grep -qx 22
+          psql -h localhost -U postgres -d rls_hardening_unknown_policy_test \
+            -tAc "SELECT has_table_privilege('anon', 'public.orders', 'SELECT')" \
+            | grep -qx t
+          psql -h localhost -U postgres -d rls_hardening_unknown_policy_test \
+            -tAc "SELECT count(*) FROM pg_policies WHERE schemaname = 'public' AND tablename = 'alert_routes' AND policyname = 'anon_read'" \
+            | grep -qx 1
+
+          createdb -h localhost -U postgres rls_hardening_preserved_policy_test
+          psql -h localhost -U postgres -d rls_hardening_preserved_policy_test \
+            -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/rls_hardening_migration_fixture.sql
+          psql -h localhost -U postgres -d rls_hardening_preserved_policy_test \
+            -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/rls_hardening_preserved_policy_drift_fixture.sql
+          if output="$(psql -h localhost -U postgres -d rls_hardening_preserved_policy_test \
+            --single-transaction -v ON_ERROR_STOP=1 \
+            -f migrations/20260823_rls_public_surface_lockdown.sql 2>&1)"; then
+            echo "preserved-policy migration unexpectedly succeeded" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -F "preserved owner policy drift"
+          psql -h localhost -U postgres -d rls_hardening_preserved_policy_test \
+            -tAc "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relrowsecurity" \
+            | grep -qx 22
+          psql -h localhost -U postgres -d rls_hardening_preserved_policy_test \
+            -tAc "SELECT has_table_privilege('anon', 'public.orders', 'SELECT')" \
+            | grep -qx t
+          psql -h localhost -U postgres -d rls_hardening_preserved_policy_test \
+            -tAc "SELECT count(*) FROM pg_policies WHERE schemaname = 'public' AND tablename = 'alert_routes' AND policyname = 'anon_read'" \
+            | grep -qx 1
+
       - name: Run P0 plus cohesion tests
         env:
           # PR #388 CI fix: PGSSLMODE=disable so ap.db never tries SSL

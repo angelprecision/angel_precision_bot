@@ -82,6 +82,6 @@ objects named; this branch contains no automatic rollback SQL.
 This is a security migration draft for further review. It is not safe to merge
 or deploy until the staging assertions, the disposable anon/authenticated/
 service-role access fixture, real role-based Data API tests, bot lifecycle
-proof, and dashboard owner mapping pass. The migration and role-access tests
-are part of the P0 workflow, but unrelated existing P0 failures still keep the
-PR on HOLD.
+proof, dashboard owner mapping, and the negative policy-drift fixtures pass.
+The migration, role-access, and failure-injection tests are part of the P0
+workflow, but unrelated existing P0 failures still keep the PR on HOLD.

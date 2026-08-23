@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "20260823_rls_public_surface_lockdown.sql"
 VALIDATION = ROOT / "sql" / "validation" / "07_rls_hardening.sql"
 ROLE_ACCESS_FIXTURE = ROOT / "tests" / "fixtures" / "rls_hardening_role_access.sql"
+UNKNOWN_POLICY_FIXTURE = ROOT / "tests" / "fixtures" / "rls_hardening_unknown_policy_fixture.sql"
+PRESERVED_POLICY_DRIFT_FIXTURE = ROOT / "tests" / "fixtures" / "rls_hardening_preserved_policy_drift_fixture.sql"
 P0_WORKFLOW = ROOT / ".github" / "workflows" / "p0_regression.yml"
 
 EXPECTED_TABLES = {
@@ -215,7 +217,9 @@ def test_validation_is_read_only_and_has_hard_gates() -> None:
     assert "service_role RLS bypass gate failed" in sql
     assert "has_table_privilege('anon', c.oid, 'SELECT')" in sql
     assert "Preserved owner policy drift" in sql
-    assert "Unreviewed public/anon/authenticated policy identity drift" in sql
+    assert "Unreviewed post-deploy public/anon/authenticated policy identity drift" in sql
+    assert "('alert_routes', 'anon_read')" not in sql
+    assert "('proof_trades', 'anon_all_proof_trades')" not in sql
     assert not re.search(r"^\s*(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b", sql, re.IGNORECASE | re.MULTILINE)
 
 
@@ -229,11 +233,22 @@ def test_role_access_fixture_exercises_real_session_roles() -> None:
     assert "CREATE" not in sql
 
 
+def test_negative_policy_drift_fixtures_exercise_fail_closed_guards() -> None:
+    unknown = UNKNOWN_POLICY_FIXTURE.read_text(encoding="utf-8")
+    preserved = PRESERVED_POLICY_DRIFT_FIXTURE.read_text(encoding="utf-8")
+    assert "CREATE POLICY unreviewed_members_policy" in unknown
+    assert "user_id IS NOT NULL" in unknown
+    assert "ALTER POLICY members_read_own" in preserved
+    assert "USING (true)" in preserved
+
+
 def test_p0_workflow_runs_the_migration_static_test() -> None:
     workflow = P0_WORKFLOW.read_text(encoding="utf-8")
     assert workflow.count("tests/test_rls_hardening_migration.py") == 1
     assert "Execute and validate RLS hardening migration" in workflow
     assert "tests/fixtures/rls_hardening_migration_fixture.sql" in workflow
     assert workflow.count("tests/fixtures/rls_hardening_role_access.sql") == 1
-    assert workflow.count("migrations/20260823_rls_public_surface_lockdown.sql") == 1
+    assert workflow.count("tests/fixtures/rls_hardening_unknown_policy_fixture.sql") == 1
+    assert workflow.count("tests/fixtures/rls_hardening_preserved_policy_drift_fixture.sql") == 1
+    assert workflow.count("migrations/20260823_rls_public_surface_lockdown.sql") == 3
     assert workflow.count("sql/validation/07_rls_hardening.sql") == 1
