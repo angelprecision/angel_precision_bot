@@ -309,8 +309,8 @@ BEGIN
      WHERE n.nspname = 'public'
        AND c.relkind = 'v'
        AND (
-           has_table_privilege('anon', format('public.%I', c.relname), 'SELECT')
-           OR has_table_privilege('authenticated', format('public.%I', c.relname), 'SELECT')
+           has_table_privilege('anon', c.oid, 'SELECT')
+           OR has_table_privilege('authenticated', c.oid, 'SELECT')
        )
        AND c.relname <> ALL (ARRAY[
            'ap_signal_funnel_daily',

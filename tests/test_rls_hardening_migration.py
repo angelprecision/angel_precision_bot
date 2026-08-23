@@ -181,6 +181,7 @@ def test_migration_is_fail_closed_without_guessing_tenant_policies() -> None:
     assert "unreviewed public tables with RLS disabled" in sql
     assert "unreviewed public sequences with anon/authenticated access" in sql
     assert "unreviewed permissive public/anon policy drift" in sql
+    assert "has_table_privilege('anon', c.oid, 'SELECT')" in sql
 
 
 def test_migration_leaves_privileged_paths_and_runner_transaction_control_alone() -> None:
@@ -207,6 +208,7 @@ def test_validation_is_read_only_and_has_hard_gates() -> None:
     assert "Public sequences remain reachable by anon/authenticated" in sql
     assert "rolbypassrls" in sql
     assert "service_role RLS bypass gate failed" in sql
+    assert "has_table_privilege('anon', c.oid, 'SELECT')" in sql
     assert not re.search(r"^\s*(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b", sql, re.IGNORECASE | re.MULTILINE)
 
 
