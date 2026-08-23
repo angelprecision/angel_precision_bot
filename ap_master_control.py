@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -2578,7 +2579,11 @@ class APMasterControl:
         if tier in ("SHADOW", "shadow"):
             tier = "C"
 
-        intel = self._run_intelligence(signal)
+        intel = self._run_intelligence(
+            signal,
+            client_id=client_id,
+            execution_mode=current_mode,
+        )
 
         # ── Canonical admission gate — MUST run before any raw field access ──
         # adjudicate_intelligence_result() handles every failure mode:
@@ -2591,7 +2596,7 @@ class APMasterControl:
         _intel_verdict = _adjudicate_intel(
             intel,
             signal=signal,
-            execution_mode="LIVE" if not self.paper else "PAPER",
+            execution_mode=current_mode,
         )
         if not _intel_verdict.allowed:
             self._store_update(signal_id, "rejected", _intel_verdict.reason_code)
@@ -2612,7 +2617,11 @@ class APMasterControl:
         # A result shaped like {"score": "unknown"} must not raise.
         _raw_score = intel_raw.get("score")
         try:
+            if isinstance(_raw_score, bool):
+                raise ValueError("bool is not a valid intelligence score")
             intel_score = float(_raw_score) if _raw_score is not None else 0.0
+            if not math.isfinite(intel_score):
+                raise ValueError("non-finite intelligence score")
         except (TypeError, ValueError):
             log.warning(
                 "[%s] intel 'score' field is non-numeric (%r) — defaulting to 0.0",
@@ -2622,6 +2631,7 @@ class APMasterControl:
         intel_approve = intel_raw.get("approved", True)   # kept for downstream sizing/metadata
         intel_reason  = str(intel_raw.get("reasoning") or "")
         intel_avail   = bool(intel_raw.get("_available", False))
+        intel_contract_authority = intel_raw.get("contract_authority") is True
 
         # ── PR-72: Quality Mode gate ──────────────────────────────────────
         # Runs AFTER score-floor and intel gate so we operate on the final
@@ -2694,21 +2704,22 @@ class APMasterControl:
             _qm_disabled_result = None
 
         # ── Safe numeric parse: intel_contracts ──────────────────────────
-        # Bridge may return {"contracts": "N/A"} on partial/malformed results.
-        # int() raises on non-numeric strings; default to 1 (no intel cap).
-        # Uses intel_raw (normalized above) so intel=None cannot crash here.
+        # Only production-shaped exact-contract evidence may provide a contract
+        # cap. Missing/malformed/zero values remain non-authoritative and never
+        # become a favorable default of one contract.
         _raw_contracts = intel_raw.get("contracts")
         try:
-            intel_contracts = int(_raw_contracts or 1)
+            if not intel_contract_authority:
+                raise ValueError("contract authority is not production-exact")
+            if isinstance(_raw_contracts, bool):
+                raise ValueError("bool is not a valid contract count")
+            if isinstance(_raw_contracts, str) and not _raw_contracts.strip().isdigit():
+                raise ValueError(f"malformed contracts={_raw_contracts!r}")
+            intel_contracts = int(_raw_contracts)
             if intel_contracts < 1:
                 raise ValueError(f"non-positive contracts={intel_contracts!r}")
         except (TypeError, ValueError):
-            log.warning(
-                "[%s] intel 'contracts' field is non-numeric or invalid (%r) — "
-                "defaulting to 1 (no intel contract cap applied)",
-                signal.get("ticker", ""), _raw_contracts,
-            )
-            intel_contracts = 1
+            intel_contracts = 0
         if bootstrap_mode:
             intel_contracts = 1
 
@@ -2770,7 +2781,7 @@ class APMasterControl:
                 contracts = _sizing.contracts
                 if contracts <= 0:
                     return self._block(signal_id, ticker, client_id, "blocked_risk", f"sizer_blocked: {_sizing.reason}")
-                if intel_avail and intel_contracts > 0:
+                if intel_avail and intel_contract_authority and intel_contracts > 0:
                     contracts = min(contracts, intel_contracts)
             except Exception as e:
                 log.warning("[%s] Sizer failed (%s) -- falling back to tier", ticker, e)
@@ -2784,7 +2795,7 @@ class APMasterControl:
                 tier_mult = 1.0 if str(tier).upper() == "A+" else 0.6
                 base = self._base_contracts(effective_score, _estimate_premium(ticker))
                 contracts = max(1, round(base * feedback_mod * tier_mult))
-                if intel_avail and intel_contracts > 0:
+                if intel_avail and intel_contract_authority and intel_contracts > 0:
                     contracts = min(contracts, intel_contracts)
 
         if bootstrap_mode:
@@ -3454,40 +3465,83 @@ class APMasterControl:
 
         return self._zero_snapshot(snapshot_ok=True, snapshot_error="")
 
-    def _run_intelligence(self, signal: dict) -> dict[str, Any]:
+    def _run_intelligence(
+        self,
+        signal: dict,
+        *,
+        client_id: str = "",
+        execution_mode: str = "",
+    ) -> dict[str, Any]:
         # PR E / FIX-6: read module-level _INTEL_AVAILABLE / _run_intel_check
         # resolved once at module load. No lazy per-signal import.
-        # Fail-open contract preserved: if intel is unavailable or any
-        # error occurs, return approved=True so a broken intel layer
-        # never blocks signals (intelligence is advisory, not a gate).
-        if not _INTEL_AVAILABLE or _run_intel_check is None:
+        # Fail-open contract preserved: if intel is unavailable or any error
+        # occurs, return scanner-preserving advisory metadata. In particular,
+        # do not manufacture a one-contract result or stamp _available=True.
+        _client_id = str(client_id or "").strip()
+        _execution_mode = str(execution_mode or "").strip().upper()
+        _scanner_raw = signal.get("score") if isinstance(signal, dict) and "score" in signal else (
+            signal.get("ev_score") if isinstance(signal, dict) else None
+        )
+        try:
+            _scanner_score = float(_scanner_raw) if not isinstance(_scanner_raw, bool) and _scanner_raw is not None else 0.0
+            if not math.isfinite(_scanner_score):
+                _scanner_score = 0.0
+        except (TypeError, ValueError, OverflowError):
+            _scanner_score = 0.0
+
+        def _unavailable_result(status: str, reasoning: str) -> dict[str, Any]:
             return {
                 "approved": True,
-                "score": 0,
-                "contracts": 1,
-                "reasoning": "intel_unavailable",
+                "score": _scanner_score,
+                "scanner_score": _scanner_score,
+                "intel_score": None,
+                "contracts": 0,
+                "reasoning": reasoning,
+                "intel_status": status,
                 "_available": False,
+                "contract_quality_state": "UNAVAILABLE",
+                "contract_authority": False,
+                "second_score_mode": "observe_only",
+                "client_id": _client_id,
+                "execution_mode": _execution_mode,
+                "signal_id": str(signal.get("signal_id") or "") if isinstance(signal, dict) else "",
+                "canonical_signal_id": str(signal.get("canonical_signal_id") or "") if isinstance(signal, dict) else "",
+                "local_order_id": str(signal.get("local_order_id") or "") if isinstance(signal, dict) else "",
             }
+
+        if not _INTEL_AVAILABLE or _run_intel_check is None:
+            return _unavailable_result("UNAVAILABLE", "intel_unavailable")
         try:
             trigger = signal.get("trigger") or {}
-            price = (
-                signal.get("entry_price")
-                or trigger.get("entry")
-                or signal.get("current_price")
-                or 100.0
+            _price = signal.get("entry_price") if signal.get("entry_price") is not None else trigger.get("entry")
+            if _price is None:
+                _price = signal.get("current_price")
+            try:
+                _price = float(_price) if not isinstance(_price, bool) and _price is not None else None
+                if _price is not None and not math.isfinite(_price):
+                    _price = None
+            except (TypeError, ValueError, OverflowError):
+                _price = None
+            result = _run_intel_check(
+                signal,
+                underlying_price=_price,
+                client_id=_client_id,
+                execution_mode=_execution_mode,
             )
-            result = _run_intel_check(signal, underlying_price=float(price))
-            result["_available"] = True
+            if not isinstance(result, dict):
+                return _unavailable_result("ERROR", "intel_result_malformed")
+            # Preserve the producer's availability and identity; this is not a
+            # successful-call stamp. The bridge returns exact evidence metadata.
+            result.setdefault("client_id", _client_id)
+            result.setdefault("execution_mode", _execution_mode)
+            result.setdefault("signal_id", str(signal.get("signal_id") or ""))
+            result.setdefault("canonical_signal_id", str(signal.get("canonical_signal_id") or ""))
+            result.setdefault("local_order_id", str(signal.get("local_order_id") or ""))
+            result.setdefault("contract_authority", False)
             return result
         except Exception as e:
             log.debug("Intelligence unavailable: %s", e)
-            return {
-                "approved": True,
-                "score": 0,
-                "contracts": 1,
-                "reasoning": f"intel_error: {e}",
-                "_available": False,
-            }
+            return _unavailable_result("ERROR", f"intel_error: {e}")
 
     def _run_final_quality_gates(
         self,
@@ -3647,7 +3701,15 @@ class APMasterControl:
                 )
 
         risk_detail = (signal.get("risk_detail") or intel_raw.get("risk_detail") or {})
-        if (
+        # Gate G is pre-selector. Scanner/pipeline contract-quality fields are
+        # advisory until exact selected OCC evidence is explicitly production
+        # authoritative. Never let estimated/default contract fields block here.
+        _contract_quality_authoritative = (
+            intel_raw.get("contract_authority") is True
+            and str(intel_raw.get("contract_quality_state") or "").upper()
+            == "PRODUCTION_EXACT"
+        )
+        if _contract_quality_authoritative and (
             risk_detail.get("contract_quality_passes") is False
             or _truthy(signal.get("contract_quality_failed"))
             or _truthy(signal.get("contract_quality_block"))

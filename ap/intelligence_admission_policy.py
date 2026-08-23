@@ -58,18 +58,19 @@ Producer/authority table (traced 2026-07-18):
     (b) fail-open LOW_CONFIDENCE / scanner-approved fallbacks.
   No free-text pass-through and no risk_reason text re-evaluation creates authority.
 
-Policy version: 1.0
+Policy version: 1.1
 """
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger("ap.intelligence_admission_policy")
 
-POLICY_VERSION = "1.0"
+POLICY_VERSION = "1.1"
 
 # ---------------------------------------------------------------------------
 # Stable public reason codes
@@ -95,6 +96,16 @@ INTEL_LOW_DATA_QUALITY_FAIL_OPEN = "INTEL_LOW_DATA_QUALITY_FAIL_OPEN"
 INTEL_ADVISORY_ONLY    = "INTEL_ADVISORY_ONLY"
 INTEL_OBSERVE_ONLY_MODE = "INTEL_OBSERVE_ONLY_MODE"
 INTEL_REGIME_MISMATCH_ADVISORY = "INTEL_REGIME_MISMATCH_ADVISORY"
+
+# Phase 1 Gate G contract-evidence statuses. These are explicitly advisory:
+# they describe whether selected-contract evidence is absent, malformed, or
+# available for later intelligence work; they do not authorize a veto or cap.
+_CONTRACT_EVIDENCE_ADVISORY_STATUS_MAP: dict[str, str] = {
+    "ADVISORY": INTEL_ADVISORY_ONLY,
+    "CONTRACT_EVIDENCE_UNAVAILABLE": INTEL_ADVISORY_ONLY,
+    "CONTRACT_EVIDENCE_INVALID": INTEL_ADVISORY_ONLY,
+    "CONTRACT_EVIDENCE_AVAILABLE_ADVISORY": INTEL_ADVISORY_ONLY,
+}
 
 # ---------------------------------------------------------------------------
 # Allowlist: intel_status values that are authoritative enough to deny entry.
@@ -163,6 +174,26 @@ class IntelligenceAdmissionVerdict:
             "intel_execution_mode": str(
                 self.diagnostics.get("execution_mode") or ""
             ).upper() or None,
+            "intel_client_id": str(
+                self.diagnostics.get("client_id") or ""
+            ) or None,
+            "intel_signal_id": str(
+                self.diagnostics.get("result_signal_id")
+                or self.diagnostics.get("signal_id")
+                or ""
+            ) or None,
+            "intel_canonical_signal_id": str(
+                self.diagnostics.get("canonical_signal_id") or ""
+            ) or None,
+            "intel_local_order_id": str(
+                self.diagnostics.get("local_order_id") or ""
+            ) or None,
+            "intel_contract_quality_state": self.diagnostics.get(
+                "contract_quality_state"
+            ),
+            "intel_contract_authority": bool(
+                self.diagnostics.get("contract_authority", False)
+            ),
         }
 
 
@@ -226,6 +257,15 @@ def adjudicate_intelligence_result(
         "side":           side,
         "execution_mode": mode,
     }
+    if isinstance(result, dict):
+        base_diag.update({
+            "client_id": str(result.get("client_id") or signal.get("client_id") or ""),
+            "result_signal_id": str(result.get("signal_id") or ""),
+            "canonical_signal_id": str(result.get("canonical_signal_id") or ""),
+            "local_order_id": str(result.get("local_order_id") or ""),
+            "contract_quality_state": result.get("contract_quality_state"),
+            "contract_authority": result.get("contract_authority") is True,
+        })
 
     # ── Observe-only mode override ─────────────────────────────────────────
     if _admission_mode() == "observe_only":
@@ -274,10 +314,19 @@ def adjudicate_intelligence_result(
     available   = bool(result.get("_available", False))
     source      = "intelligence_bridge"
 
-    _conf_raw = result.get("score") or result.get("confidence")
+    if raw_status in _CONTRACT_EVIDENCE_ADVISORY_STATUS_MAP:
+        # Gate G's score is the scanner score. Do not expose it as an
+        # intelligence confidence value when the second score is absent.
+        _conf_raw = result.get("intel_score")
+    else:
+        _conf_raw = result.get("score") if result.get("score") is not None else result.get("confidence")
     try:
+        if isinstance(_conf_raw, bool):
+            raise ValueError("bool is not a confidence")
         confidence: float | None = float(_conf_raw) if _conf_raw is not None else None
-    except (TypeError, ValueError):
+        if confidence is not None and not math.isfinite(confidence):
+            raise ValueError("non-finite confidence")
+    except (TypeError, ValueError, OverflowError):
         confidence = None
 
     # ── Infrastructure / fail-open intel_status — classified BEFORE _available ──
@@ -306,6 +355,29 @@ def adjudicate_intelligence_result(
             raw_status=raw_status,
             policy_version=POLICY_VERSION,
             diagnostics={**base_diag, "raw_status": raw_status, "available": available},
+        )
+
+    # Phase 1 selected-contract truth is explicitly advisory. Keep this before
+    # the generic _available check so a valid evidence observation retains its
+    # distinction from infrastructure failure while still never authorizing a
+    # veto, score re-check, or contract cap.
+    advisory_code = _CONTRACT_EVIDENCE_ADVISORY_STATUS_MAP.get(raw_status)
+    if advisory_code is not None:
+        return IntelligenceAdmissionVerdict(
+            allowed=True,
+            authoritative=False,
+            reason_code=advisory_code,
+            reasoning=reasoning or f"{raw_status} — advisory only",
+            source=source,
+            confidence=confidence,
+            data_quality=("available_advisory" if available else "unavailable_advisory"),
+            raw_status=raw_status,
+            policy_version=POLICY_VERSION,
+            diagnostics={
+                **base_diag,
+                "raw_status": raw_status,
+                "available": available,
+            },
         )
 
     # ── Missing 'approved' field → fail open ──────────────────────────────
