@@ -1,7 +1,9 @@
 # Supabase RLS — TODO
 
-Status: **NOT YET IMPLEMENTED.** Tracked for a follow-up PR after the
-dashboard auth model is locked.
+Status: **REVIEW DRAFT — PHASE 1 NOT APPLIED.** The exact live 22-table
+baseline is drafted in `migrations/20260823_rls_public_surface_lockdown.sql`.
+See `docs/security/RLS_ROLLOUT_PLAN.md`. The dashboard auth model and the
+authenticated tenant policies remain intentionally unresolved.
 
 ## Tables that need Row-Level Security
 
