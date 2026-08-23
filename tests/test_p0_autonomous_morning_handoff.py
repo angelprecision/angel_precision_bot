@@ -226,8 +226,11 @@ def test_watching_rows_reset_do_not_hide_ownerless_pending_trigger_order(monkeyp
     )
 
     summary = result["summary"]
+    assert result["ok"] is False
+    assert result["error"] == "live_owner_readiness_barrier:1_pending_trigger_rows_unowned"
     assert summary["watching_rows_reset"] == 5
     assert summary["orders_with_verified_owner"] == 0
+    assert summary["verified_owner_evidence_count"] == 0
     assert summary["orders_missing_runtime_owner"] == 1
 
 
@@ -247,6 +250,7 @@ def test_pending_trigger_watcher_rearm_counts_as_verified_owner(monkeypatch):
     summary = result["summary"]
     assert summary["pending_trigger_watchers_rearmed"] == 1
     assert summary["orders_with_verified_owner"] == 1
+    assert summary["verified_owner_evidence_count"] == 1
     assert summary["orders_missing_runtime_owner"] == 0
 
 
@@ -281,10 +285,15 @@ def test_verified_owner_counts_are_capped_to_preexisting_pending_trigger_rows(mo
         },
     )
 
+    assert result["ok"] is False
+    assert result["error"] == (
+        "live_owner_readiness_barrier:verified_owner_count_exceeds_pending"
+    )
     summary = result["summary"]
     assert 0 <= summary["orders_with_verified_owner"] <= summary["preexisting_pending_trigger_rows"]
     assert 0 <= summary["orders_missing_runtime_owner"] <= summary["preexisting_pending_trigger_rows"]
     assert summary["orders_with_verified_owner"] == 2
+    assert summary["verified_owner_evidence_count"] == 6
     assert summary["orders_missing_runtime_owner"] == 0
 
 

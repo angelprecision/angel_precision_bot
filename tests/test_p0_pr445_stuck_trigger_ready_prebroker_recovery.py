@@ -71,6 +71,7 @@ class _OSM:
         self.claim_calls = []
         self.cancel_calls = []
         self.retry_calls = []
+        self.transition_calls = []
 
     def get_order(self, local_order_id):
         row = self.rows.get(local_order_id)
@@ -132,6 +133,7 @@ class _OSM:
         return True
 
     def transition(self, local_order_id, status, **kwargs):
+        self.transition_calls.append((local_order_id, status, dict(kwargs)))
         row = self.rows[local_order_id]
         row["status"] = status
         if kwargs.get("broker_order_id"):
@@ -154,6 +156,18 @@ class _Watcher:
     def __init__(self, callback):
         self._pending = []
         self.on_trigger = callback
+
+
+def _broker_order(**overrides):
+    order = {
+        "tag": canonical_broker_submit_key(LOCAL_ORDER_ID),
+        "id": "broker-existing",
+        "side": "buy_to_open",
+        "quantity": "1",
+        "status": "working",
+    }
+    order.update(overrides)
+    return order
 
 
 def _recovery(row, osm, watcher, broker, *, positions=None):
