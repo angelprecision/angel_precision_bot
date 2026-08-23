@@ -1328,10 +1328,42 @@ def run_morning_handoff_audit(
         + already_verified_owner_rows,
         preexisting_pending_trigger_rows,
     )
+    verified_owner_evidence_count = (
+        pending_trigger_watchers_rearmed
+        + deferred_lifecycles_recovered
+        + already_verified_owner_rows
+    )
     orders_missing_runtime_owner = max(
         preexisting_pending_trigger_rows - orders_with_verified_owner,
         0,
     )
+    owner_readiness_error = None
+    if mode == "live" and not dry_run:
+        if verified_owner_evidence_count > preexisting_pending_trigger_rows:
+            owner_readiness_error = (
+                "live_owner_readiness_barrier:verified_owner_count_exceeds_pending"
+            )
+        elif orders_missing_runtime_owner > 0:
+            owner_readiness_error = (
+                "live_owner_readiness_barrier:"
+                f"{orders_missing_runtime_owner}_pending_trigger_rows_unowned"
+            )
+        if owner_readiness_error:
+            ok = False
+            if error is None:
+                error = owner_readiness_error
+            if owner_readiness_error not in summary_errors:
+                summary_errors.append(owner_readiness_error)
+            log.critical(
+                "LIVE_OWNER_READINESS_BARRIER_BLOCKED client_id=%s "
+                "pending_trigger_rows=%s verified_owner_evidence=%s "
+                "missing_runtime_owner=%s reason=%s",
+                client_id,
+                preexisting_pending_trigger_rows,
+                verified_owner_evidence_count,
+                orders_missing_runtime_owner,
+                owner_readiness_error,
+            )
     summary = {
         "client_id": client_id,
         "execution_mode": mode,
@@ -1344,6 +1376,7 @@ def run_morning_handoff_audit(
         "deferred_lifecycles_recovered": deferred_lifecycles_recovered,
         "already_verified_owner_rows": already_verified_owner_rows,
         "orders_with_verified_owner": orders_with_verified_owner,
+        "verified_owner_evidence_count": verified_owner_evidence_count,
         "orders_missing_runtime_owner": orders_missing_runtime_owner,
         "watching_rows_reset": watching_rows_reset,
         "errors": summary_errors,

@@ -2896,6 +2896,12 @@ class APOrderStateMachine:
         reschedule a materialization retry against a row this method had
         already released from MATERIALIZING.
 
+        The CAS accepts both the in-flight ``MATERIALIZING`` row and the
+        post-copyback ``BROKER_READY`` row, but never a row carrying a
+        persisted submit intent. This is the final live-submit reversal seam:
+        the audit is retained, the broker-unowned row is returned to a clean
+        deferred state, and no broker POST is part of this transition.
+
         When no watcher_token is supplied, the row is left explicitly
         recovery-owned (``recovery_ownership='recovery_scheduler'``,
         ``direction_reversal_rearm_requires_watcher=True``) so the existing
@@ -2909,9 +2915,24 @@ class APOrderStateMachine:
         _watcher_token = str(watcher_token or "").strip()
         _signal = str(signal_id or "").strip()
         _mode = str(execution_mode or "").strip().lower()
+        if isinstance(generation, bool):
+            return False
+        if isinstance(generation, float) and not generation.is_integer():
+            return False
+        if isinstance(generation, str):
+            _raw_generation = generation.strip()
+            if not _raw_generation:
+                return False
+            try:
+                if _raw_generation != str(int(_raw_generation)):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return False
         try:
-            _generation = max(1, int(generation))
-        except (TypeError, ValueError):
+            _generation = int(generation)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if _generation < 1:
             return False
         if not _owner or not _signal or _mode not in {"live", "paper"}:
             return False
@@ -2952,6 +2973,15 @@ class APOrderStateMachine:
             "recovery_owner": _owner if _recovery_owned else "",
             "direction_reversal_rearm_requires_watcher": _recovery_owned,
             "broker_ready": False,
+            "contract_deferred": True,
+            "contract_selection_status": "REARM_REQUIRED",
+            "contract_symbol": "",
+            "selected_contract": "",
+            "selected_limit": 0,
+            "selected_qty": 0,
+            "selected_reserved_cost": 0,
+            "limit_price": 0,
+            "contracts": 0,
             # Direction reversal starts a fresh selector attempt.  Preserve the
             # monotonic materialization_generation, but clear every active
             # attempt/schedule authority so the next confirmed breach is
@@ -3002,7 +3032,12 @@ class APOrderStateMachine:
                 cur = c.execute(
                     """
                     UPDATE orders
-                    SET meta = (
+                    SET contract = 'DEFERRED:',
+                        limit_price = 0,
+                        qty = 0,
+                        reserved_cost = 0,
+                        contract_selection_status = 'DEFERRED_REARM',
+                        meta = (
                             COALESCE(meta, '{}'::jsonb)
                             || %s::jsonb
                             || jsonb_strip_nulls(jsonb_build_object(
@@ -3080,7 +3115,15 @@ class APOrderStateMachine:
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
-                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                      AND (
+                            COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                         OR (
+                                COALESCE(meta->>'lifecycle_state','') = 'BROKER_READY'
+                            AND COALESCE(meta->>'broker_ready','false') = 'true'
+                            AND COALESCE(meta->>'materialization_status','') = 'SELECTED'
+                            )
+                          )
                       AND COALESCE(meta->>'materialization_owner','') = %s
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                     """,
