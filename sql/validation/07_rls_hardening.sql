@@ -1,9 +1,8 @@
 -- Read-only post-deploy validation for the RLS hardening review migration.
--- Expected phase-1 result:
---   * 22/22 target tables have rls_enabled=true.
---   * anon/authenticated have no table privileges on the target scope.
---   * service_role retains SELECT/INSERT/UPDATE/DELETE.
---   * public views and permissive policies are reported as separate HOLD gates.
+-- The catalog assertions intentionally raise on any mismatch so a staging
+-- run cannot be mistaken for a successful security gate.
+
+\set ON_ERROR_STOP on
 
 \echo '== RLS hardening target table matrix =='
 WITH expected(table_name) AS (
@@ -33,12 +32,19 @@ WITH expected(table_name) AS (
 )
 SELECT
     e.table_name,
+    c.oid IS NOT NULL AS table_present,
     c.relrowsecurity AS rls_enabled,
     c.relforcerowsecurity AS rls_forced,
     pg_get_userbyid(c.relowner) AS owner,
     COALESCE(p.policy_count, 0) AS policy_count,
     has_table_privilege('anon', format('public.%I', e.table_name), 'SELECT') AS anon_select,
+    has_table_privilege('anon', format('public.%I', e.table_name), 'INSERT') AS anon_insert,
+    has_table_privilege('anon', format('public.%I', e.table_name), 'UPDATE') AS anon_update,
+    has_table_privilege('anon', format('public.%I', e.table_name), 'DELETE') AS anon_delete,
     has_table_privilege('authenticated', format('public.%I', e.table_name), 'SELECT') AS authenticated_select,
+    has_table_privilege('authenticated', format('public.%I', e.table_name), 'INSERT') AS authenticated_insert,
+    has_table_privilege('authenticated', format('public.%I', e.table_name), 'UPDATE') AS authenticated_update,
+    has_table_privilege('authenticated', format('public.%I', e.table_name), 'DELETE') AS authenticated_delete,
     has_table_privilege('service_role', format('public.%I', e.table_name), 'SELECT') AS service_select,
     has_table_privilege('service_role', format('public.%I', e.table_name), 'INSERT') AS service_insert,
     has_table_privilege('service_role', format('public.%I', e.table_name), 'UPDATE') AS service_update,
@@ -56,7 +62,7 @@ LEFT JOIN (
 ) p ON p.tablename = e.table_name
 ORDER BY e.table_name;
 
-\echo '== RLS hardening summary =='
+\echo '== RLS hardening target summary =='
 WITH expected(table_name) AS (
     VALUES
         ('account_snapshots'), ('ap_audit_log'), ('ap_edge_buckets'),
@@ -72,47 +78,258 @@ WITH expected(table_name) AS (
 )
 SELECT
     count(*) AS expected_tables,
+    count(*) FILTER (WHERE c.oid IS NOT NULL) AS present_tables,
     count(*) FILTER (WHERE c.relrowsecurity) AS rls_enabled_tables,
-    count(*) FILTER (WHERE NOT c.relrowsecurity) AS rls_disabled_tables,
-    count(*) FILTER (
-        WHERE has_table_privilege('anon', format('public.%I', e.table_name), 'SELECT')
-    ) AS anon_select_tables,
-    count(*) FILTER (
-        WHERE has_table_privilege('authenticated', format('public.%I', e.table_name), 'SELECT')
-    ) AS authenticated_select_tables
+    count(*) FILTER (WHERE c.oid IS NULL OR NOT c.relrowsecurity) AS missing_or_rls_disabled_tables,
+    count(*) FILTER (WHERE
+        has_table_privilege('anon', format('public.%I', e.table_name), 'SELECT')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'INSERT')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'UPDATE')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'DELETE')
+    ) AS anon_privileged_tables,
+    count(*) FILTER (WHERE
+        has_table_privilege('authenticated', format('public.%I', e.table_name), 'SELECT')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'INSERT')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'UPDATE')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'DELETE')
+    ) AS authenticated_privileged_tables,
+    count(*) FILTER (WHERE NOT (
+        has_table_privilege('service_role', format('public.%I', e.table_name), 'SELECT')
+        AND has_table_privilege('service_role', format('public.%I', e.table_name), 'INSERT')
+        AND has_table_privilege('service_role', format('public.%I', e.table_name), 'UPDATE')
+        AND has_table_privilege('service_role', format('public.%I', e.table_name), 'DELETE')
+    )) AS service_crud_gap_tables
 FROM expected e
-JOIN pg_class c
+LEFT JOIN pg_class c
   ON c.relname = e.table_name
  AND c.relnamespace = 'public'::regnamespace
  AND c.relkind IN ('r', 'p');
 
-\echo '== Public views requiring a separate consumer-approved gate =='
-SELECT
-    c.relname AS view_name,
-    pg_get_userbyid(c.relowner) AS owner,
-    c.reloptions,
-    has_table_privilege('anon', format('public.%I', c.relname), 'SELECT') AS anon_select,
-    has_table_privilege('authenticated', format('public.%I', c.relname), 'SELECT') AS authenticated_select
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm')
-ORDER BY c.relname;
+DO $$
+DECLARE
+    _bad TEXT;
+BEGIN
+    WITH expected(table_name) AS (
+        VALUES
+            ('account_snapshots'), ('ap_audit_log'), ('ap_edge_buckets'),
+            ('ap_signal_context_tags'), ('ap_signal_hub_merged'),
+            ('ap_signal_hub_raw'), ('ap_signal_ledger'),
+            ('ap_signal_option_outcomes'), ('ap_signals'),
+            ('ap_signals_jason_manual_push_backup_20260616'), ('ap_trade_log'),
+            ('ap_whitelist'), ('audit_log'), ('client_authorizations'),
+            ('client_state'), ('kv'), ('orders'),
+            ('orders_backup_jason_null_mode_2026_06_14'),
+            ('orders_backup_jason_null_mode_orphans_2026_06_14'),
+            ('processed_signals'), ('schema_migrations'), ('trade_fills')
+    )
+    SELECT string_agg(e.table_name, ', ' ORDER BY e.table_name)
+      INTO _bad
+      FROM expected e
+      LEFT JOIN pg_class c
+        ON c.relname = e.table_name
+       AND c.relnamespace = 'public'::regnamespace
+       AND c.relkind IN ('r', 'p')
+     WHERE c.oid IS NULL
+        OR NOT c.relrowsecurity
+        OR pg_get_userbyid(c.relowner) <> 'postgres'
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'SELECT')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'INSERT')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'UPDATE')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'DELETE')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'SELECT')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'INSERT')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'UPDATE')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'DELETE')
+        OR NOT (
+            has_table_privilege('service_role', format('public.%I', e.table_name), 'SELECT')
+            AND has_table_privilege('service_role', format('public.%I', e.table_name), 'INSERT')
+            AND has_table_privilege('service_role', format('public.%I', e.table_name), 'UPDATE')
+            AND has_table_privilege('service_role', format('public.%I', e.table_name), 'DELETE')
+        );
 
-\echo '== Permissive policies requiring policy-owner review =='
-SELECT
-    schemaname,
-    tablename,
-    policyname,
-    roles,
-    cmd,
-    qual,
-    with_check
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'RLS hardening target table gate failed: %', _bad;
+    END IF;
+END $$;
+
+\echo '== Policy-lockdown table matrix =='
+WITH expected(table_name) AS (
+    VALUES
+        ('alert_routes'), ('ap_admin_audit'),
+        ('ap_signal_underlying_outcomes'), ('ap_system_control'),
+        ('bot_status'), ('client_health'), ('content_queue'),
+        ('daily_cadence_logs'), ('incidents'), ('market_data'),
+        ('option_outcomes'), ('proof_daily_summary'), ('proof_trades'),
+        ('proof_vault'), ('signal_outcomes'), ('signals'),
+        ('system_health_events')
+)
+SELECT e.table_name,
+       c.oid IS NOT NULL AS table_present,
+       c.relrowsecurity AS rls_enabled,
+       count(p.policyname) FILTER (
+           WHERE p.roles && ARRAY['public', 'anon', 'authenticated']::name[]
+             AND (p.qual = 'true' OR p.with_check = 'true')
+       ) AS unsafe_policy_count,
+       has_table_privilege('anon', format('public.%I', e.table_name), 'SELECT') AS anon_select,
+       has_table_privilege('anon', format('public.%I', e.table_name), 'INSERT') AS anon_insert,
+       has_table_privilege('anon', format('public.%I', e.table_name), 'UPDATE') AS anon_update,
+       has_table_privilege('anon', format('public.%I', e.table_name), 'DELETE') AS anon_delete,
+       has_table_privilege('authenticated', format('public.%I', e.table_name), 'SELECT') AS authenticated_select,
+       has_table_privilege('authenticated', format('public.%I', e.table_name), 'INSERT') AS authenticated_insert,
+       has_table_privilege('authenticated', format('public.%I', e.table_name), 'UPDATE') AS authenticated_update,
+       has_table_privilege('authenticated', format('public.%I', e.table_name), 'DELETE') AS authenticated_delete,
+       has_table_privilege('service_role', format('public.%I', e.table_name), 'SELECT') AS service_select,
+       has_table_privilege('service_role', format('public.%I', e.table_name), 'INSERT') AS service_insert,
+       has_table_privilege('service_role', format('public.%I', e.table_name), 'UPDATE') AS service_update,
+       has_table_privilege('service_role', format('public.%I', e.table_name), 'DELETE') AS service_delete
+FROM expected e
+LEFT JOIN pg_class c
+  ON c.relname = e.table_name
+ AND c.relnamespace = 'public'::regnamespace
+ AND c.relkind IN ('r', 'p')
+LEFT JOIN pg_policies p
+  ON p.schemaname = 'public' AND p.tablename = e.table_name
+GROUP BY e.table_name, c.oid, c.relrowsecurity
+ORDER BY e.table_name;
+
+DO $$
+DECLARE
+    _bad TEXT;
+BEGIN
+    WITH expected(table_name) AS (
+        VALUES
+            ('alert_routes'), ('ap_admin_audit'),
+            ('ap_signal_underlying_outcomes'), ('ap_system_control'),
+            ('bot_status'), ('client_health'), ('content_queue'),
+            ('daily_cadence_logs'), ('incidents'), ('market_data'),
+            ('option_outcomes'), ('proof_daily_summary'), ('proof_trades'),
+            ('proof_vault'), ('signal_outcomes'), ('signals'),
+            ('system_health_events')
+    )
+    SELECT string_agg(e.table_name, ', ' ORDER BY e.table_name)
+      INTO _bad
+      FROM expected e
+      LEFT JOIN pg_class c
+        ON c.relname = e.table_name
+       AND c.relnamespace = 'public'::regnamespace
+       AND c.relkind IN ('r', 'p')
+     WHERE c.oid IS NULL
+        OR NOT c.relrowsecurity
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'SELECT')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'INSERT')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'UPDATE')
+        OR has_table_privilege('anon', format('public.%I', e.table_name), 'DELETE')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'SELECT')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'INSERT')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'UPDATE')
+        OR has_table_privilege('authenticated', format('public.%I', e.table_name), 'DELETE')
+        OR NOT (
+            has_table_privilege('service_role', format('public.%I', e.table_name), 'SELECT')
+            AND has_table_privilege('service_role', format('public.%I', e.table_name), 'INSERT')
+            AND has_table_privilege('service_role', format('public.%I', e.table_name), 'UPDATE')
+            AND has_table_privilege('service_role', format('public.%I', e.table_name), 'DELETE')
+        );
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'Policy-lockdown table gate failed: %', _bad;
+    END IF;
+END $$;
+
+\echo '== Public views requiring the privileged-only phase-1 gate =='
+WITH expected(view_name) AS (
+    VALUES
+        ('ap_signal_funnel_daily'), ('ap_skipped_signal_outcomes'),
+        ('ledger_funnel'), ('ledger_performance'), ('v2_equity_curve'),
+        ('v2_last_20_trades'), ('v2_performance')
+)
+SELECT e.view_name,
+       c.oid IS NOT NULL AS view_present,
+       c.reloptions,
+       has_table_privilege('anon', format('public.%I', e.view_name), 'SELECT') AS anon_select,
+       has_table_privilege('authenticated', format('public.%I', e.view_name), 'SELECT') AS authenticated_select,
+       has_table_privilege('service_role', format('public.%I', e.view_name), 'SELECT') AS service_select
+FROM expected e
+LEFT JOIN pg_class c
+  ON c.relname = e.view_name
+ AND c.relnamespace = 'public'::regnamespace
+ AND c.relkind = 'v'
+ORDER BY e.view_name;
+
+DO $$
+DECLARE
+    _bad TEXT;
+BEGIN
+    WITH expected(view_name) AS (
+        VALUES
+            ('ap_signal_funnel_daily'), ('ap_skipped_signal_outcomes'),
+            ('ledger_funnel'), ('ledger_performance'), ('v2_equity_curve'),
+            ('v2_last_20_trades'), ('v2_performance')
+    )
+    SELECT string_agg(e.view_name, ', ' ORDER BY e.view_name)
+      INTO _bad
+      FROM expected e
+      LEFT JOIN pg_class c
+        ON c.relname = e.view_name
+       AND c.relnamespace = 'public'::regnamespace
+       AND c.relkind = 'v'
+     WHERE c.oid IS NULL
+        OR has_table_privilege('anon', format('public.%I', e.view_name), 'SELECT')
+        OR has_table_privilege('authenticated', format('public.%I', e.view_name), 'SELECT')
+        OR NOT has_table_privilege('service_role', format('public.%I', e.view_name), 'SELECT');
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'Public view gate failed: %', _bad;
+    END IF;
+
+    SELECT string_agg(c.relname, ', ' ORDER BY c.relname)
+      INTO _bad
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind = 'v'
+       AND (
+           has_table_privilege('anon', format('public.%I', c.relname), 'SELECT')
+           OR has_table_privilege('authenticated', format('public.%I', c.relname), 'SELECT')
+       );
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'Unreviewed anon/authenticated public view access remains: %', _bad;
+    END IF;
+END $$;
+
+\echo '== Remaining public/anon/authenticated permissive policies =='
+SELECT schemaname, tablename, policyname, roles, cmd, qual, with_check
 FROM pg_policies
 WHERE schemaname = 'public'
+  AND roles && ARRAY['public', 'anon', 'authenticated']::name[]
   AND (qual = 'true' OR with_check = 'true')
 ORDER BY tablename, policyname;
 
-\echo '== Default privileges remaining for Supabase-managed owners =='
+DO $$
+DECLARE
+    _bad TEXT;
+BEGIN
+    SELECT string_agg(format('%s.%s', tablename, policyname), ', '
+                      ORDER BY tablename, policyname)
+      INTO _bad
+      FROM pg_policies
+     WHERE schemaname = 'public'
+       AND roles && ARRAY['public', 'anon', 'authenticated']::name[]
+       AND (qual = 'true' OR with_check = 'true');
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'Unsafe public/anon/authenticated permissive policies remain: %', _bad;
+    END IF;
+END $$;
+
+\echo '== Public table drift and default privileges =='
+SELECT count(*) FILTER (WHERE NOT c.relrowsecurity) AS public_rls_disabled_tables,
+       string_agg(c.relname, ', ' ORDER BY c.relname)
+       FILTER (WHERE NOT c.relrowsecurity) AS public_rls_disabled_names
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p');
+
 SELECT
     COALESCE(n.nspname, '(all schemas)') AS schema_name,
     r.rolname AS owner_role,
@@ -124,3 +341,39 @@ JOIN pg_roles r ON r.oid = d.defaclrole
 WHERE d.defaclobjtype IN ('r', 'S', 'f')
   AND (n.nspname = 'public' OR n.nspname IS NULL)
 ORDER BY schema_name, owner_role, object_type;
+
+DO $$
+DECLARE
+    _bad TEXT;
+BEGIN
+    SELECT string_agg(c.relname, ', ' ORDER BY c.relname)
+      INTO _bad
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind IN ('r', 'p')
+       AND NOT c.relrowsecurity;
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'Public tables with RLS disabled remain: %', _bad;
+    END IF;
+
+    SELECT string_agg(
+               format('%s:%s:%s', r.rolname, d.defaclobjtype,
+                      COALESCE(g.rolname, 'PUBLIC')),
+               ', ' ORDER BY r.rolname, d.defaclobjtype
+           )
+      INTO _bad
+      FROM pg_default_acl d
+      LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
+      JOIN pg_roles r ON r.oid = d.defaclrole
+      CROSS JOIN LATERAL aclexplode(d.defaclacl) x
+      LEFT JOIN pg_roles g ON g.oid = x.grantee
+     WHERE d.defaclobjtype IN ('r', 'S', 'f')
+       AND (n.nspname = 'public' OR n.nspname IS NULL)
+       AND (x.grantee = 0 OR g.rolname IN ('anon', 'authenticated'));
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'PUBLIC/anon/authenticated default privileges remain: %', _bad;
+    END IF;
+END $$;

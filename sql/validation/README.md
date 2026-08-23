@@ -2,7 +2,8 @@
 
 After deploying Phases 2–7 to production, run the queries in this directory
 to confirm the live system is behaving as the audit specified. Every query
-is **read-only** (SELECT only — no INSERT / UPDATE / DELETE / ALTER / DROP).
+is **read-only**: catalog `SELECT` statements plus assertion-only `DO` blocks
+that raise on failure; there is no INSERT / UPDATE / DELETE / ALTER / DROP.
 
 No new migrations are required for Phase 8. The Phase 2 migrations
 (`20260519_phase2_orders_meta.sql`, `20260519_phase2_lift_caps.sql`) created
@@ -37,13 +38,14 @@ what it just printed.
 ## Safety guarantees
 
 All queries:
-- Use only `SELECT` (verified by grep below)
+- Read application metadata or PostgreSQL catalogs only; `07_rls_hardening.sql`
+  also uses assertion-only `DO` blocks with `RAISE EXCEPTION`
 - Set explicit `LIMIT` clauses where row counts could be large
 - The Phase 2–7 queries read from `orders`, `positions`, `audit_log`, and
   `decision_events` only
 - `07_rls_hardening.sql` reads PostgreSQL catalog metadata and privileges only;
   it does not select application rows from `client_state`, `clients`, or any
-  secret-bearing table
+  secret-bearing table, and its `DO` blocks do not mutate state
 
 To audit the queries before running:
 

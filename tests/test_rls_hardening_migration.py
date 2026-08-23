@@ -6,6 +6,8 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "20260823_rls_public_surface_lockdown.sql"
+VALIDATION = ROOT / "sql" / "validation" / "07_rls_hardening.sql"
+P0_WORKFLOW = ROOT / ".github" / "workflows" / "p0_regression.yml"
 
 EXPECTED_TABLES = {
     "account_snapshots",
@@ -32,6 +34,57 @@ EXPECTED_TABLES = {
     "trade_fills",
 }
 
+EXPECTED_POLICY_TABLES = {
+    "alert_routes",
+    "ap_admin_audit",
+    "ap_signal_underlying_outcomes",
+    "ap_system_control",
+    "bot_status",
+    "client_health",
+    "content_queue",
+    "daily_cadence_logs",
+    "incidents",
+    "market_data",
+    "option_outcomes",
+    "proof_daily_summary",
+    "proof_trades",
+    "proof_vault",
+    "signal_outcomes",
+    "signals",
+    "system_health_events",
+}
+
+EXPECTED_VIEWS = {
+    "ap_signal_funnel_daily",
+    "ap_skipped_signal_outcomes",
+    "ledger_funnel",
+    "ledger_performance",
+    "v2_equity_curve",
+    "v2_last_20_trades",
+    "v2_performance",
+}
+
+EXPECTED_DROPPED_POLICIES = {
+    ("alert_routes", "anon_read"),
+    ("ap_admin_audit", "anon_read"),
+    ("ap_signal_underlying_outcomes", "anon_all_underlying"),
+    ("ap_system_control", "anon_read"),
+    ("bot_status", "anon_all_bot_status"),
+    ("client_health", "anon_read_client_health"),
+    ("content_queue", "anon_read"),
+    ("daily_cadence_logs", "anon_read"),
+    ("incidents", "anon_read"),
+    ("market_data", "Anyone can read market data"),
+    ("option_outcomes", "anon_all_option_outcomes"),
+    ("proof_daily_summary", "anon_all_proof_daily"),
+    ("proof_trades", "anon_all_proof_trades"),
+    ("proof_trades", "service_role_all"),
+    ("proof_vault", "anon_read"),
+    ("signal_outcomes", "anon_all_signal_outcomes"),
+    ("signals", "Anyone can read signals"),
+    ("system_health_events", "anon_read"),
+}
+
 
 def _sql() -> str:
     return MIGRATION.read_text(encoding="utf-8")
@@ -51,23 +104,38 @@ def test_migration_targets_exact_live_scope() -> None:
     )
 
     assert set(enabled) == EXPECTED_TABLES
-    assert set(revoked) == EXPECTED_TABLES
+    assert set(revoked) == EXPECTED_TABLES | EXPECTED_POLICY_TABLES | EXPECTED_VIEWS
     assert len(enabled) == len(EXPECTED_TABLES)
-    assert len(revoked) == len(EXPECTED_TABLES)
+    assert len(revoked) == len(EXPECTED_TABLES | EXPECTED_POLICY_TABLES | EXPECTED_VIEWS)
+
+
+def test_migration_drops_only_live_verified_public_policy_rows() -> None:
+    sql = _sql()
+    dropped = re.findall(
+        r'^DROP POLICY (?:"([^"]+)"|([a-z0-9_]+)) ON public\.([a-z0-9_]+);$',
+        sql,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    normalized = {(policy_a or policy_b, table) for policy_a, policy_b, table in dropped}
+
+    assert normalized == {(policy, table) for table, policy in EXPECTED_DROPPED_POLICIES}
+    assert "service_write_client_health" in sql
+    assert "DROP POLICY service_write_client_health" not in sql
 
 
 def test_migration_is_fail_closed_without_guessing_tenant_policies() -> None:
     sql = _sql()
     assert not re.search(r"^\s*CREATE\s+POLICY\b", sql, re.IGNORECASE | re.MULTILINE)
-    assert not re.search(r"^\s*DROP\s+POLICY\b", sql, re.IGNORECASE | re.MULTILINE)
     assert not re.search(
         r"^\s*ALTER\s+TABLE\b.*\bFORCE\s+ROW\s+LEVEL\s+SECURITY\b",
         sql,
         re.IGNORECASE | re.MULTILINE,
     )
+    assert "roles::text IS DISTINCT FROM" in sql
+    assert "unreviewed public tables with RLS disabled" in sql
 
 
-def test_migration_leaves_service_role_and_runner_transaction_control_alone() -> None:
+def test_migration_leaves_privileged_paths_and_runner_transaction_control_alone() -> None:
     sql = _sql()
     revoke_statements = re.findall(
         r"^REVOKE\s+ALL\s+ON\s+TABLE\s+[^;]+;$",
@@ -76,4 +144,20 @@ def test_migration_leaves_service_role_and_runner_transaction_control_alone() ->
     )
     assert revoke_statements
     assert all("service_role" not in statement.lower() for statement in revoke_statements)
+    assert sql.count("TO service_role;") >= 3
     assert not re.search(r"^\s*(BEGIN|COMMIT|ROLLBACK)\s*;", sql, re.IGNORECASE | re.MULTILINE)
+
+
+def test_validation_is_read_only_and_has_hard_gates() -> None:
+    sql = VALIDATION.read_text(encoding="utf-8")
+    assert "\\set ON_ERROR_STOP on" in sql
+    assert sql.count("RAISE EXCEPTION") >= 5
+    assert "anon', format('public.%I', e.table_name), 'INSERT'" in sql
+    assert "authenticated', format('public.%I', e.table_name), 'DELETE'" in sql
+    assert "roles && ARRAY['public', 'anon', 'authenticated']::name[]" in sql
+    assert not re.search(r"^\s*(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b", sql, re.IGNORECASE | re.MULTILINE)
+
+
+def test_p0_workflow_runs_the_migration_static_test() -> None:
+    workflow = P0_WORKFLOW.read_text(encoding="utf-8")
+    assert workflow.count("tests/test_rls_hardening_migration.py") == 1
