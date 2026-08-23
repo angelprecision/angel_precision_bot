@@ -388,6 +388,8 @@ END $$;
 DO $$
 DECLARE
     _policy_drift TEXT;
+    _preserved_policy_drift TEXT;
+    _unexpected_public_policy TEXT;
     _unexpected_permissive_policy TEXT;
     _policy_table_gap TEXT;
 BEGIN
@@ -430,6 +432,80 @@ BEGIN
         RAISE EXCEPTION
             'RLS hardening preflight failed: permissive policy drift: %',
             _policy_drift;
+    END IF;
+
+    -- These two owner-scoped public policies are retained intentionally.  The
+    -- exact predicate, role, command, and permissiveness are part of the
+    -- reviewed security boundary; a changed predicate is a hard stop.
+    SELECT string_agg(format('%s.%s', e.table_name, e.policy_name), ', '
+                      ORDER BY e.table_name, e.policy_name)
+      INTO _preserved_policy_drift
+      FROM (VALUES
+        ('members', 'members_read_own', '{public}', 'SELECT',
+         '(auth.uid() = user_id)', '<null>', 'PERMISSIVE'),
+        ('proof_trades', 'client_sees_own_trades', '{public}', 'SELECT',
+         '(client_email = ((current_setting(''request.jwt.claims''::text, true))::json ->> ''email''::text))',
+         '<null>', 'PERMISSIVE')
+      ) AS e(table_name, policy_name, expected_roles, expected_cmd,
+             expected_qual, expected_with_check, expected_permissive)
+      LEFT JOIN pg_policies p
+        ON p.schemaname = 'public'
+       AND p.tablename = e.table_name
+       AND p.policyname = e.policy_name
+     WHERE p.policyname IS NULL
+        OR p.roles::text IS DISTINCT FROM e.expected_roles
+        OR p.cmd IS DISTINCT FROM e.expected_cmd
+        OR COALESCE(p.qual, '<null>') IS DISTINCT FROM e.expected_qual
+        OR COALESCE(p.with_check, '<null>') IS DISTINCT FROM e.expected_with_check
+        OR p.permissive IS DISTINCT FROM e.expected_permissive;
+
+    IF _preserved_policy_drift IS NOT NULL THEN
+        RAISE EXCEPTION
+            'RLS hardening preflight failed: preserved owner policy drift: %',
+            _preserved_policy_drift;
+    END IF;
+
+    -- Do not classify only literal TRUE predicates as unsafe.  Any new or
+    -- renamed policy visible to public/anon/authenticated is unreviewed until
+    -- it is added to this explicit allowlist and contract-checked above.
+    SELECT string_agg(format('%s.%s', p.tablename, p.policyname), ', '
+                      ORDER BY p.tablename, p.policyname)
+      INTO _unexpected_public_policy
+      FROM pg_policies p
+     WHERE p.schemaname = 'public'
+       AND p.roles && ARRAY['public', 'anon', 'authenticated']::name[]
+       AND NOT EXISTS (
+           SELECT 1
+             FROM (VALUES
+               ('alert_routes', 'anon_read'),
+               ('ap_admin_audit', 'anon_read'),
+               ('ap_signal_underlying_outcomes', 'anon_all_underlying'),
+               ('ap_system_control', 'anon_read'),
+               ('bot_status', 'anon_all_bot_status'),
+               ('client_health', 'anon_read_client_health'),
+               ('content_queue', 'anon_read'),
+               ('daily_cadence_logs', 'anon_read'),
+               ('incidents', 'anon_read'),
+               ('market_data', 'Anyone can read market data'),
+               ('option_outcomes', 'anon_all_option_outcomes'),
+               ('proof_daily_summary', 'anon_all_proof_daily'),
+               ('proof_trades', 'anon_all_proof_trades'),
+               ('proof_trades', 'service_role_all'),
+               ('proof_vault', 'anon_read'),
+               ('signal_outcomes', 'anon_all_signal_outcomes'),
+               ('signals', 'Anyone can read signals'),
+               ('system_health_events', 'anon_read'),
+               ('members', 'members_read_own'),
+               ('proof_trades', 'client_sees_own_trades')
+             ) AS e(table_name, policy_name)
+            WHERE p.tablename = e.table_name
+              AND p.policyname = e.policy_name
+       );
+
+    IF _unexpected_public_policy IS NOT NULL THEN
+        RAISE EXCEPTION
+            'RLS hardening preflight failed: unreviewed public/anon/authenticated policy identity drift: %',
+            _unexpected_public_policy;
     END IF;
 
     SELECT string_agg(format('%s.%s', p.tablename, p.policyname), ', '

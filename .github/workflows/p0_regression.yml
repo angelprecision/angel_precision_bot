@@ -88,6 +88,9 @@ jobs:
           psql -h localhost -U postgres -d rls_hardening_test \
             -v ON_ERROR_STOP=1 \
             -f sql/validation/07_rls_hardening.sql
+          psql -h localhost -U postgres -d rls_hardening_test \
+            -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/rls_hardening_role_access.sql
 
       - name: Run P0 plus cohesion tests
         env:

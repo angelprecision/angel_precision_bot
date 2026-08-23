@@ -18,6 +18,9 @@ baseline for the live public security surface. It:
 - removes exactly 18 live-verified `USING (true)` / `WITH CHECK (true)` policies
   targeting `public` or `anon`; the service-role-only client-health policy is
   preserved;
+- preserves the two reviewed owner-scoped public policies as exact contracts
+  and fails closed on any new or renamed policy visible to
+  `public`/`anon`/`authenticated`, including non-literal predicates;
 - revokes `PUBLIC`, `anon`, and `authenticated` access to all seven currently
   exposed public views and grants explicit `service_role` read access;
 - revokes existing `PUBLIC`, `anon`, and `authenticated` access to the 24
@@ -57,9 +60,10 @@ and staging must additionally prove:
    client state, fills, signals, proof records, and migration history.
 8. Every dashboard operation that must remain available has an explicit,
    reviewed owner predicate before an authenticated policy is added.
-9. No public/anon/authenticated permissive policy remains, and the exact policy
-   permissiveness matches the reviewed baseline. Service-role-only policies
-   require a separate owner review but do not expose the Data API.
+9. No public/anon/authenticated permissive policy remains, the exact retained
+   owner predicates match the reviewed baseline, and no unreviewed public-role
+   policy identity exists. Service-role-only policies require a separate owner
+   review but do not expose the Data API.
 10. An owner-authorized follow-up removes the remaining `supabase_admin`
    default privileges before this migration is applied, because the
    application `postgres` role is not a member of `supabase_admin`.
@@ -76,7 +80,8 @@ objects named; this branch contains no automatic rollback SQL.
 ## Review posture
 
 This is a security migration draft for further review. It is not safe to merge
-or deploy until the staging assertions, real role-based Data API tests, bot
-lifecycle proof, and dashboard owner mapping pass. The migration test is part
-of the P0 workflow, but unrelated existing P0 failures still keep the PR on
-HOLD.
+or deploy until the staging assertions, the disposable anon/authenticated/
+service-role access fixture, real role-based Data API tests, bot lifecycle
+proof, and dashboard owner mapping pass. The migration and role-access tests
+are part of the P0 workflow, but unrelated existing P0 failures still keep the
+PR on HOLD.

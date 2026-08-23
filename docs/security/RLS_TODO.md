@@ -42,7 +42,9 @@ application `postgres` role is not a member of `supabase_admin`.
       the bot service role retains the required sequence privileges and
       `rolbypassrls = true`.
 - [ ] The reviewed policy rows match the expected roles, command, predicates,
-      and `PERMISSIVE` mode before any policy is dropped.
+      and `PERMISSIVE` mode before any policy is dropped; retained public-role
+      owner policies are exact-contract checked and unknown policy identities
+      fail closed.
 - [ ] Public views are either kept privileged-only or converted to tested
       `security_invoker` views with owner-scoped base policies.
 - [ ] Staging proves dashboard own-row access, cross-tenant denial, bot

@@ -121,6 +121,27 @@ BEGIN
     END LOOP;
 END $$;
 
+CREATE SCHEMA auth;
+GRANT USAGE ON SCHEMA auth TO PUBLIC;
+CREATE FUNCTION auth.uid()
+RETURNS uuid
+LANGUAGE sql
+IMMUTABLE
+AS 'SELECT NULL::uuid';
+
+CREATE TABLE public.members (id bigint, user_id uuid);
+ALTER TABLE public.members ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT, UPDATE, DELETE
+    ON TABLE public.members TO PUBLIC, anon, authenticated, service_role;
+ALTER TABLE public.proof_trades ADD COLUMN client_email text;
+
+CREATE POLICY members_read_own ON public.members
+    FOR SELECT TO PUBLIC USING (auth.uid() = user_id);
+CREATE POLICY client_sees_own_trades ON public.proof_trades
+    FOR SELECT TO PUBLIC USING (
+        client_email = ((current_setting('request.jwt.claims', true))::json ->> 'email')
+    );
+
 CREATE POLICY anon_read ON public.alert_routes
     FOR SELECT TO PUBLIC USING (true);
 CREATE POLICY anon_read ON public.ap_admin_audit

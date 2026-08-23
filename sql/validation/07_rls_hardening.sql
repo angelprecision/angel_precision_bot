@@ -446,6 +446,77 @@ BEGIN
     END IF;
 END $$;
 
+\echo '== Reviewed public-role policy contracts and identity allowlist =='
+DO $$
+DECLARE
+    _bad TEXT;
+BEGIN
+    SELECT string_agg(format('%s.%s', e.table_name, e.policy_name), ', '
+                      ORDER BY e.table_name, e.policy_name)
+      INTO _bad
+      FROM (VALUES
+        ('members', 'members_read_own', '{public}', 'SELECT',
+         '(auth.uid() = user_id)', '<null>', 'PERMISSIVE'),
+        ('proof_trades', 'client_sees_own_trades', '{public}', 'SELECT',
+         '(client_email = ((current_setting(''request.jwt.claims''::text, true))::json ->> ''email''::text))',
+         '<null>', 'PERMISSIVE')
+      ) AS e(table_name, policy_name, expected_roles, expected_cmd,
+             expected_qual, expected_with_check, expected_permissive)
+      LEFT JOIN pg_policies p
+        ON p.schemaname = 'public'
+       AND p.tablename = e.table_name
+       AND p.policyname = e.policy_name
+     WHERE p.policyname IS NULL
+        OR p.roles::text IS DISTINCT FROM e.expected_roles
+        OR p.cmd IS DISTINCT FROM e.expected_cmd
+        OR COALESCE(p.qual, '<null>') IS DISTINCT FROM e.expected_qual
+        OR COALESCE(p.with_check, '<null>') IS DISTINCT FROM e.expected_with_check
+        OR p.permissive IS DISTINCT FROM e.expected_permissive;
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'Preserved owner policy drift: %', _bad;
+    END IF;
+
+    SELECT string_agg(format('%s.%s', p.tablename, p.policyname), ', '
+                      ORDER BY p.tablename, p.policyname)
+      INTO _bad
+      FROM pg_policies p
+     WHERE p.schemaname = 'public'
+       AND p.roles && ARRAY['public', 'anon', 'authenticated']::name[]
+       AND NOT EXISTS (
+           SELECT 1
+             FROM (VALUES
+               ('alert_routes', 'anon_read'),
+               ('ap_admin_audit', 'anon_read'),
+               ('ap_signal_underlying_outcomes', 'anon_all_underlying'),
+               ('ap_system_control', 'anon_read'),
+               ('bot_status', 'anon_all_bot_status'),
+               ('client_health', 'anon_read_client_health'),
+               ('content_queue', 'anon_read'),
+               ('daily_cadence_logs', 'anon_read'),
+               ('incidents', 'anon_read'),
+               ('market_data', 'Anyone can read market data'),
+               ('option_outcomes', 'anon_all_option_outcomes'),
+               ('proof_daily_summary', 'anon_all_proof_daily'),
+               ('proof_trades', 'anon_all_proof_trades'),
+               ('proof_trades', 'service_role_all'),
+               ('proof_vault', 'anon_read'),
+               ('signal_outcomes', 'anon_all_signal_outcomes'),
+               ('signals', 'Anyone can read signals'),
+               ('system_health_events', 'anon_read'),
+               ('members', 'members_read_own'),
+               ('proof_trades', 'client_sees_own_trades')
+             ) AS e(table_name, policy_name)
+            WHERE p.tablename = e.table_name
+              AND p.policyname = e.policy_name
+       );
+
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION
+            'Unreviewed public/anon/authenticated policy identity drift: %', _bad;
+    END IF;
+END $$;
+
 \echo '== Public table drift and default privileges =='
 SELECT count(*) FILTER (WHERE NOT c.relrowsecurity) AS public_rls_disabled_tables,
        string_agg(c.relname, ', ' ORDER BY c.relname)
