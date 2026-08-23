@@ -1,10 +1,19 @@
 -- Isolated PostgreSQL fixture for the reviewed Supabase RLS hardening
 -- migration. The workflow creates a fresh database before running this file.
 
-CREATE ROLE anon NOLOGIN;
-CREATE ROLE authenticated NOLOGIN;
-CREATE ROLE service_role NOLOGIN BYPASSRLS;
-CREATE ROLE supabase_admin NOLOGIN;
+DO $$
+DECLARE
+    role_name TEXT;
+BEGIN
+    FOREACH role_name IN ARRAY ARRAY[
+        'anon', 'authenticated', 'service_role', 'supabase_admin'
+    ] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
+            EXECUTE format('CREATE ROLE %I NOLOGIN', role_name);
+        END IF;
+    END LOOP;
+    EXECUTE 'ALTER ROLE service_role NOLOGIN BYPASSRLS';
+END $$;
 
 DO $$
 DECLARE
