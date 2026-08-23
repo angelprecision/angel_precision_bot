@@ -181,6 +181,7 @@ jobs:
             tests/test_p0_touched_profit_bid_confirmation.py \
             tests/test_p0_position_quote_monitor_binding_health.py \
             tests/test_p0_live_position_direct_quote_recovery.py \
+            tests/test_p0_direct_quote_cache_validity_recovery.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             tests/test_p0_shared_ap_signals_retry_idempotency.py \
             tests/test_p0_nonterminal_ownership_poisoning.py \
