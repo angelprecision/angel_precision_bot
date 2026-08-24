@@ -509,6 +509,16 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
         final_reason_code="EXECUTION_MODE_MISMATCH",
         queue_facing_reason="TERMINAL_INVARIANT_VIOLATION",
     ),
+    # The deferred request-scope reducer emits this only when it raises or
+    # returns an unusable value. Preserve the exact invariant failure through
+    # runtime, restart, and materializer consumers; never retry it as data.
+    "UNKNOWN_SELECTOR_RECOVERY_FAILURE": SelectorRetryPolicy(
+        classification=TERMINAL_INVARIANT,
+        selector_rerun_allowed=False, retain_existing_contract=False,
+        retry_delay_applies=False, max_attempts_applies=False,
+        final_reason_code="UNKNOWN_SELECTOR_RECOVERY_FAILURE",
+        queue_facing_reason="TERMINAL_INVARIANT_VIOLATION",
+    ),
 
     # ── UNKNOWN_REJECTION (sentinel) ──────────────────────────────────────────
     # The selector emits UNKNOWN_REJECTION as a catch-all for unexpected rejects.
