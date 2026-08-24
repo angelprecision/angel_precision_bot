@@ -410,3 +410,91 @@ def test_ordinary_call_breach_and_continuation_share_canonical_quote():
     d = _decide(side="CALL", trigger_price=100, bid=100.05, ask=100.20)
     assert d.quote == r.value
     assert d.quote_source == r.source
+
+
+# ── PR #479 second amendment: stop-broken proof must outrank a missing ──────
+# ── entry-side (canonical) quote whenever trigger_previously_breached=True ──
+#
+# Second audit found classify_late_attachment() returned
+# TRIGGER_TRUTH_UNAVAILABLE_RETRY unconditionally the moment the canonical
+# (entry-side) quote was unavailable -- before the confirmed-breach stop
+# check (the _stop_active / _evaluate_stop block) ever ran. That let an
+# already-broken opposite-side stop go unobserved for as long as the
+# entry-side quote stayed missing, even on a durably confirmed setup.
+
+def test_call_confirmed_stop_broken_wins_over_missing_ask():
+    # CALL canonical/entry-side quote is ASK; stop-side quote is BID.
+    # ask missing (None), bid=90 has broken stop=95, confirmed breach exists.
+    d = _decide(
+        side="CALL", trigger_price=100, bid=90.0, ask=None, stop=95.0,
+        trigger_previously_breached=True,
+    )
+    assert d.classification == ptc.STOP_ALREADY_BROKEN_TERMINAL
+
+
+def test_put_confirmed_stop_broken_wins_over_missing_bid():
+    # PUT canonical/entry-side quote is BID; stop-side quote is ASK.
+    d = _decide(
+        side="PUT", trigger_price=100, bid=None, ask=110.0, stop=105.0,
+        trigger_previously_breached=True,
+    )
+    assert d.classification == ptc.STOP_ALREADY_BROKEN_TERMINAL
+
+
+def test_call_confirmed_missing_ask_stop_intact_stays_retryable():
+    # Entry-side quote missing, opposite-side (bid) present but stop NOT
+    # broken. Must be retryable, not terminal — no fabricated invalidation.
+    d = _decide(
+        side="CALL", trigger_price=100, bid=98.0, ask=None, stop=95.0,
+        trigger_previously_breached=True,
+    )
+    assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is None
+
+
+def test_put_confirmed_missing_bid_stop_intact_stays_retryable():
+    d = _decide(
+        side="PUT", trigger_price=100, bid=None, ask=102.0, stop=105.0,
+        trigger_previously_breached=True,
+    )
+    assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is None
+
+
+def test_call_confirmed_both_sides_missing_stays_retryable():
+    # Neither entry-side nor stop-side quote available — stop truth is
+    # unprovable either way; must never fabricate a decision.
+    d = _decide(
+        side="CALL", trigger_price=100, bid=None, ask=None, stop=95.0,
+        trigger_previously_breached=True,
+    )
+    assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is None
+
+
+def test_call_unconfirmed_missing_ask_does_not_consult_stop():
+    # trigger_previously_breached=False: the stop is dormant pre-confirmation
+    # regardless of the fix — this must behave exactly as before.
+    d = _decide(
+        side="CALL", trigger_price=100, bid=90.0, ask=None, stop=95.0,
+        trigger_previously_breached=False,
+    )
+    assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
+
+
+def test_put_unconfirmed_missing_bid_does_not_consult_stop():
+    d = _decide(
+        side="PUT", trigger_price=100, bid=None, ask=110.0, stop=105.0,
+        trigger_previously_breached=False,
+    )
+    assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
+
+
+def test_call_confirmed_stop_not_broken_and_ask_present_falls_through_normally():
+    # Sanity: with both sides present and stop intact, ordinary continuation
+    # classification must still work exactly as before the reorder.
+    d = _decide(
+        side="CALL", trigger_price=100, bid=98.0, ask=100.05, stop=95.0,
+        trigger_previously_breached=True,
+    )
+    assert d.classification == ptc.LATE_ATTACHMENT_WITHIN_CONTINUATION
