@@ -3611,7 +3611,12 @@ class ClientRunner(threading.Thread):
             # even if their absolute age exceeds min_age_seconds. Defends
             # against deploys/restarts that race against in-flight signals.
             startup_grace_seconds = int(os.getenv("STARTUP_PHANTOM_CLEAR_GRACE_SECONDS", "180"))
-            cleanup_rule_version = "v2"
+            # v3_submit_intent_cas: candidate selection is only the first
+            # snapshot.  Both data-modifying targets below reassert the full
+            # pre-submit ownership boundary before writing, so a concurrent
+            # submit-intent commit cannot be changed to CANCELED or
+            # RETRY_ELIGIBLE by this startup pass.
+            cleanup_rule_version = "v3_submit_intent_cas"
             startup_ts = getattr(self, "_runner_startup_ts", None)
             if startup_ts is None:
                 # Defensive: if the runner didn't record its start time,
@@ -3711,12 +3716,13 @@ class ClientRunner(threading.Thread):
                               AND   o.created_ts < NOW() - (%s || ' seconds')::interval
                               AND   o.created_ts < to_timestamp(%s)
                               AND   o.submitted_ts IS NULL
+                              AND   NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NULL
                               AND   o.filled_ts IS NULL
                               AND   o.position_id IS NULL
                               AND   (
                                         o.broker_order_id IS NULL
                                     OR  TRIM(COALESCE(o.broker_order_id, '')) = ''
-                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL')
+                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE')
                                     )
                               AND   (
                                         o.meta->'watcher_audit' IS NULL
@@ -3797,6 +3803,19 @@ class ClientRunner(threading.Thread):
                                        SELECT 1 FROM active_proof ap
                                        WHERE  ap.local_order_id = ca.local_order_id
                                    )
+                              -- Reassert the candidate's pre-submit ownership
+                              -- boundary at write time.  The CTE is a statement
+                              -- snapshot and can be stale by this UPDATE.
+                              AND  o.status IN ('CREATED','PENDING_TRIGGER','PENDING','DEFERRED')
+                              AND  o.submitted_ts IS NULL
+                              AND  NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NULL
+                              AND  o.filled_ts IS NULL
+                              AND  o.position_id IS NULL
+                              AND  (
+                                        o.broker_order_id IS NULL
+                                    OR  TRIM(COALESCE(o.broker_order_id, '')) = ''
+                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE')
+                                  )
                             RETURNING o.local_order_id
                         ),
                         skip_targets AS (
@@ -3824,6 +3843,19 @@ class ClientRunner(threading.Thread):
                                        SELECT 1 FROM active_proof ap
                                        WHERE  ap.local_order_id = ca.local_order_id
                                    )
+                              -- Same write-time CAS as cancel_targets.  Active
+                              -- proof changes the outcome, never the ownership
+                              -- boundary that permits this UPDATE.
+                              AND  o.status IN ('CREATED','PENDING_TRIGGER','PENDING','DEFERRED')
+                              AND  o.submitted_ts IS NULL
+                              AND  NULLIF(BTRIM(COALESCE(o.meta->>'submit_intent_at','')), '') IS NULL
+                              AND  o.filled_ts IS NULL
+                              AND  o.position_id IS NULL
+                              AND  (
+                                        o.broker_order_id IS NULL
+                                    OR  TRIM(COALESCE(o.broker_order_id, '')) = ''
+                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE')
+                                  )
                             RETURNING o.local_order_id
                         )
                         SELECT
@@ -4220,6 +4252,7 @@ class ClientRunner(threading.Thread):
                 pm=self.position_manager,
                 execution_mode=str(self.mode).strip().lower(),
                 supabase_client=getattr(self, "supabase", None),  # Requirement 3
+                execution_core=self.core,
             )
             self.reconciler.exit_engine = exit_eng
             # P0-3: give reconciler master_control reference so it can self-

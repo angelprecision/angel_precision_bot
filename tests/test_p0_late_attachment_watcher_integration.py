@@ -514,3 +514,105 @@ def test_signal_id_and_side_survive_gate_transitions():
     w.check(bid=99.98, ask=100.05)
     assert w.signal_id == original_sid
     assert w.side == original_side
+
+
+# ── PR #479 second amendment (P0 ordering fix #2) ───────────────────────────
+#
+# Second audit found a distinct control path from the first amendment: the
+# late-attachment gate (classify_late_attachment via the PR #388 Block-2
+# classifier) ran its own canonical-quote-availability check BEFORE ever
+# evaluating the opposite-side stop, and returned TRIGGER_TRUTH_UNAVAILABLE_
+# RETRY unconditionally whenever the entry-side quote was missing -- even on
+# an already-confirmed watcher (trigger_crossed_at set) sitting in
+# WITHIN_CONTINUATION / WAITING_RESET / AWAITING_FIRST_TRUTH via recovery
+# reattachment. That meant a genuinely broken stop on the opposite side could
+# go completely unobserved for as long as the entry-side quote stayed
+# missing. The fix lives in ap/pending_trigger_classifier.classify_late_
+# attachment: the stop-broken check must run ahead of (not after) the
+# canonical-quote-availability short-circuit whenever durable breach
+# evidence (trigger_previously_breached) already exists.
+#
+# These tests exercise WatchedSignal.check() directly (the same call path
+# production polling uses) with late_attachment_state active AND
+# trigger_crossed_at already set -- the exact combination the audit flagged
+# as production-reachable via watch(recovery_rearm=True).
+
+def test_call_confirmed_late_attachment_stop_break_invalidates_despite_missing_ask():
+    # CALL stop uses BID. ask missing (0) is the canonical/entry-side quote
+    # for CALL; bid=90 has broken stop=95. The late-attachment gate must
+    # still catch this even though the canonical CALL quote (ask) is absent.
+    w = _make_watcher(side="CALL", trigger=100, stop=95, state=_WITHIN)
+    w.trigger_crossed_at = datetime.now(timezone.utc)
+    st = w.check(bid=90.0, ask=0)
+    assert st == ew.WatchState.INVALIDATED
+
+
+def test_put_confirmed_late_attachment_stop_break_invalidates_despite_missing_bid():
+    # PUT stop uses ASK. bid missing (0) is the canonical/entry-side quote
+    # for PUT; ask=110 has broken stop=105.
+    w = _make_watcher(side="PUT", trigger=100, stop=105, state=_WITHIN)
+    w.trigger_crossed_at = datetime.now(timezone.utc)
+    st = w.check(bid=0, ask=110.0)
+    assert st == ew.WatchState.INVALIDATED
+
+
+def test_call_confirmed_late_attachment_awaiting_stop_break_invalidates_despite_missing_ask():
+    # Same as above but from the AWAITING_FIRST_TRUTH sub-state (the exact
+    # state a fresh recovery reattachment seeds when no quote was available
+    # at arm time), to prove the fix applies across all three late-attachment
+    # states, not only WITHIN_CONTINUATION.
+    w = _make_awaiting_call(trigger=200.0, stop=180.0)
+    w.trigger_crossed_at = datetime.now(timezone.utc)
+    st = w.check(bid=175.0, ask=0)
+    assert st == ew.WatchState.INVALIDATED
+
+
+def test_put_confirmed_late_attachment_awaiting_stop_break_invalidates_despite_missing_bid():
+    p = _make_awaiting_put(trigger=200.0, stop=220.0)
+    p.trigger_crossed_at = datetime.now(timezone.utc)
+    st = p.check(bid=0, ask=225.0)
+    assert st == ew.WatchState.INVALIDATED
+
+
+def test_call_confirmed_waiting_reset_stop_break_invalidates_despite_missing_ask():
+    w = _make_watcher(side="CALL", trigger=100, stop=95, state=_WAITING)
+    w.trigger_crossed_at = datetime.now(timezone.utc)
+    st = w.check(bid=90.0, ask=0)
+    assert st == ew.WatchState.INVALIDATED
+
+
+def test_put_confirmed_waiting_reset_stop_break_invalidates_despite_missing_bid():
+    w = _make_watcher(side="PUT", trigger=100, stop=105, state=_WAITING)
+    w.trigger_crossed_at = datetime.now(timezone.utc)
+    st = w.check(bid=0, ask=110.0)
+    assert st == ew.WatchState.INVALIDATED
+
+
+def test_call_confirmed_late_attachment_missing_ask_stays_pending_when_stop_intact():
+    # Confirmed + late-attachment active + missing entry-side quote (ask) +
+    # opposite-side quote (bid) present but does NOT break the stop. Must
+    # remain safely PENDING with the late-attachment state preserved -- no
+    # fabricated trigger, no spurious invalidation.
+    w = _make_watcher(side="CALL", trigger=100, stop=95, state=_WITHIN)
+    w.trigger_crossed_at = datetime.now(timezone.utc)
+    st = w.check(bid=98.0, ask=0)
+    assert st == ew.WatchState.PENDING
+    assert w.late_attachment_state == _WITHIN
+
+
+def test_put_confirmed_late_attachment_missing_bid_stays_pending_when_stop_intact():
+    w = _make_watcher(side="PUT", trigger=100, stop=105, state=_WITHIN)
+    w.trigger_crossed_at = datetime.now(timezone.utc)
+    st = w.check(bid=0, ask=102.0)
+    assert st == ew.WatchState.PENDING
+    assert w.late_attachment_state == _WITHIN
+
+
+def test_call_confirmed_late_attachment_both_sides_missing_stays_pending():
+    # Neither side available: stop truth is unprovable either way. Must stay
+    # PENDING (retryable), never fabricate INVALIDATED or TRIGGERED.
+    w = _make_watcher(side="CALL", trigger=100, stop=95, state=_WITHIN)
+    w.trigger_crossed_at = datetime.now(timezone.utc)
+    st = w.check(bid=0, ask=0)
+    assert st == ew.WatchState.PENDING
+    assert w.late_attachment_state == _WITHIN

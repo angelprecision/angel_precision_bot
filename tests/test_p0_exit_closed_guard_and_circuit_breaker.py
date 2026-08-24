@@ -752,7 +752,19 @@ def test_broker_truth_exact_occ_allows_protective_close(monkeypatch, mock_broker
     assert any("UPDATE orders " in sql and "SET meta = COALESCE(meta, '{}'::jsonb)" in sql for sql, _ in fake_conn.queries)
 
 
-def test_broker_flat_exact_match_blocks_without_broker_post_and_marks_stale(monkeypatch, mock_broker):
+def test_broker_exact_match_zero_quantity_no_longer_flat_hits_circuit_breaker(monkeypatch, mock_broker):
+    """P0 amendment (spec: p0_tradier_exact_quantity_flat_guard_20260817):
+    an exact-contract row with quantity=0 is NO LONGER treated as
+    authoritative broker-flat truth -- real broker-flat is row absence, not
+    an explicit zero row (see resolve_exit_broker_truth's
+    "exact_match_conflict_unknown_quantity" path). This test previously
+    asserted the pre-amendment (buggy) behavior: that a quantity=0
+    exact-match row produced SYNTHETIC_POSITION_STALE_BROKER_FLAT and
+    marked the position CLOSED. That is precisely the false-flat defect the
+    amendment fixes. With broker truth now unknown/conflicting rather than
+    flat, the circuit-breaker gate (rejection_count=5 >=
+    MAX_EXIT_REJECTIONS_BEFORE_HALT) is the actual reason submission is
+    blocked here -- not a fabricated flat determination."""
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
     fake_conn = _patch_db(
         monkeypatch,
@@ -775,12 +787,26 @@ def test_broker_flat_exact_match_blocks_without_broker_post_and_marks_stale(monk
     )
 
     assert result["ok"] is False
-    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+    assert result["reason"] == "exit_circuit_breaker_tripped"
+    assert result["reason"] != "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
     assert mock_broker.session.post.call_count == 0
-    assert any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
+    # No CLOSED write from manufactured flat truth. (The circuit breaker
+    # itself does not close the position either -- it only blocks this
+    # submission attempt.)
+    assert not any(
+        "UPDATE positions" in sql and "status = 'CLOSED'" in sql
+        for sql, _ in fake_conn.queries
+    )
 
 
-def test_broker_flat_exact_match_blocks_even_without_circuit_breaker_trip(monkeypatch, mock_broker):
+def test_broker_exact_match_zero_quantity_no_longer_flat_proceeds_fail_open(monkeypatch, mock_broker):
+    """Same amendment as above, without a tripped circuit breaker
+    (rejection_count=0). With broker truth unknown/conflicting rather than
+    confirmed flat, the protective exit now proceeds to broker exactly as
+    it does for any other "truth unavailable" case (see
+    tests/test_p0_broker_position_unavailable_not_flat.py case15) -- it is
+    never blocked pre-broker-call on a manufactured flat determination, and
+    the position is never marked CLOSED from this quantity=0 row alone."""
     fake_conn = _patch_db(
         monkeypatch,
         lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
@@ -788,6 +814,10 @@ def test_broker_flat_exact_match_blocks_even_without_circuit_breaker_trip(monkey
     mock_broker.list_positions.return_value = [
         {"symbol": "SMCI260626P00032500", "quantity": 0, "account_id": "ACC123"},
     ]
+    mock_broker.session.post.return_value = _resp(
+        200,
+        json_body={"order": {"id": "BO-EXIT-UNKNOWN-TRUTH", "status": "open"}},
+    )
     osm = _MockOSM()
 
     result = osm.submit_exit(
@@ -801,10 +831,13 @@ def test_broker_flat_exact_match_blocks_even_without_circuit_breaker_trip(monkey
         execution_mode="live",
     )
 
-    assert result["ok"] is False
-    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
-    assert mock_broker.session.post.call_count == 0
-    assert any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
+    assert result.get("reason") != "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+    assert not any(
+        "UPDATE positions" in sql and "status = 'CLOSED'" in sql
+        for sql, _ in fake_conn.queries
+    )
+    assert mock_broker.session.post.call_count == 1
+    assert result["ok"] is True
 
 
 def test_broker_wrong_occ_contract_does_not_override_breaker(monkeypatch, mock_broker):

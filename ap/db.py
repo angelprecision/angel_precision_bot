@@ -763,30 +763,37 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
     def _fn():
         with conn() as c:
             mode = str(execution_mode or "").strip().lower()
+            reconcile_statuses = (
+                "AND ("
+                "status IN ("
+                "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
+                "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
+                ") OR ("
+                "  status = 'PENDING_TRIGGER'"
+                "  AND kind = 'ENTRY'"
+                "  AND ("
+                "    submitted_ts IS NOT NULL"
+                "    OR NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NOT NULL"
+                "  )"
+                ")"
+                ") "
+            )
             if client_id and mode in {"live", "paper"}:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
                     "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
-                    "AND status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (client_id, mode, limit))
+                    + reconcile_statuses
+                    + "ORDER BY created_ts DESC LIMIT %s", (client_id, mode, limit))
             elif client_id:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
-                    "AND status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
+                    + reconcile_statuses
+                    + "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
             else:
                 c.execute(
-                    "SELECT * FROM orders WHERE status IN ("
-                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
-                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT %s", (limit,))
+                    "SELECT * FROM orders WHERE 1=1 "
+                    + reconcile_statuses
+                    + "ORDER BY created_ts DESC LIMIT %s", (limit,))
             return c.fetchall()
     return run_with_retry(_fn)
 
