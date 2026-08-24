@@ -890,7 +890,7 @@ class TestAggregateAuditTruthfulness:
 #   * receive an independent fresh selector budget;
 #   * preserve incident-shaped candidate rank and attempt/skip order;
 #   * recover the declared survivor or exhaust on zero/stale candidates;
-#   * report SELECTOR_REQUEST_BUDGET_EXHAUSTED only for all-failing fixtures;
+#   * report each all-failing fixture's exact request-level retry reason;
 #   * NOT submit / cancel / replace any broker order;
 #   * persist the dedicated durable outcome RETRY_LATER_SELECTOR_BUDGET on
 #     the deferred-retry row with exact identity fields intact.
