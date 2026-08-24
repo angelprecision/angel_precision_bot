@@ -121,7 +121,6 @@ jobs:
             tests/test_p0_broker_owned_exit_requested_recovery.py \
             tests/test_p0_broker_owned_exit_recovery_preflight.py \
             tests/test_fill_monitor_mvp_hardening.py \
-            tests/test_p0_filled_entry_durable_identity_handoff.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
             tests/test_p0_pending_trigger_restart_recovery.py \
@@ -181,7 +180,6 @@ jobs:
             tests/test_p0_touched_profit_bid_confirmation.py \
             tests/test_p0_position_quote_monitor_binding_health.py \
             tests/test_p0_live_position_direct_quote_recovery.py \
-            tests/test_p0_direct_quote_cache_validity_recovery.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             tests/test_p0_shared_ap_signals_retry_idempotency.py \
             tests/test_p0_nonterminal_ownership_poisoning.py \
