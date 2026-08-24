@@ -19,6 +19,7 @@ from ap.contract_quote_revalidator import (
     fetch_direct_option_quote_with_meta,
     revalidate_with_direct_quote,
 )
+from ap.selector_retry_policy import RETRYABLE_DATA, get_policy
 from ap.contract_selector import (
     APContractSelectionEngine,
     SelectorRequestContext,
@@ -908,6 +909,7 @@ FLEET_INCIDENT_FIXTURES: dict[str, dict] = {
     "COF": {
         "underlying": 214.35, "direction": "PUT", "spacing": 2.5,
         "recovery_rank": None, "delta": 0.39, "oi": 640, "volume": 85,
+        "expected_failure_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
     },
     "GM": {
         "underlying": 57.60, "direction": "CALL", "spacing": 0.25,
@@ -920,6 +922,7 @@ FLEET_INCIDENT_FIXTURES: dict[str, dict] = {
     "KHC": {
         "underlying": 29.15, "direction": "CALL", "spacing": 0.5,
         "recovery_rank": None, "delta": 0.41, "oi": 7300, "volume": 2500,
+        "expected_failure_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
     },
     "ROST": {
         "underlying": 154.70, "direction": "CALL", "spacing": 0.5,
@@ -928,6 +931,7 @@ FLEET_INCIDENT_FIXTURES: dict[str, dict] = {
     "UPS": {
         "underlying": 111.85, "direction": "PUT", "spacing": 1.0,
         "recovery_rank": None, "delta": 0.37, "oi": 2400, "volume": 610,
+        "expected_failure_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
     },
     "BAC": {
         "underlying": 60.90, "direction": "PUT", "spacing": 0.25,
@@ -1121,8 +1125,8 @@ class TestJuly23FleetAcceptanceReplay:
         """8 tickers × 3 real production identities = 24 canonical
         selector requests. Each request receives its own fresh 8-call
         budget and follows an explicit incident fixture: recoverable cases
-        select the declared rank; all-failing cases exhaust with
-        SELECTOR_REQUEST_BUDGET_EXHAUSTED. Original quality reasons remain
+        select the declared rank; all-failing cases assert their exact
+        fixture-defined terminal/retry reason. Original quality reasons remain
         attached and the selection pass never touches broker orders.
 
         Durable persistence of the resulting RETRY_LATER_SELECTOR_BUDGET
@@ -1155,10 +1159,17 @@ class TestJuly23FleetAcceptanceReplay:
                 if selected is None:
                     failure = plan["metadata"]["selector_failure"]
                     diagnostics = failure["selection_diagnostics"]
+                    expected_failure_reason = fixture["expected_failure_reason"]
                     assert (
-                        failure["reason_code"]
-                        == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                        failure["reason_code"] == expected_failure_reason
                     ), f"{ticker} {label} reason precedence drifted"
+                    policy = get_policy(failure["reason_code"])
+                    assert policy.classification == RETRYABLE_DATA
+                    assert policy.selector_rerun_allowed is True
+                    assert (
+                        policy.queue_facing_reason
+                        == "RETRY_LATER_DATA_UNAVAILABLE"
+                    )
                     assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
                     assert (
                         "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
