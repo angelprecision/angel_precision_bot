@@ -8,6 +8,9 @@ from ap.selector_retry_policy import (
     get_policy,
     resolve_selector_recovery_final_reason,
 )
+from ap.contract_selector import (
+    _resolve_deferred_recovery_final_reason_fail_closed,
+)
 
 
 MONEY = "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
@@ -211,6 +214,48 @@ def test_homogeneous_exhaustive_moneyness_still_terminalizes():
     symbols = ["DDOG260821P00150000", "DDOG260821P00155000"]
     evidence = _evidence(skipped={symbol: MONEY for symbol in symbols}, known=symbols)
     assert resolve_selector_recovery_final_reason(evidence) == "MONEYNESS_OUT_OF_RANGE"
+
+
+def test_reducer_exception_fails_closed_without_resurrecting_moneyness(
+    monkeypatch,
+):
+    import ap.selector_retry_policy as retry_policy
+
+    def _raise_reducer_error(_evidence):
+        raise RuntimeError("forced reducer failure")
+
+    monkeypatch.setattr(
+        retry_policy,
+        "resolve_selector_recovery_final_reason",
+        _raise_reducer_error,
+    )
+    evidence = _evidence(
+        skipped={"DDOG260821P00150000": MONEY},
+        known=["DDOG260821P00150000"],
+        fallback="MONEYNESS_OUT_OF_RANGE",
+    )
+
+    assert (
+        _resolve_deferred_recovery_final_reason_fail_closed(evidence)
+        == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    )
+
+
+def test_reducer_unusable_return_fails_closed(monkeypatch):
+    import ap.selector_retry_policy as retry_policy
+
+    monkeypatch.setattr(
+        retry_policy,
+        "resolve_selector_recovery_final_reason",
+        lambda _evidence: None,
+    )
+
+    assert (
+        _resolve_deferred_recovery_final_reason_fail_closed({
+            "fallback_selector_reason": "MONEYNESS_OUT_OF_RANGE",
+        })
+        == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    )
 
 
 def test_ordinary_known_reason_parity_is_unchanged():

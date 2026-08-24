@@ -989,6 +989,32 @@ def _ctx_refresh_diagnostics(ctx: SelectorRequestContext | None) -> None:
     ctx.diagnostics_sink.update(_selector_request_diagnostics(ctx))
 
 
+def _resolve_deferred_recovery_final_reason_fail_closed(evidence: dict) -> str:
+    """Run the deferred reducer without ever reviving a pre-reducer reason.
+
+    An exception, blank return, or non-string return is an invariant failure.
+    The caller must receive an explicit fail-closed reason rather than retain
+    the selector's provisional observation (which may be the false request-
+    level MONEYNESS_OUT_OF_RANGE conclusion this reducer exists to prevent).
+    """
+    fail_closed_reason = "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    try:
+        from ap.selector_retry_policy import resolve_selector_recovery_final_reason
+
+        resolved = resolve_selector_recovery_final_reason(evidence)
+        if not isinstance(resolved, str) or not resolved.strip():
+            raise ValueError(
+                "selector recovery reducer returned an unusable final reason"
+            )
+        return resolved.strip()
+    except Exception:
+        log.exception(
+            "SELECTOR_RECOVERY_REDUCER_FAILED fail_closed_reason=%s",
+            fail_closed_reason,
+        )
+        return fail_closed_reason
+
+
 def _bind_selector_request_diagnostics(plan, ctx: SelectorRequestContext | None) -> None:
     if ctx is None:
         return
@@ -4098,17 +4124,13 @@ class APContractSelectionEngine:
                 ).strip().upper()
                 == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
             ):
-                try:
-                    from ap.selector_retry_policy import (
-                        resolve_selector_recovery_final_reason,
-                    )
-                    _cursor_attempted = dict(
+                _cursor_attempted = dict(
                         (request_context.recovery_cursor or {}).get(
                             "attempted_symbols"
                         )
                         or {}
                     )
-                    _final_reason = resolve_selector_recovery_final_reason({
+                _final_reason = _resolve_deferred_recovery_final_reason_fail_closed({
                         "budget_exhausted_stage": request_context.budget_exhausted_stage,
                         "budget_exhausted_detail": request_context.budget_exhausted_detail,
                         "actual_limit_reached": bool(
@@ -4182,9 +4204,7 @@ class APContractSelectionEngine:
                         "direct_quote_known_eligible_symbols": list(
                             request_context.direct_quote_eligible_symbols
                         ),
-                    })
-                except Exception:
-                    pass
+                })
             _attach_selector_failure(
                 plan,
                 reason_code=_final_reason,

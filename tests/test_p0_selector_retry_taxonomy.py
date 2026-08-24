@@ -67,6 +67,7 @@ SELECTOR_EMITTED_CODES = {
     "CHEAP_CONTRACT_NO_UPGRADE",
     "CHEAP_CONTRACT_ONLY_CHOICE",
     "DELTA_OUT_OF_RANGE",
+    "MONEYNESS_OUT_OF_RANGE",
     "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
     "DIRECT_QUOTE_UNAVAILABLE",
     "DIRECT_QUOTE_ZERO_BID_ASK",
@@ -258,6 +259,53 @@ def test_duplicate_conflict_reason_has_runtime_restart_materializer_parity():
     assert reason in RETRYABLE_BREACH_SELECTOR_REASONS
     assert deferred_materializer.is_reason_retryable(reason) is True
     assert reason in RETRYABLE_MATERIALIZATION_REASONS
+
+
+def test_moneyness_has_terminal_runtime_restart_materializer_parity():
+    """A proven request-level moneyness result is known terminal quality."""
+    from ap import deferred_materializer
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    reason = "MONEYNESS_OUT_OF_RANGE"
+    symbol = "DDOG270101P00150000"
+    policy = get_policy(reason)
+    runtime = _classify_deferred_breach_retry_decision(
+        reason,
+        queue_local_order_id="local-moneyness-parity",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+    restart_reduced = resolve_selector_recovery_final_reason({
+        "structural_skip_records": [
+            {
+                "symbol": symbol,
+                "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            }
+        ],
+        "attempted_results": {},
+        "eligible_unattempted_symbols": [],
+        "direct_quote_known_eligible_symbols": [symbol],
+        "quality_rejections": {},
+        "quality_rejection_records": [],
+    })
+
+    assert policy.classification == TERMINAL_QUALITY
+    assert policy.selector_rerun_allowed is False
+    assert policy.retry_delay_applies is False
+    assert policy.max_attempts_applies is False
+    assert policy.final_reason_code == reason
+    assert policy.queue_facing_reason == "TERMINAL_NO_TRADEABLE_CONTRACT"
+    assert runtime == {
+        "action": "terminal_quality",
+        "reason_code": reason,
+        "retryable_reason": False,
+    }
+    assert restart_reduced == reason
+    assert reason not in RETRYABLE_BREACH_SELECTOR_REASONS
+    assert deferred_materializer.is_reason_retryable(reason) is False
+    assert reason not in RETRYABLE_MATERIALIZATION_REASONS
 
 
 # ═══════════════════════════════════════════════════════════════════════

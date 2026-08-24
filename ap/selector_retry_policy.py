@@ -302,6 +302,13 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
         final_reason_code="DELTA_OUT_OF_RANGE",
         queue_facing_reason="TERMINAL_NO_TRADEABLE_CONTRACT",
     ),
+    "MONEYNESS_OUT_OF_RANGE": SelectorRetryPolicy(
+        classification=TERMINAL_QUALITY,
+        selector_rerun_allowed=False, retain_existing_contract=False,
+        retry_delay_applies=False, max_attempts_applies=False,
+        final_reason_code="MONEYNESS_OUT_OF_RANGE",
+        queue_facing_reason="TERMINAL_NO_TRADEABLE_CONTRACT",
+    ),
     "DTE_OUT_OF_RANGE": SelectorRetryPolicy(
         classification=TERMINAL_QUALITY,
         selector_rerun_allowed=False, retain_existing_contract=False,
