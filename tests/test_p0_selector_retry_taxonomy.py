@@ -68,6 +68,7 @@ SELECTOR_EMITTED_CODES = {
     "CHEAP_CONTRACT_ONLY_CHOICE",
     "DELTA_OUT_OF_RANGE",
     "MONEYNESS_OUT_OF_RANGE",
+    "UNKNOWN_SELECTOR_RECOVERY_FAILURE",
     "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
     "DIRECT_QUOTE_UNAVAILABLE",
     "DIRECT_QUOTE_ZERO_BID_ASK",
@@ -306,6 +307,93 @@ def test_moneyness_has_terminal_runtime_restart_materializer_parity():
     assert reason not in RETRYABLE_BREACH_SELECTOR_REASONS
     assert deferred_materializer.is_reason_retryable(reason) is False
     assert reason not in RETRYABLE_MATERIALIZATION_REASONS
+
+
+def test_selector_recovery_failure_has_invariant_runtime_restart_materializer_parity(
+    monkeypatch,
+):
+    """Reducer invariant failures retain their exact reason at every seam."""
+    from unittest.mock import MagicMock
+
+    import ap.selector_retry_policy as retry_policy
+    from ap import deferred_materializer
+    from ap.contract_selector import (
+        _resolve_deferred_recovery_final_reason_fail_closed,
+    )
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    with monkeypatch.context() as reducer_patch:
+        reducer_patch.setattr(
+            retry_policy,
+            "resolve_selector_recovery_final_reason",
+            lambda _evidence: (_ for _ in ()).throw(
+                RuntimeError("forced recovery reducer invariant failure")
+            ),
+        )
+        reason = _resolve_deferred_recovery_final_reason_fail_closed({
+            "fallback_selector_reason": "MONEYNESS_OUT_OF_RANGE",
+        })
+
+    assert reason == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+
+    policy = get_policy(reason)
+    assert policy.classification == TERMINAL_INVARIANT
+    assert policy.selector_rerun_allowed is False
+    assert policy.retain_existing_contract is False
+    assert policy.retry_delay_applies is False
+    assert policy.max_attempts_applies is False
+    assert policy.final_reason_code == reason
+    assert policy.final_reason_code != _FALLBACK_UNKNOWN.final_reason_code
+    assert policy.queue_facing_reason == "TERMINAL_INVARIANT_VIOLATION"
+
+    runtime = _classify_deferred_breach_retry_decision(
+        reason,
+        queue_local_order_id="local-recovery-invariant",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+    assert runtime == {
+        "action": "terminal_invariant",
+        "reason_code": reason,
+        "retryable_reason": False,
+    }
+
+    restart_reduced = resolve_selector_recovery_final_reason({
+        "attempted_results": {},
+        "structural_skip_records": [],
+        "eligible_unattempted_symbols": [],
+        "direct_quote_known_eligible_symbols": [],
+        "quality_rejections": {},
+        "quality_rejection_records": [],
+        "fallback_selector_reason": reason,
+    })
+    assert restart_reduced == reason
+    assert get_policy(restart_reduced).final_reason_code == reason
+
+    assert is_retryable_selector_reason(reason) is False
+    assert reason not in RETRYABLE_BREACH_SELECTOR_REASONS
+    assert deferred_materializer.is_reason_retryable(reason) is False
+    assert reason not in RETRYABLE_MATERIALIZATION_REASONS
+
+    osm = MagicMock()
+    osm.update_order_meta.return_value = True
+    assert deferred_materializer.stamp_failed_terminal(
+        osm,
+        "local-recovery-invariant",
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+        symbol="SPY",
+        direction="CALL",
+        reason_code=reason,
+        attempt=1,
+        selector_failure={"reason_code": reason},
+    ) is True
+    materializer_patch = osm.update_order_meta.call_args.args[1]
+    assert materializer_patch["materialization_reason"] == reason
+    assert materializer_patch["materialization_status"] == "FAILED_TERMINAL"
+    assert materializer_patch["broker_ready"] is False
 
 
 # ═══════════════════════════════════════════════════════════════════════
