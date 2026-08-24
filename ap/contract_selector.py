@@ -3583,7 +3583,9 @@ class APContractSelectionEngine:
             )
 
         def _record_quality_rejection(opt: dict, reason: str) -> None:
-            """Retain candidate identity alongside aggregate reject counts."""
+            """Retain deferred-recovery candidate identity for final reduction."""
+            if not _deferred_recovery_request:
+                return
             request_context.quality_rejection_records.append({
                 "symbol": opt.get("symbol") or opt.get("contract"),
                 "reason": _normalize_reason_code(reason),
@@ -3593,7 +3595,6 @@ class APContractSelectionEngine:
                 request_context.quality_rejection_records[:] = (
                     request_context.quality_rejection_records[-200:]
                 )
-            _ctx_refresh_diagnostics(request_context)
 
         for opt in _quality_chain:
             _structural_skip_recorded = False
@@ -4038,6 +4039,12 @@ class APContractSelectionEngine:
                     )
                 except Exception:
                     pass  # per-contract quality-filter emit — non-critical
+
+        # Publish the bounded evidence once after the quality pass. Per-row
+        # refreshes repeatedly copied the growing diagnostics payload and leaked
+        # deferred-only candidate evidence into ordinary queue selections.
+        if _deferred_recovery_request:
+            _ctx_refresh_diagnostics(request_context)
 
         _sel_survivors   = len(survivors)
         _sel_rejections  = dict(_rejections)  # snapshot for selector_failure
