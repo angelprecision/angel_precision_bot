@@ -77,6 +77,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
@@ -288,6 +289,7 @@ class APBrokerReconciler:
         interval_sec: int = RECONCILE_INTERVAL_SEC,
         execution_mode: str | None = None,
         supabase_client=None,       # Requirement 1: optional, backward-compatible
+        execution_core=None,
     ):
         self.broker          = broker
         self.client_id       = client_id
@@ -297,6 +299,7 @@ class APBrokerReconciler:
         self._interval       = interval_sec
         self.execution_mode  = _normalize_execution_mode(execution_mode)
         self.supabase_client = supabase_client  # Requirement 2: stored for proof logging
+        self.execution_core  = execution_core
         self._stop       = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
@@ -1182,6 +1185,14 @@ class APBrokerReconciler:
                 )
                 continue
 
+            if (
+                db_status == "PENDING_TRIGGER"
+                and str(order.get("kind") or "").upper() == "ENTRY"
+                and self._has_pending_trigger_submit_evidence(order)
+            ):
+                self._reconcile_pending_trigger_submit_intent(order, summary)
+                continue
+
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
                 self._handle_order_without_broker_id(order, summary)
                 continue
@@ -1256,6 +1267,88 @@ class APBrokerReconciler:
                     )
 
         self._check_ghost_fills(summary)
+
+    @staticmethod
+    def _has_pending_trigger_submit_evidence(order: dict) -> bool:
+        """Keep malformed visible rows on the broker-ownership hold path."""
+        if order.get("submitted_ts") is not None:
+            return True
+
+        raw_meta = order.get("meta")
+        if raw_meta is None:
+            return False
+        if isinstance(raw_meta, str):
+            try:
+                import json as _json
+                raw_meta = _json.loads(raw_meta)
+            except Exception:
+                return True
+        if not isinstance(raw_meta, dict):
+            return True
+
+        submit_intent_at = raw_meta.get("submit_intent_at")
+        if submit_intent_at is None:
+            return False
+        return not isinstance(submit_intent_at, str) or bool(submit_intent_at.strip())
+
+    def _reconcile_pending_trigger_submit_intent(
+        self,
+        order: dict,
+        summary: dict,
+    ) -> None:
+        """Route broker-ambiguous ENTRY rows to the existing core read path."""
+        local_id = str(order.get("local_order_id") or order.get("id") or "").strip()
+        expected_client = str(self.client_id or "").strip().lower()
+        row_client = str(order.get("client_id") or "").strip().lower()
+        row_mode = _normalize_execution_mode(order.get("execution_mode"))
+
+        if not local_id:
+            reason = "RECONCILE_LOCAL_ORDER_ID_MISSING"
+        elif not expected_client or not row_client or row_client != expected_client:
+            reason = "RECONCILE_CLIENT_ID_MISMATCH"
+        elif row_mode is None or row_mode != self.execution_mode:
+            reason = "RECONCILE_EXECUTION_MODE_MISMATCH"
+        else:
+            reconcile = getattr(self.execution_core, "reconcile_deferred_broker_intent", None)
+            if not callable(reconcile):
+                reason = "RECONCILE_EXECUTION_CORE_UNAVAILABLE"
+            else:
+                _core_call_failed = False
+                try:
+                    result = reconcile(local_order_id=local_id)
+                except Exception as exc:
+                    result = None
+                    _core_call_failed = True
+                    reason = f"RECONCILE_CORE_CALL_FAILED:{type(exc).__name__}"
+                if isinstance(result, dict):
+                    disposition = str(result.get("disposition") or "").strip().upper()
+                    result_status = str(result.get("status") or "").strip().upper()
+                    if disposition in {"ALREADY_RECONCILED", "SUBMITTED"}:
+                        if result_status and result_status != "SUBMITTED":
+                            reason = "RECONCILE_CORE_TERMINAL_STATUS_UNAUTHORIZED"
+                        else:
+                            return
+                    else:
+                        reason = str(
+                            result.get("reason_code")
+                            or disposition
+                            or "RECONCILE_CORE_RESULT_MALFORMED"
+                        )
+                elif result is not None:
+                    reason = "RECONCILE_CORE_RESULT_MALFORMED"
+                elif not _core_call_failed:
+                    reason = "RECONCILE_CORE_RESULT_MALFORMED"
+
+        summary.setdefault("errors", []).append(
+            f"pending_trigger_submit_intent_hold:{reason}"
+        )
+        summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+        log.warning(
+            "[%s] PENDING_TRIGGER broker-submit intent held | order=%s | reason=%s",
+            self.client_id,
+            local_id or "?",
+            reason,
+        )
 
     def _resolve_missing_id_exit_truth(self, order: dict, summary: dict, *, reason: str = "") -> bool:
         """Resolve an EXIT order that has no broker_order_id into exactly one safe endpoint.
@@ -2854,18 +2947,101 @@ class APBrokerReconciler:
             or c_sym
         )
 
-    def _broker_position_qty(self, bp: dict) -> int:
-        raw = (
-            bp.get("quantity")
-            or bp.get("qty")
-            or bp.get("long_quantity")
-            or bp.get("short_quantity")
-            or 0
-        )
+    def _broker_position_qty(self, bp: dict) -> Optional[int]:
+        """Extract a POSITIVE AP long quantity from a broker position row,
+        or None if this row does not establish valid positive long
+        exposure.
+
+        P0 (post-#481 final narrow merge-gate amendment): #481 correctly
+        allows legitimate signed broker quantities to pass through
+        ap/brokers/tradier.py::TradierBroker.list_positions() unmodified
+        -- negative quantity is real signed broker data (a short
+        position), not malformed payload. This reconciler function
+        previously used ``abs(int(float(raw)))``, which silently flipped
+        a negative (short) broker quantity into a POSITIVE value --
+        e.g. broker qty=-1 became reconciler qty=+1. That positive value
+        could then be treated as ordinary AP long exposure: imported as a
+        new AP long when the DB position was missing, or silently
+        "matched" against an existing DB OPEN long as though the broker
+        confirmed the same direction of exposure. A short broker position
+        must NEVER become ordinary AP long exposure.
+
+        Returns:
+          - a positive int for a valid, non-boolean, finite, integral,
+            strictly-positive quantity found under "quantity" / "qty" /
+            "long_quantity" (checked in that priority order, using an
+            explicit ``is not None`` check so an authoritative explicit
+            0 is not skipped past toward a different field).
+          - None for: field absent entirely; negative quantity (signed-
+            direction conflict -- never coerced via abs()); explicit
+            zero (not positive long authority); boolean (bool is a
+            numeric subtype in Python -- float(True) == 1.0 -- and must
+            never masquerade as a real quantity); fractional/non-integral
+            quantity (not a valid whole-contract/share count for AP's
+            option lifecycle); non-finite (NaN/inf); or unparseable
+            values. None is deliberately never coerced to a bare ``0``
+            either, since a bare 0 returned here could later be
+            misread by a caller as "confirmed flat" rather than
+            "malformed/conflicting truth" -- callers must treat None as
+            "this row does not establish positive long exposure" and
+            handle it as an explicit conflict/hold, not as authoritative
+            flatness.
+
+        Note: ``short_quantity`` is deliberately EXCLUDED from the
+        extraction fallback chain. That field represents a magnitude of
+        SHORT exposure, not a positive long quantity -- treating it as a
+        fallback source for "the" quantity would have the exact same
+        wrong-direction effect this fix exists to prevent, even without
+        any sign-flip arithmetic involved.
+        """
+        raw = None
+        for key in ("quantity", "qty", "long_quantity"):
+            val = bp.get(key)
+            if val is not None:
+                raw = val
+                break
+        if raw is None:
+            return None
+        if isinstance(raw, bool):
+            return None
         try:
-            return abs(int(float(raw)))
-        except Exception:
-            return 0
+            qty_float = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(qty_float):
+            return None
+        if not qty_float.is_integer():
+            return None
+        qty = int(qty_float)
+        if qty <= 0:
+            return None
+        return qty
+
+    def _broker_position_qty_is_negative(self, bp: dict) -> bool:
+        """True only if this row carries a cleanly parseable, non-boolean,
+        finite quantity that is strictly negative. Used exclusively to
+        distinguish an explicit signed-direction conflict (worth its own
+        alert) from a merely absent/zero/malformed quantity (which
+        _broker_position_qty() already reduces to the same None as a
+        negative value, but which does not warrant the same "this is a
+        short position" alert wording). Does not affect
+        _broker_position_qty()'s return contract.
+        """
+        raw = None
+        for key in ("quantity", "qty", "long_quantity"):
+            val = bp.get(key)
+            if val is not None:
+                raw = val
+                break
+        if raw is None or isinstance(raw, bool):
+            return False
+        try:
+            qty_float = float(raw)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(qty_float):
+            return False
+        return qty_float < 0
 
     def _broker_position_entry_price(self, bp: dict) -> float:
         """
@@ -2886,7 +3062,11 @@ class APBrokerReconciler:
         try:
             qty        = self._broker_position_qty(bp)
             cost_basis = float(bp.get("cost_basis") or bp.get("costbasis") or 0)
-            if qty > 0 and cost_basis > 0:
+            # qty may now be None (signed/malformed quantity does not
+            # establish positive long exposure) rather than always a
+            # plain int -- check truthiness explicitly rather than `> 0`
+            # to avoid comparing None to an int.
+            if qty and cost_basis > 0:
                 return abs(cost_basis) / qty / 100.0
         except Exception:
             pass
@@ -3021,9 +3201,25 @@ class APBrokerReconciler:
         for bp in broker_positions:
             c_sym = self._broker_position_contract(bp)
             u_sym = self._broker_position_underlying(bp)
-            qty   = self._broker_position_qty(bp)
-            if qty <= 0:
-                continue
+            # P0 (post-#481 final narrow merge-gate amendment): row
+            # PRESENCE tracking for DB-comparison purposes must not be
+            # gated on qty validity here. Previously this loop skipped
+            # any row whose (abs()'d) quantity was <= 0, which -- now
+            # that _broker_position_qty() correctly returns None instead
+            # of a wrong-signed positive value for a negative/malformed
+            # quantity -- would have caused a genuinely conflicting
+            # broker row (e.g. a short position reported for a contract
+            # this DB believes is an open long) to be excluded from
+            # broker_by_contract entirely. That exclusion would make the
+            # DB-comparison loop below treat the position as "broker
+            # position missing" and route it toward the ghost-close /
+            # flat-conclusion pathway (_handle_db_position_missing_at_
+            # broker) instead of surfacing it as the explicit
+            # signed-direction conflict it actually is. Quantity validity
+            # is now assessed downstream, per-comparison, where a None
+            # result is handled as an explicit conflict/hold -- not here,
+            # where it would be silently indistinguishable from "no
+            # broker row for this contract at all".
             if c_sym:
                 broker_by_contract[c_sym] = bp
             if u_sym:
@@ -3085,6 +3281,72 @@ class APBrokerReconciler:
             if broker_pos is not None:
                 self._ghost_tracker.pop(contract, None)
                 broker_qty = self._broker_position_qty(broker_pos)
+                if broker_qty is None:
+                    # P0 (post-#481 final narrow merge-gate amendment): the
+                    # broker DOES have a row for this exact contract, but it
+                    # does not establish valid positive AP long exposure --
+                    # a negative (short) quantity, explicit zero, boolean,
+                    # fractional, non-finite, or unparseable value. This
+                    # must NEVER be silently treated as "matches DB qty"
+                    # (the old abs()-based code could make a short position
+                    # look like a perfectly matching long), and must NEVER
+                    # be treated as "broker position missing" either (that
+                    # would route toward the ghost-close / flat-conclusion
+                    # pathway). Surface it as an explicit signed-direction
+                    # conflict and hold: no flat conclusion, no synthetic
+                    # long re-import, no ordinary SELL_TO_CLOSE authority
+                    # derived from this broker row. The exit engine keeps
+                    # tracking the EXISTING DB-open position unchanged --
+                    # this is not a new import, just continued management.
+                    # P0 (final signed-direction quarantine correction):
+                    # calling _seed_exit_engine_from_position(pos) here was
+                    # NOT a safe hold. It constructs/refreshes a normal,
+                    # behavior-active ManagedPosition -- APExitEngine's
+                    # on_exit/on_scale machinery treats a normal positive
+                    # ManagedPosition as eligible for ordinary ordinary
+                    # SELL_TO_CLOSE lifecycle regardless of what this
+                    # reconciler pass just logged. A logged conflict alert
+                    # does not, by itself, stop the exit engine from acting
+                    # on a position it already believes is a normal long.
+                    #
+                    # Do NOT call _seed_exit_engine_from_position here.
+                    # Additionally, if a ManagedPosition for this position_id
+                    # ALREADY exists in the exit engine (e.g. seeded on a
+                    # prior reconciler pass before this conflict was first
+                    # detected, or adopted at startup), it must be made
+                    # behavior-inactive now -- merely skipping a NEW seed
+                    # call is insufficient if a normal active object is
+                    # already sitting in the engine's position table.
+                    #
+                    # Reuse the existing, already-battle-tested
+                    # adoption-identity-quarantine primitive
+                    # (_is_behavior_active_position /
+                    # _mark_adoption_identity_quarantined in
+                    # ap_exit_engine.py) rather than inventing a new
+                    # subsystem: it already gates on_exit/on_scale
+                    # eligibility via active_positions()'s
+                    # _is_behavior_active_position() filter, does not
+                    # submit/cancel anything itself, does not mark the
+                    # position flat, and does not create a new position.
+                    if self.exit_engine and hasattr(self.exit_engine, "get_position"):
+                        try:
+                            _existing_mp = self.exit_engine.get_position(pos_id)
+                        except Exception:
+                            _existing_mp = None
+                        if _existing_mp is not None:
+                            from ap_exit_engine import _mark_adoption_identity_quarantined as _quarantine_mp
+                            _quarantine_mp(_existing_mp, "BROKER_POSITION_QTY_SIGNED_CONFLICT")
+                            log.warning(
+                                "[%s] BROKER_POSITION_QTY_SIGNED_CONFLICT_QUARANTINE | %s | "
+                                "existing ManagedPosition %s marked behavior-inactive due to "
+                                "signed-direction conflict with exact broker quantity",
+                                self.client_id, contract, pos_id,
+                            )
+                    summary["positions_alerted"] += 1
+                    summary.setdefault("errors", []).append(
+                        "broker_position_signed_conflict_quarantined"
+                    )
+                    continue
                 if broker_qty != db_qty and db_qty > 0:
                     log.warning(
                         "[%s] POSITION_QTY_MISMATCH | %s | DB=%d broker=%d",
@@ -3190,7 +3452,26 @@ class APBrokerReconciler:
                 continue
 
             qty = self._broker_position_qty(bp)
-            if qty <= 0:
+            if not qty:
+                # P0 (post-#481 final narrow merge-gate amendment): qty is
+                # None for negative/zero/boolean/fractional/non-finite/
+                # unparseable broker quantity -- never a wrong-signed
+                # positive value (no more abs()). A negative broker
+                # quantity must NEVER be imported as a new AP long
+                # position. Surface the negative case explicitly as a
+                # signed-direction conflict rather than silently skipping
+                # it identically to a merely absent/zero quantity.
+                if self._broker_position_qty_is_negative(bp):
+                    log.warning(
+                        "[%s] BROKER_POSITION_QTY_SIGNED_CONFLICT | %s | broker "
+                        "reports a negative/short quantity for a position missing "
+                        "from DB — NOT importing as an AP long position "
+                        "(signed-direction conflict, hold)",
+                        self.client_id, contract,
+                    )
+                    summary.setdefault("errors", []).append(
+                        "broker_position_signed_conflict_not_imported"
+                    )
                 continue
 
             from zoneinfo import ZoneInfo as _ZoneInfo
@@ -4209,7 +4490,13 @@ class APBrokerReconciler:
                             str(bp.get("symbol") or bp.get("contract") or "")
                         )
                         qty = self._broker_position_qty(bp)
-                        if sym and qty > 0:
+                        # qty is None (not 0) for negative/malformed
+                        # quantity -- `qty > 0` would raise on None, so
+                        # check truthiness explicitly. A negative/
+                        # malformed broker quantity must not populate
+                        # broker_open_by_contract as though it confirmed
+                        # positive remaining exposure.
+                        if sym and qty:
                             broker_open_by_contract[sym] = qty
                     broker_truth_available = True
             except Exception as _bpe:
