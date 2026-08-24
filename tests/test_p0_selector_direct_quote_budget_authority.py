@@ -616,6 +616,11 @@ class TestSelectorIntegration:
         assert diagnostics["direct_quote_budget"]["used"] == broker.get_quote.call_count
         assert diagnostics["direct_quote_budget"]["remaining"] == 20 - broker.get_quote.call_count
         assert diagnostics["direct_quote_candidate_ranking"][8]["symbol"] == expected_symbol
+        # Recovery-reducer evidence is deferred-breach-only. Ordinary success
+        # must not grow or persist a per-candidate rejection payload.
+        assert diagnostics["selector_request_kind"] == "ORDINARY"
+        assert diagnostics["quality_rejection_records"] == []
+        assert diagnostics["quality_rejection_records_overflowed"] is False
 
     def test_no_survivor_selector_replay_terminates_budget_exhausted_but_keeps_row_reasons(self, monkeypatch):
         # ORDINARY selector requests MUST NOT adopt recovery-only final reasons
@@ -647,6 +652,11 @@ class TestSelectorIntegration:
         assert diagnostics["direct_quote_budget"]["remaining"] == 0
         assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
         assert "SELECTOR_REQUEST_BUDGET_EXHAUSTED" not in failure["top_reject_buckets"]
+        # Ordinary failure diagnostics preserve aggregate reason truth without
+        # collecting deferred-recovery candidate evidence.
+        assert diagnostics["selector_request_kind"] == "ORDINARY"
+        assert diagnostics["quality_rejection_records"] == []
+        assert diagnostics["quality_rejection_records_overflowed"] is False
 
     @pytest.mark.parametrize(
         ("name", "chain_overrides", "quote", "plan_overrides", "expected_reason"),
@@ -1145,16 +1155,10 @@ class TestJuly23FleetAcceptanceReplay:
                 if selected is None:
                     failure = plan["metadata"]["selector_failure"]
                     diagnostics = failure["selection_diagnostics"]
-                    assert failure["reason_code"] in {
-                        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
-                        "CHAIN_ROW_ZERO_BID_ASK",
-                        "DIRECT_QUOTE_ZERO_BID_ASK",
-                        "MONEYNESS_OUT_OF_RANGE",
-                        "DELTA_OUT_OF_RANGE",
-                        "DTE_OUT_OF_RANGE",
-                        "NO_AFFORDABLE_CONTRACT",
-                        "PREMIUM_CAP_EXCEEDED",
-                    }
+                    assert (
+                        failure["reason_code"]
+                        == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                    ), f"{ticker} {label} reason precedence drifted"
                     assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
                     assert (
                         "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
