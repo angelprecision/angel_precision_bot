@@ -44,7 +44,6 @@ PR: hotfix/p0-direct-option-quote-revalidation
 """
 from __future__ import annotations
 
-import math
 import os
 import time
 import logging
@@ -60,10 +59,35 @@ except Exception:  # pragma: no cover — defensive
 
 log = logging.getLogger("angel.contract_quote_revalidator")
 
-# Legacy compatibility export only. It is deliberately fixed and is not read
-# from CONTRACT_REVALIDATE_TOP_N; selector request contexts use the canonical
-# SELECTOR_MAX_DIRECT_QUOTE_CALLS resolver instead.
-DEFAULT_REVALIDATE_TOP_N = 5
+# ── Configuration ───────────────────────────────────────────────────────────
+# Top N candidate option symbols to fetch direct quotes for when chain rows
+# look bad.  Keeping this small keeps the Tradier rate-limit budget bounded.
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "DIRECT_QUOTE_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int default=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if value <= 0:
+        log.warning(
+            "DIRECT_QUOTE_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int default=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
+# Compatibility diagnostic only.  The behavioral request cap is owned by
+# SELECTOR_MAX_DIRECT_QUOTE_CALLS in contract_selector.
+DEFAULT_REVALIDATE_TOP_N = _positive_int_env("CONTRACT_REVALIDATE_TOP_N", 5)
 
 # Per-transport/per-symbol cache so a single selector pass doesn't double-fetch.
 # Cleared per process; tests can reset by calling clear_quote_cache().
@@ -215,9 +239,6 @@ def _ctx_update_sink(request_context) -> None:
             "remaining": remaining,
             "conflict": bool(getattr(request_context, "direct_quote_budget_conflict", False)),
             "conflict_detail": getattr(request_context, "direct_quote_budget_conflict_detail", None),
-            "invalid_explicit_keys": list(
-                getattr(request_context, "direct_quote_budget_invalid_explicit_keys", ())
-            ),
         })
     sink["direct_quote_attempted_symbols"] = list(getattr(request_context, "direct_quote_attempted_symbols", []) or [])
     sink["direct_quote_unattempted_count"] = int(getattr(request_context, "direct_quote_unattempted_count", 0) or 0)
@@ -525,19 +546,12 @@ def _empty_quote_failure() -> dict:
 
 def _normalize_quote(raw: dict, fetched_at: float, latency_ms: int) -> dict:
     def _f(v):
-        if isinstance(v, bool):
-            return None
         try:
-            parsed = float(v) if v is not None else None
+            return float(v) if v is not None else None
         except (TypeError, ValueError):
             return None
-        if parsed is not None and not math.isfinite(parsed):
-            return None
-        return parsed
 
     def _i(v):
-        if isinstance(v, bool):
-            return None
         try:
             return int(v) if v is not None else None
         except (TypeError, ValueError):
@@ -726,11 +740,7 @@ def fetch_direct_option_quote_with_meta(
     latency_ms = int((_now() - t0) * 1000)
     _ctx_add_stage_ms(request_context, "direct_quote", latency_ms)
     quote = _normalize_quote(raw, t0, latency_ms)
-    if quote_is_cache_eligible(quote):
-        _QUOTE_CACHE[cache_key] = (t0, quote)
-    else:
-        # A forced refresh must not leave an older observation authoritative.
-        _QUOTE_CACHE.pop(cache_key, None)
+    _QUOTE_CACHE[cache_key] = (t0, quote)
 
     if quote.get("_quote_payload_empty"):
         return _empty_quote_failure()
@@ -787,41 +797,28 @@ def fetch_direct_option_quote(
 
     latency_ms = int((_now() - t0) * 1000)
     out = _normalize_quote(raw, t0, latency_ms)
-    if quote_is_cache_eligible(out):
-        _QUOTE_CACHE[cache_key] = (t0, out)
-    else:
-        # A forced refresh must not leave an older observation authoritative.
-        _QUOTE_CACHE.pop(cache_key, None)
+    _QUOTE_CACHE[cache_key] = (t0, out)
     return out
-
-
-def _strict_finite_positive(value) -> Optional[float]:
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(parsed) or parsed <= 0:
-        return None
-    return parsed
-
-
-def quote_is_cache_eligible(quote: Optional[dict]) -> bool:
-    """Return True only for finite, positive, uncrossed bid/ask observations."""
-    if not quote:
-        return False
-    bid = _strict_finite_positive(quote.get("bid"))
-    ask = _strict_finite_positive(quote.get("ask"))
-    return bid is not None and ask is not None and ask >= bid
 
 
 def direct_quote_is_valid(quote: Optional[dict]) -> bool:
     """
-    Hard validity check for a direct quote: finite bid > 0, finite ask > 0,
-    and ask >= bid. Boolean prices are rejected.
+    Hard validity check for a direct quote: bid > 0 AND ask > 0 AND ask >= bid.
     """
-    return quote_is_cache_eligible(quote)
+    if not quote:
+        return False
+    bid = quote.get("bid")
+    ask = quote.get("ask")
+    if bid is None or ask is None:
+        return False
+    try:
+        if float(bid) <= 0 or float(ask) <= 0:
+            return False
+        if float(ask) < float(bid):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def revalidate_with_direct_quote(
