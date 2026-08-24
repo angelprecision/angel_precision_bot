@@ -107,15 +107,19 @@ def test_matching_working_order_is_adopted_and_monitor_owned_without_post():
     core.broker.place_order.assert_not_called()
 
 
-def test_matching_fill_advances_through_existing_state_machine():
+def test_matching_fill_stops_at_submitted_for_fill_monitor():
     core = _core()
     core.order_state_machine.get_order.return_value = _row(crash=True)
     core.order_state_machine.transition.return_value = True
     core.broker.list_orders.return_value = [_remote("filled", exec_quantity=1, avg_fill_price=2.08)]
     result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
-    assert result["status"] == "FILLED"
-    assert core.order_state_machine.transition.call_count == 2
-    assert core.order_state_machine.transition.call_args.args[:2] == ("oid-1", "FILLED")
+    assert result["status"] == "SUBMITTED"
+    assert core.order_state_machine.transition.call_count == 1
+    assert core.order_state_machine.transition.call_args.args[:2] == ("oid-1", "SUBMITTED")
+    assert "filled_qty" not in core.order_state_machine.transition.call_args.kwargs
+    assert "fill_price" not in core.order_state_machine.transition.call_args.kwargs
+    assert "filled_qty" not in core.order_state_machine.update_order_meta.call_args.args[1]
+    assert "fill_price" not in core.order_state_machine.update_order_meta.call_args.args[1]
     core.broker.place_order.assert_not_called()
 
 

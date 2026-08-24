@@ -378,16 +378,6 @@ def classify_late_attachment(
     trigger = _safe_decimal(trigger_price)  # non-None (allowed already computed)
 
     quote_result = _canonical_trigger_quote(side=normalized_side, bid=bid, ask=ask)
-    if not quote_result.available or quote_result.value is None:
-        return LateAttachmentDecision(
-            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
-            allowed_continuation=allowed,
-            quote=None,
-            quote_source=quote_result.source,
-            detail=quote_result.reason_code,
-        )
-
-    canonical_quote = quote_result.value
 
     # A stop is not an entry-trigger substitute.  Before a CONFIRMED durable
     # breach, the opposite-side stop geometry is dormant; a wide spread must
@@ -401,6 +391,20 @@ def classify_late_attachment(
     # that same invariant.  Only the STOP EVALUATION block is gated; other
     # classifications (WITHIN_CONTINUATION, WAITING_RESET, pre-trigger
     # ordinary-breach) still flow.
+    #
+    # PR #479 second amendment (P0 ordering fix #2): this block MUST run
+    # ahead of the canonical (entry-side) quote-availability check below.
+    # _evaluate_stop() reads the OPPOSITE side from the entry-side lane
+    # (CALL stop uses bid, PUT stop uses ask) and is therefore independently
+    # provable even when the entry-side quote (ASK for CALL, BID for PUT)
+    # is unavailable. Previously, an unavailable entry-side quote returned
+    # TRIGGER_TRUTH_UNAVAILABLE_RETRY unconditionally before this block ever
+    # ran, which meant a confirmed setup (trigger_previously_breached=True)
+    # sitting in late-attachment state could have its already-broken stop go
+    # completely unobserved for as long as the entry-side quote stayed
+    # missing -- the exact class of stale/junk-entry risk PR #407/#414 exist
+    # to prevent. Stop-broken proof must always win, regardless of whether
+    # the entry-side quote happens to be present on this poll.
     _stop_active = trigger_previously_breached is True
     if _stop_active:
         _stop_state = _evaluate_stop(normalized_side, stop, bid=bid, ask=ask)
@@ -410,10 +414,25 @@ def classify_late_attachment(
             return LateAttachmentDecision(
                 classification=STOP_ALREADY_BROKEN_TERMINAL,
                 allowed_continuation=allowed,
-                quote=canonical_quote,
+                quote=quote_result.value,
                 quote_source=quote_result.source,
                 detail=f"stop_broken_at_{_stop_source}={_stop_value}",
             )
+    else:
+        _stop_state = _STOP_NO_STOP  # unused sentinel; stop is dormant pre-confirmation
+
+    if not quote_result.available or quote_result.value is None:
+        return LateAttachmentDecision(
+            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+            allowed_continuation=allowed,
+            quote=None,
+            quote_source=quote_result.source,
+            detail=quote_result.reason_code,
+        )
+
+    canonical_quote = quote_result.value
+
+    if _stop_active:
         if _stop_state == _STOP_UNKNOWN:
             # Valid stop exists but the STOP-SIDE quote is missing (CALL:
             # bid=0; PUT: ask=0). We cannot prove the stop is safe, so we
@@ -429,7 +448,8 @@ def classify_late_attachment(
                 quote_source=quote_result.source,
                 detail=f"stop_side_quote_unavailable_{normalized_side}",
             )
-    # Dormant stop path: fall through to WITHIN / WAITING / pre-trigger
+    # Dormant stop path (or stop confirmed NOT broken): fall through to
+    # WITHIN / WAITING / pre-trigger
     # classification below.  The watcher's own check() owns breach counting
     # and only issues durable trigger_crossed_at after confirmation.
 

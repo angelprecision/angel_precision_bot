@@ -1123,9 +1123,16 @@ class APOrderStateMachine:
             f"WHERE local_order_id=%s AND client_id=%s AND status=%s"
         )
         if broker_order_id:
-            # Never replace a different durable broker identity.  Empty/equal
-            # are the only idempotent acceptance states.
-            sql += " AND (broker_order_id IS NULL OR broker_order_id='' OR broker_order_id=%s)"
+            # Never replace a different durable broker identity.  Blank and
+            # legacy placeholder IDs are not durable identity, so an exact
+            # broker reconciliation may atomically replace them.
+            sql += (
+                " AND (broker_order_id IS NULL"
+                " OR BTRIM(COALESCE(broker_order_id,''))=''"
+                " OR UPPER(BTRIM(COALESCE(broker_order_id,''))) IN ("
+                "'N/A','NA','NONE','NULL','PENDING','UNKNOWN','ERROR','0','FALSE')"
+                " OR broker_order_id=%s)"
+            )
             params.append(str(broker_order_id))
         if (
             kind.upper() == "ENTRY"
@@ -4146,12 +4153,18 @@ class APOrderStateMachine:
         def _terminalize():
             with conn() as c:
                 cur = c.execute(
+                    # Reassert the broker-ownership boundary at write time.
+                    # Recovery classifies rows from an earlier snapshot; a
+                    # submit intent committed after that read must turn this
+                    # into a CAS miss, never a terminal write.
                     "UPDATE orders SET status=%s, last_error=%s, "
                     "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, updated_ts=NOW() "
                     "WHERE local_order_id=%s AND client_id=%s AND kind='ENTRY' "
                     "AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
                     "AND (broker_order_id IS NULL OR broker_order_id='') "
-                    "AND submitted_ts IS NULL" + _where_owner,
+                    "AND submitted_ts IS NULL "
+                    "AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NULL"
+                    + _where_owner,
                     tuple(_params),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)

@@ -24,6 +24,7 @@ import uuid
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from typing import Mapping, Optional
 from types import MappingProxyType, SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -47,11 +48,38 @@ except ImportError:
 log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+_BROKER_ID_PLACEHOLDERS = frozenset(
+    {"N/A", "NA", "NONE", "NULL", "PENDING", "UNKNOWN", "ERROR", "0", "FALSE"}
+)
 
 
 def _normalize_execution_mode(value) -> str | None:
     mode = str(value or "").strip().lower()
     return mode if mode in _VALID_EXECUTION_MODES else None
+
+
+def _strict_positive_integral(value) -> int | None:
+    """Parse a broker/DB quantity without lossy coercion."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, Decimal):
+        if not value.is_finite() or value != value.to_integral_value():
+            return None
+        parsed = int(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        parsed = int(value)
+    elif isinstance(value, str):
+        normalized = value.strip()
+        if not re.fullmatch(r"\d+", normalized):
+            return None
+        parsed = int(normalized)
+    else:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_flag) -> str | None:
@@ -80,6 +108,28 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
     return None
 ET  = ZoneInfo("America/New_York")
 _OCC_CONTRACT_RE = re.compile(r"\d{6}[CP]\d{5,8}")
+_RECONCILE_OCC_SUFFIX_RE = re.compile(r"\d{6}[CP]\d{8}")
+_RECONCILE_OCC_ROOT_RE = re.compile(r"[A-Z][A-Z0-9.\-]{0,9}")
+
+
+def _is_exact_reconcile_occ_contract(contract_symbol: str, ticker: str = "") -> bool:
+    """Validate the full contract identity used by broker adoption."""
+    contract = str(contract_symbol or "").strip().upper()
+    ticker_upper = str(ticker or "").strip().upper()
+    if not contract or contract.startswith("DEFERRED:"):
+        return False
+    if ticker_upper:
+        if not _RECONCILE_OCC_ROOT_RE.fullmatch(ticker_upper):
+            return False
+        if not contract.startswith(ticker_upper):
+            return False
+        return bool(_RECONCILE_OCC_SUFFIX_RE.fullmatch(contract[len(ticker_upper):]))
+    return bool(
+        re.fullmatch(
+            rf"{_RECONCILE_OCC_ROOT_RE.pattern}{_RECONCILE_OCC_SUFFIX_RE.pattern}",
+            contract,
+        )
+    )
 
 
 def _validate_deferred_selector_result(selection, ticker: str = "") -> tuple[bool, str, float, int]:
@@ -2483,6 +2533,8 @@ class APExecutionCore:
 
         # ── Durable state: already submitted (belt-and-suspenders) ──
         broker_order_id = str(row.get("broker_order_id") or "").strip()
+        if broker_order_id.upper() in _BROKER_ID_PLACEHOLDERS:
+            broker_order_id = ""
         submitted_ts = row.get("submitted_ts")
         if broker_order_id or submitted_ts:
             return _keep("RECOVERY_ALREADY_SUBMITTED")
@@ -3398,9 +3450,8 @@ class APExecutionCore:
         result is strongly checked against contract, side and quantity before
         an existing order is adopted. Ambiguity remains fail-closed.
 
-          * ALREADY_RECONCILED — broker_order_id already present; the
-            order monitor owns the row.  (Defensive; the recovery load
-            filter normally excludes these.)
+          * ALREADY_RECONCILED — the broker identity is already durable or
+            an exact broker match was adopted; the order monitor owns the row.
           * NOT_IN_CRASH_WINDOW — no submit_intent_at; the row never
             reached the broker-submit boundary and is safe for the normal
             resume path.
@@ -3437,73 +3488,217 @@ class APExecutionCore:
         if not isinstance(row, dict):
             return _keep("RECONCILE_ROW_MISSING")
 
-        # Identity: client_id (never touch another client's row)
+        # Identity: client_id (never touch another client's row).  The
+        # reconciler caller supplies the exact client/mode fence; this method
+        # still rejects any asserted mismatch before reading broker orders.
+        row_local_order_id = str(
+            row.get("local_order_id") or row.get("id") or ""
+        ).strip()
+        requested_local_order_id = str(local_order_id or "").strip()
+        if not requested_local_order_id or (
+            row_local_order_id and row_local_order_id != requested_local_order_id
+        ):
+            return _keep("RECONCILE_LOCAL_ORDER_ID_MISMATCH")
+
         row_client_id = str(row.get("client_id") or "").strip().lower()
         expected_client_id = str(self.client_id or self.email or "").strip().lower()
         if row_client_id and expected_client_id and row_client_id != expected_client_id:
             return _keep("RECONCILE_CLIENT_ID_MISMATCH")
         row_mode = str(row.get("execution_mode") or "").strip().lower()
-        expected_mode = str(getattr(self, "execution_mode", None) or getattr(self, "mode", None) or "").strip().lower()
+        expected_mode = str(
+            getattr(self, "execution_mode", None)
+            or getattr(self, "mode", None)
+            or ""
+        ).strip().lower()
         if row_mode and expected_mode and row_mode != expected_mode:
             return _keep("RECONCILE_EXECUTION_MODE_MISMATCH")
-
         broker_order_id = str(row.get("broker_order_id") or "").strip()
-        meta = row.get("meta") or {}
-        if isinstance(meta, str):
+        if broker_order_id.upper() in _BROKER_ID_PLACEHOLDERS:
+            broker_order_id = ""
+        raw_meta = row.get("meta")
+        if raw_meta is None:
+            meta = {}
+        elif isinstance(raw_meta, dict):
+            meta = raw_meta
+        elif isinstance(raw_meta, str):
             try:
-                meta = json.loads(meta)
+                meta = json.loads(raw_meta)
             except Exception:
-                meta = {}
-        meta = meta or {}
+                return _keep("RECONCILE_META_MALFORMED")
+            if not isinstance(meta, dict):
+                return _keep("RECONCILE_META_MALFORMED")
+        else:
+            return _keep("RECONCILE_META_MALFORMED")
+
         submit_intent_at = meta.get("submit_intent_at")
+        submitted_ts = row.get("submitted_ts")
         broker_submit_key = meta.get("broker_submit_key")
         _base["submit_intent_at"] = submit_intent_at
         _base["broker_submit_key"] = broker_submit_key
 
-        # ── Already has a broker order → adopted, not our concern ────
+        if str(row.get("kind") or "").strip().upper() != "ENTRY":
+            return _keep("RECONCILE_KIND_MISMATCH")
+
+        # A real durable broker id is already broker identity evidence.  Repair
+        # only the local lifecycle boundary so fill_monitor can own the next
+        # broker transition; never infer fills or terminal truth here.
         if broker_order_id:
+            if str(row.get("status") or "").strip().upper() == "PENDING_TRIGGER":
+                if not osm.transition(
+                    local_order_id,
+                    "SUBMITTED",
+                    broker_order_id=broker_order_id,
+                    submitted_ts=now_utc_iso(),
+                ):
+                    return _keep("RECONCILE_ADOPTION_TRANSITION_FAILED")
             return {
                 **_base,
                 "disposition": "ALREADY_RECONCILED",
                 "reason_code": "RECONCILE_BROKER_ORDER_PRESENT",
                 "broker_order_id": broker_order_id,
+                "status": "SUBMITTED",
             }
 
-        # ── No submit intent → not a crash-window row ────────────────
-        if not submit_intent_at:
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return _keep("RECONCILE_STATUS_MISMATCH")
+
+        # A durable submit timestamp is also broker-ownership evidence.  Empty
+        # strings are not valid evidence; any non-string value is retained for
+        # diagnostics and treated as present so it cannot reach a POST path.
+        submit_intent_present = (
+            submitted_ts is not None
+            or (
+                submit_intent_at is not None
+                and (
+                    not isinstance(submit_intent_at, str)
+                    or bool(submit_intent_at.strip())
+                )
+            )
+        )
+        if submit_intent_at is not None and not isinstance(submit_intent_at, str):
+            return _keep("RECONCILE_SUBMIT_INTENT_MALFORMED")
+        if not submit_intent_present:
             return {
                 **_base,
                 "disposition": "NOT_IN_CRASH_WINDOW",
                 "reason_code": "RECONCILE_NO_SUBMIT_INTENT",
             }
 
+        if not isinstance(broker_submit_key, str) or not broker_submit_key.strip():
+            return _keep("RECONCILE_SUBMIT_KEY_MISSING")
+        tag = canonical_broker_submit_key(broker_submit_key)
+        if not tag:
+            return _keep("RECONCILE_SUBMIT_KEY_MALFORMED")
+        expected_submit_tag = canonical_broker_submit_key(requested_local_order_id)
+        if tag != expected_submit_tag:
+            return _keep("RECONCILE_SUBMIT_KEY_LOCAL_ORDER_MISMATCH")
+
         broker = getattr(self, "broker", None)
         list_orders = getattr(broker, "list_orders", None)
         if not callable(list_orders):
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_BROKER_QUERY_UNAVAILABLE"}
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_BROKER_QUERY_UNAVAILABLE",
+            }
         try:
             broker_orders = list_orders()
         except Exception as exc:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}"}
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}",
+            }
+        if not isinstance(broker_orders, list) or any(
+            not isinstance(order, dict) for order in broker_orders
+        ):
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_BROKER_LIST_MALFORMED",
+            }
+        if not broker_orders:
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD",
+            }
 
-        tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
-        exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
-        expected_contract = str(row.get("contract") or "")
-        expected_qty = int(row.get("qty") or 0)
-        strong = [
-            o for o in exact_tag
-            if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
-            and str(o.get("side") or "").lower() == "buy_to_open"
-            and int(float(o.get("quantity") or 0)) == expected_qty
+        expected_contract = str(row.get("contract") or "").strip()
+        expected_ticker = str(
+            row.get("symbol") or row.get("ticker") or ""
+        ).strip()
+        if not _is_exact_reconcile_occ_contract(expected_contract, expected_ticker):
+            return _keep("RECONCILE_CONTRACT_MALFORMED")
+        selected_contract = meta.get("selected_contract")
+        if selected_contract is not None and str(selected_contract).strip() != expected_contract:
+            return _keep("RECONCILE_SELECTED_CONTRACT_MISMATCH")
+        expected_qty = _strict_positive_integral(row.get("qty"))
+        if expected_qty is None:
+            return _keep("RECONCILE_QTY_MALFORMED")
+        selected_qty = meta.get("selected_qty")
+        if selected_qty is not None:
+            selected_qty_value = _strict_positive_integral(selected_qty)
+            if selected_qty_value is None or selected_qty_value != expected_qty:
+                return _keep("RECONCILE_SELECTED_QTY_MISMATCH")
+
+        exact_tag = [
+            order
+            for order in broker_orders
+            if canonical_broker_submit_key(order.get("tag")) == tag
         ]
+        strong = []
+        expected_contract_key = expected_contract.upper()
+        for remote in exact_tag:
+            remote_contracts = [
+                str(remote.get(field) or "").strip()
+                for field in ("option_symbol", "contract")
+                if str(remote.get(field) or "").strip()
+            ]
+            if remote_contracts and len({value.upper() for value in remote_contracts}) > 1:
+                continue
+            remote_contract = (
+                remote_contracts[0]
+                if remote_contracts
+                else str(remote.get("symbol") or "").strip()
+            )
+            remote_qty = _strict_positive_integral(remote.get("quantity"))
+            remote_client_id = next(
+                (
+                    str(remote.get(field) or "").strip().lower()
+                    for field in ("client_id", "client", "email")
+                    if str(remote.get(field) or "").strip()
+                ),
+                "",
+            )
+            remote_mode_raw = str(remote.get("execution_mode") or "").strip()
+            remote_mode = _normalize_execution_mode(remote_mode_raw)
+            if (
+                remote_contract.upper() == expected_contract_key
+                and str(remote.get("side") or "").strip().lower() == "buy_to_open"
+                and remote_qty == expected_qty
+                and (not remote_client_id or remote_client_id == expected_client_id)
+                and (not remote_mode_raw or remote_mode == expected_mode)
+            ):
+                strong.append(remote)
+
         if len(exact_tag) > 1 or len(strong) > 1:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_MULTIPLE_MATCHES",
+                "match_count": len(exact_tag),
+            }
         if exact_tag and not strong:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH"}
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH",
+            }
         if not strong:
             # A broker order listing can be delayed, paginated, or incomplete.
             # Once submit intent is durable, one empty listing can never prove
-            # that the POST did not land.  Retain the identity fence until exact
+            # that the POST did not land. Retain the identity fence until exact
             # broker truth or an explicit operator reconciliation resolves it.
             return {
                 **_base,
@@ -3512,33 +3707,44 @@ class APExecutionCore:
             }
 
         remote = strong[0]
-        remote_id = str(remote.get("id") or remote.get("order_id") or "")
-        remote_status = str(remote.get("status") or "").lower().replace("-", "_")
-        if not remote_id:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MATCH_MISSING_ORDER_ID"}
-        status_map = {
-            "filled": "FILLED", "partially_filled": "PARTIAL_FILL",
-            "partial_filled": "PARTIAL_FILL", "rejected": "REJECTED",
-            "canceled": "CANCELED", "cancelled": "CANCELED", "expired": "EXPIRED",
+        remote_id = str(remote.get("id") or remote.get("order_id") or "").strip()
+        if not remote_id or remote_id.upper() in _BROKER_ID_PLACEHOLDERS:
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_MATCH_MISSING_ORDER_ID",
+            }
+        remote_status = str(remote.get("status") or "").strip().lower().replace("-", "_")
+
+        # Establish the accepted boundary only.  Fill monitor owns every later
+        # broker status, including a status already terminal in this listing.
+        if not osm.transition(
+            local_order_id,
+            "SUBMITTED",
+            broker_order_id=remote_id,
+            submitted_ts=now_utc_iso(),
+        ):
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED",
+            }
+        update_meta = getattr(osm, "update_order_meta", None)
+        if callable(update_meta):
+            update_meta(local_order_id, {
+                "reconciled_at": now_utc_iso(),
+                "recovery_classification": "BROKER_ORDER_ADOPTED",
+                "broker_reconcile_status": remote_status,
+                "current_owner": "ORDER_MONITOR",
+                "lifecycle_state": "SUBMITTED",
+            })
+        return {
+            **_base,
+            "disposition": "ALREADY_RECONCILED",
+            "reason_code": "BROKER_ORDER_ADOPTED",
+            "broker_order_id": remote_id,
+            "status": "SUBMITTED",
         }
-        local_status = status_map.get(remote_status, "SUBMITTED")
-        # Establish the accepted boundary first so the existing state machine
-        # owns all subsequent fill/terminal transitions.
-        if not osm.transition(local_order_id, "SUBMITTED", broker_order_id=remote_id, submitted_ts=now_utc_iso()):
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
-        if local_status != "SUBMITTED":
-            osm.transition(
-                local_order_id, local_status, broker_order_id=remote_id,
-                filled_qty=remote.get("exec_quantity") or remote.get("filled_quantity"),
-                fill_price=remote.get("avg_fill_price"),
-                last_error=(str(remote.get("reason") or remote.get("message") or "") or None),
-            )
-        osm.update_order_meta(local_order_id, {
-            "reconciled_at": now_utc_iso(), "recovery_classification": "BROKER_ORDER_ADOPTED",
-            "broker_reconcile_status": remote_status, "broker_reconcile_response": remote,
-            "current_owner": "ORDER_MONITOR", "lifecycle_state": local_status,
-        })
-        return {**_base, "disposition": "ALREADY_RECONCILED", "reason_code": "BROKER_ORDER_ADOPTED", "broker_order_id": remote_id, "status": local_status}
 
     def reconcile_exit_broker_intent(
         self,

@@ -288,6 +288,7 @@ class APBrokerReconciler:
         interval_sec: int = RECONCILE_INTERVAL_SEC,
         execution_mode: str | None = None,
         supabase_client=None,       # Requirement 1: optional, backward-compatible
+        execution_core=None,
     ):
         self.broker          = broker
         self.client_id       = client_id
@@ -297,6 +298,7 @@ class APBrokerReconciler:
         self._interval       = interval_sec
         self.execution_mode  = _normalize_execution_mode(execution_mode)
         self.supabase_client = supabase_client  # Requirement 2: stored for proof logging
+        self.execution_core  = execution_core
         self._stop       = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
@@ -1182,6 +1184,14 @@ class APBrokerReconciler:
                 )
                 continue
 
+            if (
+                db_status == "PENDING_TRIGGER"
+                and str(order.get("kind") or "").upper() == "ENTRY"
+                and self._has_pending_trigger_submit_evidence(order)
+            ):
+                self._reconcile_pending_trigger_submit_intent(order, summary)
+                continue
+
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
                 self._handle_order_without_broker_id(order, summary)
                 continue
@@ -1256,6 +1266,88 @@ class APBrokerReconciler:
                     )
 
         self._check_ghost_fills(summary)
+
+    @staticmethod
+    def _has_pending_trigger_submit_evidence(order: dict) -> bool:
+        """Keep malformed visible rows on the broker-ownership hold path."""
+        if order.get("submitted_ts") is not None:
+            return True
+
+        raw_meta = order.get("meta")
+        if raw_meta is None:
+            return False
+        if isinstance(raw_meta, str):
+            try:
+                import json as _json
+                raw_meta = _json.loads(raw_meta)
+            except Exception:
+                return True
+        if not isinstance(raw_meta, dict):
+            return True
+
+        submit_intent_at = raw_meta.get("submit_intent_at")
+        if submit_intent_at is None:
+            return False
+        return not isinstance(submit_intent_at, str) or bool(submit_intent_at.strip())
+
+    def _reconcile_pending_trigger_submit_intent(
+        self,
+        order: dict,
+        summary: dict,
+    ) -> None:
+        """Route broker-ambiguous ENTRY rows to the existing core read path."""
+        local_id = str(order.get("local_order_id") or order.get("id") or "").strip()
+        expected_client = str(self.client_id or "").strip().lower()
+        row_client = str(order.get("client_id") or "").strip().lower()
+        row_mode = _normalize_execution_mode(order.get("execution_mode"))
+
+        if not local_id:
+            reason = "RECONCILE_LOCAL_ORDER_ID_MISSING"
+        elif not expected_client or not row_client or row_client != expected_client:
+            reason = "RECONCILE_CLIENT_ID_MISMATCH"
+        elif row_mode is None or row_mode != self.execution_mode:
+            reason = "RECONCILE_EXECUTION_MODE_MISMATCH"
+        else:
+            reconcile = getattr(self.execution_core, "reconcile_deferred_broker_intent", None)
+            if not callable(reconcile):
+                reason = "RECONCILE_EXECUTION_CORE_UNAVAILABLE"
+            else:
+                _core_call_failed = False
+                try:
+                    result = reconcile(local_order_id=local_id)
+                except Exception as exc:
+                    result = None
+                    _core_call_failed = True
+                    reason = f"RECONCILE_CORE_CALL_FAILED:{type(exc).__name__}"
+                if isinstance(result, dict):
+                    disposition = str(result.get("disposition") or "").strip().upper()
+                    result_status = str(result.get("status") or "").strip().upper()
+                    if disposition in {"ALREADY_RECONCILED", "SUBMITTED"}:
+                        if result_status and result_status != "SUBMITTED":
+                            reason = "RECONCILE_CORE_TERMINAL_STATUS_UNAUTHORIZED"
+                        else:
+                            return
+                    else:
+                        reason = str(
+                            result.get("reason_code")
+                            or disposition
+                            or "RECONCILE_CORE_RESULT_MALFORMED"
+                        )
+                elif result is not None:
+                    reason = "RECONCILE_CORE_RESULT_MALFORMED"
+                elif not _core_call_failed:
+                    reason = "RECONCILE_CORE_RESULT_MALFORMED"
+
+        summary.setdefault("errors", []).append(
+            f"pending_trigger_submit_intent_hold:{reason}"
+        )
+        summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+        log.warning(
+            "[%s] PENDING_TRIGGER broker-submit intent held | order=%s | reason=%s",
+            self.client_id,
+            local_id or "?",
+            reason,
+        )
 
     def _resolve_missing_id_exit_truth(self, order: dict, summary: dict, *, reason: str = "") -> bool:
         """Resolve an EXIT order that has no broker_order_id into exactly one safe endpoint.
