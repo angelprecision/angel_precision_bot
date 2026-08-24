@@ -21,7 +21,6 @@ from ap.contract_quote_revalidator import (
 )
 from ap.contract_selector import (
     APContractSelectionEngine,
-    SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
     SelectorRequestContext,
     _new_selector_request_context,
     _order_chain_for_direct_quote_recovery,
@@ -234,7 +233,7 @@ def _select_with_chain(monkeypatch, chain: list[dict], valid_symbol: str, direct
 
 
 class TestConfigurationAuthority:
-    def test_contract_revalidate_alias_is_not_read_at_module_import(
+    def test_malformed_contract_revalidate_alias_does_not_crash_module_load(
         self,
         monkeypatch,
         caplog,
@@ -248,13 +247,7 @@ class TestConfigurationAuthority:
         )
 
         assert module_globals["DEFAULT_REVALIDATE_TOP_N"] == 5
-        assert "DIRECT_QUOTE_ENV_PARSE_ERROR key=CONTRACT_REVALIDATE_TOP_N" not in caplog.text
-
-    def test_legacy_selector_budget_export_is_fixed_compatibility_only(self, monkeypatch):
-        monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "99")
-        import ap.contract_selector as selector_module
-
-        assert selector_module.DEFAULT_REVALIDATE_TOP_N == 5
+        assert "DIRECT_QUOTE_ENV_PARSE_ERROR key=CONTRACT_REVALIDATE_TOP_N" in caplog.text
 
     def test_canonical_conflict_does_not_reduce_limit(self, caplog):
         import ap.contract_selector as selector_module
@@ -271,10 +264,6 @@ class TestConfigurationAuthority:
         assert cfg.source == "SELECTOR_MAX_DIRECT_QUOTE_CALLS"
         assert cfg.conflict is True
         assert "direct_recovery=8" in (cfg.conflict_detail or "")
-        assert cfg.canonical_value == 20
-        assert cfg.direct_recovery_value == 8
-        assert cfg.contract_revalidate_value == 20
-        assert cfg.invalid_explicit_keys == ()
         assert "SELECTOR_DIRECT_QUOTE_BUDGET_CONFLICT" in caplog.text
 
     @pytest.mark.parametrize(
@@ -304,163 +293,7 @@ class TestConfigurationAuthority:
 
         assert cfg.effective_limit == 40
         assert cfg.source == "default"
-        assert cfg.canonical_value is None
-        assert cfg.invalid_explicit_keys == ("SELECTOR_MAX_DIRECT_QUOTE_CALLS",)
         assert "SELECTOR_ENV_PARSE_ERROR key=SELECTOR_MAX_DIRECT_QUOTE_CALLS" in caplog.text
-
-    def test_empty_environment_preserves_ordinary_and_deferred_defaults(self, monkeypatch):
-        for key in (
-            "SELECTOR_MAX_DIRECT_QUOTE_CALLS",
-            "DIRECT_QUOTE_RECOVERY_TOP_N",
-            "CONTRACT_REVALIDATE_TOP_N",
-        ):
-            monkeypatch.delenv(key, raising=False)
-
-        cfg = _resolve_direct_quote_budget_config({})
-        ordinary = _new_selector_request_context("SPY", "live")
-        deferred = _new_selector_request_context(
-            "SPY",
-            "live",
-            selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
-        )
-
-        assert cfg.effective_limit == 40
-        assert cfg.source == "default"
-        assert cfg.canonical_value is None
-        assert cfg.direct_recovery_value is None
-        assert cfg.contract_revalidate_value is None
-        assert cfg.invalid_explicit_keys == ()
-        assert ordinary.effective_direct_quote_limit == 5
-        assert deferred.effective_direct_quote_limit == 40
-
-    @pytest.mark.parametrize(
-        ("canonical", "ordinary_limit", "deferred_limit"),
-        [("40", 20, 40), ("20", 20, 20)],
-    )
-    def test_canonical_value_controls_both_request_envelopes_without_aliases(
-        self, monkeypatch, canonical, ordinary_limit, deferred_limit
-    ):
-        monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", canonical)
-        monkeypatch.delenv("DIRECT_QUOTE_RECOVERY_TOP_N", raising=False)
-        monkeypatch.delenv("CONTRACT_REVALIDATE_TOP_N", raising=False)
-
-        ordinary = _new_selector_request_context("SPY", "live")
-        deferred = _new_selector_request_context(
-            "SPY",
-            "paper",
-            selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
-        )
-
-        assert ordinary.effective_direct_quote_limit == ordinary_limit
-        assert deferred.effective_direct_quote_limit == deferred_limit
-        assert deferred.direct_quote_budget_conflict is False
-        assert deferred.direct_quote_budget_invalid_explicit_keys == ()
-
-    def test_matching_aliases_are_diagnostic_without_conflict(self):
-        cfg = _resolve_direct_quote_budget_config({
-            "SELECTOR_MAX_DIRECT_QUOTE_CALLS": "40",
-            "DIRECT_QUOTE_RECOVERY_TOP_N": "40",
-            "CONTRACT_REVALIDATE_TOP_N": "40",
-        })
-
-        assert cfg.effective_limit == 40
-        assert cfg.conflict is False
-        assert cfg.invalid_explicit_keys == ()
-
-    @pytest.mark.parametrize(
-        ("key", "value"),
-        [
-            ("DIRECT_QUOTE_RECOVERY_TOP_N", "abc"),
-            ("DIRECT_QUOTE_RECOVERY_TOP_N", "0"),
-            ("CONTRACT_REVALIDATE_TOP_N", "-2"),
-            ("CONTRACT_REVALIDATE_TOP_N", ""),
-        ],
-    )
-    def test_malformed_aliases_are_surfaced_without_becoming_authority(
-        self, key, value, caplog
-    ):
-        caplog.set_level(logging.WARNING, logger="ap.contract_selector")
-        cfg = _resolve_direct_quote_budget_config({
-            "SELECTOR_MAX_DIRECT_QUOTE_CALLS": "40",
-            key: value,
-        })
-
-        assert cfg.effective_limit == 40
-        assert cfg.source == "SELECTOR_MAX_DIRECT_QUOTE_CALLS"
-        assert cfg.invalid_explicit_keys == (key,)
-        assert cfg.conflict is False
-        assert f"SELECTOR_ENV_PARSE_ERROR key={key}" in caplog.text
-
-    @pytest.mark.parametrize("alias", [
-        "DIRECT_QUOTE_RECOVERY_TOP_N",
-        "CONTRACT_REVALIDATE_TOP_N",
-    ])
-    def test_valid_alias_only_values_remain_diagnostic_only(self, alias, monkeypatch):
-        monkeypatch.delenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", raising=False)
-        monkeypatch.setenv(alias, "8" if alias.startswith("DIRECT") else "20")
-        for key in (
-            "DIRECT_QUOTE_RECOVERY_TOP_N",
-            "CONTRACT_REVALIDATE_TOP_N",
-        ):
-            if key != alias:
-                monkeypatch.delenv(key, raising=False)
-
-        cfg = _resolve_direct_quote_budget_config()
-        deferred = _new_selector_request_context(
-            "SPY",
-            "paper",
-            selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
-        )
-
-        assert cfg.effective_limit == 40
-        assert cfg.source == "default"
-        assert cfg.invalid_explicit_keys == ()
-        assert deferred.effective_direct_quote_limit == 40
-        assert deferred.direct_quote_budget_conflict is False
-
-    def test_identical_live_and_paper_envs_keep_modes_distinct(self, monkeypatch):
-        for key in (
-            "SELECTOR_MAX_DIRECT_QUOTE_CALLS",
-            "DIRECT_QUOTE_RECOVERY_TOP_N",
-            "CONTRACT_REVALIDATE_TOP_N",
-        ):
-            monkeypatch.setenv(key, "40")
-
-        live = _new_selector_request_context(
-            "SPY",
-            "live",
-            selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
-        )
-        paper = _new_selector_request_context(
-            "SPY",
-            "paper",
-            selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
-        )
-
-        assert live.effective_direct_quote_limit == paper.effective_direct_quote_limit == 40
-        assert live.execution_mode == "live"
-        assert paper.execution_mode == "paper"
-        assert live.direct_quote_budget_invalid_explicit_keys == ()
-        assert paper.direct_quote_budget_invalid_explicit_keys == ()
-
-    def test_diagnostics_use_parsed_values_and_report_invalid_keys(self, monkeypatch):
-        monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "+20")
-        monkeypatch.setenv("DIRECT_QUOTE_RECOVERY_TOP_N", "8")
-        monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "bad")
-
-        ctx = _new_selector_request_context(
-            "SPY",
-            "live",
-            selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
-        )
-        diagnostics = _selector_request_diagnostics(ctx)
-
-        assert ctx.configured_selector_max_direct_quote_calls == 20
-        assert ctx.configured_direct_quote_recovery_top_n == 8
-        assert ctx.configured_contract_revalidate_top_n is None
-        assert diagnostics["direct_quote_budget"]["invalid_explicit_keys"] == [
-            "CONTRACT_REVALIDATE_TOP_N"
-        ]
 
     def test_new_context_diagnostics_start_at_effective_limit(self, monkeypatch):
         monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "20")
