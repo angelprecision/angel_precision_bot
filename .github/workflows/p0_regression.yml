@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - recovery/aug10-forward-main
   pull_request:
     branches:
       - main
@@ -105,6 +106,7 @@ jobs:
             tests/test_p1_intel_admission_e2e_final_gate.py \
             tests/test_p0_forward_regime_advisory_flow.py \
             tests/test_p0_selector_direct_quote_budget_authority.py \
+            tests/test_p0_direct_quote_cache_validity.py \
             tests/test_p0_selector_terminal_truth_ranked_quotes_current_main.py \
             tests/test_p0_trigger_anchored_strike_selection.py \
             tests/test_p0_selector_recovery_capacity_and_validity.py \
@@ -161,6 +163,7 @@ jobs:
             tests/test_p0_live_executable_bid_pnl.py \
             tests/test_soft_exit_executable_truth.py \
             tests/test_p0_canonical_exit_fill_truth.py \
+            tests/test_p0_partial_close_reconciler.py \
             tests/test_p0_partial_exit_ownership_guard.py \
             tests/test_p0_exit_position_ambiguity_guard.py \
             tests/test_p0_exit_decision_idempotency_guard.py \

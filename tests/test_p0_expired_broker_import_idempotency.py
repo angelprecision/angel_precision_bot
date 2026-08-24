@@ -191,7 +191,7 @@ def test_500_expired_polls_create_zero_rows_and_preserve_diagnostic(production_d
 def test_500_valid_polls_create_one_row_and_timestamp_does_not_change_identity(production_db):
     diagnostics: list[dict] = []
     reconciler = _reconciler("jose@example.com", "live", diagnostics)
-    contract = "SPY260821P00751000"
+    contract = "SPY260901P00751000"
     for index in range(500):
         _poll(reconciler, [_broker_position(contract, acquired=f"2026-07-18T14:{index % 60:02d}:00Z")])
     assert _count(production_db) == 1
@@ -205,7 +205,7 @@ def test_500_valid_polls_create_one_row_and_timestamp_does_not_change_identity(p
 def test_terminal_import_is_recognized_on_next_poll(production_db):
     diagnostics: list[dict] = []
     reconciler = _reconciler("jose@example.com", "paper", diagnostics)
-    position = _broker_position("QQQ260821C00500000")
+    position = _broker_position("QQQ260901C00500000")
     _poll(reconciler, [position])
     with production_db.cursor() as cursor:
         cursor.execute("UPDATE positions SET status='EXPIRED', quantity_remaining=0")
@@ -217,7 +217,7 @@ def test_terminal_import_is_recognized_on_next_poll(production_db):
 def test_client_and_mode_isolation_and_distinct_durable_lots(production_db):
     first = _reconciler("jose@example.com", "live", [])
     second = _reconciler("jason@example.com", "paper", [])
-    contract = "AAPL260821C00200000"
+    contract = "AAPL260901C00200000"
     _poll(first, [
         _broker_position(contract, lot_id="lot-live-1"),
         _broker_position(contract, lot_id="lot-live-2"),
@@ -239,7 +239,7 @@ def test_client_and_mode_isolation_and_distinct_durable_lots(production_db):
 def test_missing_execution_identity_fails_closed(production_db):
     diagnostics: list[dict] = []
     reconciler = _reconciler("jose@example.com", None, diagnostics)
-    summary = _poll(reconciler, [_broker_position("MSFT260821C00400000")])
+    summary = _poll(reconciler, [_broker_position("MSFT260901C00400000")])
     assert _count(production_db) == 0
     assert summary["positions_alerted"] == 1
     assert diagnostics[-1]["reason_code"] == "BROKER_IMPORT_IDENTITY_UNPROVEN"
