@@ -44,6 +44,7 @@ PR: hotfix/p0-direct-option-quote-revalidation
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 import logging
@@ -546,12 +547,19 @@ def _empty_quote_failure() -> dict:
 
 def _normalize_quote(raw: dict, fetched_at: float, latency_ms: int) -> dict:
     def _f(v):
+        if isinstance(v, bool):
+            return None
         try:
-            return float(v) if v is not None else None
+            parsed = float(v) if v is not None else None
         except (TypeError, ValueError):
             return None
+        if parsed is not None and not math.isfinite(parsed):
+            return None
+        return parsed
 
     def _i(v):
+        if isinstance(v, bool):
+            return None
         try:
             return int(v) if v is not None else None
         except (TypeError, ValueError):
@@ -740,7 +748,11 @@ def fetch_direct_option_quote_with_meta(
     latency_ms = int((_now() - t0) * 1000)
     _ctx_add_stage_ms(request_context, "direct_quote", latency_ms)
     quote = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, quote)
+    if quote_is_cache_eligible(quote):
+        _QUOTE_CACHE[cache_key] = (t0, quote)
+    else:
+        # A forced refresh must not leave an older observation authoritative.
+        _QUOTE_CACHE.pop(cache_key, None)
 
     if quote.get("_quote_payload_empty"):
         return _empty_quote_failure()
@@ -797,28 +809,41 @@ def fetch_direct_option_quote(
 
     latency_ms = int((_now() - t0) * 1000)
     out = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, out)
+    if quote_is_cache_eligible(out):
+        _QUOTE_CACHE[cache_key] = (t0, out)
+    else:
+        # A forced refresh must not leave an older observation authoritative.
+        _QUOTE_CACHE.pop(cache_key, None)
     return out
+
+
+def _strict_finite_positive(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def quote_is_cache_eligible(quote: Optional[dict]) -> bool:
+    """Return True only for finite, positive, uncrossed bid/ask observations."""
+    if not quote:
+        return False
+    bid = _strict_finite_positive(quote.get("bid"))
+    ask = _strict_finite_positive(quote.get("ask"))
+    return bid is not None and ask is not None and ask >= bid
 
 
 def direct_quote_is_valid(quote: Optional[dict]) -> bool:
     """
-    Hard validity check for a direct quote: bid > 0 AND ask > 0 AND ask >= bid.
+    Hard validity check for a direct quote: finite bid > 0, finite ask > 0,
+    and ask >= bid. Boolean prices are rejected.
     """
-    if not quote:
-        return False
-    bid = quote.get("bid")
-    ask = quote.get("ask")
-    if bid is None or ask is None:
-        return False
-    try:
-        if float(bid) <= 0 or float(ask) <= 0:
-            return False
-        if float(ask) < float(bid):
-            return False
-    except (TypeError, ValueError):
-        return False
-    return True
+    return quote_is_cache_eligible(quote)
 
 
 def revalidate_with_direct_quote(
