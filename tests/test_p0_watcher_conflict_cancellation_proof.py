@@ -428,6 +428,11 @@ def test_runtime_package_watch_forwards_recovery_compatibility_flags(monkeypatch
 
 
 def _poll_quote(watcher, *, bid, ask):
+    # Direct admission tests must exercise the poll arbitration regardless of
+    # the wall-clock session when the suite is run.
+    with watcher._lock:
+        for watched in watcher._pending:
+            watched.overnight = False
     watcher._fetch_quotes = lambda tickers: {
         ticker: {"bid": bid, "ask": ask}
         for ticker in tickers
@@ -671,3 +676,136 @@ def test_confirmed_direction_holds_when_loser_cancellation_is_unproven():
         payload.get("reason_code") == "direction_claim_cancel_unproven_hold"
         for _, payload in watcher.audits
     )
+
+
+def test_won_direction_claim_blocks_opposite_replacement_after_callback_failure():
+    call = signal(
+        signal_id="call",
+        local_order_id="call-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    put = signal(
+        signal_id="put",
+        local_order_id="put-lo",
+        side="PUT",
+        score=70,
+        trigger=90,
+    )
+    osm = FakeOSM({"call-lo": row_for(call), "put-lo": row_for(put)})
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+
+    def callback_failure(_watched):
+        raise RuntimeError("callback unavailable")
+
+    watcher.on_trigger = callback_failure
+    assert watcher.add_signal(dict(call)) is True
+    assert watcher.add_signal(dict(put)) is True
+    _poll_quote(watcher, bid=98, ask=101)
+    _poll_quote(watcher, bid=98, ask=101)
+
+    replacement = signal(
+        signal_id="put-replacement",
+        local_order_id="put-replacement-lo",
+        side="PUT",
+        score=95,
+        trigger=90,
+    )
+    osm.rows["put-replacement-lo"] = row_for(replacement)
+
+    assert watcher.add_signal(dict(replacement)) is False
+    assert watcher._last_reject_reason == "direction_claim_active"
+    assert osm.cancel_calls == [
+        ("put-lo", "confirmed_breach_direction_claim_lost")
+    ]
+    assert osm.rows["call-lo"]["status"] == "PENDING_TRIGGER"
+    assert watcher.has_order("call-lo") is True
+    assert watcher.has_order("put-replacement-lo") is False
+
+
+def test_unrelated_incomplete_identity_opposite_does_not_hold_winner():
+    call = signal(
+        signal_id="call",
+        local_order_id="call-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    orphan = signal(
+        signal_id="orphan",
+        local_order_id="orphan-lo",
+        side="PUT",
+        score=70,
+        trigger=90,
+    )
+    orphan["ticker"] = "MSFT"
+    orphan_row = row_for(orphan)
+    orphan.pop("client_id")
+    orphan.pop("execution_mode")
+    osm = FakeOSM({"call-lo": row_for(call), "orphan-lo": orphan_row})
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    callbacks = []
+    watcher.on_trigger = lambda watched: (
+        callbacks.append(watched.signal_id) or {"disposition": "TERMINAL_DURABLE"}
+    )
+
+    assert watcher.add_signal(dict(call)) is True
+    assert watcher.add_signal(dict(orphan)) is True
+    _poll_quote(watcher, bid=98, ask=101)
+    _poll_quote(watcher, bid=98, ask=101)
+
+    assert callbacks == ["call"]
+    assert osm.cancel_calls == []
+    assert watcher.has_order("call-lo") is False
+    assert watcher.has_order("orphan-lo") is True
+
+
+def test_unproven_loser_cancellation_retries_after_deferred_hold():
+    call = signal(
+        signal_id="call",
+        local_order_id="call-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    put = signal(
+        signal_id="put",
+        local_order_id="put-lo",
+        side="PUT",
+        score=70,
+        trigger=90,
+    )
+    osm = FakeOSM(
+        {"call-lo": row_for(call), "put-lo": row_for(put)},
+        cancel_results={"put-lo": False},
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    callbacks = []
+    watcher.on_trigger = lambda watched: (
+        callbacks.append(watched.signal_id) or {"disposition": "TERMINAL_DURABLE"}
+    )
+
+    assert watcher.add_signal(dict(call)) is True
+    assert watcher.add_signal(dict(put)) is True
+    _poll_quote(watcher, bid=98, ask=101)
+    _poll_quote(watcher, bid=98, ask=101)
+    assert callbacks == []
+    assert osm.cancel_calls == [
+        ("put-lo", "confirmed_breach_direction_claim_lost")
+    ]
+
+    osm.cancel_results["put-lo"] = True
+    with watcher._lock:
+        for watched in watcher._pending:
+            watched.deferred_retry_not_before = None
+    _poll_quote(watcher, bid=98, ask=101)
+
+    assert callbacks == ["call"]
+    assert osm.cancel_calls == [
+        ("put-lo", "confirmed_breach_direction_claim_lost"),
+        ("put-lo", "confirmed_breach_direction_claim_lost"),
+    ]
+    assert osm.rows["put-lo"]["status"] == "CANCELED"
+    assert watcher.has_order("put-lo") is False
+    assert watcher.has_order("call-lo") is False

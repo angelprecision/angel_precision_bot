@@ -506,7 +506,8 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 signal, registration_provenance_out=registration_provenance_out,
             )
         with self._watch_admission_gate:
-            if self._ownership_key(signal) is None:
+            incoming_key = self._ownership_key(signal)
+            if incoming_key is None:
                 # A standalone legacy watcher may still be admitted without a
                 # client/mode key.  Once another same-ticker watcher exists,
                 # however, ownership is ambiguous and the safe result is a
@@ -522,6 +523,14 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                     )
                 return super().add_signal(
                     signal, registration_provenance_out=registration_provenance_out,
+                )
+            claimed_winner = self._won_direction_claim_winner(incoming_key)
+            if claimed_winner is not None:
+                return self._block(
+                    signal,
+                    claimed_winner,
+                    "direction_claim_active",
+                    "direction_claim_active:won_winner_still_owned",
                 )
             opposites = self._opposites(ticker, side, signal)
             prune = [item for item in opposites if self._prunable(signal, item)]
@@ -719,6 +728,40 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             return None
         return key
 
+    def _won_direction_claim_winner(self, key):
+        """Return a still-owned winner, clearing only stale process-local claims."""
+        if key is None:
+            return None
+        with self._direction_claim_gate:
+            claim = dict(self._direction_claims.get(key) or {})
+        if claim.get("status") != "won":
+            return None
+        winner_local_id = str(claim.get("winner_local_order_id") or "")
+        winner_signal_id = str(claim.get("winner_signal_id") or "")
+        with self._lock:
+            winner = next(
+                (
+                    item for item in self._pending
+                    if self._direction_key(item) == key
+                    and self._local_order_id(item) == winner_local_id
+                    and self._signal_id(item) == winner_signal_id
+                ),
+                None,
+            )
+        if winner is not None:
+            return winner
+        # Admission and dispatch share _watch_admission_gate, so a missing
+        # winner here means the process-local claim is stale and may be pruned.
+        with self._direction_claim_gate:
+            current = self._direction_claims.get(key) or {}
+            if (
+                current.get("status") == "won"
+                and str(current.get("winner_local_order_id") or "") == winner_local_id
+                and str(current.get("winner_signal_id") or "") == winner_signal_id
+            ):
+                self._direction_claims.pop(key, None)
+        return None
+
     @staticmethod
     def _local_order_id(watched) -> str:
         return str((getattr(watched, "signal", {}) or {}).get("local_order_id") or "").strip()
@@ -777,6 +820,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             return [
                 item for item in self._pending
                 if item is not winner
+                and str(getattr(item, "ticker", "") or "").upper().strip() == str(key[2]).upper().strip()
                 and (
                     self._direction_key(item) == key
                     or self._direction_key(item) is None
@@ -924,17 +968,26 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         pass
 
                 if claim.get("status") == "ambiguous_hold":
-                    pending_opposites = self._pending_direction_opposites(key, triggered[0])
-                    if len(triggered) > 1 or pending_opposites:
-                        for watched in triggered:
-                            self._set_direction_hold(
-                                watched, key, "direction_claim_ambiguous_hold",
-                                "same_poll_confirmed_direction_order_unproven",
-                            )
-                        continue
-                    with self._direction_claim_gate:
-                        self._direction_claims.pop(key, None)
-                    claim = {}
+                    # A cancellation-proof failure is retryable once the
+                    # durable row becomes readable/terminal.  Keep a genuine
+                    # same-poll ordering ambiguity fail-closed, but clear the
+                    # retryable claim so the normal proof path runs again.
+                    if claim.get("reason") == "opposite_cancellation_unproven":
+                        with self._direction_claim_gate:
+                            self._direction_claims.pop(key, None)
+                        claim = {}
+                    else:
+                        pending_opposites = self._pending_direction_opposites(key, triggered[0])
+                        if len(triggered) > 1 or pending_opposites:
+                            for watched in triggered:
+                                self._set_direction_hold(
+                                    watched, key, "direction_claim_ambiguous_hold",
+                                    "same_poll_confirmed_direction_order_unproven",
+                                )
+                            continue
+                        with self._direction_claim_gate:
+                            self._direction_claims.pop(key, None)
+                        claim = {}
 
                 if len(triggered) > 1:
                     winner = self._select_confirmed_winner(triggered)
