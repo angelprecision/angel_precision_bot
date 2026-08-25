@@ -209,6 +209,114 @@ def test_real_fill_monitor_reaches_step_after_trace(monkeypatch) -> None:
     assert sentinel[0] == "after_trace"
 
 
+def test_real_fill_monitor_reaches_canonical_handoff_helpers_after_trace(monkeypatch) -> None:
+    """The real tracer and downstream handoff helpers execute in order."""
+    os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
+    from ap import fill_monitor as fm
+    from ap import trace as production_trace
+    import ap.db as ap_db
+    import ap.signal_pair_manager as pair_manager_module
+
+    assert fm.trace_gate is production_trace.trace_gate
+    assert getattr(fm.trace_gate, "__module__", None) == "ap.trace"
+    assert Path(fm.trace_gate.__code__.co_filename).resolve() == TRACE_PATH.resolve()
+
+    events = []
+
+    class Broker:
+        def get_order(self, broker_order_id):
+            return {
+                "status": "filled",
+                "exec_quantity": 1,
+                "avg_fill_price": 1.49,
+            }
+
+        def place_stop_order(self, **kwargs):
+            events.append(("stop", kwargs))
+            return {"id": "stop-1", "status": "accepted"}
+
+    class OSM:
+        def transition(self, *_args, **_kwargs):
+            return True
+
+    class PositionManager:
+        def get_position_by_local_order(self, _local_order_id):
+            return None
+
+        def get_position_by_broker_order(self, _broker_order_id):
+            return None
+
+        def open_position(self, **kwargs):
+            events.append(("position", kwargs))
+            return "position-1"
+
+    class ExitEngine:
+        def seed_position(self, position_id, order, result):
+            events.append(("seed", position_id, order, result))
+
+    class PairManager:
+        def on_fill(self, **kwargs):
+            events.append(("pair", kwargs))
+            return None
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, params):
+            events.append(("link", params))
+
+    order = {
+        "client_id": "client@example.com",
+        "local_order_id": "ord-2",
+        "broker_order_id": "brk-2",
+        "kind": "ENTRY",
+        "symbol": "SMCI",
+        "contract": "SMCI260821P00038000",
+        "direction": "PUT",
+        "qty": 1,
+        "limit_price": 1.49,
+        "underlying_entry": 450.0,
+        "reserved_cost": 149.0,
+        "execution_mode": "live",
+        "plan_id": "plan-2",
+        "signal_id": "signal-2",
+        "tier": "B",
+        "score": 75,
+        "status": "ACKNOWLEDGED",
+        "filled_qty": 0,
+    }
+
+    monkeypatch.setattr(production_trace.log, "info", lambda *args, **kwargs: events.append(("trace", args)))
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_reset_broker_anomaly_count", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pair_manager_module, "get_pair_manager", lambda: PairManager())
+    monkeypatch.setattr(ap_db, "conn", lambda: Connection())
+    monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *args, **kwargs: fn())
+
+    fm.process_pending_order(
+        Broker(),
+        order,
+        osm=OSM(),
+        pm=PositionManager(),
+        exit_engine=ExitEngine(),
+    )
+
+    assert [event[0] for event in events] == [
+        "trace",
+        "pair",
+        "position",
+        "stop",
+        "seed",
+        "link",
+    ]
+
+
 def test_current_fill_monitor_retains_the_production_trace_shape() -> None:
     """The real caller remains the source of the newer diagnostic kwargs."""
     source = (REPO_ROOT / "ap" / "fill_monitor.py").read_text()
