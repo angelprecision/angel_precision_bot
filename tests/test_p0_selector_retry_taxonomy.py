@@ -419,13 +419,11 @@ def test_governed_structural_families_have_runtime_restart_materializer_parity(
     "reason",
     [
         "TERMINAL_POLICY_REJECT",
-        "EARNINGS_LOCKOUT",
-        "NO_AFFORDABLE_CONTRACT",
     ],
-    ids=["structural-policy", "earnings-lockout", "affordability-policy"],
+    ids=["structural-policy"],
 )
-def test_terminal_policy_reasons_keep_policy_action_and_block_status(reason):
-    """Registered policy blocks must not be relabelled as quality rejects."""
+def test_structural_policy_reason_keeps_policy_action_and_block_status(reason):
+    """The request-scope structural policy reason is not a quality reject."""
     from ap_execution_core import (
         _classify_deferred_breach_retry_decision,
         _deferred_selector_status,
@@ -448,52 +446,6 @@ def test_terminal_policy_reasons_keep_policy_action_and_block_status(reason):
         "retryable_reason": False,
     }
     assert _deferred_selector_status(decision) == "CONTRACT_SELECTION_BLOCKED"
-
-
-def test_real_selector_earnings_gate_preserves_terminal_policy_reason():
-    """The live selector's policy producer reaches the same durable taxonomy."""
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock
-
-    from ap.contract_selector import APContractSelectionEngine, _to_queue_reason
-
-    broker = MagicMock()
-    broker.base_url = "https://api.tradier.com"
-    broker.cfg = SimpleNamespace(
-        base_url="https://api.tradier.com",
-        access_token="test-token",
-    )
-
-    class _BlockedEarningsGuard:
-        blackout_days = 5
-
-        def check(self, ticker):
-            return {"blocked": True, "reason": f"{ticker} earnings blackout"}
-
-    selector = APContractSelectionEngine(
-        broker,
-        mode="live",
-        data_broker=broker,
-        earnings_guard=_BlockedEarningsGuard(),
-    )
-    plan = {
-        "ticker": "AAPL",
-        "side": "CALL",
-        "execution_mode": "LIVE",
-        "mode": "LIVE",
-        "max_position_usd": 500.0,
-        "tier": "B",
-        "score": 80.0,
-        "signal_id": "sig-terminal-policy",
-        "client_id": "client-terminal-policy",
-        "metadata": {},
-    }
-
-    assert selector.select(plan) is None
-    failure = plan["metadata"]["selector_failure"]
-    assert failure["reason_code"] == "EARNINGS_LOCKOUT"
-    assert get_policy(failure["reason_code"]).classification == TERMINAL_POLICY
-    assert _to_queue_reason(failure["reason_code"]) == "TERMINAL_POLICY_BLOCK"
 
 
 def test_selector_recovery_failure_has_invariant_runtime_restart_materializer_parity(

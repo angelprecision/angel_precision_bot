@@ -994,11 +994,14 @@ def _classify_deferred_breach_retry_decision(
             "reason_code": _reason_code,
             "retryable_reason": False,
         }
-    # Every reason registered as TERMINAL_POLICY gets the policy-block action.
-    # This includes the request-scope structural proof reason and existing
-    # selector policy gates such as earnings/affordability blocks; none may be
-    # relabelled as terminal quality at the deferred runtime seam.
-    if _reason_classification == TERMINAL_POLICY:
+    # PR #504's request-scope structural policy proof has its own canonical
+    # downstream action. Preserve the historical action for existing policy
+    # reasons (for example UNTRADEABLE_FOR_ACCOUNT_SIZE); this branch governs
+    # only the newly registered structural-policy request reason.
+    if (
+        _reason_code == "TERMINAL_POLICY_REJECT"
+        and _reason_classification == TERMINAL_POLICY
+    ):
         return {
             "action": "terminal_policy",
             "reason_code": _reason_code,

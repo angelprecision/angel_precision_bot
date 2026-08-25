@@ -347,8 +347,6 @@ _TO_QUEUE_REASON: dict[str, str] = {
     "NO_AFFORDABLE_CONTRACT":         "NO_AFFORDABLE_CONTRACT",
     "UNTRADEABLE_FOR_ACCOUNT_SIZE":   "NO_AFFORDABLE_CONTRACT",
     "PREMIUM_CAP_EXCEEDED":           "PREMIUM_CAP_EXCEEDED",
-    "EARNINGS_LOCKOUT":               "TERMINAL_POLICY_BLOCK",
-    "EARNINGS_GUARD_ERROR":           "TERMINAL_POLICY_BLOCK",
     "TERMINAL_POLICY_REJECT":         "TERMINAL_POLICY_BLOCK",
     "NO_VALID_PLAYBOOK_DTE_CONTRACT": "NO_VALID_PLAYBOOK_DTE_CONTRACT",
     "NO_CONTRACT_AFTER_FILTERS":      "NO_CONTRACT_AFTER_FILTERS",
@@ -2893,27 +2891,15 @@ class APContractSelectionEngine:
             try:
                 eg_result = self.earnings_guard.check(ticker)
                 if eg_result.get("blocked"):
-                    _eg_expl = (
-                        f"Blocked by EarningsGuard: "
-                        f"{eg_result.get('reason', 'earnings blackout')}"
-                    )
                     log.warning("[%s] BLOCKED by EarningsGuard -- %s",
                                 ticker, eg_result.get("reason", "earnings blackout"))
                     self._emit_selector_event(
                         plan,
-                        stage="earnings_gate",
+                stage="earnings_gate",
                         decision="REJECT",
                         reason_code="EARNINGS_LOCKOUT",
-                        explanation=_eg_expl,
+                        explanation=f"Blocked by EarningsGuard: {eg_result.get('reason','earnings blackout')}",
                         thresholds={"blackout_days": getattr(self.earnings_guard, "blackout_days", None)},
-                    )
-                    _attach_selector_failure(
-                        plan,
-                        reason_code="EARNINGS_LOCKOUT",
-                        explanation=_eg_expl,
-                        base_url=_sel_base_url,
-                        execution_mode=_sel_mode,
-                        selection_diagnostics=_selector_request_diagnostics(request_context),
                     )
                     return None
             except Exception as exc:
@@ -2935,16 +2921,6 @@ class APContractSelectionEngine:
                     context={"fail_open": fail_open},
                 )
                 if not fail_open:
-                    _attach_selector_failure(
-                        plan,
-                        reason_code="EARNINGS_GUARD_ERROR",
-                        explanation=(
-                            f"EarningsGuard exception; selector blocked fail-closed: {exc}"
-                        ),
-                        base_url=_sel_base_url,
-                        execution_mode=_sel_mode,
-                        selection_diagnostics=_selector_request_diagnostics(request_context),
-                    )
                     return None
 
         # ── PR1 (deferred-dte-ladder) ────────────────────────────────────────
