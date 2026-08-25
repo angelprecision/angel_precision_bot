@@ -14,6 +14,7 @@ from ap.selector_retry_policy import (
 )
 from ap.contract_selector import (
     _resolve_deferred_recovery_final_reason_fail_closed,
+    _to_queue_reason,
 )
 
 
@@ -260,6 +261,13 @@ def test_every_governed_structural_family_has_exhaustive_positive_control(case):
     assert policy.retry_delay_applies is False
     assert policy.max_attempts_applies is False
     assert policy.queue_facing_reason == queue_reason
+    # Selector failure metadata uses the existing selector-facing mapping;
+    # terminal-quality geometry remains its canonical reason while the policy
+    # table owns the broader terminal outcome label.
+    expected_selector_queue_reason = (
+        queue_reason if classification == TERMINAL_POLICY else result
+    )
+    assert _to_queue_reason(result) == expected_selector_queue_reason
 
 
 @pytest.mark.parametrize(
@@ -352,6 +360,8 @@ def test_structural_plus_ordinary_quality_rejection_fails_closed(case, ordinary_
     "failure_kind",
     [
         "structural_shape",
+        "attempted_shape",
+        "quality_aggregate_shape",
         "quality_shape",
         "structural_overflow",
         "quality_overflow",
@@ -368,6 +378,10 @@ def test_malformed_conflicting_overflow_or_incomplete_evidence_fails_closed(
 
     if failure_kind == "structural_shape":
         evidence["structural_skip_records"] = "malformed"
+    elif failure_kind == "attempted_shape":
+        evidence["attempted_results"] = "malformed"
+    elif failure_kind == "quality_aggregate_shape":
+        evidence["quality_rejections"] = "malformed"
     elif failure_kind == "quality_shape":
         evidence["quality_rejection_records"] = "malformed"
     elif failure_kind == "structural_overflow":

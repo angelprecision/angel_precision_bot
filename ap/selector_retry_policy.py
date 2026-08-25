@@ -1509,8 +1509,18 @@ def _resolve_exhaustive_structural_terminal_reason(
 
 
 def resolve_selector_recovery_final_reason(evidence: dict) -> str:
-    """Resolve the truthful terminal reason without side effects."""
-    data = evidence if isinstance(evidence, dict) else {}
+    """Resolve the truthful terminal reason without side effects.
+
+    The deferred handoff is evidence-driven, so a malformed container must not
+    be silently treated as an empty container.  In particular, coercing a bad
+    ``attempted_results`` or ``quality_rejections`` value to ``{}`` can make a
+    partial structural ledger look exhaustive.  Missing/explicitly-null
+    optional containers remain compatible with older evidence shapes; a
+    present non-mapping value fails closed to the invariant sentinel.
+    """
+    if not isinstance(evidence, dict):
+        return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    data = evidence
     market_outcome = str(data.get("market_truth_outcome") or "").upper()
     market_reason = str(data.get("market_truth_reason") or "").strip()
     if market_outcome == "TERMINAL_SETUP_COMPLETE":
@@ -1518,10 +1528,15 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     if market_reason == "MARKET_SETUP_INVALIDATED":
         return market_reason
 
-    quality = data.get("quality_rejections")
-    quality = quality if isinstance(quality, dict) else {}
-    attempted = data.get("attempted_results")
-    attempted = attempted if isinstance(attempted, dict) else {}
+    quality_raw = data.get("quality_rejections")
+    if quality_raw is not None and not isinstance(quality_raw, dict):
+        return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    quality = quality_raw if isinstance(quality_raw, dict) else {}
+
+    attempted_raw = data.get("attempted_results")
+    if attempted_raw is not None and not isinstance(attempted_raw, dict):
+        return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    attempted = attempted_raw if isinstance(attempted_raw, dict) else {}
     skipped = data.get("structural_skip_results")
     skipped = skipped if isinstance(skipped, dict) else {}
     structural_evidence = data.get("structural_skip_records")
