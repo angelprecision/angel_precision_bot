@@ -238,6 +238,11 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         )
 
     @staticmethod
+    def _has_durable_confirmed_direction_evidence(watched) -> bool:
+        """Return whether a watcher carries a confirmed breach across restart."""
+        return getattr(watched, "trigger_crossed_at", None) is not None
+
+    @staticmethod
     def _is_ordinary_admission(signal: dict) -> bool:
         signal = signal if isinstance(signal, dict) else {}
         return not bool(
@@ -548,6 +553,20 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 item for item in opposites
                 if incoming_can_coarm and self._is_coarmable_opposite(item)
             ]
+            durable_confirmed_opposites = [
+                item for item in protected_opposites
+                if self._has_durable_confirmed_direction_evidence(item)
+            ]
+            if durable_confirmed_opposites:
+                # The process-local claim map is empty after restart, but a
+                # confirmed trigger is durable lifecycle authority. Never let
+                # legacy pre-breach score replacement cancel that winner.
+                return self._block(
+                    signal,
+                    durable_confirmed_opposites[0],
+                    "direction_claim_active",
+                    "direction_claim_active:durable_confirmed_trigger_still_owned",
+                )
             if protected_opposites:
                 best = max(protected_opposites, key=lambda item: float(item.score or 0))
                 if not self._candidate_wins(signal, best):

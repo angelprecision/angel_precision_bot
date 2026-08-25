@@ -724,6 +724,43 @@ def test_won_direction_claim_blocks_opposite_replacement_after_callback_failure(
     assert watcher.has_order("put-replacement-lo") is False
 
 
+def test_rehydrated_confirmed_winner_blocks_score_reversal_after_restart():
+    call = signal(
+        signal_id="call",
+        local_order_id="call-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    confirmed_at = datetime.now(timezone.utc).isoformat()
+    call["metadata"] = {"trigger_crossed_at": confirmed_at}
+    put = signal(
+        signal_id="put-replacement",
+        local_order_id="put-replacement-lo",
+        side="PUT",
+        score=95,
+        trigger=90,
+    )
+    call_row = row_for(call)
+    call_row["meta"]["trigger_crossed_at"] = confirmed_at
+    osm = FakeOSM(
+        {"call-lo": call_row, "put-replacement-lo": row_for(put)},
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    winner = seed(watcher, call)
+
+    # This watcher was rehydrated into a new process: durable trigger evidence
+    # exists, but no process-local direction claim has been reconstructed.
+    assert winner.trigger_crossed_at is not None
+    assert watcher._direction_claims == {}
+
+    assert watcher.add_signal(dict(put)) is False
+    assert watcher._last_reject_reason == "direction_claim_active"
+    assert osm.cancel_calls == []
+    assert watcher.has_order("call-lo") is True
+    assert watcher.has_order("put-replacement-lo") is False
+
+
 def test_unrelated_incomplete_identity_opposite_does_not_hold_winner():
     call = signal(
         signal_id="call",
