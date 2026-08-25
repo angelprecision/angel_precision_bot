@@ -448,6 +448,31 @@ def test_structural_policy_reason_keeps_policy_action_and_block_status(reason):
     assert _deferred_selector_status(decision) == "CONTRACT_SELECTION_BLOCKED"
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["EARNINGS_LOCKOUT", "NO_AFFORDABLE_CONTRACT", "UNTRADEABLE_FOR_ACCOUNT_SIZE"],
+)
+def test_existing_policy_reasons_keep_historical_deferred_quality_action(reason):
+    """PR #504 must not broaden the structural-policy runtime seam."""
+    from ap_execution_core import (
+        _classify_deferred_breach_retry_decision,
+        _deferred_selector_status,
+    )
+
+    decision = _classify_deferred_breach_retry_decision(
+        reason,
+        queue_local_order_id="local-existing-policy",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+
+    assert get_policy(reason).classification == TERMINAL_POLICY
+    assert decision["action"] == "terminal_quality"
+    assert _deferred_selector_status(decision) == "CONTRACT_SELECTION_QUALITY_REJECT"
+
+
 def test_selector_recovery_failure_has_invariant_runtime_restart_materializer_parity(
     monkeypatch,
 ):
