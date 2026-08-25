@@ -7378,6 +7378,261 @@ class APExecutionCore:
                     _pr180_audit_extras["pr180_runtime_action"] = "OBSERVED_PROCEED"
         # ──────────────────────────────────────────────────────────────────────
 
+        # PR #514 amendment: the selector-time exposure gate is not sufficient
+        # for LIVE deferred entries because ask-cross and PR180 can change the
+        # broker-bound limit after that gate.  Revalidate the exact price that
+        # will be persisted and handed to OSM, immediately before deferred
+        # broker-ready copyback.  No broker mutation occurs before this gate.
+        if _deferred and _deferred_mode == "live":
+            _boundary_contract = str(approved_contract or "").strip()
+            try:
+                _boundary_qty_before = int(getattr(approved_plan, "contracts", 0) or 0)
+                _boundary_submit_limit = float(submit_limit or 0)
+            except (TypeError, ValueError, OverflowError) as _boundary_shape_exc:
+                _boundary_qty_before = 0
+                _boundary_submit_limit = 0.0
+                _boundary_shape_exc_text = str(_boundary_shape_exc)
+            else:
+                _boundary_shape_exc_text = ""
+
+            if (
+                not _boundary_contract
+                or not self._is_real_occ_contract(_boundary_contract, ticker)
+                or _boundary_qty_before <= 0
+                or not math.isfinite(_boundary_submit_limit)
+                or _boundary_submit_limit <= 0.01
+            ):
+                _boundary_reason = (
+                    "deferred_broker_bound_cost_unproven"
+                    if not _boundary_shape_exc_text
+                    else f"deferred_broker_bound_cost_invalid:{_boundary_shape_exc_text}"
+                )
+                _boundary_extra = {
+                    "failure_stage": "deferred_broker_boundary_exposure_revalidation",
+                    "selected_contract": _boundary_contract,
+                    "submit_limit": _boundary_submit_limit,
+                    "selected_quantity": _boundary_qty_before,
+                    "client_id": _breach_client_id,
+                    "signal_id": signal_id,
+                    "execution_mode": _deferred_mode,
+                    "decision": "BLOCK",
+                }
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_boundary_reason,
+                    contract=_boundary_contract,
+                    extra=_boundary_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _boundary_reason,
+                    extra_meta=_boundary_extra,
+                )
+
+            _boundary_cost_before = round(
+                _boundary_submit_limit * _boundary_qty_before * 100.0,
+                2,
+            )
+            _boundary_reval_extra = {
+                "selected_contract": _boundary_contract,
+                "submit_limit": _boundary_submit_limit,
+                "broker_bound_cost": _boundary_cost_before,
+                "actual_selected_cost": _boundary_cost_before,
+                "selected_quantity_before_revalidation": _boundary_qty_before,
+                "selector_actual_selected_cost": float(
+                    locals().get("_actual_selected_cost", 0.0) or 0.0
+                ),
+                "selector_budget": float(
+                    _deferred_capacity.get("selector_budget", 0) or 0
+                ),
+                "per_trade_budget": float(
+                    _deferred_capacity.get("per_trade_budget", 0) or 0
+                ),
+                "remaining_total_capacity": float(
+                    _deferred_capacity.get("remaining_total_capacity", 0) or 0
+                ),
+                "current_total_exposure": float(
+                    _deferred_capacity.get("current_total_exposure", 0) or 0
+                ),
+                "client_id": _breach_client_id,
+                "signal_id": signal_id,
+                "execution_mode": _deferred_mode,
+                "local_order_id": queue_local_order_id,
+            }
+
+            try:
+                approved_plan.limit_price = _boundary_submit_limit
+                approved_plan.max_position_usd = _boundary_cost_before
+            except Exception as _boundary_plan_exc:
+                _boundary_reason = (
+                    "deferred_broker_bound_plan_assignment_failed:"
+                    f"{_boundary_plan_exc}"
+                )
+                log.critical(
+                    "[%s] DEFERRED_BROKER_BOUNDARY_PLAN_ASSIGNMENT_FAILED "
+                    "order=%s error=%s",
+                    ticker,
+                    queue_local_order_id,
+                    _boundary_plan_exc,
+                )
+                _boundary_reval_extra.update({
+                    "decision": "BLOCK",
+                    "decision_reason": _boundary_reason,
+                })
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_boundary_reason,
+                    contract=_boundary_contract,
+                    extra=_boundary_reval_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _boundary_reason,
+                    extra_meta=_boundary_reval_extra,
+                )
+
+            _boundary_revalidator = getattr(
+                getattr(self, "master_control", None),
+                "revalidate_exposure",
+                None,
+            )
+            if not callable(_boundary_revalidator):
+                _boundary_reason = "deferred_broker_boundary_revalidation_unavailable"
+                _boundary_reval_extra.update({
+                    "decision": "BLOCK",
+                    "decision_reason": _boundary_reason,
+                })
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_boundary_reason,
+                    contract=_boundary_contract,
+                    extra=_boundary_reval_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _boundary_reason,
+                    extra_meta=_boundary_reval_extra,
+                )
+
+            try:
+                _boundary_reval = _boundary_revalidator(
+                    approved_plan,
+                    client_id=_breach_client_id,
+                )
+            except Exception as _boundary_reval_exc:
+                _boundary_reason = (
+                    "deferred_broker_boundary_revalidation_error:"
+                    f"{_boundary_reval_exc}"
+                )
+                log.critical(
+                    "[%s] DEFERRED_BROKER_BOUNDARY_REVALIDATION_ERROR "
+                    "order=%s client=%s execution_mode=%s error=%s",
+                    ticker,
+                    queue_local_order_id,
+                    _breach_client_id,
+                    _deferred_mode,
+                    _boundary_reval_exc,
+                )
+                _boundary_reval_extra.update({
+                    "decision": "BLOCK",
+                    "decision_reason": _boundary_reason,
+                })
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_boundary_reason,
+                    contract=_boundary_contract,
+                    extra=_boundary_reval_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _boundary_reason,
+                    extra_meta=_boundary_reval_extra,
+                )
+
+            _boundary_reval_ok = bool(getattr(_boundary_reval, "ok", False))
+            _boundary_reval_reason = str(
+                getattr(_boundary_reval, "reason_code", None)
+                or getattr(_boundary_reval, "reason", None)
+                or ("allowed" if _boundary_reval_ok else "revalidation_failed")
+            )
+            try:
+                _boundary_qty_after = int(
+                    getattr(approved_plan, "contracts", 0) or 0
+                )
+            except (TypeError, ValueError, OverflowError):
+                _boundary_qty_after = 0
+            if _boundary_qty_after <= 0:
+                _boundary_reval_ok = False
+                _boundary_reval_reason = "broker_bound_quantity_invalid_after_revalidation"
+
+            _boundary_cost_after = round(
+                _boundary_submit_limit * _boundary_qty_after * 100.0,
+                2,
+            ) if _boundary_qty_after > 0 else 0.0
+            _boundary_reval_extra.update({
+                "decision": "ALLOW" if _boundary_reval_ok else "BLOCK",
+                "decision_reason": _boundary_reval_reason,
+                "selected_quantity_after_revalidation": _boundary_qty_after,
+                "broker_bound_cost": _boundary_cost_after,
+                "actual_selected_cost": _boundary_cost_after,
+                "quantity_resized": _boundary_qty_after != _boundary_qty_before,
+            })
+            try:
+                # Re-read quantity above after canonical revalidation, then
+                # make the plan and the persisted OSM cost agree with the
+                # exact broker-bound limit and final quantity.
+                approved_plan.limit_price = _boundary_submit_limit
+                approved_plan.max_position_usd = _boundary_cost_after
+            except Exception as _boundary_final_plan_exc:
+                _boundary_reval_ok = False
+                _boundary_reval_reason = (
+                    "broker_bound_plan_copyback_assignment_failed:"
+                    f"{_boundary_final_plan_exc}"
+                )
+                _boundary_reval_extra.update({
+                    "decision": "BLOCK",
+                    "decision_reason": _boundary_reval_reason,
+                })
+
+            log.info(
+                "DEFERRED_BROKER_BOUNDARY_EXPOSURE_REVALIDATION "
+                "order_id=%s client_id=%s execution_mode=%s signal_id=%s "
+                "contract=%s submit_limit=%.4f broker_bound_cost=%.2f "
+                "qty_before=%s qty_after=%s per_trade_budget=%.2f "
+                "remaining_total_capacity=%.2f decision=%s reason=%s",
+                queue_local_order_id,
+                _breach_client_id,
+                _deferred_mode,
+                signal_id,
+                _boundary_contract,
+                _boundary_submit_limit,
+                _boundary_reval_extra["broker_bound_cost"],
+                _boundary_qty_before,
+                _boundary_qty_after,
+                _boundary_reval_extra.get("per_trade_budget", 0.0),
+                _boundary_reval_extra.get("remaining_total_capacity", 0.0),
+                _boundary_reval_extra["decision"],
+                _boundary_reval_reason,
+            )
+            if not _boundary_reval_ok:
+                _boundary_reason = (
+                    "deferred_broker_boundary_revalidation_blocked:"
+                    f"{_boundary_reval_reason}"
+                )
+                _boundary_reval_extra["decision_reason"] = _boundary_reval_reason
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_boundary_reason,
+                    contract=_boundary_contract,
+                    extra=_boundary_reval_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _boundary_reason,
+                    extra_meta={
+                        "failure_stage": (
+                            "deferred_broker_boundary_exposure_revalidation"
+                        ),
+                        **_boundary_reval_extra,
+                    },
+                )
+            approved_qty = _boundary_qty_after
+
         # Keep approved_plan in sync so OSM and DB record the correct price.
         try:
             approved_plan.limit_price = submit_limit

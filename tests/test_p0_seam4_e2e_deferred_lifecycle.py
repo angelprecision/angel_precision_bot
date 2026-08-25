@@ -1523,6 +1523,9 @@ class _DeferredCapacityMC:
         remaining_total_capacity: float = 500.0,
         final_ok: bool = True,
         final_reason: str = "EXPOSURE_ALLOWED",
+        final_ok_sequence=None,
+        final_reason_sequence=None,
+        resize_qty_sequence=None,
     ) -> None:
         self.mode = "LIVE"
         self.max_positions = 5
@@ -1530,6 +1533,9 @@ class _DeferredCapacityMC:
         self.remaining_total_capacity = remaining_total_capacity
         self.final_ok = final_ok
         self.final_reason = final_reason
+        self.final_ok_sequence = list(final_ok_sequence or [])
+        self.final_reason_sequence = list(final_reason_sequence or [])
+        self.resize_qty_sequence = list(resize_qty_sequence or [])
         self.capacity_calls: list[dict] = []
         self.final_calls: list[dict] = []
 
@@ -1549,6 +1555,7 @@ class _DeferredCapacityMC:
         }
 
     def revalidate_exposure(self, plan, *, client_id):
+        _call_index = len(self.final_calls)
         self.final_calls.append({
             "client_id": client_id,
             "signal_id": getattr(plan, "signal_id", ""),
@@ -1558,18 +1565,38 @@ class _DeferredCapacityMC:
             "qty": getattr(plan, "contracts", 0),
             "actual_selected_cost": getattr(plan, "max_position_usd", 0),
         })
+        if _call_index < len(self.resize_qty_sequence):
+            _resize_qty = self.resize_qty_sequence[_call_index]
+            if _resize_qty is not None:
+                plan.contracts = _resize_qty
+        _final_ok = (
+            self.final_ok_sequence[_call_index]
+            if _call_index < len(self.final_ok_sequence)
+            else self.final_ok
+        )
+        _final_reason = (
+            self.final_reason_sequence[_call_index]
+            if _call_index < len(self.final_reason_sequence)
+            else self.final_reason
+        )
         return types.SimpleNamespace(
-            ok=self.final_ok,
-            reason_code=self.final_reason,
-            reason=self.final_reason,
+            ok=_final_ok,
+            reason_code=_final_reason,
+            reason=_final_reason,
         )
 
 
 class _CSelector:
     dte_ladder_enabled = True
 
-    def __init__(self, *, execution_price_per_share: float = 1.26):
+    def __init__(
+        self,
+        *,
+        execution_price_per_share: float = 1.26,
+        affordable_contracts: int = 1,
+    ):
         self.execution_price_per_share = execution_price_per_share
+        self.affordable_contracts = affordable_contracts
         self.calls = 0
 
     def select(self, _plan, *, request_context=None):
@@ -1580,7 +1607,7 @@ class _CSelector:
             bid=1.25,
             ask=1.28,
             mid=1.265,
-            affordable_contracts=1,
+            affordable_contracts=self.affordable_contracts,
             execution_price_per_share=self.execution_price_per_share,
             candidate_audit={"underlying_price": 130.0},
             expiration_date="2026-08-28",
@@ -1596,7 +1623,15 @@ class _CSelector:
         return {"buckets_attempted": 1}
 
 
-def _run_c_deferred_materialization(monkeypatch, *, selector, master_control):
+def _run_c_deferred_materialization(
+    monkeypatch,
+    *,
+    selector,
+    master_control,
+    refresh_ask: float = 1.28,
+    refresh_bid: float | None = None,
+    refresh_mid: float | None = None,
+):
     osm = _StatefulOSM()
     osm.proof_read_failures_remaining = 0
     osm.client_id = PR514_CLIENT_ID
@@ -1628,17 +1663,27 @@ def _run_c_deferred_materialization(monkeypatch, *, selector, master_control):
     watcher = _build_watcher(osm, core)
 
     fake_execution = types.ModuleType("ap.execution")
+    refresh_bid = (
+        round(refresh_ask - 0.03, 2)
+        if refresh_bid is None
+        else refresh_bid
+    )
+    refresh_mid = (
+        round((refresh_bid + refresh_ask) / 2.0, 4)
+        if refresh_mid is None
+        else refresh_mid
+    )
     fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
-        1.28,
+        refresh_ask,
         15,
         True,
         "ok",
         {
-            "spread_pct": 0.023,
-            "submit_bid": 1.25,
-            "submit_ask": 1.28,
-            "submit_mid": 1.265,
-            "submit_last": 1.27,
+            "spread_pct": (refresh_ask - refresh_bid) / refresh_mid,
+            "submit_bid": refresh_bid,
+            "submit_ask": refresh_ask,
+            "submit_mid": refresh_mid,
+            "submit_last": refresh_ask,
         },
     )
 
@@ -1671,15 +1716,18 @@ def test_pr514_live_deferred_c_materializes_actual_cost_before_final_gate(monkey
         "signal_id": SIGNAL_ID,
         "exclude_local_order_id": LOCAL_ORDER_ID,
     }]
-    assert len(mc.final_calls) == 1
-    final = mc.final_calls[0]
-    assert final["client_id"] == PR514_CLIENT_ID
-    assert final["signal_id"] == SIGNAL_ID
-    assert final["execution_mode"] == "live"
-    assert final["contract"] == "C260828C00133000"
-    assert final["price"] == pytest.approx(1.26)
-    assert final["qty"] == 1
-    assert final["actual_selected_cost"] == pytest.approx(126.0)
+    assert len(mc.final_calls) == 2
+    selector_final, broker_boundary_final = mc.final_calls
+    assert selector_final["client_id"] == PR514_CLIENT_ID
+    assert selector_final["signal_id"] == SIGNAL_ID
+    assert selector_final["execution_mode"] == "live"
+    assert selector_final["contract"] == "C260828C00133000"
+    assert selector_final["price"] == pytest.approx(1.26)
+    assert selector_final["qty"] == 1
+    assert selector_final["actual_selected_cost"] == pytest.approx(126.0)
+    assert broker_boundary_final["price"] == pytest.approx(1.29)
+    assert broker_boundary_final["qty"] == 1
+    assert broker_boundary_final["actual_selected_cost"] == pytest.approx(129.0)
     assert osm.row["contract"] == "C260828C00133000"
     assert osm.row["reserved_cost"] == pytest.approx(129.0)
     assert osm.row["meta"]["selector_meta"]["actual_selected_cost"] == pytest.approx(126.0)
@@ -1721,6 +1769,110 @@ def test_pr514_live_deferred_final_gate_blocks_total_cap_independently(monkeypat
     assert mc.capacity_calls[0]["execution_mode"] == "live"
     assert mc.final_calls[0]["actual_selected_cost"] == pytest.approx(126.0)
     assert osm.post_payloads == []
+
+
+def test_pr514_live_deferred_broker_boundary_blocks_refreshed_per_position_cost(
+    monkeypatch,
+):
+    mc = _DeferredCapacityMC(
+        final_ok_sequence=[True, False],
+        final_reason_sequence=[
+            "EXPOSURE_ALLOWED",
+            "ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP",
+        ],
+    )
+    result, osm, broker, mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=_CSelector(execution_price_per_share=1.70),
+        master_control=mc,
+        refresh_ask=1.72,
+    )
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP" in result["reason_code"]
+    assert len(mc.final_calls) == 2
+    assert mc.final_calls[0]["actual_selected_cost"] == pytest.approx(170.0)
+    assert mc.final_calls[1]["price"] == pytest.approx(1.73)
+    assert mc.final_calls[1]["actual_selected_cost"] == pytest.approx(173.0)
+    assert osm.post_payloads == []
+
+
+def test_pr514_live_deferred_broker_boundary_blocks_refreshed_total_cost(
+    monkeypatch,
+):
+    mc = _DeferredCapacityMC(
+        remaining_total_capacity=172.0,
+        final_ok_sequence=[True, False],
+        final_reason_sequence=[
+            "EXPOSURE_ALLOWED",
+            "ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY",
+        ],
+    )
+    result, osm, broker, mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=_CSelector(execution_price_per_share=1.70),
+        master_control=mc,
+        refresh_ask=1.72,
+    )
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY" in result[
+        "reason_code"
+    ]
+    assert mc.final_calls[0]["actual_selected_cost"] == pytest.approx(170.0)
+    assert mc.final_calls[1]["actual_selected_cost"] == pytest.approx(173.0)
+    assert osm.post_payloads == []
+
+
+def test_pr514_live_deferred_broker_boundary_submits_when_refreshed_cost_fits(
+    monkeypatch,
+):
+    mc = _DeferredCapacityMC(
+        remaining_total_capacity=180.0,
+        final_ok_sequence=[True, True],
+        final_reason_sequence=["EXPOSURE_ALLOWED", "EXPOSURE_ALLOWED"],
+    )
+    result, osm, broker, mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=_CSelector(execution_price_per_share=1.70),
+        master_control=mc,
+        refresh_ask=1.72,
+    )
+
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+    assert len(osm.post_payloads) == 1
+    assert len(mc.final_calls) == 2
+    assert mc.final_calls[1]["price"] == pytest.approx(1.73)
+    assert mc.final_calls[1]["actual_selected_cost"] == pytest.approx(173.0)
+    assert osm.row["reserved_cost"] == pytest.approx(173.0)
+
+
+def test_pr514_live_deferred_broker_boundary_recomputes_cost_after_qty_resize(
+    monkeypatch,
+):
+    mc = _DeferredCapacityMC(
+        final_ok_sequence=[True, True],
+        final_reason_sequence=["EXPOSURE_ALLOWED", "EXPOSURE_ALLOWED"],
+        resize_qty_sequence=[None, 1],
+    )
+    result, osm, broker, mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=_CSelector(
+            execution_price_per_share=0.85,
+            affordable_contracts=2,
+        ),
+        master_control=mc,
+        refresh_ask=0.87,
+    )
+
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+    assert len(osm.post_payloads) == 1
+    assert mc.final_calls[0]["qty"] == 2
+    assert mc.final_calls[0]["actual_selected_cost"] == pytest.approx(170.0)
+    assert mc.final_calls[1]["qty"] == 2
+    assert mc.final_calls[1]["actual_selected_cost"] == pytest.approx(176.0)
+    assert osm.row["qty"] == 1
+    assert osm.row["reserved_cost"] == pytest.approx(88.0)
 
 
 def test_pr514_live_deferred_no_affordable_selector_result_stays_terminal(monkeypatch):
