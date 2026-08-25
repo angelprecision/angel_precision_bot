@@ -174,6 +174,7 @@ def test_trigger_ready_deferred_quote_refresh_failure_expires_order_with_last_er
         limit_price=3.10,
         contracts=1,
         max_position_usd=310.0,
+        execution_mode="paper",
         metadata={"contract_deferred": True},
         trigger_price=210.0,
         side="CALL",
