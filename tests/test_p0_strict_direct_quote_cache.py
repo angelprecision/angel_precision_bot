@@ -24,6 +24,7 @@ from ap.contract_selector import (  # noqa: E402
     APContractSelectionEngine,
     _classify_selector_failure,
 )
+from ap.brokers.tradier import TradierBroker, TradierConfig  # noqa: E402
 
 
 OCC = "SPY260901C00101000"
@@ -138,6 +139,48 @@ def test_finite_positive_uncrossed_quote_caches_and_reuses():
     assert second["ask"] == VALID_QUOTE["ask"]
     assert _cached(broker) is not None
     assert broker.calls == [OCC]
+
+
+@pytest.mark.parametrize(
+    ("bid", "ask", "invalid_field"),
+    [
+        (True, 1.70, "bid"),
+        (1.60, False, "ask"),
+    ],
+)
+def test_tradier_boolean_quote_scalars_cannot_become_cache_authority(
+    bid, ask, invalid_field
+):
+    """Provider booleans must stay invalid through the real adapter boundary."""
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="token",
+            account_id="acct",
+        )
+    )
+    broker._get = MagicMock(
+        side_effect=[
+            {"quotes": {"quote": {"bid": 1.60, "ask": 1.70, "last": 1.65}}},
+            {"quotes": {"quote": {"bid": bid, "ask": ask, "last": 1.65}}},
+        ]
+    )
+
+    first = fetch_direct_option_quote_with_meta(broker, OCC)
+    assert first["ok"] is True
+    assert _cached(broker) is not None
+
+    refreshed = fetch_direct_option_quote_with_meta(broker, OCC, cache_ttl_s=0.0)
+    assert refreshed["ok"] is True
+    assert refreshed["quote"][invalid_field] is None
+    assert direct_quote_is_valid(refreshed["quote"]) is False
+    assert _cached(broker) is None
+    broker._get.assert_has_calls(
+        [
+            (("/v1/markets/quotes",), {"params": {"symbols": OCC, "greeks": "false"}}),
+            (("/v1/markets/quotes",), {"params": {"symbols": OCC, "greeks": "false"}}),
+        ]
+    )
 
 
 @pytest.mark.parametrize(
