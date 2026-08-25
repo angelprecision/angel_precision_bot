@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util as _importlib_util
 import json as _json
 import sys as _sys
+from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path as _Path
 from typing import Any as _Any
 
@@ -63,16 +64,32 @@ def _as_dict(value: _Any) -> dict:
     return {}
 
 
+def _coerce_utc(value: _Any):
+    if isinstance(value, _datetime):
+        return value if value.tzinfo else value.replace(tzinfo=_timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            dt = _datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=_timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
 def _immutable_underlying_from_entry_meta(meta: dict) -> tuple[float, str]:
-    """Extract only values persisted at entry time, never a fresh quote."""
-    zero_repair = _as_dict(meta.get("zero_underlying_repair"))
-    trigger = _as_dict(meta.get("trigger"))
+    """Extract explicitly historical entry-underlying fields only.
+
+    Generic ``current_underlying_price``, ``underlying_price``, trigger prices,
+    and quote-repair values are intentionally excluded. They can be useful
+    diagnostics, but their names/provenance do not prove that they represent the
+    underlying at broker-confirmed fill time. Missing truth must remain missing.
+    """
     candidates = (
         ("meta.underlying_entry", meta.get("underlying_entry")),
-        ("meta.zero_underlying_repair.value", zero_repair.get("value")),
-        ("meta.trigger.current_price", trigger.get("current_price")),
-        ("meta.current_underlying_price", meta.get("current_underlying_price")),
-        ("meta.underlying_price", meta.get("underlying_price")),
+        ("meta.entry_underlying", meta.get("entry_underlying")),
+        ("meta.underlying_price_at_entry", meta.get("underlying_price_at_entry")),
+        ("meta.underlying_entry_price", meta.get("underlying_entry_price")),
+        ("meta.entry_underlying_price", meta.get("entry_underlying_price")),
     )
     for source, raw in candidates:
         val = _positive_float(raw)
@@ -84,48 +101,157 @@ def _immutable_underlying_from_entry_meta(meta: dict) -> tuple[float, str]:
 class APBrokerReconciler(_BaseAPBrokerReconciler):
     """Legacy reconciler with canonical identity adoption and immutable entry truth."""
 
-    def _filled_entry_evidence(self, contract: str, *, position_id: str = "") -> dict | None:
+    def _filled_entry_evidence(
+        self,
+        contract: str,
+        *,
+        position_id: str = "",
+        position_entry_ts: _Any = None,
+    ) -> dict | None:
+        """Return one proven ENTRY fill without crossing lifecycle identity.
+
+        Normal case: require the filled order to be linked to ``position_id``.
+
+        Incident-race case: a canonical position may become visible a few seconds
+        before ``orders.position_id`` is linked. If and only if the linked lookup
+        misses, accept exactly one *unlinked* filled ENTRY for the same
+        client/mode/contract whose fill timestamp is within five minutes of the
+        canonical position entry timestamp. Multiple candidates, missing timing
+        proof, or an order linked to another position all fail closed.
+        """
         mode = _normalize_execution_mode(self.execution_mode)
         contract_u = self._norm_contract(contract)
         if mode is None or not contract_u or not self.client_id:
             return None
+
+        columns = """
+            SELECT position_id, local_order_id, broker_order_id,
+                   signal_id, canonical_signal_id,
+                   fill_price, filled_qty, filled_ts,
+                   stop_underlying, target_underlying, meta
+            FROM orders
+            WHERE client_id = %s
+              AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+              AND UPPER(contract) = UPPER(%s)
+              AND UPPER(COALESCE(kind, '')) = 'ENTRY'
+              AND UPPER(COALESCE(status, '')) IN ('FILLED', 'PARTIAL_FILL')
+              AND COALESCE(filled_qty, 0) > 0
+        """
+
         try:
             from ap.db import conn, run_with_retry
 
-            def _query():
+            def _decorate(row: dict | None) -> dict | None:
+                if not row:
+                    return None
+                out = dict(row)
+                value, source = _immutable_underlying_from_entry_meta(
+                    _as_dict(out.get("meta"))
+                )
+                out["underlying_entry"] = value
+                out["underlying_entry_source"] = source
+                return out
+
+            if position_id:
+                def _linked_query():
+                    with conn() as c:
+                        c.execute(
+                            columns
+                            + """
+                              AND COALESCE(position_id, '') = %s
+                            ORDER BY filled_ts DESC NULLS LAST,
+                                     updated_ts DESC NULLS LAST,
+                                     id DESC
+                            LIMIT 1
+                            """,
+                            (self.client_id, mode, contract_u, position_id),
+                        )
+                        row = c.fetchone()
+                        return dict(row) if row else None
+
+                linked = run_with_retry(_linked_query)
+                if linked:
+                    return _decorate(linked)
+
+                # The only safe fallback is the short position-link race. Do not
+                # borrow an order already owned by a different canonical position.
+                anchor_ts = _coerce_utc(position_entry_ts)
+                if anchor_ts is None:
+                    log.warning(
+                        "[%s] FILLED_ENTRY_EVIDENCE_UNLINKED_BLOCKED contract=%s pos=%s "
+                        "reason=missing_position_entry_ts",
+                        self.client_id, contract_u, position_id,
+                    )
+                    return None
+
+                def _unlinked_query():
+                    with conn() as c:
+                        c.execute(
+                            columns
+                            + """
+                              AND COALESCE(position_id, '') = ''
+                            ORDER BY filled_ts DESC NULLS LAST,
+                                     updated_ts DESC NULLS LAST,
+                                     id DESC
+                            LIMIT 5
+                            """,
+                            (self.client_id, mode, contract_u),
+                        )
+                        return [dict(r) for r in (c.fetchall() or [])]
+
+                unlinked = run_with_retry(_unlinked_query) or []
+                candidates = []
+                for row in unlinked:
+                    filled_ts = _coerce_utc(row.get("filled_ts"))
+                    if filled_ts is None:
+                        continue
+                    if abs((filled_ts - anchor_ts).total_seconds()) <= 300:
+                        candidates.append(row)
+
+                if len(candidates) == 1:
+                    log.warning(
+                        "[%s] FILLED_ENTRY_EVIDENCE_UNLINKED_RACE_RECOVERED "
+                        "contract=%s pos=%s local_order=%s",
+                        self.client_id,
+                        contract_u,
+                        position_id,
+                        candidates[0].get("local_order_id") or "?",
+                    )
+                    return _decorate(candidates[0])
+                if len(candidates) > 1:
+                    log.critical(
+                        "[%s] FILLED_ENTRY_EVIDENCE_UNLINKED_AMBIGUOUS "
+                        "contract=%s pos=%s candidates=%d — refusing lifecycle cross-link",
+                        self.client_id, contract_u, position_id, len(candidates),
+                    )
+                return None
+
+            # No canonical position identity exists. Do not silently choose the
+            # newest row when multiple historical ENTRY fills share a contract.
+            def _unscoped_query():
                 with conn() as c:
                     c.execute(
-                        """
-                        SELECT position_id, local_order_id, broker_order_id,
-                               signal_id, canonical_signal_id,
-                               fill_price, filled_qty, filled_ts,
-                               stop_underlying, target_underlying, meta
-                        FROM orders
-                        WHERE client_id = %s
-                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                          AND UPPER(contract) = UPPER(%s)
-                          AND UPPER(COALESCE(kind, '')) = 'ENTRY'
-                          AND UPPER(COALESCE(status, '')) IN ('FILLED', 'PARTIAL_FILL')
-                          AND COALESCE(filled_qty, 0) > 0
-                          AND (%s = '' OR COALESCE(position_id, '') = %s)
+                        columns
+                        + """
                         ORDER BY filled_ts DESC NULLS LAST,
                                  updated_ts DESC NULLS LAST,
                                  id DESC
-                        LIMIT 1
+                        LIMIT 2
                         """,
-                        (self.client_id, mode, contract_u, position_id, position_id),
+                        (self.client_id, mode, contract_u),
                     )
-                    row = c.fetchone()
-                    return dict(row) if row else None
+                    return [dict(r) for r in (c.fetchall() or [])]
 
-            row = run_with_retry(_query)
-            if not row:
-                return None
-            row = dict(row)
-            value, source = _immutable_underlying_from_entry_meta(_as_dict(row.get("meta")))
-            row["underlying_entry"] = value
-            row["underlying_entry_source"] = source
-            return row
+            rows = run_with_retry(_unscoped_query) or []
+            if len(rows) == 1:
+                return _decorate(rows[0])
+            if len(rows) > 1:
+                log.critical(
+                    "[%s] FILLED_ENTRY_EVIDENCE_AMBIGUOUS contract=%s mode=%s "
+                    "candidates=%d — historical anchor remains untrusted",
+                    self.client_id, contract_u, mode, len(rows),
+                )
+            return None
         except Exception as exc:
             log.warning(
                 "[%s] FILLED_ENTRY_EVIDENCE_LOOKUP_FAILED contract=%s pos=%s mode=%s error=%s",
@@ -142,15 +268,21 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
     ) -> float:
         """Return historical entry truth only; never substitute the current market."""
         for key in (
-            "underlying_entry", "entry_underlying", "trigger_price",
-            "underlying_entry_price", "entry_underlying_price", "opened_underlying",
+            "underlying_entry",
+            "entry_underlying",
+            "underlying_entry_price",
+            "entry_underlying_price",
         ):
             val = self._safe_float(pos.get(key), 0.0)
             if val > 0:
                 return val
 
         position_id = str(pos.get("id") or pos.get("position_id") or "").strip()
-        evidence = self._filled_entry_evidence(contract, position_id=position_id) or {}
+        evidence = self._filled_entry_evidence(
+            contract,
+            position_id=position_id,
+            position_entry_ts=pos.get("entry_ts"),
+        ) or {}
         return _positive_float(evidence.get("underlying_entry"))
 
     def _derive_underlying_entry_from_broker_position(
@@ -192,7 +324,12 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
         if qty <= 0 or entry_px <= 0 or not contract or not pos_id:
             return
 
-        evidence = self._filled_entry_evidence(contract, position_id=pos_id) or {}
+        position_entry_ts = pos.get("entry_ts")
+        evidence = self._filled_entry_evidence(
+            contract,
+            position_id=pos_id,
+            position_entry_ts=position_entry_ts,
+        ) or {}
         underlying_entry = self._derive_underlying_entry_from_position(
             pos, underlying=underlying, contract=contract
         )
@@ -225,6 +362,7 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
             underlying_entry=underlying_entry,
             price_untrusted=price_untrusted,
             entry_evidence=evidence,
+            position_entry_ts=position_entry_ts,
         )
 
     def _seed_exit_engine_from_import(
@@ -241,10 +379,11 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
         underlying_entry: float = 0.0,
         price_untrusted: bool = False,
         entry_evidence: dict | None = None,
+        position_entry_ts: _Any = None,
     ) -> None:
         """Adopt a broker-repair owner into canonical identity before generic add.
 
-        Crucially, missing ``underlying_entry`` remains zero/untrusted.  This
+        Crucially, missing ``underlying_entry`` remains zero/untrusted. This
         allows existing degraded-data guards to HOLD rather than rewriting
         history from the current market and pretending the data is trustworthy.
         """
@@ -274,7 +413,15 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
                 )
                 return
 
-            evidence = dict(entry_evidence or self._filled_entry_evidence(contract, position_id=pos_id) or {})
+            evidence = dict(
+                entry_evidence
+                or self._filled_entry_evidence(
+                    contract,
+                    position_id=pos_id,
+                    position_entry_ts=position_entry_ts,
+                )
+                or {}
+            )
             persisted_underlying = _positive_float(underlying_entry)
             if persisted_underlying <= 0:
                 persisted_underlying = _positive_float(evidence.get("underlying_entry"))
@@ -291,7 +438,7 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
             canonical_signal_id = str(
                 evidence.get("canonical_signal_id") or evidence.get("signal_id") or signal_id
             ).strip()
-            entry_ts = evidence.get("filled_ts")
+            entry_ts = evidence.get("filled_ts") or position_entry_ts
 
             adopt = getattr(ee, "adopt_canonical_position_identity", None)
             if callable(adopt):
@@ -304,7 +451,7 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
                     canonical_signal_id=canonical_signal_id,
                     entry_fill=float(entry_px),
                     entry_ts=entry_ts,
-                    order_filled_ts=entry_ts,
+                    order_filled_ts=evidence.get("filled_ts"),
                     execution_mode=mode,
                     client_id=self.client_id,
                     underlying_entry=float(persisted_underlying),
