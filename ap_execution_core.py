@@ -144,6 +144,9 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 # for callers that want richer metadata.
 from ap.selector_retry_policy import (
     RETRYABLE_BREACH_SELECTOR_REASONS,
+    TERMINAL_INVARIANT,
+    TERMINAL_POLICY,
+    classify_selector_reason as _classify_selector_reason,
     is_retryable_selector_reason as _is_retryable_selector_reason,  # noqa: F401 – re-exported
     is_operational_request_budget_reason as _is_operational_request_budget_reason,
 )
@@ -941,6 +944,7 @@ def _classify_deferred_breach_retry_decision(
     ladder_retryable: bool = False,
 ) -> dict:
     _reason_code = str(reason_code or "").strip() or "BREACH_SELECTOR_RETURNED_NONE"
+    _reason_classification = _classify_selector_reason(_reason_code)
     _retryable_reason = (
         _reason_code in RETRYABLE_BREACH_SELECTOR_REASONS or bool(ladder_retryable)
     )
@@ -984,11 +988,50 @@ def _classify_deferred_breach_retry_decision(
             "retryable_reason": True,
             "terminal_reason": f"breach_retry_unavailable:{_reason_code}",
         }
+    if _reason_classification == TERMINAL_INVARIANT:
+        return {
+            "action": "terminal_invariant",
+            "reason_code": _reason_code,
+            "retryable_reason": False,
+        }
+    # PR #504's request-scope structural policy proof has its own canonical
+    # downstream action. Preserve the historical action for existing policy
+    # reasons (for example UNTRADEABLE_FOR_ACCOUNT_SIZE); this branch governs
+    # only the newly registered structural-policy request reason.
+    if (
+        _reason_code == "TERMINAL_POLICY_REJECT"
+        and _reason_classification == TERMINAL_POLICY
+    ):
+        return {
+            "action": "terminal_policy",
+            "reason_code": _reason_code,
+            "retryable_reason": False,
+        }
     return {
         "action": "terminal_quality",
         "reason_code": _reason_code,
         "retryable_reason": False,
     }
+
+
+def _deferred_selector_status(decision: dict) -> str:
+    """Return the durable dashboard status for a deferred selector decision.
+
+    ``TERMINAL_POLICY_REJECT`` is a policy block, not a quality rejection.
+    Keep this classification separate from the retry decision so the exact
+    selector reason remains authoritative while the operator-facing status
+    uses the existing ``CONTRACT_SELECTION_BLOCKED`` taxonomy.
+    """
+    if not isinstance(decision, dict):
+        return "CONTRACT_SELECTION_INVARIANT_FAILURE"
+    action = str(decision.get("action") or "")
+    if action == "terminal_invariant":
+        return "CONTRACT_SELECTION_INVARIANT_FAILURE"
+    if action == "terminal_policy":
+        return "CONTRACT_SELECTION_BLOCKED"
+    if decision.get("retryable_reason"):
+        return "CONTRACT_SELECTION_DATA_ERROR"
+    return "CONTRACT_SELECTION_QUALITY_REJECT"
 
 
 def _build_deferred_retry_schedule_meta(
@@ -5972,11 +6015,7 @@ class APExecutionCore:
 
                     # Not retryable (quality reject, max retries exceeded, or past cutoff).
                     # Classify into specific dashboard taxonomy before terminalizing.
-                    _cs_status_a = (
-                        "CONTRACT_SELECTION_DATA_ERROR"
-                        if _decision_a["retryable_reason"]
-                        else "CONTRACT_SELECTION_QUALITY_REJECT"
-                    )
+                    _cs_status_a = _deferred_selector_status(_decision_a)
 
                     log.critical(
                         "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "

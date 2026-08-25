@@ -1,0 +1,2295 @@
+[
+  {
+    "attempted_symbols": [
+      "AEP260821P00115000"
+    ],
+    "client_id": "jasoncosby1@gmail.com",
+    "created_ts": "2026-08-19T13:31:40.41746+00:00",
+    "eligible_unattempted_symbols": [],
+    "execution_mode": "live",
+    "id": 28364,
+    "known_eligible_symbols": [
+      "AEP260821P00060000",
+      "AEP260821P00065000",
+      "AEP260821P00070000",
+      "AEP260821P00075000",
+      "AEP260821P00080000",
+      "AEP260821P00085000",
+      "AEP260821P00090000",
+      "AEP260821P00095000",
+      "AEP260821P00100000",
+      "AEP260821P00105000",
+      "AEP260821P00110000",
+      "AEP260821P00115000",
+      "AEP260821P00120000",
+      "AEP260918P00055000",
+      "AEP260918P00060000",
+      "AEP260918P00065000",
+      "AEP260918P00070000",
+      "AEP260918P00075000",
+      "AEP260918P00080000",
+      "AEP260918P00085000",
+      "AEP260918P00090000",
+      "AEP260918P00095000",
+      "AEP260918P00100000",
+      "AEP260918P00105000",
+      "AEP260918P00110000",
+      "AEP261120P00080000",
+      "AEP261120P00085000",
+      "AEP261120P00090000",
+      "AEP261120P00095000",
+      "AEP261120P00100000",
+      "AEP261120P00105000"
+    ],
+    "local_order_id": "5b8cae63-c321-4b0f-b4fa-4ceeaf22bf3e",
+    "persisted_reason": "MONEYNESS_OUT_OF_RANGE",
+    "structural_records": [
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "AEP260821P00120000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00110000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "AEP260821P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00110000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP260918P00055000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP261120P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP261120P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP261120P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP261120P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP261120P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "AEP261120P00080000"
+      }
+    ],
+    "symbol": "AEP",
+    "top_reject_buckets": {
+      "BID_BELOW_MIN": 1,
+      "CHAIN_ROW_ZERO_BID_ASK": 11,
+      "DIRECT_QUOTE_ZERO_BID_ASK": 1,
+      "OI_TOO_LOW": 4,
+      "SPREAD_TOO_WIDE": 1
+    }
+  },
+  {
+    "attempted_symbols": [
+      "SBUX260821P00097000",
+      "SBUX260821P00096000",
+      "SBUX260821P00095000",
+      "SBUX260821P00094000"
+    ],
+    "client_id": "jasoncosby1@gmail.com",
+    "created_ts": "2026-08-19T13:32:38.011095+00:00",
+    "eligible_unattempted_symbols": [],
+    "execution_mode": "live",
+    "id": 28399,
+    "known_eligible_symbols": [
+      "SBUX260821P00055000",
+      "SBUX260821P00060000",
+      "SBUX260821P00065000",
+      "SBUX260821P00070000",
+      "SBUX260821P00075000",
+      "SBUX260821P00080000",
+      "SBUX260821P00085000",
+      "SBUX260821P00090000",
+      "SBUX260821P00091000",
+      "SBUX260821P00092000",
+      "SBUX260821P00093000",
+      "SBUX260821P00094000",
+      "SBUX260821P00095000",
+      "SBUX260821P00096000",
+      "SBUX260821P00097000",
+      "SBUX260821P00098000",
+      "SBUX260821P00099000",
+      "SBUX260821P00100000",
+      "SBUX260821P00101000",
+      "SBUX260821P00102000",
+      "SBUX260821P00103000",
+      "SBUX260828P00055000",
+      "SBUX260828P00060000",
+      "SBUX260828P00065000",
+      "SBUX260828P00070000",
+      "SBUX260828P00075000",
+      "SBUX260828P00080000",
+      "SBUX260828P00085000",
+      "SBUX260828P00090000",
+      "SBUX260828P00091000",
+      "SBUX260828P00092000",
+      "SBUX260828P00093000",
+      "SBUX260828P00094000",
+      "SBUX260828P00095000",
+      "SBUX260828P00096000",
+      "SBUX260828P00097000",
+      "SBUX260828P00098000",
+      "SBUX260828P00099000",
+      "SBUX260828P00100000",
+      "SBUX260904P00055000",
+      "SBUX260904P00060000",
+      "SBUX260904P00065000",
+      "SBUX260904P00070000",
+      "SBUX260904P00075000",
+      "SBUX260904P00080000",
+      "SBUX260904P00085000",
+      "SBUX260904P00090000",
+      "SBUX260904P00091000",
+      "SBUX260904P00092000",
+      "SBUX260904P00093000",
+      "SBUX260904P00094000",
+      "SBUX260904P00095000",
+      "SBUX260904P00096000",
+      "SBUX260904P00097000",
+      "SBUX260904P00098000"
+    ],
+    "local_order_id": "f510c6f2-51a2-4f50-bfd0-b737517c579c",
+    "persisted_reason": "MONEYNESS_OUT_OF_RANGE",
+    "structural_records": [
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00103000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00102000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00101000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00099000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00098000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00093000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00092000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00091000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00055000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00099000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00098000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00097000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00096000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00094000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00093000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00092000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00091000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00055000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00098000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00097000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00096000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00094000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00093000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00092000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00091000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00055000"
+      }
+    ],
+    "symbol": "SBUX",
+    "top_reject_buckets": {
+      "BID_BELOW_MIN": 2,
+      "CHAIN_ROW_ZERO_BID_ASK": 15,
+      "DIRECT_QUOTE_ZERO_BID_ASK": 4,
+      "OI_TOO_LOW": 7,
+      "SPREAD_TOO_WIDE": 1
+    }
+  },
+  {
+    "attempted_symbols": [],
+    "client_id": "jasoncosby1@gmail.com",
+    "created_ts": "2026-08-19T13:32:56.653699+00:00",
+    "eligible_unattempted_symbols": [],
+    "execution_mode": "live",
+    "id": 28408,
+    "known_eligible_symbols": [
+      "FTNT260821P00060000",
+      "FTNT260821P00065000",
+      "FTNT260821P00070000",
+      "FTNT260821P00075000",
+      "FTNT260821P00080000",
+      "FTNT260821P00085000",
+      "FTNT260821P00090000",
+      "FTNT260821P00095000",
+      "FTNT260821P00100000",
+      "FTNT260821P00105000",
+      "FTNT260821P00110000",
+      "FTNT260821P00115000",
+      "FTNT260821P00120000",
+      "FTNT260821P00125000",
+      "FTNT260821P00130000",
+      "FTNT260821P00135000",
+      "FTNT260821P00140000",
+      "FTNT260821P00141000",
+      "FTNT260821P00142000",
+      "FTNT260821P00143000",
+      "FTNT260821P00144000",
+      "FTNT260821P00145000",
+      "FTNT260821P00146000",
+      "FTNT260821P00147000",
+      "FTNT260821P00149000",
+      "FTNT260828P00075000",
+      "FTNT260828P00080000",
+      "FTNT260828P00085000",
+      "FTNT260828P00090000",
+      "FTNT260828P00095000",
+      "FTNT260828P00100000",
+      "FTNT260828P00105000",
+      "FTNT260828P00110000",
+      "FTNT260828P00115000",
+      "FTNT260828P00120000",
+      "FTNT260828P00125000",
+      "FTNT260828P00130000",
+      "FTNT260828P00135000",
+      "FTNT260904P00075000",
+      "FTNT260904P00080000",
+      "FTNT260904P00085000",
+      "FTNT260904P00090000",
+      "FTNT260904P00095000",
+      "FTNT260904P00100000",
+      "FTNT260904P00105000",
+      "FTNT260904P00110000",
+      "FTNT260904P00115000",
+      "FTNT260904P00120000",
+      "FTNT260904P00125000",
+      "FTNT260904P00130000",
+      "FTNT260904P00135000"
+    ],
+    "local_order_id": "2345bbe7-c68a-4ba2-9f41-445e7c6eca3d",
+    "persisted_reason": "MONEYNESS_OUT_OF_RANGE",
+    "structural_records": [
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00149000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00147000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00146000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00145000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00144000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00143000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00142000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00141000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00140000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00135000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00130000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00125000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00120000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00115000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00110000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00135000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00130000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00125000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00120000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00115000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00110000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00135000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00130000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00125000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00120000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00115000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00110000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00075000"
+      }
+    ],
+    "symbol": "FTNT",
+    "top_reject_buckets": {
+      "BID_BELOW_MIN": 3,
+      "CHAIN_ROW_ZERO_BID_ASK": 22,
+      "OI_TOO_LOW": 14,
+      "SPREAD_TOO_WIDE": 1
+    }
+  },
+  {
+    "attempted_symbols": [
+      "SBUX260821P00101000",
+      "SBUX260821P00100000",
+      "SBUX260821P00099000",
+      "SBUX260821P00098000",
+      "SBUX260821P00097000",
+      "SBUX260821P00096000",
+      "SBUX260821P00095000",
+      "SBUX260821P00094000",
+      "SBUX260821P00093000",
+      "SBUX260828P00099000",
+      "SBUX260828P00098000",
+      "SBUX260828P00097000",
+      "SBUX260828P00096000",
+      "SBUX260828P00095000",
+      "SBUX260828P00094000",
+      "SBUX260828P00093000",
+      "SBUX260904P00097000",
+      "SBUX260904P00096000",
+      "SBUX260904P00095000",
+      "SBUX260904P00094000",
+      "SBUX260904P00093000"
+    ],
+    "client_id": "jasoncosby1@gmail.com",
+    "created_ts": "2026-08-20T13:31:17.817026+00:00",
+    "eligible_unattempted_symbols": [],
+    "execution_mode": "live",
+    "id": 28506,
+    "known_eligible_symbols": [
+      "SBUX260821P00055000",
+      "SBUX260821P00060000",
+      "SBUX260821P00065000",
+      "SBUX260821P00070000",
+      "SBUX260821P00075000",
+      "SBUX260821P00080000",
+      "SBUX260821P00085000",
+      "SBUX260821P00090000",
+      "SBUX260821P00091000",
+      "SBUX260821P00092000",
+      "SBUX260821P00093000",
+      "SBUX260821P00094000",
+      "SBUX260821P00095000",
+      "SBUX260821P00096000",
+      "SBUX260821P00097000",
+      "SBUX260821P00098000",
+      "SBUX260821P00099000",
+      "SBUX260821P00100000",
+      "SBUX260821P00101000",
+      "SBUX260821P00102000",
+      "SBUX260828P00055000",
+      "SBUX260828P00060000",
+      "SBUX260828P00065000",
+      "SBUX260828P00070000",
+      "SBUX260828P00075000",
+      "SBUX260828P00080000",
+      "SBUX260828P00085000",
+      "SBUX260828P00090000",
+      "SBUX260828P00091000",
+      "SBUX260828P00092000",
+      "SBUX260828P00093000",
+      "SBUX260828P00094000",
+      "SBUX260828P00095000",
+      "SBUX260828P00096000",
+      "SBUX260828P00097000",
+      "SBUX260828P00098000",
+      "SBUX260828P00099000",
+      "SBUX260828P00100000",
+      "SBUX260828P00101000",
+      "SBUX260904P00055000",
+      "SBUX260904P00060000",
+      "SBUX260904P00065000",
+      "SBUX260904P00070000",
+      "SBUX260904P00075000",
+      "SBUX260904P00080000",
+      "SBUX260904P00085000",
+      "SBUX260904P00090000",
+      "SBUX260904P00091000",
+      "SBUX260904P00092000",
+      "SBUX260904P00093000",
+      "SBUX260904P00094000",
+      "SBUX260904P00095000",
+      "SBUX260904P00096000",
+      "SBUX260904P00097000",
+      "SBUX260904P00098000",
+      "SBUX260904P00099000"
+    ],
+    "local_order_id": "49b6a5d7-f580-45b8-a37e-1baf14610dbe",
+    "persisted_reason": "MONEYNESS_OUT_OF_RANGE",
+    "structural_records": [
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00102000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00092000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00091000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260821P00055000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00101000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00092000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00091000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260828P00055000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00099000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00098000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00092000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00091000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "SBUX260904P00055000"
+      }
+    ],
+    "symbol": "SBUX",
+    "top_reject_buckets": {
+      "BID_BELOW_MIN": 1,
+      "CHAIN_ROW_ZERO_BID_ASK": 10,
+      "DIRECT_QUOTE_ZERO_BID_ASK": 9,
+      "OI_TOO_LOW": 4,
+      "SPREAD_TOO_WIDE": 1
+    }
+  },
+  {
+    "attempted_symbols": [
+      "FTNT260821P00139000",
+      "FTNT260821P00138000",
+      "FTNT260828P00146000",
+      "FTNT260828P00143000",
+      "FTNT260828P00142000",
+      "FTNT260828P00139000",
+      "FTNT260828P00138000",
+      "FTNT260828P00137000",
+      "FTNT260828P00136000",
+      "FTNT260828P00134000",
+      "FTNT260904P00147000",
+      "FTNT260904P00144000",
+      "FTNT260904P00142000",
+      "FTNT260904P00141000",
+      "FTNT260904P00139000",
+      "FTNT260904P00137000",
+      "FTNT260904P00136000",
+      "FTNT260904P00134000"
+    ],
+    "client_id": "jasoncosby1@gmail.com",
+    "created_ts": "2026-08-20T13:31:40.460063+00:00",
+    "eligible_unattempted_symbols": [],
+    "execution_mode": "live",
+    "id": 28522,
+    "known_eligible_symbols": [
+      "FTNT260821P00060000",
+      "FTNT260821P00065000",
+      "FTNT260821P00070000",
+      "FTNT260821P00075000",
+      "FTNT260821P00080000",
+      "FTNT260821P00085000",
+      "FTNT260821P00090000",
+      "FTNT260821P00095000",
+      "FTNT260821P00100000",
+      "FTNT260821P00105000",
+      "FTNT260821P00110000",
+      "FTNT260821P00115000",
+      "FTNT260821P00120000",
+      "FTNT260821P00125000",
+      "FTNT260821P00130000",
+      "FTNT260821P00135000",
+      "FTNT260821P00138000",
+      "FTNT260821P00139000",
+      "FTNT260821P00140000",
+      "FTNT260821P00141000",
+      "FTNT260821P00142000",
+      "FTNT260821P00143000",
+      "FTNT260821P00144000",
+      "FTNT260821P00145000",
+      "FTNT260821P00146000",
+      "FTNT260821P00147000",
+      "FTNT260828P00075000",
+      "FTNT260828P00080000",
+      "FTNT260828P00085000",
+      "FTNT260828P00090000",
+      "FTNT260828P00095000",
+      "FTNT260828P00100000",
+      "FTNT260828P00105000",
+      "FTNT260828P00110000",
+      "FTNT260828P00115000",
+      "FTNT260828P00120000",
+      "FTNT260828P00125000",
+      "FTNT260828P00130000",
+      "FTNT260828P00133000",
+      "FTNT260828P00134000",
+      "FTNT260828P00135000",
+      "FTNT260828P00136000",
+      "FTNT260828P00137000",
+      "FTNT260828P00138000",
+      "FTNT260828P00139000",
+      "FTNT260828P00140000",
+      "FTNT260828P00142000",
+      "FTNT260828P00143000",
+      "FTNT260828P00146000",
+      "FTNT260904P00075000",
+      "FTNT260904P00080000",
+      "FTNT260904P00085000",
+      "FTNT260904P00090000",
+      "FTNT260904P00095000",
+      "FTNT260904P00100000",
+      "FTNT260904P00105000",
+      "FTNT260904P00110000",
+      "FTNT260904P00115000",
+      "FTNT260904P00120000",
+      "FTNT260904P00125000",
+      "FTNT260904P00128000",
+      "FTNT260904P00129000",
+      "FTNT260904P00130000",
+      "FTNT260904P00131000",
+      "FTNT260904P00132000",
+      "FTNT260904P00134000",
+      "FTNT260904P00136000",
+      "FTNT260904P00137000",
+      "FTNT260904P00139000",
+      "FTNT260904P00141000",
+      "FTNT260904P00142000",
+      "FTNT260904P00144000",
+      "FTNT260904P00147000"
+    ],
+    "local_order_id": "ce65c991-d014-4db9-93db-449aa540803b",
+    "persisted_reason": "MONEYNESS_OUT_OF_RANGE",
+    "structural_records": [
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00147000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00146000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00145000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00144000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00143000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00142000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00141000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00140000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00135000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00130000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00125000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00120000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00115000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00110000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00070000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00065000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260821P00060000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00140000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00135000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00133000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00130000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00125000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00120000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00115000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00110000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260828P00075000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00132000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00131000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00130000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00129000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00128000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00125000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00120000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00115000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00110000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00105000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00100000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00095000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00090000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00085000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00080000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "FTNT260904P00075000"
+      }
+    ],
+    "symbol": "FTNT",
+    "top_reject_buckets": {
+      "BID_BELOW_MIN": 5,
+      "CHAIN_ROW_ZERO_BID_ASK": 19,
+      "DIRECT_QUOTE_ZERO_BID_ASK": 2,
+      "SPREAD_TOO_WIDE": 1,
+      "VOLUME_TOO_LOW": 1
+    }
+  },
+  {
+    "attempted_symbols": [
+      "CDW260821C00155000"
+    ],
+    "client_id": "jasoncosby1@gmail.com",
+    "created_ts": "2026-08-20T13:34:41.18338+00:00",
+    "eligible_unattempted_symbols": [],
+    "execution_mode": "live",
+    "id": 28619,
+    "known_eligible_symbols": [
+      "CDW260821C00145000",
+      "CDW260821C00150000",
+      "CDW260821C00155000",
+      "CDW260821C00160000",
+      "CDW260821C00165000",
+      "CDW260821C00170000",
+      "CDW260821C00175000",
+      "CDW260821C00180000",
+      "CDW260821C00185000",
+      "CDW260821C00190000",
+      "CDW260821C00195000",
+      "CDW260821C00200000",
+      "CDW260918C00155000",
+      "CDW260918C00170000",
+      "CDW260918C00175000",
+      "CDW260918C00180000",
+      "CDW260918C00185000",
+      "CDW260918C00190000",
+      "CDW260918C00195000",
+      "CDW260918C00200000",
+      "CDW260918C00210000",
+      "CDW261016C00170000",
+      "CDW261016C00195000",
+      "CDW261016C00200000",
+      "CDW261016C00210000"
+    ],
+    "local_order_id": "eaa7c7fd-d256-41be-a921-ef1d6ae5032c",
+    "persisted_reason": "MONEYNESS_OUT_OF_RANGE",
+    "structural_records": [
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "CDW260821C00145000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "CDW260821C00150000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00160000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00165000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00170000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00175000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00180000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00185000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00190000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00195000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "CDW260821C00200000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00155000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00170000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00175000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00180000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00185000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00190000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00195000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00200000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW260918C00210000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW261016C00170000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW261016C00195000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW261016C00200000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DTE_OUT_OF_RANGE",
+        "symbol": "CDW261016C00210000"
+      }
+    ],
+    "symbol": "CDW",
+    "top_reject_buckets": {
+      "CHAIN_ROW_ZERO_BID_ASK": 11,
+      "DIRECT_QUOTE_ZERO_BID_ASK": 1,
+      "OI_TOO_LOW": 1,
+      "SPREAD_TOO_WIDE": 1
+    }
+  },
+  {
+    "attempted_symbols": [
+      "WDAY260821C00215000",
+      "WDAY260821C00217500",
+      "WDAY260821C00220000",
+      "WDAY260821C00222500"
+    ],
+    "client_id": "jasoncosby1@gmail.com",
+    "created_ts": "2026-08-21T13:32:51.705663+00:00",
+    "eligible_unattempted_symbols": [],
+    "execution_mode": "live",
+    "id": 28746,
+    "known_eligible_symbols": [
+      "WDAY260821C00202500",
+      "WDAY260821C00205000",
+      "WDAY260821C00207500",
+      "WDAY260821C00210000",
+      "WDAY260821C00212500",
+      "WDAY260821C00215000",
+      "WDAY260821C00217500",
+      "WDAY260821C00220000",
+      "WDAY260821C00222500",
+      "WDAY260821C00225000",
+      "WDAY260821C00227500",
+      "WDAY260821C00230000",
+      "WDAY260821C00232500",
+      "WDAY260821C00235000",
+      "WDAY260821C00237500",
+      "WDAY260821C00240000",
+      "WDAY260821C00242500",
+      "WDAY260821C00245000",
+      "WDAY260821C00247500",
+      "WDAY260821C00250000",
+      "WDAY260821C00252500",
+      "WDAY260821C00255000",
+      "WDAY260821C00257500",
+      "WDAY260821C00260000",
+      "WDAY260821C00262500",
+      "WDAY260821C00265000",
+      "WDAY260821C00267500",
+      "WDAY260821C00270000",
+      "WDAY260821C00272500",
+      "WDAY260821C00275000",
+      "WDAY260821C00277500",
+      "WDAY260821C00280000",
+      "WDAY260821C00282500",
+      "WDAY260821C00285000",
+      "WDAY260821C00287500",
+      "WDAY260821C00290000",
+      "WDAY260821C00292500",
+      "WDAY260821C00295000",
+      "WDAY260821C00297500",
+      "WDAY260821C00300000",
+      "WDAY260828C00232500",
+      "WDAY260828C00235000",
+      "WDAY260828C00237500",
+      "WDAY260828C00240000",
+      "WDAY260828C00242500",
+      "WDAY260828C00245000",
+      "WDAY260828C00247500",
+      "WDAY260828C00250000",
+      "WDAY260828C00252500",
+      "WDAY260828C00255000",
+      "WDAY260828C00257500",
+      "WDAY260828C00260000",
+      "WDAY260828C00262500",
+      "WDAY260828C00265000",
+      "WDAY260828C00267500",
+      "WDAY260828C00270000",
+      "WDAY260828C00272500",
+      "WDAY260828C00275000",
+      "WDAY260828C00277500",
+      "WDAY260828C00280000",
+      "WDAY260828C00282500",
+      "WDAY260828C00285000",
+      "WDAY260828C00287500",
+      "WDAY260828C00290000",
+      "WDAY260828C00292500",
+      "WDAY260828C00295000",
+      "WDAY260828C00297500",
+      "WDAY260828C00300000",
+      "WDAY260904C00232500",
+      "WDAY260904C00235000",
+      "WDAY260904C00237500",
+      "WDAY260904C00242500",
+      "WDAY260904C00245000",
+      "WDAY260904C00247500",
+      "WDAY260904C00250000",
+      "WDAY260904C00252500",
+      "WDAY260904C00255000",
+      "WDAY260904C00257500",
+      "WDAY260904C00260000",
+      "WDAY260904C00262500",
+      "WDAY260904C00265000",
+      "WDAY260904C00267500",
+      "WDAY260904C00270000",
+      "WDAY260904C00272500",
+      "WDAY260904C00275000",
+      "WDAY260904C00277500",
+      "WDAY260904C00280000",
+      "WDAY260904C00282500",
+      "WDAY260904C00285000",
+      "WDAY260911C00240000",
+      "WDAY260911C00250000"
+    ],
+    "local_order_id": "03c96a09-aba0-486b-a001-6a34312791ef",
+    "persisted_reason": "MONEYNESS_OUT_OF_RANGE",
+    "structural_records": [
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00202500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00205000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00207500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00210000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00212500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00225000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00227500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00230000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00232500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00235000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00237500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00240000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00242500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00245000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00247500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00250000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00252500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00255000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00257500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00260000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00262500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00265000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00267500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00270000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00272500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00275000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00277500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00280000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00282500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00285000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00287500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00290000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00292500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00295000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00297500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260821C00300000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00232500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00235000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00237500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00240000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00242500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00245000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00247500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00250000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00252500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00255000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00257500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00260000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00262500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00265000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00267500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00270000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00272500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00275000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00277500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00280000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00282500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00285000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00287500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00290000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00292500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00295000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00297500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260828C00300000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00232500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00235000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00237500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00242500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00245000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00247500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00250000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00252500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00255000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00257500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00260000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00262500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00265000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00267500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00270000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00272500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00275000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00277500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00280000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00282500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260904C00285000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260911C00240000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "WDAY260911C00250000"
+      }
+    ],
+    "symbol": "WDAY",
+    "top_reject_buckets": {
+      "CHAIN_ROW_ZERO_BID_ASK": 36,
+      "DIRECT_QUOTE_ZERO_BID_ASK": 4,
+      "OI_TOO_LOW": 1,
+      "PREMIUM_CAP_EXCEEDED": 1,
+      "SPREAD_TOO_WIDE": 1
+    }
+  },
+  {
+    "attempted_symbols": [
+      "ADBE260821C00305000"
+    ],
+    "client_id": "jasoncosby1@gmail.com",
+    "created_ts": "2026-08-21T13:35:50.312057+00:00",
+    "eligible_unattempted_symbols": [],
+    "execution_mode": "live",
+    "id": 28821,
+    "known_eligible_symbols": [
+      "ADBE260821C00282500",
+      "ADBE260821C00285000",
+      "ADBE260821C00287500",
+      "ADBE260821C00290000",
+      "ADBE260821C00292500",
+      "ADBE260821C00295000",
+      "ADBE260821C00297500",
+      "ADBE260821C00300000",
+      "ADBE260821C00305000",
+      "ADBE260821C00310000",
+      "ADBE260821C00315000",
+      "ADBE260821C00320000",
+      "ADBE260821C00325000",
+      "ADBE260821C00330000",
+      "ADBE260821C00335000",
+      "ADBE260821C00340000",
+      "ADBE260821C00345000",
+      "ADBE260821C00350000",
+      "ADBE260821C00355000",
+      "ADBE260821C00360000",
+      "ADBE260821C00365000",
+      "ADBE260821C00370000",
+      "ADBE260821C00375000",
+      "ADBE260821C00380000",
+      "ADBE260821C00385000",
+      "ADBE260821C00390000",
+      "ADBE260821C00395000",
+      "ADBE260821C00400000",
+      "ADBE260821C00405000",
+      "ADBE260821C00410000",
+      "ADBE260821C00415000",
+      "ADBE260821C00420000",
+      "ADBE260821C00425000",
+      "ADBE260821C00430000",
+      "ADBE260821C00435000",
+      "ADBE260821C00440000",
+      "ADBE260821C00445000",
+      "ADBE260821C00450000",
+      "ADBE260821C00455000",
+      "ADBE260821C00460000",
+      "ADBE260821C00465000",
+      "ADBE260821C00470000",
+      "ADBE260821C00475000",
+      "ADBE260821C00480000",
+      "ADBE260821C00485000",
+      "ADBE260821C00490000",
+      "ADBE260821C00495000",
+      "ADBE260821C00500000",
+      "ADBE260821C00505000",
+      "ADBE260821C00510000",
+      "ADBE260821C00515000",
+      "ADBE260821C00520000",
+      "ADBE260821C00525000",
+      "ADBE260821C00530000",
+      "ADBE260821C00535000",
+      "ADBE260821C00540000",
+      "ADBE260828C00307500",
+      "ADBE260828C00312500",
+      "ADBE260828C00315000",
+      "ADBE260828C00320000",
+      "ADBE260828C00325000",
+      "ADBE260828C00330000",
+      "ADBE260828C00335000",
+      "ADBE260828C00340000",
+      "ADBE260828C00345000",
+      "ADBE260904C00327500",
+      "ADBE260904C00330000",
+      "ADBE260904C00335000",
+      "ADBE260904C00340000",
+      "ADBE260904C00345000"
+    ],
+    "local_order_id": "57886684-fc54-47c5-95e4-40ad9daf49b6",
+    "persisted_reason": "MONEYNESS_OUT_OF_RANGE",
+    "structural_records": [
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00282500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00285000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00287500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00290000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00292500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00295000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00297500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00300000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00310000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00315000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00320000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00325000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00330000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00335000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00340000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00345000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00350000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00355000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00360000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00365000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00370000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00375000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00380000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00385000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00390000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00395000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00400000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00405000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00410000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00415000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00420000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00425000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00430000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00435000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00440000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00445000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00450000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00455000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00460000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00465000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00470000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00475000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00480000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00485000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00490000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00495000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00500000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00505000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00510000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00515000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00520000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00525000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00530000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00535000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260821C00540000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_DELTA_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00307500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00312500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00315000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00320000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00325000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00330000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00335000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00340000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260828C00345000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260904C00327500"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260904C00330000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260904C00335000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260904C00340000"
+      },
+      {
+        "skip_reason": "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+        "symbol": "ADBE260904C00345000"
+      }
+    ],
+    "symbol": "ADBE",
+    "top_reject_buckets": {
+      "BID_BELOW_MIN": 5,
+      "CHAIN_ROW_ZERO_BID_ASK": 50,
+      "DIRECT_QUOTE_ZERO_BID_ASK": 1,
+      "OI_TOO_LOW": 1,
+      "PREMIUM_CAP_EXCEEDED": 1,
+      "SPREAD_TOO_WIDE": 1,
+      "VOLUME_TOO_LOW": 1
+    }
+  }
+]

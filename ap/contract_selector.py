@@ -232,6 +232,12 @@ class SelectorRequestContext:
     recovery_cursor: dict | None = None
     recovery_cursor_persist: object | None = None
     structural_skips: list[dict] = field(default_factory=list)
+    structural_skip_records_overflowed: bool = False
+    # Complete per-candidate quality-rejection evidence for deferred request
+    # reduction. Aggregate counts alone cannot prove that the candidate
+    # universe was exhaustively structural.
+    quality_rejection_records: list[dict] = field(default_factory=list)
+    quality_rejection_records_overflowed: bool = False
     affordability_headroom_pct: float = 0.10
     symbol_refresh_seconds: int = 20
 
@@ -341,6 +347,7 @@ _TO_QUEUE_REASON: dict[str, str] = {
     "NO_AFFORDABLE_CONTRACT":         "NO_AFFORDABLE_CONTRACT",
     "UNTRADEABLE_FOR_ACCOUNT_SIZE":   "NO_AFFORDABLE_CONTRACT",
     "PREMIUM_CAP_EXCEEDED":           "PREMIUM_CAP_EXCEEDED",
+    "TERMINAL_POLICY_REJECT":         "TERMINAL_POLICY_BLOCK",
     "NO_VALID_PLAYBOOK_DTE_CONTRACT": "NO_VALID_PLAYBOOK_DTE_CONTRACT",
     "NO_CONTRACT_AFTER_FILTERS":      "NO_CONTRACT_AFTER_FILTERS",
 }
@@ -983,6 +990,32 @@ def _ctx_refresh_diagnostics(ctx: SelectorRequestContext | None) -> None:
     ctx.diagnostics_sink.update(_selector_request_diagnostics(ctx))
 
 
+def _resolve_deferred_recovery_final_reason_fail_closed(evidence: dict) -> str:
+    """Run the deferred reducer without ever reviving a pre-reducer reason.
+
+    An exception, blank return, or non-string return is an invariant failure.
+    The caller must receive an explicit fail-closed reason rather than retain
+    the selector's provisional observation (which may be the false request-
+    level MONEYNESS_OUT_OF_RANGE conclusion this reducer exists to prevent).
+    """
+    fail_closed_reason = "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    try:
+        from ap.selector_retry_policy import resolve_selector_recovery_final_reason
+
+        resolved = resolve_selector_recovery_final_reason(evidence)
+        if not isinstance(resolved, str) or not resolved.strip():
+            raise ValueError(
+                "selector recovery reducer returned an unusable final reason"
+            )
+        return resolved.strip()
+    except Exception:
+        log.exception(
+            "SELECTOR_RECOVERY_REDUCER_FAILED fail_closed_reason=%s",
+            fail_closed_reason,
+        )
+        return fail_closed_reason
+
+
 def _bind_selector_request_diagnostics(plan, ctx: SelectorRequestContext | None) -> None:
     if ctx is None:
         return
@@ -1145,6 +1178,13 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         "selector_request_kind": str(ctx.selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY),
         "recovery_attempt_number": int(ctx.recovery_attempt_number or 1),
         "structural_skips": list(ctx.structural_skips[:200]),
+        "structural_skip_records_overflowed": bool(
+            ctx.structural_skip_records_overflowed
+        ),
+        "quality_rejection_records": list(ctx.quality_rejection_records),
+        "quality_rejection_records_overflowed": bool(
+            ctx.quality_rejection_records_overflowed
+        ),
         "limits": {
             "max_expiration_calls": int(ctx.max_expiration_calls),
             "max_chain_calls": int(ctx.max_chain_calls),
@@ -1448,7 +1488,9 @@ def _structural_direct_quote_skip(
     }
     if request_context is not None:
         request_context.structural_skips.append(diagnostic)
-        request_context.structural_skips[:] = request_context.structural_skips[-200:]
+        if len(request_context.structural_skips) > 200:
+            request_context.structural_skip_records_overflowed = True
+            request_context.structural_skips[:] = request_context.structural_skips[-200:]
         from ap.selector_retry_policy import record_selector_structural_skip
         request_context.recovery_cursor = record_selector_structural_skip(
             request_context.recovery_cursor or {},
@@ -3541,9 +3583,25 @@ class APContractSelectionEngine:
                 _symbol, "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
             )
 
+        def _record_quality_rejection(opt: dict, reason: str) -> None:
+            """Retain deferred-recovery candidate identity for final reduction."""
+            if not _deferred_recovery_request:
+                return
+            request_context.quality_rejection_records.append({
+                "symbol": opt.get("symbol") or opt.get("contract"),
+                "reason": _normalize_reason_code(reason),
+            })
+            if len(request_context.quality_rejection_records) > 200:
+                request_context.quality_rejection_records_overflowed = True
+                request_context.quality_rejection_records[:] = (
+                    request_context.quality_rejection_records[-200:]
+                )
+
         for opt in _quality_chain:
+            _structural_skip_recorded = False
             opt, _duplicate_authority_reason = _apply_duplicate_quote_authority(opt)
             if _duplicate_authority_reason:
+                _record_quality_rejection(opt, _duplicate_authority_reason)
                 _rejections[_duplicate_authority_reason] = _rejections.get(
                     _duplicate_authority_reason, 0
                 ) + 1
@@ -3591,6 +3649,8 @@ class APContractSelectionEngine:
                         selector_budget=float(budget or 0.0),
                         request_context=request_context,
                     )
+                    if _structural_skip_pro:
+                        _structural_skip_recorded = True
                     _rv_pro = (
                         {
                             "action": "SKIP_STRUCTURAL",
@@ -3688,6 +3748,8 @@ class APContractSelectionEngine:
                 # ── end P0A/FIX-2 ────────────────────────────────────────────
 
                 if pro_tier == "REJECT":
+                    if not _structural_skip_recorded:
+                        _record_quality_rejection(opt, pro_reason)
                     _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
                     try:
                         self._emit_selector_event(
@@ -3761,6 +3823,8 @@ class APContractSelectionEngine:
                     selector_budget=float(budget or 0.0),
                     request_context=request_context,
                 )
+                if _structural_skip:
+                    _structural_skip_recorded = True
                 _rv = (
                     {
                         "action": "SKIP_STRUCTURAL",
@@ -3914,6 +3978,8 @@ class APContractSelectionEngine:
             if result is None:
                 survivors.append(opt)
             else:
+                if not _structural_skip_recorded:
+                    _record_quality_rejection(opt, result)
                 _rejections[result] = _rejections.get(result, 0) + 1
                 log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
                 # P0 (PR #299): track the best rejected candidate — the one with
@@ -3974,6 +4040,12 @@ class APContractSelectionEngine:
                     )
                 except Exception:
                     pass  # per-contract quality-filter emit — non-critical
+
+        # Publish the bounded evidence once after the quality pass. Per-row
+        # refreshes repeatedly copied the growing diagnostics payload and leaked
+        # deferred-only candidate evidence into ordinary queue selections.
+        if _deferred_recovery_request:
+            _ctx_refresh_diagnostics(request_context)
 
         _sel_survivors   = len(survivors)
         _sel_rejections  = dict(_rejections)  # snapshot for selector_failure
@@ -4060,22 +4132,13 @@ class APContractSelectionEngine:
                 ).strip().upper()
                 == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
             ):
-                try:
-                    from ap.selector_retry_policy import (
-                        resolve_selector_recovery_final_reason,
-                    )
-                    _cursor_attempted = dict(
+                _cursor_attempted = dict(
                         (request_context.recovery_cursor or {}).get(
                             "attempted_symbols"
                         )
                         or {}
                     )
-                    _structural_reasons = {
-                        item.get("symbol"): item.get("skip_reason")
-                        for item in request_context.structural_skips
-                        if isinstance(item, dict) and item.get("symbol")
-                    }
-                    _final_reason = resolve_selector_recovery_final_reason({
+                _final_reason = _resolve_deferred_recovery_final_reason_fail_closed({
                         "budget_exhausted_stage": request_context.budget_exhausted_stage,
                         "budget_exhausted_detail": request_context.budget_exhausted_detail,
                         "actual_limit_reached": bool(
@@ -4086,20 +4149,70 @@ class APContractSelectionEngine:
                             request_context.direct_quote_unattempted_symbols
                         ),
                         "attempted_results": _cursor_attempted,
-                        "structural_skip_results": _structural_reasons,
+                        # Preserve the complete ordered record stream through
+                        # validation. A dict keyed by OCC would silently
+                        # overwrite conflicting duplicate evidence before the
+                        # resolver can fail closed.
+                        "structural_skip_records": list(
+                            request_context.structural_skips
+                        ),
                         "quality_rejections": {
                             _normalize_reason_code(key): value
                             for key, value in _rejections.items()
                         },
+                        # Aggregate quality counts are diagnostic only; the
+                        # reducer also needs candidate identity so an ordinary
+                        # OI/spread reject remains in the complete universe
+                        # and blocks a false exhaustive structural claim.
+                        "quality_rejection_records": list(
+                            request_context.quality_rejection_records
+                        ),
+                        "structural_skip_records_overflowed": bool(
+                            request_context.structural_skip_records_overflowed
+                        ),
+                        "quality_rejection_records_overflowed": bool(
+                            request_context.quality_rejection_records_overflowed
+                        ),
                         "market_truth_outcome": (
                             (request_context.recovery_cursor or {}).get(
                                 "last_market_truth_outcome"
                             )
                         ),
                         "market_truth_reason": None,
-                    })
-                except Exception:
-                    pass
+                        # PR #491: preserve the selector's own already-
+                        # established pre-reducer reason as fallback truth.
+                        # This is the canonical selector observation
+                        # (_obs_reason), captured above BEFORE this reducer
+                        # can overwrite it -- deliberately NOT the separate
+                        # operational/request-budget reason, which is
+                        # threaded through its own operational_reason field
+                        # at the call site below and must never be conflated
+                        # with canonical selector truth.
+                        "fallback_selector_reason": _obs_reason,
+                        # PR #491 (accounting-gap closure): an independent
+                        # this-pass accounting of every candidate that
+                        # reached direct-quote eligibility, regardless of
+                        # its eventual fate. This is populated
+                        # unconditionally -- before either the structural-
+                        # skip or the direct-quote-attempt branch runs --
+                        # at every point in this module that adds to
+                        # direct_quote_eligible_symbols. It does not depend
+                        # on, and makes no claim about, how or when the
+                        # durable recovery cursor gets updated. Real
+                        # historical production evidence (see the CRM
+                        # production replay fixture in
+                        # tests/test_p0_selector_recovery_production_
+                        # replay_491.py) proves a genuinely direct-quote-
+                        # attempted candidate can end up unrepresented in
+                        # the evidence a given resolver invocation actually
+                        # used. Independent of the specific historical
+                        # cause, this accounting closes that gap directly:
+                        # without it, such a candidate could be silently
+                        # erased from the exhaustive-proof accounting.
+                        "direct_quote_known_eligible_symbols": list(
+                            request_context.direct_quote_eligible_symbols
+                        ),
+                })
             _attach_selector_failure(
                 plan,
                 reason_code=_final_reason,

@@ -19,6 +19,7 @@ from ap.contract_quote_revalidator import (
     fetch_direct_option_quote_with_meta,
     revalidate_with_direct_quote,
 )
+from ap.selector_retry_policy import RETRYABLE_DATA, get_policy
 from ap.contract_selector import (
     APContractSelectionEngine,
     SelectorRequestContext,
@@ -616,6 +617,11 @@ class TestSelectorIntegration:
         assert diagnostics["direct_quote_budget"]["used"] == broker.get_quote.call_count
         assert diagnostics["direct_quote_budget"]["remaining"] == 20 - broker.get_quote.call_count
         assert diagnostics["direct_quote_candidate_ranking"][8]["symbol"] == expected_symbol
+        # Recovery-reducer evidence is deferred-breach-only. Ordinary success
+        # must not grow or persist a per-candidate rejection payload.
+        assert diagnostics["selector_request_kind"] == "ORDINARY"
+        assert diagnostics["quality_rejection_records"] == []
+        assert diagnostics["quality_rejection_records_overflowed"] is False
 
     def test_no_survivor_selector_replay_terminates_budget_exhausted_but_keeps_row_reasons(self, monkeypatch):
         # ORDINARY selector requests MUST NOT adopt recovery-only final reasons
@@ -647,6 +653,11 @@ class TestSelectorIntegration:
         assert diagnostics["direct_quote_budget"]["remaining"] == 0
         assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
         assert "SELECTOR_REQUEST_BUDGET_EXHAUSTED" not in failure["top_reject_buckets"]
+        # Ordinary failure diagnostics preserve aggregate reason truth without
+        # collecting deferred-recovery candidate evidence.
+        assert diagnostics["selector_request_kind"] == "ORDINARY"
+        assert diagnostics["quality_rejection_records"] == []
+        assert diagnostics["quality_rejection_records_overflowed"] is False
 
     @pytest.mark.parametrize(
         ("name", "chain_overrides", "quote", "plan_overrides", "expected_reason"),
@@ -879,7 +890,7 @@ class TestAggregateAuditTruthfulness:
 #   * receive an independent fresh selector budget;
 #   * preserve incident-shaped candidate rank and attempt/skip order;
 #   * recover the declared survivor or exhaust on zero/stale candidates;
-#   * report SELECTOR_REQUEST_BUDGET_EXHAUSTED only for all-failing fixtures;
+#   * report each all-failing fixture's exact request-level retry reason;
 #   * NOT submit / cancel / replace any broker order;
 #   * persist the dedicated durable outcome RETRY_LATER_SELECTOR_BUDGET on
 #     the deferred-retry row with exact identity fields intact.
@@ -898,6 +909,7 @@ FLEET_INCIDENT_FIXTURES: dict[str, dict] = {
     "COF": {
         "underlying": 214.35, "direction": "PUT", "spacing": 2.5,
         "recovery_rank": None, "delta": 0.39, "oi": 640, "volume": 85,
+        "expected_failure_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
     },
     "GM": {
         "underlying": 57.60, "direction": "CALL", "spacing": 0.25,
@@ -910,6 +922,7 @@ FLEET_INCIDENT_FIXTURES: dict[str, dict] = {
     "KHC": {
         "underlying": 29.15, "direction": "CALL", "spacing": 0.5,
         "recovery_rank": None, "delta": 0.41, "oi": 7300, "volume": 2500,
+        "expected_failure_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
     },
     "ROST": {
         "underlying": 154.70, "direction": "CALL", "spacing": 0.5,
@@ -918,6 +931,7 @@ FLEET_INCIDENT_FIXTURES: dict[str, dict] = {
     "UPS": {
         "underlying": 111.85, "direction": "PUT", "spacing": 1.0,
         "recovery_rank": None, "delta": 0.37, "oi": 2400, "volume": 610,
+        "expected_failure_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
     },
     "BAC": {
         "underlying": 60.90, "direction": "PUT", "spacing": 0.25,
@@ -1111,8 +1125,8 @@ class TestJuly23FleetAcceptanceReplay:
         """8 tickers × 3 real production identities = 24 canonical
         selector requests. Each request receives its own fresh 8-call
         budget and follows an explicit incident fixture: recoverable cases
-        select the declared rank; all-failing cases exhaust with
-        SELECTOR_REQUEST_BUDGET_EXHAUSTED. Original quality reasons remain
+        select the declared rank; all-failing cases assert their exact
+        fixture-defined terminal/retry reason. Original quality reasons remain
         attached and the selection pass never touches broker orders.
 
         Durable persistence of the resulting RETRY_LATER_SELECTOR_BUDGET
@@ -1145,14 +1159,17 @@ class TestJuly23FleetAcceptanceReplay:
                 if selected is None:
                     failure = plan["metadata"]["selector_failure"]
                     diagnostics = failure["selection_diagnostics"]
-                    assert failure["reason_code"] in {
-                        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
-                        "MONEYNESS_OUT_OF_RANGE",
-                        "DELTA_OUT_OF_RANGE",
-                        "DTE_OUT_OF_RANGE",
-                        "NO_AFFORDABLE_CONTRACT",
-                        "PREMIUM_CAP_EXCEEDED",
-                    }
+                    expected_failure_reason = fixture["expected_failure_reason"]
+                    assert (
+                        failure["reason_code"] == expected_failure_reason
+                    ), f"{ticker} {label} reason precedence drifted"
+                    policy = get_policy(failure["reason_code"])
+                    assert policy.classification == RETRYABLE_DATA
+                    assert policy.selector_rerun_allowed is True
+                    assert (
+                        policy.queue_facing_reason
+                        == "RETRY_LATER_DATA_UNAVAILABLE"
+                    )
                     assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
                     assert (
                         "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
