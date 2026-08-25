@@ -314,6 +314,18 @@ class _StatefulOSM:
         })
         return True
 
+    def persist_materialized_submit_intent(self, local_order_id, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        self._merge_meta({
+            "lifecycle_state": "SUBMITTING",
+            "submit_started_at": _iso(),
+            "submit_intent_at": _iso(),
+            "broker_submit_key": kwargs.get("broker_submit_key"),
+            "current_owner": f"broker_submit:{kwargs.get('broker_submit_key', '')}",
+            "broker_submit_payload_hash": kwargs.get("payload_hash"),
+        })
+        return True
+
     def transition(self, local_order_id, to_status, **kwargs):
         assert local_order_id == LOCAL_ORDER_ID
         self.row["status"] = str(to_status)
@@ -807,7 +819,34 @@ def _approved_plan() -> types.SimpleNamespace:
     )
 
 
-def _build_core(osm: _StatefulOSM, broker: _Broker, selector: _Selector):
+def _build_core(
+    osm: _StatefulOSM,
+    broker: _Broker,
+    selector: _Selector,
+    master_control=None,
+):
+    if master_control is None:
+        master_control = types.SimpleNamespace(
+            mode="LIVE",
+            max_positions=5,
+            _kill_switch_fn=lambda: False,
+            get_entry_capacity=lambda **_kwargs: {
+                "ok": True,
+                "reason_code": "CAPACITY_AVAILABLE",
+                "account_equity": 1709.2,
+                "per_trade_budget": 170.92,
+                "total_capital_cap": 683.68,
+                "current_total_exposure": 0.0,
+                "remaining_total_capacity": 683.68,
+                "selector_budget": 170.92,
+                "max_affordable_premium": 1.7092,
+            },
+            revalidate_exposure=lambda _plan, **_kwargs: types.SimpleNamespace(
+                ok=True,
+                reason_code="EXPOSURE_ALLOWED",
+                reason="allowed",
+            ),
+        )
     core = types.SimpleNamespace(
         client_id=CLIENT_ID,
         email=CLIENT_ID,
@@ -817,7 +856,7 @@ def _build_core(osm: _StatefulOSM, broker: _Broker, selector: _Selector):
         broker=broker,
         order_state_machine=osm,
         contract_selector=selector,
-        master_control=types.SimpleNamespace(mode="LIVE", max_positions=5, _kill_switch_fn=lambda: False),
+        master_control=master_control,
         _kill_switch=False,
         _max_positions=5,
     )
@@ -1472,3 +1511,272 @@ def test_stale_deferred_penny_broker_ready_recovery_cannot_submit(monkeypatch):
     assert row["broker_order_id"] is None
     assert row["contract"] == "DEFERRED:SPY"
     assert row["limit_price"] == pytest.approx(0.01)
+
+
+PR514_CLIENT_ID = "jasoncosby1@gmail.com"
+
+
+class _DeferredCapacityMC:
+    def __init__(
+        self,
+        *,
+        remaining_total_capacity: float = 500.0,
+        final_ok: bool = True,
+        final_reason: str = "EXPOSURE_ALLOWED",
+    ) -> None:
+        self.mode = "LIVE"
+        self.max_positions = 5
+        self._kill_switch_fn = lambda: False
+        self.remaining_total_capacity = remaining_total_capacity
+        self.final_ok = final_ok
+        self.final_reason = final_reason
+        self.capacity_calls: list[dict] = []
+        self.final_calls: list[dict] = []
+
+    def get_entry_capacity(self, **kwargs):
+        self.capacity_calls.append(dict(kwargs))
+        selector_budget = min(170.92, self.remaining_total_capacity)
+        return {
+            "ok": selector_budget > 0,
+            "reason_code": "CAPACITY_AVAILABLE" if selector_budget > 0 else "CAPITAL_LIMIT_NO_REMAINING",
+            "account_equity": 1709.2,
+            "per_trade_budget": 170.92,
+            "total_capital_cap": 683.68,
+            "current_total_exposure": 683.68 - self.remaining_total_capacity,
+            "remaining_total_capacity": self.remaining_total_capacity,
+            "selector_budget": selector_budget,
+            "max_affordable_premium": selector_budget / 100.0,
+        }
+
+    def revalidate_exposure(self, plan, *, client_id):
+        self.final_calls.append({
+            "client_id": client_id,
+            "signal_id": getattr(plan, "signal_id", ""),
+            "execution_mode": getattr(plan, "execution_mode", ""),
+            "contract": getattr(plan, "contract_symbol", ""),
+            "price": getattr(plan, "limit_price", 0),
+            "qty": getattr(plan, "contracts", 0),
+            "actual_selected_cost": getattr(plan, "max_position_usd", 0),
+        })
+        return types.SimpleNamespace(
+            ok=self.final_ok,
+            reason_code=self.final_reason,
+            reason=self.final_reason,
+        )
+
+
+class _CSelector:
+    dte_ladder_enabled = True
+
+    def __init__(self, *, execution_price_per_share: float = 1.26):
+        self.execution_price_per_share = execution_price_per_share
+        self.calls = 0
+
+    def select(self, _plan, *, request_context=None):
+        assert request_context is not None
+        self.calls += 1
+        return types.SimpleNamespace(
+            contract_symbol="C260828C00133000",
+            bid=1.25,
+            ask=1.28,
+            mid=1.265,
+            affordable_contracts=1,
+            execution_price_per_share=self.execution_price_per_share,
+            candidate_audit={"underlying_price": 130.0},
+            expiration_date="2026-08-28",
+            dte=3,
+            strike=133.0,
+            option_type="CALL",
+        )
+
+    def get_last_failure(self):
+        return None
+
+    def get_last_dte_ladder_audit(self):
+        return {"buckets_attempted": 1}
+
+
+def _run_c_deferred_materialization(monkeypatch, *, selector, master_control):
+    osm = _StatefulOSM()
+    osm.proof_read_failures_remaining = 0
+    osm.client_id = PR514_CLIENT_ID
+    osm.row.update({
+        "symbol": "C",
+        "contract": "DEFERRED:C",
+        "reserved_cost": 173.06,
+        "client_id": PR514_CLIENT_ID,
+    })
+    osm.row["meta"].update({
+        "contract_deferred": True,
+        "execution_mode": "live",
+    })
+    plan = _approved_plan()
+    plan.ticker = "C"
+    plan.client_id = PR514_CLIENT_ID
+    plan.contract_symbol = "DEFERRED:C"
+    plan.max_position_usd = 173.06
+    plan.metadata = {
+        "contract_deferred": True,
+        "execution_mode": "live",
+        "queue_id": 514,
+    }
+    broker = _Broker()
+    core = _build_core(osm, broker, selector, master_control=master_control)
+    core.client_id = PR514_CLIENT_ID
+    core.email = PR514_CLIENT_ID
+    core._recover_plan_for_revalidation = lambda _watched: plan
+    watcher = _build_watcher(osm, core)
+
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
+        1.28,
+        15,
+        True,
+        "ok",
+        {
+            "spread_pct": 0.023,
+            "submit_bid": 1.25,
+            "submit_ask": 1.28,
+            "submit_mid": 1.265,
+            "submit_last": 1.27,
+        },
+    )
+
+    with patch.dict(sys.modules, {"ap.execution": fake_execution}), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        result = watcher.on_trigger(watched)
+    return result, osm, broker, master_control
+
+
+def test_pr514_live_deferred_c_materializes_actual_cost_before_final_gate(monkeypatch):
+    mc = _DeferredCapacityMC()
+    result, osm, broker, mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=_CSelector(execution_price_per_share=1.26),
+        master_control=mc,
+    )
+
+    assert len(osm.post_payloads) == 1
+    assert mc.capacity_calls == [{
+        "client_id": PR514_CLIENT_ID,
+        "execution_mode": "live",
+        "ticker": "C",
+        "signal_id": SIGNAL_ID,
+        "exclude_local_order_id": LOCAL_ORDER_ID,
+    }]
+    assert len(mc.final_calls) == 1
+    final = mc.final_calls[0]
+    assert final["client_id"] == PR514_CLIENT_ID
+    assert final["signal_id"] == SIGNAL_ID
+    assert final["execution_mode"] == "live"
+    assert final["contract"] == "C260828C00133000"
+    assert final["price"] == pytest.approx(1.26)
+    assert final["qty"] == 1
+    assert final["actual_selected_cost"] == pytest.approx(126.0)
+    assert osm.row["contract"] == "C260828C00133000"
+    assert osm.row["reserved_cost"] == pytest.approx(129.0)
+    assert osm.row["meta"]["selector_meta"]["actual_selected_cost"] == pytest.approx(126.0)
+    assert osm.row["meta"]["selector_meta"]["selector_effective_budget"] == pytest.approx(170.92)
+
+
+def test_pr514_live_deferred_final_gate_blocks_real_contract_over_per_position_cap(monkeypatch):
+    mc = _DeferredCapacityMC(
+        final_ok=False,
+        final_reason="ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP",
+    )
+    result, osm, broker, mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=_CSelector(execution_price_per_share=2.00),
+        master_control=mc,
+    )
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP" in result["reason_code"]
+    assert len(mc.final_calls) == 1
+    assert mc.final_calls[0]["actual_selected_cost"] == pytest.approx(200.0)
+    assert osm.post_payloads == []
+
+
+def test_pr514_live_deferred_final_gate_blocks_total_cap_independently(monkeypatch):
+    mc = _DeferredCapacityMC(
+        remaining_total_capacity=100.0,
+        final_ok=False,
+        final_reason="ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY",
+    )
+    result, osm, broker, mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=_CSelector(execution_price_per_share=1.26),
+        master_control=mc,
+    )
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY" in result["reason_code"]
+    assert mc.capacity_calls[0]["execution_mode"] == "live"
+    assert mc.final_calls[0]["actual_selected_cost"] == pytest.approx(126.0)
+    assert osm.post_payloads == []
+
+
+def test_pr514_live_deferred_no_affordable_selector_result_stays_terminal(monkeypatch):
+    class _NoAffordableSelector(_CSelector):
+        def select(self, _plan, *, request_context=None):
+            self.calls += 1
+            return None
+
+        def get_last_failure(self):
+            return {
+                "reason_code": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                "stage": "affordability",
+            }
+
+    mc = _DeferredCapacityMC()
+    result, osm, broker, mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=_NoAffordableSelector(),
+        master_control=mc,
+    )
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "UNTRADEABLE_FOR_ACCOUNT_SIZE" in result["reason_code"]
+    assert mc.final_calls == []
+    assert osm.post_payloads == []
+
+
+def test_pr514_deferred_unknown_mode_fails_closed_before_capacity_or_selector(monkeypatch):
+    osm = _StatefulOSM()
+    osm.row["meta"]["contract_deferred"] = True
+    plan = _approved_plan()
+    plan.execution_mode = "staging"
+    plan.metadata = {"contract_deferred": True, "execution_mode": "staging"}
+    mc = _DeferredCapacityMC()
+    selector = _CSelector()
+    core = _build_core(osm, _Broker(), selector, master_control=mc)
+    watched = types.SimpleNamespace(
+        signal={
+            "_approved_plan": plan,
+            "signal_id": SIGNAL_ID,
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "staging",
+        },
+        ticker="SPY",
+        side="CALL",
+        trigger_price=600.0,
+        entry_trigger=600.0,
+        stop_level=595.0,
+        target_price=605.0,
+    )
+
+    result = core._on_entry_trigger(watched)
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["reason_code"] == "metadata_invalid:unknown_execution_mode"
+    assert mc.capacity_calls == []
+    assert selector.calls == 0
+    assert osm.post_payloads == []

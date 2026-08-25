@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -1561,6 +1562,203 @@ class APMasterControl:
             return None
         return bd["pending_total_capital_reserved"]
 
+    def _capital_capacity_from_snapshot(
+        self,
+        snap: dict[str, Any],
+        account_equity: float,
+        pending_capital: float,
+    ) -> dict[str, float]:
+        """Return the canonical entry-capacity math for one account snapshot.
+
+        This is deliberately read-only.  Both pre-selection affordability and
+        post-selection exposure revalidation use this same split-cap formula so
+        the selector budget cannot drift from the final risk authority.
+        """
+        _equity = float(account_equity)
+        _pending = float(pending_capital)
+        _deployed = float(snap.get("capital_deployed", 0.0) or 0.0)
+        per_trade_budget = _equity * self.max_position_pct
+        total_capital_cap = _equity * self.max_total_capital_pct
+        current_total_exposure = _deployed + _pending
+        remaining_total_capacity = total_capital_cap - current_total_exposure
+        selector_budget = max(
+            0.0,
+            min(per_trade_budget, remaining_total_capacity),
+        )
+        return {
+            "per_trade_budget": float(per_trade_budget),
+            "total_capital_cap": float(total_capital_cap),
+            "current_total_exposure": float(current_total_exposure),
+            "remaining_total_capacity": float(remaining_total_capacity),
+            "remaining_total_cap": float(remaining_total_capacity),
+            "selector_budget": float(selector_budget),
+            "max_affordable_premium": float(selector_budget / 100.0),
+        }
+
+    def get_entry_capacity(
+        self,
+        *,
+        client_id: str,
+        execution_mode: str,
+        ticker: str = "",
+        signal_id: str = "",
+        exclude_local_order_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Resolve fail-closed, mode-explicit capacity for deferred selection.
+
+        The returned ``selector_budget`` is affordability capacity only.  It is
+        not an actual contract cost; that value exists only after a real OCC
+        contract, executable price, and quantity have been materialized.
+        """
+        _client_id = str(client_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        _runtime_mode = str(self._current_mode() or "").strip().lower()
+        _base: dict[str, Any] = {
+            "ok": False,
+            "client_id": _client_id,
+            "execution_mode": _mode,
+            "ticker": str(ticker or ""),
+            "signal_id": str(signal_id or ""),
+        }
+        if not _client_id:
+            return {
+                **_base,
+                "reason_code": "CLIENT_ID_REQUIRED",
+                "reason": "client_id_required_for_capacity_resolution",
+            }
+        if _mode not in {"live", "paper"}:
+            return {
+                **_base,
+                "reason_code": "INVALID_EXECUTION_MODE",
+                "reason": "explicit_execution_mode_required",
+            }
+        if _runtime_mode not in {"live", "paper"} or _runtime_mode != _mode:
+            return {
+                **_base,
+                "reason_code": "EXECUTION_MODE_MISMATCH",
+                "reason": (
+                    f"capacity_mode={_mode} runtime_mode={_runtime_mode or 'unknown'}"
+                ),
+            }
+
+        try:
+            snap = self._get_snapshot(
+                _client_id,
+                ticker=str(ticker or ""),
+                signal_id=str(signal_id or ""),
+            )
+            if not isinstance(snap, dict):
+                raise TypeError("snapshot must be a dict")
+        except Exception as exc:
+            return {
+                **_base,
+                "reason_code": "SNAPSHOT_UNAVAILABLE_LIVE_BLOCKED",
+                "reason": f"capacity_snapshot_error:{exc}",
+            }
+
+        if _mode == "live" and not snap.get("_snapshot_ok", True):
+            return {
+                **_base,
+                "reason_code": "SNAPSHOT_UNAVAILABLE_LIVE_BLOCKED",
+                "reason": str(snap.get("_snapshot_error") or "snapshot_unavailable"),
+            }
+
+        try:
+            _pending = self._pending_capital_from_snapshot_or_db(
+                snap,
+                _client_id,
+                exclude_local_order_id=exclude_local_order_id,
+                runtime_execution_mode=_mode,
+            )
+        except Exception as exc:
+            _pending = None
+            _pending_error = str(exc)
+        else:
+            _pending_error = ""
+        if _pending is None:
+            if _mode == "live" and getattr(
+                self, "pending_capital_fail_closed_live", True
+            ):
+                return {
+                    **_base,
+                    "reason_code": "PENDING_CAPITAL_UNAVAILABLE",
+                    "reason": _pending_error or "pending_capital_unavailable_live_blocked",
+                }
+            _pending = 0.0
+
+        try:
+            _equity, _ = self._equity_snapshot()
+            if isinstance(_equity, bool) or isinstance(_pending, bool):
+                raise ValueError("equity and pending capital must not be bool")
+            if not math.isfinite(float(_equity)) or not math.isfinite(float(_pending)):
+                raise ValueError("equity and pending capital must be finite")
+            if float(_equity) <= 0.0 or float(_pending) < 0.0:
+                raise ValueError("equity must be positive and pending capital non-negative")
+            _capacity = self._capital_capacity_from_snapshot(
+                snap,
+                _equity,
+                _pending,
+            )
+            if not all(
+                math.isfinite(float(_capacity[_key]))
+                for _key in (
+                    "per_trade_budget",
+                    "total_capital_cap",
+                    "current_total_exposure",
+                    "remaining_total_capacity",
+                    "selector_budget",
+                    "max_affordable_premium",
+                )
+            ):
+                raise ValueError("capacity values must be finite")
+        except Exception as exc:
+            return {
+                **_base,
+                "reason_code": "CAPACITY_RESOLUTION_FAILED",
+                "reason": f"capacity_math_error:{exc}",
+            }
+
+        _result: dict[str, Any] = {
+            **_base,
+            **_capacity,
+            "ok": True,
+            "reason_code": "CAPACITY_AVAILABLE",
+            "reason": "capacity_available_for_deferred_selector",
+            "account_equity": float(_equity),
+            "capital_deployed": float(snap.get("capital_deployed", 0.0) or 0.0),
+            "pending_capital": float(_pending),
+            "exclude_local_order_id": str(exclude_local_order_id or "") or None,
+        }
+        if _capacity["remaining_total_capacity"] <= 0.0:
+            _result.update(
+                ok=False,
+                reason_code="CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED",
+                reason="total_exposure_capacity_exhausted",
+            )
+        elif _capacity["selector_budget"] <= 0.0:
+            _result.update(
+                ok=False,
+                reason_code="CAPITAL_LIMIT_NO_REMAINING",
+                reason="no_selector_capacity_remaining",
+            )
+        log.info(
+            "DEFERRED_SELECTOR_CAPACITY_RESOLVED client=%s execution_mode=%s "
+            "ticker=%s signal_id=%s selector_budget=%.2f "
+            "per_trade_budget=%.2f remaining_total_capacity=%.2f "
+            "current_total_exposure=%.2f decision=%s reason_code=%s",
+            _client_id,
+            _mode,
+            str(ticker or ""),
+            str(signal_id or ""),
+            _result.get("selector_budget", 0.0),
+            _result.get("per_trade_budget", 0.0),
+            _result.get("remaining_total_capacity", 0.0),
+            _result.get("current_total_exposure", 0.0),
+            "ALLOW" if _result.get("ok") else "BLOCK",
+            _result.get("reason_code"),
+        )
+        return _result
+
     def _ticker_capital_deployed(self, positions: list, ticker: str) -> float:
         total = 0.0
         for pos in positions:
@@ -2017,10 +2215,15 @@ class APMasterControl:
         #   capital_limit_total_exposure_cap_reached — total cap at/over limit
         #   capital_limit_no_remaining               — selector_budget <= 0
 
-        per_trade_budget       = account_equity * self.max_position_pct
-        total_capital_cap      = account_equity * self.max_total_capital_pct
-        current_total_exposure = snap["capital_deployed"] + pending_capital_real
-        remaining_total_cap    = total_capital_cap - current_total_exposure
+        _capacity = self._capital_capacity_from_snapshot(
+            snap,
+            account_equity,
+            pending_capital_real,
+        )
+        per_trade_budget       = _capacity["per_trade_budget"]
+        total_capital_cap      = _capacity["total_capital_cap"]
+        current_total_exposure = _capacity["current_total_exposure"]
+        remaining_total_cap    = _capacity["remaining_total_capacity"]
 
         # Hard block: total portfolio exposure cap is at or over limit.
         # This is a separate, earlier block so the reason code is unambiguous.
@@ -2061,10 +2264,7 @@ class APMasterControl:
 
         # selector_budget = tighter of: per-trade cap vs remaining total capacity.
         # Floor at 0 — negative means cap already exceeded.
-        remaining_capital_for_this_trade = max(
-            0.0,
-            min(per_trade_budget, remaining_total_cap),
-        )
+        remaining_capital_for_this_trade = _capacity["selector_budget"]
 
         # Keep max_capital as an alias for downstream code that reads it
         # (logging, sizing_context, revalidate_exposure). Set to per_trade_budget
@@ -4031,11 +4231,16 @@ class APMasterControl:
         # second trades (proj_total=366 > per_trade_cap=198 when deployed=183,
         # real_cost=183) and the $15 resize bug (_remaining = 198 - 183 = 15).
 
-        per_trade_budget         = equity * self.max_position_pct
-        total_capital_cap        = equity * self.max_total_capital_pct
-        current_total_exposure   = snap["capital_deployed"] + pending_cap   # excludes new real_cost
+        _capacity = self._capital_capacity_from_snapshot(
+            snap,
+            equity,
+            pending_cap,
+        )
+        per_trade_budget         = _capacity["per_trade_budget"]
+        total_capital_cap        = _capacity["total_capital_cap"]
+        current_total_exposure   = _capacity["current_total_exposure"]  # excludes new real_cost
         projected_total_exposure = current_total_exposure + real_cost        # includes new real_cost
-        remaining_total_capacity = total_capital_cap - current_total_exposure
+        remaining_total_capacity = _capacity["remaining_total_capacity"]
         # max_capital alias for _log_capital_utilization (expects a single limit field).
         # Set to per_trade_budget — the primary per-position cap.
         max_capital = per_trade_budget

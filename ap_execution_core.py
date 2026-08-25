@@ -1842,13 +1842,32 @@ class APExecutionCore:
             qty = int(order.get("qty") or 0)
             reserved = float(order.get("reserved_cost") or 0)
             limit_price = float(order.get("limit_price") or 0)
-            real_cost = reserved if reserved > 0 else (limit_price * qty * 100 if limit_price > 0 and qty > 0 else 0.0)
-            if real_cost <= 0:
+            _order_contract = str(
+                order.get("contract") or sig.get("contract_symbol") or ""
+            ).strip()
+            _is_deferred_placeholder = bool(
+                _order_meta.get("contract_deferred")
+                or _order_contract.upper().startswith("DEFERRED:")
+            )
+            _recovered_cost = reserved if reserved > 0 else (
+                limit_price * qty * 100 if limit_price > 0 and qty > 0 else 0.0
+            )
+            if _recovered_cost <= 0:
                 log.critical(
-                    "[%s] Recovered OSM order %s but could not prove real_cost for LIVE breach revalidation",
+                    "[%s] Recovered OSM order %s but could not prove deferred reservation or selected cost",
                     watched.ticker, local_order_id,
                 )
                 return None
+
+            _recovered_meta = dict(_order_meta)
+            _recovered_meta.setdefault("local_order_id", local_order_id)
+            _recovered_meta.setdefault("execution_mode", _recovered_mode)
+            if _is_deferred_placeholder:
+                _recovered_meta.setdefault("deferred_reservation_cost", _recovered_cost)
+                _recovered_meta["cost_authority"] = "deferred_reservation"
+            else:
+                _recovered_meta.setdefault("actual_selected_cost", _recovered_cost)
+                _recovered_meta["cost_authority"] = "materialized_contract"
 
             recovered = SimpleNamespace(
                 plan_id=str(order.get("plan_id") or sig.get("plan_id") or local_order_id),
@@ -1868,14 +1887,17 @@ class APExecutionCore:
                 trigger_price=getattr(watched, "entry_trigger", watched.trigger_price),
                 stop_underlying=watched.stop_level,
                 target_underlying=watched.target_price,
-                contract_symbol=str(order.get("contract") or sig.get("contract_symbol") or ""),
+                contract_symbol=_order_contract,
                 limit_price=limit_price if limit_price > 0 else None,
-                metadata=dict(_order_meta),
+                metadata=_recovered_meta,
             )
             sig["_approved_plan"] = recovered
             log.info(
-                "[%s] Recovered approved plan for breach revalidation from OSM order %s | cost=$%.0f",
-                watched.ticker, local_order_id, real_cost,
+                "[%s] Recovered approved plan from OSM order %s | cost_authority=%s value=$%.2f",
+                watched.ticker,
+                local_order_id,
+                _recovered_meta.get("cost_authority"),
+                _recovered_cost,
             )
             return recovered
         except Exception as exc:
@@ -1894,6 +1916,21 @@ class APExecutionCore:
         if ticker and contract_symbol == ticker:
             return False
         return bool(_OCC_CONTRACT_RE.search(contract_symbol))
+
+    @staticmethod
+    def _plan_is_deferred(plan, ticker: str = "") -> bool:
+        """Return whether a plan still needs breach-time contract materialization."""
+        if plan is None:
+            return False
+        _meta = getattr(plan, "metadata", None) or {}
+        if not isinstance(_meta, dict):
+            _meta = {}
+        _contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        return bool(
+            _meta.get("contract_deferred")
+            or _contract.upper().startswith("DEFERRED:")
+            or not _contract
+        )
 
     def _refresh_hydrated_prebreach_plan(
         self,
@@ -2199,7 +2236,35 @@ class APExecutionCore:
                     "context_notes": msg + "_paper_fail_open",
                 })
 
-        if approved_plan is not None and self.master_control is not None:
+        _plan_mode = _normalize_execution_mode(
+            getattr(approved_plan, "execution_mode", None)
+            or getattr(approved_plan, "mode", None)
+            or (
+                (getattr(approved_plan, "metadata", None) or {}).get("execution_mode")
+                if isinstance(getattr(approved_plan, "metadata", None) or {}, dict)
+                else None
+            )
+            or sig.get("execution_mode")
+        )
+        _deferred_live = (
+            approved_plan is not None
+            and _plan_mode == "live"
+            and self._plan_is_deferred(approved_plan, ticker)
+        )
+        if _deferred_live:
+            log.info(
+                "DEFERRED_BREACH_CAPACITY_GATE_DEFERRED "
+                "ticker=%s signal_id=%s execution_mode=live "
+                "reason=real_contract_cost_not_materialized",
+                ticker,
+                signal_id,
+            )
+
+        if (
+            approved_plan is not None
+            and self.master_control is not None
+            and not _deferred_live
+        ):
             try:
                 reval = self.master_control.revalidate_exposure(
                     approved_plan,
@@ -4480,6 +4545,229 @@ class APExecutionCore:
         # guard deferred logs with _deferred). Non-deferred entries never emit a
         # deferred terminal outcome.
         _deferred_outcome["is_deferred"] = bool(_deferred)
+        _deferred_mode = _normalize_execution_mode(
+            getattr(approved_plan, "execution_mode", None)
+            or getattr(approved_plan, "mode", None)
+            or _sig_dict.get("execution_mode")
+        )
+        _deferred_capacity: dict = {}
+
+        if _deferred and _deferred_mode is None:
+            _reason = "metadata_invalid:unknown_execution_mode"
+            log.critical(
+                "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s order=%s",
+                ticker,
+                _reason,
+                queue_local_order_id,
+            )
+            _emit_deferred_outcome(
+                "BREACH_RISK_CHECK_BLOCKED",
+                reason=_reason,
+                contract=_contract_sym_raw,
+                extra={
+                    "client_id": _breach_client_id,
+                    "execution_mode": "",
+                    "signal_id": signal_id,
+                },
+            )
+            return _terminalize_deferred_breach_failure(
+                _reason,
+                extra_meta={
+                    "failure_stage": "deferred_execution_mode_validation",
+                    "client_id": _breach_client_id,
+                    "execution_mode": "",
+                    "signal_id": signal_id,
+                },
+            )
+
+        if _deferred and _deferred_mode == "live":
+            _capacity_resolver = getattr(self.master_control, "get_entry_capacity", None)
+            if not callable(_capacity_resolver):
+                _reason = "deferred_selector_capacity_unavailable"
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_reason,
+                    contract=_contract_sym_raw,
+                    extra={
+                        "client_id": _breach_client_id,
+                        "execution_mode": _deferred_mode,
+                        "signal_id": signal_id,
+                    },
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={
+                        "failure_stage": "deferred_capacity_resolution",
+                        "client_id": _breach_client_id,
+                        "execution_mode": _deferred_mode,
+                        "signal_id": signal_id,
+                    },
+                )
+            try:
+                _deferred_capacity = _capacity_resolver(
+                    client_id=_breach_client_id,
+                    execution_mode=_deferred_mode,
+                    ticker=ticker,
+                    signal_id=str(
+                        getattr(approved_plan, "signal_id", None) or signal_id or ""
+                    ),
+                    exclude_local_order_id=queue_local_order_id,
+                )
+            except Exception as _capacity_exc:
+                _reason = f"deferred_selector_capacity_error:{_capacity_exc}"
+                log.critical(
+                    "[%s] DEFERRED_BREACH_CAPACITY_BLOCKED order=%s error=%s",
+                    ticker,
+                    queue_local_order_id,
+                    _capacity_exc,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_reason,
+                    contract=_contract_sym_raw,
+                    extra={
+                        "client_id": _breach_client_id,
+                        "execution_mode": _deferred_mode,
+                        "signal_id": signal_id,
+                    },
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={
+                        "failure_stage": "deferred_capacity_resolution",
+                        "client_id": _breach_client_id,
+                        "execution_mode": _deferred_mode,
+                        "signal_id": signal_id,
+                    },
+                )
+
+            if not isinstance(_deferred_capacity, dict) or not _deferred_capacity.get("ok"):
+                _capacity_reason = str(
+                    (_deferred_capacity or {}).get("reason_code")
+                    or (_deferred_capacity or {}).get("reason")
+                    or "DEFERRED_SELECTOR_CAPACITY_UNAVAILABLE"
+                )
+                _capacity_extra = {
+                    _key: _value
+                    for _key, _value in (_deferred_capacity or {}).items()
+                    if isinstance(_value, (str, int, float, bool)) or _value is None
+                }
+                log.warning(
+                    "[%s] DEFERRED_BREACH_CAPACITY_BLOCKED order=%s "
+                    "client=%s execution_mode=%s reason=%s",
+                    ticker,
+                    queue_local_order_id,
+                    _breach_client_id,
+                    _deferred_mode,
+                    _capacity_reason,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_capacity_reason,
+                    contract=_contract_sym_raw,
+                    extra=_capacity_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _capacity_reason,
+                    extra_meta={
+                        "failure_stage": "deferred_capacity_resolution",
+                        **_capacity_extra,
+                    },
+                )
+
+            try:
+                _selector_budget = float(_deferred_capacity.get("selector_budget"))
+                _remaining_capacity = float(
+                    _deferred_capacity.get("remaining_total_capacity")
+                )
+                _per_trade_budget = float(_deferred_capacity.get("per_trade_budget"))
+                if not all(
+                    math.isfinite(_value) and _value > 0.0
+                    for _value in (_selector_budget, _per_trade_budget)
+                ) or not math.isfinite(_remaining_capacity):
+                    raise ValueError("capacity values must be finite and positive")
+            except (TypeError, ValueError) as _capacity_shape_exc:
+                _reason = f"deferred_selector_capacity_invalid:{_capacity_shape_exc}"
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_reason,
+                    contract=_contract_sym_raw,
+                    extra={
+                        "client_id": _breach_client_id,
+                        "execution_mode": _deferred_mode,
+                        "signal_id": signal_id,
+                    },
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={"failure_stage": "deferred_capacity_resolution"},
+                )
+
+            _reservation_before_selection = float(
+                getattr(approved_plan, "max_position_usd", 0) or 0
+            )
+            if isinstance(approved_plan, dict):
+                _plan_meta = approved_plan.setdefault("metadata", {})
+                if not isinstance(_plan_meta, dict):
+                    _plan_meta = {}
+                    approved_plan["metadata"] = _plan_meta
+            else:
+                _plan_meta = getattr(approved_plan, "metadata", None) or {}
+                if not isinstance(_plan_meta, dict):
+                    _plan_meta = {}
+                    try:
+                        approved_plan.metadata = _plan_meta
+                    except Exception:
+                        pass
+            _plan_meta.setdefault(
+                "deferred_reservation_cost", _reservation_before_selection
+            )
+            _plan_meta["cost_authority"] = "selector_capacity_pending_actual_cost"
+            _plan_meta["execution_mode"] = _deferred_mode
+            _plan_meta["local_order_id"] = queue_local_order_id
+            _sizing_context = _plan_meta.setdefault("sizing_context", {})
+            if not isinstance(_sizing_context, dict):
+                _sizing_context = {}
+                _plan_meta["sizing_context"] = _sizing_context
+            _sizing_context.update({
+                "account_equity": float(_deferred_capacity.get("account_equity", 0) or 0),
+                "per_trade_budget": _per_trade_budget,
+                "total_capital_cap": float(_deferred_capacity.get("total_capital_cap", 0) or 0),
+                "current_total_exposure": float(
+                    _deferred_capacity.get("current_total_exposure", 0) or 0
+                ),
+                "remaining_total_capacity": _remaining_capacity,
+                "remaining_total_cap": _remaining_capacity,
+                "remaining_capacity": _remaining_capacity,
+                "selector_budget": _selector_budget,
+                "max_position_usd": _selector_budget,
+                "max_affordable_premium": float(
+                    _deferred_capacity.get("max_affordable_premium", _selector_budget / 100.0)
+                    or 0
+                ),
+                "execution_mode": _deferred_mode,
+            })
+            try:
+                approved_plan.max_position_usd = _selector_budget
+                approved_plan.selector_budget = _selector_budget
+                approved_plan.remaining_capacity = _remaining_capacity
+                approved_plan.max_affordable_premium = _selector_budget / 100.0
+            except Exception:
+                pass
+            log.info(
+                "DEFERRED_SELECTOR_CAPACITY_AUTHORITY "
+                "order_id=%s client_id=%s execution_mode=%s signal_id=%s "
+                "reservation_cost=%.2f selector_budget=%.2f "
+                "per_trade_budget=%.2f remaining_total_capacity=%.2f",
+                queue_local_order_id,
+                _breach_client_id,
+                _deferred_mode,
+                str(getattr(approved_plan, "signal_id", None) or signal_id or ""),
+                _reservation_before_selection,
+                _selector_budget,
+                _per_trade_budget,
+                _remaining_capacity,
+            )
 
         # ── P0 amendment #3 (PR #294): deferred materialization handoff proof ──
         # A single snapshot dict that captures the three staged views of the
@@ -5375,14 +5663,35 @@ class APExecutionCore:
                     try:
                         approved_plan.contract_symbol = _sel_contract
                         _sel_price = _sel_price_candidate
-                        if _sel_price:
-                            approved_plan.limit_price = float(_sel_price)
+                        _sel_execution_price = float(_sel_price)
+                        approved_plan.limit_price = _sel_execution_price
                         _sel_qty = _sel_qty_candidate
                         if _sel_qty > 0:
                             approved_plan.contracts = _sel_qty
-                            _prem_per_contract = float(getattr(_sel, "premium_per_contract", 0) or 0)
-                            if _prem_per_contract > 0:
-                                approved_plan.max_position_usd = _sel_qty * _prem_per_contract
+                            # A selector capacity is not an actual contract
+                            # cost.  Once OCC + executable price + quantity
+                            # exist, materialize the actual cost from those
+                            # canonical fields instead of depending on an
+                            # optional selector diagnostic.
+                            _actual_selected_cost = round(
+                                _sel_qty * _sel_execution_price * 100.0,
+                                2,
+                            )
+                            approved_plan.max_position_usd = _actual_selected_cost
+                            try:
+                                approved_plan.selector_execution_price = _sel_execution_price
+                            except Exception:
+                                pass
+                            _plan_meta_after_selection = getattr(
+                                approved_plan, "metadata", None
+                            )
+                            if isinstance(_plan_meta_after_selection, dict):
+                                _plan_meta_after_selection["actual_selected_cost"] = (
+                                    _actual_selected_cost
+                                )
+                                _plan_meta_after_selection["cost_authority"] = (
+                                    "materialized_contract"
+                                )
                         _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
                         # P0 amendment #3 (PR #294): capture stages 1 & 2 of
                         # the handoff snapshot the moment copy-back completes.
@@ -6439,16 +6748,44 @@ class APExecutionCore:
                 _sel_qty  = int(getattr(approved_plan, "contracts", 1) or 1)
                 _sel_lim  = float(getattr(approved_plan, "limit_price", 0) or 0)
                 _sel_cost = round(_sel_qty * _sel_lim * 100, 2)
+                _sizing_after_selection = (
+                    (getattr(approved_plan, "metadata", None) or {}).get("sizing_context")
+                    if isinstance(getattr(approved_plan, "metadata", None) or {}, dict)
+                    else {}
+                )
+                _selector_capacity_budget = float(
+                    _deferred_capacity.get("selector_budget")
+                    or (
+                        _sizing_after_selection or {}
+                    ).get("selector_budget")
+                    or 0
+                )
                 _selector_materialization_meta = {
                     "selected_bid": _sel_bid,
                     "selected_ask": _sel_ask,
                     "selected_mid": _sel_mid,
+                    "selected_execution_price": _sel_lim,
+                    "selected_quantity": _sel_qty,
+                    "actual_selected_cost": _sel_cost,
                     "selector_pricing_basis": str(
                         getattr(_sel, "pricing_basis", "")
                         or "execution_price_per_share_or_ask"
                     ),
-                    "selector_effective_budget": float(
-                        getattr(approved_plan, "max_position_usd", 0) or 0
+                    "selector_effective_budget": _selector_capacity_budget,
+                    "per_trade_budget": float(
+                        _deferred_capacity.get("per_trade_budget")
+                        or (_sizing_after_selection or {}).get("per_trade_budget")
+                        or 0
+                    ),
+                    "remaining_total_capacity": float(
+                        _deferred_capacity.get("remaining_total_capacity")
+                        or (_sizing_after_selection or {}).get("remaining_total_capacity")
+                        or 0
+                    ),
+                    "remaining_total_cap": float(
+                        _deferred_capacity.get("remaining_total_cap")
+                        or (_sizing_after_selection or {}).get("remaining_total_cap")
+                        or 0
                     ),
                     "selected_expiration": str(
                         getattr(_sel, "expiration_date", "") or ""
@@ -6513,6 +6850,201 @@ class APExecutionCore:
                     ticker, _cs_err,
                 )
                 return
+
+        # The selector has now materialized a real OCC contract.  Only at this
+        # point does max_position_usd become an actual contract cost.  Re-run
+        # the existing master-control exposure authority before quote refresh
+        # and submit; the deferred reservation/capacity above is never treated
+        # as that cost.
+        if _deferred and _deferred_mode == "live":
+            _final_contract = str(
+                getattr(approved_plan, "contract_symbol", "") or ""
+            ).strip()
+            try:
+                _final_qty = int(getattr(approved_plan, "contracts", 0) or 0)
+            except Exception:
+                _final_qty = 0
+            try:
+                _final_price = float(getattr(approved_plan, "limit_price", 0) or 0)
+            except Exception:
+                _final_price = 0.0
+            _plan_client_id = str(getattr(approved_plan, "client_id", None) or "").strip()
+            _plan_signal_id = str(getattr(approved_plan, "signal_id", None) or "").strip()
+            if (
+                (_plan_client_id and _breach_client_id and _plan_client_id != _breach_client_id)
+                or (_plan_signal_id and signal_id and _plan_signal_id != signal_id)
+            ):
+                _reason = "deferred_materialization_identity_mismatch"
+                _identity_extra = {
+                    "client_id": _breach_client_id,
+                    "plan_client_id": _plan_client_id,
+                    "signal_id": signal_id,
+                    "plan_signal_id": _plan_signal_id,
+                    "execution_mode": _deferred_mode,
+                }
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_reason,
+                    contract=_final_contract,
+                    extra=_identity_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={
+                        "failure_stage": "deferred_materialization_identity",
+                        **_identity_extra,
+                    },
+                )
+            if not self._is_real_occ_contract(_final_contract, ticker) or _final_qty <= 0 or _final_price <= 0:
+                _reason = "deferred_materialization_actual_cost_unproven"
+                _invalid_extra = {
+                    "failure_stage": "deferred_actual_cost_validation",
+                    "selected_contract": _final_contract,
+                    "selected_execution_price": _final_price,
+                    "selected_quantity": _final_qty,
+                    "client_id": _breach_client_id,
+                    "signal_id": _plan_signal_id or signal_id,
+                    "execution_mode": _deferred_mode,
+                }
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_reason,
+                    contract=_final_contract,
+                    extra=_invalid_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta=_invalid_extra,
+                )
+
+            _actual_selected_cost = round(_final_qty * _final_price * 100.0, 2)
+            try:
+                approved_plan.max_position_usd = _actual_selected_cost
+            except Exception:
+                pass
+            _final_capacity_extra = {
+                "selected_contract": _final_contract,
+                "selected_execution_price": _final_price,
+                "selected_quantity": _final_qty,
+                "actual_selected_cost": _actual_selected_cost,
+                "selector_budget": float(_deferred_capacity.get("selector_budget", 0) or 0),
+                "per_trade_budget": float(_deferred_capacity.get("per_trade_budget", 0) or 0),
+                "remaining_total_capacity": float(
+                    _deferred_capacity.get("remaining_total_capacity", 0) or 0
+                ),
+                "current_total_exposure": float(
+                    _deferred_capacity.get("current_total_exposure", 0) or 0
+                ),
+                "client_id": _breach_client_id,
+                "signal_id": _plan_signal_id or signal_id,
+                "execution_mode": _deferred_mode,
+                "local_order_id": queue_local_order_id,
+            }
+            _final_revalidator = getattr(self.master_control, "revalidate_exposure", None)
+            if not callable(_final_revalidator):
+                _reason = "deferred_final_exposure_revalidation_unavailable"
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_reason,
+                    contract=_final_contract,
+                    extra=_final_capacity_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={
+                        "failure_stage": "deferred_final_exposure_revalidation",
+                        **_final_capacity_extra,
+                    },
+                )
+            try:
+                _final_reval = _final_revalidator(
+                    approved_plan,
+                    client_id=_breach_client_id,
+                )
+            except Exception as _final_reval_exc:
+                _reason = f"deferred_final_exposure_revalidation_error:{_final_reval_exc}"
+                log.critical(
+                    "[%s] DEFERRED_FINAL_EXPOSURE_REVALIDATION_ERROR "
+                    "order=%s client=%s execution_mode=%s error=%s",
+                    ticker,
+                    queue_local_order_id,
+                    _breach_client_id,
+                    _deferred_mode,
+                    _final_reval_exc,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_reason,
+                    contract=_final_contract,
+                    extra=_final_capacity_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={
+                        "failure_stage": "deferred_final_exposure_revalidation",
+                        **_final_capacity_extra,
+                    },
+                )
+
+            _final_reval_ok = bool(getattr(_final_reval, "ok", False))
+            _final_reval_reason = str(
+                getattr(_final_reval, "reason_code", None)
+                or getattr(_final_reval, "reason", None)
+                or ("allowed" if _final_reval_ok else "revalidation_failed")
+            )
+            _final_reval_extra = {
+                **_final_capacity_extra,
+                "decision": "ALLOW" if _final_reval_ok else "BLOCK",
+                "decision_reason": _final_reval_reason,
+                "total_capital_cap": float(
+                    _deferred_capacity.get("total_capital_cap", 0) or 0
+                ),
+            }
+            try:
+                _final_actual_after_reval = float(
+                    getattr(approved_plan, "max_position_usd", _actual_selected_cost)
+                    or _actual_selected_cost
+                )
+                _final_reval_extra["actual_selected_cost"] = round(
+                    _final_actual_after_reval,
+                    2,
+                )
+            except Exception:
+                pass
+            log.info(
+                "DEFERRED_FINAL_EXPOSURE_REVALIDATION "
+                "order_id=%s client_id=%s execution_mode=%s signal_id=%s "
+                "contract=%s selected_price=%.4f qty=%s actual_selected_cost=%.2f "
+                "per_trade_budget=%.2f remaining_total_capacity=%.2f "
+                "decision=%s reason=%s",
+                queue_local_order_id,
+                _breach_client_id,
+                _deferred_mode,
+                _plan_signal_id or signal_id,
+                _final_contract,
+                _final_price,
+                _final_qty,
+                _final_reval_extra.get("actual_selected_cost", _actual_selected_cost),
+                _final_reval_extra.get("per_trade_budget", 0.0),
+                _final_reval_extra.get("remaining_total_capacity", 0.0),
+                _final_reval_extra["decision"],
+                _final_reval_reason,
+            )
+            if not _final_reval_ok:
+                _reason = f"deferred_final_exposure_revalidation_blocked:{_final_reval_reason}"
+                _emit_deferred_outcome(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    reason=_reason,
+                    contract=_final_contract,
+                    extra=_final_reval_extra,
+                )
+                return _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={
+                        "failure_stage": "deferred_final_exposure_revalidation",
+                        **_final_reval_extra,
+                    },
+                )
 
         # 4) Require the approved plan to carry a valid limit price (used as
         #    the drift baseline — the actual submit limit is re-anchored to the
@@ -6884,12 +7416,23 @@ class APExecutionCore:
             # Defensive getattr: an unusual runner shape must never NameError
             # either identity field — we fall back to empty string, which the
             # CAS meta and proof log will carry rather than crashing.
-            _proof_client_id = str(getattr(self, "client_id", "") or "")
-            _proof_execution_mode = str(
-                getattr(self, "execution_mode", None)
-                or getattr(self, "mode", "")
-                or ""
-            )
+            if _deferred:
+                _proof_client_id = str(
+                    _breach_client_id or getattr(self, "client_id", "") or ""
+                )
+                _proof_execution_mode = str(
+                    _deferred_mode
+                    or getattr(self, "execution_mode", None)
+                    or getattr(self, "mode", "")
+                    or ""
+                )
+            else:
+                _proof_client_id = str(getattr(self, "client_id", "") or "")
+                _proof_execution_mode = str(
+                    getattr(self, "execution_mode", None)
+                    or getattr(self, "mode", "")
+                    or ""
+                )
 
             # ── P0 (PR #295): CAS-persist real OCC contract into the existing
             # PENDING_TRIGGER order row BEFORE the handoff proof reads it.
