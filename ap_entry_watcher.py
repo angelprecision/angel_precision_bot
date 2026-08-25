@@ -3028,6 +3028,20 @@ class APEntryWatcher:
                 w.rearm_count,
             )
 
+    def _opposite_conflict_applies(self, watched, opposite) -> bool:
+        """Return whether legacy opposite-direction arbitration applies.
+
+        The package watcher overrides this seam for exact client/mode ownership
+        and healthy pre-breach co-arming.  The legacy default preserves the
+        existing ticker-level behavior for callers that do not opt into that
+        hardening shim.
+        """
+        return True
+
+    def _same_side_conflict_applies(self, watched, same_side_watcher) -> bool:
+        """Return whether legacy same-side arbitration applies."""
+        return True
+
     def add_signal(
         self, signal: dict, *, registration_provenance_out: Optional[dict] = None,
     ) -> bool:
@@ -3125,6 +3139,7 @@ class APEntryWatcher:
                 if (w.is_active or getattr(w, "rearm_mode", False))
                 and w.ticker == watched.ticker
                 and w.side == watched.side
+                and self._same_side_conflict_applies(watched, w)
             ]
             opposite_side = [
                 w
@@ -3132,6 +3147,7 @@ class APEntryWatcher:
                 if (w.is_active or getattr(w, "rearm_mode", False))
                 and w.ticker == watched.ticker
                 and w.side != watched.side
+                and self._opposite_conflict_applies(watched, w)
             ]
 
             # Never keep both CALL and PUT armed for the same ticker. Stronger
@@ -5417,6 +5433,10 @@ class APEntryWatcher:
         if to_remove:
             log.info("[WATCHER] Overnight revalidation: %d watchers dispatched", len(to_remove))
 
+    def _before_trigger_dispatch(self, completed):
+        """Hook for a watcher implementation to arbitrate trigger batches."""
+        return completed
+
     def _poll_active_signals(self, open_protect_active: bool) -> None:
         with self._lock:
             # PR 158 P1 — RETRY_LATER watchers must not be trigger-polled.
@@ -5508,6 +5528,11 @@ class APEntryWatcher:
             #   check() → classify → callback → verify result → then remove + dedup release
             #   FAILED: enter quarantine (stay in _pending, dedup held, not active)
             pass  # removal now handled per-watcher after callback verification
+
+        # The package watcher uses this post-check/pre-callback seam to make a
+        # batch-level confirmed-breach direction claim.  It may remove proven
+        # losers or convert an ambiguous batch to a fail-closed hold.
+        completed = self._before_trigger_dispatch(completed)
 
         for action, w in completed:
             _sig_id = str(w.signal.get("signal_id", ""))

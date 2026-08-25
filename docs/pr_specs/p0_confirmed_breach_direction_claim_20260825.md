@@ -1,9 +1,9 @@
 # P0 — Confirmed-Breach Direction Claim
 
 **Date:** 2026-08-25  
-**Base main SHA:** `26cb2b4c3f019ba592cbd00882835fc825f3193a`  
+**Base main SHA:** `a8bf05529c7aec8e23132e0caf5cf3180550c0e5`
 **Branch:** `fix/p0-confirmed-breach-direction-claim-20260825`  
-**Status:** SPEC / IMPLEMENTATION REQUIRED — **DO NOT MERGE OR DEPLOY YET**
+**Status:** IMPLEMENTED / FOCUSED TESTS ADDED — **DRAFT / REVIEW REQUIRED — DO NOT MERGE OR DEPLOY YET**
 
 ---
 
@@ -835,6 +835,21 @@ Be careful if wrapping `self.on_trigger` inside `_poll_active_signals()`:
 - do not let later callback dispatch for an already-lost watcher call execution
 
 Alternative designs are acceptable if they prove the same invariants and remain surgical.
+
+## 13.1 Implemented correction set
+
+The implementation now:
+
+- retains healthy exact-key opposite pre-breach watchers and records
+  `opposite_side_coarmed`
+- keeps legacy same-side, stale, rearm, and protected-opposite proof paths
+- requires durable `signal_id` in terminal cancellation rereads
+- arbitrates the complete confirmed-trigger batch before `on_trigger`
+- cancels and proves exact-key losers before dispatching the winner
+- holds both directions when same-poll ordering is not independently provable
+- holds the winner when loser cancellation proof is unavailable or fails
+- adds registration-order, identity, cancellation, and trigger arbitration
+  regressions to the existing P0 watcher conflict test file
 
 ---
 
