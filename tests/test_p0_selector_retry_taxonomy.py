@@ -846,3 +846,31 @@ def test_allow_cheap_only_choice_live_true_comes_from_real_env_path(monkeypatch)
     assert result.execution_price_per_share == pytest.approx(0.49)
     assert result.selection_reason == "cheap_contract_only_choice"
     assert selector.get_last_failure() is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["INVALID_PLAN", "INVALID_EXECUTION_MODE", "EXECUTION_MODE_MISMATCH"],
+)
+def test_preexisting_terminal_invariants_keep_historical_deferred_quality_action(reason):
+    """PR #504 invariant handling is exact-reason scoped, not category-wide."""
+    from ap_execution_core import (
+        _classify_deferred_breach_retry_decision,
+        _deferred_selector_status,
+    )
+
+    assert get_policy(reason).classification == TERMINAL_INVARIANT
+    decision = _classify_deferred_breach_retry_decision(
+        reason,
+        queue_local_order_id="local-existing-invariant",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+    assert decision == {
+        "action": "terminal_quality",
+        "reason_code": reason,
+        "retryable_reason": False,
+    }
+    assert _deferred_selector_status(decision) == "CONTRACT_SELECTION_QUALITY_REJECT"
