@@ -1531,6 +1531,33 @@ class WatchedSignal:
                         self.stop_level,
                     )
 
+        # A trigger may become confirmed inside this very poll.  The
+        # pre-confirmation stop-truth guard above cannot see that transition,
+        # so apply the same fail-closed rule once the ordinary breach path has
+        # completed.  Preserve the confirmed trigger evidence, but do not
+        # return TRIGGERED to the dispatcher while the newly active scanner
+        # stop has unknown truth.
+        if (
+            self.state == WatchState.TRIGGERED
+            and self.trigger_crossed_at is not None
+            and bool(self.stop_level)
+            and _stop_side_quote is None
+        ):
+            _stop_side = "BID" if self.side == "CALL" else "ASK"
+            self.state = WatchState.PENDING
+            self.last_trigger_evidence_reason = (
+                f"ACTIVE_STOP_TRUTH_UNAVAILABLE_{_stop_side}"
+            )
+            log.warning(
+                "[%s] SAME_POLL_ACTIVE_STOP_TRUTH_UNAVAILABLE — "
+                "preserving trigger_crossed_at=%s, holding watcher PENDING, "
+                "and suppressing trigger callback | side=%s stop_side=%s",
+                self.ticker,
+                self.trigger_crossed_at,
+                self.side,
+                _stop_side,
+            )
+
         return self.state
 
 
