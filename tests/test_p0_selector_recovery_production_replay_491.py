@@ -1,7 +1,7 @@
 """P0 — PR #491 §18: exact persisted request-scope evidence replay.
 
 EVIDENCE-ONLY. This file makes NO production code changes. It replays the
-resolver (both the pre-#491 historical version and the current #491
+resolver (a minimal deterministic pre-#491 reference and the current #491
 version) against exact, persisted production evidence pulled live from
 Supabase (project jhawzqnhcihevkhehogm, `orders` table) on 2026-08-19/20 --
 not synthetic, not abbreviated, not hand-generated.
@@ -27,9 +27,9 @@ records, for each:
   - the real persisted `direct_quote_unattempted_symbols` (all `[]` in these
     three records)
   - the historical/persisted final reason actually recorded in production
-  - the pre-#491 resolver's replayed result (imported verbatim from git
-    history at the exact rebase-base SHA, NOT hand-reconstructed, to avoid
-    any risk of mis-transcribing the old defect)
+  - the pre-#491 resolver's replayed result (from a minimal deterministic
+    reference extracted from the exact rebase-base implementation; it keeps
+    only the pure reducer and its reason classifications)
   - the current (#491) resolver's replayed result
   - whether each result matches the persisted historical ground truth, and
     an honest note where it does not
@@ -76,11 +76,10 @@ FIXTURES_PATH = Path(__file__).parent / "fixtures_pr491_production_replay.json"
 # ── Import the CURRENT (#491) resolver, exactly as shipped in ap/. ─────────
 from ap.selector_retry_policy import resolve_selector_recovery_final_reason as current_resolver
 
-# ── Import the HISTORICAL (pre-#491) resolver verbatim from git history at
-# the exact rebase-base SHA (b8e25dc1c19c969ac595685f3cc302d3b9c830da) --
-# not hand-reconstructed, to eliminate any risk of mis-transcribing the old
-# defect. The file is fully self-contained (no `ap` package imports), so it
-# loads standalone without touching DB/schema machinery.
+# ── Import the minimal deterministic HISTORICAL (pre-#491) reducer reference.
+# It is derived from the exact rebase-base SHA
+# (b8e25dc1c19c969ac595685f3cc302d3b9c830da), keeps the historical reducer
+# order/classifications, and omits unused production cursor/recovery code.
 _HISTORICAL_MODULE_PATH = (
     Path(__file__).parent / "pr491_historical_reference" / "selector_retry_policy_pre_491.py"
 )
@@ -192,7 +191,7 @@ class TestPersistedRequestScopeEvidenceReplay:
         symbols from the order's own selection_diagnostics), zero
         unattempted. Persisted historical result: MONEYNESS_OUT_OF_RANGE.
 
-        Replaying the LITERAL pre-#491 code against this exact evidence
+        Replaying the deterministic pre-#491 reducer reference against this exact evidence
         reproduces MONEYNESS_OUT_OF_RANGE -- confirming this real request
         was a real instance of the defect. Replaying the current resolver
         against the SAME exact evidence must NOT reproduce
@@ -211,8 +210,8 @@ class TestPersistedRequestScopeEvidenceReplay:
         pre_491_replay = historical_resolver(evidence)
         post_491_replay = current_resolver(evidence)
 
-        # The literal historical code, replayed against this exact evidence,
-        # reproduces what production actually did -- confirms this fixture
+        # The historical reducer reference, replayed against this exact
+        # evidence, reproduces what production actually did -- confirms this fixture
         # is a genuine, faithful instance of the defect, not a fabrication.
         assert pre_491_replay == historical_ground_truth == "MONEYNESS_OUT_OF_RANGE"
 
@@ -287,7 +286,7 @@ class TestPersistedRequestScopeEvidenceReplay:
         first probe and Rule 1.5 for the constructed worst case.
 
         Honest finding, still true after the correction: replaying the
-        LITERAL pre-#491 code against this evidence does NOT bit-for-bit
+        The deterministic pre-#491 reducer reference against this evidence does NOT bit-for-bit
         reproduce CRM's persisted historical UNKNOWN_SELECTOR_RECOVERY_
         FAILURE outcome (the pre-#491 code has no attempted-candidate
         accounting concept at all in its Step 3, and no fallback step
@@ -420,4 +419,3 @@ class TestReplaySummaryTable:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))
-
