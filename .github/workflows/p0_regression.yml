@@ -106,6 +106,7 @@ jobs:
             tests/test_p0_forward_regime_advisory_flow.py \
             tests/test_p0_strict_direct_quote_cache.py \
             tests/test_p0_selector_direct_quote_budget_authority.py \
+            tests/test_p0_live_deferred_capacity_authority.py \
             tests/test_p0_selector_terminal_truth_ranked_quotes_current_main.py \
             tests/test_p0_trigger_anchored_strike_selection.py \
             tests/test_p0_selector_recovery_capacity_and_validity.py \

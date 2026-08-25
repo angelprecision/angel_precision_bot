@@ -881,7 +881,7 @@ def _build_core(
     return core
 
 
-def _build_watcher(osm: _StatefulOSM, core):
+def _build_watcher(osm: _StatefulOSM, core, *, ticker="SPY"):
     watcher = APEntryWatcher(None, order_state_machine=osm, mode="LIVE")
     _orig_watch = watcher.watch
     _quote_calls = {"count": 0}
@@ -916,14 +916,14 @@ def _build_watcher(osm: _StatefulOSM, core):
         _quote_calls["count"] += 1
         if _quote_calls["count"] == 1:
             return {
-                "SPY": {
+                ticker: {
                     "bid": 599.80,
                     "ask": 599.82,
                     "quote_age_ms": 10,
                 }
             }
         return {
-            "SPY": {
+            ticker: {
                 "bid": 600.20,
                 "ask": 600.22,
                 "quote_age_ms": 10,
@@ -1932,3 +1932,498 @@ def test_pr514_deferred_unknown_mode_fails_closed_before_capacity_or_selector(mo
     assert mc.capacity_calls == []
     assert selector.calls == 0
     assert osm.post_payloads == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #514 addendum — named production-shape callback liveness
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PR514_LIVENESS_SHAPES = (
+    ("C", "C260828C00133000"),
+    ("PANW", "PANW260918C00400000"),
+    ("IDXX", "IDXX260918C00700000"),
+    ("NXPI", "NXPI260918C00250000"),
+    ("ADI", "ADI260918C00200000"),
+)
+
+
+class _PR514SuccessfulSelector(_Selector):
+    """Selector double that succeeds on its first materialization attempt."""
+
+    def select(self, _approved_plan, *, request_context=None):
+        assert request_context is not None
+        assert (
+            request_context.selector_request_kind
+            == "DEFERRED_BREACH_MATERIALIZATION"
+        )
+        self.calls += 1
+        self._last_failure = None
+        return types.SimpleNamespace(
+            contract_symbol=REAL_OCC,
+            bid=2.09,
+            ask=2.10,
+            mid=2.095,
+            affordable_contracts=1,
+            execution_price_per_share=2.10,
+            candidate_audit={"underlying_price": 600.25},
+            expiration_date="2026-09-18",
+            dte=3,
+            delta=0.44,
+            open_interest=1200,
+            volume=500,
+        )
+
+
+class _PR514StrictMaterializationOSM(_StatefulOSM):
+    """In-memory OSM that enforces the production owner/generation fences."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_attempts = 0
+        self.claim_successes = 0
+
+    def claim_deferred_materialization(self, local_order_id, **kwargs):
+        self.claim_attempts += 1
+        meta = self.row.get("meta") or {}
+        lifecycle = str(meta.get("lifecycle_state") or "").upper()
+        materialization_status = str(
+            meta.get("materialization_status") or ""
+        ).upper()
+        if str(self.row.get("status") or "").upper() in {
+            "SUBMITTED",
+            "ACKNOWLEDGED",
+            "PARTIAL_FILL",
+            "FILLED",
+            "REJECTED",
+            "EXPIRED",
+            "CANCELED",
+            "ERROR",
+        }:
+            return False
+        if (
+            bool(meta.get("materialization_in_flight"))
+            or lifecycle in {"MATERIALIZING", "BROKER_READY", "SUBMITTING"}
+            or materialization_status in {"RUNNING", "SELECTED"}
+        ):
+            return False
+
+        _generation = kwargs.get("generation", kwargs.get("new_generation"))
+        try:
+            _generation = int(_generation)
+            _prior_generation = int(meta.get("materialization_generation") or 0)
+        except (TypeError, ValueError):
+            return False
+        if _generation != _prior_generation + 1:
+            return False
+
+        # The existing seam-4 double predates the OSM new_generation alias.
+        # Normalize only at the test-double boundary; production code remains
+        # exercised through its actual generation-bearing callback path.
+        _claim_kwargs = dict(kwargs)
+        _claim_kwargs.setdefault("generation", _generation)
+        if "execution_mode" in _claim_kwargs:
+            _execution_mode = _claim_kwargs["execution_mode"]
+        else:
+            _execution_mode = self.execution_mode
+        claimed = bool(
+            super().claim_deferred_materialization(
+                local_order_id,
+                **_claim_kwargs,
+            )
+        )
+        if claimed:
+            self.claim_successes += 1
+            self._merge_meta({
+                "materialization_in_flight": True,
+                "execution_mode": str(_execution_mode or "").lower(),
+            })
+        return claimed
+
+    def schedule_deferred_materialization_retry(self, local_order_id, **kwargs):
+        meta = self.row.get("meta") or {}
+        if (
+            str(meta.get("materialization_owner") or "")
+            != str(kwargs.get("owner") or "")
+            or int(meta.get("materialization_generation") or 0)
+            != int(kwargs.get("generation") or 0)
+        ):
+            return False
+        scheduled = bool(
+            super().schedule_deferred_materialization_retry(
+                local_order_id,
+                **kwargs,
+            )
+        )
+        if scheduled:
+            self._merge_meta({"materialization_in_flight": False})
+        return scheduled
+
+    def persist_deferred_broker_ready(self, local_order_id, **kwargs):
+        meta = self.row.get("meta") or {}
+        if (
+            str(meta.get("materialization_owner") or "")
+            != str(kwargs.get("owner") or "")
+            or int(meta.get("materialization_generation") or 0)
+            != int(kwargs.get("generation") or 0)
+            or not bool(meta.get("materialization_in_flight"))
+        ):
+            return False
+        persisted = bool(
+            super().persist_deferred_broker_ready(
+                local_order_id,
+                **kwargs,
+            )
+        )
+        if persisted:
+            self._merge_meta({"materialization_in_flight": False})
+        return persisted
+
+
+def _pr514_liveness_fixture(monkeypatch, ticker, contract_symbol, selector):
+    """Build the existing seam-4 production-shaped harness for one symbol."""
+    _module = sys.modules[__name__]
+    monkeypatch.setattr(_module, "CLIENT_ID", f"pr514-{ticker.lower()}@example.com")
+    monkeypatch.setattr(_module, "LOCAL_ORDER_ID", f"oid-pr514-{ticker.lower()}")
+    monkeypatch.setattr(_module, "SIGNAL_ID", f"sig-pr514-{ticker.lower()}")
+    monkeypatch.setattr(_module, "REAL_OCC", contract_symbol)
+
+    osm = _PR514StrictMaterializationOSM()
+    osm.proof_read_failures_remaining = 0
+    osm.row["symbol"] = ticker
+    osm.row["contract"] = f"DEFERRED:{ticker}"
+    osm.row["meta"].update({
+        "contract_deferred": True,
+        "execution_mode": "live",
+    })
+    plan = _approved_plan()
+    plan.ticker = ticker
+    plan.contract_symbol = f"DEFERRED:{ticker}"
+    plan.metadata.update({
+        "contract_deferred": True,
+        "execution_mode": "live",
+        "queue_id": 514,
+    })
+    broker = _Broker()
+    core = _build_core(osm, broker, selector)
+    # The generic seam-4 builder intentionally keeps its historical SPY
+    # fallback. Bind this production-shaped plan explicitly so every matrix
+    # case reaches the named ticker/mode and OCC identity.
+    core._recover_plan_for_revalidation = lambda _watched: plan
+    watcher = _build_watcher(osm, core, ticker=ticker)
+    return osm, broker, selector, core, watcher, plan
+
+
+def _pr514_liveness_execution_module():
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
+        2.09,
+        15,
+        True,
+        "ok",
+        {
+            "spread_pct": 0.02,
+            "submit_bid": 2.08,
+            "submit_ask": 2.09,
+            "submit_mid": 2.085,
+            "submit_last": 2.09,
+        },
+    )
+    return fake_execution
+
+
+@pytest.mark.parametrize(
+    ("ticker", "contract_symbol"),
+    _PR514_LIVENESS_SHAPES,
+)
+def test_pr514_named_shapes_duplicate_confirmed_callbacks_are_idempotent(
+    monkeypatch,
+    ticker,
+    contract_symbol,
+):
+    """A repeated confirmed callback cannot repeat claim, selector, or POST."""
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, _core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        ticker,
+        contract_symbol,
+        selector,
+    )
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        first_result = watcher.on_trigger(watched)
+        second_result = watcher.on_trigger(watched)
+
+    row = osm.get_order(LOCAL_ORDER_ID)
+    assert first_result is None or first_result.get("disposition") in {
+        None,
+        "SUBMITTED",
+    }
+    assert second_result["disposition"] == "SUBMITTED"
+    assert osm.claim_successes == 1
+    assert selector.calls == 1
+    assert len(osm.post_payloads) == 1
+    assert row["contract"] == contract_symbol
+    assert row["broker_order_id"] == "TR-323"
+
+
+@pytest.mark.parametrize(
+    ("ticker", "contract_symbol"),
+    _PR514_LIVENESS_SHAPES,
+)
+def test_pr514_named_shapes_retry_waits_for_durable_clock_across_restart(
+    monkeypatch,
+    ticker,
+    contract_symbol,
+):
+    """Retryable selector failure waits, then resumes once after restart."""
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "30")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setenv("LIVE_CONFIRMATION_REQUIRED", "1")
+    selector = _Selector()
+    osm, broker, selector, _core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        ticker,
+        contract_symbol,
+        selector,
+    )
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.overnight = False
+        for _ in range(3):
+            watcher._poll_active_signals(open_protect_active=False)
+
+        row_after_failure = osm.get_order(LOCAL_ORDER_ID)
+        retry_meta = row_after_failure["meta"]
+        assert selector.calls == 1
+        assert retry_meta["lifecycle_state"] == "RETRY_WAIT"
+        assert retry_meta["materialization_status"] == "RETRY_PENDING"
+        assert retry_meta["next_retry_at"] == retry_meta[
+            "materialization_next_retry_at"
+        ]
+        assert datetime.fromisoformat(retry_meta["next_retry_at"]) > _now()
+
+        # A confirmed watcher callback before its durable retry clock is due
+        # must not create another selector/materialization attempt.
+        for _ in range(3):
+            watcher._poll_active_signals(open_protect_active=False)
+        assert selector.calls == 1
+        assert len(osm.post_payloads) == 0
+
+        # Restart with no surviving in-memory owner. Recovery consumes the
+        # durable due timestamp, advances the generation, and re-arms once.
+        due_at = _iso(_now() - timedelta(seconds=1))
+        osm.row["meta"]["next_retry_at"] = due_at
+        osm.row["meta"]["materialization_next_retry_at"] = due_at
+        core2 = _build_core(osm, broker, selector)
+        core2._recover_plan_for_revalidation = lambda _watched: plan
+        watcher2 = _build_watcher(osm, core2, ticker=ticker)
+        _run_recovery(osm, broker, watcher2, core2)
+        assert LOCAL_ORDER_ID in [
+            w.signal["local_order_id"] for w in watcher2._pending
+        ]
+        for retry_watched in watcher2._pending:
+            retry_watched.overnight = False
+        for _ in range(3):
+            watcher2._poll_active_signals(open_protect_active=False)
+
+    row_after_retry = osm.get_order(LOCAL_ORDER_ID)
+    assert selector.calls == 2
+    assert osm.claim_successes == 2
+    assert osm.claimed_generations == [1, 2]
+    assert len(osm.post_payloads) == 1
+    assert row_after_retry["contract"] == contract_symbol
+    assert row_after_retry["broker_order_id"] == "TR-323"
+
+
+@pytest.mark.parametrize(
+    ("ticker", "contract_symbol"),
+    _PR514_LIVENESS_SHAPES,
+)
+def test_pr514_named_shapes_active_owner_blocks_selector_duplicate(
+    monkeypatch,
+    ticker,
+    contract_symbol,
+):
+    """A live materialization owner prevents another selector attempt."""
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        ticker,
+        contract_symbol,
+        selector,
+    )
+    osm.row["meta"].update({
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": "materializer:active-owner",
+        "materialization_generation": 7,
+        "retry_attempt": 1,
+    })
+    plan.metadata.update({
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": "materializer:active-owner",
+        "materialization_generation": 7,
+        "retry_attempt": 1,
+    })
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        result = watcher.on_trigger(watcher._pending[0])
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_STATE_WRITE_FAILED"
+    assert selector.calls == 0
+    assert osm.post_payloads == []
+    assert osm.claim_successes == 0
+    assert core.master_control is not None
+
+
+@pytest.mark.parametrize(
+    ("ticker", "contract_symbol"),
+    _PR514_LIVENESS_SHAPES,
+)
+def test_pr514_named_shapes_stale_preclaim_generation_fails_closed(
+    monkeypatch,
+    ticker,
+    contract_symbol,
+):
+    """A restart callback with a stale owner/generation cannot select or POST."""
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, _core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        ticker,
+        contract_symbol,
+        selector,
+    )
+    current_owner = "materializer:current-owner"
+    osm.row["meta"].update({
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": current_owner,
+        "materialization_generation": 2,
+        "retry_attempt": 2,
+    })
+    plan.metadata.update({
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": current_owner,
+        "materialization_generation": 2,
+        "retry_attempt": 2,
+    })
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.signal.update({
+            "_recovery_pre_claimed": True,
+            "_recovery_pre_claimed_owner": "materializer:stale-owner",
+            "_recovery_pre_claimed_generation": 1,
+            "_recovery_pre_claimed_attempt": 1,
+            "_recovery_pre_claimed_client_id": CLIENT_ID,
+            "_recovery_pre_claimed_mode": "live",
+        })
+        result = watcher.on_trigger(watched)
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"
+    assert selector.calls == 0
+    assert osm.post_payloads == []
+    assert osm.row["meta"]["materialization_generation"] == 2
+    assert osm.row["meta"]["materialization_owner"] == current_owner
+
+
+def test_pr514_paper_deferred_shape_does_not_call_live_capacity_authority(monkeypatch):
+    """The deferred capacity resolver remains LIVE-only; PAPER is isolated."""
+    selector = _PR514SuccessfulSelector()
+    osm, broker, selector, _core, _watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        "C",
+        "C260828C00133000",
+        selector,
+    )
+    capacity_calls = []
+
+    def _unexpected_live_capacity(**kwargs):
+        capacity_calls.append(kwargs)
+        raise AssertionError("PAPER must not call LIVE deferred capacity")
+
+    master_control = types.SimpleNamespace(
+        mode="PAPER",
+        max_positions=5,
+        _kill_switch_fn=lambda: False,
+        get_entry_capacity=_unexpected_live_capacity,
+        revalidate_exposure=lambda _plan, **_kwargs: types.SimpleNamespace(
+            ok=True,
+            reason_code="EXPOSURE_ALLOWED",
+            reason="allowed",
+        ),
+    )
+    core = _build_core(osm, broker, selector, master_control=master_control)
+    core._recover_plan_for_revalidation = lambda _watched: plan
+    core.paper = True
+    core.mode = "PAPER"
+    core.execution_mode = "paper"
+    watcher = _build_watcher(osm, core, ticker="C")
+    watcher.mode = "PAPER"
+    osm.execution_mode = "paper"
+    osm.row["execution_mode"] = "paper"
+    osm.row["meta"].update({"execution_mode": "paper"})
+    plan.execution_mode = "paper"
+    plan.metadata.update({"execution_mode": "paper"})
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        result = watcher.on_trigger(watcher._pending[0])
+
+    assert capacity_calls == []
+    assert selector.calls == 1
+    assert len(osm.post_payloads) == 1
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
