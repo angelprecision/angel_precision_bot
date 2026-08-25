@@ -131,6 +131,10 @@ jobs:
             tests/test_p0_pending_trigger_restart_recovery.py \
             tests/test_entry_watcher_audit.py \
             tests/test_p0_watcher_invalidation_ownership.py \
+            tests/test_p0_watcher_breach_continuity_bounded_gap.py \
+            tests/test_p0_watcher_missing_observation_hold.py \
+            tests/test_p0_watcher_zero_quote_breach_guard.py \
+            tests/test_p0_watcher_same_poll_stop_truth.py \
             tests/test_p0_watcher_rollback_exact_registration_identity.py \
             tests/test_p0_broker_open_protective_monitoring.py \
             tests/test_p0_final_duplicate_honesty.py \

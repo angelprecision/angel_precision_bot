@@ -1274,6 +1274,10 @@ class TestProductionPathRegressions:
         watched.entry_trigger = 450.0
         watched.stop_level = 440.0
         watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+        # The staged partial breach needs a valid-observation anchor; without
+        # it the bounded-continuity guard correctly treats the fixture as
+        # stale instead of exercising open-protection cleanup.
+        watched._last_valid_breach_observation_at = datetime.now(timezone.utc)
         w._open_trigger_tickers.add("SPY")
 
         def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:

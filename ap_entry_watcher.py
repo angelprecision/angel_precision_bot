@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -72,6 +73,29 @@ def _ew_record(signal_id: str, ticker: str, to_state_name: str, reason: str, **m
         pass
 
 log = logging.getLogger("ap.entry_watcher")
+
+
+def _valid_positive_finite_quote(value) -> Optional[float]:
+    """Return a usable canonical quote, or ``None`` when unavailable.
+
+    Trigger evidence is stricter than display data: booleans, malformed,
+    non-finite, zero, and negative values are all unavailable and must never
+    become breach evidence.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _is_crossed_quote_pair(bid: Optional[float], ask: Optional[float]) -> bool:
+    """Return whether both sides are present but internally inconsistent."""
+    return bid is not None and ask is not None and bid > ask
 
 # Module-level ET zoneinfo: declared BEFORE any helper that uses it.
 ET = ZoneInfo("America/New_York")
@@ -569,6 +593,13 @@ class WatchState:
     CANCELLED = "CANCELLED"
 
 
+# Fixed safety invariant: pre-confirmation breach continuity may survive
+# missing canonical observations only for this bounded interval, measured from
+# the most recent valid breach observation. This is intentionally not an
+# environment-tunable frequency setting.
+WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC = 45
+
+
 class WatchedSignal:
     MOMENTUM_POLLS_REQUIRED = 2
 
@@ -663,8 +694,14 @@ class WatchedSignal:
 
         self.breach_count = 0
         self.breach_price = 0.0
+        # Process-local and intentionally non-durable. A restart must not
+        # fabricate continuity for an unconfirmed trigger lifecycle.
+        self._last_valid_breach_observation_at: Optional[datetime] = None
         self.last_quote_bid = 0.0
         self.last_quote_ask = 0.0
+        self.last_quote_bid_raw = None
+        self.last_quote_ask_raw = None
+        self.last_trigger_evidence_reason: Optional[str] = None
         self.last_quote_age_ms: Optional[int] = None
         self._watcher_ref = None
         self._pending_audit: Optional[dict] = None  # audit payload staged inside check(), persisted by poll loop
@@ -784,6 +821,20 @@ class WatchedSignal:
         except Exception:
             pass
 
+    def _reset_pending_breach_continuity(self) -> None:
+        """Discard only stale pre-confirmation breach evidence."""
+        self.breach_count = 0
+        self._pending_first_breach_at = None
+        self.breach_price = 0.0
+        self.first_breach_bid = 0.0
+        self.first_breach_ask = 0.0
+        self.trigger_price = None
+        self._last_valid_breach_observation_at = None
+
+    def _get_watcher_now(self) -> datetime:
+        """Narrow clock seam used by bounded-continuity comparisons."""
+        return datetime.now(timezone.utc)
+
     def check(self, bid: float, ask: float, quote_age_ms: Optional[int] = None) -> str:
         # PR-C precedence note: when ask >= trigger AND bid <= stop on the
         # SAME poll tick, the breach check runs FIRST (may set
@@ -794,7 +845,24 @@ class WatchedSignal:
         # add an early-return after TRIGGERED — the current precedence is
         # intentional. See tests/test_entry_watcher_audit.py
         # TestPrecedenceTriggerVsStop for the structural guarantee.
-        now = datetime.now(timezone.utc)
+        now = self._get_watcher_now()
+        _raw_bid = bid
+        _raw_ask = ask
+        _bid_quote = _valid_positive_finite_quote(bid)
+        _ask_quote = _valid_positive_finite_quote(ask)
+        _crossed_quote_pair = _is_crossed_quote_pair(_bid_quote, _ask_quote)
+        if _crossed_quote_pair:
+            # A crossed pair is not contradictory market truth that can be
+            # used for a decision; it is an internally inconsistent quote.
+            # Treat both sides as unavailable so neither entry nor the newly
+            # active stop can authorize a mutation from this poll.
+            _bid_quote = None
+            _ask_quote = None
+        _entry_trigger = _valid_positive_finite_quote(self.entry_trigger)
+        bid = _bid_quote if _bid_quote is not None else 0.0
+        ask = _ask_quote if _ask_quote is not None else 0.0
+        self.last_quote_bid_raw = _raw_bid
+        self.last_quote_ask_raw = _raw_ask
         self.last_quote_bid = bid
         self.last_quote_ask = ask
         if quote_age_ms is not None:
@@ -804,6 +872,74 @@ class WatchedSignal:
             self.state = WatchState.EXPIRED
             log.info("[%s] EXPIRED — no breach in %smin", self.ticker, MAX_WATCH_MINUTES)
             return self.state
+
+        # Missing/unusable required-side evidence suppresses entry evidence,
+        # but does not represent contradictory market truth. Before a trigger
+        # is confirmed, hold a fresh partial streak only within the fixed
+        # continuity window. Once confirmed, this timer has no authority.
+        _required_quote = _ask_quote if self.side == "CALL" else _bid_quote
+        _entry_trigger_evidence_unavailable = (
+            _entry_trigger is None or _required_quote is None
+        )
+        _suppress_entry_breach_evidence = False
+        if _entry_trigger_evidence_unavailable:
+            if _crossed_quote_pair:
+                self.last_trigger_evidence_reason = (
+                    "TRIGGER_EVIDENCE_UNAVAILABLE_CROSSED_BID_ASK"
+                )
+            else:
+                _required_side = "ASK" if self.side == "CALL" else "BID"
+                self.last_trigger_evidence_reason = (
+                    f"TRIGGER_EVIDENCE_UNAVAILABLE_{_required_side}"
+                )
+            _suppress_entry_breach_evidence = True
+            if self.trigger_crossed_at is None:
+                if self.breach_count == 0:
+                    self._last_valid_breach_observation_at = None
+                else:
+                    _elapsed = None
+                    if self._last_valid_breach_observation_at is not None:
+                        _elapsed = (
+                            now - self._last_valid_breach_observation_at
+                        ).total_seconds()
+                    _fresh = (
+                        _elapsed is not None
+                        and 0.0 <= _elapsed <= WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
+                    )
+                    if not _fresh:
+                        log.info(
+                            "[%s] WATCHER_BREACH_CONTINUITY_EXPIRED — side=%s "
+                            "raw_bid=%r raw_ask=%r continuity_age_sec=%s "
+                            "continuity_max_gap_sec=%d stale_breach_count=%d",
+                            self.ticker,
+                            self.side,
+                            _raw_bid,
+                            _raw_ask,
+                            f"{_elapsed:.1f}" if _elapsed is not None else "unknown",
+                            WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC,
+                            self.breach_count,
+                        )
+                        self._reset_pending_breach_continuity()
+            # Otherwise HOLD unchanged; no count, timestamp, or trigger price
+            # is fabricated from an unusable observation.
+        else:
+            self.last_trigger_evidence_reason = None
+
+        # A confirmed watcher may return to PENDING for callback retry. If its
+        # entry side is valid but the independently required stop side is not,
+        # do not re-fire the entry callback from incomplete safety truth.
+        _stop_side_quote = _bid_quote if self.side == "CALL" else _ask_quote
+        _active_stop_truth_unavailable = (
+            self.trigger_crossed_at is not None
+            and bool(self.stop_level)
+            and _stop_side_quote is None
+        )
+        if _active_stop_truth_unavailable and not _suppress_entry_breach_evidence:
+            _stop_side = "BID" if self.side == "CALL" else "ASK"
+            self.last_trigger_evidence_reason = (
+                f"ACTIVE_STOP_TRUTH_UNAVAILABLE_{_stop_side}"
+            )
+            _suppress_entry_breach_evidence = True
 
         # Intraday stale-move invalidation. Daily overnight signals get their
         # own structural validator, not generic drift logic.
@@ -1096,49 +1232,65 @@ class WatchedSignal:
                         return self.state
 
         if self.side == "CALL":
-            if ask >= self.entry_trigger:
-                if self.breach_count == 0:
-                    self.breach_price = ask
-                    # PR #407: durable trigger_crossed_at proof is issued ONLY
-                    # after MOMENTUM_POLLS_REQUIRED breaches confirm. Until
-                    # then, retain the first-breach poll timestamp in a private
-                    # pending slot and record the observed first-breach quote.
-                    self._pending_first_breach_at = now
-                    self.first_breach_bid = bid
-                    self.first_breach_ask = ask
-                    log.debug(
-                        "[%s] CALL breach candidate — ask=$%.2f >= trigger=$%.2f",
-                        self.ticker,
-                        ask,
-                        self.entry_trigger,
-                    )
-                self.breach_count += 1
-                if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
-                    # PR #407: confirmation promotes the pending first-breach
-                    # timestamp into the durable trigger_crossed_at proof.
-                    # trigger_crossed_at MUST be the first-breach poll time,
-                    # not the confirmation-poll time — see LIVE trigger-age
-                    # gate (ENTRY_TRIGGER_MAX_AGE_SEC) semantics.
-                    if self.trigger_crossed_at is None:
-                        confirmed_at = self._pending_first_breach_at
-                        if confirmed_at is None:
-                            confirmed_at = now
-                        self.trigger_crossed_at = confirmed_at
-                    self._pending_first_breach_at = None
-                    self.state = WatchState.TRIGGERED
-                    self.triggered_at = now
-                    self.trigger_price = ask
-                    log.info(
-                        "[%s] CALL CONFIRMED — ask=$%.2f held above $%.2f for %d polls",
-                        self.ticker,
-                        ask,
-                        self.entry_trigger,
-                        self.breach_count,
-                    )
-            else:
-                if self.breach_count > 0:
-                    log.debug("[%s] CALL breach reset — ask=$%.2f pulled back", self.ticker, ask)
-                self.breach_count = 0
+            if not _suppress_entry_breach_evidence:
+                if _ask_quote is not None and ask >= _entry_trigger:
+                    # A valid observation may continue a partial streak only
+                    # when its anchor is fresh. This backstop also covers a
+                    # delayed valid observation with no intervening missing
+                    # poll having been processed.
+                    if self.trigger_crossed_at is None and self.breach_count > 0:
+                        _elapsed = None
+                        if self._last_valid_breach_observation_at is not None:
+                            _elapsed = (
+                                now - self._last_valid_breach_observation_at
+                            ).total_seconds()
+                        if (
+                            _elapsed is None
+                            or _elapsed < 0.0
+                            or _elapsed > WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
+                        ):
+                            self._reset_pending_breach_continuity()
+                    if self.breach_count == 0:
+                        self.breach_price = ask
+                        # PR #407: durable trigger_crossed_at proof is issued ONLY
+                        # after MOMENTUM_POLLS_REQUIRED breaches confirm. Until
+                        # then, retain the first-breach poll timestamp in a private
+                        # pending slot and record the observed first-breach quote.
+                        self._pending_first_breach_at = now
+                        self.first_breach_bid = bid
+                        self.first_breach_ask = ask
+                        log.debug(
+                            "[%s] CALL breach candidate — ask=$%.2f >= trigger=$%.2f",
+                            self.ticker,
+                            ask,
+                            self.entry_trigger,
+                        )
+                    self.breach_count += 1
+                    self._last_valid_breach_observation_at = now
+                    if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
+                        # PR #407: confirmation promotes the pending first-breach
+                        # timestamp into the durable trigger_crossed_at proof.
+                        if self.trigger_crossed_at is None:
+                            confirmed_at = self._pending_first_breach_at
+                            if confirmed_at is None:
+                                confirmed_at = now
+                            self.trigger_crossed_at = confirmed_at
+                        self._pending_first_breach_at = None
+                        self.state = WatchState.TRIGGERED
+                        self.triggered_at = now
+                        self.trigger_price = ask
+                        log.info(
+                            "[%s] CALL CONFIRMED — ask=$%.2f held above $%.2f for %d polls",
+                            self.ticker,
+                            ask,
+                            self.entry_trigger,
+                            self.breach_count,
+                        )
+                else:
+                    if self.breach_count > 0:
+                        log.debug("[%s] CALL breach reset — ask=$%.2f pulled back", self.ticker, ask)
+                    self.breach_count = 0
+                    self._last_valid_breach_observation_at = None
 
             # FUNNEL FIX (2026-05-20): for overnight + daily setups, do NOT
             # invalidate on a pre-market stop touch. Pre-open spreads are wide
@@ -1174,6 +1326,7 @@ class WatchedSignal:
             if (
                 self.stop_level
                 and getattr(self, "trigger_crossed_at", None) is not None
+                and _bid_quote is not None
                 and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -1257,42 +1410,57 @@ class WatchedSignal:
                 )
 
         else:  # PUT
-            if bid <= self.entry_trigger:
-                if self.breach_count == 0:
-                    self.breach_price = bid
-                    # PR #407: see CALL branch — pending until confirmed.
-                    self._pending_first_breach_at = now
-                    self.first_breach_bid = bid
-                    self.first_breach_ask = ask
-                    log.debug(
-                        "[%s] PUT breach candidate — bid=$%.2f <= trigger=$%.2f",
-                        self.ticker,
-                        bid,
-                        self.entry_trigger,
-                    )
-                self.breach_count += 1
-                if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
-                    # PR #407: confirmation promotes pending timestamp.
-                    if self.trigger_crossed_at is None:
-                        confirmed_at = self._pending_first_breach_at
-                        if confirmed_at is None:
-                            confirmed_at = now
-                        self.trigger_crossed_at = confirmed_at
-                    self._pending_first_breach_at = None
-                    self.state = WatchState.TRIGGERED
-                    self.triggered_at = now
-                    self.trigger_price = bid
-                    log.info(
-                        "[%s] PUT CONFIRMED — bid=$%.2f held below $%.2f for %d polls",
-                        self.ticker,
-                        bid,
-                        self.entry_trigger,
-                        self.breach_count,
-                    )
-            else:
-                if self.breach_count > 0:
-                    log.debug("[%s] PUT breach reset — bid=$%.2f pulled back", self.ticker, bid)
-                self.breach_count = 0
+            if not _suppress_entry_breach_evidence:
+                if _bid_quote is not None and bid <= _entry_trigger:
+                    if self.trigger_crossed_at is None and self.breach_count > 0:
+                        _elapsed = None
+                        if self._last_valid_breach_observation_at is not None:
+                            _elapsed = (
+                                now - self._last_valid_breach_observation_at
+                            ).total_seconds()
+                        if (
+                            _elapsed is None
+                            or _elapsed < 0.0
+                            or _elapsed > WATCHER_BREACH_CONTINUITY_MAX_GAP_SEC
+                        ):
+                            self._reset_pending_breach_continuity()
+                    if self.breach_count == 0:
+                        self.breach_price = bid
+                        # PR #407: see CALL branch — pending until confirmed.
+                        self._pending_first_breach_at = now
+                        self.first_breach_bid = bid
+                        self.first_breach_ask = ask
+                        log.debug(
+                            "[%s] PUT breach candidate — bid=$%.2f <= trigger=$%.2f",
+                            self.ticker,
+                            bid,
+                            self.entry_trigger,
+                        )
+                    self.breach_count += 1
+                    self._last_valid_breach_observation_at = now
+                    if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
+                        # PR #407: confirmation promotes pending timestamp.
+                        if self.trigger_crossed_at is None:
+                            confirmed_at = self._pending_first_breach_at
+                            if confirmed_at is None:
+                                confirmed_at = now
+                            self.trigger_crossed_at = confirmed_at
+                        self._pending_first_breach_at = None
+                        self.state = WatchState.TRIGGERED
+                        self.triggered_at = now
+                        self.trigger_price = bid
+                        log.info(
+                            "[%s] PUT CONFIRMED — bid=$%.2f held below $%.2f for %d polls",
+                            self.ticker,
+                            bid,
+                            self.entry_trigger,
+                            self.breach_count,
+                        )
+                else:
+                    if self.breach_count > 0:
+                        log.debug("[%s] PUT breach reset — bid=$%.2f pulled back", self.ticker, bid)
+                    self.breach_count = 0
+                    self._last_valid_breach_observation_at = None
 
             # FUNNEL FIX (2026-05-20): same pre-open guard for PUT setups.
             # HOTFIX (2026-08-05): see CALL branch — dormant only pre-breach;
@@ -1308,6 +1476,7 @@ class WatchedSignal:
             if (
                 self.stop_level
                 and getattr(self, "trigger_crossed_at", None) is not None
+                and _ask_quote is not None
                 and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -1379,6 +1548,38 @@ class WatchedSignal:
                         ask,
                         self.stop_level,
                     )
+
+        # A trigger may become confirmed inside this very poll.  The
+        # pre-confirmation stop-truth guard above cannot see that transition,
+        # so apply the same fail-closed rule once the ordinary breach path has
+        # completed.  Preserve the confirmed trigger evidence, but do not
+        # return TRIGGERED to the dispatcher while the newly active scanner
+        # stop has unknown truth.
+        if (
+            self.state == WatchState.TRIGGERED
+            and self.trigger_crossed_at is not None
+            and bool(self.stop_level)
+            and _stop_side_quote is None
+        ):
+            _stop_side = "BID" if self.side == "CALL" else "ASK"
+            self.state = WatchState.PENDING
+            if _crossed_quote_pair:
+                self.last_trigger_evidence_reason = (
+                    "TRIGGER_EVIDENCE_UNAVAILABLE_CROSSED_BID_ASK"
+                )
+            else:
+                self.last_trigger_evidence_reason = (
+                    f"ACTIVE_STOP_TRUTH_UNAVAILABLE_{_stop_side}"
+                )
+            log.warning(
+                "[%s] SAME_POLL_ACTIVE_STOP_TRUTH_UNAVAILABLE — "
+                "preserving trigger_crossed_at=%s, holding watcher PENDING, "
+                "and suppressing trigger callback | side=%s stop_side=%s",
+                self.ticker,
+                self.trigger_crossed_at,
+                self.side,
+                _stop_side,
+            )
 
         return self.state
 
@@ -5257,16 +5458,19 @@ class APEntryWatcher:
                         # clear and let the normal breach check re-prove the trigger.
                         w.deferred_retry_not_before = None
                 quote = quotes.get(w.ticker)
-                if not quote:
-                    continue
+                if not isinstance(quote, dict):
+                    quote = {}
 
-                bid = float(quote.get("bid", 0) or 0)
-                ask = float(quote.get("ask", 0) or 0)
+                # Keep raw canonical side values intact for WatchedSignal.check().
+                # The watcher owns type/finite/positive validation and must see
+                # (None, None) for an absent quote. LAST is never promoted to
+                # trigger authority; the exported shim may turn LAST-only
+                # observations into an empty quote, which must still reach this
+                # check() call so bounded continuity is evaluated immediately.
+                bid = quote.get("bid")
+                ask = quote.get("ask")
                 _quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
                 w.last_quote_age_ms = _quote_age_ms
-                if bid == 0 and ask == 0:
-                    last = float(quote.get("last", 0) or 0)
-                    bid = ask = last
 
                 new_state = w.check(bid, ask, quote_age_ms=_quote_age_ms)
                 if new_state == WatchState.TRIGGERED:

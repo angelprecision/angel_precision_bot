@@ -281,6 +281,9 @@ class TestPreBreachStopActivationPut:
         watched._pending_first_breach_at = prior_ts
         watched.first_breach_bid = 61.85
         watched.first_breach_ask = 61.95
+        # The staged partial breach must retain its valid-observation anchor
+        # so bounded continuity can prove this poll is a confirmation.
+        watched._last_valid_breach_observation_at = prior_ts
 
         # Drive the confirming poll through the production dispatch path.
         # The quote leaves bid strictly above scanner stop (no collision).
