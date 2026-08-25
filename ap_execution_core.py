@@ -988,7 +988,10 @@ def _classify_deferred_breach_retry_decision(
             "retryable_reason": True,
             "terminal_reason": f"breach_retry_unavailable:{_reason_code}",
         }
-    if _reason_classification == TERMINAL_INVARIANT:
+    if (
+        _reason_code == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+        and _reason_classification == TERMINAL_INVARIANT
+    ):
         return {
             "action": "terminal_invariant",
             "reason_code": _reason_code,
