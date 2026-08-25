@@ -12,6 +12,9 @@ current committed `origin/main`. It does not reopen or rebase historical PR
 - A missing, zero, malformed, boolean, NaN, infinity, or otherwise unusable
   required side is unknown truth. It suppresses this poll's entry evidence and
   does not increment, reset, create `trigger_price`, or confirm.
+- A crossed positive pair (`BID > ASK`) is internally inconsistent truth. Both
+  sides are treated as unavailable for this poll; it cannot trigger entry or
+  invalidate the active stop.
 - If a pre-confirmation partial streak exists, unknown truth holds it only when
   `0 <= now - _last_valid_breach_observation_at <= 45` seconds.
 - The anchor is the most recent valid canonical breach observation; missing

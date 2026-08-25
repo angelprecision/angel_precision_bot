@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import math
+from unittest.mock import MagicMock
 
 import pytest
 
-from ap_entry_watcher import WatchState, WatchedSignal
+from ap_entry_watcher import APEntryWatcher, WatchState, WatchedSignal
 
 
 UNUSABLE = [
@@ -112,6 +113,76 @@ def test_zero_and_last_are_not_canonical_trigger_authority(side):
     assert watched.check(*missing) == WatchState.PENDING
     assert watched.breach_count == 1
     assert watched.trigger_crossed_at is None
+
+
+@pytest.mark.parametrize(
+    ("side", "crossed_breach"),
+    [
+        ("CALL", (101.0, 100.05)),
+        ("PUT", (99.95, 99.0)),
+    ],
+)
+def test_crossed_bid_ask_pair_is_unknown_not_trigger_authority(side, crossed_breach):
+    watched = WatchedSignal(_signal(side), overnight=False)
+
+    watched.check(*crossed_breach)
+    assert watched.check(*crossed_breach) == WatchState.PENDING
+    assert watched.breach_count == 0
+    assert watched.trigger_crossed_at is None
+    assert watched.trigger_price is None
+    assert watched.last_trigger_evidence_reason == (
+        "TRIGGER_EVIDENCE_UNAVAILABLE_CROSSED_BID_ASK"
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "first", "crossed", "second"),
+    [
+        ("CALL", (99.0, 100.05), (101.0, 100.06), (99.0, 100.07)),
+        ("PUT", (100.0, 101.0), (99.94, 99.0), (99.93, 101.0)),
+    ],
+)
+def test_crossed_pair_holds_partial_streak_until_next_valid_observation(
+    side, first, crossed, second
+):
+    watched = WatchedSignal(_signal(side), overnight=False)
+
+    assert watched.check(*first) == WatchState.PENDING
+    assert watched.check(*crossed) == WatchState.PENDING
+    assert watched.breach_count == 1
+    assert watched.trigger_crossed_at is None
+
+    assert watched.check(*second) == WatchState.TRIGGERED
+    assert watched.trigger_crossed_at is not None
+
+
+@pytest.mark.parametrize(
+    ("side", "crossed_quote"),
+    [
+        ("CALL", {"bid": 101.0, "ask": 100.05}),
+        ("PUT", {"bid": 99.95, "ask": 99.0}),
+    ],
+)
+def test_exported_poll_route_does_not_callback_on_crossed_quote(side, crossed_quote):
+    watcher = APEntryWatcher(
+        MagicMock(), order_state_machine=MagicMock(), require_on_trigger=False
+    )
+    watcher._fetch_quotes = MagicMock(
+        side_effect=[{"SPY": crossed_quote}, {"SPY": crossed_quote}]
+    )
+    watched = WatchedSignal(_signal(side), overnight=False)
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    watcher._dedup_set.add(watched.signal_id)
+    watcher.on_trigger = MagicMock()
+
+    watcher._poll_active_signals()
+    watcher._poll_active_signals()
+
+    assert watched.state == WatchState.PENDING
+    assert watched.breach_count == 0
+    assert watched.trigger_crossed_at is None
+    assert watcher.on_trigger.call_count == 0
 
 
 def test_confirmed_entry_missing_does_not_replay_trigger_when_stop_truth_is_intact():

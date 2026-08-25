@@ -92,6 +92,11 @@ def _valid_positive_finite_quote(value) -> Optional[float]:
         return None
     return parsed
 
+
+def _is_crossed_quote_pair(bid: Optional[float], ask: Optional[float]) -> bool:
+    """Return whether both sides are present but internally inconsistent."""
+    return bid is not None and ask is not None and bid > ask
+
 # Module-level ET zoneinfo: declared BEFORE any helper that uses it.
 ET = ZoneInfo("America/New_York")
 
@@ -845,6 +850,14 @@ class WatchedSignal:
         _raw_ask = ask
         _bid_quote = _valid_positive_finite_quote(bid)
         _ask_quote = _valid_positive_finite_quote(ask)
+        _crossed_quote_pair = _is_crossed_quote_pair(_bid_quote, _ask_quote)
+        if _crossed_quote_pair:
+            # A crossed pair is not contradictory market truth that can be
+            # used for a decision; it is an internally inconsistent quote.
+            # Treat both sides as unavailable so neither entry nor the newly
+            # active stop can authorize a mutation from this poll.
+            _bid_quote = None
+            _ask_quote = None
         _entry_trigger = _valid_positive_finite_quote(self.entry_trigger)
         bid = _bid_quote if _bid_quote is not None else 0.0
         ask = _ask_quote if _ask_quote is not None else 0.0
@@ -870,10 +883,15 @@ class WatchedSignal:
         )
         _suppress_entry_breach_evidence = False
         if _entry_trigger_evidence_unavailable:
-            _required_side = "ASK" if self.side == "CALL" else "BID"
-            self.last_trigger_evidence_reason = (
-                f"TRIGGER_EVIDENCE_UNAVAILABLE_{_required_side}"
-            )
+            if _crossed_quote_pair:
+                self.last_trigger_evidence_reason = (
+                    "TRIGGER_EVIDENCE_UNAVAILABLE_CROSSED_BID_ASK"
+                )
+            else:
+                _required_side = "ASK" if self.side == "CALL" else "BID"
+                self.last_trigger_evidence_reason = (
+                    f"TRIGGER_EVIDENCE_UNAVAILABLE_{_required_side}"
+                )
             _suppress_entry_breach_evidence = True
             if self.trigger_crossed_at is None:
                 if self.breach_count == 0:
@@ -1545,9 +1563,14 @@ class WatchedSignal:
         ):
             _stop_side = "BID" if self.side == "CALL" else "ASK"
             self.state = WatchState.PENDING
-            self.last_trigger_evidence_reason = (
-                f"ACTIVE_STOP_TRUTH_UNAVAILABLE_{_stop_side}"
-            )
+            if _crossed_quote_pair:
+                self.last_trigger_evidence_reason = (
+                    "TRIGGER_EVIDENCE_UNAVAILABLE_CROSSED_BID_ASK"
+                )
+            else:
+                self.last_trigger_evidence_reason = (
+                    f"ACTIVE_STOP_TRUTH_UNAVAILABLE_{_stop_side}"
+                )
             log.warning(
                 "[%s] SAME_POLL_ACTIVE_STOP_TRUTH_UNAVAILABLE — "
                 "preserving trigger_crossed_at=%s, holding watcher PENDING, "
