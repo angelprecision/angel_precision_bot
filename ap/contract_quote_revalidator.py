@@ -44,6 +44,7 @@ PR: hotfix/p0-direct-option-quote-revalidation
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 import logging
@@ -544,12 +545,20 @@ def _empty_quote_failure() -> dict:
     }
 
 
+def _strict_quote_float(value) -> Optional[float]:
+    """Return a finite numeric quote scalar, rejecting malformed truth."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _normalize_quote(raw: dict, fetched_at: float, latency_ms: int) -> dict:
     def _f(v):
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
+        return _strict_quote_float(v)
 
     def _i(v):
         try:
@@ -615,20 +624,27 @@ def fetch_direct_option_quote_with_meta(
     occ_symbol = _normalize_occ_symbol(occ_symbol)
 
     cache_key = _cache_key_for(broker, occ_symbol)
+    force_refresh = cache_ttl_s is not None and cache_ttl_s <= 0.0
+    if force_refresh:
+        # An explicit current-truth request must not leave an older quote
+        # available if the provider attempt fails before returning a quote.
+        _QUOTE_CACHE.pop(cache_key, None)
     cached = _QUOTE_CACHE.get(cache_key)
     if cached and (_now() - cached[0]) < ttl:
         quote = cached[1]
-        if quote.get("_quote_payload_empty"):
-            return _empty_quote_failure()
-        return {
-            "ok": True,
-            "quote": quote,
-            "reason_code": None,
-            "error": None,
-            "endpoint": "/v1/markets/quotes",
-            "status_code": None,
-            "retryable": None,
-        }
+        if direct_quote_is_valid(quote):
+            return {
+                "ok": True,
+                "quote": quote,
+                "reason_code": None,
+                "error": None,
+                "endpoint": "/v1/markets/quotes",
+                "status_code": None,
+                "retryable": None,
+            }
+        # Defensive cleanup for any legacy/process-injected invalid entry. It
+        # must never remain reusable cache authority.
+        _QUOTE_CACHE.pop(cache_key, None)
 
     budget_failure = _direct_quote_budget_failure(request_context)
     if budget_failure is not None:
@@ -740,10 +756,18 @@ def fetch_direct_option_quote_with_meta(
     latency_ms = int((_now() - t0) * 1000)
     _ctx_add_stage_ms(request_context, "direct_quote", latency_ms)
     quote = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, quote)
 
     if quote.get("_quote_payload_empty"):
+        _QUOTE_CACHE.pop(cache_key, None)
         return _empty_quote_failure()
+
+    # Only a finite, positive, uncrossed BID/ASK is authoritative. An
+    # unusable forced/current refresh must evict older authority so a later
+    # selector decision cannot resurrect stale truth from this OCC.
+    if direct_quote_is_valid(quote):
+        _QUOTE_CACHE[cache_key] = (t0, quote)
+    else:
+        _QUOTE_CACHE.pop(cache_key, None)
 
     return {
         "ok": True,
@@ -781,9 +805,14 @@ def fetch_direct_option_quote(
         return None
 
     cache_key = _cache_key_for(broker, occ_symbol)
+    force_refresh = cache_ttl_s is not None and cache_ttl_s <= 0.0
+    if force_refresh:
+        _QUOTE_CACHE.pop(cache_key, None)
     cached = _QUOTE_CACHE.get(cache_key)
     if cached and (_now() - cached[0]) < ttl:
-        return cached[1]
+        if direct_quote_is_valid(cached[1]):
+            return cached[1]
+        _QUOTE_CACHE.pop(cache_key, None)
 
     t0 = _now()
     try:
@@ -797,28 +826,28 @@ def fetch_direct_option_quote(
 
     latency_ms = int((_now() - t0) * 1000)
     out = _normalize_quote(raw, t0, latency_ms)
-    _QUOTE_CACHE[cache_key] = (t0, out)
+    if direct_quote_is_valid(out):
+        _QUOTE_CACHE[cache_key] = (t0, out)
+    else:
+        _QUOTE_CACHE.pop(cache_key, None)
     return out
 
 
 def direct_quote_is_valid(quote: Optional[dict]) -> bool:
     """
-    Hard validity check for a direct quote: bid > 0 AND ask > 0 AND ask >= bid.
+    Hard validity check for a direct quote: finite bid/ask > 0 and ask >= bid.
     """
-    if not quote:
+    if not isinstance(quote, dict) or not quote:
         return False
     bid = quote.get("bid")
     ask = quote.get("ask")
-    if bid is None or ask is None:
+    bid_f = _strict_quote_float(bid)
+    ask_f = _strict_quote_float(ask)
+    if bid_f is None or ask_f is None:
         return False
-    try:
-        if float(bid) <= 0 or float(ask) <= 0:
-            return False
-        if float(ask) < float(bid):
-            return False
-    except (TypeError, ValueError):
+    if bid_f <= 0 or ask_f <= 0:
         return False
-    return True
+    return ask_f >= bid_f
 
 
 def revalidate_with_direct_quote(

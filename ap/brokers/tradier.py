@@ -43,9 +43,11 @@ class TradierMarketDataError(RuntimeError):
 
 
 def _to_float(x: Any) -> Optional[float]:
+    # bool is an int subclass, so float(True)/float(False) would otherwise
+    # turn an invalid provider scalar into an apparently valid quote value.
+    if x is None or isinstance(x, bool):
+        return None
     try:
-        if x is None:
-            return None
         return float(x)
     except Exception:
         return None
