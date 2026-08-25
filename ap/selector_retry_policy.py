@@ -1542,6 +1542,12 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     structural_evidence = data.get("structural_skip_records")
     if structural_evidence is None:
         structural_evidence = skipped
+    eligible_raw = data.get("eligible_unattempted_symbols")
+    if eligible_raw is not None and not isinstance(eligible_raw, (list, tuple, set)):
+        return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    eligible = list(eligible_raw or [])
+    if any(_normalize_recovery_symbol(symbol) is None for symbol in eligible):
+        return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
 
     # This amendment is surgical: it demotes ONLY affordability so that one
     # unaffordable candidate cannot terminalize a request while retryable
@@ -1615,7 +1621,6 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     # Candidate-level terminal-quality observations are not request-level
     # exhaustion truth while another known candidate remains eligible and
     # unattempted. Preserve the request for another selector pass.
-    eligible = list(data.get("eligible_unattempted_symbols") or [])
     if (
         bool(data.get("actual_limit_reached"))
         and bool(data.get("budget_exhausted_stage"))

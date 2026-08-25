@@ -363,6 +363,7 @@ def test_structural_plus_ordinary_quality_rejection_fails_closed(case, ordinary_
         "attempted_shape",
         "quality_aggregate_shape",
         "quality_shape",
+        "eligible_shape",
         "structural_overflow",
         "quality_overflow",
         "duplicate_conflict",
@@ -384,6 +385,8 @@ def test_malformed_conflicting_overflow_or_incomplete_evidence_fails_closed(
         evidence["quality_rejections"] = "malformed"
     elif failure_kind == "quality_shape":
         evidence["quality_rejection_records"] = "malformed"
+    elif failure_kind == "eligible_shape":
+        evidence["eligible_unattempted_symbols"] = "malformed"
     elif failure_kind == "structural_overflow":
         evidence["structural_skip_records_overflowed"] = True
     elif failure_kind == "quality_overflow":
