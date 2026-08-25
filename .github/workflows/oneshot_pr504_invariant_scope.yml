@@ -1,0 +1,63 @@
+name: One-shot PR504 invariant scope patch
+
+on:
+  push:
+    branches:
+      - fix/p0-pr504-invariant-scope-20260825
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/p0-pr504-invariant-scope-20260825
+          fetch-depth: 0
+
+      - name: Apply surgical PR504 scope correction
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          core_path = Path("ap_execution_core.py")
+          core = core_path.read_text(encoding="utf-8")
+          old = "    if _reason_classification == TERMINAL_INVARIANT:\n"
+          new = (
+              "    if (\n"
+              "        _reason_code == \"UNKNOWN_SELECTOR_RECOVERY_FAILURE\"\n"
+              "        and _reason_classification == TERMINAL_INVARIANT\n"
+              "    ):\n"
+          )
+          count = core.count(old)
+          if count != 1:
+              raise SystemExit(f"expected exactly one broad TERMINAL_INVARIANT branch, found {count}")
+          core_path.write_text(core.replace(old, new, 1), encoding="utf-8")
+
+          test_path = Path("tests/test_p0_selector_retry_taxonomy.py")
+          tests = test_path.read_text(encoding="utf-8")
+          marker = "test_preexisting_terminal_invariants_keep_historical_deferred_quality_action"
+          if marker in tests:
+              raise SystemExit("parity test already exists; refusing duplicate append")
+          tests += '''\n\n@pytest.mark.parametrize(\n    "reason",\n    ["INVALID_PLAN", "INVALID_EXECUTION_MODE", "EXECUTION_MODE_MISMATCH"],\n)\ndef test_preexisting_terminal_invariants_keep_historical_deferred_quality_action(reason):\n    """PR #504 invariant handling is exact-reason scoped, not category-wide."""\n    from ap_execution_core import (\n        _classify_deferred_breach_retry_decision,\n        _deferred_selector_status,\n    )\n\n    assert get_policy(reason).classification == TERMINAL_INVARIANT\n    decision = _classify_deferred_breach_retry_decision(\n        reason,\n        queue_local_order_id="local-existing-invariant",\n        attempt=1,\n        max_attempts=5,\n        past_cutoff=False,\n        retry_enabled=True,\n    )\n    assert decision == {\n        "action": "terminal_quality",\n        "reason_code": reason,\n        "retryable_reason": False,\n    }\n    assert _deferred_selector_status(decision) == "CONTRACT_SELECTION_QUALITY_REJECT"\n'''
+          test_path.write_text(tests, encoding="utf-8")
+          PY
+
+          python -m py_compile ap_execution_core.py tests/test_p0_selector_retry_taxonomy.py
+          rm .github/workflows/oneshot_pr504_invariant_scope.yml
+
+          git diff --check
+          git diff -- ap_execution_core.py tests/test_p0_selector_retry_taxonomy.py
+
+      - name: Commit surgical correction
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ap_execution_core.py tests/test_p0_selector_retry_taxonomy.py .github/workflows/oneshot_pr504_invariant_scope.yml
+          git commit -m "P0: keep PR504 invariant runtime scope surgical"
+          git push origin HEAD:fix/p0-pr504-invariant-scope-20260825
