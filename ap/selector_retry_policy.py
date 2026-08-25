@@ -475,6 +475,16 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
         final_reason_code="IV_FILTER_ERROR",
         queue_facing_reason="TERMINAL_POLICY_BLOCK",
     ),
+    # Request-scope structural policy proof is terminal policy truth, not an
+    # unknown reason and not terminal quality.  The reducer may emit this only
+    # after every known candidate agrees on STRUCTURAL_TERMINAL_POLICY_REJECT.
+    "TERMINAL_POLICY_REJECT": SelectorRetryPolicy(
+        classification=TERMINAL_POLICY,
+        selector_rerun_allowed=False, retain_existing_contract=False,
+        retry_delay_applies=False, max_attempts_applies=False,
+        final_reason_code="TERMINAL_POLICY_REJECT",
+        queue_facing_reason="TERMINAL_POLICY_BLOCK",
+    ),
 
     # ── TERMINAL_AUTH ────────────────────────────────────────────────────────
     # Authentication/authorization failure — requires operator action.

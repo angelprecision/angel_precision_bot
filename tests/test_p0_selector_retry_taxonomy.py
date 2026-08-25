@@ -68,6 +68,7 @@ SELECTOR_EMITTED_CODES = {
     "CHEAP_CONTRACT_ONLY_CHOICE",
     "DELTA_OUT_OF_RANGE",
     "MONEYNESS_OUT_OF_RANGE",
+    "TERMINAL_POLICY_REJECT",
     "UNKNOWN_SELECTOR_RECOVERY_FAILURE",
     "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
     "DIRECT_QUOTE_UNAVAILABLE",
@@ -307,6 +308,111 @@ def test_moneyness_has_terminal_runtime_restart_materializer_parity():
     assert reason not in RETRYABLE_BREACH_SELECTOR_REASONS
     assert deferred_materializer.is_reason_retryable(reason) is False
     assert reason not in RETRYABLE_MATERIALIZATION_REASONS
+
+
+@pytest.mark.parametrize(
+    ("structural_reason", "expected_reason", "expected_classification", "expected_action", "queue_reason"),
+    [
+        (
+            "STRUCTURAL_DTE_OUT_OF_RANGE",
+            "DTE_OUT_OF_RANGE",
+            TERMINAL_QUALITY,
+            "terminal_quality",
+            "TERMINAL_NO_TRADEABLE_CONTRACT",
+        ),
+        (
+            "STRUCTURAL_DELTA_OUT_OF_RANGE",
+            "DELTA_OUT_OF_RANGE",
+            TERMINAL_QUALITY,
+            "terminal_quality",
+            "TERMINAL_NO_TRADEABLE_CONTRACT",
+        ),
+        (
+            "STRUCTURAL_MONEYNESS_OUT_OF_RANGE",
+            "MONEYNESS_OUT_OF_RANGE",
+            TERMINAL_QUALITY,
+            "terminal_quality",
+            "TERMINAL_NO_TRADEABLE_CONTRACT",
+        ),
+        (
+            "STRUCTURAL_TERMINAL_POLICY_REJECT",
+            "TERMINAL_POLICY_REJECT",
+            TERMINAL_POLICY,
+            "terminal_policy",
+            "TERMINAL_POLICY_BLOCK",
+        ),
+    ],
+    ids=["dte", "delta", "moneyness", "terminal-policy"],
+)
+def test_governed_structural_families_have_runtime_restart_materializer_parity(
+    structural_reason,
+    expected_reason,
+    expected_classification,
+    expected_action,
+    queue_reason,
+):
+    """The exact governed reason survives every deferred consumer seam."""
+    from unittest.mock import MagicMock
+
+    from ap import deferred_materializer
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    symbol = "SPY270101C00100000"
+    evidence = {
+        "structural_skip_records": [
+            {"symbol": symbol, "skip_reason": structural_reason},
+        ],
+        "attempted_results": {},
+        "eligible_unattempted_symbols": [],
+        "direct_quote_known_eligible_symbols": [symbol],
+        "quality_rejections": {},
+        "quality_rejection_records": [],
+    }
+
+    reduced = resolve_selector_recovery_final_reason(evidence)
+    policy = get_policy(reduced)
+    runtime = _classify_deferred_breach_retry_decision(
+        reduced,
+        queue_local_order_id="local-structural-parity",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+    restart_reduced = resolve_selector_recovery_final_reason(dict(evidence))
+
+    assert reduced == expected_reason
+    assert restart_reduced == expected_reason
+    assert policy.classification == expected_classification
+    assert policy.selector_rerun_allowed is False
+    assert policy.retry_delay_applies is False
+    assert policy.max_attempts_applies is False
+    assert policy.final_reason_code == expected_reason
+    assert policy.queue_facing_reason == queue_reason
+    assert runtime == {
+        "action": expected_action,
+        "reason_code": expected_reason,
+        "retryable_reason": False,
+    }
+    assert deferred_materializer.is_reason_retryable(expected_reason) is False
+
+    osm = MagicMock()
+    osm.update_order_meta.return_value = True
+    assert deferred_materializer.stamp_failed_terminal(
+        osm,
+        "local-structural-parity",
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+        symbol="SPY",
+        direction="CALL",
+        reason_code=expected_reason,
+        attempt=1,
+        selector_failure={"reason_code": expected_reason},
+    ) is True
+    materializer_patch = osm.update_order_meta.call_args.args[1]
+    assert materializer_patch["materialization_reason"] == expected_reason
+    assert materializer_patch["materialization_status"] == "FAILED_TERMINAL"
+    assert materializer_patch["broker_ready"] is False
 
 
 def test_selector_recovery_failure_has_invariant_runtime_restart_materializer_parity(

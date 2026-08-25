@@ -3,8 +3,12 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
+import pytest
+
 from ap.selector_retry_policy import (
     RETRYABLE_DATA,
+    TERMINAL_POLICY,
+    TERMINAL_QUALITY,
     get_policy,
     resolve_selector_recovery_final_reason,
 )
@@ -14,8 +18,23 @@ from ap.contract_selector import (
 
 
 MONEY = "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
+DTE = "STRUCTURAL_DTE_OUT_OF_RANGE"
 DELTA = "STRUCTURAL_DELTA_OUT_OF_RANGE"
+POLICY = "STRUCTURAL_TERMINAL_POLICY_REJECT"
 RETRYABLE = "DIRECT_QUOTE_ZERO_BID_ASK"
+
+_STRUCTURAL_CASES = (
+    ("moneyness", MONEY, "MONEYNESS_OUT_OF_RANGE", TERMINAL_QUALITY,
+     "TERMINAL_NO_TRADEABLE_CONTRACT"),
+    ("dte", DTE, "DTE_OUT_OF_RANGE", TERMINAL_QUALITY,
+     "TERMINAL_NO_TRADEABLE_CONTRACT"),
+    ("delta", DELTA, "DELTA_OUT_OF_RANGE", TERMINAL_QUALITY,
+     "TERMINAL_NO_TRADEABLE_CONTRACT"),
+    ("terminal_policy", POLICY, "TERMINAL_POLICY_REJECT", TERMINAL_POLICY,
+     "TERMINAL_POLICY_BLOCK"),
+)
+_STRUCTURAL_CASE_IDS = [case[0] for case in _STRUCTURAL_CASES]
+_STRUCTURAL_CANONICAL_REASONS = {case[2] for case in _STRUCTURAL_CASES}
 
 
 def _evidence(
@@ -214,6 +233,161 @@ def test_homogeneous_exhaustive_moneyness_still_terminalizes():
     symbols = ["DDOG260821P00150000", "DDOG260821P00155000"]
     evidence = _evidence(skipped={symbol: MONEY for symbol in symbols}, known=symbols)
     assert resolve_selector_recovery_final_reason(evidence) == "MONEYNESS_OUT_OF_RANGE"
+
+
+@pytest.mark.parametrize("case", _STRUCTURAL_CASES, ids=_STRUCTURAL_CASE_IDS)
+def test_every_governed_structural_family_has_exhaustive_positive_control(case):
+    """Every canonical structural family must prove the whole request.
+
+    This calls the production request-scope reducer and its canonical policy
+    table together.  A mapping-only assertion would miss policy drift such as
+    TERMINAL_POLICY_REJECT falling through to UNKNOWN_SELECTOR_REASON.
+    """
+    _name, structural_reason, canonical_reason, classification, queue_reason = case
+    symbols = ["SPY260821C00100000", "SPY260821C00101000"]
+    evidence = _evidence(
+        skipped={symbol: structural_reason for symbol in symbols},
+        known=symbols,
+    )
+
+    result = resolve_selector_recovery_final_reason(evidence)
+    policy = get_policy(result)
+
+    assert result == canonical_reason
+    assert policy.classification == classification
+    assert policy.final_reason_code == canonical_reason
+    assert policy.selector_rerun_allowed is False
+    assert policy.retry_delay_applies is False
+    assert policy.max_attempts_applies is False
+    assert policy.queue_facing_reason == queue_reason
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (MONEY, DTE),
+        (MONEY, DELTA),
+        (DTE, DELTA),
+        (DELTA, POLICY),
+    ],
+    ids=["moneyness+dte", "moneyness+delta", "dte+delta", "delta+terminal-policy"],
+)
+def test_mixed_structural_families_are_order_independent_and_fail_closed(left, right):
+    symbols = ["SPY260821C00100000", "SPY260821C00101000"]
+
+    def _resolve(order):
+        skipped = {}
+        for index in order:
+            skipped[symbols[index]] = (left, right)[index]
+        return resolve_selector_recovery_final_reason(
+            _evidence(skipped=skipped, known=symbols)
+        )
+
+    forward = _resolve((0, 1))
+    reverse = _resolve((1, 0))
+
+    assert forward == reverse
+    assert forward not in _STRUCTURAL_CANONICAL_REASONS
+
+
+@pytest.mark.parametrize("case", _STRUCTURAL_CASES, ids=_STRUCTURAL_CASE_IDS)
+def test_structural_plus_retryable_attempted_candidate_preserves_retryable_truth(case):
+    _name, structural_reason, _canonical_reason, _classification, _queue_reason = case
+    structural_symbol = "SPY260821C00100000"
+    attempted_symbol = "SPY260821C00101000"
+    evidence = _evidence(
+        skipped={structural_symbol: structural_reason},
+        attempted={attempted_symbol: RETRYABLE},
+        known=[structural_symbol, attempted_symbol],
+        fallback=RETRYABLE,
+    )
+
+    assert resolve_selector_recovery_final_reason(evidence) == RETRYABLE
+
+
+@pytest.mark.parametrize("case", _STRUCTURAL_CASES, ids=_STRUCTURAL_CASE_IDS)
+def test_structural_plus_eligible_unattempted_candidate_cannot_terminalize(case):
+    _name, structural_reason, canonical_reason, _classification, _queue_reason = case
+    structural_symbol = "SPY260821C00100000"
+    unattempted_symbol = "SPY260821C00101000"
+    evidence = _evidence(
+        skipped={structural_symbol: structural_reason},
+        eligible=[unattempted_symbol],
+        known=[structural_symbol, unattempted_symbol],
+    )
+
+    result = resolve_selector_recovery_final_reason(evidence)
+    assert result not in _STRUCTURAL_CANONICAL_REASONS
+    assert result != canonical_reason
+
+
+@pytest.mark.parametrize(
+    ("case", "ordinary_reason"),
+    [
+        ((_STRUCTURAL_CASES[0]), "SPREAD_TOO_WIDE"),
+        ((_STRUCTURAL_CASES[1]), "OI_TOO_LOW"),
+        ((_STRUCTURAL_CASES[2]), "CHAIN_ROW_ZERO_BID_ASK"),
+        ((_STRUCTURAL_CASES[3]), "SPREAD_TOO_WIDE"),
+    ],
+    ids=["moneyness+spread", "dte+oi", "delta+chain-zero", "policy+spread"],
+)
+def test_structural_plus_ordinary_quality_rejection_fails_closed(case, ordinary_reason):
+    _name, structural_reason, _canonical_reason, _classification, _queue_reason = case
+    structural_symbol = "SPY260821C00100000"
+    ordinary_symbol = "SPY260821C00101000"
+    evidence = _evidence(
+        skipped={structural_symbol: structural_reason},
+        known=[structural_symbol, ordinary_symbol],
+        quality={ordinary_reason: 1},
+        quality_records=[{"symbol": ordinary_symbol, "reason": ordinary_reason}],
+    )
+
+    result = resolve_selector_recovery_final_reason(evidence)
+    assert result == ordinary_reason
+    assert result not in _STRUCTURAL_CANONICAL_REASONS
+
+
+@pytest.mark.parametrize("case", _STRUCTURAL_CASES, ids=_STRUCTURAL_CASE_IDS)
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "structural_shape",
+        "quality_shape",
+        "structural_overflow",
+        "quality_overflow",
+        "duplicate_conflict",
+        "known_candidate_missing",
+    ],
+)
+def test_malformed_conflicting_overflow_or_incomplete_evidence_fails_closed(
+    case, failure_kind
+):
+    _name, structural_reason, _canonical_reason, _classification, _queue_reason = case
+    symbol = "SPY260821C00100000"
+    evidence = _evidence(skipped={symbol: structural_reason}, known=[symbol])
+
+    if failure_kind == "structural_shape":
+        evidence["structural_skip_records"] = "malformed"
+    elif failure_kind == "quality_shape":
+        evidence["quality_rejection_records"] = "malformed"
+    elif failure_kind == "structural_overflow":
+        evidence["structural_skip_records_overflowed"] = True
+    elif failure_kind == "quality_overflow":
+        evidence["quality_rejection_records_overflowed"] = True
+    elif failure_kind == "duplicate_conflict":
+        evidence["structural_skip_records"] = [
+            {"symbol": symbol, "skip_reason": structural_reason},
+            {"symbol": symbol, "skip_reason": MONEY if structural_reason != MONEY else DTE},
+        ]
+    elif failure_kind == "known_candidate_missing":
+        evidence["direct_quote_known_eligible_symbols"] = [
+            symbol,
+            "SPY260821C00101000",
+        ]
+
+    result = resolve_selector_recovery_final_reason(evidence)
+    assert result == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    assert result not in _STRUCTURAL_CANONICAL_REASONS
 
 
 def test_reducer_exception_fails_closed_without_resurrecting_moneyness(

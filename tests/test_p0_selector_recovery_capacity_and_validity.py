@@ -22,6 +22,7 @@ from ap.contract_selector import (
     _structural_direct_quote_skip,
 )
 from ap.contract_quote_revalidator import clear_quote_cache
+from ap.selector_retry_policy import resolve_selector_recovery_final_reason
 from ap_execution_core import _positive_int_env_config
 
 
@@ -270,6 +271,51 @@ def test_structural_prefilter_consumes_no_provider_call(
 
 
 @pytest.mark.parametrize(
+    ("row", "reason", "canonical"),
+    [
+        (_occ(130.0), "STRUCTURAL_MONEYNESS_OUT_OF_RANGE", "MONEYNESS_OUT_OF_RANGE"),
+        (_occ(100.0, days=40), "STRUCTURAL_DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
+        (
+            _occ(101.0, greeks={"delta": 0.01}),
+            "STRUCTURAL_DELTA_OUT_OF_RANGE",
+            "DELTA_OUT_OF_RANGE",
+        ),
+    ],
+    ids=["moneyness", "dte", "delta"],
+)
+def test_deferred_structural_prefilter_reaches_request_scope_reducer(
+    row, reason, canonical
+):
+    """Exercise the real prefilter -> context ledger -> reducer handoff."""
+    ctx = _new_selector_request_context(
+        "SPY",
+        "live",
+        selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+    )
+    diagnostic = _structural_direct_quote_skip(
+        _engine(),
+        row,
+        direction="CALL",
+        ticker="SPY",
+        underlying_price=100.0,
+        today=date.today(),
+        selector_budget=200.0,
+        request_context=ctx,
+    )
+
+    assert diagnostic["skip_reason"] == reason
+    assert ctx.structural_skips == [diagnostic]
+    assert resolve_selector_recovery_final_reason({
+        "structural_skip_records": ctx.structural_skips,
+        "attempted_results": {},
+        "eligible_unattempted_symbols": [],
+        "direct_quote_known_eligible_symbols": [diagnostic["symbol"]],
+        "quality_rejections": {},
+        "quality_rejection_records": [],
+    }) == canonical
+
+
+@pytest.mark.parametrize(
     ("chain_ask", "budget"),
     [
         # (a) chain ask far above budget — the classic stale-chain case.
@@ -488,6 +534,37 @@ def test_B_ibm_ordinary_risk_replay_terminates_affordable_when_fresh_ask_exceeds
     assert reason != "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
     assert broker.submit_order.call_count == 0
     assert broker.cancel_order.call_count == 0
+
+
+def test_ordinary_selector_does_not_invoke_deferred_request_scope_reducer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "ap.contract_selector._resolve_deferred_recovery_final_reason_fail_closed",
+        lambda evidence: calls.append(evidence) or "MONEYNESS_OUT_OF_RANGE",
+    )
+    exp = _expiry(2)
+    occ = f"SPY{exp:%y%m%d}C00101000"
+    chain_row = _occ(101.0, "CALL", bid=0.0, ask=0.0)
+    chain_row["symbol"] = occ
+    chain_row["expiration_date"] = exp.isoformat()
+    plan = _integration_plan(
+        ticker="SPY", direction="CALL", budget=200.0,
+        trigger=100.0, underlying=100.0,
+    )
+
+    selected, _broker, context = _run_selector(
+        monkeypatch,
+        plan=plan,
+        chain=[chain_row],
+        valid_symbol=occ,
+        valid_quote={"bid": 0.0, "ask": 0.0, "volume": 0, "open_interest": 0},
+        underlying=100.0,
+        request_kind=SELECTOR_REQUEST_KIND_ORDINARY,
+    )
+
+    assert selected is None
+    assert context.selector_request_kind == SELECTOR_REQUEST_KIND_ORDINARY
+    assert calls == []
 
 
 def test_C_genuinely_expensive_direct_quote_remains_terminal(monkeypatch):

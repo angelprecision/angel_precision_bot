@@ -145,6 +145,7 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 from ap.selector_retry_policy import (
     RETRYABLE_BREACH_SELECTOR_REASONS,
     TERMINAL_INVARIANT,
+    TERMINAL_POLICY,
     classify_selector_reason as _classify_selector_reason,
     is_retryable_selector_reason as _is_retryable_selector_reason,  # noqa: F401 – re-exported
     is_operational_request_budget_reason as _is_operational_request_budget_reason,
@@ -990,6 +991,19 @@ def _classify_deferred_breach_retry_decision(
     if _reason_classification == TERMINAL_INVARIANT:
         return {
             "action": "terminal_invariant",
+            "reason_code": _reason_code,
+            "retryable_reason": False,
+        }
+    # PR #504's request-scope structural policy proof has its own canonical
+    # downstream action. Preserve the historical action for existing policy
+    # reasons (for example UNTRADEABLE_FOR_ACCOUNT_SIZE); this branch governs
+    # only the newly registered structural-policy request reason.
+    if (
+        _reason_code == "TERMINAL_POLICY_REJECT"
+        and _reason_classification == TERMINAL_POLICY
+    ):
+        return {
+            "action": "terminal_policy",
             "reason_code": _reason_code,
             "retryable_reason": False,
         }
