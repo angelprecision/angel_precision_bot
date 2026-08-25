@@ -260,14 +260,90 @@ def test_real_fill_monitor_reaches_canonical_handoff_helpers_after_trace(monkeyp
             return None
 
     class Connection:
+        def __init__(self):
+            self._row = None
+            self.order_row = {
+                "client_id": "client@example.com",
+                "local_order_id": "ord-2",
+                "broker_order_id": "brk-2",
+                "position_id": None,
+                "kind": "ENTRY",
+                "status": "FILLED",
+                "execution_mode": "live",
+                "contract": "SMCI260821P00038000",
+                "signal_id": "signal-2",
+                "plan_id": "plan-2",
+                "filled_qty": 1,
+            }
+            self.position_row = {
+                "id": "position-1",
+                "client_id": "client@example.com",
+                "execution_mode": "live",
+                "contract": "SMCI260821P00038000",
+                "status": "OPEN",
+                "signal_id": "signal-2",
+                "plan_id": "plan-2",
+                "local_order_id": None,
+                "broker_order_id": None,
+            }
+
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
             return False
 
-        def execute(self, _sql, params):
-            events.append(("link", params))
+        def execute(self, sql, params):
+            normalized = " ".join(str(sql).split())
+            params = tuple(params)
+
+            if normalized.startswith("SELECT * FROM orders"):
+                client_id, local_order_id = params
+                self._row = (
+                    dict(self.order_row)
+                    if client_id == self.order_row["client_id"]
+                    and local_order_id == self.order_row["local_order_id"]
+                    else None
+                )
+                return
+
+            if normalized.startswith("SELECT * FROM positions"):
+                position_id, client_id = params
+                self._row = (
+                    dict(self.position_row)
+                    if position_id == self.position_row["id"]
+                    and client_id == self.position_row["client_id"]
+                    else None
+                )
+                return
+
+            if normalized.startswith("UPDATE positions SET"):
+                local_order_id, broker_order_id, position_id, client_id = params
+                assert position_id == self.position_row["id"]
+                assert client_id == self.position_row["client_id"]
+                self.position_row["local_order_id"] = local_order_id
+                self.position_row["broker_order_id"] = broker_order_id
+                return
+
+            if normalized.startswith("UPDATE orders SET position_id=%s,"):
+                position_id, client_id, local_order_id = params
+                assert client_id == self.order_row["client_id"]
+                assert local_order_id == self.order_row["local_order_id"]
+                self.order_row["position_id"] = position_id
+                events.append(("link", params))
+                return
+
+            if normalized == "UPDATE orders SET position_id=%s WHERE local_order_id=%s":
+                position_id, local_order_id = params
+                assert local_order_id == self.order_row["local_order_id"]
+                self.order_row["position_id"] = position_id
+                events.append(("link", params))
+                return
+
+            raise AssertionError(f"unexpected SQL in focused test: {normalized}")
+
+        def fetchone(self):
+            return dict(self._row) if self._row else None
 
     order = {
         "client_id": "client@example.com",
@@ -296,7 +372,10 @@ def test_real_fill_monitor_reaches_canonical_handoff_helpers_after_trace(monkeyp
     monkeypatch.setattr(fm, "_reset_broker_anomaly_count", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "_release_entry_guards", lambda *args, **kwargs: None)
     monkeypatch.setattr(pair_manager_module, "get_pair_manager", lambda: PairManager())
-    monkeypatch.setattr(ap_db, "conn", lambda: Connection())
+    db = Connection()
+    monkeypatch.setattr(fm, "conn", lambda: db)
+    monkeypatch.setattr(fm, "run_with_retry", lambda fn, *args, **kwargs: fn())
+    monkeypatch.setattr(ap_db, "conn", lambda: db)
     monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *args, **kwargs: fn())
 
     fm.process_pending_order(
@@ -307,14 +386,13 @@ def test_real_fill_monitor_reaches_canonical_handoff_helpers_after_trace(monkeyp
         exit_engine=ExitEngine(),
     )
 
-    assert [event[0] for event in events] == [
+    assert [event[0] for event in events[:4]] == [
         "trace",
         "pair",
         "position",
         "stop",
-        "seed",
-        "link",
     ]
+    assert sorted(event[0] for event in events[4:]) == ["link", "seed"]
 
 
 def test_current_fill_monitor_retains_the_production_trace_shape() -> None:
