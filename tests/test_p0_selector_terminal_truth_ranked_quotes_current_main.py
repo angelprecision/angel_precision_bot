@@ -253,6 +253,21 @@ def _execution_core(selector, broker, execution_mode: str = "LIVE") -> APExecuti
     core.tracker = MagicMock()
     core.position_manager = MagicMock()
     core.broker = broker
+    core.master_control = SimpleNamespace(
+        get_entry_capacity=MagicMock(
+            return_value={
+                "ok": True,
+                "selector_budget": 2000.0,
+                "per_trade_budget": 2000.0,
+                "remaining_total_capacity": 2000.0,
+                "account_equity": 10000.0,
+                "total_capital_cap": 2000.0,
+                "current_total_exposure": 0.0,
+                "max_affordable_premium": 20.0,
+            }
+        ),
+        revalidate_exposure=MagicMock(return_value=SimpleNamespace(ok=True)),
+    )
     return core
 
 

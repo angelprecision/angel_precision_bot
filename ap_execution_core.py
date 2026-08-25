@@ -4581,7 +4581,11 @@ class APExecutionCore:
             )
 
         if _deferred and _deferred_mode == "live":
-            _capacity_resolver = getattr(self.master_control, "get_entry_capacity", None)
+            _capacity_resolver = getattr(
+                getattr(self, "master_control", None),
+                "get_entry_capacity",
+                None,
+            )
             if not callable(_capacity_resolver):
                 _reason = "deferred_selector_capacity_unavailable"
                 _emit_deferred_outcome(
@@ -4717,8 +4721,12 @@ class APExecutionCore:
                     _plan_meta = {}
                     try:
                         approved_plan.metadata = _plan_meta
-                    except Exception:
-                        pass
+                    except Exception as _plan_meta_exc:
+                        log.warning(
+                            "[%s] deferred plan metadata assignment unavailable: %s",
+                            ticker,
+                            _plan_meta_exc,
+                        )
             _plan_meta.setdefault(
                 "deferred_reservation_cost", _reservation_before_selection
             )
@@ -4752,8 +4760,12 @@ class APExecutionCore:
                 approved_plan.selector_budget = _selector_budget
                 approved_plan.remaining_capacity = _remaining_capacity
                 approved_plan.max_affordable_premium = _selector_budget / 100.0
-            except Exception:
-                pass
+            except Exception as _capacity_plan_exc:
+                log.warning(
+                    "[%s] deferred selector capacity plan assignment unavailable: %s",
+                    ticker,
+                    _capacity_plan_exc,
+                )
             log.info(
                 "DEFERRED_SELECTOR_CAPACITY_AUTHORITY "
                 "order_id=%s client_id=%s execution_mode=%s signal_id=%s "
@@ -5680,8 +5692,12 @@ class APExecutionCore:
                             approved_plan.max_position_usd = _actual_selected_cost
                             try:
                                 approved_plan.selector_execution_price = _sel_execution_price
-                            except Exception:
-                                pass
+                            except Exception as _selector_price_exc:
+                                log.warning(
+                                    "[%s] deferred selector execution price assignment unavailable: %s",
+                                    ticker,
+                                    _selector_price_exc,
+                                )
                             _plan_meta_after_selection = getattr(
                                 approved_plan, "metadata", None
                             )
@@ -6920,8 +6936,12 @@ class APExecutionCore:
             _actual_selected_cost = round(_final_qty * _final_price * 100.0, 2)
             try:
                 approved_plan.max_position_usd = _actual_selected_cost
-            except Exception:
-                pass
+            except Exception as _actual_cost_plan_exc:
+                log.warning(
+                    "[%s] deferred actual selected cost assignment unavailable: %s",
+                    ticker,
+                    _actual_cost_plan_exc,
+                )
             _final_capacity_extra = {
                 "selected_contract": _final_contract,
                 "selected_execution_price": _final_price,
@@ -6940,7 +6960,11 @@ class APExecutionCore:
                 "execution_mode": _deferred_mode,
                 "local_order_id": queue_local_order_id,
             }
-            _final_revalidator = getattr(self.master_control, "revalidate_exposure", None)
+            _final_revalidator = getattr(
+                getattr(self, "master_control", None),
+                "revalidate_exposure",
+                None,
+            )
             if not callable(_final_revalidator):
                 _reason = "deferred_final_exposure_revalidation_unavailable"
                 _emit_deferred_outcome(
@@ -7009,8 +7033,12 @@ class APExecutionCore:
                     _final_actual_after_reval,
                     2,
                 )
-            except Exception:
-                pass
+            except Exception as _final_cost_diag_exc:
+                log.warning(
+                    "[%s] deferred final cost diagnostic unavailable: %s",
+                    ticker,
+                    _final_cost_diag_exc,
+                )
             log.info(
                 "DEFERRED_FINAL_EXPOSURE_REVALIDATION "
                 "order_id=%s client_id=%s execution_mode=%s signal_id=%s "

@@ -1184,6 +1184,18 @@ def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
     core.proof = MagicMock()
     core._max_positions = 7
     core.master_control = SimpleNamespace(
+        get_entry_capacity=MagicMock(
+            return_value={
+                "ok": True,
+                "selector_budget": 500.0,
+                "per_trade_budget": 500.0,
+                "remaining_total_capacity": 500.0,
+                "account_equity": 10000.0,
+                "total_capital_cap": 500.0,
+                "current_total_exposure": 0.0,
+                "max_affordable_premium": 5.0,
+            }
+        ),
         revalidate_exposure=MagicMock(return_value=SimpleNamespace(ok=True))
     )
     core._emit_breach_diag = MagicMock()
