@@ -417,7 +417,9 @@ class TradierBroker(BrokerAdapter):
 
         Unlike ``get_order`` this deliberately propagates transport/auth errors:
         callers must distinguish an authoritative empty result from an unavailable
-        broker query before deciding that a new POST is safe.
+        broker query before deciding that a new POST is safe. Structural payload
+        errors also propagate; an order snapshot with any malformed row is not
+        authoritative and must not be silently reduced to a partial list.
         """
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
         node = j.get("orders") if isinstance(j, dict) else None
@@ -427,7 +429,9 @@ class TradierBroker(BrokerAdapter):
         if isinstance(orders, dict):
             return [orders]
         if isinstance(orders, list):
-            return [order for order in orders if isinstance(order, dict)]
+            if any(not isinstance(order, dict) for order in orders):
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+            return orders
         raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
@@ -496,7 +500,12 @@ class TradierBroker(BrokerAdapter):
             raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
         result = []
         for p in pos_list:
-            quantity = p.get("quantity", 0)
+            symbol_value = p.get("symbol")
+            if "symbol" not in p or not isinstance(symbol_value, str) or not symbol_value.strip():
+                raise ValueError("TRADIER_POSITIONS_SYMBOL_MALFORMED")
+            if "quantity" not in p:
+                raise ValueError("TRADIER_POSITIONS_QUANTITY_MALFORMED")
+            quantity = p["quantity"]
             if isinstance(quantity, bool):
                 raise ValueError("TRADIER_POSITIONS_QUANTITY_MALFORMED")
             try:
@@ -514,7 +523,7 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError("TRADIER_POSITIONS_COST_BASIS_MALFORMED") from None
             if not math.isfinite(cost_basis):
                 raise ValueError("TRADIER_POSITIONS_COST_BASIS_MALFORMED")
-            symbol = str(p.get("symbol", ""))
+            symbol = symbol_value.strip()
             result.append({
                 "symbol": symbol,
                 "quantity": quantity,

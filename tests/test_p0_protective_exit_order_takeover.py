@@ -250,6 +250,67 @@ def test_production_tradier_malformed_positions_are_unproven():
     assert result["is_fresh_exact"] is False
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"positions": {"position": {"symbol": CONTRACT}}},
+        {"positions": {"position": {"quantity": "1"}}},
+        {"positions": {"position": {"symbol": "  ", "quantity": "1"}}},
+    ],
+)
+def test_production_tradier_missing_position_identity_or_quantity_is_unproven(payload):
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: payload
+    result = resolve_exit_broker_truth(
+        broker=broker, client_id=CLIENT, contract=CONTRACT,
+    )
+    assert result["broker_truth_open_qty"] is None
+    assert result["is_fresh_exact"] is False
+    assert result["audit"]["snapshot_status"] == "broker_positions_error"
+
+
+def test_production_tradier_malformed_order_member_holds_takeover_before_cancel_or_post():
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    position_payload = {"positions": {"position": {"symbol": CONTRACT, "quantity": "1"}}}
+    orders_payload = {
+        "orders": {
+            "order": [
+                {"id": "unrelated", "status": "open", "option_symbol": "QQQ260828P00122000"},
+                "MALFORMED_ORDER_ROW",
+            ]
+        }
+    }
+
+    def _get(path, *args, **kwargs):
+        if path.endswith("/positions"):
+            return position_payload
+        if path.endswith("/orders"):
+            return orders_payload
+        raise AssertionError(f"unexpected endpoint: {path}")
+
+    broker._get = _get
+    cancel_calls = []
+    broker.cancel_order = lambda order_id: cancel_calls.append(order_id)
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE"
+    assert "TRADIER_ORDERS_PAYLOAD_MALFORMED" in result["audit"]["error"]
+    assert cancel_calls == []
+
+
 @pytest.mark.parametrize("mode", ["paper", "", "unknown"])
 def test_non_live_or_missing_mode_fails_closed_without_broker_mutation(mode):
     broker = _Broker(positions=[[_position(1)]], orders=[_stop()])
