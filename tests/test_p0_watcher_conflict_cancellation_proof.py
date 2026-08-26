@@ -761,6 +761,46 @@ def test_rehydrated_confirmed_winner_blocks_score_reversal_after_restart():
     assert watcher.has_order("put-replacement-lo") is False
 
 
+def test_rehydrated_confirmed_winner_blocks_stale_score_reversal_after_restart():
+    call = signal(
+        signal_id="call-stale",
+        local_order_id="call-stale-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    confirmed_at = datetime.now(timezone.utc).isoformat()
+    call["metadata"] = {"trigger_crossed_at": confirmed_at}
+    put = signal(
+        signal_id="put-stale-replacement",
+        local_order_id="put-stale-replacement-lo",
+        side="PUT",
+        score=95,
+        trigger=90,
+    )
+    call_row = row_for(call)
+    call_row["meta"]["trigger_crossed_at"] = confirmed_at
+    osm = FakeOSM(
+        {
+            "call-stale-lo": call_row,
+            "put-stale-replacement-lo": row_for(put),
+        },
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    winner = seed(watcher, call, stale=True)
+
+    # A restart must not make an aged confirmed winner eligible for legacy
+    # stale/score replacement before durable direction ownership is checked.
+    assert winner.trigger_crossed_at is not None
+    assert watcher._direction_claims == {}
+
+    assert watcher.add_signal(dict(put)) is False
+    assert watcher._last_reject_reason == "direction_claim_active"
+    assert osm.cancel_calls == []
+    assert watcher.has_order("call-stale-lo") is True
+    assert watcher.has_order("put-stale-replacement-lo") is False
+
+
 def test_unrelated_incomplete_identity_opposite_does_not_hold_winner():
     call = signal(
         signal_id="call",

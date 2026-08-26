@@ -538,7 +538,15 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                     "direction_claim_active:won_winner_still_owned",
                 )
             opposites = self._opposites(ticker, side, signal)
-            prune = [item for item in opposites if self._prunable(signal, item)]
+            # Durable confirmed-breach evidence is lifecycle authority even
+            # after restart.  It must never enter legacy stale/score pruning,
+            # which would otherwise cancel the confirmed winner before the
+            # durable-direction guard below can retain it.
+            prune = [
+                item for item in opposites
+                if not self._has_durable_confirmed_direction_evidence(item)
+                and self._prunable(signal, item)
+            ]
             if prune and not self._prove_remove_all(
                 signal, prune, "opposite_side_replaced_stale_or_weaker"
             ):
