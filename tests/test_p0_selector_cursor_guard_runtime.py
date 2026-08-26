@@ -176,6 +176,11 @@ def _call_guard(conn_ctx, *, local_order_id, client_id, signal_id,
     monkey-patched here to use the isolated test schema connection.
     """
     import ap.selector_cursor_persistence_guard as guard_mod
+    # The full P0 collection contains legacy import-isolation tests that can
+    # temporarily provide a lightweight ``ap`` package stub.  In that process
+    # shape package ``__init__`` is not executed, so exercise the same
+    # production installer explicitly before asserting runtime behavior.
+    guard_mod.install_selector_cursor_persistence_guard()
     from ap.order_state_machine import APOrderStateMachine
 
     orig_db_conn = guard_mod._db_conn
