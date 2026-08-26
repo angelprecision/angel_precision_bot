@@ -611,6 +611,39 @@ def _resolve_selector_attempt_number(
     return max(1, durable_attempt, pre_claimed), None
 
 
+def _resolve_durable_selector_prior_attempt(
+    *,
+    retry_attempt,
+    breach_attempt_count,
+    materialization_attempts,
+) -> tuple[int | None, str | None]:
+    """Resolve the persisted attempt immediately before a due retry.
+
+    The selector resolver intentionally maps an absent/all-zero first-attempt
+    row to attempt 1.  A due-retry claim needs the prior persisted value
+    instead, so that legacy rows with a missing canonical ``retry_attempt``
+    but agreeing positive mirrors can advance from N to N+1 without treating
+    the row as a competing worker.
+    """
+    resolved, reason = _resolve_selector_attempt_number(
+        retry_attempt=retry_attempt,
+        breach_attempt_count=breach_attempt_count,
+        materialization_attempts=materialization_attempts,
+        recovery_pre_claimed_attempt=None,
+    )
+    if reason:
+        return None, reason
+
+    values = (retry_attempt, breach_attempt_count, materialization_attempts)
+    has_positive_durable_value = any(
+        value is not None
+        and not (isinstance(value, str) and not value.strip())
+        and int(value) > 0
+        for value in values
+    )
+    return (resolved if has_positive_durable_value else 0), None
+
+
 def _selector_cursor_retry_block_reason(
     *,
     cursor_enabled: bool,
@@ -2938,12 +2971,11 @@ class APExecutionCore:
         # present 2/1/1-style row; classify it here so recovery can fenced-
         # terminalize the exact RETRY_WAIT generation instead of repeatedly
         # reporting CLAIM_LOST and falling through to another actor.
-        _durable_selector_attempt, _attempt_conflict_reason = (
-            _resolve_selector_attempt_number(
+        durable_prior_attempt, _attempt_conflict_reason = (
+            _resolve_durable_selector_prior_attempt(
                 retry_attempt=meta.get("retry_attempt"),
                 breach_attempt_count=meta.get("breach_attempt_count"),
                 materialization_attempts=meta.get("materialization_attempts"),
-                recovery_pre_claimed_attempt=None,
             )
         )
         if _attempt_conflict_reason:
@@ -3019,10 +3051,6 @@ class APExecutionCore:
             return _claim_lost(
                 f"RETRY_GENERATION_ADVANCED:durable={durable_generation}:expected={_expected_generation}"
             )
-        try:
-            durable_prior_attempt = int(meta.get("retry_attempt") or 0)
-        except (TypeError, ValueError):
-            durable_prior_attempt = 0
         if durable_prior_attempt != _expected_attempt - 1:
             return _claim_lost(
                 f"RETRY_ATTEMPT_ADVANCED:durable={durable_prior_attempt}:expected_prior={_expected_attempt - 1}"

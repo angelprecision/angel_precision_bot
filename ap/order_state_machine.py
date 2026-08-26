@@ -2768,14 +2768,17 @@ class APOrderStateMachine:
                 _patch["materialization_attempts"] = _ra
                 _prev_attempt = _ra - 1
                 _attempt_predicate = (
-                    " AND COALESCE((meta->>'retry_attempt')::int, 0) = %s"
-                    " AND (NULLIF(meta->>'breach_attempt_count', '') IS NULL"
-                    " OR CASE WHEN meta->>'breach_attempt_count' ~ '^[0-9]+$'"
-                    " THEN (meta->>'breach_attempt_count')::int = %s"
+                    " AND (NULLIF(BTRIM(meta->>'retry_attempt'), '') IS NULL"
+                    " OR CASE WHEN BTRIM(meta->>'retry_attempt') ~ '^[0-9]+$'"
+                    " THEN BTRIM(meta->>'retry_attempt')::int = %s"
                     " ELSE FALSE END)"
-                    " AND (NULLIF(meta->>'materialization_attempts', '') IS NULL"
-                    " OR CASE WHEN meta->>'materialization_attempts' ~ '^[0-9]+$'"
-                    " THEN (meta->>'materialization_attempts')::int = %s"
+                    " AND (NULLIF(BTRIM(meta->>'breach_attempt_count'), '') IS NULL"
+                    " OR CASE WHEN BTRIM(meta->>'breach_attempt_count') ~ '^[0-9]+$'"
+                    " THEN BTRIM(meta->>'breach_attempt_count')::int = %s"
+                    " ELSE FALSE END)"
+                    " AND (NULLIF(BTRIM(meta->>'materialization_attempts'), '') IS NULL"
+                    " OR CASE WHEN BTRIM(meta->>'materialization_attempts') ~ '^[0-9]+$'"
+                    " THEN BTRIM(meta->>'materialization_attempts')::int = %s"
                     " ELSE FALSE END)"
                 )
                 _attempt_params = [_prev_attempt, _prev_attempt, _prev_attempt]

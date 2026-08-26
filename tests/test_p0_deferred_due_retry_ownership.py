@@ -2831,6 +2831,7 @@ def test_blocker4_claim_fences_present_attempt_mirrors_before_advancing():
     sql, params = statements[0]
     assert "meta->>'breach_attempt_count'" in sql
     assert "meta->>'materialization_attempts'" in sql
+    assert "NULLIF(BTRIM(meta->>'retry_attempt'), '') IS NULL" in sql
     # Three mirror predicates precede the schedule/generation fences; a real
     # row with breach/materialization_attempts=1 cannot satisfy this claim for
     # retry_attempt=3 (which requires prior attempt 2).
@@ -2871,6 +2872,99 @@ def test_blocker4_due_retry_counter_conflict_is_terminal_required_before_claim()
     core.order_state_machine.claim_deferred_materialization.assert_not_called()
     core._on_entry_trigger.assert_not_called()
     assert not core.broker.method_calls
+
+
+def test_blocker4_due_retry_legacy_missing_canonical_mirror_advances_from_agreeing_mirrors():
+    """A valid legacy partial-mirror row must reach the next claim slot."""
+    core = _core()
+    row = _row(retry_attempt=1)
+    row["meta"].pop("retry_attempt")
+    row["meta"].update({
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+    })
+    core.order_state_machine.get_order.side_effect = [row, row]
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-legacy-partial-mirror",
+    )
+
+    claim = core.order_state_machine.claim_deferred_materialization
+    assert claim.call_args.kwargs["retry_attempt"] == 2
+    assert result["disposition"] == "RETRY_WAIT"
+    assert result["attempt"] == 2
+    core._on_entry_trigger.assert_called_once()
+
+
+def test_blocker4_startup_recovery_uses_agreeing_mirror_attempt():
+    """Startup recovery must pass attempt N+1, not default a missing
+    canonical retry_attempt mirror back to attempt 1."""
+    from unittest.mock import patch
+    from ap import db as db_mod
+    from ap_recovery import APStartupRecovery
+
+    row = _row(retry_attempt=1)
+    row["local_order_id"] = "oid-legacy-partial-mirror-startup"
+    _bind_trigger_evidence(row)
+    row["meta"].pop("retry_attempt")
+    row["meta"].update({
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+    })
+
+    resume_calls = []
+    core = SimpleNamespace(
+        client_id=CLIENT_ID,
+        email=CLIENT_ID,
+        execution_mode="paper",
+        mode="PAPER",
+    )
+
+    def _resume(**kwargs):
+        resume_calls.append(kwargs)
+        return {"disposition": "CLAIM_LOST", "reason_code": "test_claim_lost"}
+
+    core.resume_deferred_materialization_retry = _resume
+
+    class _OSM:
+        client_id = CLIENT_ID
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchall(self):
+            return [row]
+
+    class _Conn:
+        def __enter__(self):
+            return _Cursor()
+
+        def __exit__(self, *args):
+            return False
+
+    recovery = APStartupRecovery(
+        client_id=CLIENT_ID,
+        broker=MagicMock(),
+        osm=_OSM(),
+        pm=MagicMock(),
+        master_control=SimpleNamespace(mode="PAPER"),
+        entry_watcher=None,
+        execution_core=core,
+    )
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        recovery._recover_deferred_breach_lifecycles(result)
+
+    assert len(resume_calls) == 1
+    assert resume_calls[0]["expected_retry_attempt"] == 2
 
 
 def test_blocker5_expired_deadline_terminalizes_before_claim():

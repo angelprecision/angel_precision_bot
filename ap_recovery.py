@@ -2548,6 +2548,29 @@ class APStartupRecovery:
                         )
                         continue
 
+                    # A legacy retry row may have lost only the canonical
+                    # retry_attempt mirror while the other durable mirrors
+                    # still agree on a positive prior attempt.  Use the
+                    # shared resolver for that valid shape; keep the strict
+                    # canonical value for genuine conflicts so the due
+                    # consumer can fenced-terminalize them unchanged.
+                    try:
+                        from ap_execution_core import (
+                            _resolve_durable_selector_prior_attempt,
+                        )
+
+                        _resolved_prior_attempt, _counter_conflict = (
+                            _resolve_durable_selector_prior_attempt(
+                                retry_attempt=meta.get("retry_attempt"),
+                                breach_attempt_count=meta.get("breach_attempt_count"),
+                                materialization_attempts=meta.get("materialization_attempts"),
+                            )
+                        )
+                    except Exception:
+                        _resolved_prior_attempt, _counter_conflict = None, None
+                    if not _counter_conflict and _resolved_prior_attempt is not None:
+                        _retry_attempt = _resolved_prior_attempt
+
                 _is_due = _due_at is not None and _due_at <= now
 
                 # ── Due-retry path (blocker §4: watcher not required) ─────────
