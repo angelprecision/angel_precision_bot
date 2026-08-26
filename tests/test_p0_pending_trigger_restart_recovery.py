@@ -27,6 +27,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 from ap.pending_trigger_restart_recovery import (
     PendingTriggerRestartRecovery,
     _RowOutcome,
+    _build_plan,
+    _resolve_execution_mode,
     _MAT_STATUS_FIELD,
     _MAT_NEXT_RETRY_AT,
     _MAT_ATTEMPTS_FIELD,
@@ -1182,6 +1184,8 @@ class TestIntegrationOrderMonitor:
         import ap_recovery
 
         src = inspect.getsource(ap_recovery.APStartupRecovery._reseed_watchers)
+        assert "PendingTriggerRestartRecovery" in src
+        assert "plan_builder_fn=_plan_builder" in src
         assert "falling back to direct watch" not in src
         assert "self.entry_watcher.watch(plan, local_order_id)" not in src
         assert '_row_dict["client_id"]' not in src
@@ -1442,3 +1446,208 @@ class TestAmendment10Required:
         assert result is None, (
             f"No entry_watcher → must return None (unavailable), not False; got {result}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PR #519 final amendment — restart execution_mode authority parity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestExecutionModeAuthorityParity:
+    @pytest.mark.parametrize(
+        ("column_mode", "meta_mode", "runner_mode"),
+        [
+            ("", "paper", "paper"),
+            (" ", "paper", "paper"),
+            ("", "live", "live"),
+            (" live ", "live", "live"),
+        ],
+    )
+    def test_restart_recovery_uses_one_canonical_mode_for_rearm(
+        self, column_mode, meta_mode, runner_mode
+    ):
+        """Legacy blank/whitespace columns recover from metadata in production."""
+        r = _row(
+            execution_mode=column_mode,
+            meta={"execution_mode": meta_mode, "trigger_price": 450.0},
+        )
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(
+            r,
+            watcher=watcher,
+            mode=runner_mode,
+            quote_result=False,
+        )
+
+        summary = rec.recover_all([r])
+
+        assert summary["watchers_rearmed"] == 1
+        assert summary["ownerless_rows_remaining"] == 0
+        assert watcher._pending[0].signal["execution_mode"] == runner_mode
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    @pytest.mark.parametrize(
+        ("column_mode", "meta_mode"),
+        [("live", "paper"), ("paper", "live")],
+    )
+    def test_mode_conflict_is_unresolved_before_any_side_effect(
+        self, column_mode, meta_mode
+    ):
+        r = _row(
+            execution_mode=column_mode,
+            meta={"execution_mode": meta_mode, "trigger_price": 450.0},
+        )
+        watcher = _MockWatcher(watch_returns=True)
+        watcher.watch = MagicMock(return_value=True)
+        osm = _MockOSM()
+        osm.seed(r)
+        quote_check = MagicMock(return_value=False)
+        rec = PendingTriggerRestartRecovery(
+            client_id="client@test.com",
+            execution_mode=column_mode,
+            osm=osm,
+            entry_watcher=watcher,
+            broker=MagicMock(),
+            quote_check_fn=quote_check,
+        )
+
+        summary = rec.recover_all([r])
+
+        assert summary["row_outcomes"][r["local_order_id"]] == _RowOutcome.UNRESOLVED
+        assert summary["failure_reasons"][r["local_order_id"]] == (
+            "identity:execution_mode_authority_conflict"
+        )
+        assert quote_check.call_count == 0
+        watcher.watch.assert_not_called()
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_both_modes_missing_preserves_fail_closed_behavior(self):
+        r = _row(execution_mode="", meta={})
+        watcher = _MockWatcher(watch_returns=True)
+        watcher.watch = MagicMock(return_value=True)
+        rec, osm = _make_recovery(r, watcher=watcher)
+
+        summary = rec.recover_all([r])
+
+        assert summary["ownerless_rows_remaining"] == 1
+        assert summary["failure_reasons"][r["local_order_id"]] == (
+            "identity:missing_execution_mode"
+        )
+        watcher.watch.assert_not_called()
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_plan_builder_receives_canonical_mode_and_rejects_conflict(self):
+        fallback_row = _row(execution_mode=" ", meta={"execution_mode": "paper"})
+        plan = _build_plan(fallback_row)
+
+        assert plan is not None
+        assert plan.execution_mode == "paper"
+        assert _resolve_execution_mode(fallback_row) == ("paper", None)
+
+        conflict_row = _row(
+            execution_mode="live",
+            meta={"execution_mode": "paper"},
+        )
+        assert _build_plan(conflict_row) is None
+
+        captured = {}
+
+        def _builder(row):
+            captured["execution_mode"] = row.get("execution_mode")
+            return _build_plan(row)
+
+        fallback_row["meta"]["trigger_price"] = 450.0
+        watcher = _MockWatcher(watch_returns=True)
+        rec, _ = _make_recovery(fallback_row, watcher=watcher, quote_result=False)
+        assert rec.recover_one_row(fallback_row, plan_builder_fn=_builder) == (
+            _RowOutcome.WATCHER_OWNED
+        )
+        assert captured["execution_mode"] == "paper"
+
+    def test_terminal_reread_uses_metadata_mode_fallback(self):
+        reason = "overnight_daily_invalidated"
+        r = _row(
+            execution_mode="",
+            meta={
+                "execution_mode": "paper",
+                "watcher_audit": {"reason_code": reason},
+            },
+        )
+        osm = _MockOSM(cancel_returns=True, get_order_status="CANCELED")
+        osm.seed(r)
+        rec, _ = _make_recovery(r, osm=osm)
+
+        outcome = rec._terminalize_with_reason(r["local_order_id"], r, reason)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+
+    def test_materialization_retry_reread_uses_metadata_mode_fallback(self):
+        r = _row(
+            execution_mode="",
+            meta={
+                "execution_mode": "paper",
+                **_retry_meta(),
+            },
+        )
+        r["contract"] = "DEFERRED:SPY"
+        rec, _ = _make_recovery(r)
+
+        proof = rec._verify_materialization_retry_ownership(
+            r["local_order_id"], r
+        )
+
+        assert proof is not None
+
+    def test_restart_rearm_reread_uses_metadata_mode_fallback(self):
+        now = datetime.now(timezone.utc)
+        r = _row(
+            execution_mode="",
+            meta={
+                "execution_mode": "paper",
+                **_restart_rearm_meta(
+                    next_at=(now + timedelta(seconds=30)).isoformat(),
+                    deadline=(now + timedelta(minutes=3)).isoformat(),
+                ),
+            },
+        )
+        rec, _ = _make_recovery(r)
+
+        proof = rec._verify_restart_rearm_retry_ownership(
+            r["local_order_id"], r
+        )
+
+        assert proof is not None
+
+    def test_order_monitor_path_recovers_blank_column_from_meta_mode(self):
+        from ap.order_monitor import APOrderMonitor
+
+        r = _row(
+            execution_mode="",
+            meta={"execution_mode": "paper", "trigger_price": 450.0},
+        )
+        osm = _MockOSM()
+        osm.seed(r)
+        watcher = _MockWatcher(watch_returns=True)
+        monitor = APOrderMonitor.__new__(APOrderMonitor)
+        monitor.client_id = "client@test.com"
+        monitor.mode = "PAPER"
+        monitor.osm = osm
+        monitor.entry_watcher = watcher
+        monitor.broker = MagicMock()
+        monitor.broker.get_quote.return_value = {"bid": 449.5, "ask": 449.6}
+
+        attempted, succeeded, reason = monitor._canonical_pending_trigger_rearm(
+            r,
+            r["local_order_id"],
+            "SPY240101C00450000",
+            is_past_eod=False,
+        )
+
+        assert (attempted, succeeded, reason) == (
+            True,
+            True,
+            "canonical_recovery_watcher_owned",
+        )
+        assert watcher._pending[0].signal["execution_mode"] == "paper"
