@@ -2094,7 +2094,13 @@ class APOrderStateMachine:
                 )
         run_with_retry(_fn)
 
-    def update_order_meta(self, local_order_id: str, meta_patch: dict) -> bool:
+    def update_order_meta(
+        self,
+        local_order_id: str,
+        meta_patch: dict,
+        *,
+        expected_status: str | None = None,
+    ) -> bool:
         """Merge *meta_patch* into orders.meta using a safe JSONB || merge.
 
         ONLY the keys supplied in *meta_patch* are written.  All other existing
@@ -2106,9 +2112,14 @@ class APOrderStateMachine:
         Uses COALESCE(meta, '{}'::jsonb) so rows with a NULL meta column are
         handled safely without raising.
 
+        ``expected_status`` optionally adds a lifecycle CAS predicate.  This is
+        used by confirmed-direction claims, which must not authorize opposite
+        cancellation if the winner row became terminal between the read and
+        the metadata write.
+
         Returns True only when Postgres confirms rowcount > 0 (the row exists
-        and was updated).  Returns False on not-found or write error; callers
-        must treat False as best-effort only.
+        and was updated).  Returns False on not-found, CAS miss, or write error;
+        callers must treat False as best-effort only.
         """
         import json as _json_local
         try:
@@ -2118,13 +2129,17 @@ class APOrderStateMachine:
 
         def _fn():
             with conn() as c:
-                cur = c.execute(
+                _sql = (
                     "UPDATE orders "
                     "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
                     "    updated_ts = NOW() "
-                    "WHERE local_order_id = %s AND client_id = %s",
-                    (_patch_json, local_order_id, self.client_id),
+                    "WHERE local_order_id = %s AND client_id = %s"
                 )
+                _params = [_patch_json, local_order_id, self.client_id]
+                if expected_status is not None:
+                    _sql += " AND UPPER(COALESCE(status, '')) = %s"
+                    _params.append(str(expected_status).strip().upper())
+                cur = c.execute(_sql, tuple(_params))
                 # psycopg2: execute() returns the cursor; rowcount is on the cursor.
                 # Never use `or 1` fallback — rowcount=0 means row not found.
                 return getattr(cur, "rowcount", getattr(c, "rowcount", None))

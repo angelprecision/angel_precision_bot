@@ -74,6 +74,7 @@ class _Identity:
     ticker: str
     side: str
     dedup_key: str
+    canonical_signal_id: str
 
 
 @_dataclass
@@ -189,6 +190,15 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def _identity(self, watched) -> _Identity:
         signal = getattr(watched, "signal", None) or {}
         signal_id = str(getattr(watched, "signal_id", "") or signal.get("signal_id") or "").strip()
+        metadata = signal.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        canonical_signal_id = str(
+            signal.get("canonical_signal_id")
+            or metadata.get("canonical_signal_id")
+            or _base.build_canonical_signal_id(signal_id)
+            or ""
+        ).strip()
         return _Identity(
             str(signal.get("local_order_id") or "").strip(),
             str(signal.get("client_id") or signal.get("client_email") or "").strip(),
@@ -197,6 +207,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             str(getattr(watched, "ticker", "") or signal.get("ticker") or "").upper().strip(),
             str(getattr(watched, "side", "") or signal.get("side") or "").upper().strip(),
             str(self._dedup_key_for_signal(signal) or signal_id or "").strip(),
+            canonical_signal_id,
         )
 
     @staticmethod
@@ -280,17 +291,39 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             raise RuntimeError("osm_get_order_unavailable")
         return read(local_order_id)
 
-    def _verify_row(self, row: _Any, expected: _Identity) -> tuple[bool, str | None, str]:
+    def _verify_row(
+        self,
+        row: _Any,
+        expected: _Identity,
+        *,
+        pending_only: bool = False,
+    ) -> tuple[bool, str | None, str]:
         if not isinstance(row, dict):
             return False, None, "row_unreadable"
         meta = self._meta(row)
         local_id = str(row.get("local_order_id") or row.get("id") or "").strip()
         client_id = str(row.get("client_id") or meta.get("client_id") or "").strip()
         mode = self._mode(row.get("execution_mode") or meta.get("execution_mode"))
-        signal_id = str(
-            row.get("signal_id") or row.get("canonical_signal_id")
-            or meta.get("signal_id") or meta.get("canonical_signal_id") or ""
+        signal_id = str(row.get("signal_id") or meta.get("signal_id") or "").strip()
+        canonical_signal_id = str(
+            row.get("canonical_signal_id")
+            or meta.get("canonical_signal_id")
+            or ""
         ).strip()
+        ticker = str(
+            row.get("symbol")
+            or row.get("ticker")
+            or row.get("underlying")
+            or meta.get("symbol")
+            or meta.get("ticker")
+            or ""
+        ).strip().upper()
+        side = _normalize_watcher_side(
+            row.get("direction")
+            or row.get("side")
+            or meta.get("direction")
+            or meta.get("side")
+        )
         status = str(row.get("status") or "").upper().strip() or None
         if local_id != expected.local_order_id:
             return False, status, "durable_identity_mismatch:local_order_id"
@@ -302,6 +335,22 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             return False, status, "durable_identity_mismatch:signal_id_missing"
         if signal_id != expected.signal_id:
             return False, status, "durable_identity_mismatch:signal_id"
+        if canonical_signal_id and canonical_signal_id != expected.canonical_signal_id:
+            return False, status, "durable_identity_mismatch:canonical_signal_id"
+        if not ticker:
+            return False, status, "durable_identity_mismatch:ticker_missing"
+        if ticker != expected.ticker:
+            return False, status, "durable_identity_mismatch:ticker"
+        if not side:
+            return False, status, "durable_identity_mismatch:side_missing"
+        if side != expected.side:
+            return False, status, "durable_identity_mismatch:side"
+        if pending_only:
+            if status == "PENDING_TRIGGER":
+                return True, status, "durable_pending_exact_identity"
+            if not status:
+                return False, status, "winner_row_status_missing"
+            return False, status, f"winner_row_not_pending_{status.lower()}"
         if status in _TERMINAL_ENTRY:
             return True, status, "durable_terminal_exact_identity"
         if status == "PENDING_TRIGGER":
@@ -309,6 +358,39 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         if not status:
             return False, status, "row_status_missing"
         return False, status, f"row_nonterminal_{status.lower()}"
+
+    def _verify_pending_direction_winner(self, watched) -> bool:
+        """Require exact durable identity before a winner can cancel losers."""
+        expected = self._identity(watched)
+        if not all(
+            (
+                expected.local_order_id,
+                expected.client_id,
+                expected.execution_mode,
+                expected.signal_id,
+                expected.ticker,
+                expected.side,
+                expected.canonical_signal_id,
+            )
+        ):
+            return False
+        try:
+            row = self._read_order(expected.local_order_id)
+        except Exception:
+            return False
+        proven, _status, _reason = self._verify_row(
+            row, expected, pending_only=True
+        )
+        return proven
+
+    def _persist_trigger_confirmation_authority(
+        self, watched, *, require_pending_row: bool = False
+    ) -> bool:
+        if require_pending_row and not self._verify_pending_direction_winner(watched):
+            return False
+        return super()._persist_trigger_confirmation_authority(
+            watched, require_pending_row=require_pending_row
+        )
 
     def _cancel_conflicting_watcher_with_proof(
         self, watched, expected: _Identity, *, cancel_reason: str
@@ -319,6 +401,9 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 ("client_id", expected.client_id),
                 ("execution_mode", expected.execution_mode),
                 ("signal_id", expected.signal_id),
+                ("canonical_signal_id", expected.canonical_signal_id),
+                ("ticker", expected.ticker),
+                ("side", expected.side),
             ) if not value
         ]
         if missing:
@@ -1054,7 +1139,9 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 # A loser must never be canceled while the selected winner's
                 # trigger authority exists only in process memory.  Persist the
                 # winner first; a false return/exception is a fail-closed HOLD.
-                if losers and not self._persist_trigger_confirmation_authority(winner):
+                if losers and not self._persist_trigger_confirmation_authority(
+                    winner, require_pending_row=True
+                ):
                     with self._direction_claim_gate:
                         self._direction_claims[key] = {
                             "status": "ambiguous_hold",

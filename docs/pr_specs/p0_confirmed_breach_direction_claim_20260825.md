@@ -359,12 +359,19 @@ For the losing opposite direction:
 - `client_id` required
 - `execution_mode` required
 - signal identity required
+- ticker and normalized CALL/PUT direction required
+- canonical signal identity must match when the durable row carries it
 - cancellation must be proven by exact OSM return or durable terminal reread
 - identity mismatch = HOLD / fail closed
 - cancellation exception + unreadable durable row = HOLD / fail closed
 - row still `PENDING_TRIGGER` after cancel failure = HOLD / fail closed
 
 Only after all losing opposites are proven terminal may the winning `on_trigger` callback proceed.
+
+Before canceling any loser, the winner's durable row must be reread with the
+same complete identity and still be `PENDING_TRIGGER`. The authority metadata
+write must use a `PENDING_TRIGGER` lifecycle CAS; a read/write race or terminal
+winner row is a HOLD and cannot authorize loser cancellation.
 
 ## 4.6 Winner failure after loser cancellation
 

@@ -5485,8 +5485,17 @@ class APEntryWatcher:
 
         return protected
 
-    def _persist_trigger_confirmation_authority(self, watched) -> bool:
-        """Persist trigger authority before any downstream destructive action."""
+    def _persist_trigger_confirmation_authority(
+        self, watched, *, require_pending_row: bool = False
+    ) -> bool:
+        """Persist trigger authority before any downstream destructive action.
+
+        Direction claims may cancel an opposite pending lifecycle immediately
+        after this write.  Those claims therefore use the optional
+        ``require_pending_row`` fence so the metadata write is conditional on
+        the durable row still being ``PENDING_TRIGGER``.  Ordinary callback
+        persistence keeps the historical two-argument merge semantics.
+        """
         if getattr(watched, "_trigger_authority_persisted", False):
             return True
 
@@ -5519,7 +5528,17 @@ class APEntryWatcher:
             patch["first_breach_ask"] = first_ask
 
         try:
-            if not bool(update_order_meta(local_order_id, patch)):
+            if require_pending_row:
+                persisted = bool(
+                    update_order_meta(
+                        local_order_id,
+                        patch,
+                        expected_status="PENDING_TRIGGER",
+                    )
+                )
+            else:
+                persisted = bool(update_order_meta(local_order_id, patch))
+            if not persisted:
                 return False
         except Exception:
             log.exception(

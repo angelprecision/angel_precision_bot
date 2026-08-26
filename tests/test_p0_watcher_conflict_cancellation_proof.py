@@ -29,6 +29,7 @@ class FakeOSM:
         self.observer = observer
         self.cancel_calls = []
         self.meta_calls = []
+        self.meta_expected_statuses = []
 
     def has_order(self, local_order_id):
         return local_order_id in self.rows
@@ -52,14 +53,21 @@ class FakeOSM:
         row = self.rows.get(local_order_id)
         return dict(row) if isinstance(row, dict) else row
 
-    def update_order_meta(self, local_order_id, patch):
+    def update_order_meta(self, local_order_id, patch, *, expected_status=None):
         self.meta_calls.append((local_order_id, dict(patch)))
+        self.meta_expected_statuses.append(expected_status)
         if self.observer:
             self.observer("meta", local_order_id)
         result = self.meta_results.get(local_order_id, True)
         if isinstance(result, BaseException):
             raise result
         if not result or local_order_id not in self.rows:
+            return False
+        if (
+            expected_status is not None
+            and str(self.rows[local_order_id].get("status") or "").upper()
+            != str(expected_status).upper()
+        ):
             return False
         self.rows[local_order_id].setdefault("meta", {}).update(dict(patch))
         return True
@@ -118,7 +126,13 @@ def row_for(sig, *, status="PENDING_TRIGGER", **overrides):
             "client_id": sig["client_id"],
             "execution_mode": sig["execution_mode"],
             "signal_id": sig["signal_id"],
+            "canonical_signal_id": sig.get("canonical_signal_id") or sig["signal_id"],
+            "symbol": sig["ticker"],
+            "direction": sig["side"],
         },
+        "canonical_signal_id": sig.get("canonical_signal_id") or sig["signal_id"],
+        "symbol": sig["ticker"],
+        "direction": sig["side"],
     }
     row.update(overrides)
     return row
@@ -261,6 +275,37 @@ def test_terminal_reread_identity_mismatch_fails_closed():
     assert_retained(watcher, existing, old)
     assert any(
         "durable_identity_mismatch:client_id" in str(payload.get("raw_reason"))
+        for _, payload in watcher.audits
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("symbol", "MSFT", "ticker"),
+        ("direction", "CALL", "side"),
+        ("canonical_signal_id", "other-canonical", "canonical_signal_id"),
+    ],
+)
+def test_terminal_reread_complete_identity_mismatch_fails_closed(
+    field, value, reason
+):
+    old = signal(signal_id="old", local_order_id="old-lo", side="PUT", score=70)
+    new = signal(signal_id="new", local_order_id="new-lo", side="CALL", score=80)
+    mismatched = row_for(old, status="CANCELED")
+    mismatched[field] = value
+    osm = FakeOSM(
+        {"old-lo": mismatched, "new-lo": row_for(new)},
+        cancel_results={"old-lo": False},
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    existing = seed(watcher, old, stale=True)
+
+    assert watcher.add_signal(dict(new)) is False
+    assert_retained(watcher, existing, old)
+    assert any(
+        f"durable_identity_mismatch:{reason}"
+        in str(payload.get("raw_reason"))
         for _, payload in watcher.audits
     )
 
@@ -590,7 +635,10 @@ def test_winner_authority_failure_holds_before_loser_cancellation():
 
     assert callbacks == []
     assert osm.cancel_calls == []
-    assert events == [("meta", "call-live-lo")]
+    assert events == [
+        ("read", "call-live-lo"),
+        ("meta", "call-live-lo"),
+    ]
     assert osm.rows["call-live-lo"]["status"] == "PENDING_TRIGGER"
     assert osm.rows["put-live-lo"]["status"] == "PENDING_TRIGGER"
     assert "trigger_crossed_at" not in osm.rows["call-live-lo"]["meta"]
@@ -675,6 +723,97 @@ def test_opposite_direction_isolated_by_client_and_execution_mode():
     assert watcher.add_signal(dict(new)) is True
     assert active_directions(watcher) == {"CALL", "PUT"}
     assert osm.cancel_calls == []
+
+
+@pytest.mark.parametrize(
+    "mutation", ["terminal", "signal_id", "direction", "canonical_signal_id"]
+)
+def test_confirmed_direction_requires_exact_pending_winner_row(mutation):
+    call = signal(
+        signal_id="call",
+        local_order_id="call-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    put = signal(
+        signal_id="put",
+        local_order_id="put-lo",
+        side="PUT",
+        score=70,
+        trigger=90,
+    )
+    call_row = row_for(call)
+    if mutation == "terminal":
+        call_row["status"] = "CANCELED"
+    elif mutation == "signal_id":
+        call_row["signal_id"] = "other-signal"
+        call_row["meta"]["signal_id"] = "other-signal"
+    elif mutation == "direction":
+        call_row["direction"] = "PUT"
+        call_row["meta"]["direction"] = "PUT"
+    else:
+        call_row["canonical_signal_id"] = "other-canonical"
+        call_row["meta"]["canonical_signal_id"] = "other-canonical"
+    osm = FakeOSM({"call-lo": call_row, "put-lo": row_for(put)})
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    callbacks = []
+    watcher.on_trigger = lambda watched: callbacks.append(watched.signal_id)
+
+    assert watcher.add_signal(dict(call)) is True
+    assert watcher.add_signal(dict(put)) is True
+    _poll_quote(watcher, bid=98, ask=101)
+    _poll_quote(watcher, bid=98, ask=101)
+
+    assert callbacks == []
+    assert osm.cancel_calls == []
+    assert osm.meta_calls == []
+    assert osm.meta_expected_statuses == []
+    assert active_directions(watcher) == {"CALL", "PUT"}
+    assert watcher._direction_claims[
+        ("client@example.com", "paper", "AAPL")
+    ]["reason"] == "winner_authority_unproven"
+
+
+def test_confirmed_direction_winner_write_is_pending_status_cas():
+    call = signal(
+        signal_id="call-cas",
+        local_order_id="call-cas-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    put = signal(
+        signal_id="put-cas",
+        local_order_id="put-cas-lo",
+        side="PUT",
+        score=70,
+        trigger=90,
+    )
+    holder = {}
+
+    def observer(stage, local_order_id):
+        if stage == "meta" and local_order_id == call["local_order_id"]:
+            holder["osm"].rows[local_order_id]["status"] = "CANCELED"
+
+    osm = FakeOSM(
+        {"call-cas-lo": row_for(call), "put-cas-lo": row_for(put)},
+        observer=observer,
+    )
+    holder["osm"] = osm
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    callbacks = []
+    watcher.on_trigger = lambda watched: callbacks.append(watched.signal_id)
+
+    assert watcher.add_signal(dict(call)) is True
+    assert watcher.add_signal(dict(put)) is True
+    _poll_quote(watcher, bid=98, ask=101)
+    _poll_quote(watcher, bid=98, ask=101)
+
+    assert callbacks == []
+    assert osm.cancel_calls == []
+    assert osm.meta_expected_statuses == ["PENDING_TRIGGER"]
+    assert active_directions(watcher) == {"CALL", "PUT"}
 
 
 def test_terminal_cancellation_requires_durable_signal_id():
