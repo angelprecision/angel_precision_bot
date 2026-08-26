@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util as _importlib_util
 import json as _json
 import math as _math
+import re as _re
 import sys as _sys
 from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path as _Path
@@ -41,6 +42,39 @@ for _name in dir(_base):
         globals()[_name] = getattr(_base, _name)
 
 _BaseAPBrokerReconciler = _base.APBrokerReconciler
+
+
+_OCC_CP_RE = _re.compile(r"^[A-Z0-9]{1,6}(\d{6})(C|P)(\d{8})$")
+
+
+def _strict_option_side(contract: str, persisted: _Any) -> "str | None":
+    """Return 'CALL' or 'PUT' with OCC-contract proof; fail closed on every ambiguity.
+
+    Policy:
+    1. Parse C/P from OCC contract marker — only deterministic source.
+    2. If persisted present: normalize to CALL/PUT; accepted tokens: 'CALL','PUT','C','P'.
+       Anything else → None (fail closed).
+    3. If normalized persisted conflicts with OCC → None (fail closed).
+    4. If persisted absent → derive from OCC directly.
+    5. Never default to CALL. Never default to PUT.
+    """
+    contract_u = (contract or "").strip().upper()
+    m = _OCC_CP_RE.match(contract_u)
+    if not m:
+        return None
+    occ_side = "CALL" if m.group(2) == "C" else "PUT"
+    raw = str(persisted).strip().upper() if persisted is not None else ""
+    if not raw:
+        return occ_side
+    if raw in {"CALL", "C"}:
+        persisted_side = "CALL"
+    elif raw in {"PUT", "P"}:
+        persisted_side = "PUT"
+    else:
+        return None
+    if persisted_side != occ_side:
+        return None
+    return occ_side
 
 
 def _positive_float(value: _Any) -> float:
@@ -403,7 +437,17 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
         underlying = self._norm_underlying(
             pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract)
         )
-        side = str(pos.get("direction") or pos.get("side") or "CALL").upper()
+        side = _strict_option_side(
+            contract, pos.get("direction") or pos.get("side")
+        )
+        if side is None:
+            log.critical(
+                "[%s] RECONCILER_CANONICAL_SEED_BLOCKED direction_unproven "
+                "pos=%s contract=%s persisted_direction=%r",
+                self.client_id, pos_id or "?", contract,
+                pos.get("direction") or pos.get("side"),
+            )
+            return
         qty = int(
             pos.get("quantity_remaining")
             or pos.get("qty")
@@ -690,3 +734,6 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
 
 # Harden standard import surface.
 globals()["APBrokerReconciler"] = APBrokerReconciler
+
+globals()["_strict_option_side"] = _strict_option_side
+globals()["_OCC_CP_RE"] = _OCC_CP_RE
