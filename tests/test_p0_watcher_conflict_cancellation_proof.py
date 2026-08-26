@@ -601,6 +601,42 @@ def test_market_open_protection_uses_directional_ownership_identity(
     }
 
 
+def test_market_open_protection_preserves_same_watcher_callback_retry():
+    call = signal(
+        signal_id="open-retry",
+        local_order_id="open-retry-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    osm = FakeOSM({"open-retry-lo": row_for(call)})
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    callbacks = []
+
+    def callback(watched):
+        callbacks.append(watched.signal_id)
+        if len(callbacks) == 1:
+            return {"disposition": "RETRY_WAIT", "retry_after_seconds": 1}
+        return {"disposition": "TERMINAL_DURABLE"}
+
+    watcher.on_trigger = callback
+    assert watcher.add_signal(dict(call)) is True
+    _poll_quote(watcher, bid=98, ask=106, open_protect_active=True)
+    _poll_quote(watcher, bid=98, ask=106, open_protect_active=True)
+
+    assert callbacks == ["open-retry"]
+    with watcher._lock:
+        assert watcher._pending[0].state == WatchState.PENDING
+        watcher._pending[0].deferred_retry_not_before = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        )
+
+    _poll_quote(watcher, bid=98, ask=106, open_protect_active=True)
+
+    assert callbacks == ["open-retry", "open-retry"]
+    assert watcher.has_order("open-retry-lo") is False
+
+
 def test_winner_authority_failure_holds_before_loser_cancellation():
     call = signal(
         signal_id="call-live",

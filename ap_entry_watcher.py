@@ -1617,6 +1617,7 @@ class APEntryWatcher:
         self._open_protect_date = None
         self._open_trigger_tickers: set = set()   # per-ticker open protection
         self._open_trigger_keys: set = set()      # arbitration identity keys
+        self._open_trigger_owners: dict = {}      # key -> exact retained watcher
 
         # Real watcher-level duplicate barrier. Cleanup alone is not enough;
         # the key must be initialized and enforced before a signal is armed.
@@ -4749,6 +4750,7 @@ class APEntryWatcher:
             self._open_trigger_count = 0
             self._open_trigger_tickers = set()
             self._open_trigger_keys = set()
+            self._open_trigger_owners = {}
 
         open_protect_active = (
             now_et.hour == 9 and 30 <= now_et.minute < 30 + OPEN_PROTECT_MINUTES
@@ -5443,6 +5445,21 @@ class APEntryWatcher:
         """Return the identity used by the base market-open duplicate barrier."""
         return str(getattr(watched, "ticker", "") or "").strip().upper()
 
+    @staticmethod
+    def _open_protection_owner(watched):
+        """Identify the exact watcher allowed to retry after open admission."""
+        registration_token = str(
+            getattr(watched, "_registration_token", "") or ""
+        ).strip()
+        if registration_token:
+            return ("registration", registration_token)
+        signal = getattr(watched, "signal", {}) or {}
+        return (
+            "legacy",
+            str(signal.get("local_order_id") or "").strip(),
+            str(signal.get("signal_id") or getattr(watched, "signal_id", "") or "").strip(),
+        )
+
     def _apply_open_protection(self, completed, open_protect_active: bool):
         """Apply market-open protection after any trigger arbitration hook.
 
@@ -5462,6 +5479,7 @@ class APEntryWatcher:
 
             key = self._open_protection_key(watched)
             ticker = str(getattr(watched, "ticker", "") or "").strip().upper()
+            owner = self._open_protection_owner(watched)
             already_triggered = key in self._open_trigger_keys
             # Preserve compatibility with callers/tests that seed the historical
             # ticker-only set directly before the first protected poll.
@@ -5469,6 +5487,12 @@ class APEntryWatcher:
                 already_triggered = ticker in self._open_trigger_tickers
 
             if already_triggered:
+                if self._open_trigger_owners.get(key) == owner:
+                    # A transient callback failure/RETRY_WAIT leaves this exact
+                    # watcher pending. Preserve its retry ownership while still
+                    # blocking every different watcher for the same key.
+                    protected.append(("trigger", watched))
+                    continue
                 watched.state = WatchState.EXPIRED
                 protected.append(("done", watched))
                 log.info(
@@ -5479,6 +5503,7 @@ class APEntryWatcher:
 
             self._open_trigger_count += 1
             self._open_trigger_keys.add(key)
+            self._open_trigger_owners[key] = owner
             if ticker:
                 self._open_trigger_tickers.add(ticker)
             protected.append(("trigger", watched))
