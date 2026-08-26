@@ -2803,7 +2803,7 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
                       AND COALESCE((meta->>'broker_ready')::boolean, false) = false
                     """ + _attempt_predicate + """
                       AND (
@@ -2879,7 +2879,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3580,7 +3580,7 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
                       AND COALESCE(meta->>'materialization_owner','') = %s
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
@@ -3805,7 +3805,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(NULLIF(execution_mode, ''), meta->>'execution_mode',''))) = %s
+                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3888,7 +3888,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')

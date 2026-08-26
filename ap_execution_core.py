@@ -2948,16 +2948,8 @@ class APExecutionCore:
         if row_client != expected_client:
             return _term("RETRY_CLIENT_ID_MISMATCH", status="ERROR")
 
-        # execution_mode: row must contain a valid mode and must match runner.
-        row_mode = str(row.get("execution_mode") or "").strip().lower()
-        expected_mode = str(self.execution_mode or self.mode or "").strip().lower()
-        if row_mode not in {"live", "paper"}:
-            return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
-        if expected_mode not in {"live", "paper"}:
-            return _term("RETRY_RUNNER_EXECUTION_MODE_INVALID", status="ERROR")
-        if row_mode != expected_mode:
-            return _term("RETRY_EXECUTION_MODE_MISMATCH", status="ERROR")
-
+        # Parse meta early — canonical execution_mode resolution requires the
+        # meta fallback before the mode gate below.
         meta = row.get("meta") or {}
         if isinstance(meta, str):
             try:
@@ -2965,6 +2957,38 @@ class APExecutionCore:
             except Exception:
                 meta = {}
         meta = meta or {}
+
+        # ── FINAL AMENDMENT: canonical execution_mode resolution ─────────────
+        # Column authority is used when non-blank after BTRIM; meta is the
+        # fallback when the column is blank or whitespace-only.  Two non-blank
+        # but disagreeing authorities fail closed — never infer mode from
+        # transport, never allow a whitespace-padded column to evict a valid
+        # meta authority silently.
+        _col_mode_raw = str(row.get("execution_mode") or "").strip().lower()
+        _meta_mode_raw = str(meta.get("execution_mode") or "").strip().lower()
+        # Contradiction fence: both authorities present and disagree → hard fail.
+        if _col_mode_raw and _meta_mode_raw and _col_mode_raw != _meta_mode_raw:
+            return _term(
+                "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+                status="ERROR",
+                diagnostics={
+                    "column_execution_mode": _col_mode_raw,
+                    "meta_execution_mode": _meta_mode_raw,
+                    "selector_calls": 0,
+                    "direct_quote_calls": 0,
+                    "broker_post_count": 0,
+                },
+            )
+        # Canonical: non-blank column wins; blank column falls back to meta.
+        row_mode = _col_mode_raw or _meta_mode_raw
+
+        expected_mode = str(self.execution_mode or self.mode or "").strip().lower()
+        if row_mode not in {"live", "paper"}:
+            return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
+        if expected_mode not in {"live", "paper"}:
+            return _term("RETRY_RUNNER_EXECUTION_MODE_INVALID", status="ERROR")
+        if row_mode != expected_mode:
+            return _term("RETRY_EXECUTION_MODE_MISMATCH", status="ERROR")
 
         # A due retry must never let one durable counter stand in for the
         # selector-attempt identity.  Claim CAS intentionally rejects a
