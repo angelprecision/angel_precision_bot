@@ -22,13 +22,16 @@ class _Broker:
 
 
 class _ExitEngine:
-    def __init__(self, disposition="ADOPTED"):
+    def __init__(self, disposition="ADOPTED", result=None):
         self.disposition = disposition
+        self.result = result
         self.adopt_calls = []
         self.added = []
 
     def adopt_canonical_position_identity(self, **kwargs):
         self.adopt_calls.append(kwargs)
+        if self.result is not None:
+            return self.result
         if self.disposition == "ADOPTED":
             return SimpleNamespace(
                 disposition="ADOPTED", adopted=True, retryable=False, safe_to_seed=False
@@ -78,6 +81,103 @@ def _evidence():
         "underlying_entry": 127.425,
         "underlying_entry_source": "meta.underlying_entry",
     }
+
+
+def _actual_exit_engine_with_repair():
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    engine = APExitEngine(_Broker(), email=CLIENT)
+    repair = ManagedPosition(
+        ticker="NOW",
+        option_symbol=CONTRACT,
+        side="PUT",
+        quantity=1,
+        entry_price=1.30,
+        underlying_entry=0.0,
+        underlying_target=124.78,
+        underlying_stop=130.44,
+    )
+    repair.position_id = f"broker-repair-{CLIENT}-NOW"
+    repair.client_id = CLIENT
+    repair.execution_mode = "live"
+    repair.entry_broker_order_id = BROKER_ORDER_ID
+    engine.add_position(repair)
+    return engine, repair
+
+
+def _canonical_row():
+    return {
+        "id": POSITION_ID,
+        "client_id": CLIENT,
+        "execution_mode": "live",
+        "underlying": "NOW",
+        "contract": CONTRACT,
+        "direction": "PUT",
+        "quantity_remaining": 1,
+        "avg_fill": 1.30,
+        "underlying_entry": None,
+        "stop_underlying": 130.44,
+        "target_underlying": 124.78,
+    }
+
+
+def test_real_exit_engine_collapses_now_repair_and_repeated_ticks_keep_one_owner(monkeypatch):
+    reconciler = _reconciler()
+    engine, repair = _actual_exit_engine_with_repair()
+    reconciler.exit_engine = engine
+    monkeypatch.setattr(reconciler, "_filled_entry_evidence", lambda *a, **k: _evidence())
+
+    reconciler._seed_exit_engine_from_position(_canonical_row())
+    reconciler._seed_exit_engine_from_position(_canonical_row())
+
+    active = engine.active_positions()
+    assert len(active) == 1
+    assert active[0] is repair
+    assert active[0].position_id == POSITION_ID
+    assert active[0].client_id == CLIENT
+    assert active[0].execution_mode == "live"
+    assert active[0].option_symbol == CONTRACT
+    assert active[0].entry_local_order_id == LOCAL_ORDER_ID
+    assert active[0].entry_broker_order_id == BROKER_ORDER_ID
+    assert active[0].signal_id == SIGNAL_ID
+    assert active[0].canonical_signal_id == SIGNAL_ID
+    assert active[0].entry_price == 1.30
+    assert active[0].opened_at.isoformat() == "2026-08-25T13:54:01.682835+00:00"
+    assert active[0].underlying_entry == 127.425
+
+
+def test_real_exit_engine_removes_repair_when_canonical_owner_already_exists(monkeypatch):
+    reconciler = _reconciler()
+    engine, repair = _actual_exit_engine_with_repair()
+    from ap_exit_engine import ManagedPosition
+
+    canonical = ManagedPosition(
+        ticker="NOW",
+        option_symbol=CONTRACT,
+        side="PUT",
+        quantity=1,
+        entry_price=1.30,
+        underlying_entry=127.425,
+        underlying_target=124.78,
+        underlying_stop=130.44,
+    )
+    canonical.position_id = POSITION_ID
+    canonical.client_id = CLIENT
+    canonical.execution_mode = "live"
+    engine._positions.insert(0, canonical)
+    engine._positions_by_id[POSITION_ID] = canonical
+    # Simulate two independently hydrated owners before the collapse call.
+    engine._positions.append(repair)
+    engine._positions_by_id[repair.position_id] = repair
+    reconciler.exit_engine = engine
+    monkeypatch.setattr(reconciler, "_filled_entry_evidence", lambda *a, **k: _evidence())
+
+    reconciler._seed_exit_engine_from_position(_canonical_row())
+
+    active = engine.active_positions()
+    assert len(active) == 1
+    assert active[0] is canonical
+    assert repair not in active
 
 
 def test_missing_db_underlying_entry_does_not_move_to_current_market(monkeypatch):
@@ -156,6 +256,7 @@ def test_no_repair_found_seeds_one_canonical_owner(monkeypatch):
     reconciler._seed_exit_engine_from_position(
         {
             "id": POSITION_ID,
+            "client_id": CLIENT,
             "underlying": "NOW",
             "contract": CONTRACT,
             "direction": "PUT",
@@ -186,6 +287,7 @@ def test_retry_adoption_fails_closed_without_second_owner(monkeypatch):
     reconciler._seed_exit_engine_from_position(
         {
             "id": POSITION_ID,
+            "client_id": CLIENT,
             "underlying": "NOW",
             "contract": CONTRACT,
             "direction": "PUT",
@@ -196,6 +298,119 @@ def test_retry_adoption_fails_closed_without_second_owner(monkeypatch):
     )
 
     assert len(exit_engine.adopt_calls) == 1
+    assert exit_engine.added == []
+
+
+def test_unknown_adoption_disposition_fails_closed_without_second_owner(monkeypatch):
+    reconciler = _reconciler()
+    exit_engine = _ExitEngine(
+        result=SimpleNamespace(
+            disposition="UNKNOWN_SELECTOR_RECOVERY_FAILURE",
+            adopted=False,
+            retryable=False,
+            safe_to_seed=True,
+        )
+    )
+    reconciler.exit_engine = exit_engine
+    monkeypatch.setattr(reconciler, "_filled_entry_evidence", lambda *a, **k: _evidence())
+
+    reconciler._seed_exit_engine_from_position(
+        {
+            "id": POSITION_ID,
+            "client_id": CLIENT,
+            "underlying": "NOW",
+            "contract": CONTRACT,
+            "direction": "PUT",
+            "quantity_remaining": 1,
+            "avg_fill": 1.30,
+            "execution_mode": "live",
+        }
+    )
+
+    assert len(exit_engine.adopt_calls) == 1
+    assert exit_engine.added == []
+
+
+def test_malformed_adoption_result_fails_closed_without_second_owner(monkeypatch):
+    reconciler = _reconciler()
+    exit_engine = _ExitEngine(
+        result=SimpleNamespace(
+            disposition="NO_REPAIR_FOUND",
+            adopted=False,
+            retryable=False,
+        )
+    )
+    reconciler.exit_engine = exit_engine
+    monkeypatch.setattr(reconciler, "_filled_entry_evidence", lambda *a, **k: _evidence())
+
+    reconciler._seed_exit_engine_from_position(
+        {
+            "id": POSITION_ID,
+            "client_id": CLIENT,
+            "underlying": "NOW",
+            "contract": CONTRACT,
+            "direction": "PUT",
+            "quantity_remaining": 1,
+            "avg_fill": 1.30,
+            "execution_mode": "live",
+        }
+    )
+
+    assert len(exit_engine.adopt_calls) == 1
+    assert exit_engine.added == []
+
+
+def test_client_or_mode_mismatch_fails_closed_before_adoption(monkeypatch):
+    reconciler = _reconciler()
+    exit_engine = _ExitEngine("NO_REPAIR_FOUND")
+    reconciler.exit_engine = exit_engine
+    monkeypatch.setattr(reconciler, "_filled_entry_evidence", lambda *a, **k: _evidence())
+
+    for field, value in (("client_id", "other-client"), ("execution_mode", "paper")):
+        row = {
+            "id": POSITION_ID,
+            "client_id": CLIENT,
+            "underlying": "NOW",
+            "contract": CONTRACT,
+            "direction": "PUT",
+            "quantity_remaining": 1,
+            "avg_fill": 1.30,
+            "execution_mode": "live",
+        }
+        row[field] = value
+        reconciler._seed_exit_engine_from_position(row)
+
+    assert exit_engine.adopt_calls == []
+    assert exit_engine.added == []
+
+
+def test_missing_adoption_api_fails_closed_without_generic_add(monkeypatch):
+    reconciler = _reconciler()
+
+    class _NoAdoptionEngine:
+        def __init__(self):
+            self.added = []
+
+        def add_position(self, position):
+            self.added.append(position)
+
+    exit_engine = _NoAdoptionEngine()
+    reconciler.exit_engine = exit_engine
+    monkeypatch.setattr(reconciler, "_filled_entry_evidence", lambda *a, **k: _evidence())
+
+    reconciler._seed_exit_engine_from_position(
+        {
+            "id": POSITION_ID,
+            "client_id": CLIENT,
+            "underlying": "NOW",
+            "contract": CONTRACT,
+            "direction": "PUT",
+            "quantity_remaining": 1,
+            "avg_fill": 1.30,
+            "execution_mode": "live",
+        }
+    )
+
     assert exit_engine.added == []
 
 

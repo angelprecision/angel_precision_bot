@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util as _importlib_util
 import json as _json
+import math as _math
 import sys as _sys
 from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path as _Path
@@ -43,13 +44,52 @@ _BaseAPBrokerReconciler = _base.APBrokerReconciler
 
 
 def _positive_float(value: _Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
     try:
         out = float(value)
-        if out > 0 and out == out:
+        if _math.isfinite(out) and out > 0:
             return out
     except Exception:
         pass
     return 0.0
+
+
+def _positive_integral(value: _Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+        if not _math.isfinite(out) or out <= 0 or out != int(out):
+            return None
+        return int(out)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _proven_broker_order_id(value: _Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    token = str(value or "").strip().upper()
+    if token in {
+        "", "0", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "UNDEFINED",
+        "NIL", "TRUE", "FALSE", "NAN", "INF", "+INF", "-INF",
+    }:
+        return False
+    try:
+        numeric = float(token)
+        if not _math.isfinite(numeric) or numeric <= 0:
+            return False
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return True
+
+
+def _strict_execution_mode(value: _Any) -> str | None:
+    """Accept only the canonical persisted mode tokens; never infer a mode."""
+    if not isinstance(value, str):
+        return None
+    return value if value in {"live", "paper"} else None
 
 
 def _as_dict(value: _Any) -> dict:
@@ -119,9 +159,9 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
         canonical position entry timestamp. Multiple candidates, missing timing
         proof, or an order linked to another position all fail closed.
         """
-        mode = _normalize_execution_mode(self.execution_mode)
+        mode = _strict_execution_mode(self.execution_mode)
         contract_u = self._norm_contract(contract)
-        if mode is None or not contract_u or not self.client_id:
+        if mode is None or not contract_u or not str(self.client_id or "").strip():
             return None
 
         columns = """
@@ -131,10 +171,10 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
                    stop_underlying, target_underlying, meta
             FROM orders
             WHERE client_id = %s
-              AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-              AND UPPER(contract) = UPPER(%s)
-              AND UPPER(COALESCE(kind, '')) = 'ENTRY'
-              AND UPPER(COALESCE(status, '')) IN ('FILLED', 'PARTIAL_FILL')
+              AND execution_mode = %s
+              AND contract = %s
+              AND kind = 'ENTRY'
+              AND status IN ('FILLED', 'PARTIAL_FILL')
               AND COALESCE(filled_qty, 0) > 0
         """
 
@@ -152,26 +192,69 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
                 out["underlying_entry_source"] = source
                 return out
 
+            def _validated_rows(rows: list[dict] | None) -> list[dict] | None:
+                """Validate every exact-identity row before selecting any candidate."""
+                validated = []
+                for raw_row in rows or []:
+                    row = dict(raw_row)
+                    if not _proven_broker_order_id(row.get("broker_order_id")):
+                        log.critical(
+                            "[%s] FILLED_ENTRY_EVIDENCE_BROKER_ID_UNPROVEN "
+                            "contract=%s mode=%s — refusing historical donation",
+                            self.client_id, contract_u, mode,
+                        )
+                        return None
+                    if _positive_float(row.get("fill_price")) <= 0:
+                        log.critical(
+                            "[%s] FILLED_ENTRY_EVIDENCE_FILL_PRICE_UNPROVEN "
+                            "contract=%s mode=%s — refusing historical donation",
+                            self.client_id, contract_u, mode,
+                        )
+                        return None
+                    if _positive_integral(row.get("filled_qty")) is None:
+                        log.critical(
+                            "[%s] FILLED_ENTRY_EVIDENCE_FILL_QTY_UNPROVEN "
+                            "contract=%s mode=%s — refusing historical donation",
+                            self.client_id, contract_u, mode,
+                        )
+                        return None
+                    if _coerce_utc(row.get("filled_ts")) is None:
+                        log.critical(
+                            "[%s] FILLED_ENTRY_EVIDENCE_FILL_TS_UNPROVEN "
+                            "contract=%s mode=%s — refusing historical donation",
+                            self.client_id, contract_u, mode,
+                        )
+                        return None
+                    validated.append(row)
+                return validated
+
             if position_id:
                 def _linked_query():
                     with conn() as c:
                         c.execute(
                             columns
                             + """
-                              AND COALESCE(position_id, '') = %s
+                              AND position_id = %s
                             ORDER BY filled_ts DESC NULLS LAST,
                                      updated_ts DESC NULLS LAST,
                                      id DESC
-                            LIMIT 1
                             """,
                             (self.client_id, mode, contract_u, position_id),
                         )
-                        row = c.fetchone()
-                        return dict(row) if row else None
+                        return [dict(r) for r in (c.fetchall() or [])]
 
-                linked = run_with_retry(_linked_query)
-                if linked:
-                    return _decorate(linked)
+                linked = _validated_rows(run_with_retry(_linked_query))
+                if linked is None:
+                    return None
+                if len(linked) == 1:
+                    return _decorate(linked[0])
+                if len(linked) > 1:
+                    log.critical(
+                        "[%s] FILLED_ENTRY_EVIDENCE_LINKED_AMBIGUOUS "
+                        "contract=%s pos=%s candidates=%d — refusing lifecycle cross-link",
+                        self.client_id, contract_u, position_id, len(linked),
+                    )
+                    return None
 
                 # The only safe fallback is the short position-link race. Do not
                 # borrow an order already owned by a different canonical position.
@@ -189,22 +272,21 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
                         c.execute(
                             columns
                             + """
-                              AND COALESCE(position_id, '') = ''
+                              AND (position_id IS NULL OR position_id = '')
                             ORDER BY filled_ts DESC NULLS LAST,
                                      updated_ts DESC NULLS LAST,
                                      id DESC
-                            LIMIT 5
                             """,
                             (self.client_id, mode, contract_u),
                         )
                         return [dict(r) for r in (c.fetchall() or [])]
 
-                unlinked = run_with_retry(_unlinked_query) or []
+                unlinked = _validated_rows(run_with_retry(_unlinked_query))
+                if unlinked is None:
+                    return None
                 candidates = []
                 for row in unlinked:
                     filled_ts = _coerce_utc(row.get("filled_ts"))
-                    if filled_ts is None:
-                        continue
                     if abs((filled_ts - anchor_ts).total_seconds()) <= 300:
                         candidates.append(row)
 
@@ -226,31 +308,11 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
                     )
                 return None
 
-            # No canonical position identity exists. Do not silently choose the
-            # newest row when multiple historical ENTRY fills share a contract.
-            def _unscoped_query():
-                with conn() as c:
-                    c.execute(
-                        columns
-                        + """
-                        ORDER BY filled_ts DESC NULLS LAST,
-                                 updated_ts DESC NULLS LAST,
-                                 id DESC
-                        LIMIT 2
-                        """,
-                        (self.client_id, mode, contract_u),
-                    )
-                    return [dict(r) for r in (c.fetchall() or [])]
-
-            rows = run_with_retry(_unscoped_query) or []
-            if len(rows) == 1:
-                return _decorate(rows[0])
-            if len(rows) > 1:
-                log.critical(
-                    "[%s] FILLED_ENTRY_EVIDENCE_AMBIGUOUS contract=%s mode=%s "
-                    "candidates=%d — historical anchor remains untrusted",
-                    self.client_id, contract_u, mode, len(rows),
-                )
+            log.critical(
+                "[%s] FILLED_ENTRY_EVIDENCE_UNSCOPED_BLOCKED contract=%s mode=%s "
+                "— canonical position identity is required",
+                self.client_id, contract_u, mode,
+            )
             return None
         except Exception as exc:
             log.warning(
@@ -265,24 +327,28 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
         *,
         underlying: str,
         contract: str,
+        entry_evidence: dict | None = None,
     ) -> float:
         """Return historical entry truth only; never substitute the current market."""
         for key in (
             "underlying_entry",
             "entry_underlying",
+            "underlying_price_at_entry",
             "underlying_entry_price",
             "entry_underlying_price",
         ):
-            val = self._safe_float(pos.get(key), 0.0)
+            val = _positive_float(pos.get(key))
             if val > 0:
                 return val
 
         position_id = str(pos.get("id") or pos.get("position_id") or "").strip()
-        evidence = self._filled_entry_evidence(
-            contract,
-            position_id=position_id,
-            position_entry_ts=pos.get("entry_ts"),
-        ) or {}
+        evidence = entry_evidence
+        if evidence is None:
+            evidence = self._filled_entry_evidence(
+                contract,
+                position_id=position_id,
+                position_entry_ts=pos.get("entry_ts"),
+            ) or {}
         return _positive_float(evidence.get("underlying_entry"))
 
     def _derive_underlying_entry_from_broker_position(
@@ -295,20 +361,44 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
         """Broker imports accept explicit historical fields, not current-market aliases."""
         for key in (
             "underlying_entry", "underlying_entry_price", "entry_underlying",
-            "underlying_price_at_entry",
+            "underlying_price_at_entry", "entry_underlying_price",
         ):
-            val = self._safe_float(bp.get(key), 0.0)
+            val = _positive_float(bp.get(key))
             if val > 0:
                 return val
 
-        evidence = self._filled_entry_evidence(contract) or {}
-        return _positive_float(evidence.get("underlying_entry"))
+        # Without a canonical position timestamp/identity, an order matched only
+        # by client + mode + OCC contract could belong to a prior economic lifecycle.
+        return 0.0
 
     def _seed_exit_engine_from_position(self, pos: dict) -> None:
         """Seed/adopt an existing canonical DB position with its durable identity."""
         if not pos:
             return
         pos_id = str(pos.get("id") or pos.get("position_id") or "").strip()
+        if pos_id.lower().startswith("broker-repair-"):
+            log.critical(
+                "[%s] RECONCILER_CANONICAL_SEED_BLOCKED synthetic_position_id=%s",
+                self.client_id, pos_id,
+            )
+            return
+        expected_client = str(self.client_id or "").strip()
+        row_client = str(pos.get("client_id") or "").strip()
+        mode = _strict_execution_mode(self.execution_mode)
+        row_mode = _strict_execution_mode(pos.get("execution_mode"))
+        if not expected_client or row_client != expected_client:
+            log.critical(
+                "[%s] RECONCILER_CANONICAL_SEED_BLOCKED client_identity_unproven pos=%s",
+                self.client_id, pos_id or "?",
+            )
+            return
+        if mode is None or row_mode is None or row_mode != mode:
+            log.critical(
+                "[%s] RECONCILER_CANONICAL_SEED_BLOCKED execution_mode_unproven "
+                "pos=%s row_mode=%r reconciler_mode=%r",
+                self.client_id, pos_id or "?", pos.get("execution_mode"), self.execution_mode,
+            )
+            return
         contract = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
         underlying = self._norm_underlying(
             pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract)
@@ -331,7 +421,10 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
             position_entry_ts=position_entry_ts,
         ) or {}
         underlying_entry = self._derive_underlying_entry_from_position(
-            pos, underlying=underlying, contract=contract
+            pos,
+            underlying=underlying,
+            contract=contract,
+            entry_evidence=evidence,
         )
         stop_underlying = (
             pos.get("stop_underlying")
@@ -387,25 +480,45 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
         allows existing degraded-data guards to HOLD rather than rewriting
         history from the current market and pretending the data is trustworthy.
         """
+        client_id = str(self.client_id or "").strip()
+        contract = self._norm_contract(contract)
+        if not client_id or not contract:
+            log.critical(
+                "[%s] EXIT_ENGINE_CANONICAL_ADOPTION_BLOCKED client_or_contract_unproven "
+                "contract=%s pos=%s",
+                self.client_id, contract, pos_id or "?",
+            )
+            return
         ee = getattr(self, "exit_engine", None)
         if not ee:
-            return super()._seed_exit_engine_from_import(
-                pos_id=pos_id,
-                contract=contract,
-                underlying=underlying,
-                side=side,
-                qty=qty,
-                entry_px=entry_px,
-                stop_underlying=stop_underlying,
-                target_underlying=target_underlying,
-                underlying_entry=underlying_entry,
-                price_untrusted=price_untrusted,
+            log.critical(
+                "[%s] EXIT_ENGINE_NOT_WIRED contract=%s pos=%s "
+                "— refusing reconciler seed",
+                self.client_id, contract, pos_id or "?",
             )
+            try:
+                self._record_reconciler_rejection(
+                    signal_id=str(pos_id or f"reconciled:{contract}"),
+                    ticker=self._norm_underlying(underlying or contract),
+                    category_name="HEALTH",
+                    severity_name="CRITICAL",
+                    reason_code="EXIT_ENGINE_NOT_WIRED",
+                    human_reason="reconciler could not seed imported/open position because exit_engine is not wired",
+                    contract=contract,
+                    pos_id=pos_id,
+                    qty=qty,
+                    entry_px=entry_px,
+                    price_untrusted=price_untrusted,
+                    underlying_entry=underlying_entry,
+                )
+            except Exception:
+                pass
+            return
 
         try:
             from ap_exit_engine import ManagedPosition
 
-            mode = _normalize_execution_mode(self.execution_mode)
+            mode = _strict_execution_mode(self.execution_mode)
             if mode is None:
                 log.critical(
                     "[%s] RECONCILER_CANONICAL_ADOPTION_BLOCKED mode_unproven contract=%s pos=%s",
@@ -441,53 +554,83 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
             entry_ts = evidence.get("filled_ts") or position_entry_ts
 
             adopt = getattr(ee, "adopt_canonical_position_identity", None)
-            if callable(adopt):
-                result = adopt(
-                    contract=contract,
-                    canonical_position_id=str(pos_id or ""),
-                    local_order_id=local_order_id,
-                    broker_order_id=broker_order_id,
-                    signal_id=signal_id,
-                    canonical_signal_id=canonical_signal_id,
-                    entry_fill=float(entry_px),
-                    entry_ts=entry_ts,
-                    order_filled_ts=evidence.get("filled_ts"),
-                    execution_mode=mode,
-                    client_id=self.client_id,
-                    underlying_entry=float(persisted_underlying),
-                    score=0.0,
-                    tier="RECONCILED",
-                    pattern="",
-                    direction=side,
-                    timeframe="",
-                    underlying_stop=float(stop_u),
-                    underlying_target=float(target_u),
+            if not callable(adopt):
+                log.critical(
+                    "[%s] EXIT_ENGINE_CANONICAL_ADOPTION_BLOCKED contract=%s pos=%s "
+                    "reason=adoption_api_unavailable — refusing generic seed",
+                    self.client_id, contract, pos_id,
                 )
-                disposition = str(getattr(result, "disposition", "") or "")
-                adopted = bool(getattr(result, "adopted", False))
-                retryable = bool(getattr(result, "retryable", False))
-                safe_to_seed = bool(getattr(result, "safe_to_seed", False))
+                return
 
-                if adopted or disposition in {"ADOPTED", "ALREADY_CANONICAL_REPAIR_REMOVED"}:
-                    log.critical(
-                        "[%s] EXIT_ENGINE_CANONICAL_ADOPTED_FROM_RECONCILER contract=%s pos=%s disposition=%s underlying_entry=%s source=%s",
-                        self.client_id, contract, pos_id, disposition or "ADOPTED",
-                        persisted_underlying if persisted_underlying > 0 else "unknown",
-                        evidence.get("underlying_entry_source") or "db_position",
-                    )
-                    return
-                if disposition.startswith("RETRY_") or (retryable and not safe_to_seed):
-                    log.critical(
-                        "[%s] EXIT_ENGINE_CANONICAL_ADOPTION_RETRY_HOLD contract=%s pos=%s disposition=%s — refusing second owner",
-                        self.client_id, contract, pos_id, disposition or "RETRY_UNKNOWN",
-                    )
-                    return
-                if disposition and disposition != "NO_REPAIR_FOUND" and not safe_to_seed:
-                    log.critical(
-                        "[%s] EXIT_ENGINE_CANONICAL_ADOPTION_HOLD contract=%s pos=%s disposition=%s",
-                        self.client_id, contract, pos_id, disposition,
-                    )
-                    return
+            result = adopt(
+                contract=contract,
+                canonical_position_id=str(pos_id or ""),
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                signal_id=signal_id,
+                canonical_signal_id=canonical_signal_id,
+                entry_fill=float(entry_px),
+                entry_ts=entry_ts,
+                order_filled_ts=evidence.get("filled_ts"),
+                execution_mode=mode,
+                client_id=client_id,
+                underlying_entry=float(persisted_underlying),
+                score=0.0,
+                tier="RECONCILED",
+                pattern="",
+                direction=side,
+                timeframe="",
+                underlying_stop=float(stop_u),
+                underlying_target=float(target_u),
+            )
+            disposition = getattr(result, "disposition", None)
+            adopted = getattr(result, "adopted", None)
+            retryable = getattr(result, "retryable", None)
+            safe_to_seed = getattr(result, "safe_to_seed", None)
+            well_formed = (
+                isinstance(disposition, str)
+                and isinstance(adopted, bool)
+                and isinstance(retryable, bool)
+                and isinstance(safe_to_seed, bool)
+            )
+
+            if (
+                well_formed
+                and disposition in {"ADOPTED", "ALREADY_CANONICAL_REPAIR_REMOVED"}
+                and adopted is True
+                and retryable is False
+                and safe_to_seed is False
+            ):
+                log.critical(
+                    "[%s] EXIT_ENGINE_CANONICAL_ADOPTED_FROM_RECONCILER contract=%s pos=%s disposition=%s underlying_entry=%s source=%s",
+                    self.client_id, contract, pos_id, disposition,
+                    persisted_underlying if persisted_underlying > 0 else "unknown",
+                    evidence.get("underlying_entry_source") or "db_position",
+                )
+                return
+
+            if (
+                well_formed
+                and disposition == "NO_REPAIR_FOUND"
+                and adopted is False
+                and retryable is False
+                and safe_to_seed is True
+            ):
+                pass
+            else:
+                log.critical(
+                    "[%s] EXIT_ENGINE_CANONICAL_ADOPTION_HOLD contract=%s pos=%s "
+                    "disposition=%r adopted=%r retryable=%r safe_to_seed=%r "
+                    "— refusing second owner",
+                    self.client_id,
+                    contract,
+                    pos_id,
+                    disposition,
+                    adopted,
+                    retryable,
+                    safe_to_seed,
+                )
+                return
 
             # No repair exists. Seed exactly one canonical ManagedPosition.
             mp = ManagedPosition(
@@ -501,7 +644,7 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
                 underlying_stop=float(stop_u),
             )
             mp.position_id = str(pos_id or "")
-            mp.client_id = self.client_id
+            mp.client_id = client_id
             mp.signal_id = signal_id
             mp.canonical_signal_id = canonical_signal_id
             mp.execution_mode = mode

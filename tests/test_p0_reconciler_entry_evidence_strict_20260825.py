@@ -40,9 +40,22 @@ def _reconciler():
     )
 
 
-def _order_row(*, local_order_id=LOCAL_ORDER_ID, filled_ts=FILL_TS):
+def _order_row(
+    *,
+    local_order_id=LOCAL_ORDER_ID,
+    filled_ts=FILL_TS,
+    position_id=None,
+    client_id=CLIENT,
+    execution_mode="live",
+    contract=CONTRACT,
+):
     return {
-        "position_id": None,
+        "position_id": position_id,
+        "client_id": client_id,
+        "execution_mode": execution_mode,
+        "contract": contract,
+        "kind": "ENTRY",
+        "status": "FILLED",
         "local_order_id": local_order_id,
         "broker_order_id": BROKER_ORDER_ID,
         "signal_id": SIGNAL_ID,
@@ -102,8 +115,9 @@ def test_trigger_price_column_is_not_redefined_as_underlying_entry(monkeypatch):
 
 
 class _DBState:
-    def __init__(self, unlinked_rows):
+    def __init__(self, unlinked_rows, linked_rows=None):
         self.unlinked_rows = list(unlinked_rows)
+        self.linked_rows = list(linked_rows or [])
         self.executions = []
 
 
@@ -129,11 +143,26 @@ class _Conn:
         return None
 
     def fetchall(self):
-        return list(self.state.unlinked_rows)
+        rows = (
+            self.state.linked_rows
+            if "position_id = %s" in self.sql
+            else self.state.unlinked_rows
+        )
+        expected_client, expected_mode, expected_contract = self.params[:3]
+        filtered = [
+            row for row in rows
+            if row.get("client_id") == expected_client
+            and row.get("execution_mode") == expected_mode
+            and row.get("contract") == expected_contract
+        ]
+        if "position_id = %s" in self.sql:
+            expected_position_id = self.params[-1]
+            return [row for row in filtered if row.get("position_id") == expected_position_id]
+        return [row for row in filtered if not str(row.get("position_id") or "").strip()]
 
 
-def _install_fake_db(monkeypatch, rows):
-    state = _DBState(rows)
+def _install_fake_db(monkeypatch, rows, *, linked_rows=None):
+    state = _DBState(rows, linked_rows=linked_rows)
     monkeypatch.setattr(db, "conn", lambda: _Conn(state))
     monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
     return state
@@ -156,10 +185,133 @@ def test_unique_unlinked_fill_within_position_time_window_recovers_incident_race
     assert len(state.executions) == 2
     linked_sql, linked_params = state.executions[0]
     unlinked_sql, unlinked_params = state.executions[1]
-    assert "COALESCE(position_id, '') = %s" in linked_sql
+    assert "position_id = %s" in linked_sql
     assert linked_params[-1] == POSITION_ID
-    assert "COALESCE(position_id, '') = ''" in unlinked_sql
+    assert "position_id IS NULL OR position_id = ''" in unlinked_sql
     assert unlinked_params == (CLIENT, "live", CONTRACT)
+
+
+def test_exact_position_linked_fill_is_accepted(monkeypatch):
+    state = _install_fake_db(
+        monkeypatch,
+        [],
+        linked_rows=[_order_row(position_id=POSITION_ID)],
+    )
+    reconciler = _reconciler()
+
+    evidence = reconciler._filled_entry_evidence(
+        CONTRACT,
+        position_id=POSITION_ID,
+        position_entry_ts=None,
+    )
+
+    assert evidence is not None
+    assert evidence["position_id"] == POSITION_ID
+    assert len(state.executions) == 1
+
+
+def test_fill_linked_to_different_position_is_rejected(monkeypatch):
+    state = _install_fake_db(
+        monkeypatch,
+        [_order_row(position_id="different-position")],
+    )
+    reconciler = _reconciler()
+
+    evidence = reconciler._filled_entry_evidence(
+        CONTRACT,
+        position_id=POSITION_ID,
+        position_entry_ts=ENTRY_TS,
+    )
+
+    assert evidence is None
+    assert len(state.executions) == 2
+
+
+def test_client_mode_and_contract_mismatch_do_not_donate_evidence(monkeypatch):
+    row = _order_row()
+    state = _install_fake_db(monkeypatch, [], linked_rows=[row])
+    reconciler = _reconciler()
+
+    for field, value, query_contract in (
+        ("client_id", "other-client", CONTRACT),
+        ("execution_mode", "paper", CONTRACT),
+        ("contract", "OTHER260828P00122000", CONTRACT),
+    ):
+        row[field] = value
+        evidence = reconciler._filled_entry_evidence(
+            query_contract,
+            position_id=POSITION_ID,
+            position_entry_ts=ENTRY_TS,
+        )
+        assert evidence is None
+        state.executions.clear()
+        row[field] = _order_row()[field]
+
+
+def test_malformed_execution_mode_fails_closed_before_query(monkeypatch):
+    state = _install_fake_db(monkeypatch, [], linked_rows=[_order_row(position_id=POSITION_ID)])
+    reconciler = _reconciler()
+    reconciler.execution_mode = "sandbox"
+
+    evidence = reconciler._filled_entry_evidence(
+        CONTRACT,
+        position_id=POSITION_ID,
+        position_entry_ts=ENTRY_TS,
+    )
+
+    assert evidence is None
+    assert state.executions == []
+
+
+def test_multiple_position_linked_fills_fail_closed(monkeypatch):
+    _install_fake_db(
+        monkeypatch,
+        [_order_row(local_order_id="unlinked-candidate")],
+        linked_rows=[
+            _order_row(local_order_id="linked-a", position_id=POSITION_ID),
+            _order_row(local_order_id="linked-b", position_id=POSITION_ID),
+        ],
+    )
+    reconciler = _reconciler()
+
+    evidence = reconciler._filled_entry_evidence(
+        CONTRACT,
+        position_id=POSITION_ID,
+        position_entry_ts=ENTRY_TS,
+    )
+
+    assert evidence is None
+
+
+def test_unscoped_filled_entry_lookup_is_blocked(monkeypatch):
+    state = _install_fake_db(monkeypatch, [_order_row()])
+    reconciler = _reconciler()
+
+    evidence = reconciler._filled_entry_evidence(CONTRACT)
+
+    assert evidence is None
+    assert state.executions == []
+
+
+def test_unproven_fill_scalars_fail_closed(monkeypatch):
+    for field, value in (
+        ("broker_order_id", None),
+        ("fill_price", float("inf")),
+        ("filled_qty", 1.5),
+        ("filled_ts", None),
+    ):
+        row = _order_row()
+        row[field] = value
+        _install_fake_db(monkeypatch, [], linked_rows=[row])
+        reconciler = _reconciler()
+
+        evidence = reconciler._filled_entry_evidence(
+            CONTRACT,
+            position_id=POSITION_ID,
+            position_entry_ts=ENTRY_TS,
+        )
+
+        assert evidence is None, field
 
 
 def test_multiple_unlinked_fills_fail_closed_instead_of_cross_linking(monkeypatch):
