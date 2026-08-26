@@ -4082,6 +4082,76 @@ class APExecutionCore:
             "generation": _mat_generation,
         })
 
+        # PR #520 — REAL_OCC fresh-claim authority guard.
+        #
+        # For REAL_OCC contracts (selector has already run at least once and
+        # the plan's contract_symbol was updated to the real OCC symbol), a
+        # fresh claim_deferred_materialization() attempt is only authorised when
+        # resume_deferred_materialization_retry() has set _recovery_pre_claimed=True.
+        # Stale metadata flags (contract_deferred=True) on a REAL_OCC row must
+        # never drive a fresh CAS write — the claim SQL allows
+        # lifecycle_state IN ('', 'RETRY_WAIT'), so a stale flag + blank state
+        # would succeed and fire a second selector run without a recovery lock.
+        #
+        # Duplicate callbacks on an already-submitted REAL_OCC order are handled
+        # by reading the order status BEFORE the CAS: SUBMITTED/terminal statuses
+        # return DONE immediately, preserving idempotency.  Only a row still in
+        # PENDING_TRIGGER (or unknown) state triggers the fresh-claim refusal.
+        if not _recovery_pre_claimed:
+            _fc_contract = str(
+                getattr(approved_plan, "contract_symbol", "") or ""
+            ).strip()
+            if (
+                _fc_contract
+                and APExecutionCore._classify_contract(_fc_contract, ticker)
+                == _CONTRACT_REAL_OCC
+            ):
+                _fc_row = None
+                try:
+                    _fc_row = self.order_state_machine.get_order(
+                        queue_local_order_id
+                    )
+                except Exception:
+                    pass
+                _fc_status = str(
+                    (_fc_row or {}).get("status") or ""
+                ).upper()
+                if _fc_status in {
+                    "SUBMITTED",
+                    "ACKNOWLEDGED",
+                    "PARTIAL_FILL",
+                    "FILLED",
+                }:
+                    # Legitimate duplicate callback — order already done.
+                    return {
+                        "status": "DONE",
+                        "result": {"disposition": "SUBMITTED"},
+                    }
+                if _fc_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                    return {
+                        "status": "DONE",
+                        "result": {"disposition": "TERMINAL_DURABLE"},
+                    }
+                # Row not in a terminal state and no recovery pre-claim present.
+                # Refuse the fresh CAS: stale metadata is not sufficient authority.
+                log.critical(
+                    "[%s] REAL_OCC_FRESH_CLAIM_REFUSED order=%s contract=%r "
+                    "status=%r — REAL_OCC deferred materialization requires a "
+                    "verified recovery pre-claim; failing closed",
+                    ticker,
+                    queue_local_order_id,
+                    _fc_contract,
+                    _fc_status,
+                )
+                return {
+                    "status": "REAL_OCC_FRESH_CLAIM_REFUSED",
+                    "result": {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "REAL_OCC_DEFERRED_CLAIM_NOT_AUTHORISED",
+                        "retry_after_seconds": 30,
+                    },
+                }
+
         _mat_claim = getattr(
             self.order_state_machine,
             "claim_deferred_materialization",
