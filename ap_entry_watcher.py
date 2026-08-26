@@ -5530,8 +5530,9 @@ class APEntryWatcher:
 
         watched._trigger_authority_persisted = True
         log.info(
-            "WATCHER_TRIGGER_AUTHORITY_PERSISTED local_order_id=%s trigger_crossed_at=%s "
-            "trigger_confirmed_at=%s",
+            "WATCHER_TRIGGER_TIMESTAMPS_PERSISTED "
+            "WATCHER_TRIGGER_AUTHORITY_PERSISTED local_order_id=%s "
+            "trigger_crossed_at=%s trigger_confirmed_at=%s",
             local_order_id,
             patch["trigger_crossed_at"],
             patch["trigger_confirmed_at"],
