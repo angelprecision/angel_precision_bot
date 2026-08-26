@@ -350,6 +350,7 @@ class _StatefulOSM:
         self.row["status"] = terminal_status
         self.row["last_error"] = reason_code
         self.terminalizations.append((reason_code, terminal_status))
+        self._merge_meta(diagnostics or {})
         self._merge_meta({
             "lifecycle_state": terminal_status,
             "reason_code": reason_code,
@@ -746,6 +747,7 @@ class _ConcurrentOSM:
         assert local_order_id == LOCAL_ORDER_ID
         self.terminalizations.append((reason_code, terminal_status))
         self.store.transition(terminal_status, last_error=reason_code)
+        self.store.update_order_meta(diagnostics or {})
         self.store.update_order_meta({
             "lifecycle_state": terminal_status,
             "reason_code": reason_code,
