@@ -99,6 +99,15 @@ class _MockOSM:
         })
         return True
 
+    def rewrite_exit_submit_intent_payload(self, local_order_id, **kwargs):
+        if not self.exit_row or self.exit_row["local_order_id"] != local_order_id:
+            return False
+        if self.exit_row["meta"].get("broker_submit_payload_hash") != kwargs["prior_payload_hash"]:
+            return False
+        self.exit_row["meta"]["broker_submit_payload_hash"] = kwargs["replacement_payload_hash"]
+        self.exit_row["meta"]["protective_takeover_replacement_qty"] = kwargs["replacement_qty"]
+        return True
+
     def transition(self, local_order_id, new_status, **kwargs):
         self.transitions.append((local_order_id, new_status, kwargs))
         if self.exit_row and self.exit_row["local_order_id"] == local_order_id:
@@ -153,6 +162,7 @@ def mock_broker():
     broker.base_url = "https://api.tradier.com"
     broker.account_id = "ACC123"
     broker.session = MagicMock()
+    broker.list_orders.return_value = []
     return broker
 
 
@@ -256,6 +266,9 @@ def test_exit_guard_allows_open_position(monkeypatch, mock_broker):
         200,
         json_body={"order": {"id": "BO-1", "status": "open"}},
     )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+    ]
     osm = _MockOSM()
 
     result = osm.submit_exit(
@@ -271,6 +284,179 @@ def test_exit_guard_allows_open_position(monkeypatch, mock_broker):
 
     assert result["ok"] is True
     assert mock_broker.session.post.call_count == 1
+
+
+def test_now_incident_cancels_exact_protective_stop_before_replacement(monkeypatch, mock_broker):
+    """Fail-first replay of LIVE NOW stop 143387714 reserving the only contract."""
+    contract = "NOW260828P00122000"
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": contract, "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+    ]
+    mock_broker.list_orders.return_value = [
+        {
+            "id": "143387714",
+            "status": "open",
+            "class": "option",
+            "type": "stop",
+            "side": "sell_to_close",
+            "option_symbol": contract,
+            "quantity": 1,
+            "exec_quantity": 0,
+            "duration": "gtc",
+            "account_id": "ACC123",
+        }
+    ]
+    mock_broker.cancel_order.return_value = {
+        "ok": True,
+        "status": "canceled",
+        "broker_order_id": "143387714",
+    }
+    mock_broker.get_order.return_value = {
+        "id": "143387714",
+        "status": "canceled",
+        "option_symbol": contract,
+        "side": "sell_to_close",
+        "quantity": 1,
+        "exec_quantity": 0,
+    }
+    mock_broker.session.post.return_value = _resp(
+        200, json_body={"order": {"id": "CANONICAL-EXIT-1", "status": "open"}}
+    )
+
+    result = _MockOSM().submit_exit(
+        broker=mock_broker,
+        position_id="position-now-live-1",
+        contract=contract,
+        symbol="NOW",
+        direction="PUT",
+        qty=1,
+        limit_price=1.08,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is True
+    mock_broker.cancel_order.assert_called_once_with("143387714")
+    mock_broker.get_order.assert_called_once_with("143387714")
+    assert mock_broker.session.post.call_count == 1
+    assert mock_broker.session.post.call_args.kwargs["data"]["quantity"] == 1
+
+
+def test_partial_protective_fill_rewrites_durable_payload_and_posts_residual(monkeypatch, mock_broker):
+    contract = "NOW260828P00122000"
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row(quantity_remaining=2) if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    mock_broker.list_positions.side_effect = [
+        [{"symbol": contract, "quantity": 2, "account_id": "ACC123"}],
+        [{"symbol": contract, "quantity": 2, "account_id": "ACC123"}],
+        [{"symbol": contract, "quantity": 1, "account_id": "ACC123"}],
+    ]
+    mock_broker.list_orders.return_value = [{
+        "id": "143387714", "status": "open", "type": "stop",
+        "side": "sell_to_close", "option_symbol": contract,
+        "quantity": 2, "exec_quantity": 0, "account_id": "ACC123",
+    }]
+    mock_broker.cancel_order.return_value = {"ok": True, "status": "canceled"}
+    mock_broker.get_order.return_value = {
+        "id": "143387714", "status": "filled", "quantity": 2, "exec_quantity": 1,
+    }
+    mock_broker.session.post.return_value = _resp(
+        200, json_body={"order": {"id": "CANONICAL-RESIDUAL-1", "status": "open"}}
+    )
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker, position_id="position-now-live-2", contract=contract,
+        symbol="NOW", direction="PUT", qty=2, limit_price=1.08,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is True
+    assert mock_broker.cancel_order.call_count == 1
+    assert mock_broker.session.post.call_count == 1
+    assert mock_broker.session.post.call_args.kwargs["data"]["quantity"] == 1
+    assert osm.exit_row["qty"] == 2
+    assert osm.exit_row["meta"]["protective_takeover_replacement_qty"] == 1
+
+
+def test_repeated_exit_tick_keeps_one_takeover_owner_and_one_post(monkeypatch, mock_broker):
+    contract = "NOW260828P00122000"
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": contract, "quantity": 1, "account_id": "ACC123"}
+    ]
+    mock_broker.list_orders.return_value = [{
+        "id": "143387714", "status": "open", "type": "stop",
+        "side": "sell_to_close", "option_symbol": contract,
+        "quantity": 1, "exec_quantity": 0, "account_id": "ACC123",
+    }]
+    mock_broker.cancel_order.return_value = {"ok": True, "status": "canceled"}
+    mock_broker.get_order.return_value = {"id": "143387714", "status": "canceled"}
+    mock_broker.session.post.return_value = _resp(
+        200, json_body={"order": {"id": "CANONICAL-EXIT-ONCE", "status": "open"}}
+    )
+    osm = _MockOSM()
+    kwargs = dict(
+        broker=mock_broker, position_id="position-now-live-repeat", contract=contract,
+        symbol="NOW", direction="PUT", qty=1, limit_price=1.08,
+        execution_mode="live",
+    )
+
+    first = osm.submit_exit(**kwargs)
+    second = osm.submit_exit(**kwargs)
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert mock_broker.cancel_order.call_count == 1
+    assert mock_broker.session.post.call_count == 1
+
+
+def test_restart_during_takeover_cannot_reclaim_submit_intent_or_mutate_broker(monkeypatch, mock_broker):
+    contract = "NOW260828P00122000"
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+
+    class _RestartedOSM(_MockOSM):
+        def persist_exit_submit_intent(self, local_order_id, **kwargs):
+            return False
+
+    osm = _RestartedOSM()
+    osm.exit_row = {
+        "local_order_id": "L-EXIT-RESTART",
+        "client_id": osm.client_id,
+        "position_id": "position-now-live-restart",
+        "kind": "EXIT",
+        "status": "EXIT_REQUESTED",
+        "execution_mode": "live",
+        "contract": contract,
+        "qty": 1,
+        "broker_order_id": "",
+        "submitted_ts": None,
+        "meta": {
+            "submit_intent_at": "2026-08-26T14:00:00+00:00",
+            "current_owner": "broker_submit:L-EXIT-RESTART",
+        },
+    }
+    result = osm.submit_exit(
+        broker=mock_broker, position_id="position-now-live-restart", contract=contract,
+        symbol="NOW", direction="PUT", qty=1, limit_price=1.08,
+        execution_mode="live", local_order_id="L-EXIT-RESTART",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "EXIT_SUBMIT_INTENT_FENCE_LOST"
+    assert mock_broker.cancel_order.call_count == 0
+    assert mock_broker.session.post.call_count == 0
 
 
 def test_exit_retry_guard_blocks_closed_position(monkeypatch, mock_broker):
@@ -361,6 +547,9 @@ def test_exit_circuit_breaker_does_not_trip_below_threshold(monkeypatch, mock_br
         200,
         json_body={"order": {"id": "BO-2", "status": "open"}},
     )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+    ]
     osm = _MockOSM()
 
     result = osm.submit_exit(

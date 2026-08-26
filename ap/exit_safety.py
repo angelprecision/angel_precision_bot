@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.db import conn, run_with_retry
 from ap.notify import post_discord
 from ap.utils import now_utc_iso
@@ -233,6 +234,206 @@ def resolve_exit_broker_truth(
         "is_fresh_exact": True,
         "audit": audit,
     }
+
+
+_ACTIVE_BROKER_SELL_STATUSES = {
+    "accepted", "ack", "new", "open", "pending", "pending_cancel",
+    "partially_filled", "partial_fill", "submitted", "working",
+}
+_TERMINAL_BROKER_ORDER_STATUSES = {
+    "canceled", "cancelled", "expired", "filled", "rejected",
+}
+_PROTECTIVE_ORDER_TYPES = {"stop", "stop_limit", "stop-limit", "stoplimit"}
+
+
+def _exact_order_contract(raw: dict[str, Any]) -> str:
+    for key in ("option_symbol", "contract"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            return str(value).strip().upper()
+    return ""
+
+
+def _strict_positive_order_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not parsed.is_integer() or parsed <= 0:
+        return None
+    return int(parsed)
+
+
+def resolve_protective_exit_takeover(
+    *,
+    broker: Any,
+    client_id: str,
+    execution_mode: str,
+    position_id: str,
+    local_order_id: str,
+    contract: str,
+    requested_qty: int,
+) -> dict[str, Any]:
+    """Prove broker sell ownership immediately before a LIVE EXIT POST.
+
+    The account is supplied by the broker adapter itself; this routine never
+    accepts a caller-provided account and never matches by underlying ticker.
+    """
+    mode = str(execution_mode or "").strip().lower()
+    exact_contract = str(contract or "").strip().upper()
+    audit: dict[str, Any] = {
+        "event": "EXIT_PROTECTIVE_PREFLIGHT_START",
+        "checked_at": now_utc_iso(),
+        "client_id": str(client_id or ""),
+        "execution_mode": mode,
+        "position_id": str(position_id or ""),
+        "local_order_id": str(local_order_id or ""),
+        "contract": str(contract or ""),
+        "requested_qty": requested_qty,
+        "account": _extract_broker_account_id(broker),
+    }
+    if mode != "live" or not exact_contract or not isinstance(requested_qty, int) \
+            or isinstance(requested_qty, bool) or requested_qty <= 0:
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="identity_unproven")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+
+    initial_position = resolve_exit_broker_truth(
+        broker=broker, client_id=client_id, contract=contract,
+    )
+    initial_qty = initial_position.get("broker_truth_open_qty")
+    audit["initial_position"] = initial_position.get("audit") or {}
+    if initial_position.get("is_fresh_exact") is not True or not isinstance(initial_qty, int):
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="broker_position_unproven")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
+    audit["broker_long_qty"] = initial_qty
+    if initial_qty <= 0:
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="broker_already_flat")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_BROKER_FLAT", "audit": audit}
+
+    list_orders = getattr(broker, "list_orders", None)
+    if not callable(list_orders):
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_unavailable")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
+    try:
+        orders = list_orders()
+    except Exception as exc:
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_error", error=str(exc))
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
+    if not isinstance(orders, list) or any(not isinstance(row, dict) for row in orders):
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_malformed")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
+
+    account = audit["account"]
+    active_sells: list[dict[str, Any]] = []
+    for row in orders:
+        if _exact_order_contract(row) != exact_contract:
+            continue
+        row_account = _normalize_text(row.get("account_id") or row.get("account"))
+        if row_account and account and row_account != account:
+            continue
+        side = _normalize_text(row.get("side"))
+        if side != "sell_to_close":
+            continue
+        status = _normalize_text(row.get("status") or row.get("state"))
+        if status in _TERMINAL_BROKER_ORDER_STATUSES:
+            continue
+        if status not in _ACTIVE_BROKER_SELL_STATUSES:
+            audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason="unknown_status", protective_status=status or "missing")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+        qty = _strict_positive_order_int(row.get("quantity", row.get("qty")))
+        executed = _safe_int(row.get("exec_quantity")) or 0
+        remaining = _strict_positive_order_int(row.get("remaining_quantity"))
+        if remaining is None and qty is not None:
+            remaining = qty - max(executed, 0)
+        if qty is None or remaining is None or remaining <= 0:
+            audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason="quantity_unproven")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+        active_sells.append({"raw": row, "status": status, "qty": qty, "remaining": remaining})
+
+    if not active_sells:
+        # Re-read after the order snapshot so a protective fill that became
+        # terminal immediately before/during classification wins the race.
+        final_position = resolve_exit_broker_truth(
+            broker=broker, client_id=client_id, contract=contract,
+        )
+        final_qty = final_position.get("broker_truth_open_qty")
+        audit["final_position"] = final_position.get("audit") or {}
+        if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_position_unproven")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
+        replacement_qty = min(requested_qty, max(final_qty, 0))
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_ALLOWED", replacement_qty=replacement_qty)
+        return {
+            "allowed": replacement_qty > 0,
+            "replacement_qty": replacement_qty,
+            "reason": "EXIT_PROTECTIVE_NO_CONFLICT" if replacement_qty > 0 else "EXIT_PROTECTIVE_BROKER_FLAT",
+            "audit": audit,
+        }
+    if len(active_sells) != 1:
+        audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason="multiple_active_sells", active_sell_count=len(active_sells))
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+
+    candidate = active_sells[0]
+    raw = candidate["raw"]
+    order_type = _normalize_text(raw.get("type") or raw.get("order_type")).replace(" ", "_")
+    broker_order_id = str(raw.get("id") or raw.get("order_id") or "").strip()
+    tag = str(raw.get("tag") or "").strip()
+    canonical_tag = canonical_broker_submit_key(local_order_id)
+    if tag and tag in {str(local_order_id or "").strip(), canonical_tag}:
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="canonical_exit_already_active", existing_broker_order_id=broker_order_id)
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_CANONICAL_BROKER_SELL_ACTIVE", "audit": audit}
+    if order_type not in _PROTECTIVE_ORDER_TYPES or not broker_order_id:
+        audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason="non_protective_or_missing_id", protective_status=candidate["status"])
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+
+    audit.update(
+        event="EXIT_PROTECTIVE_ORDER_FOUND",
+        protective_broker_order_id=broker_order_id,
+        protective_qty=candidate["qty"],
+        protective_status=candidate["status"],
+    )
+    cancel = getattr(broker, "cancel_order", None)
+    get_order = getattr(broker, "get_order", None)
+    if not callable(cancel) or not callable(get_order):
+        audit.update(event="EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", reason="cancel_interface_unavailable")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", "audit": audit}
+    audit["event"] = "EXIT_PROTECTIVE_CANCEL_REQUESTED"
+    try:
+        cancel_result = cancel(broker_order_id)
+        audit["cancel_result"] = cancel_result if isinstance(cancel_result, dict) else {"malformed": True}
+    except Exception as exc:
+        audit["cancel_error"] = str(exc)
+    try:
+        terminal = get_order(broker_order_id)
+    except Exception as exc:
+        audit.update(event="EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", get_order_error=str(exc))
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", "audit": audit}
+    if not isinstance(terminal, dict):
+        audit.update(event="EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", reason="get_order_malformed")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", "audit": audit}
+    terminal_status = _normalize_text(terminal.get("status") or terminal.get("state"))
+    audit["protective_terminal_status"] = terminal_status or "missing"
+    if terminal_status not in _TERMINAL_BROKER_ORDER_STATUSES:
+        audit.update(event="EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", reason="order_not_terminal")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", "audit": audit}
+
+    final_position = resolve_exit_broker_truth(
+        broker=broker, client_id=client_id, contract=contract,
+    )
+    final_qty = final_position.get("broker_truth_open_qty")
+    audit["final_position"] = final_position.get("audit") or {}
+    if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_position_unproven")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
+    replacement_qty = min(requested_qty, max(final_qty, 0))
+    event = "EXIT_PROTECTIVE_FILLED_DURING_TAKEOVER" if terminal_status == "filled" or final_qty < initial_qty else "EXIT_PROTECTIVE_CANCEL_CONFIRMED"
+    audit.update(event=event, broker_long_qty=final_qty, replacement_qty=replacement_qty)
+    if replacement_qty <= 0:
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_BROKER_FLAT", "audit": audit}
+    audit["event"] = "EXIT_PROTECTIVE_REPLACEMENT_ALLOWED"
+    return {"allowed": True, "replacement_qty": replacement_qty, "reason": "EXIT_PROTECTIVE_REPLACEMENT_ALLOWED", "audit": audit}
 
 
 def _table_columns(table_name: str) -> set[str]:

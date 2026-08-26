@@ -380,15 +380,17 @@ class TestScopeEnforcement:
         assert "SYNTHETIC_POSITION_STALE_BROKER_FLAT" in exit_safety_src
 
     def test_07b_exit_safety_does_not_cancel_broker_positions(self):
-        """The circuit breaker fix must not issue any broker cancel/close calls."""
+        """Only the exact #522 protective takeover helper may request a cancel."""
         src = open("ap/exit_safety.py").read()
-        forbidden = ["broker.cancel", "broker.post", "place_order",
-                     "submit_order", "cancel_order"]
+        forbidden = ["broker.cancel", "broker.post", "place_order", "submit_order"]
         for term in forbidden:
             assert term not in src, (
                 f"exit_safety.py must not contain {term!r} — "
                 "it is a pure safety gate, not a position manager"
             )
+        assert src.count('getattr(broker, "cancel_order", None)') == 1
+        takeover = src[src.index("def resolve_protective_exit_takeover("):]
+        assert 'getattr(broker, "cancel_order", None)' in takeover
 
 
 # ─────────────────────────────────────────────────────────────────────────────

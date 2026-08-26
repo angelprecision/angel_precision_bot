@@ -58,6 +58,7 @@ from ap.db import conn, run_with_retry
 from ap.exit_safety import (
     alert_exit_submission_halted,
     evaluate_exit_submission_safety,
+    resolve_protective_exit_takeover,
     resolve_exit_broker_truth,
 )
 try:
@@ -2286,7 +2287,7 @@ class APOrderStateMachine:
             or qty <= 0
         ):
             return False
-        patch = __import__("json").dumps({
+        patch = json.dumps({
             "lifecycle_state": "SUBMITTING",
             "submit_intent_at": now_utc_iso(),
             "broker_submit_key": submit_key,
@@ -2309,14 +2310,8 @@ class APOrderStateMachine:
                     "AND COALESCE((meta->>'split_brain_quarantine')::boolean, false)=false "
                     "AND COALESCE((meta->>'reconciliation_required')::boolean, false)=false",
                     (
-                        patch,
-                        local_order_id,
-                        self.client_id,
-                        str(position_id),
-                        OrderStatus.EXIT_REQUESTED,
-                        mode,
-                        str(contract or ""),
-                        qty,
+                        patch, local_order_id, self.client_id, str(position_id),
+                        OrderStatus.EXIT_REQUESTED, mode, str(contract or ""), qty,
                     ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
@@ -2326,9 +2321,73 @@ class APOrderStateMachine:
         except Exception as exc:
             log.warning(
                 "[%s] persist_exit_submit_intent failed order=%s: %s",
-                self.client_id,
-                local_order_id,
-                exc,
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def rewrite_exit_submit_intent_payload(
+        self,
+        local_order_id: str,
+        *,
+        position_id: str,
+        execution_mode: str,
+        contract: str,
+        durable_qty: int,
+        broker_submit_key: str,
+        prior_payload_hash: str,
+        replacement_payload_hash: str,
+        replacement_qty: int,
+    ) -> bool:
+        """CAS a takeover residual into the already-owned EXIT submit intent."""
+        mode = str(execution_mode or "").strip().lower()
+        submit_key = canonical_broker_submit_key(broker_submit_key)
+        if (
+            mode not in {"live", "paper"}
+            or not submit_key
+            or not prior_payload_hash
+            or not replacement_payload_hash
+            or not isinstance(durable_qty, int)
+            or isinstance(durable_qty, bool)
+            or not isinstance(replacement_qty, int)
+            or isinstance(replacement_qty, bool)
+            or replacement_qty <= 0
+            or replacement_qty > durable_qty
+        ):
+            return False
+        patch = json.dumps({
+            "broker_submit_payload_hash": replacement_payload_hash,
+            "protective_takeover_replacement_qty": replacement_qty,
+            "protective_takeover_payload_rewritten_at": now_utc_iso(),
+        })
+
+        def _rewrite():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders SET meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, updated_ts=NOW() "
+                    "WHERE local_order_id=%s AND client_id=%s AND position_id=%s "
+                    "AND kind='EXIT' AND status=%s AND LOWER(COALESCE(execution_mode,''))=%s "
+                    "AND COALESCE(contract,'')=%s AND COALESCE(qty,0)=%s "
+                    "AND COALESCE(broker_order_id,'')='' AND submitted_ts IS NULL "
+                    "AND COALESCE(meta->>'broker_submit_key','')=%s "
+                    "AND COALESCE(meta->>'broker_submit_payload_hash','')=%s "
+                    "AND COALESCE(meta->>'current_owner','')=%s "
+                    "AND COALESCE((meta->>'split_brain_quarantine')::boolean, false)=false "
+                    "AND COALESCE((meta->>'reconciliation_required')::boolean, false)=false",
+                    (
+                        patch, local_order_id, self.client_id, str(position_id),
+                        OrderStatus.EXIT_REQUESTED, mode, str(contract or ""),
+                        durable_qty, submit_key, prior_payload_hash,
+                        f"broker_submit:{submit_key}",
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_rewrite) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] rewrite_exit_submit_intent_payload failed order=%s: %s",
+                self.client_id, local_order_id, exc,
             )
             return False
 
@@ -6542,6 +6601,87 @@ class APOrderStateMachine:
                 "error": "EXIT_SUBMIT_INTENT_DURABLE_PROOF_FAILED",
                 "reconciliation_required": True,
             }
+
+        # P0 protective-order takeover: the durable EXIT submit intent above is
+        # the single owner fence.  Only that owner may inspect/cancel an exact
+        # LIVE protective sell before the irreversible replacement POST.
+        if str(execution_mode or "").strip().lower() == "live":
+            _takeover = resolve_protective_exit_takeover(
+                broker=broker,
+                client_id=self.client_id,
+                execution_mode=str(execution_mode or ""),
+                position_id=str(position_id),
+                local_order_id=str(local_id),
+                contract=str(contract or ""),
+                requested_qty=requested_qty,
+            )
+            _takeover_audit = dict(_takeover.get("audit") or {})
+            _upd_takeover = getattr(self, "update_order_meta", None)
+            if callable(_upd_takeover):
+                try:
+                    _upd_takeover(local_id, {"protective_exit_takeover": _takeover_audit})
+                except Exception as _takeover_meta_exc:
+                    log.debug("submit_exit takeover audit write failed: %s", _takeover_meta_exc)
+            if not _takeover.get("allowed"):
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.EXIT_REQUESTED,
+                    "error": str(_takeover.get("reason") or "EXIT_PROTECTIVE_REPLACEMENT_BLOCKED"),
+                    "reconciliation_required": True,
+                    "protective_takeover": _takeover_audit,
+                }
+            _replacement_qty = _takeover.get("replacement_qty")
+            if not isinstance(_replacement_qty, int) or isinstance(_replacement_qty, bool) \
+                    or _replacement_qty <= 0 or _replacement_qty > requested_qty:
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.EXIT_REQUESTED,
+                    "error": "EXIT_PROTECTIVE_REPLACEMENT_QTY_UNPROVEN",
+                    "reconciliation_required": True,
+                }
+            if _replacement_qty != requested_qty:
+                _replacement_data = dict(_order_data)
+                _replacement_data["quantity"] = _replacement_qty
+                _replacement_hash = hashlib.sha256(
+                    json.dumps(_replacement_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                _rewrite = getattr(self, "rewrite_exit_submit_intent_payload", None)
+                if not callable(_rewrite) or not _rewrite(
+                    local_id,
+                    position_id=str(position_id),
+                    execution_mode=str(execution_mode or ""),
+                    contract=str(contract or ""),
+                    durable_qty=requested_qty,
+                    broker_submit_key=_order_data["tag"],
+                    prior_payload_hash=_exit_payload_hash,
+                    replacement_payload_hash=_replacement_hash,
+                    replacement_qty=_replacement_qty,
+                ):
+                    return {
+                        "ok": False,
+                        "local_order_id": local_id,
+                        "broker_order_id": None,
+                        "status": OrderStatus.EXIT_REQUESTED,
+                        "error": "EXIT_PROTECTIVE_RESIDUAL_DURABLE_REWRITE_FAILED",
+                        "reconciliation_required": True,
+                        "replacement_qty": _replacement_qty,
+                    }
+                _order_data = _replacement_data
+                _exit_payload_hash = _replacement_hash
+                _intent_proven, _intent_row = _exit_submit_intent_proven()
+                if not _intent_proven:
+                    return {
+                        "ok": False,
+                        "local_order_id": local_id,
+                        "broker_order_id": _intent_row.get("broker_order_id"),
+                        "status": _intent_row.get("status") or OrderStatus.ERROR,
+                        "error": "EXIT_PROTECTIVE_RESIDUAL_DURABLE_PROOF_FAILED",
+                        "reconciliation_required": True,
+                    }
 
         # ── Retry-safe broker submission ──────────────────────────────────────
         # Failure classes:

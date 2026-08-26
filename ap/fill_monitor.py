@@ -1671,6 +1671,51 @@ def _place_standing_stop_best_effort(
     entry_price: float,
 ):
     """Optional secondary broker-side stop, after local position persistence."""
+    def _persist_identity(stop_id, stop_status, source):
+        concrete_id = str(stop_id or "").strip()
+        if concrete_id in {"", "?", "N/A", "UNKNOWN", "0"}:
+            concrete_id = ""
+        normalized_status = str(stop_status or "").strip().lower()
+        if concrete_id and normalized_status in {
+            "ok", "accepted", "ack", "new", "open", "pending", "submitted", "working",
+        }:
+            ownership_state = "ACTIVE" if normalized_status in {"new", "open", "pending", "working"} else "SUBMITTED"
+        else:
+            ownership_state = "OUTCOME_UNPROVEN"
+        payload = {
+            "protective_order_state": ownership_state,
+            "protective_broker_order_id": concrete_id or None,
+            "protective_contract": str(order.get("contract") or ""),
+            "protective_qty": int(qty),
+            "protective_created_at": now_utc_iso(),
+            "protective_status": normalized_status or "unknown",
+            "protective_source": "standing_stop",
+            "protective_transport": source,
+            "execution_mode": str(order.get("execution_mode") or "").strip().lower(),
+            "client_id": str(order.get("client_id") or ""),
+        }
+        try:
+            def _write():
+                with conn() as c:
+                    cur = c.execute(
+                        "UPDATE orders SET meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, updated_ts=NOW() "
+                        "WHERE local_order_id=%s AND client_id=%s AND kind='ENTRY' "
+                        "AND COALESCE(contract,'')=%s "
+                        "AND LOWER(COALESCE(execution_mode,''))=%s",
+                        (
+                            json_dumps({"protective_order": payload}),
+                            str(order.get("local_order_id") or ""),
+                            str(order.get("client_id") or ""),
+                            str(order.get("contract") or ""),
+                            str(order.get("execution_mode") or "").strip().lower(),
+                        ),
+                    )
+                    return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+            if run_with_retry(_write) <= 0:
+                log.warning("[%s] Standing stop identity persistence missed exact ENTRY row", order.get("symbol", "?"))
+        except Exception as exc:
+            log.warning("[%s] Standing stop identity persistence failed: %s", order.get("symbol", "?"), exc)
+
     try:
         if qty <= 0 or entry_price <= 0:
             return
@@ -1687,6 +1732,7 @@ def _place_standing_stop_best_effort(
             if isinstance(stop_resp, dict):
                 stop_id = stop_resp.get("id") or stop_resp.get("order_id") or stop_resp.get("broker_order_id")
                 stop_stat = str(stop_resp.get("status") or stop_resp.get("state") or "unknown")
+            _persist_identity(stop_id, stop_stat, "broker_helper")
             log.info("[%s] Standing stop placed via broker helper @ $%.2f | broker_stop=%s status=%s", ticker, stop_px, stop_id or "?", stop_stat)
             audit(
                 order["client_id"],
@@ -1739,6 +1785,7 @@ def _place_standing_stop_best_effort(
             stop_data = (resp.json() or {}).get("order", {}) or {}
             stop_id = stop_data.get("id", "?")
             stop_stat = stop_data.get("status", "unknown")
+            _persist_identity(stop_id, stop_stat, "rest")
             log.info(
                 "[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",
                 ticker,
@@ -1764,6 +1811,7 @@ def _place_standing_stop_best_effort(
         else:
             err_body = getattr(resp, "text", "")[:200]
             log.warning("[%s] Standing stop FAILED — exit engine sole protection | %s", ticker, err_body)
+            _persist_identity(None, "rejected", "rest")
             audit(
                 order["client_id"],
                 "WARNING",
@@ -1778,6 +1826,7 @@ def _place_standing_stop_best_effort(
 
     except Exception as exc:
         log.warning("[%s] Standing stop placement error: %s", order.get("symbol", "?"), exc)
+        _persist_identity(None, "error", "exception")
 
 
 def _load_managed_position_class():
