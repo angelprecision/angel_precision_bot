@@ -700,9 +700,32 @@ class TestBlocker3CanonicalRetryFields:
         assert all_meta.get(_MAT_NEXT_RETRY_AT) is not None
         # _MAT_RETRY_DEADLINE was removed — real stamp_retry_pending has no deadline field
         assert isinstance(all_meta.get(_MAT_ATTEMPTS_FIELD), int)
+        assert all_meta.get("retry_attempt") == all_meta.get(_MAT_ATTEMPTS_FIELD)
+        assert all_meta.get("breach_attempt_count") == all_meta.get(_MAT_ATTEMPTS_FIELD)
         assert all_meta.get(_MAT_REASON_FIELD)                        # reason written
         assert all_meta.get(_MAT_LAST_FAILURE_FIELD)                   # last_failure_at written
         assert all_meta.get(_MAT_BROKER_READY) is False               # broker_ready=False
+
+    def test_enter_canonical_retry_quarantines_counter_conflict(self):
+        """Restart recovery must not choose one value from a split 2/1/1 row."""
+        r = _row(meta={
+            "trigger_price": 450.0,
+            "retry_attempt": 2,
+            "breach_attempt_count": 1,
+            _MAT_ATTEMPTS_FIELD: 1,
+        })
+        r["contract"] = "DEFERRED:SPY"
+        rec, osm = _make_recovery(r)
+
+        outcome = rec._enter_canonical_retry(
+            r["local_order_id"], r, reason="counter_conflict"
+        )
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert osm.meta_writes == []
+        assert rec._row_failure_reasons[r["local_order_id"]] == (
+            "SELECTOR_RECOVERY_CURSOR_INVALID:MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1175,7 +1198,7 @@ class TestAmendment10Required:
     # 1. Real stamp_retry_pending fields written, no invented ones ─────────────
 
     def test_enter_canonical_retry_only_writes_real_stamp_fields(self):
-        """_enter_canonical_retry must write exactly the fields stamp_retry_pending writes.
+        """Write the real #323 fields plus coherent attempt-authority mirrors.
         Must NOT write: materialization_owner, materialization_retry_deadline,
         materialization_attempt_count, materialization_retry_reason."""
         r = _row(meta={"trigger_price": 450.0})

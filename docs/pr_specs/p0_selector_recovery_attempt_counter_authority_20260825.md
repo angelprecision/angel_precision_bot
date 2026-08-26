@@ -1,8 +1,8 @@
 # P0 SPEC — Repair deferred selector recovery attempt-counter authority conflicts
 
-**Status:** SPEC ONLY / HARD HOLD / CODEX IMPLEMENTATION REQUIRED
+**Status:** SURGICAL AMENDMENT APPLIED / EXACT-HEAD CI PENDING / HARD HOLD
 
-**Base main SHA:** `be8e4d484ac1c69dc6e88e2885c9779420e97f5c`
+**Base main SHA:** `de87e3b0460e8908bc271590d425cc1fcfb9ae3d`
 
 **Production date:** 2026-08-25
 
@@ -1002,6 +1002,6 @@ Before approving implementation, answer every item explicitly:
 
 **HARD HOLD.**
 
-This branch contains the implementation contract only. Codex must implement the authority repair, tests, and production replay on this branch. After that, perform a full production audit of the actual diff before merge.
+This branch contains the surgical authority amendment and focused regression coverage. Exact-head CI and final behavioral diff review remain required before any merge decision; no merge or deployment authorization is implied.
 
 The objective is not to make the error disappear. The objective is to make it structurally impossible for normal runtime to create contradictory selector-attempt truth while preserving fail-closed behavior for genuinely unprovable state.

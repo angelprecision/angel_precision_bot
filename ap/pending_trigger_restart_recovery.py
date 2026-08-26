@@ -58,8 +58,10 @@ class _RowOutcome:
 
 _TERMINAL_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED", "ERROR"})
 
-# #323 canonical materialization retry fields — exact shape from ap/deferred_materializer.stamp_retry_pending()
-# DO NOT invent fields not present in that function.
+# #323 canonical materialization retry fields — the consumer-facing shape from
+# ap/deferred_materializer.stamp_retry_pending().  The three selector-attempt
+# mirrors below are additionally required because they describe one durable
+# authority and must advance with this writer.
 _MAT_STATUS_FIELD        = "materialization_status"      # "RETRY_PENDING"
 _MAT_NEXT_RETRY_AT       = "materialization_next_retry_at"
 _MAT_ATTEMPTS_FIELD      = "materialization_attempts"    # int — canonical attempt counter
@@ -767,8 +769,9 @@ class PendingTriggerRestartRecovery:
 
     def _enter_canonical_retry(self, local_oid: str, row: dict, *, reason: str) -> str:
         """
-        Fix 1: write the exact fields that ap/deferred_materializer.stamp_retry_pending()
-        writes so the deployed #323 consumer can see and process the row.
+        Fix 1: write the #323 consumer fields that
+        ap/deferred_materializer.stamp_retry_pending() reads, plus the three
+        selector-attempt mirrors that must remain transactionally coherent.
 
         Real canonical schema (from stamp_retry_pending):
           materialization_status          = "RETRY_PENDING"
@@ -780,7 +783,8 @@ class PendingTriggerRestartRecovery:
 
         Removed: materialization_owner, materialization_retry_deadline,
                  materialization_attempt_count, materialization_retry_reason
-                 (none of these exist in stamp_retry_pending).
+                 (none of these exist in stamp_retry_pending); the selector
+                 mirrors are retained for durable attempt-authority proof.
         """
         _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
         try:
@@ -795,7 +799,67 @@ class PendingTriggerRestartRecovery:
         _now   = datetime.now(timezone.utc)
 
         _meta     = _extract_meta(row)
-        _attempts = int(_meta.get(_MAT_ATTEMPTS_FIELD) or 0) + 1
+        # The restart path is a live writer, so it must not advance the
+        # materialization-only counter while leaving the selector-attempt
+        # mirrors behind.  Validate every durable mirror first; a conflict is
+        # unresolved state, not evidence from which recovery may guess.
+        try:
+            from ap_execution_core import _resolve_selector_attempt_number
+
+            _durable_attempt, _counter_conflict = _resolve_selector_attempt_number(
+                retry_attempt=_meta.get("retry_attempt"),
+                breach_attempt_count=_meta.get("breach_attempt_count"),
+                materialization_attempts=_meta.get(_MAT_ATTEMPTS_FIELD),
+                recovery_pre_claimed_attempt=None,
+            )
+        except Exception as _counter_exc:
+            _durable_attempt = None
+            _counter_conflict = (
+                "MATERIALIZATION_ATTEMPT_COUNTER_CHECK_FAILED:"
+                f"{type(_counter_exc).__name__}"
+            )
+        if _counter_conflict:
+            self._mark_failure(
+                local_oid,
+                f"SELECTOR_RECOVERY_CURSOR_INVALID:{_counter_conflict}",
+            )
+            log.critical(
+                "RESTART_RECOVERY_ATTEMPT_COUNTER_CONFLICT local=%s "
+                "retry_attempt=%r breach_attempt_count=%r "
+                "materialization_attempts=%r reason=%s — UNRESOLVED",
+                local_oid,
+                _meta.get("retry_attempt"),
+                _meta.get("breach_attempt_count"),
+                _meta.get(_MAT_ATTEMPTS_FIELD),
+                _counter_conflict,
+            )
+            return _RowOutcome.UNRESOLVED
+
+        _counter_values = (
+            _meta.get("retry_attempt"),
+            _meta.get("breach_attempt_count"),
+            _meta.get(_MAT_ATTEMPTS_FIELD),
+        )
+        _has_durable_counter = any(
+            value is not None
+            and not (isinstance(value, str) and not value.strip())
+            for value in _counter_values
+        )
+        _all_counters_zero = _has_durable_counter and all(
+            value is None
+            or (isinstance(value, str) and not value.strip())
+            or value == 0
+            or (isinstance(value, str) and value.strip() == "0")
+            for value in _counter_values
+        )
+        # Preserve the legacy initial transition (no counter/explicit zero ->
+        # attempt 1), while using the validated durable identity when a real
+        # prior attempt exists.
+        _attempts = (
+            1
+            if not _has_durable_counter or _all_counters_zero
+            else int(_durable_attempt) + 1
+        )
         if _attempts > _max:
             log.warning(
                 "RESTART_RECOVERY_CANONICAL_RETRY_EXHAUSTED local=%s attempts=%d max=%d — terminalizing",
@@ -812,6 +876,8 @@ class PendingTriggerRestartRecovery:
             _MAT_STATUS_FIELD:       "RETRY_PENDING",
             _MAT_BROKER_READY:       False,
             _MAT_ATTEMPTS_FIELD:     _attempts,
+            "retry_attempt":         _attempts,
+            "breach_attempt_count":  _attempts,
             _MAT_NEXT_RETRY_AT:      _next,
             _MAT_REASON_FIELD:       reason,
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
@@ -1002,6 +1068,32 @@ class PendingTriggerRestartRecovery:
             return None
 
         meta = _extract_meta(reread)
+        try:
+            from ap_execution_core import _resolve_selector_attempt_number
+
+            _, _counter_conflict = _resolve_selector_attempt_number(
+                retry_attempt=meta.get("retry_attempt"),
+                breach_attempt_count=meta.get("breach_attempt_count"),
+                materialization_attempts=meta.get(_MAT_ATTEMPTS_FIELD),
+                recovery_pre_claimed_attempt=None,
+            )
+        except Exception as _counter_exc:
+            _counter_conflict = (
+                "MATERIALIZATION_ATTEMPT_COUNTER_CHECK_FAILED:"
+                f"{type(_counter_exc).__name__}"
+            )
+        if _counter_conflict:
+            log.critical(
+                "RESTART_RECOVERY_MATERIALIZATION_RETRY_COUNTER_CONFLICT "
+                "local=%s retry_attempt=%r breach_attempt_count=%r "
+                "materialization_attempts=%r reason=%s",
+                local_oid,
+                meta.get("retry_attempt"),
+                meta.get("breach_attempt_count"),
+                meta.get(_MAT_ATTEMPTS_FIELD),
+                _counter_conflict,
+            )
+            return None
         materialization_outcome = str(
             meta.get("materialization_outcome") or ""
         ).strip().upper()

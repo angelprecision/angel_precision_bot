@@ -1897,6 +1897,7 @@ class APStartupRecovery:
                     expected_prior_retry_attempt=_exp_prior,
                     diagnostics={
                         **(extra_diagnostics or {}),
+                        **(outcome.get("diagnostics") or {}),
                         "recovery_classification": "fenced_retry_terminal",
                         "recovery_owner": outcome.get("owner"),
                     },
@@ -2594,6 +2595,29 @@ class APStartupRecovery:
                             self.execution_core, "resume_deferred_materialization_retry", None,
                         )
                     if not callable(_resume_fn):
+                        try:
+                            from ap_execution_core import _resolve_selector_attempt_number
+                            _, _counter_conflict = _resolve_selector_attempt_number(
+                                retry_attempt=meta.get("retry_attempt"),
+                                breach_attempt_count=meta.get("breach_attempt_count"),
+                                materialization_attempts=meta.get("materialization_attempts"),
+                                recovery_pre_claimed_attempt=None,
+                            )
+                        except Exception as _counter_exc:
+                            _counter_conflict = (
+                                f"MATERIALIZATION_ATTEMPT_COUNTER_CHECK_FAILED:{type(_counter_exc).__name__}"
+                            )
+                        if _counter_conflict:
+                            log.critical(
+                                "[%s] RECOVERY_RETRY_COUNTER_CONFLICT local_order_id=%s "
+                                "reason=%s — retaining row; no selector/broker work",
+                                self.client_id, local_order_id, _counter_conflict,
+                            )
+                            _retain_recovery_ownership(
+                                local_order_id,
+                                reason=f"retry_attempt_counter_conflict:{_counter_conflict}",
+                            )
+                            continue
                         log.warning(
                             "[%s] RECOVERY_DUE_RETRY_TAKEOVER_UNAVAILABLE "
                             "local_order_id=%s proof_reason=%s — falling through "

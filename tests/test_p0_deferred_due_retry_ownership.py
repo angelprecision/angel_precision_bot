@@ -1093,6 +1093,7 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
                     tier TEXT,
                     trigger_price NUMERIC,
                     meta JSONB,
+                    last_error TEXT,
                     created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
@@ -1231,6 +1232,87 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
                 (client_id, local_order_id),
             )
             assert int(c.fetchone()["entry_count"]) == 1
+
+        # Production-shaped MCD replay: two independent workers race the same
+        # generation/attempt fence. Exactly one may claim, and a process crash
+        # immediately after the claim must still leave all three durable
+        # attempt mirrors at the same value before any selector/broker work.
+        claim_barrier = threading.Barrier(2)
+        claim_results: list[tuple[str, bool]] = []
+        claim_errors: list[BaseException] = []
+
+        def _claim_worker(worker_owner: str) -> None:
+            try:
+                claim_barrier.wait(timeout=10)
+                worker_osm = APOrderStateMachine(client_id)
+                claimed = worker_osm.claim_deferred_materialization(
+                    local_order_id,
+                    owner=worker_owner,
+                    new_generation=generation + 1,
+                    lease_until=(now + timedelta(minutes=2)).isoformat(),
+                    trigger_crossed_at=(now - timedelta(seconds=10)).isoformat(),
+                    trigger_price=61.0,
+                    observed_underlying_price=61.05,
+                    signal_id=signal_id,
+                    execution_mode="live",
+                    retry_attempt=2,
+                )
+                claim_results.append((worker_owner, bool(claimed)))
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                claim_errors.append(exc)
+
+        workers = [
+            threading.Thread(target=_claim_worker, args=("worker-a",)),
+            threading.Thread(target=_claim_worker, args=("worker-b",)),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=15)
+        assert not claim_errors
+        assert len(claim_results) == 2
+        assert sum(1 for _, claimed in claim_results if claimed) == 1
+
+        claimed_owner = next(owner for owner, claimed in claim_results if claimed)
+        claimed_row = osm.get_order(local_order_id)
+        claimed_meta = claimed_row["meta"]
+        assert claimed_meta["materialization_generation"] == generation + 1
+        assert {
+            claimed_meta["retry_attempt"],
+            claimed_meta["breach_attempt_count"],
+            claimed_meta["materialization_attempts"],
+        } == {2}
+        assert claimed_meta["retry_attempt_in_flight"] == 2
+        assert claimed_meta["broker_ready"] is False
+        assert claimed_row["broker_order_id"] is None
+        assert claimed_row["submitted_ts"] is None
+
+        assert osm.terminalize_materialization_retry(
+            local_order_id,
+            owner=claimed_owner,
+            generation=generation + 1,
+            retry_attempt=2,
+            client_id=client_id,
+            execution_mode="live",
+            terminal_status="ERROR",
+            reason="SELECTOR_RECOVERY_CURSOR_INVALID:MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT",
+            diagnostics={
+                "selector_calls": 0,
+                "direct_quote_calls": 0,
+                "broker_post_count": 0,
+            },
+        ) is True
+        terminal_row = osm.get_order(local_order_id)
+        assert terminal_row["status"] == "ERROR"
+        terminal_meta = terminal_row["meta"]
+        assert {
+            terminal_meta["retry_attempt"],
+            terminal_meta["breach_attempt_count"],
+            terminal_meta["materialization_attempts"],
+        } == {2}
+        assert terminal_meta["broker_ready"] is False
+        assert terminal_row["broker_order_id"] is None
+        assert terminal_row["submitted_ts"] is None
     finally:
         with admin.cursor() as cursor:
             cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -2754,6 +2836,41 @@ def test_blocker4_claim_fences_present_attempt_mirrors_before_advancing():
     # retry_attempt=3 (which requires prior attempt 2).
     assert params[5:8] == (2, 2, 2)
     assert params[-1] == 2
+
+
+def test_blocker4_due_retry_counter_conflict_is_terminal_required_before_claim():
+    """A nonterminal split counter row is classified before selector work.
+
+    The recovery consumer must not turn a claim CAS miss into a retry loop for
+    a row whose durable selector-attempt identity is already contradictory.
+    """
+    core = _core()
+    row = _row(retry_attempt=2)
+    row["meta"].update({
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+    })
+    core.order_state_machine.get_order.return_value = row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=3,
+        owner="owner-counter-conflict",
+    )
+
+    assert result["disposition"] == "TERMINAL_REQUIRED"
+    assert result["reason_code"] == (
+        "SELECTOR_RECOVERY_CURSOR_INVALID:MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+    )
+    assert result["diagnostics"]["materialization_attempt_counters"] == {
+        "retry_attempt": 2,
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+    }
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+    core._on_entry_trigger.assert_not_called()
+    assert not core.broker.method_calls
 
 
 def test_blocker5_expired_deadline_terminalizes_before_claim():
