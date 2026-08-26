@@ -69,6 +69,7 @@ import ap_execution_core as core_mod
 
 _CONTRACT_REAL_OCC             = core_mod._CONTRACT_REAL_OCC
 _CONTRACT_DEFERRED_PLACEHOLDER = core_mod._CONTRACT_DEFERRED_PLACEHOLDER
+_CONTRACT_INVALID               = core_mod._CONTRACT_INVALID
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -592,3 +593,44 @@ def test_nc4_classify_contract_canonical_shapes(
         f"Unexpected classification state {got!r} — "
         "gate logic assumes exactly two states"
     )
+
+
+@pytest.mark.parametrize("symbol", [
+    "SPY   240731C00500000X",
+    "SPY-BAD240731C00500000-X",
+    "SPY 240731 C00500000",
+    "SPY   991332C00500000",
+])
+def test_pr520_rejects_malformed_occ_substrings(symbol: str) -> None:
+    """Classifier and selector validation require a complete valid OCC ID."""
+    assert core_mod.APExecutionCore._classify_contract(symbol, _TICKER) == _CONTRACT_INVALID
+    selection = types.SimpleNamespace(
+        contract_symbol=symbol,
+        execution_price_per_share=2.10,
+        ask=2.10,
+        mid=2.10,
+        affordable_contracts=1,
+    )
+    assert core_mod._validate_deferred_selector_result(selection, _TICKER)[0] is False
+
+
+@pytest.mark.parametrize(
+    ("price", "qty"),
+    [
+        (float("inf"), 1),
+        (float("nan"), 1),
+        (2.10, True),
+        (2.10, 1.5),
+        (2.10, "1"),
+    ],
+)
+def test_pr520_rejects_nonfinite_or_nonintegral_selector_truth(price, qty) -> None:
+    """Broker-critical price and quantity scalars must be strict and finite."""
+    selection = types.SimpleNamespace(
+        contract_symbol=_REAL_OCC_SYM,
+        execution_price_per_share=price,
+        ask=price,
+        mid=price,
+        affordable_contracts=qty,
+    )
+    assert core_mod._validate_deferred_selector_result(selection, _TICKER)[0] is False

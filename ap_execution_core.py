@@ -83,7 +83,28 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
         return "paper" if paper_flag else "live"
     return None
 ET  = ZoneInfo("America/New_York")
-_OCC_CONTRACT_RE = re.compile(r"\d{6}[CP]\d{5,8}")
+_OCC_CONTRACT_RE = re.compile(
+    r"(?P<root>[A-Z0-9./-]{1,6})(?P<padding> *)"
+    r"(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{8})"
+)
+
+
+def _strict_occ_contract_match(contract_symbol: str):
+    """Return a match only for a complete, date-valid OCC contract symbol."""
+    candidate = str(contract_symbol or "").strip().upper()
+    match = _OCC_CONTRACT_RE.fullmatch(candidate)
+    if match is None:
+        return None
+    padding = match.group("padding")
+    if padding and len(match.group("root")) + len(padding) != 6:
+        return None
+    try:
+        datetime.strptime(match.group("expiry"), "%y%m%d")
+    except ValueError:
+        return None
+    if int(match.group("strike")) <= 0:
+        return None
+    return match
 
 
 def _validate_deferred_selector_result(selection, ticker: str = "") -> tuple[bool, str, float, int]:
@@ -95,20 +116,32 @@ def _validate_deferred_selector_result(selection, ticker: str = "") -> tuple[boo
         contract
         and not contract_upper.startswith("DEFERRED:")
         and contract_upper != ticker_upper
-        and _OCC_CONTRACT_RE.search(contract_upper)
+        and _strict_occ_contract_match(contract_upper) is not None
     )
-    try:
-        price = float(
-            getattr(selection, "execution_price_per_share", 0)
-            or getattr(selection, "ask", 0)
-            or getattr(selection, "mid", 0)
-            or 0
-        )
-    except (TypeError, ValueError):
+    raw_price = (
+        getattr(selection, "execution_price_per_share", 0)
+        or getattr(selection, "ask", 0)
+        or getattr(selection, "mid", 0)
+        or 0
+    )
+    if isinstance(raw_price, bool):
         price = 0.0
-    try:
-        qty = int(getattr(selection, "affordable_contracts", 0) or 0)
-    except (TypeError, ValueError):
+    else:
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            price = 0.0
+    if not math.isfinite(price):
+        price = 0.0
+
+    raw_qty = getattr(selection, "affordable_contracts", 0) or 0
+    if isinstance(raw_qty, bool):
+        qty = 0
+    elif isinstance(raw_qty, int):
+        qty = raw_qty
+    elif isinstance(raw_qty, float) and math.isfinite(raw_qty) and raw_qty.is_integer():
+        qty = int(raw_qty)
+    else:
         qty = 0
     return bool(is_occ and price > 0 and qty > 0), contract, price, qty
 
@@ -1922,7 +1955,7 @@ class APExecutionCore:
             return False
         if ticker and contract_symbol == ticker:
             return False
-        return bool(_OCC_CONTRACT_RE.search(contract_symbol))
+        return _strict_occ_contract_match(contract_symbol) is not None
 
     @staticmethod
     def _classify_contract(contract_symbol: str, ticker: str = "") -> str:
@@ -7576,10 +7609,10 @@ class APExecutionCore:
 
         # The selector has now materialized a real OCC contract.  Only at this
         # point does max_position_usd become an actual contract cost.  Re-run
-        # the existing master-control exposure authority before quote refresh
-        # and submit; the deferred reservation/capacity above is never treated
-        # as that cost.
-        if _deferred and _deferred_mode == "live":
+        # the existing master-control exposure authority for both LIVE and
+        # PAPER before quote refresh and submit; the deferred
+        # reservation/capacity above is never treated as that cost.
+        if _deferred and _deferred_mode in {"live", "paper"}:
             _final_contract = str(
                 getattr(approved_plan, "contract_symbol", "") or ""
             ).strip()

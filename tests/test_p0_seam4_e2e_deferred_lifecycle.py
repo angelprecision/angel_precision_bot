@@ -2962,7 +2962,7 @@ def test_pr514_named_shapes_stale_preclaim_generation_fails_closed(
 
 
 def test_pr514_paper_deferred_shape_does_not_call_live_capacity_authority(monkeypatch):
-    """The deferred capacity resolver remains LIVE-only; PAPER is isolated."""
+    """PAPER skips LIVE capacity but still revalidates after selection."""
     selector = _PR514SuccessfulSelector()
     osm, broker, selector, _core, _watcher, plan = _pr514_liveness_fixture(
         monkeypatch,
@@ -3024,10 +3024,96 @@ def test_pr514_paper_deferred_shape_does_not_call_live_capacity_authority(monkey
         result = watcher.on_trigger(watcher._pending[0])
 
     assert capacity_calls == []
-    assert all(selector_calls > 0 for selector_calls, _ in revalidation_calls)
+    assert len(revalidation_calls) == 1
+    assert revalidation_calls[0][0] == 1
+    assert revalidation_calls[0][1] == "C260828C00133000"
     assert selector.calls == 1
     assert len(osm.post_payloads) == 1
     assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+
+
+def test_pr520_paper_deferred_final_exposure_revalidation_blocks_before_post(monkeypatch):
+    """PAPER deferred materialization must fail closed on final exposure truth."""
+    selector = _PR514SuccessfulSelector()
+    osm, broker, selector, _core, _watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        "C",
+        "C260828C00133000",
+        selector,
+    )
+    revalidation_calls = []
+
+    def _paper_revalidate(plan, **_kwargs):
+        revalidation_calls.append((selector.calls, plan.contract_symbol))
+        return types.SimpleNamespace(
+            ok=False,
+            reason_code="PAPER_EXPOSURE_BLOCKED",
+            reason="paper_exposure_blocked",
+        )
+
+    master_control = types.SimpleNamespace(
+        mode="PAPER",
+        max_positions=5,
+        _kill_switch_fn=lambda: False,
+        get_entry_capacity=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("PAPER called LIVE deferred capacity")
+        ),
+        revalidate_exposure=_paper_revalidate,
+    )
+    core = _build_core(osm, broker, selector, master_control=master_control)
+    core._recover_plan_for_revalidation = lambda _watched: plan
+    core.paper = True
+    core.mode = "PAPER"
+    core.execution_mode = "paper"
+    _bind_real_breach_risk_check(core)
+    watcher = _build_watcher(osm, core, ticker="C")
+    watcher.mode = "PAPER"
+    osm.execution_mode = "paper"
+    osm.row["execution_mode"] = "paper"
+    osm.row["meta"].update({"execution_mode": "paper"})
+    plan.execution_mode = "paper"
+    plan.metadata.update({"execution_mode": "paper"})
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        result = watcher.on_trigger(watcher._pending[0])
+
+    assert len(revalidation_calls) == 1
+    assert revalidation_calls[0][0] == 1
+    assert osm.post_payloads == []
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "PAPER_EXPOSURE_BLOCKED" in result["reason_code"]
+
+
+def test_pr520_malformed_selector_contract_blocks_before_broker_post(monkeypatch):
+    """A selector suffix corruption cannot reach durable broker submission."""
+
+    class _MalformedSelector(_CSelector):
+        def select(self, _plan, *, request_context=None):
+            selection = super().select(_plan, request_context=request_context)
+            selection.contract_symbol = f"{selection.contract_symbol}X"
+            return selection
+
+    selector = _MalformedSelector(execution_price_per_share=1.26)
+    result, osm, _broker, _mc = _run_c_deferred_materialization(
+        monkeypatch,
+        selector=selector,
+        master_control=_DeferredCapacityMC(),
+    )
+
+    assert selector.calls == 1
+    assert osm.post_payloads == []
+    assert osm.row["contract"] == "DEFERRED:C"
+    assert result["disposition"] == "TERMINAL_DURABLE"
 
 
 def test_pr514_osm_recovery_reconstructs_plan_and_reaches_materialization(
