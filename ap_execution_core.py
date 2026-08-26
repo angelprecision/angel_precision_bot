@@ -4768,6 +4768,101 @@ class APExecutionCore:
                             "ERROR",
                         }:
                             return {"disposition": "TERMINAL_DURABLE"}
+
+                        # A failed CAS can mean that another materializer already
+                        # owns this exact deferred row.  Treat that as a healthy
+                        # in-flight handoff only when the durable identity,
+                        # lifecycle, owner, generation, and lease all prove it.
+                        # The watcher will then sleep until the durable lease
+                        # boundary instead of becoming a five-second claim loop.
+                        _claim_meta = _claim_row.get("meta") or {}
+                        if isinstance(_claim_meta, str):
+                            try:
+                                _claim_meta = json.loads(_claim_meta)
+                            except Exception:
+                                _claim_meta = {}
+                        if not isinstance(_claim_meta, dict):
+                            _claim_meta = {}
+                        _expected_signal_id = str(
+                            getattr(approved_plan, "signal_id", "")
+                            or signal_id
+                            or ""
+                        ).strip()
+                        _active_owner = str(
+                            _claim_meta.get("materialization_owner") or ""
+                        ).strip()
+                        _active_generation_raw = _claim_meta.get(
+                            "materialization_generation"
+                        )
+                        try:
+                            _active_generation = int(_active_generation_raw)
+                        except (TypeError, ValueError):
+                            _active_generation = 0
+                        _active_generation_valid = (
+                            not isinstance(_active_generation_raw, bool)
+                            and _active_generation > 0
+                        )
+                        _active_lease_raw = str(
+                            _claim_meta.get("materialization_lease_until") or ""
+                        ).strip()
+                        _active_lease = None
+                        if _active_lease_raw:
+                            try:
+                                _active_lease = datetime.fromisoformat(
+                                    _active_lease_raw
+                                )
+                                if _active_lease.tzinfo is None:
+                                    _active_lease = _active_lease.replace(
+                                        tzinfo=timezone.utc
+                                    )
+                            except Exception:
+                                _active_lease = None
+                        _active_owner_proven = bool(
+                            _claim_row.get("local_order_id")
+                            and str(_claim_row.get("local_order_id") or "").strip()
+                            == str(queue_local_order_id or "").strip()
+                            and str(_claim_row.get("client_id") or "")
+                            .strip()
+                            .lower()
+                            == str(_mat_client_id or "").strip().lower()
+                            and str(_claim_row.get("execution_mode") or "")
+                            .strip()
+                            .lower()
+                            == str(_mat_exec_mode or "").strip().lower()
+                            and str(_claim_row.get("signal_id") or "").strip()
+                            == _expected_signal_id
+                            and _claim_status == "PENDING_TRIGGER"
+                            and not str(_claim_row.get("broker_order_id") or "").strip()
+                            and _claim_row.get("submitted_ts") is None
+                            and str(_claim_meta.get("lifecycle_state") or "")
+                            .strip()
+                            .upper()
+                            == "MATERIALIZING"
+                            and str(_claim_meta.get("materialization_status") or "")
+                            .strip()
+                            .upper()
+                            == "RUNNING"
+                            and _claim_meta.get("materialization_in_flight") is True
+                            and bool(_active_owner)
+                            and _active_generation_valid
+                            and _active_lease is not None
+                            and _active_lease > datetime.now(timezone.utc)
+                        )
+                        if _active_owner_proven:
+                            log.info(
+                                "[%s] MATERIALIZATION_ALREADY_OWNED order=%s "
+                                "owner=%s generation=%s next_retry_at=%s",
+                                ticker,
+                                queue_local_order_id,
+                                _active_owner,
+                                _active_generation,
+                                _active_lease_raw,
+                            )
+                            return {
+                                "disposition": "KEEP_WATCHER",
+                                "reason_code": "MATERIALIZATION_ALREADY_OWNED",
+                                "next_retry_at": _active_lease_raw,
+                            }
                     log.critical(
                         "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s — "
                         "capacity, selector, and broker work blocked; watcher retains ownership",

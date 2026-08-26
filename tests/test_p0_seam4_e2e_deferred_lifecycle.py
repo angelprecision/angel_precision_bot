@@ -2287,7 +2287,7 @@ def test_pr514_named_shapes_active_owner_blocks_selector_duplicate(
     ticker,
     contract_symbol,
 ):
-    """A live materialization owner prevents another selector attempt."""
+    """A live owner parks the real watcher until the durable lease boundary."""
     selector = _PR514SuccessfulSelector()
     osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
         monkeypatch,
@@ -2295,12 +2295,120 @@ def test_pr514_named_shapes_active_owner_blocks_selector_duplicate(
         contract_symbol,
         selector,
     )
+    lease_until = _iso(_now() + timedelta(seconds=120))
     osm.row["meta"].update({
         "lifecycle_state": "MATERIALIZING",
         "materialization_status": "RUNNING",
         "materialization_in_flight": True,
         "materialization_owner": "materializer:active-owner",
         "materialization_generation": 7,
+        "materialization_lease_until": lease_until,
+        "retry_attempt": 1,
+    })
+    no_work_mc = _PR514NoAttemptWorkMasterControl()
+    core.master_control = no_work_mc
+    plan.metadata.update({
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": "materializer:active-owner",
+        "materialization_generation": 7,
+        "retry_attempt": 1,
+    })
+    callback_results = []
+    callback_calls = 0
+    original_callback = watcher.on_trigger
+
+    def _counted_callback(watched):
+        nonlocal callback_calls
+        callback_calls += 1
+        result = original_callback(watched)
+        callback_results.append(result)
+        return result
+
+    watcher.on_trigger = _counted_callback
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.overnight = False
+        for _ in range(3):
+            watcher._poll_active_signals(open_protect_active=False)
+
+        assert callback_calls == 1
+        result = callback_results[0]
+        assert result["disposition"] == "KEEP_WATCHER"
+        assert result["reason_code"] == "MATERIALIZATION_ALREADY_OWNED"
+        assert result["next_retry_at"] == lease_until
+        assert watched in watcher._pending
+        assert watched.deferred_retry_not_before is not None
+        assert datetime.fromisoformat(str(lease_until)) == watched.deferred_retry_not_before
+
+        counts_before_lease = (
+            callback_calls,
+            osm.claim_attempts,
+            selector.calls,
+            no_work_mc.capacity_calls,
+            no_work_mc.final_calls,
+            len(osm.post_payloads),
+        )
+        for _ in range(3):
+            watcher._poll_active_signals(open_protect_active=False)
+
+    assert (
+        callback_calls,
+        osm.claim_attempts,
+        selector.calls,
+        no_work_mc.capacity_calls,
+        no_work_mc.final_calls,
+        len(osm.post_payloads),
+    ) == counts_before_lease
+    assert selector.calls == 0
+    assert osm.post_payloads == []
+    assert osm.claim_successes == 0
+    assert no_work_mc.capacity_calls == 0
+    assert no_work_mc.final_calls == 0
+    assert osm.row["meta"]["materialization_owner"] == "materializer:active-owner"
+    assert osm.row["meta"]["materialization_generation"] == 7
+    assert osm.row["meta"]["materialization_lease_until"] == lease_until
+
+
+@pytest.mark.parametrize(
+    "invalid_owner_shape",
+    ["expired_lease", "malformed_lease", "client_mismatch"],
+)
+def test_pr514_active_owner_proof_fail_closed_when_lease_or_identity_is_invalid(
+    monkeypatch,
+    invalid_owner_shape,
+):
+    """Unproven ownership keeps the existing fail-closed state-write outcome."""
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        "C",
+        "C260828C00133000",
+        selector,
+    )
+    if invalid_owner_shape == "expired_lease":
+        invalid_lease = _iso(_now() - timedelta(seconds=1))
+    elif invalid_owner_shape == "malformed_lease":
+        invalid_lease = "not-a-timestamp"
+    else:
+        invalid_lease = _iso(_now() + timedelta(seconds=120))
+        osm.row["client_id"] = "different-client@example.com"
+    osm.row["meta"].update({
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": "materializer:active-owner",
+        "materialization_generation": 7,
+        "materialization_lease_until": invalid_lease,
         "retry_attempt": 1,
     })
     no_work_mc = _PR514NoAttemptWorkMasterControl()
@@ -2322,17 +2430,17 @@ def test_pr514_named_shapes_active_owner_blocks_selector_duplicate(
         lambda fn, *a, **k: fn(),
     ):
         assert watcher.watch(plan, LOCAL_ORDER_ID) is True
-        row_before_callback = osm.get_order(LOCAL_ORDER_ID)
         result = watcher.on_trigger(watcher._pending[0])
 
     assert result["disposition"] == "KEEP_WATCHER"
     assert result["reason_code"] == "MATERIALIZATION_STATE_WRITE_FAILED"
+    assert "next_retry_at" not in result
+    assert osm.claim_attempts == 1
+    assert osm.claim_successes == 0
     assert selector.calls == 0
     assert osm.post_payloads == []
-    assert osm.claim_successes == 0
     assert no_work_mc.capacity_calls == 0
     assert no_work_mc.final_calls == 0
-    assert osm.get_order(LOCAL_ORDER_ID) == row_before_callback
 
 
 @pytest.mark.parametrize(
