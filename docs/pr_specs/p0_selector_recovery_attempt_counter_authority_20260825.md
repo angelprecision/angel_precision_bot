@@ -1,6 +1,6 @@
 # P0 SPEC — Repair deferred selector recovery attempt-counter authority conflicts
 
-**Status:** SURGICAL AMENDMENT APPLIED / EXACT-HEAD CI PENDING / HARD HOLD
+**Status:** SURGICAL AMENDMENT COMPLETE / EXACT-HEAD CI GREEN / HARD HOLD
 
 **Base main SHA:** `de87e3b0460e8908bc271590d425cc1fcfb9ae3d`
 
@@ -1002,6 +1002,6 @@ Before approving implementation, answer every item explicitly:
 
 **HARD HOLD.**
 
-This branch contains the surgical authority amendment and focused regression coverage. Exact-head CI and final behavioral diff review remain required before any merge decision; no merge or deployment authorization is implied.
+This branch contains the surgical authority amendment and focused regression coverage. Exact-head CI is green; final behavioral diff review remains required before any merge decision, and no merge or deployment authorization is implied.
 
 The objective is not to make the error disappear. The objective is to make it structurally impossible for normal runtime to create contradictory selector-attempt truth while preserving fail-closed behavior for genuinely unprovable state.
