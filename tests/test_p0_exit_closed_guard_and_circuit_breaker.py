@@ -296,7 +296,7 @@ def test_now_incident_cancels_exact_protective_stop_before_replacement(monkeypat
     mock_broker.list_positions.return_value = [
         {"symbol": contract, "quantity": 1, "side": "PUT", "account_id": "ACC123"}
     ]
-    mock_broker.list_orders.return_value = [
+    mock_broker.list_orders.side_effect = [[
         {
             "id": "143387714",
             "status": "open",
@@ -309,7 +309,7 @@ def test_now_incident_cancels_exact_protective_stop_before_replacement(monkeypat
             "duration": "gtc",
             "account_id": "ACC123",
         }
-    ]
+    ], []]
     mock_broker.cancel_order.return_value = {
         "ok": True,
         "status": "canceled",
@@ -356,11 +356,11 @@ def test_partial_protective_fill_rewrites_durable_payload_and_posts_residual(mon
         [{"symbol": contract, "quantity": 2, "account_id": "ACC123"}],
         [{"symbol": contract, "quantity": 1, "account_id": "ACC123"}],
     ]
-    mock_broker.list_orders.return_value = [{
+    mock_broker.list_orders.side_effect = [[{
         "id": "143387714", "status": "open", "type": "stop",
         "side": "sell_to_close", "option_symbol": contract,
         "quantity": 2, "exec_quantity": 0, "account_id": "ACC123",
-    }]
+    }], []]
     mock_broker.cancel_order.return_value = {"ok": True, "status": "canceled"}
     mock_broker.get_order.return_value = {
         "id": "143387714", "status": "filled", "quantity": 2, "exec_quantity": 1,
@@ -393,11 +393,11 @@ def test_repeated_exit_tick_keeps_one_takeover_owner_and_one_post(monkeypatch, m
     mock_broker.list_positions.return_value = [
         {"symbol": contract, "quantity": 1, "account_id": "ACC123"}
     ]
-    mock_broker.list_orders.return_value = [{
+    mock_broker.list_orders.side_effect = [[{
         "id": "143387714", "status": "open", "type": "stop",
         "side": "sell_to_close", "option_symbol": contract,
         "quantity": 1, "exec_quantity": 0, "account_id": "ACC123",
-    }]
+    }], []]
     mock_broker.cancel_order.return_value = {"ok": True, "status": "canceled"}
     mock_broker.get_order.return_value = {"id": "143387714", "status": "canceled"}
     mock_broker.session.post.return_value = _resp(

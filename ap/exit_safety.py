@@ -144,7 +144,16 @@ def resolve_exit_broker_truth(
         "exact_contract_match": False,
     }
 
-    list_positions = getattr(broker, "list_positions", None)
+    # The production Tradier adapter exposes a strict capability so a request
+    # failure cannot be collapsed into its legacy ``list_positions() == []``
+    # compatibility result. Test doubles and older adapters retain fallback.
+    strict_method = getattr(type(broker), "list_positions_strict", None)
+    list_positions = (
+        getattr(broker, "list_positions_strict", None)
+        if callable(strict_method)
+        else getattr(broker, "list_positions", None)
+    )
+    audit["source"] = "broker.list_positions_strict" if callable(strict_method) else "broker.list_positions"
     if not callable(list_positions):
         audit["snapshot_status"] = "broker_positions_unavailable"
         audit["error"] = "broker_list_positions_missing"
@@ -326,31 +335,35 @@ def resolve_protective_exit_takeover(
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
 
     account = audit["account"]
-    active_sells: list[dict[str, Any]] = []
-    for row in orders:
-        if _exact_order_contract(row) != exact_contract:
-            continue
-        row_account = _normalize_text(row.get("account_id") or row.get("account"))
-        if row_account and account and row_account != account:
-            continue
-        side = _normalize_text(row.get("side"))
-        if side != "sell_to_close":
-            continue
-        status = _normalize_text(row.get("status") or row.get("state"))
-        if status in _TERMINAL_BROKER_ORDER_STATUSES:
-            continue
-        if status not in _ACTIVE_BROKER_SELL_STATUSES:
-            audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason="unknown_status", protective_status=status or "missing")
-            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
-        qty = _strict_positive_order_int(row.get("quantity", row.get("qty")))
-        executed = _safe_int(row.get("exec_quantity")) or 0
-        remaining = _strict_positive_order_int(row.get("remaining_quantity"))
-        if remaining is None and qty is not None:
-            remaining = qty - max(executed, 0)
-        if qty is None or remaining is None or remaining <= 0:
-            audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason="quantity_unproven")
-            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
-        active_sells.append({"raw": row, "status": status, "qty": qty, "remaining": remaining})
+    def _inventory(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+        active: list[dict[str, Any]] = []
+        for row in rows:
+            if _exact_order_contract(row) != exact_contract:
+                continue
+            row_account = _normalize_text(row.get("account_id") or row.get("account"))
+            if row_account and account and row_account != account:
+                continue
+            if _normalize_text(row.get("side")) != "sell_to_close":
+                continue
+            status = _normalize_text(row.get("status") or row.get("state"))
+            if status in _TERMINAL_BROKER_ORDER_STATUSES:
+                continue
+            if status not in _ACTIVE_BROKER_SELL_STATUSES:
+                return [], "unknown_status"
+            qty = _strict_positive_order_int(row.get("quantity", row.get("qty")))
+            executed = _safe_int(row.get("exec_quantity")) or 0
+            remaining = _strict_positive_order_int(row.get("remaining_quantity"))
+            if remaining is None and qty is not None:
+                remaining = qty - max(executed, 0)
+            if qty is None or remaining is None or remaining <= 0:
+                return [], "quantity_unproven"
+            active.append({"raw": row, "status": status, "qty": qty, "remaining": remaining})
+        return active, None
+
+    active_sells, inventory_issue = _inventory(orders)
+    if inventory_issue:
+        audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason=inventory_issue)
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
 
     if not active_sells:
         # Re-read after the order snapshot so a protective fill that became
@@ -363,6 +376,22 @@ def resolve_protective_exit_takeover(
         if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_position_unproven")
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
+        try:
+            post_orders = list_orders()
+        except Exception as exc:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_list_orders_error", error=str(exc))
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
+        if not isinstance(post_orders, list) or any(not isinstance(row, dict) for row in post_orders):
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_list_orders_malformed")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
+        post_active_sells, post_inventory_issue = _inventory(post_orders)
+        if post_inventory_issue or post_active_sells:
+            audit.update(
+                event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+                reason=post_inventory_issue or "active_sell_appeared_after_takeover",
+                post_takeover_active_sell_count=len(post_active_sells),
+            )
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
         replacement_qty = min(requested_qty, max(final_qty, 0))
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_ALLOWED", replacement_qty=replacement_qty)
         return {
@@ -427,6 +456,22 @@ def resolve_protective_exit_takeover(
     if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_position_unproven")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
+    try:
+        post_orders = list_orders()
+    except Exception as exc:
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_list_orders_error", error=str(exc))
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
+    if not isinstance(post_orders, list) or any(not isinstance(row, dict) for row in post_orders):
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_list_orders_malformed")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
+    post_active_sells, post_inventory_issue = _inventory(post_orders)
+    if post_inventory_issue or post_active_sells:
+        audit.update(
+            event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+            reason=post_inventory_issue or "active_sell_appeared_after_takeover",
+            post_takeover_active_sell_count=len(post_active_sells),
+        )
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
     replacement_qty = min(requested_qty, max(final_qty, 0))
     event = "EXIT_PROTECTIVE_FILLED_DURING_TAKEOVER" if terminal_status == "filled" or final_qty < initial_qty else "EXIT_PROTECTIVE_CANCEL_CONFIRMED"
     audit.update(event=event, broker_long_qty=final_qty, replacement_qty=replacement_qty)

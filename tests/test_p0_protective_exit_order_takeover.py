@@ -11,6 +11,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 sys.path.insert(0, str(REPO_ROOT))
 
 from ap.exit_safety import resolve_protective_exit_takeover  # noqa: E402
+from ap.exit_safety import resolve_exit_broker_truth  # noqa: E402
+from ap.brokers.tradier import TradierBroker, TradierConfig  # noqa: E402
 from ap import fill_monitor as fill_monitor_mod  # noqa: E402
 
 
@@ -59,6 +61,12 @@ class _Broker:
         self.list_orders_calls += 1
         if isinstance(self._orders, Exception):
             raise self._orders
+        if (
+            isinstance(self._orders, list)
+            and self._orders
+            and isinstance(self._orders[0], list)
+        ):
+            return self._orders.pop(0)
         return self._orders
 
     def cancel_order(self, order_id):
@@ -89,7 +97,7 @@ def _run(broker, *, qty=1, mode="live", contract=CONTRACT):
 def test_exact_now_positive_control_cancels_once_then_allows_one_contract():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
-        orders=[_stop()],
+        orders=[[_stop()], []],
         terminal={"id": "143387714", "status": "canceled", "exec_quantity": 0},
     )
     result = _run(broker)
@@ -110,7 +118,7 @@ def test_stop_filled_before_takeover_posts_zero():
 def test_stop_fills_during_cancel_allows_only_proven_residual():
     broker = _Broker(
         positions=[[_position(2)], [_position(1)]],
-        orders=[_stop(qty=2)],
+        orders=[[_stop(qty=2)], []],
         terminal={"id": "143387714", "status": "filled", "exec_quantity": 1},
     )
     result = _run(broker, qty=2)
@@ -129,7 +137,7 @@ def test_cancel_ack_but_order_still_open_holds():
 def test_cancel_exception_can_only_proceed_when_requery_is_terminal():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
-        orders=[_stop()],
+        orders=[[_stop()], []],
         terminal={"id": "143387714", "status": "canceled"},
         cancel_error=RuntimeError("transport lost"),
     )
@@ -177,6 +185,69 @@ def test_same_ticker_different_occ_and_wrong_account_are_never_touched():
     result = _run(broker)
     assert result["allowed"] is True
     assert broker.cancel_calls == []
+
+
+def test_post_takeover_reinventory_blocks_external_exact_active_sell():
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[_stop()], [_stop("external-sell", status="open", qty=1)]],
+        terminal={"id": "143387714", "status": "canceled"},
+    )
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["reason"] == "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS"
+    assert result["audit"]["reason"] == "active_sell_appeared_after_takeover"
+    assert broker.cancel_calls == ["143387714"]
+    assert broker.list_orders_calls == 2
+
+
+def test_production_tradier_position_failure_never_becomes_authoritative_flat():
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("positions timeout"))
+    result = resolve_exit_broker_truth(
+        broker=broker, client_id=CLIENT, contract=CONTRACT,
+    )
+    assert result["broker_truth_open_qty"] is None
+    assert result["is_fresh_exact"] is False
+    assert result["audit"]["snapshot_status"] == "broker_positions_error"
+
+
+def test_production_tradier_successful_empty_positions_remains_authoritative_flat():
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: {"positions": {"position": []}}
+    result = resolve_exit_broker_truth(
+        broker=broker, client_id=CLIENT, contract=CONTRACT,
+    )
+    assert result["broker_truth_open_qty"] == 0
+    assert result["is_fresh_exact"] is True
+
+
+def test_production_tradier_malformed_positions_are_unproven():
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: {"positions": {"position": "not-a-row"}}
+    result = resolve_exit_broker_truth(
+        broker=broker, client_id=CLIENT, contract=CONTRACT,
+    )
+    assert result["broker_truth_open_qty"] is None
+    assert result["is_fresh_exact"] is False
 
 
 @pytest.mark.parametrize("mode", ["paper", "", "unknown"])

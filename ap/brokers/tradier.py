@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -467,34 +468,70 @@ class TradierBroker(BrokerAdapter):
             return {"ok": False, "status": "unknown",
                     "broker_order_id": broker_order_id, "raw": {}, "error": str(e)}
 
-    def list_positions(self) -> list:
+    def list_positions_strict(self) -> list:
+        """Return an authoritative Tradier positions snapshot.
+
+        A successful empty ``positions`` node returns ``[]``. Transport,
+        HTTP, and malformed payload errors are raised so money-path callers
+        can distinguish unavailable broker truth from a flat account.
         """
-        Return open positions from Tradier account.
-        Returns list of dicts with: symbol, quantity, cost_basis, side
-        Returns [] if no positions or on error.
-        """
-        try:
-            resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
-            positions = resp.get("positions", {})
-            if not positions or positions == "null":
+        resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
+        if not isinstance(resp, dict) or "positions" not in resp:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        positions = resp.get("positions")
+        if positions is None or positions == "null" or positions == {}:
+            return []
+        if not isinstance(positions, dict):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if "position" not in positions:
+            if not positions:
                 return []
-            pos_list = positions.get("position", [])
-            if isinstance(pos_list, dict):
-                pos_list = [pos_list]
-            result = []
-            for p in pos_list:
-                result.append({
-                    "symbol":     p.get("symbol", ""),
-                    "quantity":   float(p.get("quantity", 0)),
-                    "cost_basis": float(p.get("cost_basis", 0)),
-                    "side":       (lambda sym: (
-                        "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
-                        "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
-                        "CALL" if "C" in sym else "PUT"
-                    ))(str(p.get("symbol", ""))),
-                    "raw":        p,
-                })
-            return result
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        pos_list = positions.get("position", [])
+        if pos_list is None:
+            return []
+        if isinstance(pos_list, dict):
+            pos_list = [pos_list]
+        if not isinstance(pos_list, list) or any(not isinstance(p, dict) for p in pos_list):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        result = []
+        for p in pos_list:
+            quantity = p.get("quantity", 0)
+            if isinstance(quantity, bool):
+                raise ValueError("TRADIER_POSITIONS_QUANTITY_MALFORMED")
+            try:
+                quantity = float(quantity)
+            except (TypeError, ValueError):
+                raise ValueError("TRADIER_POSITIONS_QUANTITY_MALFORMED") from None
+            if not math.isfinite(quantity):
+                raise ValueError("TRADIER_POSITIONS_QUANTITY_MALFORMED")
+            cost_basis = p.get("cost_basis", 0)
+            if isinstance(cost_basis, bool):
+                raise ValueError("TRADIER_POSITIONS_COST_BASIS_MALFORMED")
+            try:
+                cost_basis = float(cost_basis)
+            except (TypeError, ValueError):
+                raise ValueError("TRADIER_POSITIONS_COST_BASIS_MALFORMED") from None
+            if not math.isfinite(cost_basis):
+                raise ValueError("TRADIER_POSITIONS_COST_BASIS_MALFORMED")
+            symbol = str(p.get("symbol", ""))
+            result.append({
+                "symbol": symbol,
+                "quantity": quantity,
+                "cost_basis": cost_basis,
+                "side": (lambda sym: (
+                    "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
+                    "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
+                    "CALL" if "C" in sym else "PUT"
+                ))(symbol),
+                "raw": p,
+            })
+        return result
+
+    def list_positions(self) -> list:
+        """Legacy compatibility wrapper; strict callers use ``list_positions_strict``."""
+        try:
+            return self.list_positions_strict()
         except Exception as e:
             log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
             return []
