@@ -1616,6 +1616,7 @@ class APEntryWatcher:
         self._open_trigger_count = 0
         self._open_protect_date = None
         self._open_trigger_tickers: set = set()   # per-ticker open protection
+        self._open_trigger_keys: set = set()      # arbitration identity keys
 
         # Real watcher-level duplicate barrier. Cleanup alone is not enough;
         # the key must be initialized and enforced before a signal is armed.
@@ -4747,6 +4748,7 @@ class APEntryWatcher:
             self._open_protect_date = today_et
             self._open_trigger_count = 0
             self._open_trigger_tickers = set()
+            self._open_trigger_keys = set()
 
         open_protect_active = (
             now_et.hour == 9 and 30 <= now_et.minute < 30 + OPEN_PROTECT_MINUTES
@@ -5437,6 +5439,105 @@ class APEntryWatcher:
         """Hook for a watcher implementation to arbitrate trigger batches."""
         return completed
 
+    def _open_protection_key(self, watched):
+        """Return the identity used by the base market-open duplicate barrier."""
+        return str(getattr(watched, "ticker", "") or "").strip().upper()
+
+    def _apply_open_protection(self, completed, open_protect_active: bool):
+        """Apply market-open protection after any trigger arbitration hook.
+
+        Arbitration must see every watcher that confirmed in this poll.  Applying
+        ticker protection while the watcher list is still being classified can
+        discard a candidate before a more specific implementation can choose a
+        durable winner.
+        """
+        if not open_protect_active:
+            return completed
+
+        protected = []
+        for action, watched in completed:
+            if action != "trigger":
+                protected.append((action, watched))
+                continue
+
+            key = self._open_protection_key(watched)
+            ticker = str(getattr(watched, "ticker", "") or "").strip().upper()
+            already_triggered = key in self._open_trigger_keys
+            # Preserve compatibility with callers/tests that seed the historical
+            # ticker-only set directly before the first protected poll.
+            if not already_triggered and not self._open_trigger_keys:
+                already_triggered = ticker in self._open_trigger_tickers
+
+            if already_triggered:
+                watched.state = WatchState.EXPIRED
+                protected.append(("done", watched))
+                log.info(
+                    "[%s] OPEN_PROTECTION_BLOCK — identity already triggered at open",
+                    watched.ticker,
+                )
+                continue
+
+            self._open_trigger_count += 1
+            self._open_trigger_keys.add(key)
+            if ticker:
+                self._open_trigger_tickers.add(ticker)
+            protected.append(("trigger", watched))
+
+        return protected
+
+    def _persist_trigger_confirmation_authority(self, watched) -> bool:
+        """Persist trigger authority before any downstream destructive action."""
+        if getattr(watched, "_trigger_authority_persisted", False):
+            return True
+
+        signal = getattr(watched, "signal", {}) or {}
+        local_order_id = str(signal.get("local_order_id") or "").strip()
+        trigger_crossed_at = getattr(watched, "trigger_crossed_at", None)
+        update_order_meta = getattr(self.order_state_machine, "update_order_meta", None)
+        if not local_order_id or trigger_crossed_at is None or not callable(update_order_meta):
+            return False
+
+        patch = {
+            "trigger_crossed_at": (
+                trigger_crossed_at.isoformat()
+                if hasattr(trigger_crossed_at, "isoformat")
+                else str(trigger_crossed_at)
+            ),
+            "trigger_crossed_at_provenance": _build_trigger_crossed_at_provenance(
+                signal, local_order_id
+            ),
+            "trigger_confirmed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            first_bid = float(getattr(watched, "first_breach_bid", 0) or 0)
+            first_ask = float(getattr(watched, "first_breach_ask", 0) or 0)
+        except (TypeError, ValueError):
+            first_bid = first_ask = 0.0
+        if first_bid:
+            patch["first_breach_bid"] = first_bid
+        if first_ask:
+            patch["first_breach_ask"] = first_ask
+
+        try:
+            if not bool(update_order_meta(local_order_id, patch)):
+                return False
+        except Exception:
+            log.exception(
+                "WATCHER_TRIGGER_AUTHORITY_PERSIST_FAILED local_order_id=%s",
+                local_order_id,
+            )
+            return False
+
+        watched._trigger_authority_persisted = True
+        log.info(
+            "WATCHER_TRIGGER_AUTHORITY_PERSISTED local_order_id=%s trigger_crossed_at=%s "
+            "trigger_confirmed_at=%s",
+            local_order_id,
+            patch["trigger_crossed_at"],
+            patch["trigger_confirmed_at"],
+        )
+        return True
+
     def _poll_active_signals(self, open_protect_active: bool) -> None:
         with self._lock:
             # PR 158 P1 — RETRY_LATER watchers must not be trigger-polled.
@@ -5494,21 +5595,7 @@ class APEntryWatcher:
 
                 new_state = w.check(bid, ask, quote_age_ms=_quote_age_ms)
                 if new_state == WatchState.TRIGGERED:
-                    if open_protect_active and w.ticker in self._open_trigger_tickers:
-                        # Per-ticker open protection: this ticker already triggered once
-                        # at open. Block duplicate triggers for the same ticker within
-                        # the open protection window (first 5 minutes).
-                        w.state = WatchState.EXPIRED
-                        completed.append(("done", w))
-                        log.info(
-                            "[%s] OPEN_PROTECTION_BLOCK — ticker already triggered at open",
-                            w.ticker,
-                        )
-                    else:
-                        self._open_trigger_count += 1
-                        if open_protect_active:
-                            self._open_trigger_tickers.add(w.ticker)
-                        completed.append(("trigger", w))
+                    completed.append(("trigger", w))
                 elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
                     completed.append(("done", w))
 
@@ -5533,6 +5620,7 @@ class APEntryWatcher:
         # batch-level confirmed-breach direction claim.  It may remove proven
         # losers or convert an ambiguous batch to a fail-closed hold.
         completed = self._before_trigger_dispatch(completed)
+        completed = self._apply_open_protection(completed, open_protect_active)
 
         for action, w in completed:
             _sig_id = str(w.signal.get("signal_id", ""))
@@ -5584,53 +5672,11 @@ class APEntryWatcher:
                     # against an empty orders.meta and either passes (stale-miss)
                     # or relies on an in-memory fallback that may not be in scope.
                     # Durable timestamp must exist BEFORE execution can reach the gate.
-                    _ts_pre_write_ok = False
-                    _ts_pre_local_oid = None
-                    try:
-                        _sig_for_ts   = getattr(w, "signal", {}) or {}
-                        _ts_pre_local_oid = _sig_for_ts.get("local_order_id")
-                        _tc_at  = getattr(w, "trigger_crossed_at", None)
-                        _tc_bid = float(getattr(w, "first_breach_bid", 0) or 0)
-                        _tc_ask = float(getattr(w, "first_breach_ask", 0) or 0)
-                        # trigger_confirmed_at = NOW (the moment breach is confirmed
-                        # and callback is about to fire, not after it returns).
-                        _confirmed_now = datetime.now(timezone.utc)
-                        if _ts_pre_local_oid and self.order_state_machine is not None:
-                            _ts_patch: dict = {}
-                            if _tc_at is not None:
-                                _ts_patch["trigger_crossed_at"] = (
-                                    _tc_at.isoformat() if hasattr(_tc_at, "isoformat")
-                                    else str(_tc_at)
-                                )
-                                _ts_patch["trigger_crossed_at_provenance"] = (
-                                    _build_trigger_crossed_at_provenance(
-                                        _sig_for_ts, _ts_pre_local_oid
-                                    )
-                                )
-                            if _tc_bid:
-                                _ts_patch["first_breach_bid"]  = _tc_bid
-                            if _tc_ask:
-                                _ts_patch["first_breach_ask"]  = _tc_ask
-                            _ts_patch["trigger_confirmed_at"] = _confirmed_now.isoformat()
-                            if _ts_patch:
-                                _upd_ts = getattr(
-                                    self.order_state_machine, "update_order_meta", None
-                                )
-                                if callable(_upd_ts):
-                                    _ts_pre_write_ok = bool(
-                                        _upd_ts(_ts_pre_local_oid, _ts_patch)
-                                    )
-                                    if not _ts_pre_write_ok:
-                                        raise RuntimeError("trigger_timestamp_meta_write_returned_false")
-                                    log.info(
-                                        "WATCHER_TRIGGER_TIMESTAMPS_PERSISTED "
-                                        "local_order_id=%s trigger_crossed_at=%s "
-                                        "trigger_confirmed_at=%s — before on_trigger",
-                                        _ts_pre_local_oid,
-                                        _ts_patch.get("trigger_crossed_at"),
-                                        _ts_patch.get("trigger_confirmed_at"),
-                                    )
-                    except Exception as _pre_ts_exc:
+                    _ts_pre_local_oid = str(
+                        ((getattr(w, "signal", {}) or {}).get("local_order_id") or "")
+                    ).strip()
+                    _ts_pre_write_ok = self._persist_trigger_confirmation_authority(w)
+                    if not _ts_pre_write_ok:
                         _is_live_ts = self._is_live_runtime()
                         if _is_live_ts:
                             log.critical(
@@ -5638,13 +5684,14 @@ class APEntryWatcher:
                                 "LIVE mode, trigger timestamps could not be written "
                                 "to orders.meta before on_trigger; callback is "
                                 "skipped and persistence will be retried. "
-                                "local_order_id=%s error=%s",
-                                w.ticker, _ts_pre_local_oid or "?", _pre_ts_exc,
+                                "local_order_id=%s",
+                                w.ticker, _ts_pre_local_oid or "?",
                             )
                         else:
                             log.debug(
-                                "[%s] trigger timestamp pre-persist non-critical: %s",
-                                w.ticker, _pre_ts_exc,
+                                "[%s] trigger timestamp pre-persist non-critical "
+                                "local_order_id=%s",
+                                w.ticker, _ts_pre_local_oid or "?",
                             )
 
                     if (

@@ -14,12 +14,21 @@ class DummyBroker:
 
 
 class FakeOSM:
-    def __init__(self, rows, cancel_results=None, unreadable=None, observer=None):
+    def __init__(
+        self,
+        rows,
+        cancel_results=None,
+        unreadable=None,
+        observer=None,
+        meta_results=None,
+    ):
         self.rows = {key: dict(value) for key, value in rows.items()}
         self.cancel_results = dict(cancel_results or {})
+        self.meta_results = dict(meta_results or {})
         self.unreadable = set(unreadable or ())
         self.observer = observer
         self.cancel_calls = []
+        self.meta_calls = []
 
     def has_order(self, local_order_id):
         return local_order_id in self.rows
@@ -42,6 +51,18 @@ class FakeOSM:
             raise RuntimeError("durable row unavailable")
         row = self.rows.get(local_order_id)
         return dict(row) if isinstance(row, dict) else row
+
+    def update_order_meta(self, local_order_id, patch):
+        self.meta_calls.append((local_order_id, dict(patch)))
+        if self.observer:
+            self.observer("meta", local_order_id)
+        result = self.meta_results.get(local_order_id, True)
+        if isinstance(result, BaseException):
+            raise result
+        if not result or local_order_id not in self.rows:
+            return False
+        self.rows[local_order_id].setdefault("meta", {}).update(dict(patch))
+        return True
 
 
 class AuditWatcher(APEntryWatcher):
@@ -427,7 +448,7 @@ def test_runtime_package_watch_forwards_recovery_compatibility_flags(monkeypatch
     }
 
 
-def _poll_quote(watcher, *, bid, ask):
+def _poll_quote(watcher, *, bid, ask, open_protect_active=False):
     # Direct admission tests must exercise the poll arbitration regardless of
     # the wall-clock session when the suite is run.
     with watcher._lock:
@@ -437,7 +458,159 @@ def _poll_quote(watcher, *, bid, ask):
         ticker: {"bid": bid, "ask": ask}
         for ticker in tickers
     }
-    watcher._poll_active_signals(False)
+    watcher._poll_active_signals(open_protect_active)
+
+
+@pytest.mark.parametrize(
+    "registration_order",
+    [("CALL", "PUT"), ("PUT", "CALL")],
+)
+def test_market_open_protection_arbitrates_same_poll_before_duplicate_barrier(
+    registration_order,
+):
+    call = signal(
+        signal_id="open-call",
+        local_order_id="open-call-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    put = signal(
+        signal_id="open-put",
+        local_order_id="open-put-lo",
+        side="PUT",
+        score=70,
+        trigger=105,
+    )
+    signals = {"CALL": call, "PUT": put}
+    osm = FakeOSM(
+        {sig["local_order_id"]: row_for(sig) for sig in signals.values()}
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    callbacks = []
+    watcher.on_trigger = lambda watched: callbacks.append(watched.signal_id)
+
+    for side in registration_order:
+        assert watcher.add_signal(dict(signals[side])) is True
+
+    # Both sides confirm in one poll.  The package arbitration hook must see
+    # both candidates before market-open protection can apply a duplicate rule.
+    _poll_quote(watcher, bid=98, ask=106, open_protect_active=True)
+    _poll_quote(watcher, bid=98, ask=106, open_protect_active=True)
+
+    assert callbacks == []
+    assert osm.cancel_calls == []
+    assert active_directions(watcher) == {"CALL", "PUT"}
+    assert watcher._open_trigger_keys == set()
+
+
+@pytest.mark.parametrize("registration_order", [("CALL", "PUT"), ("PUT", "CALL")])
+@pytest.mark.parametrize(
+    "call_identity,put_identity",
+    [
+        (("call-client@example.com", "paper"), ("put-client@example.com", "paper")),
+        (("same-client@example.com", "paper"), ("same-client@example.com", "live")),
+    ],
+)
+def test_market_open_protection_uses_directional_ownership_identity(
+    registration_order, call_identity, put_identity
+):
+    call = signal(
+        signal_id="identity-call",
+        local_order_id="identity-call-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+        client_id=call_identity[0],
+        execution_mode=call_identity[1],
+    )
+    put = signal(
+        signal_id="identity-put",
+        local_order_id="identity-put-lo",
+        side="PUT",
+        score=70,
+        trigger=105,
+        client_id=put_identity[0],
+        execution_mode=put_identity[1],
+    )
+    signals = {"CALL": call, "PUT": put}
+    osm = FakeOSM(
+        {sig["local_order_id"]: row_for(sig) for sig in signals.values()}
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    callbacks = []
+    watcher.on_trigger = lambda watched: (
+        callbacks.append(watched.signal_id) or {"disposition": "TERMINAL_DURABLE"}
+    )
+
+    for side in registration_order:
+        assert watcher.add_signal(dict(signals[side])) is True
+    _poll_quote(watcher, bid=98, ask=106, open_protect_active=True)
+    _poll_quote(watcher, bid=98, ask=106, open_protect_active=True)
+
+    assert set(callbacks) == {"identity-call", "identity-put"}
+    assert osm.cancel_calls == []
+    assert watcher._open_trigger_keys == {
+        ("direction", call_identity[0], call_identity[1], "AAPL"),
+        ("direction", put_identity[0], put_identity[1], "AAPL"),
+    }
+
+
+def test_winner_authority_failure_holds_before_loser_cancellation():
+    call = signal(
+        signal_id="call-live",
+        local_order_id="call-live-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+        execution_mode="live",
+    )
+    put = signal(
+        signal_id="put-live",
+        local_order_id="put-live-lo",
+        side="PUT",
+        score=70,
+        trigger=90,
+        execution_mode="live",
+    )
+    events = []
+    osm = FakeOSM(
+        {"call-live-lo": row_for(call), "put-live-lo": row_for(put)},
+        meta_results={"call-live-lo": False},
+        observer=lambda stage, local_order_id: events.append((stage, local_order_id)),
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm, mode="LIVE")
+    callbacks = []
+    watcher.on_trigger = lambda watched: callbacks.append(watched.signal_id)
+
+    assert watcher.add_signal(dict(call)) is True
+    assert watcher.add_signal(dict(put)) is True
+    _poll_quote(watcher, bid=98, ask=101)
+    _poll_quote(watcher, bid=98, ask=101)
+
+    assert callbacks == []
+    assert osm.cancel_calls == []
+    assert events == [("meta", "call-live-lo")]
+    assert osm.rows["call-live-lo"]["status"] == "PENDING_TRIGGER"
+    assert osm.rows["put-live-lo"]["status"] == "PENDING_TRIGGER"
+    assert "trigger_crossed_at" not in osm.rows["call-live-lo"]["meta"]
+    assert watcher._direction_claims[
+        ("client@example.com", "live", "AAPL")
+    ]["reason"] == "winner_authority_unproven"
+    assert active_directions(watcher) == {"CALL", "PUT"}
+
+    # Once the durable write becomes available, the held winner may proceed and
+    # only then is the opposite allowed to be canceled.
+    osm.meta_results["call-live-lo"] = True
+    with watcher._lock:
+        for watched in watcher._pending:
+            watched.deferred_retry_not_before = None
+    _poll_quote(watcher, bid=98, ask=101)
+
+    assert callbacks == ["call-live"]
+    assert osm.cancel_calls == [
+        ("put-live-lo", "confirmed_breach_direction_claim_lost")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -540,7 +713,11 @@ def test_confirmed_call_wins_and_cancels_prebreach_put_before_callback():
         score=70,
         trigger=90,
     )
-    osm = FakeOSM({"call-lo": row_for(call), "put-lo": row_for(put)})
+    events = []
+    osm = FakeOSM(
+        {"call-lo": row_for(call), "put-lo": row_for(put)},
+        observer=lambda stage, local_order_id: events.append((stage, local_order_id)),
+    )
     watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
     callbacks = []
     watcher.on_trigger = lambda watched: (
@@ -559,6 +736,7 @@ def test_confirmed_call_wins_and_cancels_prebreach_put_before_callback():
     assert osm.rows["put-lo"]["status"] == "CANCELED"
     assert watcher.has_order("put-lo") is False
     assert watcher.has_order("call-lo") is False
+    assert events.index(("meta", "call-lo")) < events.index(("cancel", "put-lo"))
     reasons = [payload.get("reason_code") for _, payload in watcher.audits]
     assert "direction_claim_won" in reasons
     assert "direction_claim_lost" in reasons

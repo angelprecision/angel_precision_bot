@@ -755,6 +755,13 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             return None
         return key
 
+    def _open_protection_key(self, watched):
+        """Keep market-open protection aligned with directional ownership."""
+        key = self._direction_key(watched)
+        if key is not None:
+            return ("direction", *key)
+        return ("legacy", str(getattr(watched, "ticker", "") or "").strip().upper())
+
     def _won_direction_claim_winner(self, key):
         """Return a still-owned winner, clearing only stale process-local claims."""
         if key is None:
@@ -999,7 +1006,10 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                     # durable row becomes readable/terminal.  Keep a genuine
                     # same-poll ordering ambiguity fail-closed, but clear the
                     # retryable claim so the normal proof path runs again.
-                    if claim.get("reason") == "opposite_cancellation_unproven":
+                    if claim.get("reason") in {
+                        "opposite_cancellation_unproven",
+                        "winner_authority_unproven",
+                    }:
                         with self._direction_claim_gate:
                             self._direction_claims.pop(key, None)
                         claim = {}
@@ -1040,6 +1050,31 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 for loser in triggered:
                     if loser is not winner and loser not in losers:
                         losers.append(loser)
+
+                # A loser must never be canceled while the selected winner's
+                # trigger authority exists only in process memory.  Persist the
+                # winner first; a false return/exception is a fail-closed HOLD.
+                if losers and not self._persist_trigger_confirmation_authority(winner):
+                    with self._direction_claim_gate:
+                        self._direction_claims[key] = {
+                            "status": "ambiguous_hold",
+                            "reason": "winner_authority_unproven",
+                        }
+                    self._set_direction_hold(
+                        winner,
+                        key,
+                        "direction_claim_authority_unproven_hold",
+                        "winner_confirmed_trigger_authority_not_durable",
+                    )
+                    for watched in triggered:
+                        if watched is not winner:
+                            self._set_direction_hold(
+                                watched,
+                                key,
+                                "direction_claim_authority_unproven_hold",
+                                "winner_confirmed_trigger_authority_not_durable",
+                            )
+                    continue
 
                 cancel_failure = None
                 for loser in losers:
