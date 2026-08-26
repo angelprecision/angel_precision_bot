@@ -48,6 +48,9 @@ except ImportError:
 log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+_CONTRACT_DEFERRED_PLACEHOLDER = "DEFERRED_PLACEHOLDER"
+_CONTRACT_REAL_OCC = "REAL_OCC"
+_CONTRACT_INVALID = "INVALID_CONTRACT"
 
 
 def _normalize_execution_mode(value) -> str | None:
@@ -1846,12 +1849,12 @@ class APExecutionCore:
             _order_contract = str(
                 order.get("contract") or sig.get("contract_symbol") or ""
             ).strip()
-            _is_deferred_placeholder = bool(
-                _order_meta.get("contract_deferred")
-                or self._is_deferred_contract(
+            _is_deferred_placeholder = (
+                self._classify_contract(
                     _order_contract,
                     str(order.get("symbol") or watched.ticker),
                 )
+                == _CONTRACT_DEFERRED_PLACEHOLDER
             )
             _recovered_cost = reserved if reserved > 0 else (
                 limit_price * qty * 100 if limit_price > 0 and qty > 0 else 0.0
@@ -1922,22 +1925,63 @@ class APExecutionCore:
         return bool(_OCC_CONTRACT_RE.search(contract_symbol))
 
     @staticmethod
+    def _classify_contract(contract_symbol: str, ticker: str = "") -> str:
+        """Classify contract identity without treating corruption as deferred.
+
+        A deferred placeholder is an intentionally unmaterialized contract:
+        empty, the underlying ticker, or a DEFERRED:* marker.  A non-OCC value
+        outside those shapes is invalid and must fail closed before selector or
+        broker work.  These states are deliberately not represented as a
+        boolean because INVALID_CONTRACT is not a materialization request.
+        """
+        _contract = str(contract_symbol or "").strip().upper()
+        _ticker = str(ticker or "").strip().upper()
+        if (
+            not _contract
+            or _contract.startswith("DEFERRED:")
+            or (_ticker and _contract == _ticker)
+        ):
+            return _CONTRACT_DEFERRED_PLACEHOLDER
+        if APExecutionCore._is_real_occ_contract(_contract, _ticker):
+            return _CONTRACT_REAL_OCC
+        return _CONTRACT_INVALID
+
+    @staticmethod
     def _is_deferred_contract(contract_symbol: str, ticker: str = "") -> bool:
-        """Return the single canonical placeholder/non-OCC classification."""
-        return not APExecutionCore._is_real_occ_contract(contract_symbol, ticker)
+        """Return whether the contract is an intentional placeholder."""
+        return (
+            APExecutionCore._classify_contract(contract_symbol, ticker)
+            == _CONTRACT_DEFERRED_PLACEHOLDER
+        )
 
     @staticmethod
     def _plan_is_deferred(plan, ticker: str = "") -> bool:
-        """Return whether a plan still needs breach-time contract materialization."""
+        """Return whether a plan still needs breach-time materialization.
+
+        A real OCC identity is normally already materialized.  The one
+        explicit exception is a durable selector-retry plan: recovery can
+        carry forward the last real contract while its metadata still proves
+        that the deferred-breach lifecycle is in flight (or that the
+        selector attempt must be rerun).  Those lifecycle markers are not
+        accepted for arbitrary contracts and never make INVALID_CONTRACT
+        selector-eligible.
+        """
         if plan is None:
+            return False
+        _contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        _classification = APExecutionCore._classify_contract(_contract, ticker)
+        if _classification == _CONTRACT_DEFERRED_PLACEHOLDER:
+            return True
+        if _classification != _CONTRACT_REAL_OCC:
             return False
         _meta = getattr(plan, "metadata", None) or {}
         if not isinstance(_meta, dict):
-            _meta = {}
-        _contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+            return False
         return bool(
-            _meta.get("contract_deferred")
-            or APExecutionCore._is_deferred_contract(_contract, ticker)
+            _meta.get("contract_deferred") is True
+            or _meta.get("deferred_breach_selection") is True
+            or str(_meta.get("selection_context") or "").strip().lower()
+            == "deferred_breach_retry"
         )
 
     def _refresh_hydrated_prebreach_plan(
@@ -2139,13 +2183,24 @@ class APExecutionCore:
         ticker = watched.ticker
         signal_id = str(sig.get("signal_id", "") or "")
 
+        def _record_breach_signal(fields: dict) -> None:
+            """Record non-owned callback diagnostics only after its owner CAS.
+
+            A deferred callback that already claimed materialization ownership
+            must let the owner/generation terminal CAS decide durable truth.
+            Writing ap_signals here would leave a split lifecycle if that CAS
+            loses a race after this method returns False.
+            """
+            if deferred_materialization_claimed or not signal_id:
+                return
+            self.store.update_signal_fields(signal_id, fields)
+
         if getattr(self, "_kill_switch", False):
             log.critical("[%s] Breach blocked — execution core kill switch active", ticker)
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": "kill_switch_active_at_breach",
-                })
+            _record_breach_signal({
+                "decision_status": "blocked_at_breach",
+                "context_notes": "kill_switch_active_at_breach",
+            })
             self._emit_breach_diag(
                 "BREACH_RISK_CHECK_BLOCKED",
                 watched=watched,
@@ -2160,11 +2215,10 @@ class APExecutionCore:
                 kill_fn = getattr(self.master_control, "_kill_switch_fn", None)
                 if kill_fn and kill_fn():
                     log.critical("[%s] Breach blocked — master control kill switch active", ticker)
-                    if signal_id:
-                        self.store.update_signal_fields(signal_id, {
-                            "decision_status": "blocked_at_breach",
-                            "context_notes": "master_control_kill_switch_active_at_breach",
-                        })
+                    _record_breach_signal({
+                        "decision_status": "blocked_at_breach",
+                        "context_notes": "master_control_kill_switch_active_at_breach",
+                    })
                     self._emit_breach_diag(
                         "BREACH_RISK_CHECK_BLOCKED",
                         watched=watched,
@@ -2193,14 +2247,13 @@ class APExecutionCore:
                 "[%s] No slot at breach time — open=%s pending=%s max=%s. Blocking queued entry.",
                 ticker, open_count, pending_entries, self._max_positions,
             )
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": (
-                        f"positions_full_at_breach open={open_count} "
-                        f"pending={pending_entries} max={self._max_positions}"
-                    ),
-                })
+            _record_breach_signal({
+                "decision_status": "blocked_at_breach",
+                "context_notes": (
+                    f"positions_full_at_breach open={open_count} "
+                    f"pending={pending_entries} max={self._max_positions}"
+                ),
+            })
             if not deferred_materialization_claimed:
                 try:
                     self._cleanup_pending_entry_order(
@@ -2240,11 +2293,10 @@ class APExecutionCore:
                     "[%s] LIVE BREACH BLOCK — _approved_plan missing; cannot revalidate exposure safely",
                     ticker,
                 )
-                if signal_id:
-                    self.store.update_signal_fields(signal_id, {
-                        "decision_status": "blocked_at_breach",
-                        "context_notes": msg,
-                    })
+                _record_breach_signal({
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": msg,
+                })
                 _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
                 self._emit_breach_diag(
                     "BREACH_RISK_CHECK_BLOCKED",
@@ -2260,10 +2312,9 @@ class APExecutionCore:
                 "[%s] PAPER BREACH WARNING — _approved_plan missing; continuing without exposure revalidation",
                 ticker,
             )
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "context_notes": msg + "_paper_fail_open",
-                })
+            _record_breach_signal({
+                "context_notes": msg + "_paper_fail_open",
+            })
 
         _plan_mode = _normalize_execution_mode(
             getattr(approved_plan, "execution_mode", None)
@@ -2275,24 +2326,24 @@ class APExecutionCore:
             )
             or sig.get("execution_mode")
         )
-        _deferred_live = bool(
+        _deferred_unmaterialized = bool(
             approved_plan is not None
-            and _plan_mode == "live"
             and self._plan_is_deferred(approved_plan, ticker)
         )
-        if _deferred_live:
+        if _deferred_unmaterialized:
             log.info(
                 "DEFERRED_BREACH_CAPACITY_GATE_DEFERRED "
-                "ticker=%s signal_id=%s execution_mode=live "
+                "ticker=%s signal_id=%s execution_mode=%s "
                 "reason=real_contract_cost_not_materialized",
                 ticker,
                 signal_id,
+                _plan_mode or "unknown",
             )
 
         if (
             approved_plan is not None
             and self.master_control is not None
-            and not _deferred_live
+            and not _deferred_unmaterialized
         ):
             try:
                 reval = self.master_control.revalidate_exposure(
@@ -2302,11 +2353,10 @@ class APExecutionCore:
                 if not getattr(reval, "ok", False):
                     reason = getattr(reval, "reason", "revalidation_failed")
                     log.info("[%s] Breach exposure revalidation blocked: %s", ticker, reason)
-                    if signal_id:
-                        self.store.update_signal_fields(signal_id, {
-                            "decision_status": "blocked_at_breach",
-                            "context_notes": f"exposure_revalidation={reason}",
-                        })
+                    _record_breach_signal({
+                        "decision_status": "blocked_at_breach",
+                        "context_notes": f"exposure_revalidation={reason}",
+                    })
                     _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
                     # Best-effort capacity numbers for diagnostics
                     _cur_total_exp = (
@@ -2340,11 +2390,10 @@ class APExecutionCore:
                         "[%s] LIVE BREACH BLOCK — exposure revalidation errored: %s",
                         ticker, exc,
                     )
-                    if signal_id:
-                        self.store.update_signal_fields(signal_id, {
-                            "decision_status": "blocked_at_breach",
-                            "context_notes": f"exposure_revalidation_error={exc}",
-                        })
+                    _record_breach_signal({
+                        "decision_status": "blocked_at_breach",
+                        "context_notes": f"exposure_revalidation_error={exc}",
+                    })
                     _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
                     self._emit_breach_diag(
                         "BREACH_RISK_CHECK_EXCEPTION",
@@ -4153,6 +4202,32 @@ class APExecutionCore:
         sig = watched.signal or {}
         ticker = watched.ticker
         signal_id = str(sig.get("signal_id", "") or "")
+        # These are deliberately initialized before the nested terminal
+        # helpers.  Deferred terminal diagnostics are staged in memory until
+        # the exact owner/generation terminal CAS succeeds; this prevents a
+        # losing callback from publishing split signal/order truth.
+        _deferred = False
+        _deferred_callback_staging = False
+        _deferred_terminal_meta: dict = {}
+        _deferred_terminal_queue_error: dict | None = None
+        _deferred_trigger_status_pending = False
+
+        def _flush_deferred_trigger_status() -> None:
+            """Publish the trigger marker only after durable authority wins."""
+            nonlocal _deferred_trigger_status_pending
+            if not _deferred_trigger_status_pending or not signal_id:
+                return
+            try:
+                self.store.update_status(
+                    signal_id, "triggered", timestamp_flag="triggered_at"
+                )
+            except Exception as _status_exc:
+                log.warning(
+                    "[%s] deferred trigger status write failed after authority: %s",
+                    ticker,
+                    _status_exc,
+                )
+            _deferred_trigger_status_pending = False
 
         # Recovery ownership must exist before the first policy gate.  Store one
         # immutable context on the callback payload so every cleanup path uses
@@ -4357,10 +4432,6 @@ class APExecutionCore:
             trigger_price_for_log,
         )
 
-        if signal_id:
-            self.store.update_status(signal_id, "triggered", timestamp_flag="triggered_at")
-        funnel.inc("watcher_triggered")
-
         # Establish the durable entry identity before any generic breach-risk
         # policy.  Deferred callbacks must prove the materialization owner
         # before kill-switch/position cleanup, capacity, selector, or exposure
@@ -4415,15 +4486,20 @@ class APExecutionCore:
             approved_plan = _recover_plan(watched)
         else:
             approved_plan = sig.get("_approved_plan")
-        _preclaim_meta = getattr(approved_plan, "metadata", None) or {}
-        if not isinstance(_preclaim_meta, dict):
-            _preclaim_meta = {}
         _preclaim_contract = str(
             getattr(approved_plan, "contract_symbol", "") or ""
         ).strip()
-        _deferred_classifier = getattr(self, "_is_deferred_contract", None)
-        if not callable(_deferred_classifier):
-            _deferred_classifier = APExecutionCore._is_deferred_contract
+        _contract_classifier = getattr(self, "_classify_contract", None)
+        if not callable(_contract_classifier):
+            _contract_classifier = APExecutionCore._classify_contract
+        _preclaim_contract_state = _contract_classifier(
+            _preclaim_contract,
+            ticker,
+        )
+        _preclaim_retry_materialization = bool(
+            _preclaim_contract_state == _CONTRACT_REAL_OCC
+            and APExecutionCore._plan_is_deferred(approved_plan, ticker)
+        )
         _materialization_callback = not (
             _is_recovered and _ownership_kind == "broker_ready_recovery"
         )
@@ -4431,11 +4507,11 @@ class APExecutionCore:
             _materialization_callback
             and approved_plan is not None
             and (
-                bool(_preclaim_meta.get("contract_deferred"))
-                or bool(sig.get("contract_deferred"))
-                or _deferred_classifier(_preclaim_contract, ticker)
+                _preclaim_contract_state == _CONTRACT_DEFERRED_PLACEHOLDER
+                or _preclaim_retry_materialization
             )
         )
+        _deferred_callback_staging = _preclaim_deferred
         _preclaim_mode = _normalize_execution_mode(
             getattr(approved_plan, "execution_mode", None)
             or getattr(approved_plan, "mode", None)
@@ -4443,6 +4519,9 @@ class APExecutionCore:
         )
         _skip_breach_risk_for_invalid_deferred = bool(
             _preclaim_deferred and _preclaim_mode is None
+        )
+        _skip_breach_risk_for_invalid_contract = (
+            _preclaim_contract_state == _CONTRACT_INVALID
         )
 
         if _preclaim_deferred and _preclaim_mode is not None:
@@ -4477,10 +4556,30 @@ class APExecutionCore:
             )
             _pv_row = _preclaim_result.get("row")
 
+        # Do not mutate the signal before a deferred materializer has acquired
+        # its durable owner.  A duplicate callback or a lost claim is a
+        # passive/no-op outcome and must not leave a triggered signal behind.
+        # Ordinary and successfully claimed deferred callbacks retain the
+        # historical trigger marker.
+        if (
+            (not _preclaim_deferred and not _skip_breach_risk_for_invalid_contract)
+            or _deferred_preclaimed
+        ):
+            if _deferred_preclaimed:
+                _deferred_trigger_status_pending = bool(signal_id)
+            elif signal_id:
+                self.store.update_status(
+                    signal_id, "triggered", timestamp_flag="triggered_at"
+                )
+            funnel.inc("watcher_triggered")
+
         # Revalidate only after the deferred callback has an exact durable
         # owner.  Duplicate callbacks return from the preclaim above and never
         # enter this policy gate.
-        if _skip_breach_risk_for_invalid_deferred:
+        if (
+            _skip_breach_risk_for_invalid_deferred
+            or _skip_breach_risk_for_invalid_contract
+        ):
             _breach_risk_allowed = True
         elif _deferred_preclaimed:
             _risk_check = self._breach_risk_check
@@ -4554,6 +4653,8 @@ class APExecutionCore:
                             queue_local_order_id,
                             _risk_terminalize_exc,
                         )
+                if _risk_terminalized:
+                    _flush_deferred_trigger_status()
                 if _risk_terminalized and signal_id:
                     self.store.update_signal_fields(signal_id, {
                         "decision_status": "blocked_at_breach",
@@ -4563,6 +4664,7 @@ class APExecutionCore:
                     return {
                         "disposition": "KEEP_WATCHER",
                         "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+                        "ownership_lost": True,
                         "retry_after_seconds": 5,
                     }
                 return {
@@ -4596,7 +4698,7 @@ class APExecutionCore:
             decision_status: str = "blocked_at_breach",
             context_notes: str | None = None,
             funnel_key: str = "order_failed",
-        ) -> None:
+        ) -> dict | None:
             if _ownership_context.get("is_recovered"):
                 # Recovery terminal truth belongs to the exact callback owner.
                 # Never write generic diagnostics or signal state before its
@@ -4605,6 +4707,7 @@ class APExecutionCore:
                     watched, action=cleanup_action, reason=reason,
                 )
                 if _recovered_ok:
+                    _flush_deferred_trigger_status()
                     if funnel_key:
                         funnel.inc(funnel_key)
                     if signal_id:
@@ -4613,43 +4716,145 @@ class APExecutionCore:
                             "context_notes": context_notes or reason,
                         })
                 return
-            if funnel_key:
-                funnel.inc(funnel_key)
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": decision_status,
-                    "context_notes": context_notes or reason,
-                })
             _claim_owner = str(_deferred_claim_context.get("owner") or "")
             _claim_generation = _deferred_claim_context.get("generation")
             _atomic_terminalize = getattr(
                 self.order_state_machine, "terminalize_deferred_breach", None,
             )
-            if _claim_owner and callable(_atomic_terminalize):
+            _terminal_meta = dict(_deferred_terminal_meta)
+            if meta_patch:
+                _terminal_meta.update(meta_patch)
+            if _deferred_preclaimed or _claim_owner:
+                # A claimed deferred attempt has only one legal terminal
+                # writer: the exact owner/generation CAS.  If it loses the
+                # race, do not write signal/meta state and do not invoke a
+                # generic cleanup method against a newer owner.
+                if not _claim_owner or not callable(_atomic_terminalize):
+                    log.critical(
+                        "[%s] deferred terminal CAS unavailable order=%s — "
+                        "retaining watcher ownership",
+                        ticker,
+                        queue_local_order_id,
+                    )
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "MATERIALIZATION_TERMINAL_CAS_UNAVAILABLE",
+                        "retry_after_seconds": 5,
+                    }
                 try:
-                    if _atomic_terminalize(
+                    _terminalized = bool(_atomic_terminalize(
                         queue_local_order_id,
                         reason_code=str(reason or "UNKNOWN_BREACH_FAILURE"),
                         terminal_status=("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
                         owner=_claim_owner,
                         generation=_claim_generation,
-                        diagnostics=meta_patch or {},
-                    ):
-                        return {
-                            "disposition": "TERMINAL_DURABLE",
-                            "reason_code": str(reason or "UNKNOWN_BREACH_FAILURE"),
-                            "terminal_status": ("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
-                        }
+                        diagnostics=_terminal_meta,
+                    ))
                 except Exception as _atomic_terminal_exc:
                     log.critical(
                         "[%s] breach atomic terminal write failed order=%s error=%s",
                         ticker, queue_local_order_id, _atomic_terminal_exc,
                     )
+                    _terminalized = False
+                if not _terminalized:
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+                        "ownership_lost": True,
+                        "retry_after_seconds": 5,
+                    }
+                _flush_deferred_trigger_status()
+                _flush_deferred_meta_after_terminal(_terminal_meta)
+                if funnel_key:
+                    funnel.inc(funnel_key)
+                if signal_id:
+                    _signal_patch = {}
+                    _signal_patch.update({
+                        "decision_status": decision_status,
+                        "context_notes": context_notes or reason,
+                    })
+                    self.store.update_signal_fields(signal_id, _signal_patch)
+                _flush_deferred_queue_error()
+                return {
+                    "disposition": "TERMINAL_DURABLE",
+                    "reason_code": str(reason or "UNKNOWN_BREACH_FAILURE"),
+                    "terminal_status": (
+                        "CANCELED" if cleanup_action == "cancel" else "EXPIRED"
+                    ),
+                }
+
+            # A deferred failure that occurs before ownership is acquired
+            # still uses the deferred terminal authority so the normal watcher
+            # expiry guard cannot strand a queued placeholder.  If that write
+            # cannot prove success, keep the watcher and perform no fallback
+            # mutation.
+            if _deferred:
+                if not callable(_atomic_terminalize):
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "MATERIALIZATION_TERMINAL_CAS_UNAVAILABLE",
+                        "retry_after_seconds": 5,
+                    }
+                try:
+                    _terminalized = bool(_atomic_terminalize(
+                        queue_local_order_id,
+                        reason_code=str(reason or "UNKNOWN_DEFERRED_BREACH_FAILURE"),
+                        terminal_status=("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
+                        owner="",
+                        generation=None,
+                        diagnostics=_terminal_meta,
+                    ))
+                except Exception as _unclaimed_terminal_exc:
+                    log.critical(
+                        "[%s] unclaimed deferred terminal write failed order=%s error=%s",
+                        ticker,
+                        queue_local_order_id,
+                        _unclaimed_terminal_exc,
+                    )
+                    _terminalized = False
+                if not _terminalized:
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+                        "retry_after_seconds": 5,
+                    }
+                _flush_deferred_trigger_status()
+                _flush_deferred_meta_after_terminal(_terminal_meta)
+                if funnel_key:
+                    funnel.inc(funnel_key)
+                if signal_id:
+                    _signal_patch = {}
+                    _signal_patch.update({
+                        "decision_status": decision_status,
+                        "context_notes": context_notes or reason,
+                    })
+                    self.store.update_signal_fields(signal_id, _signal_patch)
+                _flush_deferred_queue_error()
+                return {
+                    "disposition": "TERMINAL_DURABLE",
+                    "reason_code": str(reason or "UNKNOWN_DEFERRED_BREACH_FAILURE"),
+                    "terminal_status": (
+                        "CANCELED" if cleanup_action == "cancel" else "EXPIRED"
+                    ),
+                }
+
+            # No deferred owner exists. Preserve the established generic
+            # cleanup path for ordinary non-deferred callbacks and for
+            # deferred callbacks that failed before ownership was acquired.
+            if funnel_key:
+                funnel.inc(funnel_key)
+            if signal_id:
+                _signal_patch = {}
+                _signal_patch.update({
+                    "decision_status": decision_status,
+                    "context_notes": context_notes or reason,
+                })
+                self.store.update_signal_fields(signal_id, _signal_patch)
             if queue_local_order_id and self.order_state_machine is not None and meta_patch:
                 try:
                     update_meta = getattr(self.order_state_machine, "update_order_meta", None)
                     if callable(update_meta):
-                        update_meta(queue_local_order_id, meta_patch)
+                        update_meta(queue_local_order_id, _terminal_meta)
                 except Exception as _meta_exc:
                     log.warning("[%s] breach failure meta persist failed: %s", ticker, _meta_exc)
             _cleanup_ok = self._cleanup_pending_entry_order(
@@ -4688,35 +4893,6 @@ class APExecutionCore:
                     meta_patch=meta_patch,
                     context_notes=reason,
                 )
-            _atomic_terminalize = getattr(
-                self.order_state_machine, "terminalize_deferred_breach", None,
-            )
-            if callable(_atomic_terminalize):
-                try:
-                    if _atomic_terminalize(
-                        queue_local_order_id,
-                        reason_code=str(reason or "UNKNOWN_DEFERRED_BREACH_FAILURE"),
-                        terminal_status="EXPIRED",
-                        owner=str(_deferred_claim_context.get("owner") or ""),
-                        generation=_deferred_claim_context.get("generation"),
-                        diagnostics=meta_patch,
-                    ):
-                        if signal_id:
-                            self.store.update_signal_fields(signal_id, {
-                                "decision_status": "blocked_at_breach",
-                                "context_notes": reason,
-                            })
-                        funnel.inc("order_failed")
-                        return {
-                            "disposition": "TERMINAL_DURABLE",
-                            "reason_code": str(reason or "UNKNOWN_DEFERRED_BREACH_FAILURE"),
-                            "terminal_status": "EXPIRED",
-                        }
-                except Exception as _atomic_terminal_exc:
-                    log.critical(
-                        "[%s] deferred terminal CAS failed order=%s error=%s",
-                        ticker, queue_local_order_id, _atomic_terminal_exc,
-                    )
             return _terminalize_breach_failure(
                 reason,
                 cleanup_action="expire",
@@ -4767,6 +4943,176 @@ class APExecutionCore:
             "DEFERRED_ORDER_ROW_UNREADABLE",
         })
         _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
+
+        def _stage_deferred_meta(patch: dict | None) -> None:
+            """Stage deferred terminal metadata until ownership is proven.
+
+            Non-deferred callbacks retain their existing best-effort metadata
+            writer.  A deferred callback must not issue an unfenced terminal
+            metadata write while its owner/generation CAS is still pending.
+            """
+            if not isinstance(patch, dict) or not patch:
+                return
+            # Only a claimed attempt has an owner whose lifecycle writes must
+            # wait for the exact terminal CAS.  A deferred placeholder that
+            # never acquired an owner has no competing materializer to fence;
+            # retain the established diagnostic write path for that case.
+            if _deferred_preclaimed or _deferred_claim_context.get("owner"):
+                _deferred_terminal_meta.update(patch)
+                return
+            _update_meta = getattr(self.order_state_machine, "update_order_meta", None)
+            if callable(_update_meta) and queue_local_order_id:
+                try:
+                    _update_meta(queue_local_order_id, patch)
+                except Exception as _stage_exc:
+                    log.debug(
+                        "[%s] non-deferred terminal metadata persist failed: %s",
+                        ticker,
+                        _stage_exc,
+                    )
+
+        def _stage_deferred_queue_error(
+            *,
+            queue_id,
+            reason_code: str,
+            explanation: str = "",
+            attempt: int = 0,
+        ) -> None:
+            """Defer trade_queue.last_error until the terminal CAS is true."""
+            nonlocal _deferred_terminal_queue_error
+            _payload = {
+                "queue_id": queue_id,
+                "reason_code": str(reason_code or ""),
+                "explanation": str(explanation or ""),
+                "attempt": int(attempt or 0),
+                "client_id": str(_breach_client_id or ""),
+                "ticker": ticker,
+            }
+            if _deferred_preclaimed or _deferred_claim_context.get("owner"):
+                _deferred_terminal_queue_error = _payload
+                return
+            try:
+                from ap.queue import write_deferred_breach_last_error
+                write_deferred_breach_last_error(**_payload)
+            except Exception as _queue_exc:
+                log.debug(
+                    "[%s] non-deferred breach last_error write failed: %s",
+                    ticker,
+                    _queue_exc,
+                )
+
+        def _stage_deferred_selector_attempt_audit(**kwargs) -> None:
+            """Build flat selector audit fields without issuing an OSM write."""
+            try:
+                _flat_fields = _build_flat_selector_audit_fields(**kwargs)
+                _stage_deferred_meta(_flat_fields)
+            except Exception as _flat_exc:
+                log.debug(
+                    "[%s] deferred selector audit staging failed: %s",
+                    ticker,
+                    _flat_exc,
+                )
+
+        def _stage_deferred_materialization_audit(**kwargs) -> None:
+            """Build the existing audit shape without issuing a real OSM write."""
+            try:
+                _sink = SimpleNamespace(
+                    update_order_meta=lambda _local_id, patch: _stage_deferred_meta(patch)
+                )
+                _write_deferred_materialization_audit(
+                    _sink,
+                    queue_local_order_id,
+                    **kwargs,
+                )
+            except Exception as _audit_exc:
+                log.debug(
+                    "[%s] deferred materialization audit staging failed: %s",
+                    ticker,
+                    _audit_exc,
+                )
+
+        def _flush_deferred_queue_error() -> None:
+            """Publish staged queue diagnostics only after terminal CAS success."""
+            if not _deferred_terminal_queue_error:
+                return
+            try:
+                from ap.queue import write_deferred_breach_last_error
+                write_deferred_breach_last_error(**_deferred_terminal_queue_error)
+            except Exception as _queue_exc:
+                log.debug(
+                    "[%s] deferred terminal last_error write failed: %s",
+                    ticker,
+                    _queue_exc,
+                )
+
+        def _flush_deferred_meta_after_terminal(patch: dict | None) -> None:
+            """Merge staged diagnostics only after terminal CAS success."""
+            if (
+                not (_deferred_preclaimed or _deferred_claim_context.get("owner"))
+                or not isinstance(patch, dict)
+                or not patch
+            ):
+                return
+            _update_meta = getattr(self.order_state_machine, "update_order_meta", None)
+            if not callable(_update_meta) or not queue_local_order_id:
+                return
+            try:
+                _update_meta(queue_local_order_id, dict(patch))
+            except Exception as _meta_exc:
+                # The terminal CAS already established lifecycle truth. A
+                # diagnostic merge failure must not turn a terminal row back
+                # into a retry or invoke any generic cleanup fallback.
+                log.warning(
+                    "[%s] deferred post-terminal metadata flush failed order=%s: %s",
+                    ticker,
+                    queue_local_order_id,
+                    _meta_exc,
+                )
+
+        def _flush_deferred_meta_after_submit(local_order_id: str | None) -> None:
+            """Publish staged deferred metadata only after OSM accepted submit."""
+            if (
+                not (_deferred_preclaimed or _deferred_claim_context.get("owner"))
+                or not _deferred_terminal_meta
+                or not local_order_id
+            ):
+                return
+            _update_meta = getattr(self.order_state_machine, "update_order_meta", None)
+            if not callable(_update_meta):
+                return
+            try:
+                _update_meta(local_order_id, dict(_deferred_terminal_meta))
+            except Exception as _meta_exc:
+                log.warning(
+                    "[%s] deferred post-submit metadata flush failed order=%s: %s",
+                    ticker,
+                    local_order_id,
+                    _meta_exc,
+                )
+
+        def _stamp_failed_terminal_after_cas(
+            *, reason_code: str, attempt: int, selector_failure: dict
+        ) -> None:
+            """Retain the established terminal audit, but only after CAS."""
+            try:
+                from ap.deferred_materializer import stamp_failed_terminal
+                stamp_failed_terminal(
+                    self.order_state_machine,
+                    str(queue_local_order_id or ""),
+                    client_id=str(_breach_client_id or ""),
+                    execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                    symbol=ticker,
+                    direction=str(getattr(approved_plan, "side", "") or ""),
+                    reason_code=str(reason_code or ""),
+                    attempt=int(attempt or 0),
+                    selector_failure=selector_failure or {},
+                )
+            except Exception as _stamp_exc:
+                log.debug(
+                    "[%s] deferred failed-terminal audit persist non-critical: %s",
+                    ticker,
+                    _stamp_exc,
+                )
 
         def _emit_deferred_progress(
             outcome: str,
@@ -4853,50 +5199,32 @@ class APExecutionCore:
                     log.warning("DEFERRED_TRIGGER_OUTCOME_EMIT_FAILED outcome=%s", outcome)
                 except Exception:
                     pass
-            # ── P0 (monday-trade-flow-readiness, amended): persist the
-            # canonical materialization outcome onto the order row so the operator can
-            # answer "what happened to this deferred trigger?" from
-            # orders.meta alone — no log spelunking. Best-effort, never
-            # raises, exactly-once by construction (this emitter is the
-            # exactly-once terminal channel). Selected bid/ask/mid and the
-            # final submit limit arrive via `extra` from the call sites and
-            # are merged verbatim.
+            # ── P0 (monday-trade-flow-readiness, amended): stage the canonical
+            # materialization outcome for the owner-fenced terminal write.  It
+            # must not be persisted before the exact owner/generation CAS: a
+            # losing callback cannot publish terminal-looking order metadata.
             try:
-                if queue_local_order_id and self.order_state_machine is not None:
-                    _update_meta = getattr(
-                        self.order_state_machine, "update_order_meta", None
-                    )
-                    if callable(_update_meta):
-                        # P0 amendment #2 (PR #294 review): submit-cap
-                        # terminals reuse the external UNTRADEABLE_FOR_ACCOUNT_SIZE
-                        # code (operator vocabulary continuity) but need to
-                        # preserve their fine-grained detail
-                        # (ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT vs
-                        # ACCEPTANCE_CAP_MISCONFIGURED). When the caller
-                        # supplies materialization_detail_override in extra,
-                        # it wins over the raw outcome string; otherwise the
-                        # raw outcome remains the detail. Never becomes the
-                        # OUTCOME — mapping to MATERIALIZED_AND_SUBMITTED /
-                        # TERMINAL_NO_TRADEABLE_CONTRACT still keys off
-                        # `outcome`, not the override.
-                        _detail = outcome
-                        if extra and "materialization_detail_override" in extra:
-                            _detail = str(extra.get("materialization_detail_override") or outcome)
-                        _canon_meta: dict = {
-                            "entry_path": _MATERIALIZATION_ENTRY_PATH,
-                            "materialization_outcome": _canonical_materialization_outcome(outcome),
-                            "materialization_detail": _detail,
-                            "materialization_reason": reason or "",
-                            "materialization_contract": contract or "",
-                            "materialization_broker_order_id": broker_order_id or "",
-                            "materialization_ts": datetime.now(timezone.utc).isoformat(),
-                        }
-                        if extra:
-                            for _mk, _mv in extra.items():
-                                if _mk == "materialization_detail_override":
-                                    continue  # already consumed above
-                                _canon_meta.setdefault(f"materialization_{_mk}", _mv)
-                        _update_meta(queue_local_order_id, _canon_meta)
+                # P0 amendment #2 (PR #294 review): submit-cap terminals reuse
+                # the external UNTRADEABLE_FOR_ACCOUNT_SIZE code while retaining
+                # their fine-grained materialization detail.
+                _detail = outcome
+                if extra and "materialization_detail_override" in extra:
+                    _detail = str(extra.get("materialization_detail_override") or outcome)
+                _canon_meta: dict = {
+                    "entry_path": _MATERIALIZATION_ENTRY_PATH,
+                    "materialization_outcome": _canonical_materialization_outcome(outcome),
+                    "materialization_detail": _detail,
+                    "materialization_reason": reason or "",
+                    "materialization_contract": contract or "",
+                    "materialization_broker_order_id": broker_order_id or "",
+                    "materialization_ts": datetime.now(timezone.utc).isoformat(),
+                }
+                if extra:
+                    for _mk, _mv in extra.items():
+                        if _mk == "materialization_detail_override":
+                            continue
+                        _canon_meta.setdefault(f"materialization_{_mk}", _mv)
+                _stage_deferred_meta(_canon_meta)
             except Exception as _canon_exc:
                 try:
                     log.debug(
@@ -4930,7 +5258,11 @@ class APExecutionCore:
                 client_id=_breach_client_id,
                 local_order_id=str(queue_local_order_id or ""),
                 plan=approved_plan,  # Req 1: plan passed for canonical snapshot build
-                order_meta_writer=getattr(self.order_state_machine, "update_order_meta", None),
+                order_meta_writer=(
+                    (lambda _local_id, _patch: _stage_deferred_meta(_patch))
+                    if _deferred_callback_staging
+                    else getattr(self.order_state_machine, "update_order_meta", None)
+                ),
                 ticker=ticker,
             )
         except Exception as _eid_exc:
@@ -5025,11 +5357,15 @@ class APExecutionCore:
         )
         _candidate_audit = None  # Item 3 — set if breach-time selection runs
         _contract_sym_raw = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
-        _deferred   = (
-            bool(_sig_meta.get("contract_deferred"))
-            or bool(_sig_dict.get("contract_deferred"))
-            or self._is_deferred_contract(_contract_sym_raw, ticker)
+        _contract_state = _contract_classifier(_contract_sym_raw, ticker)
+        # Contract identity is authoritative.  Metadata may explain why a
+        # placeholder was expected, but it must never turn an arbitrary
+        # string into a selector/broker-eligible contract.
+        _deferred = bool(
+            _contract_state == _CONTRACT_DEFERRED_PLACEHOLDER
+            or APExecutionCore._plan_is_deferred(approved_plan, ticker)
         )
+        _invalid_contract = _contract_state == _CONTRACT_INVALID
         # Enable deferred-outcome emission only for deferred triggers (amendment:
         # guard deferred logs with _deferred). Non-deferred entries never emit a
         # deferred terminal outcome.
@@ -5040,6 +5376,31 @@ class APExecutionCore:
             or _sig_dict.get("execution_mode")
         )
         _deferred_capacity: dict = {}
+
+        if _invalid_contract:
+            _reason = "INVALID_CONTRACT_IDENTITY"
+            _invalid_extra = {
+                "failure_stage": "contract_identity_validation",
+                "contract_classification": _CONTRACT_INVALID,
+                "invalid_contract_symbol": _contract_sym_raw,
+                "client_id": _breach_client_id,
+                "signal_id": signal_id,
+                "execution_mode": _deferred_mode or "",
+                "selector_calls": 0,
+                "broker_post_count": 0,
+            }
+            log.critical(
+                "[%s] PRODUCTION_ENTRY_BLOCK — invalid contract identity "
+                "order=%s contract=%r; selector and broker paths blocked",
+                ticker,
+                queue_local_order_id,
+                _contract_sym_raw,
+            )
+            return _terminalize_breach_failure(
+                _reason,
+                meta_patch=_invalid_extra,
+                context_notes=_reason,
+            )
 
         if _deferred and _deferred_mode is None:
             _reason = "metadata_invalid:unknown_execution_mode"
@@ -6125,26 +6486,16 @@ class APExecutionCore:
                             reason=_cap_reason,
                             contract=_sel_contract,
                         )
-                        # Write breach last error to trade_queue BEFORE terminalizing
-                        # so Supabase shows the cap reason without reading Render logs.
-                        try:
-                            from ap.queue import write_deferred_breach_last_error
-                            _cap_queue_id = (
+                        _stage_deferred_queue_error(
+                            queue_id=(
                                 sig.get("queue_id")
                                 or sig.get("trade_queue_id")
                                 or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
-                            )
-                            write_deferred_breach_last_error(
-                                _cap_queue_id,
-                                reason_code=f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}",
-                                explanation=f"acceptance cap misconfigured: {_cap_error}",
-                                attempt=1,
-                                client_id=_breach_client_id,
-                                ticker=ticker,
-                            )
-                        except Exception as _cap_obs_exc:
-                            log.debug("[%s] cap misconfigured queue write non-critical: %s",
-                                      ticker, _cap_obs_exc)
+                            ),
+                            reason_code=f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}",
+                            explanation=f"acceptance cap misconfigured: {_cap_error}",
+                            attempt=1,
+                        )
                         return _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
@@ -6169,29 +6520,19 @@ class APExecutionCore:
                             reason=_cap_reason,
                             contract=_sel_contract,
                         )
-                        # Write breach last error to trade_queue BEFORE terminalizing
-                        # so Supabase shows the cap block reason without reading Render logs.
-                        try:
-                            from ap.queue import write_deferred_breach_last_error
-                            _cap_queue_id2 = (
+                        _stage_deferred_queue_error(
+                            queue_id=(
                                 sig.get("queue_id")
                                 or sig.get("trade_queue_id")
                                 or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
-                            )
-                            write_deferred_breach_last_error(
-                                _cap_queue_id2,
-                                reason_code="ACCEPTANCE_ASK_CAP_EXCEEDED",
-                                explanation=(
-                                    f"acceptance ask cap exceeded: ask={_sel_ask:.2f} "
-                                    f"cap={_accept_cap:.2f} contract={_sel_contract}"
-                                ),
-                                attempt=1,
-                                client_id=_breach_client_id,
-                                ticker=ticker,
-                            )
-                        except Exception as _cap_obs_exc2:
-                            log.debug("[%s] cap exceeded queue write non-critical: %s",
-                                      ticker, _cap_obs_exc2)
+                            ),
+                            reason_code="ACCEPTANCE_ASK_CAP_EXCEEDED",
+                            explanation=(
+                                f"acceptance ask cap exceeded: ask={_sel_ask:.2f} "
+                                f"cap={_accept_cap:.2f} contract={_sel_contract}"
+                            ),
+                            attempt=1,
+                        )
                         return _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
@@ -6654,6 +6995,7 @@ class APExecutionCore:
                                 "reason_code": "MATERIALIZATION_RETRY_SCHEDULE_WRITE_FAILED",
                                 "retry_after_seconds": 5,
                             }
+                        _flush_deferred_trigger_status()
 
                         try:
                             _ap_meta_a = getattr(approved_plan, "metadata", None)
@@ -6748,22 +7090,6 @@ class APExecutionCore:
                         "client=%s ticker=%s reason=%s",
                         _breach_client_id, ticker, _reason,
                     )
-                    # P0 (PR #300): stamp FAILED_TERMINAL lifecycle state.
-                    try:
-                        from ap.deferred_materializer import stamp_failed_terminal
-                        stamp_failed_terminal(
-                            self.order_state_machine,
-                            str(queue_local_order_id or ""),
-                            client_id=str(_breach_client_id or ""),
-                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                            symbol=ticker,
-                            direction=str(getattr(approved_plan, "side", "") or ""),
-                            reason_code=str(_decision_a.get("terminal_reason") or _reason or ""),
-                            attempt=int(_this_attempt_a),
-                            selector_failure=_deferred_selector_audit or {},
-                        )
-                    except Exception as _ft_exc:
-                        log.debug("[%s] stamp_failed_terminal non-critical: %s", ticker, _ft_exc)
                     _final_reason_a = str(_decision_a.get("terminal_reason") or _reason)
                     _emit_deferred_outcome(
                         (
@@ -6774,77 +7100,62 @@ class APExecutionCore:
                         reason=_final_reason_a,
                         extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
                     )
-                    # ── PR #182 + P0: write selector failure to trade_queue.last_error ──
-                    try:
-                        from ap.queue import write_deferred_breach_last_error
-                        _queue_id_for_obs = (
+                    # Stage selector diagnostics; the exact owner/generation
+                    # terminal CAS below is the first durable terminal writer.
+                    _stage_deferred_queue_error(
+                        queue_id=(
                             sig.get("queue_id")
                             or sig.get("trade_queue_id")
                             or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
-                        )
-                        write_deferred_breach_last_error(
-                            _queue_id_for_obs,
-                            reason_code=(
-                                _decision_a.get("terminal_reason")
-                                or str(_obs_rc_a)
-                            ),
-                            explanation=(
-                                _decision_a.get("terminal_reason")
-                                or str(_reason or "")
-                            )[:400],
-                            attempt=_this_attempt_a,
-                            client_id=_breach_client_id,
-                            ticker=ticker,
-                        )
-                        try:
-                            _upd_a = getattr(self.order_state_machine, "update_order_meta", None)
-                            if callable(_upd_a) and queue_local_order_id:
-                                _upd_a(queue_local_order_id, {
-                                    "breach_attempt_count":            _this_attempt_a,
-                                    "last_breach_failure_reason":      str(
-                                        _decision_a.get("terminal_reason") or _reason or ""
-                                    ),
-                                    "last_breach_failure_reason_code": str(_obs_rc_a),
-                                    "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
-                                    "contract_selection_status":       _cs_status_a,
-                                    **(
-                                        _build_deferred_retry_terminal_meta(
-                                            terminal_reason=str(_decision_a.get("terminal_reason") or ""),
-                                            reason_code=_obs_rc_a,
-                                            selector_audit=_deferred_selector_audit or {},
-                                            attempt=_this_attempt_a,
-                                            max_attempts=_MAX_RETRIES_A,
-                                            client_id=_breach_client_id,
-                                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                                            local_order_id=str(queue_local_order_id or ""),
-                                            signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
-                                        )
-                                        if _decision_a["retryable_reason"]
-                                        else {
-                                            "last_breach_selector_audit": _deferred_selector_audit or {},
-                                        }
-                                    ),
-                                })
-                        except Exception as _ma_exc:
-                            log.debug("[%s] PR182 meta update non-critical: %s", ticker, _ma_exc)
-                    except Exception as _obs_a_exc:
-                        log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
-                    # Fix B: persist flat selector attempt audit on terminal failure (Path A)
-                    try:
-                        _persist_deferred_selector_attempt_audit(
-                            self.order_state_machine,
-                            str(queue_local_order_id or ""),
-                            selector_audit=_deferred_selector_audit or {},
-                            attempt_number=_this_attempt_a,
-                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                            is_paper=bool(getattr(self, "paper", False)),
-                            broker_base_url=str(
-                                getattr(getattr(self.broker, "cfg", None), "base_url", "") or ""
-                            ),
-                        )
-                    except Exception as _b_term_exc:
-                        log.debug("[%s] Fix B terminal audit non-critical: %s", ticker, _b_term_exc)
-                    # ── end PR #182 + P0 Path A ────────────────────────────────
+                        ),
+                        reason_code=(
+                            _decision_a.get("terminal_reason")
+                            or str(_obs_rc_a)
+                        ),
+                        explanation=(
+                            _decision_a.get("terminal_reason")
+                            or str(_reason or "")
+                        )[:400],
+                        attempt=_this_attempt_a,
+                    )
+                    _final_reason_a = str(_decision_a.get("terminal_reason") or _reason)
+                    _stage_deferred_meta({
+                        "breach_attempt_count": _this_attempt_a,
+                        "last_breach_failure_reason": _final_reason_a,
+                        "last_breach_failure_reason_code": str(_obs_rc_a),
+                        "last_breach_failure_at": datetime.now(timezone.utc).isoformat(),
+                        "contract_selection_status": _cs_status_a,
+                        "materialization_status": "FAILED_TERMINAL",
+                        "broker_ready": False,
+                        "materialization_attempts": _this_attempt_a,
+                        "materialization_reason": _final_reason_a,
+                        "materialization_last_failure_at": datetime.now(timezone.utc).isoformat(),
+                        "materialization_selector_failure": _deferred_selector_audit or {},
+                        **(
+                            _build_deferred_retry_terminal_meta(
+                                terminal_reason=_final_reason_a,
+                                reason_code=_obs_rc_a,
+                                selector_audit=_deferred_selector_audit or {},
+                                attempt=_this_attempt_a,
+                                max_attempts=_MAX_RETRIES_A,
+                                client_id=_breach_client_id,
+                                execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                                local_order_id=str(queue_local_order_id or ""),
+                                signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                            )
+                            if _decision_a["retryable_reason"]
+                            else {"last_breach_selector_audit": _deferred_selector_audit or {}}
+                        ),
+                    })
+                    _stage_deferred_selector_attempt_audit(
+                        selector_audit=_deferred_selector_audit or {},
+                        attempt_number=_this_attempt_a,
+                        execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                        is_paper=bool(getattr(self, "paper", False)),
+                        broker_base_url=str(
+                            getattr(getattr(self.broker, "cfg", None), "base_url", "") or ""
+                        ),
+                    )
                     # P0: Write durable materialization audit before terminalizing.
                     # Extracts chain/reject data from plan.metadata["selector_failure"]
                     # (written by _attach_selector_failure in contract_selector) and
@@ -6856,9 +7167,7 @@ class APExecutionCore:
                         _ladder_buckets_a = (
                             _deferred_selector_audit.get("last_dte_ladder_audit") or {}
                         ).get("buckets_attempted")
-                        _write_deferred_materialization_audit(
-                            self.order_state_machine,
-                            queue_local_order_id,
+                        _stage_deferred_materialization_audit(
                             success=False,
                             attempt_ts=datetime.now(timezone.utc).isoformat(),
                             original_contract=_contract_sym_raw or f"DEFERRED:{ticker}",
@@ -6930,70 +7239,54 @@ class APExecutionCore:
                         contract=_live_contract,
                         extra={"stage": "deferred_copy_back"},
                     )
-                    # ── PR #182: write selector failure reason to trade_queue.last_error ──
-                    # Path B: selector returned a value but contract is still DEFERRED:
-                    # (copy-back failed or returned unresolved placeholder). Write reason
-                    # to trade_queue.last_error before terminal cleanup.
-                    # Best-effort: failure here must never block the cleanup below.
+                    # Stage selector diagnostics; the exact owner/generation
+                    # terminal CAS below is the first durable terminal writer.
+                    _prior_attempt_b = 0
                     try:
-                        from ap.queue import write_deferred_breach_last_error
-                        _queue_id_for_obs_b = (
+                        _prior_attempt_b = int(
+                            (getattr(approved_plan, "metadata", None) or {}).get(
+                                "breach_attempt_count", 0
+                            ) or 0
+                        )
+                    except (TypeError, ValueError):
+                        _prior_attempt_b = 0
+                    _this_attempt_b = _prior_attempt_b + 1
+                    _obs_rc_b = (
+                        _deferred_selector_audit.get("reason_code")
+                        or "DEFERRED_UNRESOLVED_AT_BREACH"
+                    )
+                    _stage_deferred_queue_error(
+                        queue_id=(
                             sig.get("queue_id")
                             or sig.get("trade_queue_id")
                             or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
-                        )
-                        _prior_attempt_b = 0
-                        try:
-                            _prior_attempt_b = int(
-                                (getattr(approved_plan, "metadata", None) or {}).get(
-                                    "breach_attempt_count", 0
-                                ) or 0
-                            )
-                        except (TypeError, ValueError):
-                            _prior_attempt_b = 0
-                        _this_attempt_b = _prior_attempt_b + 1
-                        _obs_rc_b = (
-                            _deferred_selector_audit.get("reason_code")
-                            or "DEFERRED_UNRESOLVED_AT_BREACH"
-                        )
-                        write_deferred_breach_last_error(
-                            _queue_id_for_obs_b,
-                            reason_code=str(_obs_rc_b),
-                            explanation=str(_reason or "")[:400],
-                            attempt=_this_attempt_b,
-                            client_id=_breach_client_id,
-                            ticker=ticker,
-                        )
-                        try:
-                            _upd_b = getattr(self.order_state_machine, "update_order_meta", None)
-                            if callable(_upd_b) and queue_local_order_id:
-                                _upd_b(queue_local_order_id, {
-                                    "breach_attempt_count":           _this_attempt_b,
-                                    "last_breach_failure_reason":     str(_reason or ""),
-                                    "last_breach_failure_reason_code": str(_obs_rc_b),
-                                    "last_breach_failure_at":         datetime.now(timezone.utc).isoformat(),
-                                    "last_breach_selector_audit":     _deferred_selector_audit or {},
-                                })
-                        except Exception as _mb_exc:
-                            log.debug("[%s] PR182 meta update non-critical: %s", ticker, _mb_exc)
-                    except Exception as _obs_b_exc:
-                        log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_b_exc)
-                    # Fix B: persist flat selector attempt audit on Path B (DEFERRED unresolved)
-                    try:
-                        _persist_deferred_selector_attempt_audit(
-                            self.order_state_machine,
-                            str(queue_local_order_id or ""),
-                            selector_audit=_deferred_selector_audit or {},
-                            attempt_number=_prior_mat_attempt + 1,
-                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                            is_paper=bool(getattr(self, "paper", False)),
-                            broker_base_url=str(
-                                getattr(getattr(self.broker, "cfg", None), "base_url", "") or ""
-                            ),
-                        )
-                    except Exception as _b_path_b_exc:
-                        log.debug("[%s] Fix B path-B audit non-critical: %s", ticker, _b_path_b_exc)
-                    # ── end PR #182 Path B ─────────────────────────────────────
+                        ),
+                        reason_code=str(_obs_rc_b),
+                        explanation=str(_reason or "")[:400],
+                        attempt=_this_attempt_b,
+                    )
+                    _stage_deferred_meta({
+                        "breach_attempt_count": _this_attempt_b,
+                        "last_breach_failure_reason": str(_reason or ""),
+                        "last_breach_failure_reason_code": str(_obs_rc_b),
+                        "last_breach_failure_at": datetime.now(timezone.utc).isoformat(),
+                        "last_breach_selector_audit": _deferred_selector_audit or {},
+                        "materialization_status": "FAILED_TERMINAL",
+                        "broker_ready": False,
+                        "materialization_attempts": _this_attempt_b,
+                        "materialization_reason": str(_reason or ""),
+                        "materialization_last_failure_at": datetime.now(timezone.utc).isoformat(),
+                        "materialization_selector_failure": _deferred_selector_audit or {},
+                    })
+                    _stage_deferred_selector_attempt_audit(
+                        selector_audit=_deferred_selector_audit or {},
+                        attempt_number=_prior_mat_attempt + 1,
+                        execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                        is_paper=bool(getattr(self, "paper", False)),
+                        broker_base_url=str(
+                            getattr(getattr(self.broker, "cfg", None), "base_url", "") or ""
+                        ),
+                    )
                     # P0: Write durable materialization audit before terminalizing (Path B).
                     try:
                         _sel_failure_b = (
@@ -7002,9 +7295,7 @@ class APExecutionCore:
                         _ladder_buckets_b = (
                             _deferred_selector_audit.get("last_dte_ladder_audit") or {}
                         ).get("buckets_attempted")
-                        _write_deferred_materialization_audit(
-                            self.order_state_machine,
-                            queue_local_order_id,
+                        _stage_deferred_materialization_audit(
                             success=False,
                             attempt_ts=datetime.now(timezone.utc).isoformat(),
                             original_contract=_contract_sym_raw or f"DEFERRED:{ticker}",
@@ -7057,9 +7348,7 @@ class APExecutionCore:
                 # evidence so the row proves materialization happened correctly.
                 try:
                     _cand_audit_for_meta = getattr(_sel, "candidate_audit", None) or {}
-                    _write_deferred_materialization_audit(
-                        self.order_state_machine,
-                        queue_local_order_id,
+                    _stage_deferred_materialization_audit(
                         success=True,
                         attempt_ts=datetime.now(timezone.utc).isoformat(),
                         original_contract=_contract_sym_raw or f"DEFERRED:{ticker}",
@@ -8324,12 +8613,7 @@ class APExecutionCore:
                         ticker, _fail_reason,
                     )
                     # Persist confirmation meta for observability without blocking.
-                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
-                        try:
-                            self.order_state_machine.update_order_meta(
-                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
-                        except Exception:
-                            pass
+                    _stage_deferred_meta({"entry_confirmation": _confirm_meta})
                     # Fall through to broker submit — do NOT cleanup, expire, or
                     # write blocked_at_breach.
 
@@ -8344,6 +8628,14 @@ class APExecutionCore:
                         float(_confirm_meta.get("underlying_move_pct") or 0),
                         float(_confirm_meta.get("quote_age_seconds") or 0),
                     )
+                    if _deferred:
+                        _stage_deferred_meta({"entry_confirmation": _confirm_meta})
+                        _terminalize_breach_failure(
+                            _fail_reason,
+                            cleanup_action="expire",
+                            funnel_key="entry_confirm_blocked",
+                        )
+                        return
                     funnel.inc("entry_confirm_blocked")
                     if signal_id:
                         # Only write to known ap_signals columns — no unknown fields
@@ -8427,6 +8719,20 @@ class APExecutionCore:
                     details={"reason": "entry_confirm_module_missing",
                              "confirmation_required": True},
                 )
+                if _deferred:
+                    _stage_deferred_meta({
+                        "entry_confirmation": {
+                            "confirmation_required": True,
+                            "confirmation_passed": False,
+                            "confirmation_fail_reason": "entry_confirm_module_missing",
+                        }
+                    })
+                    _terminalize_breach_failure(
+                        "entry_confirm_module_missing",
+                        cleanup_action="expire",
+                        funnel_key="entry_confirm_blocked",
+                    )
+                    return
                 funnel.inc("entry_confirm_blocked")
                 if signal_id:
                     self.store.update_signal_fields(signal_id, {
@@ -8482,8 +8788,18 @@ class APExecutionCore:
         except Exception as _ec_err:
             # Fail-closed for confirmation errors — block the submit
             log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
+            _confirm_error_reason = f"entry_confirm_error:{_ec_err}"
+            if _deferred:
+                if _confirm_meta:
+                    _stage_deferred_meta({"entry_confirmation": _confirm_meta})
+                _terminalize_breach_failure(
+                    _confirm_error_reason,
+                    cleanup_action="expire",
+                    funnel_key="entry_confirm_blocked",
+                )
+                return
             _terminalize_breach_failure(
-                f"entry_confirm_error:{_ec_err}",
+                _confirm_error_reason,
                 cleanup_action="expire",
                 funnel_key="entry_confirm_blocked",
             )
@@ -9083,15 +9399,10 @@ class APExecutionCore:
                             str(_proof_execution_mode or ""),
                             _paper_block_reason,
                         )
-                        try:
-                            _upd_pb = getattr(self.order_state_machine, "update_order_meta", None)
-                            if callable(_upd_pb) and queue_local_order_id:
-                                _upd_pb(queue_local_order_id, {
-                                    "paper_domain_block_reason": _paper_block_reason,
-                                    "paper_domain_block_at": datetime.now(timezone.utc).isoformat(),
-                                })
-                        except Exception:
-                            pass
+                        _stage_deferred_meta({
+                            "paper_domain_block_reason": _paper_block_reason,
+                            "paper_domain_block_at": datetime.now(timezone.utc).isoformat(),
+                        })
                         _terminalize_breach_failure(_paper_block_reason)
                         return
 
@@ -9115,9 +9426,7 @@ class APExecutionCore:
                             order_id=str(queue_local_order_id or ""),
                             ticker=ticker,
                         )
-                        _upd_zu = getattr(self.order_state_machine, "update_order_meta", None)
-                        if callable(_upd_zu) and queue_local_order_id:
-                            _upd_zu(queue_local_order_id, _no_src_meta)
+                        _stage_deferred_meta(_no_src_meta)
                     except Exception as _zu_persist_exc:
                         log.debug("[%s] zero_underlying no-source meta persist non-critical: %s",
                                   ticker, _zu_persist_exc)
@@ -9147,13 +9456,9 @@ class APExecutionCore:
                         if "trigger" not in _ap_meta_udl or not isinstance(_ap_meta_udl.get("trigger"), dict):
                             _ap_meta_udl["trigger"] = {}
                         _ap_meta_udl["trigger"]["current_price"] = _udl_price
-                    # Persist to orders.meta (best-effort)
-                    try:
-                        _upd_udl = getattr(self.order_state_machine, "update_order_meta", None)
-                        if callable(_upd_udl) and queue_local_order_id:
-                            _upd_udl(queue_local_order_id, _udl_patch)
-                    except Exception:
-                        pass
+                    # Defer durable audit until the owner-fenced terminal or
+                    # successful broker handoff is known.
+                    _stage_deferred_meta(_udl_patch)
                     log.info(
                         "%s order_id=%s symbol=%s source=%s underlying=%.4f",
                         _ZU_REPAIRED,
@@ -9204,9 +9509,7 @@ class APExecutionCore:
         # ── Fix B + Fix C: persist flat selector attempt audit at submit ──────
         if _deferred:
             try:
-                _persist_deferred_selector_attempt_audit(
-                    self.order_state_machine,
-                    str(queue_local_order_id or ""),
+                _stage_deferred_selector_attempt_audit(
                     selector_audit=(locals().get("_deferred_selector_audit") or {}) if _deferred else {},
                     attempt_number=(locals().get("_prior_mat_attempt") or 0) + 1,
                     execution_mode=str(_proof_execution_mode or ""),
@@ -9308,21 +9611,11 @@ class APExecutionCore:
                     "order_id=%s detail=%s",
                     str(queue_local_order_id or ""), _gate_client_id_mismatch,
                 )
-                try:
-                    self.order_state_machine.update_order_meta(
-                        str(queue_local_order_id or ""),
-                        {"live_submit_gate": {
-                            "all_passed": False,
-                            "failed_gate": "client_id_source_mismatch",
-                            "detail": _gate_client_id_mismatch[:400],
-                        }},
-                    )
-                except Exception as _mism_meta_exc:
-                    log.warning(
-                        "[%s] LIVE_SUBMIT_GATE_AUDIT_WRITE_FAILED gate=client_id_source_mismatch "
-                        "order_id=%s error=%s — submit still blocked",
-                        ticker, str(queue_local_order_id or ""), _mism_meta_exc,
-                    )
+                _stage_deferred_meta({"live_submit_gate": {
+                    "all_passed": False,
+                    "failed_gate": "client_id_source_mismatch",
+                    "detail": _gate_client_id_mismatch[:400],
+                }})
                 _terminalize_breach_failure("live_submit_gate:CLIENT_ID_SOURCE_MISMATCH")
                 return
             _final_market_validity_audit = {
@@ -9370,26 +9663,18 @@ class APExecutionCore:
                     str(queue_local_order_id or ""), _gate_client_id,
                     _gate_exec_mode, ticker, _gate_contract,
                 )
-                try:
-                    self.order_state_machine.update_order_meta(
-                        str(queue_local_order_id or ""),
-                        {"live_submit_gate": {
-                            "failed_gate": "contract_check",
-                            "reason_code": _deferred_reason,
-                            "contract": _gate_contract,
-                        },
-                        "final_market_validity": {
-                            **_final_market_validity_audit,
-                            "reason": _deferred_reason,
-                            "contract": _gate_contract,
-                        }},
-                    )
-                except Exception as _def_meta_exc:
-                    log.warning(
-                        "[%s] LIVE_SUBMIT_GATE_AUDIT_WRITE_FAILED gate=deferred_hard_stop "
-                        "order_id=%s error=%s — submit still blocked",
-                        ticker, str(queue_local_order_id or ""), _def_meta_exc,
-                    )
+                _stage_deferred_meta({
+                    "live_submit_gate": {
+                        "failed_gate": "contract_check",
+                        "reason_code": _deferred_reason,
+                        "contract": _gate_contract,
+                    },
+                    "final_market_validity": {
+                        **_final_market_validity_audit,
+                        "reason": _deferred_reason,
+                        "contract": _gate_contract,
+                    },
+                })
                 _terminalize_breach_failure(f"live_submit_gate:{_deferred_reason}")
                 return
 
@@ -9558,20 +9843,10 @@ class APExecutionCore:
                     _mv_res.reason_code, _mv_res.detail,
                     str(queue_local_order_id or ""), _gate_client_id, ticker,
                 )
-                try:
-                    self.order_state_machine.update_order_meta(
-                        str(queue_local_order_id or ""),
-                        {
-                            "live_submit_gate": {"failed_gate": "market_validity", **_mv_res.audit},
-                            "final_market_validity": _mv_res.audit,
-                        },
-                    )
-                except Exception as _mv_meta_exc:
-                    log.warning(
-                        "[%s] LIVE_SUBMIT_GATE_AUDIT_WRITE_FAILED gate=market_validity "
-                        "order_id=%s reason=%s error=%s — submit still blocked",
-                        ticker, str(queue_local_order_id or ""), _mv_res.reason_code, _mv_meta_exc,
-                    )
+                _stage_deferred_meta({
+                    "live_submit_gate": {"failed_gate": "market_validity", **_mv_res.audit},
+                    "final_market_validity": _mv_res.audit,
+                })
                 _terminalize_breach_failure(f"live_submit_gate:{_mv_res.reason_code}")
                 return
             # Even on PASS in paper we log the mid so audit trails are complete
@@ -9650,18 +9925,10 @@ class APExecutionCore:
                     str(queue_local_order_id or ""), _gate_client_id, ticker,
                     _ta_res.audit.get("age_seconds"),
                 )
-                try:
-                    self.order_state_machine.update_order_meta(
-                        str(queue_local_order_id or ""),
-                        {"live_submit_gate": {"failed_gate": "trigger_age", **_ta_res.audit},
-                         "final_market_validity": _final_market_validity_audit},
-                    )
-                except Exception as _ta_meta_exc:
-                    log.warning(
-                        "[%s] LIVE_SUBMIT_GATE_AUDIT_WRITE_FAILED gate=trigger_age "
-                        "order_id=%s reason=%s error=%s — submit still blocked",
-                        ticker, str(queue_local_order_id or ""), _ta_res.reason_code, _ta_meta_exc,
-                    )
+                _stage_deferred_meta({
+                    "live_submit_gate": {"failed_gate": "trigger_age", **_ta_res.audit},
+                    "final_market_validity": _final_market_validity_audit,
+                })
                 _terminalize_breach_failure(f"live_submit_gate:{_ta_res.reason_code}")
                 return
 
@@ -9675,24 +9942,15 @@ class APExecutionCore:
                 _mv_res.audit.get("current_mid"),
                 _ta_res.audit.get("age_seconds"),
             )
-            try:
-                self.order_state_machine.update_order_meta(
-                    str(queue_local_order_id or ""),
-                    {"live_submit_gate": {
-                        "all_passed": True,
-                        "identity_gate": _id_res.audit,
-                        "market_validity_gate": _mv_res.audit,
-                        "trigger_age_gate": _ta_res.audit,
-                    },
-                    "final_market_validity": _mv_res.audit,
-                    },
-                )
-            except Exception as _ap_meta_exc:
-                log.debug(
-                    "[%s] LIVE_SUBMIT_GATE all-passed meta write failed "
-                    "order_id=%s error=%s (non-blocking)",
-                    ticker, str(queue_local_order_id or ""), _ap_meta_exc,
-                )
+            _stage_deferred_meta({
+                "live_submit_gate": {
+                    "all_passed": True,
+                    "identity_gate": _id_res.audit,
+                    "market_validity_gate": _mv_res.audit,
+                    "trigger_age_gate": _ta_res.audit,
+                },
+                "final_market_validity": _mv_res.audit,
+            })
         except Exception as _gate_exc:
             # If the entire gate module fails, LIVE fails closed. Never let
             # a bug in the safety code allow an unchecked broker submit.
@@ -9724,29 +9982,21 @@ class APExecutionCore:
                     "mode=%r order_id=%s — blocking submit (unknown mode treated as live)",
                     ticker, _module_error_exec_mode, str(queue_local_order_id or ""),
                 )
-                try:
-                    self.order_state_machine.update_order_meta(
-                        str(queue_local_order_id or ""),
-                        {"live_submit_gate": {
-                            "all_passed": False,
-                            "failed_gate": "module_error",
-                            "error": str(_gate_exc)[:200],
-                            "resolved_mode": _module_error_exec_mode or "unknown",
-                        },
-                        "final_market_validity": {
-                            **(locals().get("_final_market_validity_audit") or {}),
-                            "gate": "market_validity",
-                            "not_run": True,
-                            "reason": "MODULE_ERROR",
-                            "execution_mode": _module_error_exec_mode or "unknown",
-                        }},
-                    )
-                except Exception as _me_meta_exc:
-                    log.warning(
-                        "[%s] LIVE_SUBMIT_GATE_AUDIT_WRITE_FAILED gate=module_error "
-                        "order_id=%s error=%s — submit still blocked",
-                        ticker, str(queue_local_order_id or ""), _me_meta_exc,
-                    )
+                _stage_deferred_meta({
+                    "live_submit_gate": {
+                        "all_passed": False,
+                        "failed_gate": "module_error",
+                        "error": str(_gate_exc)[:200],
+                        "resolved_mode": _module_error_exec_mode or "unknown",
+                    },
+                    "final_market_validity": {
+                        **(locals().get("_final_market_validity_audit") or {}),
+                        "gate": "market_validity",
+                        "not_run": True,
+                        "reason": "MODULE_ERROR",
+                        "execution_mode": _module_error_exec_mode or "unknown",
+                    },
+                })
                 _terminalize_breach_failure("live_submit_gate:MODULE_ERROR")
                 return
 
@@ -9883,6 +10133,8 @@ class APExecutionCore:
                     "execution_mode":        str(getattr(self, "execution_mode", None) or getattr(self, "mode", "") or ""),
                 },
             )
+            _flush_deferred_trigger_status()
+            _flush_deferred_meta_after_submit(local_order_id or queue_local_order_id)
             return
 
         if (
@@ -10539,11 +10791,25 @@ class APExecutionCore:
                         _mat_status = str(_snap_meta.get("materialization_status") or "").upper()
                         _lc_state   = str(_snap_meta.get("lifecycle_state") or "").upper()
                         _in_flight  = bool(_snap_meta.get("materialization_in_flight"))
+                        _mat_owner  = str(
+                            _snap_meta.get("materialization_owner")
+                            or _snap_meta.get("current_owner")
+                            or ""
+                        ).strip()
+                        _invalid_unowned_contract = (
+                            APExecutionCore._classify_contract(
+                                _snap.get("contract"),
+                                str(_snap.get("symbol") or watched.ticker),
+                            ) == _CONTRACT_INVALID
+                            and not _mat_owner
+                            and not _in_flight
+                            and _lc_state not in {"MATERIALIZING", "RETRY_WAIT"}
+                        )
                         _is_active_mat = (
                             _mat_status in {"QUEUED", "RUNNING", "RETRY_PENDING"}
                             or _lc_state  in {"MATERIALIZING", "RETRY_WAIT"}
                             or _in_flight
-                        )
+                        ) and not _invalid_unowned_contract
                         if _is_active_mat:
                             _sig_id_for_log  = str(_snap.get("signal_id") or "").strip()
                             _client_for_log  = str(_snap.get("client_id") or "").strip()

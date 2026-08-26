@@ -875,6 +875,7 @@ def _build_core(
     core._refresh_hydrated_prebreach_plan = lambda *a, **k: False
     core._cleanup_pending_entry_order = core_mod.APExecutionCore._cleanup_pending_entry_order.__get__(core, type(core))
     core._classify_recovered_ownership_loss = core_mod.APExecutionCore._classify_recovered_ownership_loss.__get__(core, type(core))
+    core._classify_contract = core_mod.APExecutionCore._classify_contract
     core._claim_deferred_materialization_for_trigger = (
         core_mod.APExecutionCore._claim_deferred_materialization_for_trigger.__get__(
             core, type(core)
@@ -1413,13 +1414,24 @@ def test_cheap_gate_none_terminalizes_with_exact_reason_and_no_generic_overwrite
 
 def test_cheap_gate_terminal_write_failure_keeps_watcher_owned(monkeypatch):
     class _FailTerminalOSM(_StatefulOSM):
+        def __init__(self):
+            super().__init__()
+            self.meta_update_calls = 0
+            self.cleanup_calls = []
+
+        def update_order_meta(self, local_order_id, patch):
+            self.meta_update_calls += 1
+            return super().update_order_meta(local_order_id, patch)
+
         def terminalize_deferred_breach(self, *_args, **_kwargs):
             return False
 
-        def expire_pending_entry(self, *_args, **_kwargs):
+        def expire_pending_entry(self, local_order_id, reason):
+            self.cleanup_calls.append(("expire", local_order_id, reason))
             return False
 
-        def cancel_pending_entry(self, *_args, **_kwargs):
+        def cancel_pending_entry(self, local_order_id, reason):
+            self.cleanup_calls.append(("cancel", local_order_id, reason))
             return False
 
     class _NoneCheapSelector:
@@ -1444,6 +1456,10 @@ def test_cheap_gate_terminal_write_failure_keeps_watcher_owned(monkeypatch):
     osm = _FailTerminalOSM()
     core = _build_core(osm, broker, _NoneCheapSelector())
     watcher = _build_watcher(osm, core)
+    signal_updates = []
+    core.store.update_signal_fields = lambda *args, **kwargs: signal_updates.append(
+        (args, kwargs)
+    )
 
     fake_execution = types.ModuleType("ap.execution")
     fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
@@ -1483,6 +1499,10 @@ def test_cheap_gate_terminal_write_failure_keeps_watcher_owned(monkeypatch):
     assert str(meta.get("lifecycle_state") or "") == "MATERIALIZING"
     assert str(meta.get("materialization_owner") or "").startswith("watcher:")
     assert meta["broker_ready"] is False
+    assert osm.meta_update_calls == 0
+    assert osm.cleanup_calls == []
+    assert signal_updates == []
+    assert "last_breach_failure_reason_code" not in meta
 
 
 def test_stale_deferred_penny_broker_ready_recovery_cannot_submit(monkeypatch):
@@ -2690,6 +2710,84 @@ def test_pr520_claimed_owner_kill_switch_terminalizes_exactly(monkeypatch):
     assert osm.row["meta"]["current_owner"] == ""
 
 
+def test_pr520_claimed_owner_terminal_cas_loss_has_no_fallback_mutations(monkeypatch):
+    class _FailTerminalOSM(_PR514StrictMaterializationOSM):
+        def __init__(self):
+            super().__init__()
+            self.meta_update_calls = 0
+            self.cleanup_calls = []
+
+        def terminalize_deferred_breach(self, *_args, **_kwargs):
+            return False
+
+        def update_order_meta(self, local_order_id, patch):
+            self.meta_update_calls += 1
+            return super().update_order_meta(local_order_id, patch)
+
+        def expire_pending_entry(self, local_order_id, reason):
+            self.cleanup_calls.append(("expire", local_order_id, reason))
+            return False
+
+        def cancel_pending_entry(self, local_order_id, reason):
+            self.cleanup_calls.append(("cancel", local_order_id, reason))
+            return False
+
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        "C",
+        "C260828C00133000",
+        selector,
+    )
+    # Replace the fixture OSM only after construction so the production-shaped
+    # plan/watcher setup remains identical to the winning-owner test.
+    failing_osm = _FailTerminalOSM()
+    failing_osm.proof_read_failures_remaining = 0
+    failing_osm.row = copy.deepcopy(osm.row)
+    core.order_state_machine = failing_osm
+    watcher.order_state_machine = failing_osm
+    core._recover_plan_for_revalidation = lambda _watched: plan
+    cleanup_calls = failing_osm.cleanup_calls
+    signal_updates = []
+    status_updates = []
+    core.store.update_status = lambda *args, **kwargs: status_updates.append(
+        (args, kwargs)
+    )
+    core.store.update_signal_fields = lambda *args, **kwargs: signal_updates.append(
+        (args, kwargs)
+    )
+    core._kill_switch = True
+    _bind_real_breach_risk_check(core)
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        result = watcher.on_trigger(watcher._pending[0])
+
+    assert result == {
+        "disposition": "KEEP_WATCHER",
+        "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+        "ownership_lost": True,
+        "retry_after_seconds": 5,
+    }
+    assert failing_osm.claim_successes == 1
+    assert failing_osm.terminalizations == []
+    assert failing_osm.meta_update_calls == 0
+    assert cleanup_calls == []
+    assert status_updates == []
+    assert signal_updates == []
+    assert selector.calls == 0
+    assert failing_osm.post_payloads == []
+    assert failing_osm.row["status"] == "PENDING_TRIGGER"
+    assert failing_osm.row["meta"]["materialization_owner"]
+    assert failing_osm.row["meta"]["broker_ready"] is False
+
+
 def test_pr520_claimed_owner_positions_full_terminalizes_without_generic_cancel(
     monkeypatch,
 ):
@@ -2878,16 +2976,25 @@ def test_pr514_paper_deferred_shape_does_not_call_live_capacity_authority(monkey
         capacity_calls.append(kwargs)
         raise AssertionError("PAPER must not call LIVE deferred capacity")
 
+    revalidation_calls = []
+
+    def _paper_revalidate(plan, **_kwargs):
+        revalidation_calls.append((selector.calls, plan.contract_symbol))
+        assert selector.calls > 0, (
+            "PAPER must not revalidate the deferred reservation before selector"
+        )
+        return types.SimpleNamespace(
+            ok=True,
+            reason_code="EXPOSURE_ALLOWED",
+            reason="allowed",
+        )
+
     master_control = types.SimpleNamespace(
         mode="PAPER",
         max_positions=5,
         _kill_switch_fn=lambda: False,
         get_entry_capacity=_unexpected_live_capacity,
-        revalidate_exposure=lambda _plan, **_kwargs: types.SimpleNamespace(
-            ok=True,
-            reason_code="EXPOSURE_ALLOWED",
-            reason="allowed",
-        ),
+        revalidate_exposure=_paper_revalidate,
     )
     core = _build_core(osm, broker, selector, master_control=master_control)
     core._recover_plan_for_revalidation = lambda _watched: plan
@@ -2917,6 +3024,7 @@ def test_pr514_paper_deferred_shape_does_not_call_live_capacity_authority(monkey
         result = watcher.on_trigger(watcher._pending[0])
 
     assert capacity_calls == []
+    assert all(selector_calls > 0 for selector_calls, _ in revalidation_calls)
     assert selector.calls == 1
     assert len(osm.post_payloads) == 1
     assert result is None or result.get("disposition") in {None, "SUBMITTED"}
@@ -2998,7 +3106,7 @@ def test_pr514_osm_recovery_reconstructs_plan_and_reaches_materialization(
         ("", True),
         ("DEFERRED:C", True),
         ("C", True),
-        ("BROKEN-CONTRACT", True),
+        ("BROKEN-CONTRACT", False),
         ("C260828C00133000", False),
     ],
 )
@@ -3015,3 +3123,72 @@ def test_pr514_deferred_classifier_uses_canonical_occ_authority(
         core_mod.APExecutionCore._plan_is_deferred(plan, "C")
         is expected_deferred
     )
+
+
+def test_pr520_contract_classifier_separates_placeholder_occ_and_invalid():
+    assert (
+        core_mod.APExecutionCore._classify_contract("", "C")
+        == "DEFERRED_PLACEHOLDER"
+    )
+    assert (
+        core_mod.APExecutionCore._classify_contract("DEFERRED:C", "C")
+        == "DEFERRED_PLACEHOLDER"
+    )
+    assert (
+        core_mod.APExecutionCore._classify_contract("C", "C")
+        == "DEFERRED_PLACEHOLDER"
+    )
+    assert (
+        core_mod.APExecutionCore._classify_contract("BROKEN-CONTRACT", "C")
+        == "INVALID_CONTRACT"
+    )
+    assert (
+        core_mod.APExecutionCore._classify_contract(REAL_OCC, "C")
+        == "REAL_OCC"
+    )
+
+
+def test_pr520_invalid_contract_identity_blocks_selector_and_broker(monkeypatch):
+    osm = _StatefulOSM()
+    osm.row["contract"] = "BROKEN-CONTRACT"
+    selector = _Selector()
+    plan = _approved_plan()
+    plan.contract_symbol = "BROKEN-CONTRACT"
+    plan.metadata.update({
+        "contract_deferred": True,
+        "execution_mode": "live",
+    })
+    watched = types.SimpleNamespace(
+        signal={
+            "_approved_plan": plan,
+            "signal_id": SIGNAL_ID,
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "live",
+            "contract_symbol": "BROKEN-CONTRACT",
+            "contract_deferred": True,
+        },
+        ticker="SPY",
+        side="CALL",
+        trigger_price=600.0,
+        entry_trigger=600.0,
+        stop_level=595.0,
+        target_price=605.0,
+    )
+    core = _build_core(osm, _Broker(), selector)
+    core._recover_plan_for_revalidation = lambda _watched: plan
+    _bind_real_breach_risk_check(core)
+
+    result = core._on_entry_trigger(watched)
+
+    assert result == {
+        "disposition": "TERMINAL_DURABLE",
+        "reason_code": "INVALID_CONTRACT_IDENTITY",
+        "terminal_status": "EXPIRED",
+    }
+    assert osm.claimed_generations == []
+    assert selector.calls == 0
+    assert osm.post_payloads == []
+    assert osm.row["status"] == "EXPIRED"
+    assert osm.row["last_error"] == "INVALID_CONTRACT_IDENTITY"
+    assert osm.row["meta"]["contract_classification"] == "INVALID_CONTRACT"
