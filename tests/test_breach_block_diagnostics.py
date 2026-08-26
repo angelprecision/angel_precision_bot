@@ -354,7 +354,7 @@ class TestEntryTriggerBlockedReturn:
         # Look at a generous window before the emission for the breach_risk_check
         # gate and the funnel counter (proves we're in the right code block).
         window = _EC_SRC[max(0, idx - 2000): idx + 1000]
-        assert "_breach_risk_check(watched)" in window
+        assert "_breach_risk_check(" in window
         assert "master_control_blocked" in window
         # The emission's reason field must be the agreed value
         assert 'reason="breach_risk_check_false"' in window

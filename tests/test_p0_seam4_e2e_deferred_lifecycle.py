@@ -864,7 +864,7 @@ def _build_core(
         update_status=lambda *a, **k: None,
         update_signal_fields=lambda *a, **k: None,
     )
-    core._breach_risk_check = lambda watched: True
+    core._breach_risk_check = lambda watched, **_kwargs: True
     core._recover_plan_for_revalidation = lambda watched: (
         ((getattr(watched, "signal", {}) or {}).get("_approved_plan"))
         or _approved_plan()
@@ -875,6 +875,11 @@ def _build_core(
     core._refresh_hydrated_prebreach_plan = lambda *a, **k: False
     core._cleanup_pending_entry_order = core_mod.APExecutionCore._cleanup_pending_entry_order.__get__(core, type(core))
     core._classify_recovered_ownership_loss = core_mod.APExecutionCore._classify_recovered_ownership_loss.__get__(core, type(core))
+    core._claim_deferred_materialization_for_trigger = (
+        core_mod.APExecutionCore._claim_deferred_materialization_for_trigger.__get__(
+            core, type(core)
+        )
+    )
     core._is_real_occ_contract = core_mod.APExecutionCore._is_real_occ_contract
     core._is_deferred_contract = core_mod.APExecutionCore._is_deferred_contract
     core.resume_deferred_broker_ready_order = core_mod.APExecutionCore.resume_deferred_broker_ready_order.__get__(core, type(core))
@@ -933,6 +938,14 @@ def _build_watcher(osm: _StatefulOSM, core, *, ticker="SPY"):
 
     watcher._fetch_quotes = _fetch_quotes
     return watcher
+
+
+def _bind_real_breach_risk_check(core):
+    core._plan_is_deferred = core_mod.APExecutionCore._plan_is_deferred
+    core._breach_risk_check = core_mod.APExecutionCore._breach_risk_check.__get__(
+        core, type(core)
+    )
+    return core
 
 
 def _run_recovery(osm: _StatefulOSM, broker: _Broker, watcher, core):
@@ -1908,8 +1921,16 @@ def test_pr514_deferred_unknown_mode_fails_closed_before_capacity_or_selector(mo
     plan.execution_mode = "staging"
     plan.metadata = {"contract_deferred": True, "execution_mode": "staging"}
     mc = _DeferredCapacityMC()
+    def _unexpected_placeholder_revalidation(plan, **_kwargs):
+        raise AssertionError(
+            f"unknown deferred mode reached exposure revalidation: "
+            f"{getattr(plan, 'contract_symbol', '')}"
+        )
+
+    mc.revalidate_exposure = _unexpected_placeholder_revalidation
     selector = _CSelector()
     core = _build_core(osm, _Broker(), selector, master_control=mc)
+    _bind_real_breach_risk_check(core)
     watched = types.SimpleNamespace(
         signal={
             "_approved_plan": plan,
@@ -2152,6 +2173,48 @@ def _pr514_liveness_execution_module():
     return fake_execution
 
 
+def _mark_pr514_active_materializer(osm, plan, *, execution_mode="live"):
+    lease_until = _iso(_now() + timedelta(seconds=120))
+    osm.row["execution_mode"] = execution_mode
+    osm.row["meta"].update({
+        "execution_mode": execution_mode,
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": "materializer:active-owner",
+        "materialization_generation": 7,
+        "materialization_lease_until": lease_until,
+        "retry_attempt": 1,
+    })
+    plan.execution_mode = execution_mode
+    plan.metadata.update({
+        "execution_mode": execution_mode,
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": "materializer:active-owner",
+        "materialization_generation": 7,
+        "retry_attempt": 1,
+    })
+    return lease_until
+
+
+def _record_pr514_cleanup_attempts(osm):
+    calls = []
+
+    def _expire(local_order_id, *, reason):
+        calls.append(("expire", local_order_id, reason))
+        return False
+
+    def _cancel(local_order_id, *, reason):
+        calls.append(("cancel", local_order_id, reason))
+        return False
+
+    osm.expire_pending_entry = _expire
+    osm.cancel_pending_entry = _cancel
+    return calls
+
+
 @pytest.mark.parametrize(
     ("ticker", "contract_symbol"),
     _PR514_LIVENESS_SHAPES,
@@ -2380,6 +2443,295 @@ def test_pr514_named_shapes_active_owner_blocks_selector_duplicate(
 
 
 @pytest.mark.parametrize(
+    ("ticker", "contract_symbol"),
+    _PR514_LIVENESS_SHAPES,
+)
+def test_pr520_active_owner_kill_switch_parks_before_breach_risk(
+    monkeypatch,
+    ticker,
+    contract_symbol,
+):
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        ticker,
+        contract_symbol,
+        selector,
+    )
+    lease_until = _mark_pr514_active_materializer(osm, plan)
+    cleanup_calls = _record_pr514_cleanup_attempts(osm)
+    no_work_mc = _PR514NoAttemptWorkMasterControl()
+    core.master_control = no_work_mc
+    core._kill_switch = True
+    _bind_real_breach_risk_check(core)
+    risk_calls = []
+    _real_risk_check = core._breach_risk_check
+
+    def _counted_risk_check(watched, **kwargs):
+        risk_calls.append(kwargs)
+        return _real_risk_check(watched, **kwargs)
+
+    core._breach_risk_check = _counted_risk_check
+    callback_results = []
+    row_before_callback = None
+    original_callback = watcher.on_trigger
+
+    def _counted_callback(watched):
+        nonlocal row_before_callback
+        row_before_callback = copy.deepcopy(osm.row)
+        result = original_callback(watched)
+        callback_results.append(result)
+        return result
+
+    watcher.on_trigger = _counted_callback
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.overnight = False
+        for _ in range(3):
+            watcher._poll_active_signals(open_protect_active=False)
+
+    assert len(callback_results) == 1
+    assert callback_results[0] == {
+        "disposition": "KEEP_WATCHER",
+        "reason_code": "MATERIALIZATION_ALREADY_OWNED",
+        "next_retry_at": lease_until,
+    }
+    assert risk_calls == []
+    assert cleanup_calls == []
+    assert osm.row == row_before_callback
+    assert osm.claim_attempts == 1
+    assert osm.claim_successes == 0
+    assert selector.calls == 0
+    assert no_work_mc.capacity_calls == 0
+    assert no_work_mc.final_calls == 0
+    assert osm.post_payloads == []
+
+
+@pytest.mark.parametrize(
+    ("ticker", "contract_symbol"),
+    _PR514_LIVENESS_SHAPES,
+)
+def test_pr520_active_owner_positions_full_parks_before_cleanup(
+    monkeypatch,
+    ticker,
+    contract_symbol,
+):
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        ticker,
+        contract_symbol,
+        selector,
+    )
+    lease_until = _mark_pr514_active_materializer(osm, plan)
+    cleanup_calls = _record_pr514_cleanup_attempts(osm)
+    no_work_mc = _PR514NoAttemptWorkMasterControl()
+    core.master_control = no_work_mc
+    core._current_open_position_count = lambda: 5
+    core._current_pending_entry_count = lambda: 0
+    _bind_real_breach_risk_check(core)
+    risk_calls = []
+    _real_risk_check = core._breach_risk_check
+
+    def _counted_risk_check(watched, **kwargs):
+        risk_calls.append(kwargs)
+        return _real_risk_check(watched, **kwargs)
+
+    core._breach_risk_check = _counted_risk_check
+    callback_results = []
+    row_before_callback = None
+    original_callback = watcher.on_trigger
+
+    def _counted_callback(watched):
+        nonlocal row_before_callback
+        row_before_callback = copy.deepcopy(osm.row)
+        result = original_callback(watched)
+        callback_results.append(result)
+        return result
+
+    watcher.on_trigger = _counted_callback
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.overnight = False
+        for _ in range(3):
+            watcher._poll_active_signals(open_protect_active=False)
+
+    assert len(callback_results) == 1
+    assert callback_results[0] == {
+        "disposition": "KEEP_WATCHER",
+        "reason_code": "MATERIALIZATION_ALREADY_OWNED",
+        "next_retry_at": lease_until,
+    }
+    assert risk_calls == []
+    assert cleanup_calls == []
+    assert osm.row == row_before_callback
+    assert osm.claim_attempts == 1
+    assert osm.claim_successes == 0
+    assert selector.calls == 0
+    assert no_work_mc.capacity_calls == 0
+    assert no_work_mc.final_calls == 0
+    assert osm.post_payloads == []
+
+
+def test_pr520_paper_active_owner_parks_before_placeholder_revalidation(monkeypatch):
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        "C",
+        "C260828C00133000",
+        selector,
+    )
+    lease_until = _mark_pr514_active_materializer(osm, plan, execution_mode="paper")
+    cleanup_calls = _record_pr514_cleanup_attempts(osm)
+    no_work_mc = _PR514NoAttemptWorkMasterControl()
+    no_work_mc.mode = "PAPER"
+    core.master_control = no_work_mc
+    core.paper = True
+    core.mode = "PAPER"
+    core.execution_mode = "paper"
+    watcher.mode = "PAPER"
+    osm.execution_mode = "paper"
+    _bind_real_breach_risk_check(core)
+    risk_calls = []
+    _real_risk_check = core._breach_risk_check
+
+    def _counted_risk_check(watched, **kwargs):
+        risk_calls.append(kwargs)
+        return _real_risk_check(watched, **kwargs)
+
+    core._breach_risk_check = _counted_risk_check
+    callback_results = []
+    original_callback = watcher.on_trigger
+
+    def _counted_callback(watched):
+        result = original_callback(watched)
+        callback_results.append(result)
+        return result
+
+    watcher.on_trigger = _counted_callback
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.overnight = False
+        for _ in range(3):
+            watcher._poll_active_signals(open_protect_active=False)
+
+    assert len(callback_results) == 1
+    assert callback_results[0]["reason_code"] == "MATERIALIZATION_ALREADY_OWNED"
+    assert callback_results[0]["next_retry_at"] == lease_until
+    assert risk_calls == []
+    assert cleanup_calls == []
+    assert selector.calls == 0
+    assert no_work_mc.capacity_calls == 0
+    assert no_work_mc.final_calls == 0
+    assert osm.post_payloads == []
+
+
+def test_pr520_claimed_owner_kill_switch_terminalizes_exactly(monkeypatch):
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        "C",
+        "C260828C00133000",
+        selector,
+    )
+    cleanup_calls = _record_pr514_cleanup_attempts(osm)
+    no_work_mc = _PR514NoAttemptWorkMasterControl()
+    core.master_control = no_work_mc
+    core._kill_switch = True
+    _bind_real_breach_risk_check(core)
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        result = watcher.on_trigger(watcher._pending[0])
+
+    assert result == {
+        "disposition": "TERMINAL_DURABLE",
+        "reason_code": "breach_risk_check_false",
+        "terminal_status": "EXPIRED",
+    }
+    assert osm.claim_successes == 1
+    assert osm.terminalizations == [("breach_risk_check_false", "EXPIRED")]
+    assert cleanup_calls == []
+    assert selector.calls == 0
+    assert no_work_mc.capacity_calls == 0
+    assert no_work_mc.final_calls == 0
+    assert osm.post_payloads == []
+    assert osm.row["status"] == "EXPIRED"
+    assert osm.row["meta"]["current_owner"] == ""
+
+
+def test_pr520_claimed_owner_positions_full_terminalizes_without_generic_cancel(
+    monkeypatch,
+):
+    selector = _PR514SuccessfulSelector()
+    osm, _broker, selector, core, watcher, plan = _pr514_liveness_fixture(
+        monkeypatch,
+        "C",
+        "C260828C00133000",
+        selector,
+    )
+    cleanup_calls = _record_pr514_cleanup_attempts(osm)
+    no_work_mc = _PR514NoAttemptWorkMasterControl()
+    core.master_control = no_work_mc
+    core._current_open_position_count = lambda: 5
+    core._current_pending_entry_count = lambda: 0
+    _bind_real_breach_risk_check(core)
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_liveness_execution_module()},
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        result = watcher.on_trigger(watcher._pending[0])
+
+    assert result == {
+        "disposition": "TERMINAL_DURABLE",
+        "reason_code": "breach_risk_check_false",
+        "terminal_status": "EXPIRED",
+    }
+    assert osm.claim_successes == 1
+    assert osm.terminalizations == [("breach_risk_check_false", "EXPIRED")]
+    assert cleanup_calls == []
+    assert selector.calls == 0
+    assert no_work_mc.capacity_calls == 0
+    assert no_work_mc.final_calls == 0
+    assert osm.post_payloads == []
+
+
+@pytest.mark.parametrize(
     "invalid_owner_shape",
     ["expired_lease", "malformed_lease", "client_mismatch"],
 )
@@ -2542,6 +2894,7 @@ def test_pr514_paper_deferred_shape_does_not_call_live_capacity_authority(monkey
     core.paper = True
     core.mode = "PAPER"
     core.execution_mode = "paper"
+    _bind_real_breach_risk_check(core)
     watcher = _build_watcher(osm, core, ticker="C")
     watcher.mode = "PAPER"
     osm.execution_mode = "paper"
