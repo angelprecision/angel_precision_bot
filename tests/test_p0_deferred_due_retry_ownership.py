@@ -2699,6 +2699,61 @@ def test_blocker4_claim_writes_canonical_retry_attempt():
     assert "retry_attempt" in patch_written, "canonical retry_attempt must be in patch"
     assert patch_written["retry_attempt"] == 2
     assert patch_written.get("retry_attempt_in_flight") == 2
+    assert patch_written["breach_attempt_count"] == 2
+    assert patch_written["materialization_attempts"] == 2
+
+
+def test_blocker4_claim_fences_present_attempt_mirrors_before_advancing():
+    """A pre-existing 2/1/1 row is not silently repaired by a later claim.
+
+    The claim may fill a genuinely absent legacy mirror, but every present
+    mirror must still equal the expected prior attempt in the same CAS.
+    """
+    from ap.order_state_machine import APOrderStateMachine
+    from unittest.mock import patch
+
+    statements: list[tuple[str, tuple]] = []
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            statements.append((str(sql), tuple(params)))
+            return self
+
+    class _Conn:
+        def __enter__(self):
+            return _Cursor()
+
+        def __exit__(self, *args):
+            return False
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+    with patch("ap.order_state_machine.conn", return_value=_Conn()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        assert osm.claim_deferred_materialization(
+            "8767886d-7619-4b8f-a87f-f9a2821c39c0",
+            owner="owner-x",
+            new_generation=3,
+            lease_until="2026-12-31T00:00:00+00:00",
+            trigger_crossed_at="2026-08-25T13:40:00+00:00",
+            trigger_price=449.0,
+            observed_underlying_price=448.9,
+            signal_id="73ad6808-cbf0-4218-afb5-d960a613baca",
+            execution_mode="live",
+            retry_attempt=3,
+        )
+
+    assert statements
+    sql, params = statements[0]
+    assert "meta->>'breach_attempt_count'" in sql
+    assert "meta->>'materialization_attempts'" in sql
+    # Three mirror predicates precede the schedule/generation fences; a real
+    # row with breach/materialization_attempts=1 cannot satisfy this claim for
+    # retry_attempt=3 (which requires prior attempt 2).
+    assert params[5:8] == (2, 2, 2)
+    assert params[-1] == 2
 
 
 def test_blocker5_expired_deadline_terminalizes_before_claim():
