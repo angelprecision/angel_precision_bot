@@ -182,6 +182,7 @@ jobs:
             tests/test_p0_reconciler_proof_persistence.py \
             tests/test_p0_reconciler_canonical_exit_adoption_20260825.py \
             tests/test_p0_reconciler_entry_evidence_strict_20260825.py \
+            tests/test_p0_reconciler_direction_identity_20260826.py \
             tests/test_p0_expired_broker_import_idempotency.py \
             tests/test_p0_broker_confirmed_daily_trade_count.py \
             tests/test_p0_schema_attestation_and_migration_runner.py \
