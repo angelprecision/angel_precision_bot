@@ -92,8 +92,8 @@ _RETRY_WATCHER        = "WATCHER_RETRY"
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 _EXECUTION_MODE_AUTHORITY_CONFLICT = "EXECUTION_MODE_AUTHORITY_CONFLICT"
-_EXECUTION_MODE_MISSING = "MISSING_EXECUTION_MODE"
-_EXECUTION_MODE_INVALID = "INVALID_EXECUTION_MODE"
+_EXECUTION_MODE_MISSING = "MISSING_OR_INVALID_EXECUTION_MODE"
+_EXECUTION_MODE_INVALID = "INVALID_EXECUTION_MODE_METADATA"
 
 
 def _canonical_execution_mode_value(raw: object) -> str:
@@ -109,11 +109,11 @@ def _canonical_execution_mode_value(raw: object) -> str:
 def _resolve_execution_mode(row: dict) -> tuple[Optional[str], Optional[str]]:
     """Resolve one durable row mode without using runner or broker context.
 
-    ``orders.execution_mode`` is authoritative when it is nonblank after
-    trimming.  A blank/whitespace-only column may fall back to
-    ``meta.execution_mode``.  Two nonblank, disagreeing values are an
-    authority conflict, not a repair opportunity.  The resolved value must be
-    one of the two explicitly supported execution modes.
+    ``orders.execution_mode`` is the required canonical authority.  Metadata
+    may corroborate that authority, but never replaces a missing column value.
+    Two valid, disagreeing values are an authority conflict, not a repair
+    opportunity.  The resolved value must be one of the two explicitly
+    supported execution modes.
     """
     durable_row = row if isinstance(row, dict) else {}
     column_mode = _canonical_execution_mode_value(
@@ -122,13 +122,13 @@ def _resolve_execution_mode(row: dict) -> tuple[Optional[str], Optional[str]]:
     meta = _extract_meta(durable_row)
     meta_mode = _canonical_execution_mode_value(meta.get("execution_mode"))
 
-    if column_mode and meta_mode and column_mode != meta_mode:
+    if column_mode not in _VALID_EXECUTION_MODES:
+        return None, _EXECUTION_MODE_MISSING
+    if meta_mode and meta_mode not in _VALID_EXECUTION_MODES:
+        return None, _EXECUTION_MODE_INVALID
+    if meta_mode and meta_mode != column_mode:
         return None, _EXECUTION_MODE_AUTHORITY_CONFLICT
-
-    resolved = column_mode or meta_mode
-    if resolved not in _VALID_EXECUTION_MODES:
-        return None, _EXECUTION_MODE_MISSING if not resolved else _EXECUTION_MODE_INVALID
-    return resolved, None
+    return column_mode, None
 
 
 # ── Environment-tunable limits ────────────────────────────────────────────────
@@ -283,8 +283,8 @@ class PendingTriggerRestartRecovery:
 
         # Downstream evidence validation and plan builders must see the same
         # canonical durable mode that passed this fence.  In particular, this
-        # prevents a whitespace-only column from winning a later Python
-        # ``or`` expression over a valid metadata fallback.
+        # prevents any later Python ``or`` expression from treating metadata
+        # as a replacement for the required column authority.
         row["execution_mode"] = row_mode
 
         # Identity fence: durable row identity is required. The mode above was

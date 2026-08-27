@@ -1456,16 +1456,14 @@ class TestExecutionModeAuthorityParity:
     @pytest.mark.parametrize(
         ("column_mode", "meta_mode", "runner_mode"),
         [
-            ("", "paper", "paper"),
-            (" ", "paper", "paper"),
-            ("", "live", "live"),
+            ("paper", "paper", "paper"),
             (" live ", "live", "live"),
         ],
     )
     def test_restart_recovery_uses_one_canonical_mode_for_rearm(
         self, column_mode, meta_mode, runner_mode
     ):
-        """Legacy blank/whitespace columns recover from metadata in production."""
+        """Valid nonblank columns are normalized and rearmed safely."""
         r = _row(
             execution_mode=column_mode,
             meta={"execution_mode": meta_mode, "trigger_price": 450.0},
@@ -1485,6 +1483,57 @@ class TestExecutionModeAuthorityParity:
         assert watcher._pending[0].signal["execution_mode"] == runner_mode
         assert osm.cancel_calls == []
         assert osm.meta_writes == []
+
+    @pytest.mark.parametrize(
+        ("column_mode", "meta_mode", "runner_mode"),
+        [("", "paper", "paper"), (" ", "live", "live")],
+    )
+    def test_blank_column_with_metadata_is_unresolved_without_side_effects(
+        self, column_mode, meta_mode, runner_mode
+    ):
+        """Metadata never replaces a missing canonical execution_mode column."""
+        r = _row(
+            execution_mode=column_mode,
+            meta={"execution_mode": meta_mode, "trigger_price": 450.0},
+        )
+        watcher = _MockWatcher(watch_returns=True)
+        watcher.watch = MagicMock(return_value=True)
+        rec, osm = _make_recovery(
+            r,
+            watcher=watcher,
+            mode=runner_mode,
+            quote_result=False,
+        )
+
+        assert _resolve_execution_mode(r) == (
+            None,
+            "MISSING_OR_INVALID_EXECUTION_MODE",
+        )
+        summary = rec.recover_all([r])
+
+        assert summary["row_outcomes"][r["local_order_id"]] == _RowOutcome.UNRESOLVED
+        assert summary["ownerless_rows_remaining"] == 1
+        assert watcher.watch.call_count == 0
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    @pytest.mark.parametrize(
+        ("column_mode", "meta_mode", "expected"),
+        [
+            ("paper", "sandbox", (None, "INVALID_EXECUTION_MODE_METADATA")),
+            ("sandbox", "paper", (None, "MISSING_OR_INVALID_EXECUTION_MODE")),
+            (" PAPER ", " paper ", ("paper", None)),
+        ],
+    )
+    def test_resolver_validates_column_first_and_metadata_as_mirror(
+        self, column_mode, meta_mode, expected
+    ):
+        row = _row(
+            execution_mode=column_mode,
+            meta={"execution_mode": meta_mode},
+        )
+
+        assert _resolve_execution_mode(row) == expected
 
     @pytest.mark.parametrize(
         ("column_mode", "meta_mode"),
@@ -1538,13 +1587,13 @@ class TestExecutionModeAuthorityParity:
         assert osm.cancel_calls == []
         assert osm.meta_writes == []
 
-    def test_plan_builder_receives_canonical_mode_and_rejects_conflict(self):
-        fallback_row = _row(execution_mode=" ", meta={"execution_mode": "paper"})
-        plan = _build_plan(fallback_row)
-
-        assert plan is not None
-        assert plan.execution_mode == "paper"
-        assert _resolve_execution_mode(fallback_row) == ("paper", None)
+    def test_plan_builder_rejects_blank_and_conflicting_mode_mirrors(self):
+        blank_row = _row(execution_mode=" ", meta={"execution_mode": "paper"})
+        assert _build_plan(blank_row) is None
+        assert _resolve_execution_mode(blank_row) == (
+            None,
+            "MISSING_OR_INVALID_EXECUTION_MODE",
+        )
 
         conflict_row = _row(
             execution_mode="live",
@@ -1552,21 +1601,7 @@ class TestExecutionModeAuthorityParity:
         )
         assert _build_plan(conflict_row) is None
 
-        captured = {}
-
-        def _builder(row):
-            captured["execution_mode"] = row.get("execution_mode")
-            return _build_plan(row)
-
-        fallback_row["meta"]["trigger_price"] = 450.0
-        watcher = _MockWatcher(watch_returns=True)
-        rec, _ = _make_recovery(fallback_row, watcher=watcher, quote_result=False)
-        assert rec.recover_one_row(fallback_row, plan_builder_fn=_builder) == (
-            _RowOutcome.WATCHER_OWNED
-        )
-        assert captured["execution_mode"] == "paper"
-
-    def test_terminal_reread_uses_metadata_mode_fallback(self):
+    def test_terminal_reread_with_blank_column_is_unresolved_without_mutation(self):
         reason = "overnight_daily_invalidated"
         r = _row(
             execution_mode="",
@@ -1581,9 +1616,11 @@ class TestExecutionModeAuthorityParity:
 
         outcome = rec._terminalize_with_reason(r["local_order_id"], r, reason)
 
-        assert outcome == _RowOutcome.TERMINALIZED
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
 
-    def test_materialization_retry_reread_uses_metadata_mode_fallback(self):
+    def test_materialization_retry_reread_with_blank_column_is_unresolved(self):
         r = _row(
             execution_mode="",
             meta={
@@ -1598,9 +1635,9 @@ class TestExecutionModeAuthorityParity:
             r["local_order_id"], r
         )
 
-        assert proof is not None
+        assert proof is None
 
-    def test_restart_rearm_reread_uses_metadata_mode_fallback(self):
+    def test_restart_rearm_reread_with_blank_column_is_unresolved(self):
         now = datetime.now(timezone.utc)
         r = _row(
             execution_mode="",
@@ -1618,9 +1655,9 @@ class TestExecutionModeAuthorityParity:
             r["local_order_id"], r
         )
 
-        assert proof is not None
+        assert proof is None
 
-    def test_order_monitor_path_recovers_blank_column_from_meta_mode(self):
+    def test_order_monitor_path_rejects_blank_column_without_rearm(self):
         from ap.order_monitor import APOrderMonitor
 
         r = _row(
@@ -1647,7 +1684,9 @@ class TestExecutionModeAuthorityParity:
 
         assert (attempted, succeeded, reason) == (
             True,
-            True,
-            "canonical_recovery_watcher_owned",
+            False,
+            "canonical_recovery_unresolved:UNRESOLVED",
         )
-        assert watcher._pending[0].signal["execution_mode"] == "paper"
+        assert watcher._pending == []
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []

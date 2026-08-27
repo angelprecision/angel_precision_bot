@@ -680,8 +680,8 @@ class APOrderStateMachine:
             "direction":          _direction,
             "side":               _direction,   # alias — retry_engine reads both
             "symbol":             str(getattr(plan, "ticker", "") or ""),
-            # execution_mode mirrored into meta as a JSON fallback alongside the
-            # top-level orders.execution_mode column.
+            # execution_mode mirrored into meta as a consistency check
+            # alongside the top-level orders.execution_mode column.
             "execution_mode":     _exec_mode,
 
         }
@@ -2805,13 +2805,11 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
-                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
-                      -- A nonblank column and metadata mode are two mirrors
-                      -- of one identity. A contradictory pair must not satisfy
-                      -- this CAS; only a blank mirror may fall back.
+                      AND LOWER(BTRIM(execution_mode)) = %s
+                      -- Metadata can corroborate the canonical column, but
+                      -- must not replace a missing/blank column authority.
                       AND (
-                            NULLIF(BTRIM(execution_mode), '') IS NULL
-                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
                       )
                       AND COALESCE((meta->>'broker_ready')::boolean, false) = false
@@ -2889,10 +2887,9 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND LOWER(BTRIM(execution_mode)) = %s
                       AND (
-                            NULLIF(BTRIM(execution_mode), '') IS NULL
-                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
                       )
                       AND kind = 'ENTRY'
@@ -3595,10 +3592,9 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
-                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND LOWER(BTRIM(execution_mode)) = %s
                       AND (
-                            NULLIF(BTRIM(execution_mode), '') IS NULL
-                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
                       )
                       AND COALESCE(meta->>'materialization_owner','') = %s
@@ -3825,10 +3821,9 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND LOWER(BTRIM(execution_mode)) = %s
                       AND (
-                            NULLIF(BTRIM(execution_mode), '') IS NULL
-                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
                       )
                       AND kind = 'ENTRY'
@@ -3913,10 +3908,9 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND LOWER(BTRIM(execution_mode)) = %s
                       AND (
-                            NULLIF(BTRIM(execution_mode), '') IS NULL
-                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
                       )
                       AND kind = 'ENTRY'

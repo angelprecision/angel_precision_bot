@@ -13,8 +13,9 @@ Also proves:
 
   * runner mode is resolved once at the top and unknown mode short-circuits
   * OSM.client_id mismatch short-circuits before any DB call
-  * SQL query includes the canonical column/meta execution-mode fallback,
-    contradiction fence, and binds the runner mode as its second parameter
+  * SQL query uses the canonical column execution_mode authority, retains a
+    contradiction fence for metadata, and binds runner mode as its second
+    parameter
   * `_build_recovery_plan_from_order` no longer infers execution_mode from
     the runner (Amendment §1 fail-closed rule)
 
@@ -26,6 +27,7 @@ convention used by `test_p0_deferred_breach_lifecycle_completion.py`.
 from __future__ import annotations
 
 import types
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -153,7 +155,7 @@ def _row(**overrides):
 
 
 def test_sql_predicate_includes_execution_mode_scoping(db_spy):
-    """The SELECT must use the canonical mode fallback and contradiction
+    """The SELECT must use the strict column authority and contradiction
     fence, then bind the runner mode (lowercase) as the second parameter."""
     sink, state = db_spy
     rec, _, _ = _make_recovery(client_id="jason-live", mode="LIVE")
@@ -164,7 +166,9 @@ def test_sql_predicate_includes_execution_mode_scoping(db_spy):
 
     assert sink, "expected exactly one SQL execute"
     sql, params = sink[0]
-    assert "LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', '')))" in sql
+    assert "LOWER(BTRIM(execution_mode)) = %s" in sql
+    assert "COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', '')" not in sql
+    assert "NULLIF(BTRIM(execution_mode), '') IS NULL" not in sql
     assert "NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL" in sql
     assert "LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))" in sql
     assert params == ("jason-live", "live")
@@ -332,6 +336,7 @@ def test_matching_mode_and_client_row_is_processed_normally(db_spy):
     state["rows"] = [_row(
         client_id="jason-live",
         execution_mode="LIVE",
+        created_ts=datetime.now(timezone.utc).isoformat(),
         meta={"materialization_status": "WAITING_FOR_TRIGGER"},
     )]
 
@@ -406,8 +411,8 @@ def test_plan_from_row_with_valid_mode_lowercases_it():
     assert plan.execution_mode == "live"
 
 
-def test_plan_from_row_with_blank_column_uses_valid_metadata_mode():
-    """Legacy rows may use metadata when the top-level mode is blank."""
+def test_plan_from_row_with_blank_column_does_not_use_metadata_mode():
+    """A metadata mode cannot make a blank canonical column usable."""
     rec, _, _ = _make_recovery(client_id="jason-live", mode="PAPER")
 
     plan = rec._build_recovery_plan_from_order({
@@ -426,8 +431,10 @@ def test_plan_from_row_with_blank_column_uses_valid_metadata_mode():
         "meta": {"execution_mode": "paper"},
     })
 
+    # APStartupRecovery keeps its legacy plan shape for this read-only helper,
+    # but must not put the metadata value into the plan's canonical mode.
     assert plan is not None
-    assert plan.execution_mode == "paper"
+    assert plan.execution_mode == ""
 
 
 def test_plan_from_row_with_conflicting_mode_mirrors_is_rejected():

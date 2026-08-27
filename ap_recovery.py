@@ -1691,13 +1691,12 @@ class APStartupRecovery:
         runner mode. A paper runner MUST NOT observe or mutate LIVE rows,
         and a LIVE runner MUST NOT observe or mutate paper rows, even for
         the same client_id. The runner mode is resolved once at the top;
-        the SQL query uses the canonical column/meta fallback and rejects
-        contradictory nonblank mode mirrors; each row is re-verified in
+        the SQL query uses the canonical column authority and rejects
+        contradictory metadata mirrors; each row is re-verified in
         Python (defence in depth); the plan
         built from the row is re-verified before any watcher rearm or
-        submit path. A blank column is accepted only when metadata supplies
-        a valid mode; a malformed or contradictory persisted mode fails
-        identity closed here.
+        submit path. A blank or invalid column, or invalid/contradictory
+        metadata, fails identity closed here.
         """
         from ap.db import conn, run_with_retry
 
@@ -1735,10 +1734,9 @@ class APStartupRecovery:
                            , created_ts
                     FROM orders
                     WHERE client_id = %s
-                      AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND LOWER(BTRIM(execution_mode)) = %s
                       AND (
-                            NULLIF(BTRIM(execution_mode), '') IS NULL
-                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
                       )
                       AND kind = 'ENTRY'
@@ -2138,8 +2136,8 @@ class APStartupRecovery:
                 "meta": meta,
             })
             if row_mode_error:
-                # A blank column may use the metadata mirror, but a malformed
-                # or contradictory pair is not ours to repair in recovery.
+                # A blank/invalid column, or malformed/contradictory metadata,
+                # is not ours to repair in recovery.
                 # We QUARANTINE (skip + log) rather than terminalize, because
                 # we cannot prove the row is ours without a valid mode field.
                 log.error(
@@ -2151,8 +2149,7 @@ class APStartupRecovery:
                 continue
             row_mode = str(row_mode).upper()
             # Downstream plan/evidence builders must see the same canonical
-            # mode that passed this authority fence, including legacy rows
-            # whose column mirror is blank but metadata is valid.
+            # mode that passed this authority fence.
             order["execution_mode"] = row_mode
             if row_mode != recovery_mode:
                 log.error(
@@ -3493,9 +3490,9 @@ class APStartupRecovery:
                     WHERE o.client_id = %s
                       AND o.kind = 'ENTRY'
                       AND o.status = 'PENDING_TRIGGER'
+                      AND LOWER(BTRIM(o.execution_mode)) = %s
                       AND (
-                            NULLIF(BTRIM(o.execution_mode), '') IS NULL
-                         OR NULLIF(BTRIM(o.meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(o.meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(o.execution_mode)) = LOWER(BTRIM(o.meta->>'execution_mode'))
                       )
                       AND o.created_ts >= %s
@@ -3517,7 +3514,7 @@ class APStartupRecovery:
                       )
                     ORDER BY o.created_ts ASC
                     """,
-                    (self.client_id, cutoff_utc),
+                    (self.client_id, _mc_mode.lower(), cutoff_utc),
                 )
                 return c.fetchall()
 

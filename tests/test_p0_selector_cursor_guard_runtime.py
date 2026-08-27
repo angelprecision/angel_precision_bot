@@ -9,17 +9,14 @@ Problem closed:
 
       LOWER(TRIM(COALESCE(execution_mode,''))) = %s
 
-  which:
-    • dropped whitespace before the comparison but left execution_mode=""
-      returning '' (not the mode), so a row with a blank column and a
-      meta.execution_mode fallback would CAS-miss even though the row is valid;
-    • had no metadata fallback, so blank column + meta='paper' → False.
+  which did not consistently normalize the canonical column and left the
+  runtime guard out of parity with the durable mode authority.
 
   This file proves the installed guard (not the unpatched OSM stub) now handles:
     G1: column=' paper ' (whitespace)  → cursor persisted (True)
-    G2: column=''       meta='paper'   → cursor persisted (True)
+    G2: column=''       meta='paper'   → rejected without mutation (False)
     G3: column=' live ' (whitespace)   → cursor persisted (True)
-    G4: column=''       meta='live'    → cursor persisted (True)
+    G4: column=''       meta='live'    → rejected without mutation (False)
 
   And preserves the existing CAS-miss contract for non-matching rows:
     H1: wrong owner         → False
@@ -210,17 +207,16 @@ def _call_guard(conn_ctx, *, local_order_id, client_id, signal_id,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Positive tests G1–G4: whitespace column / blank column with meta fallback
+# G1/G3 positive tests: whitespace is normalized on a nonblank column.
+# G2/G4 negative tests: a blank canonical column cannot use metadata.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_G1_whitespace_paper_column_guard_persists():
     """Installed guard: orders.execution_mode=' paper ' resolves to 'paper'.
 
-    Prior to this amendment the runtime SQL used LOWER(TRIM(COALESCE(...)))
-    which normalised whitespace on the column but produced '' when column=''
-    with no meta path — so ' paper ' (single spaces) WOULD pass TRIM, but
-    this shape proves the full BTRIM path is live in the installed guard."""
+    The strict column-authority predicate must still normalize a nonblank
+    whitespace-padded value before comparing it with the requested mode."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -266,11 +262,8 @@ def test_G1_whitespace_paper_column_guard_persists():
         admin.close()
 
 
-def test_G2_blank_column_meta_paper_guard_persists():
-    """Installed guard: column='' with meta.execution_mode='paper' must return True.
-
-    Without the canonical predicate the installed guard had no meta fallback so
-    '' != 'paper' → CAS miss → False. This is the primary regression shape."""
+def test_G2_blank_column_meta_paper_guard_rejects_without_mutation():
+    """Installed guard rejects blank column even when metadata says paper."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -290,10 +283,11 @@ def test_G2_blank_column_meta_paper_guard_persists():
             client_id=_CLIENT,
             signal_id=_SIGNAL,
             col_execution_mode="",          # ← blank column
-            meta_execution_mode="paper",    # ← fallback authority
+            meta_execution_mode="paper",    # ← corroborating mirror
             generation=_GENERATION,
             owner=_OWNER,
         )
+        before = _read_order(conn_ctx, schema, local_order_id)
 
         result = _call_guard(
             conn_ctx,
@@ -305,11 +299,12 @@ def test_G2_blank_column_meta_paper_guard_persists():
             generation=_GENERATION,
         )
 
-        assert result is True, (
-            f"Installed guard must return True for blank column with meta='paper'; "
-            f"got {result!r}. Old LOWER(TRIM(COALESCE(execution_mode,'')))='', "
-            f"which does not equal 'paper' → was a false CAS miss."
-        )
+        assert result is False
+        after = _read_order(conn_ctx, schema, local_order_id)
+        assert after["updated_ts"] == before["updated_ts"]
+        assert after["execution_mode"] == ""
+        assert after["meta"]["execution_mode"] == "paper"
+        assert after["meta"]["selector_recovery_cursor_v1"] is None
     finally:
         with admin.cursor() as acur:
             acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -362,8 +357,8 @@ def test_G3_whitespace_live_column_guard_persists():
         admin.close()
 
 
-def test_G4_blank_column_meta_live_guard_persists():
-    """Installed guard: column='' with meta.execution_mode='live' must return True."""
+def test_G4_blank_column_meta_live_guard_rejects_without_mutation():
+    """Installed guard rejects blank column even when metadata says live."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -383,10 +378,11 @@ def test_G4_blank_column_meta_live_guard_persists():
             client_id=_CLIENT,
             signal_id=_SIGNAL,
             col_execution_mode="",          # ← blank column
-            meta_execution_mode="live",     # ← fallback authority
+            meta_execution_mode="live",     # ← corroborating mirror
             generation=_GENERATION,
             owner=_OWNER,
         )
+        before = _read_order(conn_ctx, schema, local_order_id)
 
         result = _call_guard(
             conn_ctx,
@@ -398,10 +394,12 @@ def test_G4_blank_column_meta_live_guard_persists():
             generation=_GENERATION,
         )
 
-        assert result is True, (
-            f"Installed guard must return True for blank column with meta='live'; "
-            f"got {result!r}."
-        )
+        assert result is False
+        after = _read_order(conn_ctx, schema, local_order_id)
+        assert after["updated_ts"] == before["updated_ts"]
+        assert after["execution_mode"] == ""
+        assert after["meta"]["execution_mode"] == "live"
+        assert after["meta"]["selector_recovery_cursor_v1"] is None
     finally:
         with admin.cursor() as acur:
             acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -688,13 +686,12 @@ def test_N_osm_copyback_rejects_contradictory_mode_without_mutation(
 
 @pytest.mark.parametrize("column_mode,meta_mode", [
     ("", "paper"),
-    (" paper ", "paper"),
     ("", "live"),
 ])
-def test_M_osm_claim_preserves_blank_mirror_metadata_fallback(
+def test_M_osm_claim_rejects_blank_column_even_with_metadata(
     column_mode, meta_mode
 ):
-    """A blank/whitespace column remains a valid metadata fallback."""
+    """The claim CAS must require a nonblank canonical mode column."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -708,7 +705,7 @@ def test_M_osm_claim_preserves_blank_mirror_metadata_fallback(
     admin.autocommit = True
     try:
         with admin.cursor() as acur:
-            schema = _make_schema("test_m_claim_fallback", acur)
+            schema = _make_schema("test_m_claim_strict_column", acur)
         conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
         _insert_order(
             conn_ctx, schema,
@@ -721,6 +718,7 @@ def test_M_osm_claim_preserves_blank_mirror_metadata_fallback(
             owner="",
             lifecycle_state="RETRY_WAIT",
         )
+        before = _read_order(conn_ctx, schema, local_order_id)
 
         original_conn = osm_mod.conn
         osm_mod.conn = conn_ctx
@@ -741,11 +739,13 @@ def test_M_osm_claim_preserves_blank_mirror_metadata_fallback(
         finally:
             osm_mod.conn = original_conn
 
-        assert result is True
+        assert result is False
         row = _read_order(conn_ctx, schema, local_order_id)
+        assert row["updated_ts"] == before["updated_ts"]
+        assert row["execution_mode"] == column_mode
         assert row["meta"]["execution_mode"] == meta_mode
-        assert row["meta"]["lifecycle_state"] == "MATERIALIZING"
-        assert row["meta"]["materialization_generation"] == _GENERATION
+        assert row["meta"]["lifecycle_state"] == "RETRY_WAIT"
+        assert row["meta"]["materialization_generation"] == _GENERATION - 1
     finally:
         with admin.cursor() as acur:
             acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
