@@ -4845,7 +4845,7 @@ class APExecutionCore:
             self._cleanup_pending_entry_order(watched, action="expire", reason=_reason)
             return
 
-        def _terminalize_breach_failure(
+        def _terminalize_breach_failure_impl(
             reason: str,
             *,
             cleanup_action: str = "expire",
@@ -4955,9 +4955,9 @@ class APExecutionCore:
                 "terminal_status": ("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
             }
 
-        def _terminalize_breach_failure_for_callback(*args, **kwargs) -> dict | None:
+        def _terminalize_breach_failure(*args, **kwargs) -> dict | None:
             """Forward an owned deferred CAS outcome without changing ordinary returns."""
-            _result = _terminalize_breach_failure(*args, **kwargs)
+            _result = _terminalize_breach_failure_impl(*args, **kwargs)
             return _result if _deferred_materialization_owned else None
 
         def _terminalize_deferred_breach_failure(
@@ -4977,14 +4977,14 @@ class APExecutionCore:
             if extra_meta:
                 meta_patch.update(extra_meta)
             if _deferred_materialization_owned:
-                return _terminalize_breach_failure(
+                return _terminalize_breach_failure_impl(
                     reason,
                     cleanup_action="expire",
                     meta_patch=meta_patch,
                     context_notes=reason,
                 )
             if _ownership_context.get("is_recovered"):
-                return _terminalize_breach_failure(
+                return _terminalize_breach_failure_impl(
                     reason,
                     cleanup_action="expire",
                     meta_patch=meta_patch,
@@ -5019,7 +5019,7 @@ class APExecutionCore:
                         "[%s] deferred terminal CAS failed order=%s error=%s",
                         ticker, queue_local_order_id, _atomic_terminal_exc,
                     )
-            return _terminalize_breach_failure(
+            return _terminalize_breach_failure_impl(
                 reason,
                 cleanup_action="expire",
                 meta_patch=meta_patch,
@@ -7699,7 +7699,7 @@ class APExecutionCore:
 
         if _plan_limit <= 0:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing valid limit_price", ticker)
-            return _terminalize_breach_failure_for_callback(
+            return _terminalize_breach_failure(
                 "approved_plan_missing_limit_price"
             )
 
@@ -7759,13 +7759,13 @@ class APExecutionCore:
 
         if not approved_contract:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing contract_symbol", ticker)
-            return _terminalize_breach_failure_for_callback(
+            return _terminalize_breach_failure(
                 "approved_plan_missing_contract_symbol"
             )
 
         if approved_qty <= 0:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan has invalid contracts=%s", ticker, approved_qty)
-            return _terminalize_breach_failure_for_callback(
+            return _terminalize_breach_failure(
                 f"approved_plan_invalid_contracts={approved_qty}"
             )
 
@@ -7808,7 +7808,7 @@ class APExecutionCore:
                 "contract=%s reason=%s refresh_ok=%s submit_ask=%s | blocking submit",
                 ticker, approved_contract, _refresh_reason, _refresh_ok, _submit_ask,
             )
-            return _terminalize_breach_failure_for_callback(
+            return _terminalize_breach_failure(
                 f"breach_quote_refresh_failed:{_refresh_reason}"
             )
 
@@ -7822,7 +7822,7 @@ class APExecutionCore:
                 "contract=%s spread_pct=%.3f max=%.3f | blocking submit",
                 ticker, approved_contract, _spread_pct, _max_spread,
             )
-            return _terminalize_breach_failure_for_callback(
+            return _terminalize_breach_failure(
                 f"breach_spread_too_wide:{_spread_pct:.3f}"
             )
 
@@ -7837,7 +7837,7 @@ class APExecutionCore:
                 ticker, approved_contract, _plan_limit, _submit_ask,
                 _drift_pct * 100, ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN * 100,
             )
-            return _terminalize_breach_failure_for_callback(
+            return _terminalize_breach_failure(
                 (
                     f"breach_entry_price_drift_too_high:"
                     f"plan={_plan_limit:.2f} ask={_submit_ask:.2f} "
@@ -7933,7 +7933,7 @@ class APExecutionCore:
                         _pr180_bid, _pr180_mid, _pr180_ask, _pr180_spread,
                         _pr180_spread_source, submit_limit, self.client_id,
                     )
-                    return _terminalize_breach_failure_for_callback(
+                    return _terminalize_breach_failure(
                         f"pr180_block:{_pr180_reason.lower()}:"
                         f"spread={_pr180_spread!r}:"
                         f"limit={submit_limit:.2f}"
@@ -8453,7 +8453,7 @@ class APExecutionCore:
                                 "execution_mode":                  _proof_execution_mode,
                             },
                         )
-                        return _terminalize_breach_failure_for_callback(_cb_fail_reason)
+                        return _terminalize_breach_failure(_cb_fail_reason)
                 else:
                     # Selector snapshot exists but values are not copyback-ready
                     # (placeholder contract, zero limit, zero qty). The existing
@@ -8767,7 +8767,7 @@ class APExecutionCore:
         except Exception as _ec_err:
             # Fail-closed for confirmation errors — block the submit
             log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
-            _terminalization_result = _terminalize_breach_failure_for_callback(
+            _terminalization_result = _terminalize_breach_failure(
                 f"entry_confirm_error:{_ec_err}",
                 cleanup_action="expire",
                 funnel_key="entry_confirm_blocked",
@@ -8805,7 +8805,7 @@ class APExecutionCore:
             getattr(self, "paper", None),
         )
         if _submit_execution_mode is None:
-            return _terminalize_breach_failure_for_callback(
+            return _terminalize_breach_failure(
                 "metadata_invalid:unknown_execution_mode",
                 cleanup_action="expire",
                 funnel_key="entry_metadata_blocked",
@@ -8856,7 +8856,7 @@ class APExecutionCore:
                     str(_pre_contract or ""),
                     float(_pre_limit),
                 )
-                return _terminalize_breach_failure_for_callback(_br_inv_err)
+                return _terminalize_breach_failure(_br_inv_err)
 
             # ── P0 amendment #5+#6 (PR #294 final hardening): fail-closed
             # order-row read. Identity vars (_proof_client_id /
@@ -9036,7 +9036,7 @@ class APExecutionCore:
                             "execution_mode":                  _proof_execution_mode,
                         },
                     )
-                    return _terminalize_breach_failure_for_callback(_inv_err)
+                    return _terminalize_breach_failure(_inv_err)
 
             # Stage C: row is readable (PASS or proof not applicable). Extract
             # order_row_contract into the snapshot for the handoff classifier
@@ -9081,7 +9081,7 @@ class APExecutionCore:
                             "execution_mode":                  _proof_execution_mode,
                         },
                     )
-                    return _terminalize_breach_failure_for_callback(_inv_err)
+                    return _terminalize_breach_failure(_inv_err)
 
             # ── P0 amendment #3+#4+#5: deferred materialization handoff proof.
             # Runs BEFORE the existing DEFERRED_CONTRACT/LIMIT invariants.
@@ -9171,7 +9171,7 @@ class APExecutionCore:
                         "execution_mode":                  _proof_execution_mode,
                     },
                 )
-                return _terminalize_breach_failure_for_callback(_inv_err)
+                return _terminalize_breach_failure(_inv_err)
 
             if (not _pre_contract) or _pre_contract.upper().startswith("DEFERRED:"):
                 _inv_err = "DEFERRED_CONTRACT_NOT_MATERIALIZED"
@@ -9192,7 +9192,7 @@ class APExecutionCore:
                     str(_pre_contract or ""),
                     float(_pre_limit),
                 )
-                return _terminalize_breach_failure_for_callback(_inv_err)
+                return _terminalize_breach_failure(_inv_err)
             if _pre_limit <= 0.01:
                 _inv_err = "DEFERRED_LIMIT_NOT_MATERIALIZED"
                 log.critical(
@@ -9212,7 +9212,7 @@ class APExecutionCore:
                     str(_pre_contract or ""),
                     float(_pre_limit),
                 )
-                return _terminalize_breach_failure_for_callback(_inv_err)
+                return _terminalize_breach_failure(_inv_err)
 
             # ── P0 (monday-trade-flow-readiness, amended): acceptance cap on
             # the FINAL submit limit. The selection-time cap check above can
@@ -9271,7 +9271,7 @@ class APExecutionCore:
                             "materialization_detail_override": _inv_err,
                         },
                     )
-                    return _terminalize_breach_failure_for_callback(_inv_err)
+                    return _terminalize_breach_failure(_inv_err)
                 if _pre_limit > _accept_cap:
                     _inv_err = (
                         f"ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT:"
@@ -9292,7 +9292,7 @@ class APExecutionCore:
                             "materialization_detail_override": "ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT",
                         },
                     )
-                    return _terminalize_breach_failure_for_callback(_inv_err)
+                    return _terminalize_breach_failure(_inv_err)
 
         # ── P0 (#301) Fix A: resolve_positive_underlying_for_breach ──────────────
         # Mandatory before submit_existing_entry() for all breach orders.
@@ -9370,7 +9370,7 @@ class APExecutionCore:
                                 })
                         except Exception:
                             pass
-                        return _terminalize_breach_failure_for_callback(
+                        return _terminalize_breach_failure(
                             _paper_block_reason
                         )
 
@@ -9400,7 +9400,7 @@ class APExecutionCore:
                     except Exception as _zu_persist_exc:
                         log.debug("[%s] zero_underlying no-source meta persist non-critical: %s",
                                   ticker, _zu_persist_exc)
-                    return _terminalize_breach_failure_for_callback(_ZU_TERMINAL)
+                    return _terminalize_breach_failure(_ZU_TERMINAL)
 
                 # Underlying resolved — patch in-memory plan metadata
                 try:
@@ -9476,7 +9476,7 @@ class APExecutionCore:
             log.critical("[%s] UNEXPECTED_UNDERLYING_RESOLVE_ERROR order_id=%s error=%s",
                          ticker, str(queue_local_order_id or ""), _udl_exc)
             if _deferred:
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     f"underlying_resolve_error:{_udl_exc}"
                 )
 
@@ -9602,7 +9602,7 @@ class APExecutionCore:
                         "order_id=%s error=%s — submit still blocked",
                         ticker, str(queue_local_order_id or ""), _mism_meta_exc,
                     )
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     "live_submit_gate:CLIENT_ID_SOURCE_MISMATCH"
                 )
             _final_market_validity_audit = {
@@ -9670,9 +9670,7 @@ class APExecutionCore:
                         "order_id=%s error=%s — submit still blocked",
                         ticker, str(queue_local_order_id or ""), _def_meta_exc,
                     )
-                return _terminalize_breach_failure_for_callback(
-                    f"live_submit_gate:{_deferred_reason}"
-                )
+                return _terminalize_breach_failure(f"live_submit_gate:{_deferred_reason}")
 
             # ── Amendment 2: read trigger timestamps from durable meta ───────
             # WatchedSignal.check() stamps trigger_crossed_at on first breach
@@ -9736,7 +9734,7 @@ class APExecutionCore:
                         "order_id=%s client_id=%s error=%s — submit still blocked",
                         ticker, str(queue_local_order_id or ""), _gate_client_id, _id_meta_exc,
                     )
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     f"live_submit_gate:{_id_res.reason_code}"
                 )
 
@@ -9854,7 +9852,7 @@ class APExecutionCore:
                         "order_id=%s reason=%s error=%s — submit still blocked",
                         ticker, str(queue_local_order_id or ""), _mv_res.reason_code, _mv_meta_exc,
                     )
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     f"live_submit_gate:{_mv_res.reason_code}"
                 )
             # Even on PASS in paper we log the mid so audit trails are complete
@@ -9880,7 +9878,7 @@ class APExecutionCore:
                 except Exception:
                     _absolute_deadline = None
                 if _absolute_deadline is None or _confirm_now >= _absolute_deadline:
-                    return _terminalize_breach_failure_for_callback(
+                    return _terminalize_breach_failure(
                         "live_submit_gate:ABSOLUTE_ENTRY_DEADLINE_EXCEEDED"
                     )
 
@@ -9891,7 +9889,7 @@ class APExecutionCore:
             )
             _confirm_et = _confirm_now.astimezone(_ZoneInfo("America/New_York"))
             if _gate_is_live and (_confirm_et.hour * 100 + _confirm_et.minute) >= _entry_cutoff_hhmm:
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     "live_submit_gate:ENTRY_CUTOFF_EXCEEDED"
                 )
 
@@ -9907,7 +9905,7 @@ class APExecutionCore:
                     "last_trigger_confirmation_quote": _mv_res.audit,
                 },
             ):
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     "live_submit_gate:TRIGGER_CONFIRMATION_PERSIST_FAILED"
                 )
             _confirmed_row = self.order_state_machine.get_order(
@@ -9918,7 +9916,7 @@ class APExecutionCore:
                 _confirmed_meta = json.loads(_confirmed_meta)
             _last_confirmed_durable = _confirmed_meta.get("last_confirmed_trigger_at")
             if _last_confirmed_durable != _last_confirmed_candidate:
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     "live_submit_gate:TRIGGER_CONFIRMATION_REREAD_MISMATCH"
                 )
 
@@ -9949,7 +9947,7 @@ class APExecutionCore:
                         "order_id=%s reason=%s error=%s — submit still blocked",
                         ticker, str(queue_local_order_id or ""), _ta_res.reason_code, _ta_meta_exc,
                     )
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     f"live_submit_gate:{_ta_res.reason_code}"
                 )
 
@@ -10035,7 +10033,7 @@ class APExecutionCore:
                         "order_id=%s error=%s — submit still blocked",
                         ticker, str(queue_local_order_id or ""), _me_meta_exc,
                     )
-                return _terminalize_breach_failure_for_callback(
+                return _terminalize_breach_failure(
                     "live_submit_gate:MODULE_ERROR"
                 )
 
