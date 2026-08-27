@@ -2591,7 +2591,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
+                      AND LOWER(COALESCE(execution_mode,'')) = %s
                       AND COALESCE(signal_id,'') = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = %s

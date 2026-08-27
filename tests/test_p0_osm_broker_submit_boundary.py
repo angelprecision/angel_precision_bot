@@ -1087,6 +1087,48 @@ class TestNormalEntryRegressions:
         assert result["error"] != "MATERIALIZATION_EXECUTION_MODE_UNPROVEN"
         assert broker.session.post.call_count == 1
 
+    def test_ordinary_submit_intent_uses_column_only_mode_cas(self, monkeypatch):
+        """The real ordinary intent CAS must not apply deferred meta fencing."""
+        osm = _make_osm()
+        executed_sql = []
+
+        class _Cursor:
+            rowcount = 1
+
+        class _Conn:
+            rowcount = 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, _params):
+                executed_sql.append(sql)
+                return _Cursor()
+
+        monkeypatch.setattr("ap.order_state_machine.conn", lambda: _Conn())
+        monkeypatch.setattr(
+            "ap.order_state_machine.run_with_retry",
+            lambda fn, *args, **kwargs: fn(),
+        )
+
+        assert osm.persist_entry_submit_intent(
+            _LOID,
+            current_status="PENDING_TRIGGER",
+            execution_mode="live",
+            signal_id=_SIGNAL,
+            contract=_CONTRACT,
+            qty=1,
+            limit_price=1.25,
+            payload_hash="ordinary-payload-hash",
+            broker_submit_key=_TAG,
+        ) is True
+        assert len(executed_sql) == 1
+        assert "LOWER(COALESCE(execution_mode,'')) = %s" in executed_sql[0]
+        assert "meta->>'execution_mode'" not in executed_sql[0]
+
     def test_deferred_entry_keeps_strict_mode_gate(self):
         osm = _make_osm()
         broker = _broker_post(broker_id="BID-SHOULD-NOT-APPEAR", status_str="open")
