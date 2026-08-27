@@ -1890,6 +1890,9 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     EXACTLY ONCE across the entire path. The second claim inside
     _on_entry_trigger must be bypassed via the verified pre-claim markers.
 
+    Also exercises the legacy durable-row shape where the top-level
+    execution_mode column is blank and the metadata mirror is authoritative.
+
     Does NOT mock _on_entry_trigger. Does NOT manually manufacture the
     post-callback row.
     """
@@ -1915,6 +1918,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
 
     # ── Build a production-shape durable row (RETRY_WAIT attempt=1) ──
     before_meta = {
+        "execution_mode": "paper",
         "lifecycle_state": "RETRY_WAIT",
         "materialization_status": "RETRY_PENDING",
         "materialization_generation": 1,
@@ -1946,7 +1950,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     before_row = {
         "local_order_id": LOCAL_ORDER_ID,
         "client_id": CLIENT_ID,
-        "execution_mode": "paper",
+        "execution_mode": "",
         "signal_id": SIGNAL_ID,
         "plan_id": "plan-seam-1",
         "kind": "ENTRY",

@@ -2806,6 +2806,14 @@ class APOrderStateMachine:
                       AND submitted_ts IS NULL
                       AND signal_id = %s
                       AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      -- A nonblank column and metadata mode are two mirrors
+                      -- of one identity. A contradictory pair must not satisfy
+                      -- this CAS; only a blank mirror may fall back.
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND COALESCE((meta->>'broker_ready')::boolean, false) = false
                     """ + _attempt_predicate + """
                       AND (
@@ -2882,6 +2890,11 @@ class APOrderStateMachine:
                       AND client_id = %s
                       AND signal_id = %s
                       AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3583,6 +3596,11 @@ class APOrderStateMachine:
                       AND submitted_ts IS NULL
                       AND signal_id = %s
                       AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND COALESCE(meta->>'materialization_owner','') = %s
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
@@ -3808,6 +3826,11 @@ class APOrderStateMachine:
                       AND client_id = %s
                       AND signal_id = %s
                       AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3891,6 +3914,11 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')

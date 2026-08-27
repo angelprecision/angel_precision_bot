@@ -130,6 +130,11 @@ def _guarded_persist_selector_recovery_cursor(
                   AND client_id = %s
                   AND signal_id = %s
                   AND LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', ''))) = %s
+                  AND (
+                        NULLIF(BTRIM(execution_mode), '') IS NULL
+                     OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                     OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                  )
                   AND UPPER(BTRIM(COALESCE(kind,''))) = 'ENTRY'
                   AND UPPER(BTRIM(COALESCE(status,''))) = 'PENDING_TRIGGER'
                   AND (broker_order_id IS NULL OR broker_order_id = '')

@@ -92,6 +92,11 @@ def _make_schema(prefix: str, cur) -> str:
             signal_id      TEXT,
             broker_order_id TEXT,
             submitted_ts   TIMESTAMPTZ,
+            contract       TEXT,
+            limit_price    DOUBLE PRECISION,
+            qty            INTEGER,
+            reserved_cost  DOUBLE PRECISION,
+            contract_selection_status TEXT,
             meta           JSONB,
             updated_ts     TIMESTAMPTZ DEFAULT NOW()
         )
@@ -397,6 +402,350 @@ def test_G4_blank_column_meta_live_guard_persists():
             f"Installed guard must return True for blank column with meta='live'; "
             f"got {result!r}."
         )
+    finally:
+        with admin.cursor() as acur:
+            acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direct PostgreSQL contradiction controls for the #519 SQL seams.
+#
+# The Python retry consumer already rejects this identity conflict before it
+# calls OSM. These tests deliberately call the production SQL methods directly
+# so a future caller cannot bypass that upstream guard and mutate the row.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _read_order(conn_ctx, schema, local_order_id):
+    with conn_ctx() as c:
+        c.execute(
+            f'SELECT execution_mode, contract, contract_selection_status, meta, '
+            f'updated_ts '
+            f'FROM "{schema}".orders WHERE local_order_id = %s',
+            (local_order_id,),
+        )
+        return c.fetchone()
+
+
+@pytest.mark.parametrize("column_mode,meta_mode", [
+    ("live", "paper"),
+    ("paper", "live"),
+])
+def test_J_osm_claim_rejects_contradictory_mode_without_mutation(
+    column_mode, meta_mode
+):
+    """The production claim CAS must not let column-first mode win."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = _pg_skip_or_fail()
+
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_mod
+
+    local_order_id = f"oid-j-claim-{uuid.uuid4().hex}"
+    signal_id = f"sig-j-claim-{uuid.uuid4().hex}"
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as acur:
+            schema = _make_schema("test_j_claim_conflict", acur)
+        conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
+        _insert_order(
+            conn_ctx, schema,
+            local_order_id=local_order_id,
+            client_id=_CLIENT,
+            signal_id=signal_id,
+            col_execution_mode=column_mode,
+            meta_execution_mode=meta_mode,
+            generation=_GENERATION - 1,
+            owner="",
+            lifecycle_state="RETRY_WAIT",
+        )
+        before = _read_order(conn_ctx, schema, local_order_id)
+
+        original_conn = osm_mod.conn
+        osm_mod.conn = conn_ctx
+        try:
+            osm = APOrderStateMachine(client_id=_CLIENT)
+            result = osm.claim_deferred_materialization(
+                local_order_id,
+                owner=_OWNER,
+                new_generation=_GENERATION,
+                lease_until=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+                trigger_crossed_at=datetime.now(timezone.utc).isoformat(),
+                trigger_price=130.0,
+                observed_underlying_price=130.05,
+                signal_id=signal_id,
+                execution_mode=column_mode,
+                retry_attempt=1,
+            )
+        finally:
+            osm_mod.conn = original_conn
+
+        assert result is False
+        row = _read_order(conn_ctx, schema, local_order_id)
+        assert row["updated_ts"] == before["updated_ts"]
+        assert row["execution_mode"] == column_mode
+        assert row["contract"] is None
+        assert row["meta"]["execution_mode"] == meta_mode
+        assert row["meta"]["lifecycle_state"] == "RETRY_WAIT"
+    finally:
+        with admin.cursor() as acur:
+            acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+@pytest.mark.parametrize("column_mode,meta_mode", [
+    ("live", "paper"),
+    ("paper", "live"),
+])
+def test_K_installed_cursor_guard_rejects_contradictory_mode_without_mutation(
+    column_mode, meta_mode
+):
+    """The installed cursor guard must preserve the row on mode conflict."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = _pg_skip_or_fail()
+
+    local_order_id = f"oid-k-cursor-{uuid.uuid4().hex}"
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as acur:
+            schema = _make_schema("test_k_cursor_conflict", acur)
+        conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
+        _insert_order(
+            conn_ctx, schema,
+            local_order_id=local_order_id,
+            client_id=_CLIENT,
+            signal_id=_SIGNAL,
+            col_execution_mode=column_mode,
+            meta_execution_mode=meta_mode,
+            generation=_GENERATION,
+            owner=_OWNER,
+        )
+        before = _read_order(conn_ctx, schema, local_order_id)
+
+        result = _call_guard(
+            conn_ctx,
+            local_order_id=local_order_id,
+            client_id=_CLIENT,
+            signal_id=_SIGNAL,
+            execution_mode_arg=column_mode,
+            owner=_OWNER,
+            generation=_GENERATION,
+        )
+
+        assert result is False
+        row = _read_order(conn_ctx, schema, local_order_id)
+        assert row["updated_ts"] == before["updated_ts"]
+        assert row["meta"]["selector_recovery_cursor_v1"] is None
+        assert row["execution_mode"] == column_mode
+        assert row["meta"]["execution_mode"] == meta_mode
+    finally:
+        with admin.cursor() as acur:
+            acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+@pytest.mark.parametrize("column_mode,meta_mode", [
+    ("live", "paper"),
+    ("paper", "live"),
+])
+def test_L_osm_retry_schedule_rejects_contradictory_mode_without_mutation(
+    column_mode, meta_mode
+):
+    """A second #519 retry CAS must also fail closed on the same conflict."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = _pg_skip_or_fail()
+
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_mod
+
+    local_order_id = f"oid-l-schedule-{uuid.uuid4().hex}"
+    signal_id = f"sig-l-schedule-{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as acur:
+            schema = _make_schema("test_l_schedule_conflict", acur)
+        conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
+        _insert_order(
+            conn_ctx, schema,
+            local_order_id=local_order_id,
+            client_id=_CLIENT,
+            signal_id=signal_id,
+            col_execution_mode=column_mode,
+            meta_execution_mode=meta_mode,
+            generation=_GENERATION,
+            owner=_OWNER,
+            lifecycle_state="MATERIALIZING",
+        )
+        before = _read_order(conn_ctx, schema, local_order_id)
+
+        original_conn = osm_mod.conn
+        osm_mod.conn = conn_ctx
+        try:
+            osm = APOrderStateMachine(client_id=_CLIENT)
+            result = osm.schedule_deferred_materialization_retry(
+                local_order_id,
+                owner=_OWNER,
+                generation=_GENERATION,
+                reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                attempt=1,
+                max_attempts=3,
+                next_retry_at=(now + timedelta(seconds=30)).isoformat(),
+                selector_failure={
+                    "signal_id": signal_id,
+                    "execution_mode": column_mode,
+                },
+                signal_id=signal_id,
+                execution_mode=column_mode,
+            )
+        finally:
+            osm_mod.conn = original_conn
+
+        assert result is False
+        row = _read_order(conn_ctx, schema, local_order_id)
+        assert row["updated_ts"] == before["updated_ts"]
+        assert row["execution_mode"] == column_mode
+        assert row["meta"]["execution_mode"] == meta_mode
+        assert row["meta"]["lifecycle_state"] == "MATERIALIZING"
+        assert "retry_scheduled_at" not in row["meta"]
+    finally:
+        with admin.cursor() as acur:
+            acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+@pytest.mark.parametrize("column_mode,meta_mode", [
+    ("live", "paper"),
+    ("paper", "live"),
+])
+def test_N_osm_copyback_rejects_contradictory_mode_without_mutation(
+    column_mode, meta_mode
+):
+    """The materialization copyback CAS must share the same mode fence."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = _pg_skip_or_fail()
+
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_mod
+
+    local_order_id = f"oid-n-copyback-{uuid.uuid4().hex}"
+    signal_id = f"sig-n-copyback-{uuid.uuid4().hex}"
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as acur:
+            schema = _make_schema("test_n_copyback_conflict", acur)
+        conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
+        _insert_order(
+            conn_ctx, schema,
+            local_order_id=local_order_id,
+            client_id=_CLIENT,
+            signal_id=signal_id,
+            col_execution_mode=column_mode,
+            meta_execution_mode=meta_mode,
+            generation=_GENERATION,
+            owner=_OWNER,
+            lifecycle_state="MATERIALIZING",
+        )
+        before = _read_order(conn_ctx, schema, local_order_id)
+
+        original_conn = osm_mod.conn
+        osm_mod.conn = conn_ctx
+        try:
+            osm = APOrderStateMachine(client_id=_CLIENT)
+            result = osm.persist_deferred_broker_ready(
+                local_order_id,
+                owner=_OWNER,
+                generation=_GENERATION,
+                signal_id=signal_id,
+                execution_mode=column_mode,
+                contract="RTX260117C00130000",
+                limit_price=2.10,
+                qty=1,
+                reserved_cost=210.0,
+                selector_meta={"materialization_detail": "test"},
+            )
+        finally:
+            osm_mod.conn = original_conn
+
+        assert result is False
+        row = _read_order(conn_ctx, schema, local_order_id)
+        assert row["updated_ts"] == before["updated_ts"]
+        assert row["execution_mode"] == column_mode
+        assert row["contract"] is None
+        assert row["contract_selection_status"] is None
+        assert row["meta"]["execution_mode"] == meta_mode
+        assert row["meta"]["lifecycle_state"] == "MATERIALIZING"
+    finally:
+        with admin.cursor() as acur:
+            acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+@pytest.mark.parametrize("column_mode,meta_mode", [
+    ("", "paper"),
+    (" paper ", "paper"),
+    ("", "live"),
+])
+def test_M_osm_claim_preserves_blank_mirror_metadata_fallback(
+    column_mode, meta_mode
+):
+    """A blank/whitespace column remains a valid metadata fallback."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = _pg_skip_or_fail()
+
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_mod
+
+    local_order_id = f"oid-m-claim-{uuid.uuid4().hex}"
+    signal_id = f"sig-m-claim-{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as acur:
+            schema = _make_schema("test_m_claim_fallback", acur)
+        conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
+        _insert_order(
+            conn_ctx, schema,
+            local_order_id=local_order_id,
+            client_id=_CLIENT,
+            signal_id=signal_id,
+            col_execution_mode=column_mode,
+            meta_execution_mode=meta_mode,
+            generation=_GENERATION - 1,
+            owner="",
+            lifecycle_state="RETRY_WAIT",
+        )
+
+        original_conn = osm_mod.conn
+        osm_mod.conn = conn_ctx
+        try:
+            osm = APOrderStateMachine(client_id=_CLIENT)
+            result = osm.claim_deferred_materialization(
+                local_order_id,
+                owner=_OWNER,
+                new_generation=_GENERATION,
+                lease_until=(now + timedelta(seconds=60)).isoformat(),
+                trigger_crossed_at=now.isoformat(),
+                trigger_price=130.0,
+                observed_underlying_price=130.05,
+                signal_id=signal_id,
+                execution_mode=meta_mode,
+                retry_attempt=1,
+            )
+        finally:
+            osm_mod.conn = original_conn
+
+        assert result is True
+        row = _read_order(conn_ctx, schema, local_order_id)
+        assert row["meta"]["execution_mode"] == meta_mode
+        assert row["meta"]["lifecycle_state"] == "MATERIALIZING"
+        assert row["meta"]["materialization_generation"] == _GENERATION
     finally:
         with admin.cursor() as acur:
             acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

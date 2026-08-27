@@ -36,6 +36,9 @@ from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
+from ap.pending_trigger_restart_recovery import (
+    _resolve_execution_mode as _resolve_durable_execution_mode,
+)
 from ap.utils                import now_utc_iso
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
@@ -1863,13 +1866,16 @@ class APExecutionCore:
                     _order_meta = {}
             if not isinstance(_order_meta, dict):
                 _order_meta = {}
-            _recovered_mode = str(
-                order.get("execution_mode") or _order_meta.get("execution_mode") or ""
-            ).strip().lower()
-            if _recovered_mode not in ("live", "paper"):
+            _recovered_mode, _recovered_mode_error = _resolve_durable_execution_mode({
+                **order,
+                "meta": _order_meta,
+            })
+            if _recovered_mode_error:
                 log.critical(
-                    "[%s] Recovered OSM order %s has invalid execution_mode=%r",
-                    watched.ticker, local_order_id, _recovered_mode,
+                    "[%s] Recovered OSM order %s has invalid execution_mode "
+                    "authority=%s column=%r meta=%r",
+                    watched.ticker, local_order_id, _recovered_mode_error,
+                    order.get("execution_mode"), _order_meta.get("execution_mode"),
                 )
                 return None
             qty = int(order.get("qty") or 0)
@@ -2959,15 +2965,17 @@ class APExecutionCore:
         meta = meta or {}
 
         # ── FINAL AMENDMENT: canonical execution_mode resolution ─────────────
-        # Column authority is used when non-blank after BTRIM; meta is the
-        # fallback when the column is blank or whitespace-only.  Two non-blank
-        # but disagreeing authorities fail closed — never infer mode from
-        # transport, never allow a whitespace-padded column to evict a valid
-        # meta authority silently.
+        # Use the same durable column/meta authority resolver as restart
+        # recovery. It accepts a blank mirror as a legacy fallback, but a
+        # contradictory pair is a durable identity conflict and must never
+        # reach a claim, selector, or broker path.
         _col_mode_raw = str(row.get("execution_mode") or "").strip().lower()
         _meta_mode_raw = str(meta.get("execution_mode") or "").strip().lower()
-        # Contradiction fence: both authorities present and disagree → hard fail.
-        if _col_mode_raw and _meta_mode_raw and _col_mode_raw != _meta_mode_raw:
+        row_mode, _mode_error = _resolve_durable_execution_mode({
+            **row,
+            "meta": meta,
+        })
+        if _mode_error == "EXECUTION_MODE_AUTHORITY_CONFLICT":
             return _term(
                 "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
                 status="ERROR",
@@ -2979,8 +2987,9 @@ class APExecutionCore:
                     "broker_post_count": 0,
                 },
             )
-        # Canonical: non-blank column wins; blank column falls back to meta.
-        row_mode = _col_mode_raw or _meta_mode_raw
+        if _mode_error:
+            return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
+        row_mode = str(row_mode or "").strip().lower()
 
         expected_mode = str(self.execution_mode or self.mode or "").strip().lower()
         if row_mode not in {"live", "paper"}:
@@ -4055,13 +4064,17 @@ class APExecutionCore:
                 _owned_attempt = int(_owned_meta.get("retry_attempt") or 0)
             except (TypeError, ValueError):
                 _owned_attempt = 0
+            _owned_mode, _owned_mode_error = _resolve_durable_execution_mode(
+                _owned_row if isinstance(_owned_row, dict) else {}
+            )
             _owned_ok = (
                 isinstance(_owned_row, dict)
                 and str(_owned_row.get("status") or "").upper() == "PENDING_TRIGGER"
                 and not str(_owned_row.get("broker_order_id") or "").strip()
                 and not _owned_row.get("submitted_ts")
                 and str(_owned_row.get("client_id") or "").strip().lower() == _callback_client_id
-                and str(_owned_row.get("execution_mode") or "").strip().lower() == _callback_mode
+                and not _owned_mode_error
+                and _owned_mode == _callback_mode
                 and str(_owned_meta.get("lifecycle_state") or "").upper() == "MATERIALIZING"
                 and str(_owned_meta.get("materialization_status") or "").upper() == "RUNNING"
                 and _owned_meta.get("materialization_in_flight") is True
@@ -4975,7 +4988,7 @@ class APExecutionCore:
                         except Exception:
                             _pvm = {}
                     _pvc = str(_pv_row.get("client_id") or "").strip().lower()
-                    _pve = str(_pv_row.get("execution_mode") or "").strip().lower()
+                    _pve, _pve_error = _resolve_durable_execution_mode(_pv_row)
                     _pvg = int((_pvm or {}).get("materialization_generation") or 0)
                     _pvo = str((_pvm or {}).get("materialization_owner") or "").strip()
                     _pvl = str((_pvm or {}).get("lifecycle_state") or "").upper()
@@ -4987,6 +5000,7 @@ class APExecutionCore:
                         and _pvg == _pre_gen
                         and _pvo == _pre_owner
                         and _pvc == _pre_client
+                        and not _pve_error
                         and _pve == _pre_mode
                         and _pva == _pre_attempt
                         and bool(_pre_owner)

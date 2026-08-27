@@ -13,8 +13,8 @@ Also proves:
 
   * runner mode is resolved once at the top and unknown mode short-circuits
   * OSM.client_id mismatch short-circuits before any DB call
-  * SQL query includes the `LOWER(TRIM(COALESCE(execution_mode, ''))) = %s`
-    predicate and binds the runner mode as its second parameter
+  * SQL query includes the canonical column/meta execution-mode fallback,
+    contradiction fence, and binds the runner mode as its second parameter
   * `_build_recovery_plan_from_order` no longer infers execution_mode from
     the runner (Amendment §1 fail-closed rule)
 
@@ -153,8 +153,8 @@ def _row(**overrides):
 
 
 def test_sql_predicate_includes_execution_mode_scoping(db_spy):
-    """The SELECT must scope by LOWER(TRIM(COALESCE(execution_mode,''))) = %s
-    and bind the runner mode (lowercase) as the second parameter."""
+    """The SELECT must use the canonical mode fallback and contradiction
+    fence, then bind the runner mode (lowercase) as the second parameter."""
     sink, state = db_spy
     rec, _, _ = _make_recovery(client_id="jason-live", mode="LIVE")
     state["rows"] = []  # no rows needed to inspect the SQL
@@ -164,7 +164,9 @@ def test_sql_predicate_includes_execution_mode_scoping(db_spy):
 
     assert sink, "expected exactly one SQL execute"
     sql, params = sink[0]
-    assert "LOWER(TRIM(COALESCE(execution_mode, '')))" in sql
+    assert "LOWER(BTRIM(COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', '')))" in sql
+    assert "NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL" in sql
+    assert "LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))" in sql
     assert params == ("jason-live", "live")
 
 
@@ -402,3 +404,50 @@ def test_plan_from_row_with_valid_mode_lowercases_it():
 
     assert plan is not None
     assert plan.execution_mode == "live"
+
+
+def test_plan_from_row_with_blank_column_uses_valid_metadata_mode():
+    """Legacy rows may use metadata when the top-level mode is blank."""
+    rec, _, _ = _make_recovery(client_id="jason-live", mode="PAPER")
+
+    plan = rec._build_recovery_plan_from_order({
+        "local_order_id": "loc-z",
+        "client_id": "jason-live",
+        "signal_id": "sig-z",
+        "plan_id": "plan-z",
+        "symbol": "MSFT",
+        "contract": "MSFT240119C00400000",
+        "direction": "CALL",
+        "execution_mode": "",
+        "trigger_price": 400.0,
+        "qty": 1,
+        "limit_price": 2.0,
+        "reserved_cost": 200.0,
+        "meta": {"execution_mode": "paper"},
+    })
+
+    assert plan is not None
+    assert plan.execution_mode == "paper"
+
+
+def test_plan_from_row_with_conflicting_mode_mirrors_is_rejected():
+    """A contradictory durable identity must not become a recovery plan."""
+    rec, _, _ = _make_recovery(client_id="jason-live", mode="LIVE")
+
+    plan = rec._build_recovery_plan_from_order({
+        "local_order_id": "loc-conflict",
+        "client_id": "jason-live",
+        "signal_id": "sig-conflict",
+        "plan_id": "plan-conflict",
+        "symbol": "MSFT",
+        "contract": "MSFT240119C00400000",
+        "direction": "CALL",
+        "execution_mode": "LIVE",
+        "trigger_price": 400.0,
+        "qty": 1,
+        "limit_price": 2.0,
+        "reserved_cost": 200.0,
+        "meta": {"execution_mode": "paper"},
+    })
+
+    assert plan is None
