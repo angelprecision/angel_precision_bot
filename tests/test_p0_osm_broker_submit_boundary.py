@@ -1108,9 +1108,11 @@ class TestNormalEntryRegressions:
                 executed_sql.append(sql)
                 return _Cursor()
 
-        monkeypatch.setattr("ap.order_state_machine.conn", lambda: _Conn())
-        monkeypatch.setattr(
-            "ap.order_state_machine.run_with_retry",
+        method_globals = APOrderStateMachine.persist_entry_submit_intent.__globals__
+        monkeypatch.setitem(method_globals, "conn", lambda: _Conn())
+        monkeypatch.setitem(
+            method_globals,
+            "run_with_retry",
             lambda fn, *args, **kwargs: fn(),
         )
 
