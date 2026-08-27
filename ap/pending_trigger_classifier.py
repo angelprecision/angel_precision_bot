@@ -853,21 +853,18 @@ def _active_materialization_proof(meta: dict) -> bool:
     if not isinstance(owner, str) or not owner.strip():
         return False
 
-    # materialization_generation must be a positive integer.
+    # materialization_generation must be a real positive int — no coercion.
+    #
+    # #524 writes this field as a PostgreSQL integer, so anything other than
+    # a Python int here is a schema anomaly and must not receive protection.
     # bool is rejected even though bool subclasses int (True==1, False==0).
-    # float is rejected — int(1.7)==1 would silently pass; the materializer
-    # stamps this field as a PostgreSQL integer, so a float here is a schema
-    # anomaly and must not receive protection.
+    # Explicit isinstance(int)-and-not-bool test — no int() coercion, no
+    # str-to-int, no float-to-int; malformed schema values fail closed at
+    # their exact durable shape.
     generation = meta.get("materialization_generation")
-    if isinstance(generation, bool):
+    if isinstance(generation, bool) or not isinstance(generation, int):
         return False
-    if isinstance(generation, float):
-        return False
-    try:
-        gen_int = int(generation)
-    except (TypeError, ValueError):
-        return False
-    if gen_int <= 0:
+    if generation <= 0:
         return False
 
     # materialization_lease_until must be parseable, timezone-aware, in the future.

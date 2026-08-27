@@ -9,7 +9,47 @@ broader lifecycle protection, this amendment narrows it.
 **Rebased on post-#524 main:**
 `ba1e86a01ed9c81423cc6b5baaa766e43310bec7`
 
-**Binding scope after amendment:**
+### Amendment round 2 (2026-08-27, follow-up audit) — fail-closed strictness
+
+Two fail-closed gaps closed:
+
+1. **`_active_materialization_proof`: `materialization_generation` must be a
+   real `int`.** Pre-r2 code did `int(generation)` inside a try/except, which
+   silently accepted the string `"1"`. #524 writes this field as a PostgreSQL
+   integer; anything else is a schema anomaly. The predicate now requires
+   `isinstance(int) and not isinstance(bool)` with no coercion — string,
+   float, bool, and None all fail closed at their exact durable shape.
+
+2. **`order_monitor._maybe_hydrate_deferred_order`: durable
+   `execution_mode` must not be inferred from runner context.** Pre-r2
+   code did `str(order.get("execution_mode") or self.client_mode or "")`,
+   so a row with `execution_mode = NULL / "" / whitespace / "banana"`
+   would inherit the runner's mode and could then receive the
+   materialization-in-flight fence. This was inconsistent with the
+   classifier and `ap_recovery`, both of which reject missing/malformed
+   durable mode before classification. The hydration guard now fails
+   closed with `reason=execution_mode_missing_or_invalid` before the
+   materialization guard is consulted.
+
+Production check preceding r2: `SELECT COUNT(*)` over active deferred
+`PENDING_TRIGGER ENTRY` rows on 2026-08-27 = 36; blank `execution_mode` = 0;
+string `materialization_generation` = 0. No currently poisoned rows —
+r2 closes the fail-closed contract, not a live incident.
+
+Negative controls added:
+
+- `TestActiveMaterializationProof::test_generation_string_rejected` —
+  `"1"`, `"01"`, `" 1 "`, `"0"`, `"-1"` all → `False`.
+- `TestActiveMaterializationProof::test_generation_float_rejected` —
+  `1.0`, `2.5`, `0.0`, `-1.0` all → `False`.
+- `test_deferred_prebreach_hydration.py::test_hydration_refuses_to_infer_missing_or_malformed_execution_mode` —
+  parametrized over `None`, `""`, `"   "`, `"banana"`, `"LIVE_OR_PAPER"`;
+  each → `reason=execution_mode_missing_or_invalid`, guard NOT invoked.
+- `test_deferred_prebreach_hydration.py::test_hydration_execution_mode_mismatch_still_wins_over_materialization_guard` —
+  PAPER durable row on LIVE runner → `reason=execution_mode_mismatch`,
+  guard NOT invoked, even with full active-owner metadata.
+
+### Binding scope after amendment (r1 + r2):
 
 - Core canonical work in `ap/pending_trigger_classifier.py` and
   `ap/pending_trigger_restart_recovery.py` remains as authored:

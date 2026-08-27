@@ -2004,7 +2004,19 @@ class APOrderMonitor:
             return {"attempted": False, "reason": "non_entry"}
         if order.get("broker_order_id") or order.get("submitted_ts"):
             return {"attempted": False, "reason": "already_submitted"}
-        if str(order.get("execution_mode") or self.client_mode or "").strip().lower() != str(self.client_mode or "").strip().lower():
+
+        # Execution-mode identity is a durable-only invariant.  The runner's
+        # own client_mode MUST NOT be substituted for a missing/blank/malformed
+        # durable value on the row.  Runner-context inference would let a row
+        # with execution_mode = NULL / "" / "banana" receive the retained
+        # materialization-in-flight fence below, which would be inconsistent
+        # with the classifier and ap_recovery consumers that both reject
+        # missing/malformed durable mode before classification.  Fail closed.
+        durable_mode = str(order.get("execution_mode") or "").strip().lower()
+        runtime_mode = str(self.client_mode or "").strip().lower()
+        if durable_mode not in {"live", "paper"}:
+            return {"attempted": False, "reason": "execution_mode_missing_or_invalid"}
+        if durable_mode != runtime_mode:
             return {"attempted": False, "reason": "execution_mode_mismatch"}
 
         # Hydration is a selector/write path.  It must observe the same

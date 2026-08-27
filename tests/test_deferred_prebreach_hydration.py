@@ -191,6 +191,99 @@ def test_partial_materialization_markers_do_not_block_hydration(monkeypatch, par
     )
 
 
+def _full_active_meta():
+    """Full canonical #524 owner-proof shape — MATERIALIZING/RUNNING/in_flight
+    is bool True/valid owner/positive-int generation/future tz-aware lease,
+    no broker handoff. Every downstream check should treat this as owned.
+    """
+    return {
+        "watcher_audit": {"reason_code": "trigger_ready"},
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": "materializer:client@example.com:paper:local-123",
+        "materialization_generation": 1,
+        "materialization_lease_until": (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+        "broker_ready": False,
+        "submit_intent_at": "",
+        "broker_submit_key": "",
+    }
+
+
+@pytest.mark.parametrize(
+    "durable_mode,expected_reason,label",
+    [
+        (None, "execution_mode_missing_or_invalid", "mode_none"),
+        ("", "execution_mode_missing_or_invalid", "mode_blank"),
+        ("   ", "execution_mode_missing_or_invalid", "mode_whitespace"),
+        ("banana", "execution_mode_missing_or_invalid", "mode_banana"),
+        ("LIVE_OR_PAPER", "execution_mode_missing_or_invalid", "mode_junk_string"),
+    ],
+)
+def test_hydration_refuses_to_infer_missing_or_malformed_execution_mode(
+    monkeypatch, durable_mode, expected_reason, label
+):
+    """
+    Amendment r2 — retained hydration guard must NOT substitute the runner's
+    self.client_mode for a missing/blank/malformed durable execution_mode.
+
+    A row whose durable execution_mode is absent, blank, whitespace, or an
+    unknown token like "banana" MUST fail closed BEFORE the materialization
+    guard is consulted, with reason=execution_mode_missing_or_invalid.
+    Otherwise a malformed row with full-looking active-owner metadata could
+    receive the #521 no-hydration fence despite failing every other #521
+    consumer's identity gate (classifier + PTR + ap_recovery all reject
+    missing/malformed durable mode). Inconsistency is not tolerable in a
+    consumer that could reselect and overwrite a live materializer attempt.
+    """
+    selector = MagicMock()
+    monitor = _make_monitor(contract_selector=selector)
+    _enable_window(monkeypatch)
+
+    order = _make_order(meta=_full_active_meta())
+    order["execution_mode"] = durable_mode  # deliberately malformed
+
+    result = monitor._maybe_hydrate_deferred_order(order)
+
+    assert result == {"attempted": False, "reason": expected_reason}, (
+        f"malformed durable mode {label!r} was inferred from runner context; "
+        f"got {result!r}"
+    )
+    # And crucially, the materialization-in-flight fence must NOT be the
+    # reason — the row is malformed and belongs to the durable-identity
+    # authority, not the materialization-owner authority.
+    assert result.get("reason") != "materialization_in_flight"
+    selector.select.assert_not_called()
+    monitor.osm.record_deferred_hydration_result.assert_not_called()
+
+
+def test_hydration_execution_mode_mismatch_still_wins_over_materialization_guard(monkeypatch):
+    """
+    Amendment r2 (companion) — a durable mode present but different from
+    the runner (e.g. PAPER row on a LIVE runner) must fail closed with
+    reason=execution_mode_mismatch, NOT materialization_in_flight. Even if
+    the meta shape passes every #524 canonical proof gate, cross-mode
+    protection would be wrong: the LIVE runner has no business touching a
+    PAPER row's materializer, and vice versa.
+    """
+    selector = MagicMock()
+    monitor = _make_monitor(contract_selector=selector)  # runner is PAPER
+    monitor.client_mode = "live"  # flip runner to LIVE
+    _enable_window(monkeypatch)
+
+    order = _make_order(meta=_full_active_meta())
+    order["execution_mode"] = "paper"  # durable is PAPER, runner is LIVE
+
+    result = monitor._maybe_hydrate_deferred_order(order)
+
+    assert result == {"attempted": False, "reason": "execution_mode_mismatch"}
+    assert result.get("reason") != "materialization_in_flight"
+    selector.select.assert_not_called()
+    monitor.osm.record_deferred_hydration_result.assert_not_called()
+
+
 def test_pending_trigger_deferred_row_hydrates_to_occ_contract_and_limit_gt_point_01(monkeypatch):
     selector = MagicMock()
 

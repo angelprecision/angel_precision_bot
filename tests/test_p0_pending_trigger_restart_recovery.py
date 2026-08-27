@@ -2157,6 +2157,34 @@ class TestActiveMaterializationProof:
             meta = _inflight_meta(outcome=outcome)
             assert _active_materialization_proof(meta) is False, f"outcome={outcome}"
 
+    def test_generation_string_rejected(self):
+        """Amendment r2: generation MUST be a real int — no str-to-int coercion.
+
+        #524 writes materialization_generation as a PostgreSQL integer, so a
+        Python string here is a schema anomaly. The pre-amendment code used
+        int(generation) which silently accepted "1"; the fail-closed contract
+        requires exact isinstance(int) after excluding bool.
+        """
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        for value in ("1", "01", " 1 ", "0", "-1"):
+            meta = _inflight_meta()
+            meta["materialization_generation"] = value
+            assert _active_materialization_proof(meta) is False, f"generation={value!r}"
+
+    def test_generation_float_rejected(self):
+        """Amendment r2 (companion): a float 1.0 must also fail closed.
+
+        Even though the pre-amendment implementation already rejected float,
+        the new strict path is `isinstance(int) and not isinstance(bool)`,
+        which subsumes it. Pin the invariant so a future refactor cannot
+        silently reintroduce float acceptance.
+        """
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        for value in (1.0, 2.5, 0.0, -1.0):
+            meta = _inflight_meta()
+            meta["materialization_generation"] = value
+            assert _active_materialization_proof(meta) is False, f"generation={value!r}"
+
 
 # ── F5: trigger_crossed_at + matching provenance → still MATERIALIZATION_OWNED ─
 
