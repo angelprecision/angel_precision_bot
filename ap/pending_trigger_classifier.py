@@ -785,8 +785,13 @@ def _active_materialization_proof(meta: dict) -> bool:
 
     # materialization_generation must be a positive integer.
     # bool is rejected even though bool subclasses int (True==1, False==0).
+    # float is rejected — int(1.7)==1 would silently pass; the materializer
+    # stamps this field as a PostgreSQL integer, so a float here is a schema
+    # anomaly and must not receive protection.
     generation = meta.get("materialization_generation")
     if isinstance(generation, bool):
+        return False
+    if isinstance(generation, float):
         return False
     try:
         gen_int = int(generation)

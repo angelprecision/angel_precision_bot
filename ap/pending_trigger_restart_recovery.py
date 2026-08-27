@@ -349,10 +349,40 @@ class PendingTriggerRestartRecovery:
                 "treating as orphan", local_oid,
             )
 
+        # PR #521 amendment (audit Finding 3): MATERIALIZATION_IN_FLIGHT is
+        # hoisted BEFORE the second evidence fence.
+        #
+        # Rationale: the second evidence fence rejects rows where
+        # trigger_crossed_at is present but trigger_crossed_at_provenance is
+        # absent (crash window).  In that crash window an active materializer
+        # may legitimately own the row — its in-flight flags are written
+        # atomically under its own lease and are independent of the trigger
+        # provenance stamp.  Firing the fence before this check would return
+        # UNRESOLVED and generate a false ownerless alarm even though the
+        # materializer is alive.
+        #
+        # Safety: the classification itself is already fail-closed — any
+        # missing/expired proof field produces STUCK_TRIGGER_READY, which
+        # then hits the second fence and returns UNRESOLVED as before.  Only
+        # rows whose 7-field proof is fully valid reach this branch.
+        if cls == PTC.MATERIALIZATION_IN_FLIGHT:
+            # Binding invariant: ZERO mutations. No terminalize, rearm,
+            # selector, materializer invocation, capacity/revalidation,
+            # attempt-counter increment, owner/generation replacement, lease
+            # renewal, retry scheduling, broker submit/cancel, or
+            # position/proof_trades/queue mutation.
+            log.info(
+                "RESTART_RECOVERY_MATERIALIZATION_IN_FLIGHT local=%s "
+                "— active materializer owns attempt; observing read-only",
+                local_oid,
+            )
+            return _RowOutcome.MATERIALIZATION_OWNED
+
         # Every path that would classify, terminalize, retry, or rearm an
         # order with confirmed-trigger evidence still requires durable
         # lifecycle identity.  Only the proven already-owned fast path above
-        # is allowed to return before this fence.
+        # and the MATERIALIZATION_IN_FLIGHT read-only path are allowed to
+        # return before this fence.
         if not _evidence_proven:
             return _reject_unproven_trigger_evidence()
 
@@ -432,22 +462,6 @@ class PendingTriggerRestartRecovery:
                     "first_breach_ask":       _meta.get("first_breach_ask"),
                 },
             )
-
-        elif cls == PTC.MATERIALIZATION_IN_FLIGHT:
-            # PR #521 — Binding invariant: a durably proven, current, unexpired
-            # deferred materializer owns this row. Recovery performs ZERO mutations:
-            # no terminalization, no PENDING_TRIGGER→terminal transition, no
-            # watcher recovery-rearm, no selector/materializer invocation, no
-            # capacity/revalidation, no attempt-counter increment, no
-            # owner/generation replacement, no lease renewal, no retry scheduling,
-            # no broker submit/cancel, no position/proof_trades/queue mutation.
-            # The existing deferred retry scheduler owns any future retry.
-            log.info(
-                "RESTART_RECOVERY_MATERIALIZATION_IN_FLIGHT local=%s "
-                "— active materializer owns attempt; observing read-only",
-                local_oid,
-            )
-            return _RowOutcome.MATERIALIZATION_OWNED
 
         else:
             log.critical(
@@ -1416,11 +1430,12 @@ def _emit_summary(summary: dict) -> None:
         "PENDING_TRIGGER_RESTART_RECOVERY_SUMMARY "
         "client=%s mode=%s examined=%d "
         "rearmed=%d retry=%d terminalized=%d skipped=%d "
-        "unresolved=%d ownerless=%d",
+        "inflight=%d unresolved=%d ownerless=%d",
         summary["client_id"], summary["execution_mode"],
         summary["rows_examined"],
         summary["watchers_rearmed"], summary["retry_rows_owned"],
         summary["terminalized"], summary["skipped_not_pending_trigger"],
+        summary["materialization_in_flight_count"],
         summary["unresolved_cleanup_failures"],
         summary["ownerless_rows_remaining"],
     )

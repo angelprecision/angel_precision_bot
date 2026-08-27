@@ -2017,3 +2017,150 @@ class TestActiveMaterializationProof:
         ):
             meta = _inflight_meta(outcome=outcome)
             assert _active_materialization_proof(meta) is False, f"outcome={outcome}"
+
+
+# ── F5: trigger_crossed_at + matching provenance → still MATERIALIZATION_OWNED ─
+
+class TestInflightWithMatchingProvenance:
+    """PR #521 audit Finding 5 — exercise the production code path where
+    trigger_crossed_at IS present in meta alongside a fully-matched
+    trigger_crossed_at_provenance dict.
+
+    Context: the evidence-identity fence returns True when raw_crossed_at is
+    None (no crossing persisted yet).  When a crossing IS recorded the fence
+    validates the provenance dict.  An active materializer may legitimately
+    run in either window.  This class covers the second window: a row that
+    has both a crossing timestamp AND a durable provenance that exactly
+    matches the TMO row identities.  Recovery must still return
+    MATERIALIZATION_OWNED — the hoisted pre-fence handler must fire BEFORE
+    the fence evaluates the provenance.
+    """
+
+    def _live_recovery(self, row: dict):
+        osm = _MockOSM()
+        osm.seed(row)
+        rec = PendingTriggerRestartRecovery(
+            client_id=row["client_id"],
+            execution_mode=row["execution_mode"],
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            quote_check_fn=lambda *a, **k: False,
+        )
+        return rec, osm
+
+    def _provenance_meta(self, *, row_signal_id: str, local_order_id: str,
+                         client_id: str, execution_mode: str) -> dict:
+        """Build a valid _inflight_meta with trigger_crossed_at + matching provenance."""
+        from ap_canonical_signal import build_canonical_signal_id
+        canonical = build_canonical_signal_id(row_signal_id)
+        meta = _inflight_meta()
+        # Stamp a crossing timestamp — this activates the evidence-identity fence.
+        meta["trigger_crossed_at"] = "2026-08-25T13:39:27.905000+00:00"
+        # Provide a fully-matching provenance so the fence passes.
+        meta["trigger_crossed_at_provenance"] = {
+            "canonical_signal_id": canonical,
+            "client_id":           client_id.strip().lower(),
+            "execution_mode":      execution_mode.strip().lower(),
+            "local_order_id":      local_order_id,
+        }
+        return meta
+
+    def test_f5_active_materializer_with_proven_crossing_is_owned(self):
+        """MATERIALIZATION_IN_FLIGHT handler fires before evidence fence —
+        a row with a fully-proven trigger_crossed_at is still MATERIALIZATION_OWNED.
+
+        This is the production code path that would have been unreachable if
+        the handler had remained AFTER the second evidence fence (audit Finding 3).
+        With the hoist applied, the fence evaluation order is:
+          1. First fence (watcher_owned=None, evidence TBD) — passes (crossed_at present, provenance matches)
+          2. MATERIALIZATION_IN_FLIGHT check — returns MATERIALIZATION_OWNED
+          (second fence is never reached for this classification)
+        """
+        row = _tmo_row()
+        meta = self._provenance_meta(
+            row_signal_id=row["signal_id"],
+            local_order_id=row["local_order_id"],
+            client_id=row["client_id"],
+            execution_mode=row["execution_mode"],
+        )
+        row["meta"] = meta
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.MATERIALIZATION_OWNED, (
+            f"Active materializer with proven trigger crossing must be MATERIALIZATION_OWNED; "
+            f"got {outcome}"
+        )
+        assert len(osm.cancel_calls) == 0, (
+            "No cancel must be issued when MATERIALIZATION_IN_FLIGHT is confirmed"
+        )
+
+    def test_f5_mismatched_provenance_falls_through_to_fence_unresolved(self):
+        """A row with trigger_crossed_at but WRONG provenance must not be protected.
+
+        Proof fails → STUCK_TRIGGER_READY → second evidence fence fires →
+        UNRESOLVED (because watcher_owned is None and provenance is wrong).
+        The MATERIALIZATION_IN_FLIGHT handler is only reached for rows whose
+        7-field proof is fully valid; a bad provenance does not affect that path.
+        """
+        row = _tmo_row()
+        meta = _inflight_meta()
+        meta["trigger_crossed_at"] = "2026-08-25T13:39:27.905000+00:00"
+        # Provenance has a wrong local_order_id — identity mismatch.
+        meta["trigger_crossed_at_provenance"] = {
+            "canonical_signal_id": row["signal_id"],
+            "client_id":           row["client_id"].lower(),
+            "execution_mode":      row["execution_mode"].lower(),
+            "local_order_id":      "00000000-0000-0000-0000-000000000000",  # wrong
+        }
+        row["meta"] = meta
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        # Evidence fence fires → UNRESOLVED (not MATERIALIZATION_OWNED,
+        # not TERMINALIZED — the crossing is unproven so no cleanup is safe).
+        assert outcome == _RowOutcome.UNRESOLVED, (
+            f"Mismatched provenance with active-looking meta must be UNRESOLVED; got {outcome}"
+        )
+        assert len(osm.cancel_calls) == 0, (
+            "No cancel must fire when trigger evidence identity is unproven"
+        )
+
+    def test_f5_crossed_at_present_no_provenance_is_unresolved(self):
+        """Crash window: trigger_crossed_at present, provenance absent → UNRESOLVED.
+
+        When trigger_crossed_at is persisted but trigger_crossed_at_provenance
+        is absent, _evidence_proven=False.  The FIRST evidence fence at the
+        top of _recover_one fires immediately:
+
+            if watcher_owned is not True and not _evidence_proven:
+                return _reject_unproven_trigger_evidence()  # → UNRESOLVED
+
+        Classification is never reached, so the MATERIALIZATION_IN_FLIGHT
+        hoisted handler is also never reached.  Result: UNRESOLVED (fail-closed).
+
+        This is correct behavior — we cannot safely observe or protect a row
+        whose trigger evidence identity has not been durably proven.  The
+        materializer's lease and in-flight flags are independent of the
+        trigger provenance stamp, but the recovery engine cannot distinguish
+        a genuine crash-window row from a tampered one without provenance.
+
+        The F3 hoist (audit Finding 3) helps when the FIRST fence is bypassed
+        (watcher_owned=True, or trigger_crossed_at absent).  For this specific
+        case — crossed_at present, no provenance, watcher not owned — the row
+        correctly stays UNRESOLVED, alerting operators without mutating state.
+        """
+        row = _tmo_row()
+        meta = _inflight_meta()
+        # trigger_crossed_at present, no matching provenance (crash window).
+        meta["trigger_crossed_at"] = "2026-08-25T13:39:27.905000+00:00"
+        # trigger_crossed_at_provenance deliberately absent.
+        row["meta"] = meta
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        # First evidence fence fires → UNRESOLVED (fail-closed; no mutation).
+        assert outcome == _RowOutcome.UNRESOLVED, (
+            f"Crash-window row with absent provenance must be UNRESOLVED; got {outcome}"
+        )
+        assert len(osm.cancel_calls) == 0, (
+            "No cancel must fire when trigger evidence identity is unproven"
+        )
