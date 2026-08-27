@@ -3047,8 +3047,11 @@ class APExecutionCore:
             generation=_generation,
         )
 
-        mode = str(row.get("execution_mode") or meta.get("execution_mode") or "").lower()
-        if mode not in {"live", "paper"} or mode != str(self.execution_mode or "").lower():
+        from ap.order_state_machine import _durable_execution_mode as _resolve_durable_execution_mode
+
+        mode = _resolve_durable_execution_mode(row, meta)
+        expected_mode = _normalize_execution_mode(self.execution_mode)
+        if mode is None or expected_mode is None or mode != expected_mode:
             return _term("RECOVERY_EXECUTION_MODE_MISMATCH", status="ERROR")
         contract = str(row.get("contract") or "").strip()
         qty = int(row.get("qty") or 0)
@@ -3284,23 +3287,35 @@ class APExecutionCore:
         if row_client != expected_client:
             return _term("RETRY_CLIENT_ID_MISMATCH", status="ERROR")
 
-        # execution_mode: row must contain a valid mode and must match runner.
-        row_mode = str(row.get("execution_mode") or "").strip().lower()
-        expected_mode = str(self.execution_mode or self.mode or "").strip().lower()
-        if row_mode not in {"live", "paper"}:
-            return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
-        if expected_mode not in {"live", "paper"}:
-            return _term("RETRY_RUNNER_EXECUTION_MODE_INVALID", status="ERROR")
-        if row_mode != expected_mode:
-            return _term("RETRY_EXECUTION_MODE_MISMATCH", status="ERROR")
-
         meta = row.get("meta") or {}
+        _meta_parse_ok = True
         if isinstance(meta, str):
             try:
                 meta = json.loads(meta)
             except Exception:
                 meta = {}
-        meta = meta or {}
+                _meta_parse_ok = False
+        if not isinstance(meta, dict):
+            meta = {}
+            _meta_parse_ok = False
+
+        # execution_mode: resolve the durable column/meta authority and then
+        # require it to match this deferred-retry worker's explicit mode.
+        from ap.order_state_machine import _durable_execution_mode as _resolve_durable_execution_mode
+
+        row_mode = (
+            _resolve_durable_execution_mode(row, meta)
+            if _meta_parse_ok else None
+        )
+        expected_mode = _normalize_execution_mode(
+            self.execution_mode or self.mode
+        )
+        if row_mode is None:
+            return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
+        if expected_mode not in {"live", "paper"}:
+            return _term("RETRY_RUNNER_EXECUTION_MODE_INVALID", status="ERROR")
+        if row_mode != expected_mode:
+            return _term("RETRY_EXECUTION_MODE_MISMATCH", status="ERROR")
 
         # signal_id: required — the CAS predicate needs it.
         signal_id = str(row.get("signal_id") or meta.get("signal_id") or "").strip()

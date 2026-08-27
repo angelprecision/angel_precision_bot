@@ -202,9 +202,9 @@ def _durable_execution_mode(row: dict, meta: dict | None = None) -> str | None:
     return column_mode or meta_mode
 
 
-# Used only by the deferred materialization CASes below.  The predicate keeps
-# the SQL authority aligned with _durable_execution_mode(): blank columns may
-# use valid metadata, while invalid or contradictory durable values fail closed.
+# Used only by deferred/materialization identity CASes below.  The predicate
+# keeps the SQL authority aligned with _durable_execution_mode(): blank columns
+# may use valid metadata, while invalid or contradictory durable values fail closed.
 _DURABLE_EXECUTION_MODE_SQL = (
     "LOWER(TRIM(COALESCE(NULLIF(TRIM(execution_mode), ''), "
     "NULLIF(TRIM(meta->>'execution_mode'), ''), ''))) = %s "
@@ -2426,7 +2426,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -4802,18 +4802,30 @@ class APOrderStateMachine:
                 "split_brain": True,
                 "reconciliation_required": True,
             }
-        _durable_mode = (
-            _durable_execution_mode(current, _raw_meta)
-            if _raw_meta_parse_ok else None
+        _is_materialized_deferred = bool(
+            _raw_meta.get("contract_deferred")
+            or _raw_meta.get("materialization_generation")
+            or _raw_meta.get("materialization_entry_path") == "DEFERRED_BREACH_MATERIALIZATION"
         )
-        if _durable_mode is None:
-            return {
-                "ok": False,
-                "local_order_id": local_order_id,
-                "broker_order_id": current.get("broker_order_id"),
-                "status": status,
-                "error": "MATERIALIZATION_EXECUTION_MODE_UNPROVEN",
-            }
+        _requires_durable_mode = bool(
+            _is_materialized_deferred or _is_recovery_submit
+        )
+        if _requires_durable_mode:
+            _durable_mode = (
+                _durable_execution_mode(current, _raw_meta)
+                if _raw_meta_parse_ok else None
+            )
+            if _durable_mode is None:
+                return {
+                    "ok": False,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": current.get("broker_order_id"),
+                    "status": status,
+                    "error": "MATERIALIZATION_EXECUTION_MODE_UNPROVEN",
+                }
+        else:
+            # Preserve the established ordinary ENTRY execution_mode behavior.
+            _durable_mode = str(current.get("execution_mode") or "")
         # ── Req 3: submitted-like state must have proven broker identity ────────
         # SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL: idempotent success only if
         # broker_order_id is present.  If it is missing, attempt tag lookup to
@@ -4852,6 +4864,7 @@ class APOrderStateMachine:
                     broker_order_id=_recovered_bid,
                     current_status=status,
                     current_execution_mode=_durable_mode,
+                    durable_mode_authority=_requires_durable_mode,
                 )
                 if not _attached:
                     return {
@@ -4997,6 +5010,7 @@ class APOrderStateMachine:
                     broker_order_id=_existing_bid,
                     error_msg="ENTRY_PRIOR_SUBMIT_IDENTITY_ATTACH_FAILED",
                     execution_mode=_durable_mode,
+                    durable_mode_authority=_requires_durable_mode,
                 )
             return {
                 "ok": False,
@@ -5030,11 +5044,6 @@ class APOrderStateMachine:
             or _db_contract.upper() == str(_ticker).upper()
         )
 
-        _is_materialized_deferred = bool(
-            _raw_meta.get("contract_deferred")
-            or _raw_meta.get("materialization_generation")
-            or _raw_meta.get("materialization_entry_path") == "DEFERRED_BREACH_MATERIALIZATION"
-        )
         if not _is_materialized_deferred:
             # Preserve the established non-deferred refresh path: its caller may
             # supply a fresh ask, which is fail-closed synced below before POST.
@@ -5064,8 +5073,16 @@ class APOrderStateMachine:
             _plan_client_id = str(getattr(plan, "client_id", "") or "").lower()
             if _plan_client_id and _plan_client_id != str(current.get("client_id") or "").lower():
                 _identity_mismatches.append("client_id")
-            _plan_mode = str(getattr(plan, "execution_mode", "") or "").strip().lower()
-            if _plan_mode and _plan_mode != _durable_mode:
+            if _requires_durable_mode:
+                _plan_mode = str(getattr(plan, "execution_mode", "") or "").strip().lower()
+                _plan_mode_mismatch = _plan_mode and _plan_mode != _durable_mode
+            else:
+                _plan_mode = str(getattr(plan, "execution_mode", "") or "").lower()
+                _plan_mode_mismatch = (
+                    _plan_mode
+                    and _plan_mode != str(current.get("execution_mode") or "").lower()
+                )
+            if _plan_mode_mismatch:
                 _identity_mismatches.append("execution_mode")
         if (
             _is_materialized_deferred
@@ -5195,14 +5212,21 @@ class APOrderStateMachine:
             _latest_meta_parse_ok = False
         _latest_durable_mode = (
             _durable_execution_mode(latest, _latest_meta)
-            if _latest_meta_parse_ok else None
+            if _requires_durable_mode and _latest_meta_parse_ok
+            else str(latest.get("execution_mode") or "")
+        )
+        _latest_mode_matches = (
+            _latest_durable_mode == _durable_mode
+            if _requires_durable_mode
+            else str(latest.get("execution_mode") or "").lower()
+            == str(current.get("execution_mode") or "").lower()
         )
         if (
             str(latest.get("contract") or "") != contract
             or int(latest.get("qty") or 0) != qty
             or abs(float(latest.get("limit_price") or 0) - lp) > 0.001
             or str(latest.get("signal_id") or "") != str(current.get("signal_id") or "")
-            or _latest_durable_mode != _durable_mode
+            or not _latest_mode_matches
         ):
             return {
                 "ok": False,
@@ -5344,7 +5368,16 @@ class APOrderStateMachine:
             _intent_meta_parse_ok = False
         _intent_durable_mode = (
             _durable_execution_mode(_intent_row, _intent_meta)
-            if _intent_meta_parse_ok else None
+            if _requires_durable_mode and _intent_meta_parse_ok
+            else str(_intent_row.get("execution_mode") or "").strip().lower()
+        )
+        _intent_mode_matches = (
+            _intent_durable_mode == _latest_durable_mode
+            if _requires_durable_mode
+            else (
+                str(_intent_row.get("execution_mode") or "").strip().lower()
+                == str(latest.get("execution_mode") or "").strip().lower()
+            )
         )
         _intent_status = str(_intent_row.get("status") or "").upper()
         _intent_quarantined = bool(
@@ -5362,7 +5395,7 @@ class APOrderStateMachine:
             _intent_status in {OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER}
             and str(_intent_row.get("client_id") or "").strip().lower()
                 == str(self.client_id or "").strip().lower()
-            and _intent_durable_mode == _latest_durable_mode
+            and _intent_mode_matches
             and str(_intent_row.get("signal_id") or "")
                 == str(latest.get("signal_id") or "")
             and str(_intent_row.get("contract") or "") == contract
@@ -5409,7 +5442,8 @@ class APOrderStateMachine:
                 error_msg = "submitted_transition_failed_after_broker_accept"
                 self._flag_split_brain_order(local_order_id, broker_order_id=broker_order_id,
                                              error_msg=error_msg,
-                                             execution_mode=_durable_mode)
+                                             execution_mode=_durable_mode,
+                                             durable_mode_authority=_requires_durable_mode)
                 return {"ok": False, "local_order_id": local_order_id,
                         "broker_order_id": broker_order_id, "status": OrderStatus.ERROR,
                         "error": error_msg, "split_brain": True}
@@ -5426,6 +5460,7 @@ class APOrderStateMachine:
                     broker_order_id=broker_order_id,
                     error_msg=_sb_reason,
                     execution_mode=_durable_mode,
+                    durable_mode_authority=_requires_durable_mode,
                 )
                 log.critical(
                     "[%s] BROKER_STATUS_UNKNOWN_WITH_ID | order=%s broker_id=%s "
@@ -6667,6 +6702,7 @@ class APOrderStateMachine:
         broker_order_id: str,
         current_status: str,
         current_execution_mode: str,
+        durable_mode_authority: bool = False,
     ) -> bool:
         """Atomically attach a recovered broker_order_id to an order that is already
         in a submitted-like state but is missing its broker identity.
@@ -6688,6 +6724,11 @@ class APOrderStateMachine:
         _bid = str(broker_order_id or "").strip()
         _status = str(current_status or "").strip().upper()
         _mode = str(current_execution_mode or "").strip().lower()
+        _mode_predicate = (
+            _DURABLE_EXECUTION_MODE_SQL
+            if durable_mode_authority
+            else "LOWER(COALESCE(execution_mode, '')) = %s"
+        )
         if not _bid or not _status or _mode not in {"live", "paper"}:
             return False
         _allowed = {
@@ -6715,7 +6756,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(COALESCE(execution_mode, '')) = %s
+                      AND """ + _mode_predicate + """
                       AND UPPER(COALESCE(status, '')) = %s
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                     """,
@@ -6834,6 +6875,7 @@ class APOrderStateMachine:
         broker_order_id: str,
         error_msg: str,
         execution_mode: str,
+        durable_mode_authority: bool = False,
     ) -> bool:
         """
         Quarantine an order that may already be broker-owned.
@@ -6846,6 +6888,11 @@ class APOrderStateMachine:
         """
         _bid = str(broker_order_id or "").strip()
         _mode = str(execution_mode or "").strip().lower()
+        _mode_predicate = (
+            _DURABLE_EXECUTION_MODE_SQL
+            if durable_mode_authority
+            else "LOWER(COALESCE(execution_mode,'')) = %s"
+        )
         if not _bid or _mode not in {"live", "paper"}:
             return False
         try:
@@ -6881,7 +6928,7 @@ class APOrderStateMachine:
                             updated_ts      = NOW()
                         WHERE local_order_id = %s
                           AND client_id = %s
-                          AND LOWER(COALESCE(execution_mode,'')) = %s
+                          AND """ + _mode_predicate + """
                           AND kind IN ('ENTRY','EXIT')
                           AND (
                                 (kind = 'ENTRY' AND UPPER(COALESCE(status,'')) IN (

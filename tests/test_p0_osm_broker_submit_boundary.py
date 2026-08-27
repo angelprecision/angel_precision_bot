@@ -30,6 +30,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch, call
 
@@ -481,7 +482,8 @@ class TestSubmittedMissingBrokerIdentity:
         attach_calls: list = []
 
         def _fake_attach(
-            loid, *, broker_order_id, current_status, current_execution_mode
+            loid, *, broker_order_id, current_status, current_execution_mode,
+            durable_mode_authority=False,
         ):
             attach_calls.append(
                 (loid, broker_order_id, current_status, current_execution_mode)
@@ -627,7 +629,9 @@ def _pending_row(**overrides) -> dict:
     return row
 
 
-def _run_from_pending(osm, broker, row=None) -> dict:
+def _run_from_pending(
+    osm, broker, row=None, *, plan=None, bypass_entry_guards=False,
+) -> dict:
     """Run submit_existing_entry from a PENDING_TRIGGER row with all DB writes mocked."""
     if row is None:
         row = _pending_row()
@@ -662,7 +666,10 @@ def _run_from_pending(osm, broker, row=None) -> dict:
         row["meta"] = json.dumps(meta)
         return True
 
-    def _flag(loid, *, broker_order_id, execution_mode, error_msg):
+    def _flag(
+        loid, *, broker_order_id, execution_mode, error_msg,
+        durable_mode_authority=False,
+    ):
         flag_calls.append({
             "loid": loid,
             "bid": broker_order_id,
@@ -685,11 +692,29 @@ def _run_from_pending(osm, broker, row=None) -> dict:
 
     with patch.object(osm, "_get_order", side_effect=lambda _loid: dict(row)), \
          patch.object(osm, "persist_entry_submit_intent", side_effect=_persist_intent), \
+         patch.object(osm, "persist_deferred_submit_intent", side_effect=_persist_intent), \
          patch.object(osm, "persist_materialized_submit_intent", side_effect=_persist_intent), \
          patch.object(osm, "transition", side_effect=_transition), \
          patch.object(osm, "update_order_meta", side_effect=_update_meta), \
          patch.object(osm, "_flag_split_brain_order", side_effect=_flag):
-        result = osm.submit_existing_entry(local_order_id=_LOID, broker=broker)
+        if bypass_entry_guards:
+            original_submit = getattr(
+                APOrderStateMachine,
+                "_entry_metadata_guard_original_submit_existing",
+                None,
+            )
+            if original_submit is None:
+                result = osm.submit_existing_entry(
+                    local_order_id=_LOID, broker=broker, plan=plan,
+                )
+            else:
+                result = original_submit(
+                    osm, local_order_id=_LOID, broker=broker, plan=plan,
+                )
+        else:
+            result = osm.submit_existing_entry(
+                local_order_id=_LOID, broker=broker, plan=plan,
+            )
     result["_flag_split_brain_calls"] = flag_calls
     result["_durable_row"] = dict(row)
     return result
@@ -981,6 +1006,101 @@ class TestNormalEntryRegressions:
         assert result["ok"] is True
         assert result["broker_order_id"] == "BID-STANDARD"
         broker.session.post.assert_called_once()
+
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
+    def test_ordinary_entry_does_not_use_materialization_mode_gate(self, execution_mode):
+        """Ordinary rows retain the pre-#524 submit seam despite malformed meta mode."""
+        osm = _make_osm()
+        broker = _broker_post(broker_id=f"BID-{execution_mode.upper()}", status_str="open")
+        row = _pending_row(execution_mode=execution_mode)
+        meta = json.loads(row["meta"])
+        meta["execution_mode"] = "staging"
+        row["meta"] = json.dumps(meta)
+
+        result = _run_from_pending(
+            osm, broker, row, bypass_entry_guards=True,
+        )
+
+        assert result["ok"] is True
+        assert result["error"] is None
+        assert result["error"] != "MATERIALIZATION_EXECUTION_MODE_UNPROVEN"
+        assert broker.session.post.call_count == 1
+
+    def test_deferred_entry_keeps_strict_mode_gate(self):
+        osm = _make_osm()
+        broker = _broker_post(broker_id="BID-SHOULD-NOT-APPEAR", status_str="open")
+        row = _pending_row(execution_mode="")
+        meta = json.loads(row["meta"])
+        meta.pop("execution_mode", None)
+        meta.update({
+            "contract_deferred": False,
+            "materialization_generation": 7,
+            "materialization_entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+            "lifecycle_state": "BROKER_READY",
+            "broker_ready": True,
+        })
+        row["meta"] = json.dumps(meta)
+
+        result = _run_from_pending(
+            osm, broker, row, bypass_entry_guards=True,
+        )
+
+        assert result["ok"] is False
+        assert result["error"] == "MATERIALIZATION_EXECUTION_MODE_UNPROVEN"
+        broker.session.post.assert_not_called()
+
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
+    def test_materialized_deferred_blank_column_uses_durable_meta_mode(self, execution_mode):
+        osm = _make_osm()
+        broker = _broker_post(broker_id=f"BID-META-{execution_mode.upper()}", status_str="open")
+        row = _pending_row(execution_mode="")
+        meta = json.loads(row["meta"])
+        meta.update({
+            "execution_mode": execution_mode,
+            "contract_deferred": False,
+            "materialization_generation": 7,
+            "materialization_entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+            "lifecycle_state": "BROKER_READY",
+            "broker_ready": True,
+        })
+        row["meta"] = json.dumps(meta)
+
+        result = _run_from_pending(
+            osm, broker, row, bypass_entry_guards=True,
+        )
+
+        assert result["ok"] is True
+        assert broker.session.post.call_count == 1
+
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
+    def test_recovery_deferred_blank_column_uses_durable_meta_mode(self, execution_mode):
+        osm = _make_osm()
+        broker = _broker_post(broker_id=f"BID-RECOVERY-{execution_mode.upper()}", status_str="open")
+        row = _pending_row(execution_mode="")
+        owner = "recovery-submit:owner"
+        meta = json.loads(row["meta"])
+        meta.update({
+            "execution_mode": execution_mode,
+            "contract_deferred": False,
+            "materialization_generation": 7,
+            "materialization_entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+            "lifecycle_state": "BROKER_READY",
+            "broker_ready": True,
+            "recovery_submit_owner": owner,
+        })
+        row["meta"] = json.dumps(meta)
+        plan = SimpleNamespace(metadata={
+            "recovery_submit_fenced": True,
+            "recovery_submit_owner": owner,
+            "recovery_submit_generation": 7,
+        })
+
+        result = _run_from_pending(
+            osm, broker, row, plan=plan, bypass_entry_guards=True,
+        )
+
+        assert result["ok"] is True
+        assert broker.session.post.call_count == 1
 
     def test_deferred_placeholder_never_reaches_broker(self):
         """DEFERRED: contract is hard-blocked before any POST."""

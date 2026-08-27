@@ -2846,6 +2846,41 @@ def _base_meta(*, retry_max_attempts=None, retry_attempt: int = 1) -> dict:
     return m
 
 
+def test_deferred_retry_mode_uses_valid_metadata_when_column_is_blank(monkeypatch):
+    """Deferred retry keeps the canonical column/meta fallback authority."""
+    meta = _base_meta(retry_attempt=1)
+    meta["execution_mode"] = "paper"
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch, execution_mode="paper")
+    osm.get_order.return_value["execution_mode"] = ""
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+
+    assert result["reason_code"] != "RETRY_INVALID_EXECUTION_MODE"
+    core._on_entry_trigger.assert_called_once()
+
+
+def test_deferred_retry_mode_contradiction_fails_closed_before_callback(monkeypatch):
+    meta = _base_meta(retry_attempt=1)
+    meta["execution_mode"] = "paper"
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch, execution_mode="live")
+    osm.get_order.return_value["execution_mode"] = "live"
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+
+    assert result["reason_code"] == "RETRY_INVALID_EXECUTION_MODE"
+    core._on_entry_trigger.assert_not_called()
+
+
 # ── Test 1: durable=3, env=5 → max_attempts raised to 5 ─────────────────────
 
 def test_am1_durable_3_env_5_raises_to_5(monkeypatch):
