@@ -225,7 +225,7 @@ def test_submit_intent_cas_declares_all_irreversible_boundary_predicates():
     import inspect
     source = inspect.getsource(APOrderStateMachine.persist_deferred_submit_intent)
     for proof in (
-        "local_order_id = %s", "client_id = %s", "execution_mode,'')) = %s",
+        "local_order_id = %s", "client_id = %s", "_DURABLE_EXECUTION_MODE_SQL",
         "status,'')) = 'PENDING_TRIGGER'", "broker_order_id IS NULL",
         "submitted_ts IS NULL", "lifecycle_state','') = 'BROKER_READY'",
         "broker_ready')::boolean", "materialization_generation')::int",
