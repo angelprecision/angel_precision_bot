@@ -386,10 +386,26 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def _persist_trigger_confirmation_authority(
         self, watched, *, require_pending_row: bool = False
     ) -> bool:
-        if require_pending_row and not self._verify_pending_direction_winner(watched):
-            return False
+        expected = self._identity(watched)
+        if require_pending_row:
+            if not all(
+                (
+                    expected.local_order_id,
+                    expected.client_id,
+                    expected.execution_mode,
+                    expected.signal_id,
+                )
+            ):
+                return False
+            if not self._verify_pending_direction_winner(watched):
+                return False
         return super()._persist_trigger_confirmation_authority(
-            watched, require_pending_row=require_pending_row
+            watched,
+            require_pending_row=require_pending_row,
+            expected_execution_mode=(
+                expected.execution_mode if require_pending_row else None
+            ),
+            expected_signal_id=(expected.signal_id if require_pending_row else None),
         )
 
     def _cancel_conflicting_watcher_with_proof(

@@ -2100,6 +2100,8 @@ class APOrderStateMachine:
         meta_patch: dict,
         *,
         expected_status: str | None = None,
+        expected_execution_mode: str | None = None,
+        expected_signal_id: str | None = None,
     ) -> bool:
         """Merge *meta_patch* into orders.meta using a safe JSONB || merge.
 
@@ -2112,10 +2114,12 @@ class APOrderStateMachine:
         Uses COALESCE(meta, '{}'::jsonb) so rows with a NULL meta column are
         handled safely without raising.
 
-        ``expected_status`` optionally adds a lifecycle CAS predicate.  This is
-        used by confirmed-direction claims, which must not authorize opposite
-        cancellation if the winner row became terminal between the read and
-        the metadata write.
+        ``expected_status`` optionally adds a lifecycle CAS predicate.  The
+        optional execution-mode and signal-id predicates are used together by
+        confirmed-direction claims, which must not authorize opposite
+        cancellation if the proven winner identity changes between the read
+        and the metadata write.  Ordinary callers retain the historical
+        local-order/client scoped merge semantics.
 
         Returns True only when Postgres confirms rowcount > 0 (the row exists
         and was updated).  Returns False on not-found, CAS miss, or write error;
@@ -2139,6 +2143,12 @@ class APOrderStateMachine:
                 if expected_status is not None:
                     _sql += " AND UPPER(COALESCE(status, '')) = %s"
                     _params.append(str(expected_status).strip().upper())
+                if expected_execution_mode is not None:
+                    _sql += " AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s"
+                    _params.append(str(expected_execution_mode).strip().lower())
+                if expected_signal_id is not None:
+                    _sql += " AND COALESCE(signal_id, '') = %s"
+                    _params.append(str(expected_signal_id).strip())
                 cur = c.execute(_sql, tuple(_params))
                 # psycopg2: execute() returns the cursor; rowcount is on the cursor.
                 # Never use `or 1` fallback — rowcount=0 means row not found.

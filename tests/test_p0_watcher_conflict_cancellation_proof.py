@@ -30,6 +30,8 @@ class FakeOSM:
         self.cancel_calls = []
         self.meta_calls = []
         self.meta_expected_statuses = []
+        self.meta_expected_execution_modes = []
+        self.meta_expected_signal_ids = []
 
     def has_order(self, local_order_id):
         return local_order_id in self.rows
@@ -53,9 +55,19 @@ class FakeOSM:
         row = self.rows.get(local_order_id)
         return dict(row) if isinstance(row, dict) else row
 
-    def update_order_meta(self, local_order_id, patch, *, expected_status=None):
+    def update_order_meta(
+        self,
+        local_order_id,
+        patch,
+        *,
+        expected_status=None,
+        expected_execution_mode=None,
+        expected_signal_id=None,
+    ):
         self.meta_calls.append((local_order_id, dict(patch)))
         self.meta_expected_statuses.append(expected_status)
+        self.meta_expected_execution_modes.append(expected_execution_mode)
+        self.meta_expected_signal_ids.append(expected_signal_id)
         if self.observer:
             self.observer("meta", local_order_id)
         result = self.meta_results.get(local_order_id, True)
@@ -67,6 +79,18 @@ class FakeOSM:
             expected_status is not None
             and str(self.rows[local_order_id].get("status") or "").upper()
             != str(expected_status).upper()
+        ):
+            return False
+        if (
+            expected_execution_mode is not None
+            and str(self.rows[local_order_id].get("execution_mode") or "").strip().lower()
+            != str(expected_execution_mode).strip().lower()
+        ):
+            return False
+        if (
+            expected_signal_id is not None
+            and str(self.rows[local_order_id].get("signal_id") or "").strip()
+            != str(expected_signal_id).strip()
         ):
             return False
         self.rows[local_order_id].setdefault("meta", {}).update(dict(patch))
@@ -698,6 +722,132 @@ def test_winner_authority_failure_holds_before_loser_cancellation():
 
 
 @pytest.mark.parametrize(
+    ("identity_field", "replacement"),
+    [("signal_id", "MUTATED_SIGNAL"), ("execution_mode", "paper")],
+)
+def test_winner_authority_identity_cas_holds_after_proven_row_changes(
+    identity_field, replacement
+):
+    call = signal(
+        signal_id="CALL_SIGNAL",
+        local_order_id="A",
+        side="CALL",
+        score=70,
+        trigger=100,
+        client_id="Jason",
+        execution_mode="live",
+    )
+    put = signal(
+        signal_id="PUT_SIGNAL",
+        local_order_id="B",
+        side="PUT",
+        score=70,
+        trigger=90,
+        client_id="Jason",
+        execution_mode="live",
+    )
+    events = []
+    holder = {}
+
+    def observer(stage, local_order_id):
+        events.append((stage, local_order_id))
+        if stage == "meta" and local_order_id == "A":
+            row = holder["osm"].rows[local_order_id]
+            row[identity_field] = replacement
+            row["meta"][identity_field] = replacement
+
+    osm = FakeOSM(
+        {"A": row_for(call), "B": row_for(put)},
+        observer=observer,
+    )
+    holder["osm"] = osm
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm, mode="LIVE")
+    callbacks = []
+    broker_submits = []
+
+    def callback(watched):
+        callbacks.append(watched.signal_id)
+        broker_submits.append(watched.signal_id)
+
+    watcher.on_trigger = callback
+
+    assert watcher.add_signal(dict(call)) is True
+    assert watcher.add_signal(dict(put)) is True
+    _poll_quote(watcher, bid=98, ask=101)
+    _poll_quote(watcher, bid=98, ask=101)
+
+    assert events == [("read", "A"), ("meta", "A")]
+    assert osm.meta_expected_statuses == ["PENDING_TRIGGER"]
+    assert osm.meta_expected_execution_modes == ["live"]
+    assert osm.meta_expected_signal_ids == ["CALL_SIGNAL"]
+    assert callbacks == []
+    assert broker_submits == []
+    assert osm.cancel_calls == []
+    assert osm.rows["A"]["status"] == "PENDING_TRIGGER"
+    assert osm.rows["B"]["status"] == "PENDING_TRIGGER"
+    claim = watcher._direction_claims[("jason", "live", "AAPL")]
+    assert claim == {"status": "ambiguous_hold", "reason": "winner_authority_unproven"}
+    assert any(
+        payload.get("reason_code") == "direction_claim_authority_unproven_hold"
+        for _, payload in watcher.audits
+    )
+    assert active_directions(watcher) == {"CALL", "PUT"}
+
+
+def test_winner_authority_identity_cas_rechecks_on_retry_before_cancel():
+    call = signal(
+        signal_id="call-retry-cas",
+        local_order_id="call-retry-cas-lo",
+        side="CALL",
+        score=70,
+        trigger=100,
+    )
+    put = signal(
+        signal_id="put-retry-cas",
+        local_order_id="put-retry-cas-lo",
+        side="PUT",
+        score=70,
+        trigger=90,
+    )
+    holder = {}
+    meta_attempts = {"n": 0}
+
+    def observer(stage, local_order_id):
+        if stage == "meta" and local_order_id == call["local_order_id"]:
+            meta_attempts["n"] += 1
+            if meta_attempts["n"] == 2:
+                row = holder["osm"].rows[local_order_id]
+                row["signal_id"] = "mutated-on-retry"
+                row["meta"]["signal_id"] = "mutated-on-retry"
+
+    osm = FakeOSM(
+        {call["local_order_id"]: row_for(call), put["local_order_id"]: row_for(put)},
+        cancel_results={put["local_order_id"]: False},
+        observer=observer,
+    )
+    holder["osm"] = osm
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    callbacks = []
+    watcher.on_trigger = lambda watched: callbacks.append(watched.signal_id)
+
+    assert watcher.add_signal(dict(call)) is True
+    assert watcher.add_signal(dict(put)) is True
+    _poll_quote(watcher, bid=98, ask=101)
+    _poll_quote(watcher, bid=98, ask=101)
+    assert osm.cancel_calls == [(put["local_order_id"], "confirmed_breach_direction_claim_lost")]
+
+    with watcher._lock:
+        for watched in watcher._pending:
+            watched.deferred_retry_not_before = None
+    _poll_quote(watcher, bid=98, ask=101)
+
+    assert meta_attempts["n"] == 2
+    assert osm.cancel_calls == [(put["local_order_id"], "confirmed_breach_direction_claim_lost")]
+    assert callbacks == []
+    assert active_directions(watcher) == {"CALL", "PUT"}
+
+
+@pytest.mark.parametrize(
     "first_side,second_side",
     [("CALL", "PUT"), ("PUT", "CALL")],
 )
@@ -908,6 +1058,9 @@ def test_confirmed_call_wins_and_cancels_prebreach_put_before_callback():
     assert osm.cancel_calls == [
         ("put-lo", "confirmed_breach_direction_claim_lost")
     ]
+    assert osm.meta_expected_statuses == ["PENDING_TRIGGER"]
+    assert osm.meta_expected_execution_modes == ["paper"]
+    assert osm.meta_expected_signal_ids == ["call"]
     assert osm.rows["put-lo"]["status"] == "CANCELED"
     assert watcher.has_order("put-lo") is False
     assert watcher.has_order("call-lo") is False

@@ -5511,7 +5511,12 @@ class APEntryWatcher:
         return protected
 
     def _persist_trigger_confirmation_authority(
-        self, watched, *, require_pending_row: bool = False
+        self,
+        watched,
+        *,
+        require_pending_row: bool = False,
+        expected_execution_mode: str | None = None,
+        expected_signal_id: str | None = None,
     ) -> bool:
         """Persist trigger authority before any downstream destructive action.
 
@@ -5521,7 +5526,13 @@ class APEntryWatcher:
         the durable row still being ``PENDING_TRIGGER``.  Ordinary callback
         persistence keeps the historical two-argument merge semantics.
         """
-        if getattr(watched, "_trigger_authority_persisted", False):
+        # Ordinary callback retries are idempotent after the first durable
+        # write.  Direction-claim retries must still execute the identity CAS
+        # before another destructive loser-cancellation attempt.
+        if (
+            getattr(watched, "_trigger_authority_persisted", False)
+            and not require_pending_row
+        ):
             return True
 
         signal = getattr(watched, "signal", {}) or {}
@@ -5559,6 +5570,8 @@ class APEntryWatcher:
                         local_order_id,
                         patch,
                         expected_status="PENDING_TRIGGER",
+                        expected_execution_mode=expected_execution_mode,
+                        expected_signal_id=expected_signal_id,
                     )
                 )
             else:
