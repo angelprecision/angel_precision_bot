@@ -45,6 +45,7 @@ USAGE
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -686,6 +687,11 @@ _TERMINAL_MATERIALIZATION_OUTCOMES: frozenset[str] = frozenset({
     "FAILED_TERMINAL",
 })
 
+_RETRY_MATERIALIZATION_OUTCOMES: frozenset[str] = frozenset({
+    "RETRY_LATER_DATA_UNAVAILABLE",
+    "RETRY_LATER_SELECTOR_BUDGET",
+})
+
 
 def _reason_is_invalidation(reason_code: str) -> bool:
     """PR #324 §4: delegate to classify_watcher_reason for canonical classification.
@@ -713,6 +719,24 @@ def _extract(row: dict, path: str, default=None):
         return cur
     except Exception:
         return default
+
+
+def _coerce_classifier_meta(raw) -> dict:
+    """Return a JSONB meta mapping without ever treating malformed data as proof."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _persisted_value_is_absent(raw) -> bool:
+    """Whether a persisted scalar is genuinely blank/NULL, not merely falsy."""
+    return raw is None or (isinstance(raw, str) and not raw.strip())
 
 
 def _parse_iso_classifier(raw) -> Optional[datetime]:
@@ -749,7 +773,8 @@ def _active_materialization_proof(meta: dict) -> bool:
       materialization_owner   non-empty string
       materialization_generation positive int (isinstance(bool) rejected as invalid)
       materialization_lease_until parseable, timezone-aware, strictly in the future
-      no canonical terminal materialization_outcome in meta
+      no broker-ready or broker-submit intent, and no materialization outcome
+      at either the top level or nested under meta.materialization
 
     Missing, malformed, expired, stale, or identity-conflicting proof receives
     no protection — existing fail-closed STUCK/recovery behavior remains intact.
@@ -757,10 +782,43 @@ def _active_materialization_proof(meta: dict) -> bool:
     if not isinstance(meta, dict):
         return False
 
-    # Terminal outcome wins over any stale in-flight flags.
-    outcome_raw = str(meta.get("materialization_outcome") or "").strip().upper()
-    if outcome_raw in _TERMINAL_MATERIALIZATION_OUTCOMES:
+    # A broker-ready/submit-intent marker means ownership has advanced beyond
+    # this observer-only state.  Missing broker_ready is tolerated for legacy
+    # rows; a present value must be an explicit false value.  Any submit intent
+    # or broker submit key is a hard contradiction and receives no protection.
+    broker_ready = meta.get("broker_ready")
+    if broker_ready is not None and not (
+        broker_ready is False
+        or (isinstance(broker_ready, str) and broker_ready.strip().lower() == "false")
+    ):
         return False
+    for intent_key in (
+        "submit_intent_at",
+        "broker_submit_key",
+        "broker_submit_payload_hash",
+    ):
+        if not _persisted_value_is_absent(meta.get(intent_key)):
+            return False
+
+    nested_materialization = meta.get("materialization")
+    if nested_materialization is not None and not isinstance(nested_materialization, dict):
+        return False
+
+    # A bounded retry outcome may legitimately remain on a row when the next
+    # materializer claim transitions it back to RUNNING.  Terminal, submitted,
+    # unknown, and malformed outcomes are incompatible with active proof. In
+    # particular, do not let a nested materialization.outcome hide a terminal
+    # decision from the active-owner fence.
+    for outcome_value in (
+        meta.get("materialization_outcome"),
+        _extract(meta, "materialization.outcome"),
+        _extract(meta, "materialization.materialization_outcome"),
+    ):
+        if _persisted_value_is_absent(outcome_value):
+            continue
+        outcome_raw = str(outcome_value).strip().upper()
+        if outcome_raw not in _RETRY_MATERIALIZATION_OUTCOMES:
+            return False
 
     # lifecycle_state must be exactly MATERIALIZING.
     lifecycle_state = str(meta.get("lifecycle_state") or "").strip().upper()
@@ -833,6 +891,60 @@ def _active_materialization_proof(meta: dict) -> bool:
     return True
 
 
+def has_broker_handoff_evidence(row: dict) -> bool:
+    """Return True when durable metadata indicates broker ownership advanced.
+
+    This is deliberately separate from ``_active_materialization_proof``:
+    failed or contradictory materializer proof must not authorize cleanup.
+    Recovery consumers use this predicate to hold an ambiguous row before
+    terminalization, rearm, selector work, or another broker attempt.
+    """
+    if not isinstance(row, dict):
+        return False
+    meta = _coerce_classifier_meta(row.get("meta"))
+    surfaces = [meta]
+    nested = meta.get("materialization")
+    if isinstance(nested, dict):
+        surfaces.append(nested)
+
+    for surface in surfaces:
+        broker_ready = surface.get("broker_ready")
+        if not _persisted_value_is_absent(broker_ready) and not (
+            broker_ready is False
+            or (isinstance(broker_ready, str) and broker_ready.strip().lower() == "false")
+        ):
+            return True
+        for key in (
+            "submit_intent_at",
+            "broker_submit_key",
+            "broker_submit_payload_hash",
+        ):
+            if not _persisted_value_is_absent(surface.get(key)):
+                return True
+    return False
+
+
+def is_active_materialization_in_flight(row: dict) -> bool:
+    """Return whether a pending entry row has a current materializer owner.
+
+    This is the shared read-only fence for callers that do not otherwise need
+    the full classifier.  It deliberately checks row-level broker identity as
+    well as the durable metadata proof so hydration and cleanup paths cannot
+    act on an already-advanced handoff.
+    """
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+        return False
+    if row.get("kind") is not None and str(row.get("kind") or "").strip().upper() != "ENTRY":
+        return False
+    if not _persisted_value_is_absent(row.get("broker_order_id")):
+        return False
+    if not _persisted_value_is_absent(row.get("submitted_ts")):
+        return False
+    return _active_materialization_proof(_coerce_classifier_meta(row.get("meta")))
+
+
 def classify_pending_trigger_row(
     row: dict,
     *,
@@ -863,13 +975,11 @@ def classify_pending_trigger_row(
 
         broker_order_id = row.get("broker_order_id")
         submitted_ts    = row.get("submitted_ts")
-        meta            = row.get("meta") or {}
-        if not isinstance(meta, dict):
-            meta = {}
+        meta            = _coerce_classifier_meta(row.get("meta"))
 
         # If broker already accepted or submit already stamped, this is not
         # a lifecycle bug — it's a partially-applied write; not our concern.
-        if broker_order_id or submitted_ts:
+        if not _persisted_value_is_absent(broker_order_id) or not _persisted_value_is_absent(submitted_ts):
             return PendingTriggerClassification.NOT_PENDING_TRIGGER
 
         watcher_reason = str(_extract(meta, "watcher_audit.reason_code") or "").strip()
@@ -897,7 +1007,7 @@ def classify_pending_trigger_row(
         # deferred materialization owner holds this row, recovery must not
         # terminalize it — the materializer alone resolves the attempt.
         if watcher_reason == "trigger_ready":
-            if _active_materialization_proof(meta):
+            if is_active_materialization_in_flight(row):
                 return PendingTriggerClassification.MATERIALIZATION_IN_FLIGHT
             return PendingTriggerClassification.STUCK_TRIGGER_READY
 

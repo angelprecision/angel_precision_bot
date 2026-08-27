@@ -864,6 +864,26 @@ def _build_reseed_scenario(monkeypatch, *, quote_bid=98.0, quote_ask=98.5):
     return fresh_recovery, osm, row_store, watcher, selector, broker_calls
 
 
+def test_startup_cleanup_preserves_stale_active_materializer(monkeypatch):
+    """Age-based startup cleanup must not terminalize an active owner."""
+    recovery, _core, osm, row_store, _watcher, _selector, broker_calls = (
+        _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+    )
+    row_store["row"]["created_ts"] = (
+        datetime.now(timezone.utc) - timedelta(days=4)
+    ).isoformat()
+    row_store["row"]["meta"] = _materializing_meta()
+    osm.terminalize_deferred_breach = MagicMock(return_value=True)
+
+    result = {"errors": []}
+    recovery._recover_deferred_breach_lifecycles(result)
+
+    osm.terminalize_deferred_breach.assert_not_called()
+    assert result["materialization_in_flight_rows"] == 1
+    assert broker_calls["post"] == []
+    assert broker_calls["cancel"] == []
+
+
 class TestStartupFreshWatcherAdoptionSucceeds:
     """Test A — PTR creates a real watcher for a direction-reversal
     watcher-required row; durable adoption CAS succeeds; the reread

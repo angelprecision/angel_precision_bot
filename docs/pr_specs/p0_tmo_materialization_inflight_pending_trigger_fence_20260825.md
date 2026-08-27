@@ -839,3 +839,29 @@ confirmed breach
 -> cleanup path calls it STUCK_TRIGGER_READY
 -> local order canceled underneath active materialization
 ```
+
+## 22. Correction addendum (2026-08-27)
+
+The audit found additional production consumers outside the original
+classifier/restart-recovery diff that could bypass the fence. The correction
+therefore extends the surgical scope to the actual bypasses:
+
+1. The shared active-materialization predicate rejects broker-ready truth,
+   submit intent/identity, and top-level or nested materialization outcomes;
+   malformed metadata receives no protection.
+2. Contradictory broker-ready or submit markers are held as ambiguous before
+   restart recovery can quote, terminalize, rearm, or resubmit; generic OSM
+   cancel/expire terminal CAS also reasserts the same ownership fences.
+3. Restart recovery classifies the durable row before quote access and emits a
+   structured `PENDING_TRIGGER_MATERIALIZATION_IN_FLIGHT` observation with
+   `broker_submission=NOT_ATTEMPTED` and `broker_cancel=NOT_ATTEMPTED`.
+4. Order-monitor deferred hydration and deferred-ghost expiry reassert the
+   active-owner and broker-intent fences in both Python and SQL. The hydration
+   copyback CAS has the same guards, including its compatibility fallback.
+5. Startup deferred-lifecycle cleanup checks the active owner before stale or
+   terminal cleanup, and both recovery consumers handle
+   `MATERIALIZATION_OWNED` as read-only rather than unresolved/rearmable.
+
+These added production files are required to preserve the Section 21 lifecycle
+across every discovered caller; no broker, selector, position, queue, or
+attempt-counter mutation is introduced for an active owner.

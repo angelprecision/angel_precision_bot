@@ -1029,9 +1029,35 @@ class APOrderStateMachine:
                 meta = {}
         if not isinstance(meta, dict):
             meta = {}
-        if str(meta.get("lifecycle_state") or "").upper() == "SUBMITTING":
+        def _present(raw) -> bool:
+            return raw is not None and not (isinstance(raw, str) and not raw.strip())
+
+        def _not_explicit_false(raw) -> bool:
+            return _present(raw) and not (
+                raw is False
+                or (isinstance(raw, str) and raw.strip().lower() == "false")
+            )
+
+        if _not_explicit_false(meta.get("broker_ready")):
             return True
-        if meta.get("submit_intent_at") or meta.get("broker_submit_key"):
+        if _not_explicit_false(meta.get("materialization_in_flight")):
+            return True
+        if str(meta.get("lifecycle_state") or "").strip().upper() in {
+            "MATERIALIZING", "BROKER_READY", "SUBMITTING", "SUBMITTED",
+        }:
+            return True
+        if str(meta.get("materialization_status") or "").strip().upper() in {
+            "RUNNING", "QUEUED",
+        }:
+            return True
+        if any(
+            _present(meta.get(key))
+            for key in (
+                "submit_intent_at",
+                "broker_submit_key",
+                "broker_submit_payload_hash",
+            )
+        ):
             return True
         if str(meta.get("current_owner") or "").startswith("broker_submit:"):
             return True
@@ -1200,10 +1226,17 @@ class APOrderStateMachine:
             sql += (
                 " AND (broker_order_id IS NULL OR broker_order_id='')"
                 " AND submitted_ts IS NULL"
-                " AND COALESCE(meta->>'submit_intent_at','')=''"
-                " AND UPPER(COALESCE(meta->>'lifecycle_state',''))"
-                "     NOT IN ('SUBMITTING','SUBMITTED')"
-                " AND COALESCE(meta->>'broker_submit_key','')=''"
+                " AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NULL"
+                " AND UPPER(BTRIM(COALESCE(meta->>'lifecycle_state','')))"
+                "     NOT IN ('MATERIALIZING','BROKER_READY','SUBMITTING','SUBMITTED')"
+                " AND UPPER(BTRIM(COALESCE(meta->>'materialization_status','')))"
+                "     NOT IN ('RUNNING','QUEUED')"
+                " AND LOWER(BTRIM(COALESCE(meta->>'broker_ready','')))"
+                "     IN ('','false')"
+                " AND LOWER(BTRIM(COALESCE(meta->>'materialization_in_flight','')))"
+                "     IN ('','false')"
+                " AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key','')), '') IS NULL"
+                " AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash','')), '') IS NULL"
                 " AND COALESCE(meta->>'recovery_submit_owner','')=''"
                 " AND COALESCE(meta->>'split_brain_quarantine','')=''"
                 " AND COALESCE(last_error,'') NOT LIKE 'SPLIT_BRAIN:%%'"
@@ -4155,10 +4188,13 @@ class APOrderStateMachine:
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
-                      AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
-                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
-                      AND COALESCE(meta->>'materialization_status','') = 'RUNNING'
-                      AND COALESCE(meta->>'materialization_in_flight', 'false') = 'true'
+                      AND LOWER(BTRIM(COALESCE(meta->>'broker_ready', ''))) IN ('', 'false')
+                      AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL
+                      AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL
+                      AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL
+                      AND UPPER(BTRIM(COALESCE(meta->>'lifecycle_state',''))) = 'MATERIALIZING'
+                      AND UPPER(BTRIM(COALESCE(meta->>'materialization_status',''))) = 'RUNNING'
+                      AND LOWER(BTRIM(COALESCE(meta->>'materialization_in_flight', 'false'))) = 'true'
                       AND COALESCE(meta->>'materialization_owner','') = %s
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE((meta->>'retry_attempt')::int, 0) = %s
@@ -4362,7 +4398,15 @@ class APOrderStateMachine:
                     "WHERE local_order_id=%s AND client_id=%s AND kind='ENTRY' "
                     "AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
                     "AND (broker_order_id IS NULL OR broker_order_id='') "
-                    "AND submitted_ts IS NULL" + _where_owner,
+                    "AND submitted_ts IS NULL "
+                    "AND LOWER(BTRIM(COALESCE(meta->>'broker_ready', ''))) IN ('', 'false') "
+                    "AND LOWER(BTRIM(COALESCE(meta->>'materialization_in_flight', ''))) IN ('', 'false') "
+                    "AND UPPER(BTRIM(COALESCE(meta->>'lifecycle_state', ''))) <> 'MATERIALIZING' "
+                    "AND UPPER(BTRIM(COALESCE(meta->>'materialization_status', ''))) NOT IN ('RUNNING', 'QUEUED') "
+                    "AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL "
+                    "AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL "
+                    "AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL"
+                    + _where_owner,
                     tuple(_params),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
@@ -4650,11 +4694,60 @@ class APOrderStateMachine:
                 local_order_id,
             )
 
+        def _meta_blocks_hydration(raw_meta) -> bool:
+            """Reject hydration when durable ownership or broker intent is present."""
+            if raw_meta is None:
+                meta = {}
+            elif isinstance(raw_meta, dict):
+                meta = raw_meta
+            elif isinstance(raw_meta, str):
+                try:
+                    meta = _json_local.loads(raw_meta)
+                except Exception:
+                    return True
+                if not isinstance(meta, dict):
+                    return True
+            else:
+                return True
+
+            def _blank(value) -> bool:
+                return value is None or (isinstance(value, str) and not value.strip())
+
+            def _false_or_blank(value) -> bool:
+                return value is None or value is False or (
+                    isinstance(value, str) and value.strip().lower() in {"", "false"}
+                )
+
+            if not _false_or_blank(meta.get("broker_ready")):
+                return True
+            if not _false_or_blank(meta.get("materialization_in_flight")):
+                return True
+            if str(meta.get("lifecycle_state") or "").strip().upper() == "MATERIALIZING":
+                return True
+            if str(meta.get("materialization_status") or "").strip().upper() in {"RUNNING", "QUEUED"}:
+                return True
+            for key in (
+                "submit_intent_at",
+                "broker_submit_key",
+                "broker_submit_payload_hash",
+            ):
+                if not _blank(meta.get(key)):
+                    return True
+            return False
+
+        def _log_active_owner_skip() -> None:
+            log.info(
+                "[%s] DEFERRED_HYDRATION_STALE_SKIP local=%s "
+                "reason=materialization_in_flight_or_broker_intent",
+                self.client_id,
+                local_order_id,
+            )
+
         def _update_with_status_column():
             with conn() as c:
                 cur = c.execute(
                     """
-                    SELECT status, contract, broker_order_id, submitted_ts
+                    SELECT status, contract, broker_order_id, submitted_ts, meta
                     FROM orders
                     WHERE local_order_id = %s
                       AND client_id = %s
@@ -4676,6 +4769,9 @@ class APOrderStateMachine:
                     return 0
                 if not current_contract.upper().startswith("DEFERRED:"):
                     return 0
+                if _meta_blocks_hydration(row.get("meta")):
+                    _log_active_owner_skip()
+                    return 0
                 if success:
                     cur = c.execute(
                         """
@@ -4694,6 +4790,13 @@ class APOrderStateMachine:
                           AND (broker_order_id IS NULL OR broker_order_id = '')
                           AND submitted_ts IS NULL
                           AND (limit_price IS NULL OR limit_price <= 0.01)
+                          AND LOWER(COALESCE(meta->>'broker_ready', '')) IN ('', 'false')
+                          AND LOWER(COALESCE(meta->>'materialization_in_flight', '')) IN ('', 'false')
+                          AND UPPER(COALESCE(meta->>'lifecycle_state', '')) <> 'MATERIALIZING'
+                          AND UPPER(COALESCE(meta->>'materialization_status', '')) NOT IN ('RUNNING', 'QUEUED')
+                          AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL
                         """,
                         (
                             contract,
@@ -4719,6 +4822,13 @@ class APOrderStateMachine:
                           AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
                           AND (broker_order_id IS NULL OR broker_order_id = '')
                           AND submitted_ts IS NULL
+                          AND LOWER(COALESCE(meta->>'broker_ready', '')) IN ('', 'false')
+                          AND LOWER(COALESCE(meta->>'materialization_in_flight', '')) IN ('', 'false')
+                          AND UPPER(COALESCE(meta->>'lifecycle_state', '')) <> 'MATERIALIZING'
+                          AND UPPER(COALESCE(meta->>'materialization_status', '')) NOT IN ('RUNNING', 'QUEUED')
+                          AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL
                         """,
                         (
                             contract_selection_status,
@@ -4736,7 +4846,7 @@ class APOrderStateMachine:
             with conn() as c:
                 cur = c.execute(
                     """
-                    SELECT status, contract, broker_order_id, submitted_ts
+                    SELECT status, contract, broker_order_id, submitted_ts, meta
                     FROM orders
                     WHERE local_order_id = %s
                       AND client_id = %s
@@ -4758,6 +4868,9 @@ class APOrderStateMachine:
                     return 0
                 if not current_contract.upper().startswith("DEFERRED:"):
                     return 0
+                if _meta_blocks_hydration(row.get("meta")):
+                    _log_active_owner_skip()
+                    return 0
                 if success:
                     cur = c.execute(
                         """
@@ -4775,6 +4888,13 @@ class APOrderStateMachine:
                           AND (broker_order_id IS NULL OR broker_order_id = '')
                           AND submitted_ts IS NULL
                           AND (limit_price IS NULL OR limit_price <= 0.01)
+                          AND LOWER(COALESCE(meta->>'broker_ready', '')) IN ('', 'false')
+                          AND LOWER(COALESCE(meta->>'materialization_in_flight', '')) IN ('', 'false')
+                          AND UPPER(COALESCE(meta->>'lifecycle_state', '')) <> 'MATERIALIZING'
+                          AND UPPER(COALESCE(meta->>'materialization_status', '')) NOT IN ('RUNNING', 'QUEUED')
+                          AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL
                         """,
                         (
                             contract,
@@ -4798,6 +4918,13 @@ class APOrderStateMachine:
                           AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
                           AND (broker_order_id IS NULL OR broker_order_id = '')
                           AND submitted_ts IS NULL
+                          AND LOWER(COALESCE(meta->>'broker_ready', '')) IN ('', 'false')
+                          AND LOWER(COALESCE(meta->>'materialization_in_flight', '')) IN ('', 'false')
+                          AND UPPER(COALESCE(meta->>'lifecycle_state', '')) <> 'MATERIALIZING'
+                          AND UPPER(COALESCE(meta->>'materialization_status', '')) NOT IN ('RUNNING', 'QUEUED')
+                          AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL
                         """,
                         (
                             meta_json,

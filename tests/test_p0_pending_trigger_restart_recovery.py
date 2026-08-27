@@ -1102,6 +1102,29 @@ class TestIntegrationOrderMonitor:
         assert result_reason == "canonical_recovery_terminalized"
         assert osm.cancel_calls == [(r["local_order_id"], reason)]
 
+    def test_canonical_rearm_observes_active_materializer_read_only(self):
+        """The order-monitor consumer must preserve MATERIALIZATION_OWNED."""
+        from ap.order_monitor import APOrderMonitor
+
+        r = _tmo_row()
+        osm = _MockOSM()
+        osm.seed(r)
+        monitor = APOrderMonitor.__new__(APOrderMonitor)
+        monitor.client_id = r["client_id"]
+        monitor.client_mode = "LIVE"
+        monitor.osm = osm
+        monitor.entry_watcher = None
+        monitor.broker = MagicMock()
+
+        attempted, succeeded, result_reason = monitor._canonical_pending_trigger_rearm(
+            r, r["local_order_id"], r["contract"], is_past_eod=True
+        )
+
+        assert (attempted, succeeded) == (False, False)
+        assert result_reason == "canonical_recovery_materialization_owned"
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
     def test_order_monitor_missing_client_id_does_not_inject_runtime_identity(self):
         from ap.order_monitor import APOrderMonitor
 
@@ -1458,6 +1481,11 @@ def _inflight_meta(
         "materialization_owner": owner,
         "materialization_generation": generation,
         "materialization_lease_until": lease,
+        # Active ownership is explicitly pre-broker.  Submit truth is kept
+        # blank so contradiction tests can toggle each field independently.
+        "broker_ready": False,
+        "submit_intent_at": "",
+        "broker_submit_key": "",
     }
     if outcome:
         m["materialization_outcome"] = outcome
@@ -1541,6 +1569,56 @@ class TestClassifierMaterializationInFlight:
         row = _tmo_row()
         assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.MATERIALIZATION_IN_FLIGHT
 
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("broker_ready", True),
+            ("broker_ready", "true"),
+            ("submit_intent_at", "2026-08-27T16:00:00+00:00"),
+            ("broker_submit_key", "broker-submit-key"),
+            ("broker_submit_payload_hash", "payload-hash"),
+        ],
+    )
+    def test_broker_advanced_truth_invalidates_active_proof(self, field, value):
+        """Any broker-ready or submit marker must defeat the active fence."""
+        from ap.pending_trigger_classifier import (
+            _active_materialization_proof,
+            classify_pending_trigger_row,
+        )
+
+        meta = _inflight_meta()
+        meta[field] = value
+        assert _active_materialization_proof(meta) is False
+        assert classify_pending_trigger_row(
+            _tmo_row(meta=meta), watcher_owned=False
+        ) == PTC.STUCK_TRIGGER_READY
+
+    def test_nested_terminal_materialization_outcome_invalidates_active_proof(self):
+        """Nested meta.materialization.outcome cannot hide a terminal decision."""
+        from ap.pending_trigger_classifier import (
+            _active_materialization_proof,
+            classify_pending_trigger_row,
+        )
+
+        meta = _inflight_meta()
+        meta["materialization"] = {"outcome": "FAILED_TERMINAL"}
+        assert _active_materialization_proof(meta) is False
+        assert classify_pending_trigger_row(
+            _tmo_row(meta=meta), watcher_owned=False
+        ) == PTC.STUCK_TRIGGER_READY
+
+    @pytest.mark.parametrize(
+        "outcome",
+        ["RETRY_LATER_DATA_UNAVAILABLE", "RETRY_LATER_SELECTOR_BUDGET"],
+    )
+    def test_bounded_retry_outcome_can_be_carried_into_next_active_claim(self, outcome):
+        """A next materializer claim may retain its prior bounded-retry outcome."""
+        from ap.pending_trigger_classifier import _active_materialization_proof
+
+        meta = _inflight_meta()
+        meta["materialization_outcome"] = outcome
+        assert _active_materialization_proof(meta) is True
+
 
 # ── Recovery-level tests (full action path) ───────────────────────────────────
 
@@ -1616,6 +1694,67 @@ class TestMaterializationInFlightFence:
                 f"TMO replay: recovery wrote forbidden keys under active materializer: "
                 f"{overlap}"
             )
+
+    def test_active_owner_is_classified_before_quote_check(self):
+        """An active owner must not incur even a read-only quote request."""
+        row = _tmo_row()
+        osm = _MockOSM()
+        osm.seed(row)
+        quote_calls = []
+
+        def _quote(*args, **kwargs):
+            quote_calls.append((args, kwargs))
+            return True
+
+        rec = PendingTriggerRestartRecovery(
+            client_id=row["client_id"],
+            execution_mode=row["execution_mode"],
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            quote_check_fn=_quote,
+        )
+
+        assert rec.recover_one_row(row) == _RowOutcome.MATERIALIZATION_OWNED
+        assert quote_calls == []
+        assert osm.cancel_calls == []
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("broker_ready", True),
+            ("broker_ready", "true"),
+            ("submit_intent_at", "2026-08-27T16:00:00+00:00"),
+            ("broker_submit_key", "broker-submit-key"),
+            ("broker_submit_payload_hash", "payload-hash"),
+        ],
+    )
+    def test_broker_handoff_contradiction_is_held_before_cleanup(self, field, value):
+        """Failed active proof must not turn broker ambiguity into a cancel."""
+        row = _tmo_row()
+        row["meta"][field] = value
+        osm = _MockOSM()
+        osm.seed(row)
+        quote_calls = []
+
+        def _quote(*args, **kwargs):
+            quote_calls.append((args, kwargs))
+            return True
+
+        rec = PendingTriggerRestartRecovery(
+            client_id=row["client_id"],
+            execution_mode=row["execution_mode"],
+            osm=osm,
+            entry_watcher=None,
+            broker=MagicMock(),
+            quote_check_fn=_quote,
+        )
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert quote_calls == []
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+        assert rec._row_failure_reasons[row["local_order_id"]] == "broker_handoff_ambiguous"
 
     def test_tmo_replay_summary_ownerless_zero(self):
         """recover_all summary must report ownerless=0 for the TMO row."""

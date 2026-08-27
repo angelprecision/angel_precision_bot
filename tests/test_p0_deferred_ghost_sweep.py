@@ -41,6 +41,12 @@ def test_update_reasserts_full_eligibility_at_write_time():
     assert "kind = 'ENTRY'" in where
     assert "client_id = %s" in where
     assert "created_ts < %s" in where
+    assert "broker_ready" in where
+    assert "materialization_in_flight" in where
+    assert "lifecycle_state" in where
+    assert "materialization_status" in where
+    assert "submit_intent_at" in where
+    assert "broker_submit_key" in where
 
 
 def test_terminal_state_is_expired_with_forensic_reason():

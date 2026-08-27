@@ -23,6 +23,7 @@ BLOCKER FIXES (PR #328 amendment):
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
@@ -36,6 +37,8 @@ from ap_entry_watcher import (
 from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
+    has_broker_handoff_evidence,
+    is_active_materialization_in_flight,
 )
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
@@ -301,6 +304,77 @@ class PendingTriggerRestartRecovery:
         if watcher_owned is not True and not _evidence_proven:
             return _reject_unproven_trigger_evidence()
 
+        # A contradictory broker-ready or submit marker is not permission to
+        # classify the row as a zombie.  The broker may have accepted an
+        # order before the durable identity write completed.  Hold this row
+        # before quote work and before the STUCK cleanup action; the dedicated
+        # broker-intent reconciler, when available, is the only authority that
+        # may resolve that ambiguity.
+        if has_broker_handoff_evidence(row):
+            meta = _extract_meta(row)
+            self._mark_failure(local_oid, "broker_handoff_ambiguous")
+            log.critical(
+                "PENDING_TRIGGER_BROKER_HANDOFF_AMBIGUOUS "
+                "local_order_id=%s client_id=%s execution_mode=%s signal_id=%s "
+                "broker_submission=UNKNOWN broker_cancel=NOT_ATTEMPTED caller=%s "
+                "submit_intent_at=%s broker_submit_key=%s "
+                "broker_submit_payload_hash=%s broker_ready=%s",
+                local_oid,
+                row_client,
+                row_mode,
+                signal_id,
+                self.caller_source,
+                bool(str(meta.get("submit_intent_at") or "").strip()),
+                bool(str(meta.get("broker_submit_key") or "").strip()),
+                bool(str(meta.get("broker_submit_payload_hash") or "").strip()),
+                meta.get("broker_ready"),
+            )
+            return _RowOutcome.UNRESOLVED
+
+        # Classify the durable owner before doing any quote work.  An active
+        # materializer is already the sole authority for this attempt; even a
+        # read-only external quote request is unnecessary and can delay the
+        # owner while another cleanup path races the same row.
+        cls = classify_pending_trigger_row(
+            row,
+            watcher_owned=watcher_owned,
+            is_past_eod=self.is_past_eod,
+            live_quote_already_through_trigger=None,
+        )
+
+        def _observe_materialization_owner() -> str:
+            meta = row.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            log.info(
+                "PENDING_TRIGGER_MATERIALIZATION_IN_FLIGHT "
+                "local_order_id=%s client_id=%s execution_mode=%s signal_id=%s "
+                "materialization_owner=%s materialization_generation=%s "
+                "materialization_lease_until=%s broker_submission=NOT_ATTEMPTED "
+                "broker_cancel=NOT_ATTEMPTED caller=%s",
+                local_oid,
+                row.get("client_id") or self.client_id,
+                row.get("execution_mode") or self.execution_mode,
+                row.get("signal_id") or "",
+                meta.get("materialization_owner") or "",
+                meta.get("materialization_generation") or "",
+                meta.get("materialization_lease_until") or "",
+                self.caller_source,
+            )
+            return _RowOutcome.MATERIALIZATION_OWNED
+
+        if cls == PTC.MATERIALIZATION_IN_FLIGHT:
+            # The shared predicate is repeated here so this early no-quote
+            # optimization cannot become a protection bypass if the
+            # classifier priority changes later.
+            if is_active_materialization_in_flight(row):
+                return _observe_materialization_owner()
+
         # Live quote check.
         live_quote_abt: Optional[bool] = None
         _side    = str(row.get("direction") or row.get("side") or "").strip().upper()
@@ -312,7 +386,8 @@ class PendingTriggerRestartRecovery:
             except Exception as _qe:
                 log.debug("RESTART_RECOVERY quote check failed local=%s: %s", local_oid, _qe)
 
-        # Classification.
+        # Reclassify after the optional quote check so quote-derived unsafe
+        # states retain their existing priority for non-active rows.
         cls = classify_pending_trigger_row(
             row,
             watcher_owned=watcher_owned,
@@ -387,12 +462,7 @@ class PendingTriggerRestartRecovery:
             # attempt-counter increment, owner/generation replacement, lease
             # renewal, retry scheduling, broker submit/cancel, or
             # position/proof_trades/queue mutation.
-            log.info(
-                "RESTART_RECOVERY_MATERIALIZATION_IN_FLIGHT local=%s "
-                "— active materializer owns attempt; observing read-only",
-                local_oid,
-            )
-            return _RowOutcome.MATERIALIZATION_OWNED
+            return _observe_materialization_owner()
 
         # Every path that would classify, terminalize, retry, or rearm an
         # order with confirmed-trigger evidence still requires durable

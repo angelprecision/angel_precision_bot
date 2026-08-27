@@ -27,6 +27,10 @@ def _pending_row(meta=None, **overrides):
         "recovery_submit_owner": "worker-B",
         "recovery_submit_lease_until": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
     },
+    {"broker_ready": True},
+    {"materialization_in_flight": True},
+    {"materialization_status": "RUNNING"},
+    {"broker_submit_payload_hash": "payload-hash"},
 ])
 @pytest.mark.parametrize("method", ["cancel_pending_entry", "expire_pending_entry"])
 def test_generic_pending_cleanup_refuses_ambiguous_meta(guarded, method):

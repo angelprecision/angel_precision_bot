@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -81,6 +81,32 @@ def test_disabled_flag_prevents_hydration_and_selector_call(monkeypatch):
     result = monitor._maybe_hydrate_deferred_order(_make_order())
 
     assert result == {"attempted": False, "reason": "disabled"}
+    selector.select.assert_not_called()
+    monitor.osm.record_deferred_hydration_result.assert_not_called()
+
+
+def test_active_materializer_blocks_prebreach_selector_and_copyback(monkeypatch):
+    """The poll-loop hydration consumer must preserve a live owner read-only."""
+    selector = MagicMock()
+    monitor = _make_monitor(contract_selector=selector)
+    _enable_window(monkeypatch)
+    active_meta = {
+        "watcher_audit": {"reason_code": "trigger_ready"},
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": "materializer:client@example.com:paper:local-123",
+        "materialization_generation": 1,
+        "materialization_lease_until": (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+        "broker_ready": False,
+        "submit_intent_at": "",
+        "broker_submit_key": "",
+    }
+    result = monitor._maybe_hydrate_deferred_order(_make_order(meta=active_meta))
+
+    assert result == {"attempted": False, "reason": "materialization_in_flight"}
     selector.select.assert_not_called()
     monitor.osm.record_deferred_hydration_result.assert_not_called()
 

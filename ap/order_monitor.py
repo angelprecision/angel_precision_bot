@@ -1047,6 +1047,16 @@ class APOrderMonitor:
                           AND UPPER(contract) LIKE 'DEFERRED:%%'
                           AND kind = 'ENTRY'
                           AND created_ts < %s
+                          -- Active materialization ownership is a hard
+                          -- no-cleanup fence.  Missing legacy markers are
+                          -- allowed, but malformed/non-false values are not.
+                          AND LOWER(COALESCE(meta->>'broker_ready', '')) IN ('', 'false')
+                          AND LOWER(COALESCE(meta->>'materialization_in_flight', '')) IN ('', 'false')
+                          AND UPPER(COALESCE(meta->>'lifecycle_state', '')) <> 'MATERIALIZING'
+                          AND UPPER(COALESCE(meta->>'materialization_status', '')) NOT IN ('RUNNING', 'QUEUED')
+                          AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL
+                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL
                         RETURNING local_order_id, symbol, reserved_cost, created_ts
                         """,
                         (_rule, _sweep_meta, self.client_id, _threshold),
@@ -1717,6 +1727,10 @@ class APOrderMonitor:
                 return (True, True, "canonical_recovery_retry_owned")
             elif _outcome == _RowOutcome.TERMINALIZED:
                 return (True, False, "canonical_recovery_terminalized")
+            elif _outcome == _RowOutcome.MATERIALIZATION_OWNED:
+                # The deferred materializer owns the attempt.  Do not report
+                # a rearm attempt or fall through to any legacy watcher path.
+                return (False, False, "canonical_recovery_materialization_owned")
             elif _outcome == _RowOutcome.SKIPPED:
                 return (False, False, "canonical_recovery_not_pending_trigger")
             else:
@@ -2002,6 +2016,30 @@ class APOrderMonitor:
             return {"attempted": False, "reason": "already_submitted"}
         if str(order.get("execution_mode") or self.client_mode or "").strip().lower() != str(self.client_mode or "").strip().lower():
             return {"attempted": False, "reason": "execution_mode_mismatch"}
+
+        # Hydration is a selector/write path.  It must observe the same
+        # durable active-materialization owner as restart recovery; otherwise
+        # this poll-loop consumer can reselect and overwrite an attempt while
+        # the canonical materializer is still running.
+        try:
+            from ap.pending_trigger_classifier import is_active_materialization_in_flight
+            if is_active_materialization_in_flight(order):
+                log.info(
+                    "[%s] DEFERRED_HYDRATION_SKIPPED local=%s "
+                    "reason=materialization_in_flight",
+                    self.client_id,
+                    order.get("local_order_id") or "",
+                )
+                return {"attempted": False, "reason": "materialization_in_flight"}
+        except Exception as exc:
+            log.error(
+                "[%s] DEFERRED_HYDRATION_GUARD_UNAVAILABLE local=%s exc=%s "
+                "— preserving row without selector/write",
+                self.client_id,
+                order.get("local_order_id") or "",
+                exc,
+            )
+            return {"attempted": False, "reason": "materialization_guard_unavailable"}
 
         try:
             limit_price = float(order.get("limit_price")) if order.get("limit_price") is not None else None
