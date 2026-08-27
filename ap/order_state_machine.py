@@ -209,7 +209,9 @@ def _durable_execution_mode(row: dict, meta: dict | None = None) -> str | None:
 # Used only by deferred/materialization identity CASes below.  The predicate
 # keeps the SQL authority aligned with _durable_execution_mode(): a valid
 # metadata mode may fill a blank column, while malformed or contradictory
-# durable values fail closed.
+# durable values fail closed.  This fragment contributes exactly one
+# positional %s placeholder; each embedding query must bind the expected
+# normalized mode at that fragment position.
 _DURABLE_EXECUTION_MODE_SQL = (
     "LOWER(TRIM(COALESCE(NULLIF(TRIM(execution_mode), ''), "
     "NULLIF(TRIM(meta->>'execution_mode'), ''), ''))) = %s "

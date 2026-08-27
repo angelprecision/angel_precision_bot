@@ -2096,6 +2096,10 @@ class APExecutionCore:
         if _osm is None or not local_order_id or not _client or not _mode or not _signal:
             return _keep("MATERIALIZATION_OWNERSHIP_UNPROVEN")
 
+        from ap.order_state_machine import (
+            _durable_execution_mode as _resolve_durable_execution_mode,
+        )
+
         def _read():
             try:
                 return _osm.get_order(local_order_id), True
@@ -2115,32 +2119,10 @@ class APExecutionCore:
                     return None
             return value if isinstance(value, dict) else None
 
-        def _durable_execution_mode(row, meta):
-            """Resolve durable mode without inferring from the runner."""
-            if not isinstance(row, dict) or not isinstance(meta, dict):
-                return None
-            column_raw = row.get("execution_mode")
-            meta_raw = meta.get("execution_mode")
-            column_text = "" if column_raw is None else str(column_raw).strip()
-            meta_text = "" if meta_raw is None else str(meta_raw).strip()
-            column_mode = (
-                _normalize_execution_mode(column_text) if column_text else None
-            )
-            meta_mode = (
-                _normalize_execution_mode(meta_text) if meta_text else None
-            )
-            if (column_text and column_mode is None) or (
-                meta_text and meta_mode is None
-            ):
-                return None
-            if column_mode and meta_mode and column_mode != meta_mode:
-                return None
-            return column_mode or meta_mode
-
         def _identity(row, meta):
             if not isinstance(meta, dict):
                 return False
-            durable_mode = _durable_execution_mode(row, meta)
+            durable_mode = _resolve_durable_execution_mode(row, meta)
             row_client = str(row.get("client_id") or "").strip().lower()
             meta_client = str(meta.get("client_id") or "").strip().lower()
             row_signal = str(row.get("signal_id") or "").strip()
@@ -4536,7 +4518,10 @@ class APExecutionCore:
                     "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
                     "retry_after_seconds": 5,
                 }
-            funnel.inc("master_control_blocked")
+            # Keep the existing surfaced funnel counter for a terminalized
+            # deferred order failure; the precise risk cause is in the
+            # structured diagnostic and durable reason code.
+            funnel.inc("order_failed")
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
                     "decision_status": "blocked_at_breach",
@@ -4860,7 +4845,7 @@ class APExecutionCore:
             decision_status: str = "blocked_at_breach",
             context_notes: str | None = None,
             funnel_key: str = "order_failed",
-        ) -> None:
+        ) -> dict | None:
             nonlocal _deferred_outcome_authority_proven
             if _ownership_context.get("is_recovered") and not _deferred_materialization_owned:
                 # Recovery terminal truth belongs to the exact callback owner.
