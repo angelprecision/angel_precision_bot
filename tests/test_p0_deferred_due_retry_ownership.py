@@ -1870,6 +1870,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "materialization_status": "RUNNING",
         "materialization_generation": 2,
         "materialization_owner": f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3",
+        "materialization_lease_until": _iso(now + timedelta(seconds=120)),
         "materialization_in_flight": True,
         "retry_attempt": 2,
     })
@@ -2077,6 +2078,13 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         f"claim_deferred_materialization must be called exactly once; "
         f"got {claim_call_count[0]}"
     )
+    if starting_contract != "DEFERRED:RTX":
+        # A real durable OCC is already materialized.  A stale deferred flag
+        # must not reopen selector work or create a second ownership claim.
+        assert _FakeSelector.select_count == 0
+        assert copyback_calls == []
+        assert submit_calls == []
+        return
     # Selector must have been called exactly once
     assert _FakeSelector.select_count == 1, (
         f"selector.select must be called exactly once; got {_FakeSelector.select_count}"

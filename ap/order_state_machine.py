@@ -171,6 +171,53 @@ def _normalize_client_key(client_id: str) -> str:
     return str(client_id or "").strip().lower()
 
 
+def _durable_execution_mode(row: dict, meta: dict | None = None) -> str | None:
+    """Resolve the canonical mode stored on an order without runner inference."""
+    if not isinstance(row, dict):
+        return None
+    if meta is None:
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                return None
+    if not isinstance(meta, dict):
+        return None
+
+    column_raw = row.get("execution_mode")
+    meta_raw = meta.get("execution_mode")
+    column_text = "" if column_raw is None else str(column_raw).strip()
+    meta_text = "" if meta_raw is None else str(meta_raw).strip()
+    column_mode = (
+        column_text.lower() if column_text.lower() in {"live", "paper"} else None
+    )
+    meta_mode = (
+        meta_text.lower() if meta_text.lower() in {"live", "paper"} else None
+    )
+    if (column_text and column_mode is None) or (meta_text and meta_mode is None):
+        return None
+    if column_mode and meta_mode and column_mode != meta_mode:
+        return None
+    return column_mode or meta_mode
+
+
+# Used only by the deferred materialization CASes below.  The predicate keeps
+# the SQL authority aligned with _durable_execution_mode(): blank columns may
+# use valid metadata, while invalid or contradictory durable values fail closed.
+_DURABLE_EXECUTION_MODE_SQL = (
+    "LOWER(TRIM(COALESCE(NULLIF(TRIM(execution_mode), ''), "
+    "NULLIF(TRIM(meta->>'execution_mode'), ''), ''))) = %s "
+    "AND (NULLIF(TRIM(execution_mode), '') IS NULL "
+    "OR LOWER(TRIM(execution_mode)) IN ('live', 'paper')) "
+    "AND (NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL "
+    "OR LOWER(TRIM(meta->>'execution_mode')) IN ('live', 'paper')) "
+    "AND (NULLIF(TRIM(execution_mode), '') IS NULL "
+    "OR NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL "
+    "OR LOWER(TRIM(execution_mode)) = LOWER(TRIM(meta->>'execution_mode')))"
+)
+
+
 def register_exit_engine(*args, **kwargs) -> None:
     """
     Register a per-client exit engine. Supports:
@@ -2456,7 +2503,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND COALESCE(signal_id,'') = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
@@ -2789,7 +2836,7 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND COALESCE((meta->>'broker_ready')::boolean, false) = false
                       AND (
                             COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
@@ -3565,7 +3612,7 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND COALESCE(meta->>'materialization_owner','') = %s
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
@@ -4090,7 +4137,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -4723,13 +4770,16 @@ class APOrderStateMachine:
                     "status": OrderStatus.ERROR, "error": error_msg}
 
         _raw_meta = current.get("meta") or {}
+        _raw_meta_parse_ok = True
         if isinstance(_raw_meta, str):
             try:
                 _raw_meta = json.loads(_raw_meta)
             except Exception:
                 _raw_meta = {}
+                _raw_meta_parse_ok = False
         if not isinstance(_raw_meta, dict):
             _raw_meta = {}
+            _raw_meta_parse_ok = False
         _plan_meta = getattr(plan, "metadata", None) if plan is not None else None
         _plan_meta = _plan_meta if isinstance(_plan_meta, dict) else {}
         _recovery_owner = str(_plan_meta.get("recovery_submit_owner") or "").strip()
@@ -4751,6 +4801,18 @@ class APOrderStateMachine:
                 "error": "ENTRY_SPLIT_BRAIN_QUARANTINED",
                 "split_brain": True,
                 "reconciliation_required": True,
+            }
+        _durable_mode = (
+            _durable_execution_mode(current, _raw_meta)
+            if _raw_meta_parse_ok else None
+        )
+        if _durable_mode is None:
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": current.get("broker_order_id"),
+                "status": status,
+                "error": "MATERIALIZATION_EXECUTION_MODE_UNPROVEN",
             }
         # ── Req 3: submitted-like state must have proven broker identity ────────
         # SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL: idempotent success only if
@@ -4789,7 +4851,7 @@ class APOrderStateMachine:
                     local_order_id,
                     broker_order_id=_recovered_bid,
                     current_status=status,
-                    current_execution_mode=str(current.get("execution_mode") or ""),
+                    current_execution_mode=_durable_mode,
                 )
                 if not _attached:
                     return {
@@ -4934,7 +4996,7 @@ class APOrderStateMachine:
                     local_order_id,
                     broker_order_id=_existing_bid,
                     error_msg="ENTRY_PRIOR_SUBMIT_IDENTITY_ATTACH_FAILED",
-                    execution_mode=str(current.get("execution_mode") or ""),
+                    execution_mode=_durable_mode,
                 )
             return {
                 "ok": False,
@@ -5002,8 +5064,8 @@ class APOrderStateMachine:
             _plan_client_id = str(getattr(plan, "client_id", "") or "").lower()
             if _plan_client_id and _plan_client_id != str(current.get("client_id") or "").lower():
                 _identity_mismatches.append("client_id")
-            _plan_mode = str(getattr(plan, "execution_mode", "") or "").lower()
-            if _plan_mode and _plan_mode != str(current.get("execution_mode") or "").lower():
+            _plan_mode = str(getattr(plan, "execution_mode", "") or "").strip().lower()
+            if _plan_mode and _plan_mode != _durable_mode:
                 _identity_mismatches.append("execution_mode")
         if (
             _is_materialized_deferred
@@ -5120,13 +5182,27 @@ class APOrderStateMachine:
                     "broker_order_id": latest.get("broker_order_id"),
                     "status": latest_status,
                     "error": f"submit_existing_entry_invalid_status:{latest_status}"}
+        _latest_meta = latest.get("meta") or {}
+        _latest_meta_parse_ok = True
+        if isinstance(_latest_meta, str):
+            try:
+                _latest_meta = json.loads(_latest_meta)
+            except Exception:
+                _latest_meta = {}
+                _latest_meta_parse_ok = False
+        if not isinstance(_latest_meta, dict):
+            _latest_meta = {}
+            _latest_meta_parse_ok = False
+        _latest_durable_mode = (
+            _durable_execution_mode(latest, _latest_meta)
+            if _latest_meta_parse_ok else None
+        )
         if (
             str(latest.get("contract") or "") != contract
             or int(latest.get("qty") or 0) != qty
             or abs(float(latest.get("limit_price") or 0) - lp) > 0.001
             or str(latest.get("signal_id") or "") != str(current.get("signal_id") or "")
-            or str(latest.get("execution_mode") or "").lower()
-               != str(current.get("execution_mode") or "").lower()
+            or _latest_durable_mode != _durable_mode
         ):
             return {
                 "ok": False,
@@ -5182,7 +5258,7 @@ class APOrderStateMachine:
                 local_order_id,
                 owner=_recovery_owner,
                 generation=_recovery_generation,
-                execution_mode=str(current.get("execution_mode") or ""),
+                execution_mode=_durable_mode,
                 payload_hash=_payload_hash,
                 broker_submit_key=_submit_key,
             )
@@ -5193,7 +5269,7 @@ class APOrderStateMachine:
                 and self.persist_materialized_submit_intent(
                     local_order_id,
                     generation=_materialization_generation,
-                    execution_mode=str(current.get("execution_mode") or ""),
+                    execution_mode=_durable_mode,
                     signal_id=str(current.get("signal_id") or ""),
                     payload_hash=_payload_hash,
                     broker_submit_key=_submit_key,
@@ -5232,7 +5308,7 @@ class APOrderStateMachine:
             _intent_ok = self.persist_entry_submit_intent(
                 local_order_id,
                 current_status=latest_status,
-                execution_mode=str(latest.get("execution_mode") or ""),
+                execution_mode=_latest_durable_mode,
                 signal_id=str(latest.get("signal_id") or ""),
                 contract=contract,
                 qty=qty,
@@ -5256,13 +5332,20 @@ class APOrderStateMachine:
         _intent_row = self._get_order(local_order_id)
         _intent_row = dict(_intent_row) if _intent_row else {}
         _intent_meta = _intent_row.get("meta") or {}
+        _intent_meta_parse_ok = True
         if isinstance(_intent_meta, str):
             try:
                 _intent_meta = json.loads(_intent_meta)
             except Exception:
                 _intent_meta = {}
+                _intent_meta_parse_ok = False
         if not isinstance(_intent_meta, dict):
             _intent_meta = {}
+            _intent_meta_parse_ok = False
+        _intent_durable_mode = (
+            _durable_execution_mode(_intent_row, _intent_meta)
+            if _intent_meta_parse_ok else None
+        )
         _intent_status = str(_intent_row.get("status") or "").upper()
         _intent_quarantined = bool(
             str(_intent_row.get("last_error") or "").startswith("SPLIT_BRAIN:")
@@ -5279,8 +5362,7 @@ class APOrderStateMachine:
             _intent_status in {OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER}
             and str(_intent_row.get("client_id") or "").strip().lower()
                 == str(self.client_id or "").strip().lower()
-            and str(_intent_row.get("execution_mode") or "").strip().lower()
-                == str(latest.get("execution_mode") or "").strip().lower()
+            and _intent_durable_mode == _latest_durable_mode
             and str(_intent_row.get("signal_id") or "")
                 == str(latest.get("signal_id") or "")
             and str(_intent_row.get("contract") or "") == contract
@@ -5327,7 +5409,7 @@ class APOrderStateMachine:
                 error_msg = "submitted_transition_failed_after_broker_accept"
                 self._flag_split_brain_order(local_order_id, broker_order_id=broker_order_id,
                                              error_msg=error_msg,
-                                             execution_mode=str(current.get("execution_mode") or ""))
+                                             execution_mode=_durable_mode)
                 return {"ok": False, "local_order_id": local_order_id,
                         "broker_order_id": broker_order_id, "status": OrderStatus.ERROR,
                         "error": error_msg, "split_brain": True}
@@ -5343,7 +5425,7 @@ class APOrderStateMachine:
                     local_order_id,
                     broker_order_id=broker_order_id,
                     error_msg=_sb_reason,
-                    execution_mode=str(current.get("execution_mode") or ""),
+                    execution_mode=_durable_mode,
                 )
                 log.critical(
                     "[%s] BROKER_STATUS_UNKNOWN_WITH_ID | order=%s broker_id=%s "

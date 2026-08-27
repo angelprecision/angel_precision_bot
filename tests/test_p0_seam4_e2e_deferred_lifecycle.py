@@ -876,6 +876,10 @@ def _build_core(
     core._cleanup_pending_entry_order = core_mod.APExecutionCore._cleanup_pending_entry_order.__get__(core, type(core))
     core._classify_recovered_ownership_loss = core_mod.APExecutionCore._classify_recovered_ownership_loss.__get__(core, type(core))
     core._is_real_occ_contract = core_mod.APExecutionCore._is_real_occ_contract
+    core._strict_materialization_int = core_mod.APExecutionCore._strict_materialization_int
+    core._live_materialization_lease = core_mod.APExecutionCore._live_materialization_lease
+    core._claim_deferred_materialization_for_trigger = core_mod.APExecutionCore._claim_deferred_materialization_for_trigger.__get__(core, type(core))
+    core._plan_is_deferred = core_mod.APExecutionCore._plan_is_deferred
     core.resume_deferred_broker_ready_order = core_mod.APExecutionCore.resume_deferred_broker_ready_order.__get__(core, type(core))
     core._on_entry_trigger = core_mod.APExecutionCore._on_entry_trigger.__get__(core, type(core))
     return core
@@ -1927,8 +1931,8 @@ def test_pr514_deferred_unknown_mode_fails_closed_before_capacity_or_selector(mo
 
     result = core._on_entry_trigger(watched)
 
-    assert result["disposition"] == "TERMINAL_DURABLE"
-    assert result["reason_code"] == "metadata_invalid:unknown_execution_mode"
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_OWNERSHIP_UNPROVEN"
     assert mc.capacity_calls == []
     assert selector.calls == 0
     assert osm.post_payloads == []
@@ -2169,7 +2173,7 @@ def test_pr514_named_shapes_duplicate_confirmed_callbacks_are_idempotent(
         None,
         "SUBMITTED",
     }
-    assert second_result["disposition"] == "SUBMITTED"
+    assert second_result is None
     assert osm.claim_successes == 1
     assert selector.calls == 1
     assert len(osm.post_payloads) == 1
@@ -2281,6 +2285,7 @@ def test_pr514_named_shapes_active_owner_blocks_selector_duplicate(
         "materialization_owner": "materializer:active-owner",
         "materialization_generation": 7,
         "retry_attempt": 1,
+        "materialization_lease_until": _iso(_now() + timedelta(seconds=30)),
     })
     plan.metadata.update({
         "lifecycle_state": "MATERIALIZING",
@@ -2302,7 +2307,8 @@ def test_pr514_named_shapes_active_owner_blocks_selector_duplicate(
         result = watcher.on_trigger(watcher._pending[0])
 
     assert result["disposition"] == "KEEP_WATCHER"
-    assert result["reason_code"] == "MATERIALIZATION_STATE_WRITE_FAILED"
+    assert result["reason_code"] == "MATERIALIZATION_ALREADY_OWNED"
+    assert result["next_retry_at"] == osm.row["meta"]["materialization_lease_until"]
     assert selector.calls == 0
     assert osm.post_payloads == []
     assert osm.claim_successes == 0
@@ -2427,3 +2433,699 @@ def test_pr514_paper_deferred_shape_does_not_call_live_capacity_authority(monkey
     assert selector.calls == 1
     assert len(osm.post_payloads) == 1
     assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #514 follow-up — deferred materialization ownership boundary
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _PR514OwnershipTraceOSM(_StatefulOSM):
+    """Small durable-row double for ownership ordering and fail-closed tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.trace = []
+        self.claim_calls = 0
+        self.claim_return = True
+        self.claim_error = None
+        self.read_error = None
+        self.missing_row = False
+        self.expire_calls = 0
+        self.cancel_calls = 0
+        self.terminalize_return = True
+        self.terminalization_kwargs = []
+        self.proof_read_failures_remaining = 0
+
+    def get_order(self, local_order_id):
+        if self.read_error:
+            raise RuntimeError(self.read_error)
+        if self.missing_row:
+            return None
+        return super().get_order(local_order_id)
+
+    def claim_deferred_materialization(self, local_order_id, **kwargs):
+        self.trace.append("claim")
+        self.claim_calls += 1
+        if self.claim_error:
+            raise RuntimeError(self.claim_error)
+        if not self.claim_return:
+            return False
+        return super().claim_deferred_materialization(local_order_id, **kwargs)
+
+    def terminalize_deferred_breach(self, local_order_id, **kwargs):
+        self.trace.append("terminalize")
+        self.terminalization_kwargs.append(dict(kwargs))
+        if not self.terminalize_return:
+            return False
+        return super().terminalize_deferred_breach(local_order_id, **kwargs)
+
+    def expire_pending_entry(self, local_order_id, reason):
+        self.trace.append("expire")
+        self.expire_calls += 1
+        return False
+
+    def cancel_pending_entry(self, local_order_id, reason):
+        self.trace.append("cancel")
+        self.cancel_calls += 1
+        return False
+
+    def _submit_order_with_retry(self, **kwargs):
+        self.trace.append("broker_post")
+        return super()._submit_order_with_retry(**kwargs)
+
+
+class _PR514OwnershipTraceMC(_DeferredCapacityMC):
+    def __init__(self, trace, **kwargs):
+        super().__init__(**kwargs)
+        self.trace = trace
+
+    def get_entry_capacity(self, **kwargs):
+        self.trace.append("capacity")
+        return super().get_entry_capacity(**kwargs)
+
+    def revalidate_exposure(self, plan, *, client_id):
+        self.trace.append("revalidation")
+        return super().revalidate_exposure(plan, client_id=client_id)
+
+
+class _PR514OwnershipTraceSelector(_CSelector):
+    def __init__(self, trace):
+        super().__init__(execution_price_per_share=1.26)
+        self.trace = trace
+
+    def select(self, plan, *, request_context=None):
+        self.trace.append("selector")
+        return super().select(plan, request_context=request_context)
+
+
+def _pr514_ownership_fixture(monkeypatch):
+    trace = []
+    osm = _PR514OwnershipTraceOSM()
+    osm.trace = trace
+    plan = _approved_plan()
+    selector = _PR514OwnershipTraceSelector(trace)
+    master_control = _PR514OwnershipTraceMC(trace)
+    broker = _Broker()
+    core = _build_core(osm, broker, selector, master_control=master_control)
+    core._recover_plan_for_revalidation = lambda _watched: plan
+    store_calls = {"status": [], "signal": []}
+    core.store = types.SimpleNamespace(
+        update_status=lambda *args, **kwargs: store_calls["status"].append((args, kwargs)),
+        update_signal_fields=lambda *args, **kwargs: store_calls["signal"].append((args, kwargs)),
+    )
+    watcher = _build_watcher(osm, core)
+    return osm, selector, master_control, core, watcher, plan, trace, store_calls
+
+
+def _pr514_ownership_execution_module():
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
+        1.28,
+        15,
+        True,
+        "ok",
+        {
+            "spread_pct": 0.02,
+            "submit_bid": 1.25,
+            "submit_ask": 1.28,
+            "submit_mid": 1.265,
+            "submit_last": 1.28,
+        },
+    )
+    return fake_execution
+
+
+def _run_pr514_scoped_callback(watcher, plan, *, signal_patch=None):
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_ownership_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        if signal_patch:
+            watched.signal.update(signal_patch)
+        return watched, watcher.on_trigger(watched)
+
+
+def _set_active_materialization(
+    osm,
+    *,
+    owner="materializer:active-owner",
+    generation=7,
+    attempt=1,
+    lease=None,
+):
+    osm.row["meta"].update({
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
+        "materialization_in_flight": True,
+        "materialization_owner": owner,
+        "materialization_generation": generation,
+        "retry_attempt": attempt,
+        "materialization_lease_until": lease or _iso(_now() + timedelta(seconds=30)),
+    })
+
+
+def test_pr514_fresh_deferred_claim_precedes_every_attempt_gate(monkeypatch):
+    """Load-bearing order test: moving claim below any gate must fail this."""
+    osm, selector, _mc, core, watcher, plan, trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+    assert osm.claim_calls == 1
+    assert selector.calls == 1
+    assert trace.index("claim") < trace.index("risk")
+    assert trace.index("claim") < trace.index("capacity")
+    assert trace.index("claim") < trace.index("selector")
+    assert trace.index("claim") < trace.index("revalidation")
+    assert trace.index("claim") < trace.index("broker_post")
+    assert trace.count("broker_post") == 1
+
+
+def test_pr514_recovery_without_in_memory_plan_uses_recovered_cost(monkeypatch):
+    osm, selector, _mc, core, _watcher, _plan, trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    core._recover_plan_for_revalidation = (
+        core_mod.APExecutionCore._recover_plan_for_revalidation.__get__(
+            core, type(core)
+        )
+    )
+    watched = types.SimpleNamespace(
+        signal={
+            "signal_id": SIGNAL_ID,
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "live",
+            "contract_deferred": True,
+            "contract_symbol": "DEFERRED:SPY",
+        },
+        ticker="SPY",
+        side="CALL",
+        trigger_price=600.0,
+        entry_trigger=600.0,
+        stop_level=595.0,
+        target_price=605.0,
+        trigger_crossed_at=_now(),
+    )
+    core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_ownership_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        result = core._on_entry_trigger(watched)
+
+    recovered = watched.signal["_approved_plan"]
+    assert recovered.metadata["deferred_reservation_cost"] == pytest.approx(1.0)
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+    assert osm.claim_calls == 1
+    assert selector.calls == 1
+    assert trace.index("claim") < trace.index("risk")
+    assert len(osm.post_payloads) == 1
+
+
+def test_pr514_recovery_preclaim_is_proven_without_second_claim(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    owner = "recovery_retry:owner"
+    _set_active_materialization(osm, owner=owner, generation=7, attempt=1)
+    plan.metadata["trigger_crossed_at"] = _iso(_now() - timedelta(seconds=10))
+    core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
+
+    watched, result = _run_pr514_scoped_callback(
+        watcher,
+        plan,
+        signal_patch={
+            "_recovery_pre_claimed": True,
+            "_recovery_pre_claimed_owner": owner,
+            "_recovery_pre_claimed_generation": 7,
+            "_recovery_pre_claimed_attempt": 1,
+            "_recovery_pre_claimed_client_id": CLIENT_ID,
+            "_recovery_pre_claimed_mode": "live",
+        },
+    )
+
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+    assert osm.claim_calls == 0
+    assert selector.calls == 1
+    assert trace.index("risk") < trace.index("selector")
+    assert len(osm.post_payloads) == 1
+
+
+def test_pr514_duplicate_active_owner_parks_at_exact_lease(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    lease = _iso(_now() + timedelta(seconds=45))
+    _set_active_materialization(osm, owner="peer-owner", generation=9, attempt=0, lease=lease)
+    row_before = copy.deepcopy(osm.row)
+    osm.claim_return = False
+    core._breach_risk_check = lambda _watched: pytest.fail("risk work after duplicate owner")
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_ALREADY_OWNED"
+    assert result["next_retry_at"] == lease
+    assert osm.claim_calls == 1
+    assert selector.calls == 0
+    assert trace == ["claim"]
+    assert osm.expire_calls == 0
+    assert osm.cancel_calls == 0
+    assert osm.row["meta"]["materialization_owner"] == "peer-owner"
+    assert osm.row["meta"]["materialization_generation"] == 9
+    assert osm.row["meta"]["retry_attempt"] == 0
+    assert osm.row == row_before
+    assert stores["status"] == []
+    assert stores["signal"] == []
+
+
+@pytest.mark.parametrize("block", ["kill_switch", "positions_full"])
+def test_pr514_duplicate_owner_does_no_work_even_when_risk_would_block(monkeypatch, block):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    lease = _iso(_now() + timedelta(seconds=45))
+    _set_active_materialization(osm, owner="peer-owner", generation=9, attempt=0, lease=lease)
+    osm.claim_return = False
+    if block == "kill_switch":
+        core._kill_switch = True
+    else:
+        core._current_open_position_count = lambda: 5
+        core._current_pending_entry_count = lambda: 0
+    core._breach_risk_check = lambda _watched: pytest.fail("duplicate reached risk work")
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_ALREADY_OWNED"
+    assert selector.calls == 0
+    assert trace == ["claim"]
+    assert stores["status"] == []
+    assert stores["signal"] == []
+    assert osm.expire_calls == 0
+    assert osm.cancel_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("stale_owner", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("expired_lease", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("malformed_lease", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("timezone_naive_lease", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("missing_lease", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("missing_owner", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("generation_zero", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("generation_negative", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("generation_bool", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("wrong_client_id", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("wrong_execution_mode", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("wrong_signal_id", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("stale_generation", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("wrong_owner", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("malformed_preclaim_attempt", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("missing_durable_row", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+        ("db_read_failure", "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"),
+    ],
+)
+def test_pr514_preclaim_proof_failures_keep_watcher_and_do_zero_work(
+    monkeypatch, case, expected_reason
+):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    owner = "preclaim-owner"
+    _set_active_materialization(osm, owner=owner, generation=7, attempt=1)
+    marker = {
+        "_recovery_pre_claimed": True,
+        "_recovery_pre_claimed_owner": owner,
+        "_recovery_pre_claimed_generation": 7,
+        "_recovery_pre_claimed_attempt": 1,
+        "_recovery_pre_claimed_client_id": CLIENT_ID,
+        "_recovery_pre_claimed_mode": "live",
+    }
+    if case == "stale_owner":
+        osm.row["meta"]["materialization_owner"] = "old-owner"
+    elif case == "expired_lease":
+        osm.row["meta"]["materialization_lease_until"] = _iso(_now() - timedelta(seconds=1))
+    elif case == "malformed_lease":
+        osm.row["meta"]["materialization_lease_until"] = "not-a-lease"
+    elif case == "timezone_naive_lease":
+        osm.row["meta"]["materialization_lease_until"] = "2099-01-01T00:00:00"
+    elif case == "missing_lease":
+        osm.row["meta"].pop("materialization_lease_until", None)
+    elif case == "missing_owner":
+        osm.row["meta"]["materialization_owner"] = ""
+    elif case == "generation_zero":
+        osm.row["meta"]["materialization_generation"] = 0
+    elif case == "generation_negative":
+        osm.row["meta"]["materialization_generation"] = -1
+    elif case == "generation_bool":
+        osm.row["meta"]["materialization_generation"] = True
+    elif case == "wrong_client_id":
+        osm.row["client_id"] = "other@example.com"
+    elif case == "wrong_execution_mode":
+        osm.row["execution_mode"] = "paper"
+    elif case == "wrong_signal_id":
+        osm.row["signal_id"] = "other-signal"
+    elif case == "stale_generation":
+        osm.row["meta"]["materialization_generation"] = 8
+    elif case == "wrong_owner":
+        marker["_recovery_pre_claimed_owner"] = "wrong-owner"
+    elif case == "malformed_preclaim_attempt":
+        marker["_recovery_pre_claimed_attempt"] = True
+    elif case == "missing_durable_row":
+        osm.missing_row = True
+    elif case == "db_read_failure":
+        osm.read_error = "db_hiccup"
+    row_before = copy.deepcopy(osm.row)
+    core._breach_risk_check = lambda _watched: pytest.fail("invalid preclaim reached risk work")
+
+    _watched, result = _run_pr514_scoped_callback(
+        watcher, plan, signal_patch=marker
+    )
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == expected_reason
+    assert osm.row == row_before
+    assert osm.claim_calls == 0
+    assert selector.calls == 0
+    assert trace == []
+    assert osm.expire_calls == 0
+    assert osm.cancel_calls == 0
+    assert stores["status"] == []
+    assert stores["signal"] == []
+
+
+def test_pr514_claim_db_failure_keeps_watcher_before_selector(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    osm.claim_error = "db_write_failed"
+    core._breach_risk_check = lambda _watched: pytest.fail("claim failure reached risk work")
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_STATE_WRITE_FAILED"
+    assert osm.claim_calls == 1
+    assert selector.calls == 0
+    assert trace == ["claim"]
+    assert osm.expire_calls == 0
+    assert osm.cancel_calls == 0
+    assert stores["status"] == []
+    assert stores["signal"] == []
+
+
+def test_pr514_missing_client_is_not_inferred_from_runner(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    plan.client_id = ""
+    core._breach_risk_check = lambda _watched: pytest.fail(
+        "missing client identity reached risk work"
+    )
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_OWNERSHIP_UNPROVEN"
+    assert osm.claim_calls == 0
+    assert selector.calls == 0
+    assert trace == []
+    assert stores["status"] == []
+    assert stores["signal"] == []
+
+
+@pytest.mark.parametrize(
+    ("column_mode", "meta_mode", "callback_mode", "expected_valid"),
+    [
+        ("live", "live", "live", True),
+        (" live ", "live", "live", True),
+        ("", "live", "live", True),
+        ("", "paper", "paper", True),
+        ("live", "paper", "live", False),
+        ("paper", "live", "paper", False),
+        ("", "", "live", False),
+        ("", None, "live", False),
+        ("", "staging", "live", False),
+        ("live", "", "paper", False),
+        ("paper", "", "live", False),
+    ],
+)
+def test_pr514_durable_execution_mode_authority_matrix(
+    monkeypatch, column_mode, meta_mode, callback_mode, expected_valid,
+):
+    """Durable column/meta mode is canonical, with no runner inference."""
+    osm, selector, _mc, core, _watcher, _plan, trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    osm.row["execution_mode"] = column_mode
+    if meta_mode is None:
+        osm.row["meta"].pop("execution_mode", None)
+    else:
+        osm.row["meta"]["execution_mode"] = meta_mode
+    watched = types.SimpleNamespace(
+        signal={
+            "signal_id": SIGNAL_ID,
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": callback_mode,
+        },
+        ticker="SPY",
+        trigger_price=600.0,
+        last_quote_ask=600.20,
+        last_quote_bid=600.10,
+        trigger_crossed_at=_now(),
+    )
+
+    result = core._claim_deferred_materialization_for_trigger(
+        watched=watched,
+        signal=watched.signal,
+        local_order_id=LOCAL_ORDER_ID,
+        ticker="SPY",
+        client_id=CLIENT_ID,
+        execution_mode=callback_mode,
+        signal_id=SIGNAL_ID,
+    )
+
+    if expected_valid:
+        assert result["disposition"] == "OWNED"
+        assert osm.claim_calls == 1
+    else:
+        assert result["disposition"] == "KEEP_WATCHER"
+        assert result["reason_code"] == "MATERIALIZATION_STATE_WRITE_FAILED"
+        assert osm.claim_calls == 0
+    assert selector.calls == 0
+    assert osm.post_payloads == []
+    assert osm.expire_calls == 0
+    assert osm.cancel_calls == 0
+    assert trace == (["claim"] if expected_valid else [])
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_reason"),
+    [
+        ("blocked", "exposure_revalidation_blocked"),
+        ("error", "exposure_revalidation_error_live"),
+    ],
+)
+def test_pr514_owned_deferred_exposure_reason_survives_terminal_cas(
+    monkeypatch, failure, expected_reason,
+):
+    osm, selector, master_control, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    # Keep this callback in the deferred ownership path while forcing the
+    # existing exposure gate to execute, so the reason preservation is tested
+    # at the same owner/generation terminal boundary as kill/capacity blocks.
+    core._plan_is_deferred = lambda *_args: False
+    diagnostics = []
+    core._emit_breach_diag = lambda *_args, **kwargs: diagnostics.append(kwargs)
+    if failure == "blocked":
+        master_control.final_ok = False
+        master_control.final_reason = "EXPOSURE_CAP"
+    else:
+        def _raise_exposure(*_args, **_kwargs):
+            raise RuntimeError("exposure_db_unavailable")
+        master_control.revalidate_exposure = _raise_exposure
+    core._breach_risk_check = core_mod.APExecutionCore._breach_risk_check.__get__(
+        core, type(core)
+    )
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["reason_code"] == expected_reason
+    assert osm.terminalization_kwargs[0]["reason_code"] == expected_reason
+    assert osm.terminalization_kwargs[0]["diagnostics"]["failure_stage"] == "breach_risk_check"
+    if failure == "blocked":
+        assert osm.terminalization_kwargs[0]["diagnostics"]["mc_block_reason"] == "EXPOSURE_CAP"
+    assert selector.calls == 0
+    assert osm.post_payloads == []
+    assert osm.expire_calls == 0
+    assert osm.cancel_calls == 0
+    assert stores["signal"]
+    assert diagnostics and diagnostics[0]["reason"] == expected_reason
+    assert trace.index("claim") < trace.index("terminalize")
+
+
+@pytest.mark.parametrize(
+    ("risk_block", "expected_reason"),
+    [
+        ("kill_switch", "kill_switch_active"),
+        ("master_kill_switch", "master_control_kill_switch_active"),
+        ("positions_full", "positions_full_at_breach"),
+    ],
+)
+def test_pr514_owned_deferred_risk_failure_uses_exact_terminal_cas(
+    monkeypatch, risk_block, expected_reason,
+):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    if risk_block == "kill_switch":
+        core._kill_switch = True
+    elif risk_block == "master_kill_switch":
+        core.master_control._kill_switch_fn = lambda: True
+    else:
+        core._current_open_position_count = lambda: 5
+        core._current_pending_entry_count = lambda: 0
+    core._breach_risk_check = core_mod.APExecutionCore._breach_risk_check.__get__(
+        core, type(core)
+    )
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert osm.claim_calls == 1
+    assert selector.calls == 0
+    assert osm.expire_calls == 0
+    assert osm.cancel_calls == 0
+    assert trace.index("claim") < trace.index("terminalize")
+    assert result["reason_code"] == expected_reason
+    assert osm.terminalization_kwargs[0]["reason_code"] == expected_reason
+    assert osm.terminalization_kwargs[0]["owner"] == osm.row["meta"]["materialization_owner"]
+    assert osm.terminalization_kwargs[0]["generation"] == osm.row["meta"]["materialization_generation"]
+    assert osm.terminalization_kwargs[0]["diagnostics"]["failure_stage"] == "breach_risk_check"
+    assert stores["status"] == []
+    assert stores["signal"]
+
+
+def test_pr514_owned_terminal_cas_loss_keeps_watcher_without_generic_cleanup(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    osm.terminalize_return = False
+    core._kill_switch = True
+    diagnostics = []
+    core._emit_breach_diag = lambda *_args, **kwargs: diagnostics.append(kwargs)
+    core._breach_risk_check = core_mod.APExecutionCore._breach_risk_check.__get__(
+        core, type(core)
+    )
+
+    watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "BREACH_TERMINAL_WRITE_FAILED"
+    assert osm.claim_calls == 1
+    assert selector.calls == 0
+    assert trace == ["claim", "terminalize"]
+    assert osm.expire_calls == 0
+    assert osm.cancel_calls == 0
+    assert stores["status"] == []
+    assert stores["signal"] == []
+    assert diagnostics == []
+    assert watched.signal["_deferred_breach_risk_reason"] == "kill_switch_active"
+
+
+def test_pr514_stale_deferred_flag_on_real_contract_does_not_reclaim_or_select(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    plan.contract_symbol = REAL_OCC
+    plan.limit_price = 2.10
+    plan.max_position_usd = 210.0
+    plan.metadata.update({"contract_deferred": True})
+    osm.row.update({
+        "contract": REAL_OCC,
+        "limit_price": 2.10,
+        "reserved_cost": 210.0,
+    })
+    osm.row["meta"].update({
+        "contract_deferred": True,
+        "contract_symbol": REAL_OCC,
+        "execution_mode": "live",
+    })
+    core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
+
+    _watched, _result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert osm.claim_calls == 0
+    assert selector.calls == 0
+
+
+def test_pr514_recovery_preclaim_on_hydrated_contract_is_still_proven(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    owner = "recovery_retry:hydrated"
+    lease = _iso(_now() + timedelta(seconds=30))
+    _set_active_materialization(osm, owner=owner, generation=7, attempt=1, lease=lease)
+    osm.row["contract"] = REAL_OCC
+    osm.row["limit_price"] = 2.10
+    osm.row["reserved_cost"] = 210.0
+    plan.contract_symbol = REAL_OCC
+    plan.limit_price = 2.10
+    plan.max_position_usd = 210.0
+    plan.metadata.update({
+        "contract_deferred": True,
+        "trigger_crossed_at": _iso(_now() - timedelta(seconds=10)),
+    })
+    osm.submit_existing_entry = lambda **_kwargs: {
+        "ok": True,
+        "local_order_id": LOCAL_ORDER_ID,
+        "broker_order_id": "hydrated-proof",
+        "status": "ACK",
+    }
+    marker = {
+        "_recovery_pre_claimed": True,
+        "_recovery_pre_claimed_owner": owner,
+        "_recovery_pre_claimed_generation": 7,
+        "_recovery_pre_claimed_attempt": 1,
+        "_recovery_pre_claimed_client_id": CLIENT_ID,
+        "_recovery_pre_claimed_mode": "live",
+    }
+    core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
+
+    watched, result = _run_pr514_scoped_callback(
+        watcher, plan, signal_patch=marker
+    )
+
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+    assert watched.signal.get("_deferred_materialization_owned") is True
+    assert osm.claim_calls == 0
+    assert selector.calls == 0
+    assert trace.index("risk") >= 0
+    assert osm.post_payloads == []
+    assert stores["status"] == []

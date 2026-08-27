@@ -1880,7 +1880,7 @@ class APExecutionCore:
                 pattern=str(sig.get("pattern") or ""),
                 timeframe=str(sig.get("timeframe") or "1d"),
                 contracts=qty,
-                max_position_usd=real_cost,
+                max_position_usd=_recovered_cost,
                 tier=str(sig.get("grade") or sig.get("tier") or "B"),
                 score=float(sig.get("score") or 0),
                 trigger_type="breach",
@@ -1926,6 +1926,10 @@ class APExecutionCore:
         if not isinstance(_meta, dict):
             _meta = {}
         _contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        # A stale deferred marker must not reopen materialization after a real
+        # OCC contract has already been durably hydrated.
+        if APExecutionCore._is_real_occ_contract(_contract, ticker):
+            return False
         return bool(
             _meta.get("contract_deferred")
             or _contract.upper().startswith("DEFERRED:")
@@ -2036,6 +2040,307 @@ class APExecutionCore:
         )
         return True
 
+    @staticmethod
+    def _strict_materialization_int(value, *, minimum: int) -> int | None:
+        """Parse a durable materialization counter without coercing booleans."""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, float) and (
+            not math.isfinite(value) or not value.is_integer()
+        ):
+            return None
+        if isinstance(value, str) and not re.fullmatch(r"[+-]?\d+", value.strip()):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed >= minimum else None
+
+    @staticmethod
+    def _live_materialization_lease(value, *, now: datetime | None = None) -> datetime | None:
+        """Return only an aware, parseable, unexpired durable lease."""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            lease = datetime.fromisoformat(value.strip())
+        except (TypeError, ValueError):
+            return None
+        if lease.tzinfo is None or lease.utcoffset() is None:
+            return None
+        return lease if lease > (now or datetime.now(timezone.utc)) else None
+
+    def _claim_deferred_materialization_for_trigger(
+        self,
+        *,
+        watched: WatchedSignal,
+        signal: dict,
+        local_order_id: str,
+        ticker: str,
+        client_id: str,
+        execution_mode: str,
+        signal_id: str,
+    ) -> dict:
+        """Own or prove one deferred callback before any attempt work."""
+        _osm = getattr(self, "order_state_machine", None)
+        _client = str(client_id or "").strip().lower()
+        _mode = _normalize_execution_mode(execution_mode)
+        _signal = str(signal_id or "").strip()
+
+        def _keep(reason, lease=None):
+            result = {"disposition": "KEEP_WATCHER", "reason_code": reason}
+            if lease:
+                result["next_retry_at"] = lease
+            return result
+
+        if _osm is None or not local_order_id or not _client or not _mode or not _signal:
+            return _keep("MATERIALIZATION_OWNERSHIP_UNPROVEN")
+
+        def _read():
+            try:
+                return _osm.get_order(local_order_id), True
+            except Exception as exc:
+                log.critical(
+                    "[%s] deferred materialization ownership row read failed order=%s error=%s",
+                    ticker, local_order_id, exc,
+                )
+                return None, False
+
+        def _meta(row):
+            value = row.get("meta") or {}
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    return None
+            return value if isinstance(value, dict) else None
+
+        def _durable_execution_mode(row, meta):
+            """Resolve durable mode without inferring from the runner."""
+            if not isinstance(row, dict) or not isinstance(meta, dict):
+                return None
+            column_raw = row.get("execution_mode")
+            meta_raw = meta.get("execution_mode")
+            column_text = "" if column_raw is None else str(column_raw).strip()
+            meta_text = "" if meta_raw is None else str(meta_raw).strip()
+            column_mode = (
+                _normalize_execution_mode(column_text) if column_text else None
+            )
+            meta_mode = (
+                _normalize_execution_mode(meta_text) if meta_text else None
+            )
+            if (column_text and column_mode is None) or (
+                meta_text and meta_mode is None
+            ):
+                return None
+            if column_mode and meta_mode and column_mode != meta_mode:
+                return None
+            return column_mode or meta_mode
+
+        def _identity(row, meta):
+            if not isinstance(meta, dict):
+                return False
+            durable_mode = _durable_execution_mode(row, meta)
+            row_client = str(row.get("client_id") or "").strip().lower()
+            meta_client = str(meta.get("client_id") or "").strip().lower()
+            row_signal = str(row.get("signal_id") or "").strip()
+            meta_signal = str(meta.get("signal_id") or "").strip()
+            return (
+                durable_mode == _mode
+                and str(row.get("local_order_id") or "").strip() == local_order_id
+                and (
+                    not meta.get("local_order_id")
+                    or str(meta.get("local_order_id")).strip() == local_order_id
+                )
+                and row_client == _client
+                and (not meta_client or meta_client == _client)
+                and (row_signal or meta_signal) == _signal
+                and (
+                    not row_signal
+                    or not meta_signal
+                    or row_signal == meta_signal
+                )
+                and str(row.get("kind") or "").strip().upper() == "ENTRY"
+            )
+
+        def _proof(row, meta, *, owner=None, generation=None, attempt=None):
+            if (
+                not isinstance(row, dict)
+                or not _identity(row, meta)
+                or str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER"
+                or str(row.get("broker_order_id") or "").strip()
+                or row.get("submitted_ts") is not None
+                or str(meta.get("lifecycle_state") or "").strip().upper() != "MATERIALIZING"
+                or str(meta.get("materialization_status") or "").strip().upper() != "RUNNING"
+                or meta.get("materialization_in_flight") is not True
+            ):
+                return None
+            actual_owner = str(meta.get("materialization_owner") or "").strip()
+            actual_generation = self._strict_materialization_int(
+                meta.get("materialization_generation"), minimum=1,
+            )
+            lease_value = meta.get("materialization_lease_until")
+            if (
+                not actual_owner
+                or actual_generation is None
+                or self._live_materialization_lease(lease_value) is None
+                or (owner is not None and actual_owner != owner)
+                or (generation is not None and actual_generation != generation)
+            ):
+                return None
+            actual_attempt = self._strict_materialization_int(
+                meta.get("retry_attempt"), minimum=1,
+            )
+            if attempt is not None and actual_attempt != attempt:
+                return None
+            return {
+                "owner": actual_owner,
+                "generation": actual_generation,
+                "attempt": actual_attempt or 0,
+                "lease_until": lease_value,
+            }
+
+        def _owned(proof, row):
+            return {"disposition": "OWNED", **proof, "row": row}
+
+        if signal.get("_recovery_pre_claimed"):
+            expected_owner = str(
+                signal.get("_recovery_pre_claimed_owner") or ""
+            ).strip()
+            expected_generation = self._strict_materialization_int(
+                signal.get("_recovery_pre_claimed_generation"), minimum=1,
+            )
+            expected_attempt = self._strict_materialization_int(
+                signal.get("_recovery_pre_claimed_attempt"), minimum=1,
+            )
+            expected_client = str(
+                signal.get("_recovery_pre_claimed_client_id") or ""
+            ).strip().lower()
+            expected_mode = _normalize_execution_mode(
+                signal.get("_recovery_pre_claimed_mode")
+            )
+            if (
+                not expected_owner
+                or expected_generation is None
+                or expected_attempt is None
+                or expected_client != _client
+                or expected_mode != _mode
+            ):
+                return _keep("MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED")
+            row, read_ok = _read()
+            proof = (
+                _proof(
+                    row,
+                    _meta(row),
+                    owner=expected_owner,
+                    generation=expected_generation,
+                    attempt=expected_attempt,
+                )
+                if read_ok and isinstance(row, dict)
+                else None
+            )
+            return (
+                _owned(proof, row)
+                if proof is not None
+                else _keep("MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED")
+            )
+
+        row, read_ok = _read()
+        if not read_ok or not isinstance(row, dict):
+            return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+        row_meta = _meta(row)
+        if not isinstance(row_meta, dict) or not _identity(row, row_meta):
+            return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+        row_status = str(row.get("status") or "").strip().upper()
+        if row_status in {"SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"}:
+            return {"disposition": "SUBMITTED"}
+        if row_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return {"disposition": "TERMINAL_DURABLE"}
+        if (
+            row_status != "PENDING_TRIGGER"
+            or str(row.get("broker_order_id") or "").strip()
+            or row.get("submitted_ts") is not None
+        ):
+            return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+
+        raw_generation = row_meta.get("materialization_generation")
+        generation = (
+            0 if raw_generation is None or raw_generation == ""
+            else self._strict_materialization_int(raw_generation, minimum=0)
+        )
+        if generation is None:
+            return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+        owner = str(
+            signal.get("watcher_token")
+            or signal.get("materialization_owner")
+            or f"execution-core:{getattr(self, 'client_id', '')}:{local_order_id}"
+        ).strip()
+        if not owner:
+            return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+        next_generation = generation + 1
+        crossed = getattr(watched, "trigger_crossed_at", None)
+        crossed = (
+            crossed.isoformat()
+            if hasattr(crossed, "isoformat")
+            else str(crossed or datetime.now(timezone.utc).isoformat())
+        )
+        try:
+            observed = float(
+                getattr(watched, "last_quote_ask", 0)
+                or getattr(watched, "last_quote_bid", 0)
+                or getattr(watched, "trigger_price", 0)
+                or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            observed = 0.0
+        claim = getattr(_osm, "claim_deferred_materialization", None)
+        if not callable(claim):
+            return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+        try:
+            claimed = bool(claim(
+                local_order_id,
+                owner=owner,
+                generation=next_generation,
+                lease_until=(datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+                trigger_crossed_at=crossed,
+                trigger_price=float(getattr(watched, "trigger_price", 0) or 0),
+                observed_underlying_price=observed,
+                signal_id=_signal,
+                execution_mode=_mode,
+            ))
+        except Exception as exc:
+            log.critical(
+                "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s error=%s",
+                ticker, local_order_id, exc,
+            )
+            claimed = False
+        if claimed:
+            return _owned({
+                "owner": owner,
+                "generation": next_generation,
+                "attempt": self._strict_materialization_int(
+                    row_meta.get("retry_attempt"), minimum=1,
+                ) or 0,
+                "lease_until": None,
+            }, row)
+
+        row, read_ok = _read()
+        if read_ok and isinstance(row, dict):
+            row_meta = _meta(row)
+            proof = _proof(row, row_meta)
+            if proof is not None:
+                return {
+                    **_keep("MATERIALIZATION_ALREADY_OWNED", proof["lease_until"]),
+                    "owner": proof["owner"],
+                    "generation": proof["generation"],
+                }
+            row_status = str(row.get("status") or "").strip().upper()
+            if row_status in {"SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"}:
+                return {"disposition": "SUBMITTED"}
+            if row_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                return {"disposition": "TERMINAL_DURABLE"}
+        return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+
     # ── Diagnostic-only helper (PR hotfix/breach-block-diagnostics) ──────────
     # Emits a single structured log line for every silent block / exception
     # path in _breach_risk_check and _on_entry_trigger. The bot is working;
@@ -2124,21 +2429,42 @@ class APExecutionCore:
         sig = watched.signal
         ticker = watched.ticker
         signal_id = str(sig.get("signal_id", "") or "")
+        _owned_deferred = bool(sig.get("_deferred_materialization_owned"))
+
+        # Owned deferred callbacks cannot publish ordinary signal/operator
+        # diagnostics until their owner/generation terminal CAS succeeds.
+        # Keep the exact transient reason on this callback so the terminal
+        # writer does not collapse distinct risk gates into one generic code.
+        if _owned_deferred:
+            sig.pop("_deferred_breach_risk_reason", None)
+            sig.pop("_deferred_breach_risk_diag", None)
+
+        def _stage_owned_risk_failure(reason: str, **diagnostics) -> None:
+            if not _owned_deferred:
+                return
+            sig["_deferred_breach_risk_reason"] = str(reason)
+            if diagnostics:
+                sig["_deferred_breach_risk_diag"] = dict(diagnostics)
 
         if getattr(self, "_kill_switch", False):
             log.critical("[%s] Breach blocked — execution core kill switch active", ticker)
-            if signal_id:
+            _stage_owned_risk_failure(
+                "kill_switch_active",
+                max_positions=getattr(self, "_max_positions", "n/a"),
+            )
+            if signal_id and not _owned_deferred:
                 self.store.update_signal_fields(signal_id, {
                     "decision_status": "blocked_at_breach",
                     "context_notes": "kill_switch_active_at_breach",
                 })
-            self._emit_breach_diag(
-                "BREACH_RISK_CHECK_BLOCKED",
-                watched=watched,
-                reason="kill_switch_active",
-                max_positions=getattr(self, "_max_positions", "n/a"),
-                level="critical",
-            )
+            if not _owned_deferred:
+                self._emit_breach_diag(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    watched=watched,
+                    reason="kill_switch_active",
+                    max_positions=getattr(self, "_max_positions", "n/a"),
+                    level="critical",
+                )
             return False
 
         if self.master_control is not None:
@@ -2146,18 +2472,23 @@ class APExecutionCore:
                 kill_fn = getattr(self.master_control, "_kill_switch_fn", None)
                 if kill_fn and kill_fn():
                     log.critical("[%s] Breach blocked — master control kill switch active", ticker)
-                    if signal_id:
+                    _stage_owned_risk_failure(
+                        "master_control_kill_switch_active",
+                        max_positions=getattr(self, "_max_positions", "n/a"),
+                    )
+                    if signal_id and not _owned_deferred:
                         self.store.update_signal_fields(signal_id, {
                             "decision_status": "blocked_at_breach",
                             "context_notes": "master_control_kill_switch_active_at_breach",
                         })
-                    self._emit_breach_diag(
-                        "BREACH_RISK_CHECK_BLOCKED",
-                        watched=watched,
-                        reason="master_control_kill_switch_active",
-                        max_positions=getattr(self, "_max_positions", "n/a"),
-                        level="critical",
-                    )
+                    if not _owned_deferred:
+                        self._emit_breach_diag(
+                            "BREACH_RISK_CHECK_BLOCKED",
+                            watched=watched,
+                            reason="master_control_kill_switch_active",
+                            max_positions=getattr(self, "_max_positions", "n/a"),
+                            level="critical",
+                        )
                     return False
             except Exception as exc:
                 log.warning("[%s] Kill-switch check failed at breach: %s", ticker, exc)
@@ -2179,7 +2510,13 @@ class APExecutionCore:
                 "[%s] No slot at breach time — open=%s pending=%s max=%s. Blocking queued entry.",
                 ticker, open_count, pending_entries, self._max_positions,
             )
-            if signal_id:
+            _stage_owned_risk_failure(
+                "positions_full_at_breach",
+                positions_open=open_count,
+                pending_entries=pending_entries,
+                max_positions=self._max_positions,
+            )
+            if signal_id and not _owned_deferred:
                 self.store.update_signal_fields(signal_id, {
                     "decision_status": "blocked_at_breach",
                     "context_notes": (
@@ -2187,20 +2524,21 @@ class APExecutionCore:
                         f"pending={pending_entries} max={self._max_positions}"
                     ),
                 })
-            _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
-            try:
-                self._cleanup_pending_entry_order(watched, action="cancel", reason="positions_full_at_breach")
-            except Exception as _clean_err:
-                log.error("[%s] Failed to cleanup pending entry order: %s", ticker, _clean_err)
-            self._emit_breach_diag(
-                "BREACH_RISK_CHECK_BLOCKED",
-                watched=watched,
-                reason="positions_full_at_breach",
-                positions_open=open_count,
-                pending_entries=pending_entries,
-                max_positions=self._max_positions,
-                level="info",
-            )
+            if not _owned_deferred:
+                _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                try:
+                    self._cleanup_pending_entry_order(watched, action="cancel", reason="positions_full_at_breach")
+                except Exception as _clean_err:
+                    log.error("[%s] Failed to cleanup pending entry order: %s", ticker, _clean_err)
+                self._emit_breach_diag(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    watched=watched,
+                    reason="positions_full_at_breach",
+                    positions_open=open_count,
+                    pending_entries=pending_entries,
+                    max_positions=self._max_positions,
+                    level="info",
+                )
             return False
 
         approved_plan = self._recover_plan_for_revalidation(watched)
@@ -2211,21 +2549,27 @@ class APExecutionCore:
                     "[%s] LIVE BREACH BLOCK — _approved_plan missing; cannot revalidate exposure safely",
                     ticker,
                 )
-                if signal_id:
+                _stage_owned_risk_failure(
+                    msg,
+                    positions_open=open_count,
+                    pending_entries=pending_entries,
+                    max_positions=self._max_positions,
+                )
+                if signal_id and not _owned_deferred:
                     self.store.update_signal_fields(signal_id, {
                         "decision_status": "blocked_at_breach",
                         "context_notes": msg,
                     })
-                _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
-                self._emit_breach_diag(
-                    "BREACH_RISK_CHECK_BLOCKED",
-                    watched=watched,
-                    reason="approved_plan_missing_at_breach_revalidation",
-                    positions_open=open_count,
-                    pending_entries=pending_entries,
-                    max_positions=self._max_positions,
-                    level="critical",
-                )
+                if not _owned_deferred:
+                    self._emit_breach_diag(
+                        "BREACH_RISK_CHECK_BLOCKED",
+                        watched=watched,
+                        reason="approved_plan_missing_at_breach_revalidation",
+                        positions_open=open_count,
+                        pending_entries=pending_entries,
+                        max_positions=self._max_positions,
+                        level="critical",
+                    )
                 return False
             log.critical(
                 "[%s] PAPER BREACH WARNING — _approved_plan missing; continuing without exposure revalidation",
@@ -2273,7 +2617,7 @@ class APExecutionCore:
                 if not getattr(reval, "ok", False):
                     reason = getattr(reval, "reason", "revalidation_failed")
                     log.info("[%s] Breach exposure revalidation blocked: %s", ticker, reason)
-                    if signal_id:
+                    if signal_id and not _owned_deferred:
                         self.store.update_signal_fields(signal_id, {
                             "decision_status": "blocked_at_breach",
                             "context_notes": f"exposure_revalidation={reason}",
@@ -2288,22 +2632,38 @@ class APExecutionCore:
                         getattr(reval, "remaining_total_cap", None)
                         if hasattr(reval, "remaining_total_cap") else "n/a"
                     )
-                    self._emit_breach_diag(
-                        "BREACH_RISK_CHECK_BLOCKED",
-                        watched=watched,
-                        reason="exposure_revalidation_blocked",
-                        positions_open=open_count,
-                        pending_entries=pending_entries,
-                        max_positions=self._max_positions,
-                        current_total_exposure=(
+                    _risk_diag = {
+                        "positions_open": open_count,
+                        "pending_entries": pending_entries,
+                        "max_positions": self._max_positions,
+                        "current_total_exposure": (
                             _cur_total_exp if _cur_total_exp is not None else "n/a"
                         ),
-                        remaining_total_cap=(
+                        "remaining_total_cap": (
                             _rem_total_cap if _rem_total_cap is not None else "n/a"
                         ),
-                        mc_block_reason=str(reason),
-                        level="warning",
+                        "mc_block_reason": str(reason),
+                    }
+                    _stage_owned_risk_failure(
+                        "exposure_revalidation_blocked", **_risk_diag,
                     )
+                    if not _owned_deferred:
+                        self._emit_breach_diag(
+                            "BREACH_RISK_CHECK_BLOCKED",
+                            watched=watched,
+                            reason="exposure_revalidation_blocked",
+                            positions_open=open_count,
+                            pending_entries=pending_entries,
+                            max_positions=self._max_positions,
+                            current_total_exposure=(
+                                _cur_total_exp if _cur_total_exp is not None else "n/a"
+                            ),
+                            remaining_total_cap=(
+                                _rem_total_cap if _rem_total_cap is not None else "n/a"
+                            ),
+                            mc_block_reason=str(reason),
+                            level="warning",
+                        )
                     return False
             except Exception as exc:
                 if self.mode == "LIVE":
@@ -2311,23 +2671,32 @@ class APExecutionCore:
                         "[%s] LIVE BREACH BLOCK — exposure revalidation errored: %s",
                         ticker, exc,
                     )
-                    if signal_id:
+                    if signal_id and not _owned_deferred:
                         self.store.update_signal_fields(signal_id, {
                             "decision_status": "blocked_at_breach",
                             "context_notes": f"exposure_revalidation_error={exc}",
                         })
-                    _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
-                    self._emit_breach_diag(
-                        "BREACH_RISK_CHECK_EXCEPTION",
-                        watched=watched,
-                        reason="exposure_revalidation_error_live",
+                    _stage_owned_risk_failure(
+                        "exposure_revalidation_error_live",
                         positions_open=open_count,
                         pending_entries=pending_entries,
                         max_positions=self._max_positions,
                         exception_type=type(exc).__name__,
                         exception_message=str(exc),
-                        level="critical",
                     )
+                    _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                    if not _owned_deferred:
+                        self._emit_breach_diag(
+                            "BREACH_RISK_CHECK_EXCEPTION",
+                            watched=watched,
+                            reason="exposure_revalidation_error_live",
+                            positions_open=open_count,
+                            pending_entries=pending_entries,
+                            max_positions=self._max_positions,
+                            exception_type=type(exc).__name__,
+                            exception_message=str(exc),
+                            level="critical",
+                        )
                     return False
                 log.warning("[%s] PAPER breach exposure revalidation failed open: %s", ticker, exc)
                 self._emit_breach_diag(
@@ -3912,7 +4281,7 @@ class APExecutionCore:
             "execution_mode": _callback_mode,
         })
         sig["_callback_ownership_context"] = _ownership_context
-        if _is_recovered and (
+        if _is_recovered and not bool(sig.get("_recovery_pre_claimed")) and (
             not _recovery_owner
             or _recovery_generation is None
             or _callback_mode not in {"live", "paper"}
@@ -3931,7 +4300,11 @@ class APExecutionCore:
                 "disposition": "KEEP_WATCHER",
                 "reason_code": "RECOVERY_CALLBACK_OWNERSHIP_INVALID",
             }
-        if _is_recovered and _ownership_kind == "materialization_retry":
+        if (
+            _is_recovered
+            and _ownership_kind == "materialization_retry"
+            and not bool(sig.get("_recovery_pre_claimed"))
+        ):
             if _recovery_attempt is None or _recovery_attempt < 1:
                 return {
                     "disposition": "KEEP_WATCHER",
@@ -4030,12 +4403,239 @@ class APExecutionCore:
             trigger_price_for_log,
         )
 
-        if signal_id:
+        queue_local_order_id = str(sig.get("local_order_id") or "").strip()
+        if not queue_local_order_id:
+            log.critical(
+                "[%s] PRODUCTION_ENTRY_BLOCK — local_order_id missing from watcher signal",
+                ticker,
+            )
+            funnel.inc("order_failed")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": "local_order_id_missing_at_breach",
+                })
+            return
+        _deferred_claim_context = {"owner": "", "generation": None}
+        _deferred_materialization_owned = False
+        _recovery_pre_claimed = bool(sig.get("_recovery_pre_claimed"))
+        _mat_client_id = ""
+        _mat_exec_mode = ""
+        _mat_owner = ""
+        _mat_generation = None
+        _prior_mat_attempt = 0
+        _pv_row = None
+        _hydration_bridge_applied = False
+        _deferred_outcome_authority_proven = False
+
+        def _terminalize_owned_deferred(
+            reason: str,
+            *,
+            terminal_status: str = "EXPIRED",
+            diagnostics: dict | None = None,
+        ) -> bool:
+            """Use the exact CAS for this callback's materialization claim."""
+            if self.order_state_machine is None:
+                return False
+            if _recovery_pre_claimed:
+                _terminalize = getattr(
+                    self.order_state_machine, "terminalize_materialization_retry", None,
+                )
+                _kwargs = {
+                    "reason": reason,
+                    "terminal_status": terminal_status,
+                    "owner": _mat_owner,
+                    "generation": _mat_generation,
+                    "retry_attempt": _prior_mat_attempt,
+                    "client_id": _mat_client_id,
+                    "execution_mode": _mat_exec_mode,
+                    "diagnostics": diagnostics or {},
+                }
+            else:
+                _terminalize = getattr(
+                    self.order_state_machine, "terminalize_deferred_breach", None,
+                )
+                _kwargs = {
+                    "reason_code": reason,
+                    "terminal_status": terminal_status,
+                    "owner": _mat_owner,
+                    "generation": _mat_generation,
+                    "diagnostics": diagnostics or {},
+                }
+            if not callable(_terminalize):
+                return False
+            try:
+                return bool(_terminalize(queue_local_order_id, **_kwargs))
+            except Exception as _terminal_exc:
+                log.critical(
+                    "[%s] owned deferred terminal CAS failed order=%s error=%s",
+                    ticker, queue_local_order_id, _terminal_exc,
+                )
+                return False
+
+        def _terminalize_owned_deferred_risk_failure(reason: str | None = None) -> dict:
+            """Terminalize only through the owner/generation authority."""
+            _risk_reason = str(
+                sig.get("_deferred_breach_risk_reason")
+                or reason
+                or "breach_risk_check_false"
+            ).strip() or "breach_risk_check_false"
+            _risk_diag = sig.get("_deferred_breach_risk_diag")
+            if not isinstance(_risk_diag, dict):
+                _risk_diag = {}
+            _terminal_diagnostics = {
+                "failure_stage": "breach_risk_check",
+                **_risk_diag,
+            }
+            if not _terminalize_owned_deferred(
+                _risk_reason,
+                diagnostics=_terminal_diagnostics,
+            ):
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+                    "retry_after_seconds": 5,
+                }
+            funnel.inc("master_control_blocked")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": _risk_reason,
+                })
+            self._emit_breach_diag(
+                "BREACH_RISK_CHECK_BLOCKED",
+                watched=watched,
+                reason=_risk_reason,
+                positions_open=_risk_diag.get("positions_open", "n/a"),
+                pending_entries=_risk_diag.get("pending_entries", "n/a"),
+                max_positions=_risk_diag.get(
+                    "max_positions", getattr(self, "_max_positions", "n/a")
+                ),
+                current_total_exposure=_risk_diag.get(
+                    "current_total_exposure", "n/a"
+                ),
+                remaining_total_cap=_risk_diag.get("remaining_total_cap", "n/a"),
+                mc_block_reason=str(_risk_diag.get("mc_block_reason") or ""),
+                exception_type=str(_risk_diag.get("exception_type") or ""),
+                exception_message=str(_risk_diag.get("exception_message") or ""),
+                level="info",
+            )
+            sig.pop("_deferred_breach_risk_reason", None)
+            sig.pop("_deferred_breach_risk_diag", None)
+            return {
+                "disposition": "TERMINAL_DURABLE",
+                "reason_code": _risk_reason,
+                "terminal_status": "EXPIRED",
+            }
+
+        # Recover and classify the durable plan before any breach capacity or
+        # risk work.  A callback with no provable plan is ambiguous and stays
+        # owned by the watcher; it must not enter selector or broker work.
+        _preflight_plan = sig.get("_approved_plan")
+        if _preflight_plan is None and queue_local_order_id:
+            _preflight_plan = self._recover_plan_for_revalidation(watched)
+        if _preflight_plan is None:
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "MATERIALIZATION_PLAN_RECOVERY_FAILED",
+                "retry_after_seconds": 5,
+            }
+        _preflight_contract = str(getattr(_preflight_plan, "contract_symbol", "") or "").strip()
+        _durable_contract = ""
+        if (
+            not APExecutionCore._is_real_occ_contract(_preflight_contract, ticker)
+            and not bool(sig.get("_recovery_pre_claimed"))
+            and self.order_state_machine is not None
+        ):
+            try:
+                _durable_row = self.order_state_machine.get_order(queue_local_order_id)
+            except Exception:
+                _durable_row = None
+            if isinstance(_durable_row, dict):
+                _durable_contract = str(_durable_row.get("contract") or "").strip()
+        _preflight_deferred = bool(sig.get("_recovery_pre_claimed")) or (
+            not APExecutionCore._is_real_occ_contract(_preflight_contract, ticker)
+            and not APExecutionCore._is_real_occ_contract(_durable_contract, ticker)
+            and (
+                (
+                    _is_recovered
+                    and _ownership_kind == "materialization_retry"
+                )
+                or (
+                    not _is_recovered
+                    and (
+                        APExecutionCore._plan_is_deferred(_preflight_plan, ticker)
+                        or bool(sig.get("contract_deferred"))
+                    )
+                )
+            )
+        )
+        if _preflight_deferred:
+            _plan_mode_raw = (
+                getattr(_preflight_plan, "execution_mode", None)
+                or getattr(_preflight_plan, "mode", None)
+                or sig.get("execution_mode")
+            )
+            _preflight_mode = _normalize_execution_mode(_plan_mode_raw)
+            _signal_mode = _normalize_execution_mode(sig.get("execution_mode"))
+            _plan_client = str(
+                getattr(_preflight_plan, "client_id", None) or ""
+            ).strip().lower()
+            _signal_client = str(
+                sig.get("client_id") or sig.get("client_email") or ""
+            ).strip().lower()
+            _preflight_client = _plan_client or _signal_client
+            _plan_signal = str(
+                getattr(_preflight_plan, "signal_id", None) or ""
+            ).strip()
+            _preflight_signal = _plan_signal or signal_id
+            if (
+                not _preflight_mode
+                or not _preflight_client
+                or (_signal_mode and _signal_mode != _preflight_mode)
+                or (_plan_client and _signal_client and _plan_client != _signal_client)
+                or (_plan_signal and signal_id and _plan_signal != signal_id)
+            ):
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_OWNERSHIP_UNPROVEN",
+                    "retry_after_seconds": 5,
+                }
+            _breach_client_id = _preflight_client
+            _claim_result = self._claim_deferred_materialization_for_trigger(
+                watched=watched,
+                signal=sig,
+                local_order_id=queue_local_order_id,
+                ticker=ticker,
+                client_id=_preflight_client,
+                execution_mode=_preflight_mode,
+                signal_id=_preflight_signal,
+            )
+            if str(_claim_result.get("disposition") or "").upper() != "OWNED":
+                return _claim_result
+            approved_plan = _preflight_plan
+            sig["_approved_plan"] = approved_plan
+            _mat_client_id = _preflight_client
+            _mat_exec_mode = _preflight_mode
+            _mat_owner = str(_claim_result.get("owner") or "")
+            _mat_generation = _claim_result.get("generation")
+            _prior_mat_attempt = int(_claim_result.get("attempt") or 0)
+            _pv_row = _claim_result.get("row")
+            _deferred_materialization_owned = True
+            sig["_deferred_materialization_owned"] = True
+            _deferred_claim_context.update({
+                "owner": _mat_owner,
+                "generation": _mat_generation,
+            })
+
+        if signal_id and not _deferred_materialization_owned:
             self.store.update_status(signal_id, "triggered", timestamp_flag="triggered_at")
         funnel.inc("watcher_triggered")
 
         # 1) Revalidate only. Never re-run selection/sizing logic here.
         if not self._breach_risk_check(watched):
+            if _deferred_materialization_owned:
+                return _terminalize_owned_deferred_risk_failure()
             funnel.inc("master_control_blocked")
             self._emit_breach_diag(
                 "ENTRY_TRIGGER_BLOCKED_RETURN",
@@ -4072,22 +4672,11 @@ class APExecutionCore:
                 })
             return
 
-        queue_local_order_id = str(sig.get("local_order_id") or "").strip()
-        if not queue_local_order_id:
-            log.critical("[%s] PRODUCTION_ENTRY_BLOCK — local_order_id missing from watcher signal", ticker)
-            funnel.inc("order_failed")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": "local_order_id_missing_at_breach",
-                })
-            return
-
-        _deferred_claim_context = {"owner": "", "generation": None}
-
         if not hasattr(self.order_state_machine, "submit_existing_entry"):
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — OSM missing submit_existing_entry", ticker)
             _reason = "osm_missing_submit_existing_entry"
+            if _deferred_materialization_owned:
+                return _terminalize_owned_deferred_risk_failure(_reason)
             funnel.inc("order_failed")
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
@@ -4106,7 +4695,8 @@ class APExecutionCore:
             context_notes: str | None = None,
             funnel_key: str = "order_failed",
         ) -> None:
-            if _ownership_context.get("is_recovered"):
+            nonlocal _deferred_outcome_authority_proven
+            if _ownership_context.get("is_recovered") and not _deferred_materialization_owned:
                 # Recovery terminal truth belongs to the exact callback owner.
                 # Never write generic diagnostics or signal state before its
                 # owner/generation/lease CAS succeeds.
@@ -4114,6 +4704,8 @@ class APExecutionCore:
                     watched, action=cleanup_action, reason=reason,
                 )
                 if _recovered_ok:
+                    _deferred_outcome_authority_proven = True
+                    _publish_deferred_outcome()
                     if funnel_key:
                         funnel.inc(funnel_key)
                     if signal_id:
@@ -4122,6 +4714,34 @@ class APExecutionCore:
                             "context_notes": context_notes or reason,
                         })
                 return
+            if _deferred_materialization_owned:
+                _terminal_status = (
+                    "CANCELED" if cleanup_action == "cancel" else "EXPIRED"
+                )
+                if not _terminalize_owned_deferred(
+                    str(reason or "UNKNOWN_BREACH_FAILURE"),
+                    terminal_status=_terminal_status,
+                    diagnostics=meta_patch,
+                ):
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+                        "retry_after_seconds": 5,
+                    }
+                _deferred_outcome_authority_proven = True
+                _publish_deferred_outcome()
+                if funnel_key:
+                    funnel.inc(funnel_key)
+                if signal_id:
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": decision_status,
+                        "context_notes": context_notes or reason,
+                    })
+                return {
+                    "disposition": "TERMINAL_DURABLE",
+                    "reason_code": str(reason or "UNKNOWN_BREACH_FAILURE"),
+                    "terminal_status": _terminal_status,
+                }
             if funnel_key:
                 funnel.inc(funnel_key)
             if signal_id:
@@ -4190,6 +4810,13 @@ class APExecutionCore:
             }
             if extra_meta:
                 meta_patch.update(extra_meta)
+            if _deferred_materialization_owned:
+                return _terminalize_breach_failure(
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch=meta_patch,
+                    context_notes=reason,
+                )
             if _ownership_context.get("is_recovered"):
                 return _terminalize_breach_failure(
                     reason,
@@ -4275,7 +4902,7 @@ class APExecutionCore:
             # MATERIALIZATION_ORDER_ROW_UNREADABLE detail.
             "DEFERRED_ORDER_ROW_UNREADABLE",
         })
-        _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
+        _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False, "pending": None}
 
         def _emit_deferred_progress(
             outcome: str,
@@ -4333,6 +4960,16 @@ class APExecutionCore:
                 # channel. Route it to progress logging instead of consuming the
                 # exactly-once slot.
                 _emit_deferred_progress(outcome, contract=contract, extra=extra)
+                return
+            if _deferred_materialization_owned and not _deferred_outcome_authority_proven:
+                if _deferred_outcome.get("pending") is None:
+                    _deferred_outcome["pending"] = {
+                        "outcome": outcome,
+                        "reason": reason,
+                        "contract": contract,
+                        "broker_order_id": broker_order_id,
+                        "extra": dict(extra) if isinstance(extra, dict) else extra,
+                    }
                 return
             if _deferred_outcome.get("emitted"):
                 return
@@ -4415,8 +5052,21 @@ class APExecutionCore:
                 except Exception:
                     pass
 
+        def _publish_deferred_outcome() -> None:
+            """Publish a staged terminal outcome after exact ownership wins."""
+            _pending = _deferred_outcome.pop("pending", None)
+            if not isinstance(_pending, dict):
+                return
+            _emit_deferred_outcome(
+                _pending.get("outcome", ""),
+                reason=str(_pending.get("reason") or ""),
+                contract=str(_pending.get("contract") or ""),
+                broker_order_id=str(_pending.get("broker_order_id") or ""),
+                extra=_pending.get("extra"),
+            )
+
         # 3) Recover the already-approved queue/OSM plan.
-        approved_plan = self._recover_plan_for_revalidation(watched)
+        approved_plan = _preflight_plan
         if approved_plan is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing after breach revalidation", ticker)
             # NOTE: _deferred is not yet known here, and an invalid/missing plan
@@ -4447,12 +5097,13 @@ class APExecutionCore:
             log.debug("[%s] intelligence early dispatch non-critical: %s", ticker, _eid_exc)
         # ── End early intelligence dispatch ─────────────────────────────────────
 
-        _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
-            approved_plan=approved_plan,
-            sig=sig,
-            local_order_id=queue_local_order_id,
-            ticker=ticker,
-        )
+        if not _hydration_bridge_applied:
+            _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
+                approved_plan=approved_plan,
+                sig=sig,
+                local_order_id=queue_local_order_id,
+                ticker=ticker,
+            )
         _hydrated_master_control = getattr(self, "master_control", None)
         if _hydration_bridge_applied:
             if _hydrated_master_control is None:
@@ -4536,10 +5187,13 @@ class APExecutionCore:
         _candidate_audit = None  # Item 3 — set if breach-time selection runs
         _contract_sym_raw = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
         _deferred   = (
-            bool(_sig_meta.get("contract_deferred"))
-            or bool(_sig_dict.get("contract_deferred"))
-            or not _contract_sym_raw
-            or _contract_sym_raw.upper().startswith("DEFERRED:")  # safety: never submit placeholder
+            not self._is_real_occ_contract(_contract_sym_raw, ticker)
+            and (
+                bool(_sig_meta.get("contract_deferred"))
+                or bool(_sig_dict.get("contract_deferred"))
+                or not _contract_sym_raw
+                or _contract_sym_raw.upper().startswith("DEFERRED:")  # safety: never submit placeholder
+            )
         )
         # Enable deferred-outcome emission only for deferred triggers (amendment:
         # guard deferred logs with _deferred). Non-deferred entries never emit a
@@ -4830,195 +5484,6 @@ class APExecutionCore:
                     _reason,
                     extra_meta={"failure_stage": "deferred_contract_selection"},
                 )
-                log.critical(
-                    "[%s] PRODUCTION_ENTRY_BLOCK — contract_deferred=True but no "
-                    "contract_selector wired into execution core",
-                    ticker,
-                )
-                return
-            # P0 (PR #299): structured start marker — one line per deferred breach
-            # attempt. Operators filter on this to confirm the materializer is
-            # actually running on the row before looking for SELECTED/FAILED.
-            log.info(
-                "DEFERRED_MATERIALIZATION_STARTED "
-                "order_id=%s client_id=%s execution_mode=%s symbol=%s "
-                "direction=%s contract_before=%s limit_before=%.4f",
-                str(queue_local_order_id or ""),
-                str(_breach_client_id or ""),
-                str(getattr(approved_plan, "execution_mode", "") or ""),
-                ticker,
-                str(getattr(approved_plan, "side", "") or ""),
-                str(_contract_sym_raw or ""),
-                float(getattr(approved_plan, "limit_price", 0) or 0),
-            )
-            # ── Pre-claim bypass for resume_deferred_materialization_retry ──
-            # resume_deferred_materialization_retry already claimed the row
-            # (generation N→N+1, lifecycle→MATERIALIZING) before calling
-            # _on_entry_trigger. A second claim here fails because the row is
-            # already MATERIALIZING with a live lease, blocking selector + submit.
-            #
-            # The bypass is ONLY safe when verified against the durable row:
-            # lifecycle=MATERIALIZING, materialization_in_flight=true, exact
-            # owner, generation, attempt, client_id, execution_mode must all
-            # match the pre-claim markers written into sig. Any mismatch fails
-            # closed — no selector, no broker path.
-            _recovery_pre_claimed = bool(sig.get("_recovery_pre_claimed"))
-            _mat_client_id     = str(_breach_client_id or "")
-            _mat_exec_mode     = str(getattr(approved_plan, "execution_mode", "") or "")
-            _mat_direction     = str(getattr(approved_plan, "side", "") or "")
-            _mat_trigger_price = float(getattr(watched, "trigger_price", 0) or 0)
-
-            if _recovery_pre_claimed:
-                _pre_owner   = str(sig.get("_recovery_pre_claimed_owner") or "")
-                _pre_gen     = int(sig.get("_recovery_pre_claimed_generation") or 0)
-                _pre_attempt = int(sig.get("_recovery_pre_claimed_attempt") or 0)
-                _pre_client  = str(sig.get("_recovery_pre_claimed_client_id") or "").lower()
-                _pre_mode    = str(sig.get("_recovery_pre_claimed_mode") or "").lower()
-                _pv_row = None
-                try:
-                    _pv_row = self.order_state_machine.get_order(queue_local_order_id)
-                except Exception:
-                    pass
-                _pre_verified = False
-                if isinstance(_pv_row, dict):
-                    _pvm = _pv_row.get("meta") or {}
-                    if isinstance(_pvm, str):
-                        try:
-                            _pvm = json.loads(_pvm)
-                        except Exception:
-                            _pvm = {}
-                    _pvc = str(_pv_row.get("client_id") or "").strip().lower()
-                    _pve = str(_pv_row.get("execution_mode") or "").strip().lower()
-                    _pvg = int((_pvm or {}).get("materialization_generation") or 0)
-                    _pvo = str((_pvm or {}).get("materialization_owner") or "").strip()
-                    _pvl = str((_pvm or {}).get("lifecycle_state") or "").upper()
-                    _pvif = bool((_pvm or {}).get("materialization_in_flight"))
-                    _pva = int((_pvm or {}).get("retry_attempt") or 0)
-                    _pre_verified = (
-                        _pvl == "MATERIALIZING"
-                        and _pvif
-                        and _pvg == _pre_gen
-                        and _pvo == _pre_owner
-                        and _pvc == _pre_client
-                        and _pve == _pre_mode
-                        and _pva == _pre_attempt
-                        and bool(_pre_owner)
-                        and _pre_gen > 0
-                        and _pre_attempt > 0
-                    )
-                if not _pre_verified:
-                    log.critical(
-                        "[%s] MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED order=%s "
-                        "pre_gen=%d pre_attempt=%d pre_owner=%r — "
-                        "failing closed; no selector or broker path entered",
-                        ticker, queue_local_order_id,
-                        _pre_gen, _pre_attempt, _pre_owner,
-                    )
-                    return {
-                        "disposition": "KEEP_WATCHER",
-                        "reason_code": "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED",
-                        "retry_after_seconds": 5,
-                    }
-                # Verified — bypass the normal claim and proceed to selector.
-                _mat_owner = _pre_owner
-                _mat_generation = _pre_gen
-                _mat_claimed = True
-                _deferred_claim_context.update({
-                    "owner": _mat_owner,
-                    "generation": _mat_generation,
-                })
-            else:
-                # ── Normal watcher path: claim exactly once ───────────────
-                _mat_owner = str(
-                    sig.get("watcher_token")
-                    or sig.get("materialization_owner")
-                    or f"execution-core:{getattr(self, 'client_id', '')}:{queue_local_order_id}"
-                )
-                _prior_mat_attempt = 0
-                try:
-                    _meta_for_attempt = getattr(approved_plan, "metadata", None) or {}
-                    _prior_mat_attempt = int(_meta_for_attempt.get("materialization_attempts", 0) or 0)
-                except Exception:
-                    _prior_mat_attempt = 0
-                # ── AMENDMENT §3: strictly monotonic generation ──────────
-                _persisted_generation = 0
-                try:
-                    _durable_row = self.order_state_machine.get_order(queue_local_order_id)
-                    if isinstance(_durable_row, dict):
-                        _dur_meta = _durable_row.get("meta") or {}
-                        if isinstance(_dur_meta, str):
-                            try:
-                                _dur_meta = json.loads(_dur_meta)
-                            except Exception:
-                                _dur_meta = {}
-                        _persisted_generation = int(
-                            (_dur_meta or {}).get("materialization_generation") or 0
-                        )
-                except Exception:
-                    _persisted_generation = 0
-                _mat_generation = _persisted_generation + 1
-                _deferred_claim_context.update({
-                    "owner": _mat_owner,
-                    "generation": _mat_generation,
-                })
-                _mat_claim = getattr(
-                    self.order_state_machine, "claim_deferred_materialization", None,
-                )
-                _mat_claimed = False
-                if callable(_mat_claim):
-                    try:
-                        _lease_until = (
-                            datetime.now(timezone.utc) + timedelta(seconds=120)
-                        ).isoformat()
-                        _crossed_at = getattr(watched, "trigger_crossed_at", None)
-                        _crossed_at = (
-                            _crossed_at.isoformat()
-                            if hasattr(_crossed_at, "isoformat")
-                            else str(_crossed_at or datetime.now(timezone.utc).isoformat())
-                        )
-                        _observed_underlying = float(
-                            getattr(watched, "last_quote_ask", 0)
-                            or getattr(watched, "last_quote_bid", 0)
-                            or _mat_trigger_price
-                            or 0
-                        )
-                        _mat_claimed = bool(_mat_claim(
-                            str(queue_local_order_id or ""),
-                            owner=_mat_owner,
-                            generation=_mat_generation,
-                            lease_until=_lease_until,
-                            trigger_crossed_at=_crossed_at,
-                            trigger_price=_mat_trigger_price,
-                            observed_underlying_price=_observed_underlying,
-                            signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
-                            execution_mode=_mat_exec_mode,
-                        ))
-                    except Exception as _mat_claim_exc:
-                        log.critical(
-                            "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s error=%s",
-                            ticker, queue_local_order_id, _mat_claim_exc,
-                        )
-                if not _mat_claimed:
-                    try:
-                        _claim_row = self.order_state_machine.get_order(queue_local_order_id)
-                    except Exception:
-                        _claim_row = None
-                    if isinstance(_claim_row, dict):
-                        _claim_status = str(_claim_row.get("status") or "").upper()
-                        if _claim_status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}:
-                            return {"disposition": "SUBMITTED"}
-                        if _claim_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
-                            return {"disposition": "TERMINAL_DURABLE"}
-                    log.critical(
-                        "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s — "
-                        "selector and broker submission blocked; watcher retains ownership",
-                        ticker, queue_local_order_id,
-                    )
-                    return {
-                        "disposition": "KEEP_WATCHER",
-                        "reason_code": "MATERIALIZATION_STATE_WRITE_FAILED",
-                        "retry_after_seconds": 5,
-                    }
             try:
                 # PR #401: bind this explicitly-owned deferred attempt to one
                 # durable selector cursor.  Ordinary selector calls never
@@ -7996,6 +8461,11 @@ class APExecutionCore:
                         float(_confirm_meta.get("underlying_move_pct") or 0),
                         float(_confirm_meta.get("quote_age_seconds") or 0),
                     )
+                    if _deferred_materialization_owned:
+                        return _terminalize_deferred_breach_failure(
+                            _fail_reason,
+                            extra_meta={"failure_stage": "entry_confirmation"},
+                        )
                     funnel.inc("entry_confirm_blocked")
                     if signal_id:
                         # Only write to known ap_signals columns — no unknown fields
@@ -8068,6 +8538,11 @@ class APExecutionCore:
                     "Blocking client submit to preserve gate integrity.",
                     ticker,
                 )
+                if _deferred_materialization_owned:
+                    return _terminalize_deferred_breach_failure(
+                        "entry_confirm_module_missing",
+                        extra_meta={"failure_stage": "entry_confirmation"},
+                    )
                 self._alert_degraded(
                     "ENTRY_CONFIRM_MODULE_MISSING",
                     severity="CRITICAL",
@@ -9443,6 +9918,8 @@ class APExecutionCore:
         if submit_res.get("ok"):
             local_order_id = submit_res.get("local_order_id")
             broker_order_id = submit_res.get("broker_order_id")
+            if _deferred_materialization_owned:
+                _deferred_outcome_authority_proven = True
             # P0: persist entry pricing audit into orders.meta (best-effort).
             if local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
                 try:
@@ -9561,6 +10038,16 @@ class APExecutionCore:
             submit_res.get("local_order_id") or queue_local_order_id,
             submit_res.get("error"),
         )
+        if _deferred_materialization_owned:
+            _emit_deferred_outcome(
+                "BREACH_SUBMISSION_SKIPPED",
+                reason=f"osm_submit_existing_entry_failed:{submit_res.get('error')}",
+                contract=str(approved_contract or ""),
+            )
+            return _terminalize_deferred_breach_failure(
+                f"submit_failed:{submit_res.get('error')}",
+                extra_meta={"failure_stage": "broker_submit"},
+            )
         _emit_deferred_outcome(
             "BREACH_SUBMISSION_SKIPPED",
             reason=f"osm_submit_existing_entry_failed:{submit_res.get('error')}",
