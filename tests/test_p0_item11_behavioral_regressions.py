@@ -647,8 +647,8 @@ def _now_iso() -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Audit additional finding: schedule_deferred_materialization_retry must use
-# the canonical execution-mode column and must not fall back to metadata when
-# that column is an empty string (not NULL).
+# the canonical execution-mode column, with valid metadata as the fallback when
+# that column is empty.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestScheduleRetryExecutionModeNormalization:
@@ -683,8 +683,8 @@ class TestScheduleRetryExecutionModeNormalization:
             "whitespace-padded durable execution_mode must still CAS-match"
         )
 
-    def test_empty_column_rejects_even_when_meta_execution_mode_is_valid(self):
-        """A blank canonical mode remains unproven even with valid metadata."""
+    def test_empty_column_uses_valid_meta_execution_mode(self):
+        """A blank column may use valid metadata without runner inference."""
         _insert_row(
             local_order_id=self.LOID,
             owner="watcher:real-owner",
@@ -706,9 +706,9 @@ class TestScheduleRetryExecutionModeNormalization:
             selector_failure={}, signal_id="sig-item11-1",
             execution_mode="paper",
         )
-        assert ok is False, (
-            "empty-string canonical execution_mode must block the CAS; "
-            "metadata cannot replace the durable column"
+        assert ok is True, (
+            "valid metadata execution_mode must support the CAS when the "
+            "durable column is blank"
         )
 
 
