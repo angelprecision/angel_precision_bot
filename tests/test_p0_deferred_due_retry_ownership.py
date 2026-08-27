@@ -1277,6 +1277,7 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
         claimed_row = osm.get_order(local_order_id)
         claimed_meta = claimed_row["meta"]
         assert claimed_meta["materialization_generation"] == generation + 1
+        assert claimed_meta["materialization_owner"] == claimed_owner
         assert {
             claimed_meta["retry_attempt"],
             claimed_meta["breach_attempt_count"],
@@ -1286,6 +1287,29 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
         assert claimed_meta["broker_ready"] is False
         assert claimed_row["broker_order_id"] is None
         assert claimed_row["submitted_ts"] is None
+
+        # Simulated restart: a fresh worker cannot reuse the already-claimed
+        # attempt or replace the exact materialization owner before the first
+        # owner produces a durable outcome.
+        restart_osm = APOrderStateMachine(client_id)
+        assert restart_osm.claim_deferred_materialization(
+            local_order_id,
+            owner="worker-after-restart",
+            new_generation=generation + 1,
+            lease_until=(now + timedelta(minutes=2)).isoformat(),
+            trigger_crossed_at=(now - timedelta(seconds=10)).isoformat(),
+            trigger_price=61.0,
+            observed_underlying_price=61.05,
+            signal_id=signal_id,
+            execution_mode="live",
+            retry_attempt=2,
+        ) is False
+        restart_row = osm.get_order(local_order_id)
+        assert restart_row["meta"]["materialization_owner"] == claimed_owner
+        assert restart_row["meta"]["materialization_generation"] == generation + 1
+        assert restart_row["meta"]["retry_attempt"] == 2
+        assert restart_row["broker_order_id"] is None
+        assert restart_row["submitted_ts"] is None
 
         assert osm.terminalize_materialization_retry(
             local_order_id,
@@ -2785,6 +2809,42 @@ def test_blocker4_claim_writes_canonical_retry_attempt():
     assert patch_written["materialization_attempts"] == 2
 
 
+@pytest.mark.parametrize("retry_attempt", [True, False])
+def test_blocker4_boolean_retry_attempt_rejected_before_sql(retry_attempt):
+    """Boolean retry attempts must not become integer attempt authority."""
+    from copy import deepcopy
+    from unittest.mock import MagicMock, patch
+    from ap.order_state_machine import APOrderStateMachine
+
+    durable_row = _row(retry_attempt=1)
+    before = deepcopy(durable_row)
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+    fake_conn = MagicMock()
+    fake_run_with_retry = MagicMock()
+
+    with patch("ap.order_state_machine.conn", return_value=fake_conn), patch(
+        "ap.order_state_machine.run_with_retry", fake_run_with_retry
+    ):
+        claimed = osm.claim_deferred_materialization(
+            LOCAL_ORDER_ID,
+            owner="owner-bool-retry",
+            new_generation=2,
+            lease_until="2026-12-31T00:00:00+00:00",
+            trigger_crossed_at="2026-08-25T13:40:00+00:00",
+            trigger_price=130.0,
+            observed_underlying_price=130.05,
+            signal_id=SIGNAL_ID,
+            execution_mode="paper",
+            retry_attempt=retry_attempt,
+        )
+
+    assert claimed is False
+    assert durable_row == before
+    fake_conn.assert_not_called()
+    fake_run_with_retry.assert_not_called()
+
+
 def test_blocker4_claim_fences_present_attempt_mirrors_before_advancing():
     """A pre-existing 2/1/1 row is not silently repaired by a later claim.
 
@@ -3828,20 +3888,10 @@ def test_E_real_postgres_211_counter_split_causes_claim_miss():
                 """
             )
 
-        # Insert the 2/1/1 split row: retry_attempt advanced to 1, the other
-        # two mirrors still at 1 as well — but when we claim with retry_attempt=2,
-        # the predicate checks that retry_attempt was PREVIOUSLY 1 AND that
-        # breach_attempt_count was PREVIOUSLY 1 AND materialization_attempts was
-        # PREVIOUSLY 1.  All three are consistent here (prior = 1), so this
-        # particular insert should SUCCEED on the first claim.
-        #
-        # To reproduce the ACTUAL 2/1/1 failure we insert a row where
-        # retry_attempt=2 (already advanced) but the other two mirrors are still 1.
-        # The claim predicate for retry_attempt=3 would then check prev=2 for
-        # retry_attempt but prev=2 also for the other two (which are 1) → fail.
-        # We simulate the production incident by inserting 2/1/1 and then
-        # attempting to claim with retry_attempt=3 (which requires prior=2 on
-        # ALL three mirrors).
+        # Reproduce the production 2/1/1 incident: retry_attempt is already
+        # advanced to 2 while the two legacy mirrors remain at 1.  A next
+        # claim for attempt 3 requires prior=2 in all three predicates and
+        # must therefore fail closed without normalizing the row.
         split_meta = {
             "lifecycle_state": "",
             "materialization_status": "",
@@ -4001,6 +4051,7 @@ def test_F_real_postgres_111_to_222_canonical_claim_succeeds():
             "materialization_generation": generation - 1,  # = 1
             "broker_ready": False,
             "retry_attempt": 1,
+            "retry_attempt_in_flight": 1,
             "breach_attempt_count": 1,
             "materialization_attempts": 1,
             "signal_id": signal_id,
@@ -4062,6 +4113,10 @@ def test_F_real_postgres_111_to_222_canonical_claim_succeeds():
             )
             assert int(durable_meta.get("materialization_attempts", -1)) == 2, (
                 f"materialization_attempts must be 2 after claim; got {durable_meta.get('materialization_attempts')!r}"
+            )
+            assert int(durable_meta.get("retry_attempt_in_flight", -1)) == 2, (
+                "retry_attempt_in_flight must be 2 after claim; got "
+                f"{durable_meta.get('retry_attempt_in_flight')!r}"
             )
         finally:
             osm_mod.conn = original_conn

@@ -2758,6 +2758,8 @@ class APOrderStateMachine:
         _attempt_predicate = ""
         _attempt_params: list = []
         if retry_attempt is not None:
+            if isinstance(retry_attempt, bool):
+                return False
             try:
                 _ra = int(retry_attempt)
                 if _ra < 1:
