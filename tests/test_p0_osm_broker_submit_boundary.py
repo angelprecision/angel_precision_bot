@@ -388,6 +388,60 @@ class TestCopybackSuccess:
         assert "MATERIALIZATION_COPYBACK" not in caplog.text
 
 
+def test_owned_broker_ready_terminal_cas_loses_to_submit_intent_without_overwrite():
+    osm = _make_osm()
+    seen = {}
+
+    class _Cursor:
+        rowcount = 0
+
+        def execute(self, sql, params):
+            seen["sql"] = sql
+            seen["params"] = params
+            return self
+
+    class _Conn:
+        def __enter__(self):
+            return _Cursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    osm.transition = MagicMock()
+    method_globals = APOrderStateMachine.terminalize_owned_broker_ready_materialization.__globals__
+    with patch.dict(
+        method_globals,
+        {
+            "conn": lambda: _Conn(),
+            "run_with_retry": lambda fn, *a, **k: fn(),
+        },
+    ):
+        result = osm.terminalize_owned_broker_ready_materialization(
+            _LOID,
+            reason="late_gate_rejected",
+            terminal_status="EXPIRED",
+            owner="watcher-001",
+            generation=7,
+            retry_attempt=2,
+            client_id=_CLIENT,
+            execution_mode="paper",
+            diagnostics={"failure_stage": "late_gate"},
+        )
+
+    assert result is False
+    assert "BROKER_READY" in seen["sql"]
+    assert "SELECTED" in seen["sql"]
+    assert "broker_ready" in seen["sql"]
+    assert "materialization_owner" in seen["sql"]
+    assert "materialization_generation" in seen["sql"]
+    assert "retry_attempt" in seen["sql"]
+    assert "submit_intent_at" in seen["sql"]
+    assert "broker_submit_key" in seen["sql"]
+    assert "recovery_submit_owner" in seen["sql"]
+    assert "current_owner" in seen["sql"]
+    osm.transition.assert_not_called()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Req 3 — submit_existing_entry: submitted-like state must have broker identity
 # ─────────────────────────────────────────────────────────────────────────────

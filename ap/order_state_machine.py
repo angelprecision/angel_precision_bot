@@ -4167,6 +4167,117 @@ class APOrderStateMachine:
             )
             return False
 
+    def terminalize_owned_broker_ready_materialization(
+        self,
+        local_order_id: str,
+        *,
+        reason: str,
+        terminal_status: str = "EXPIRED",
+        owner: str,
+        generation: int,
+        retry_attempt: int,
+        client_id: str,
+        execution_mode: str,
+        diagnostics: dict | None = None,
+    ) -> bool:
+        """Terminalize one exact owner-owned BROKER_READY materialization."""
+        import json as _json_local
+
+        _reason = str(reason or "").strip()
+        _status = str(terminal_status or "EXPIRED").strip().upper()
+        _owner = str(owner or "").strip()
+        _client = str(client_id or "").strip().lower()
+        _mode = str(execution_mode or "").strip().lower()
+        try:
+            _generation = int(generation)
+            _attempt = int(retry_attempt)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _reason
+            or _status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
+            or not _owner
+            or _generation < 1
+            or _attempt < 0
+            or not _client
+            or _mode not in {"live", "paper"}
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = dict(diagnostics or {})
+        _patch.update({
+            "lifecycle_state": _status,
+            "materialization_status": "FAILED_TERMINAL",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "current_owner": "",
+            "watcher_token": "",
+            "materialization_lease_until": "",
+            "broker_ready": False,
+            "reason_code": _reason,
+            "materialization_reason": _reason,
+            "final_reason": _reason,
+            "materialization_finished_at": _now,
+            "selector_completed_at": _now,
+            "materialization_broker_ready_terminal_fenced": True,
+            "materialization_broker_ready_terminal_owner": _owner,
+            "materialization_broker_ready_terminal_generation": _generation,
+            "materialization_broker_ready_terminal_attempt": _attempt,
+            "selector_recovery_cursor_v1": None,
+        })
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _terminalize():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET status = %s,
+                        last_error = %s,
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
+                      AND COALESCE(meta->>'broker_submit_key','') = ''
+                      AND COALESCE(meta->>'broker_submit_payload_hash','') = ''
+                      AND COALESCE(meta->>'recovery_submit_owner','') = ''
+                      AND COALESCE(meta->>'current_owner','') = %s
+                      AND COALESCE(meta->>'lifecycle_state','') = 'BROKER_READY'
+                      AND COALESCE(meta->>'materialization_status','') = 'SELECTED'
+                      AND COALESCE(meta->>'materialization_in_flight','') = 'false'
+                      AND COALESCE(meta->>'broker_ready','') = 'true'
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE(meta->>'materialization_generation','') = %s
+                      AND COALESCE(meta->>'retry_attempt','0') = %s
+                    """,
+                    (
+                        _status, _reason, _patch_json,
+                        local_order_id, _client, _mode,
+                        _owner, _owner, str(_generation), str(_attempt),
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_terminalize) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] terminalize_owned_broker_ready_materialization failed "
+                "order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def terminalize_deferred_breach(
         self,
         local_order_id: str,

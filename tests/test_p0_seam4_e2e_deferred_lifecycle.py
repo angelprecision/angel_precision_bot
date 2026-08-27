@@ -157,6 +157,7 @@ class _StatefulOSM:
         self.fail_next_row_read = False
         self.proof_read_failures_remaining = 1
         self.terminalizations: list[tuple[str, str]] = []
+        self.broker_ready_terminalization_calls: list[dict] = []
         self.submit_existing_entry = APOrderStateMachine.submit_existing_entry.__get__(self, type(self))
         self._is_broker_accept_status = APOrderStateMachine._is_broker_accept_status
 
@@ -237,7 +238,9 @@ class _StatefulOSM:
             "contract_deferred": False,
             "lifecycle_state": "BROKER_READY",
             "materialization_status": "SELECTED",
+            "materialization_in_flight": False,
             "materialization_owner": kwargs["owner"],
+            "current_owner": kwargs["owner"],
             "materialization_generation": int(kwargs["generation"]),
             "broker_ready": True,
             "selected_contract": kwargs["contract"],
@@ -250,6 +253,66 @@ class _StatefulOSM:
         if self.proof_read_failures_remaining > 0:
             self.fail_next_row_read = True
             self.proof_read_failures_remaining -= 1
+        return True
+
+    def terminalize_owned_broker_ready_materialization(
+        self,
+        local_order_id,
+        *,
+        reason,
+        terminal_status="EXPIRED",
+        owner,
+        generation,
+        retry_attempt,
+        client_id,
+        execution_mode,
+        diagnostics=None,
+    ):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.broker_ready_terminalization_calls.append({
+            "reason": reason,
+            "terminal_status": terminal_status,
+            "owner": owner,
+            "generation": generation,
+            "retry_attempt": retry_attempt,
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "diagnostics": diagnostics or {},
+        })
+        meta = self.row["meta"]
+        if not (
+            self.row.get("status") == "PENDING_TRIGGER"
+            and self.row.get("client_id") == client_id
+            and str(self.row.get("execution_mode") or "").lower() == str(execution_mode).lower()
+            and not self.row.get("broker_order_id")
+            and self.row.get("submitted_ts") is None
+            and meta.get("lifecycle_state") == "BROKER_READY"
+            and meta.get("materialization_status") == "SELECTED"
+            and meta.get("materialization_in_flight") is False
+            and meta.get("broker_ready") is True
+            and meta.get("materialization_owner") == owner
+            and meta.get("current_owner") == owner
+            and int(meta.get("materialization_generation") or 0) == int(generation)
+            and int(meta.get("retry_attempt") or 0) == int(retry_attempt)
+            and not meta.get("submit_intent_at")
+            and not meta.get("broker_submit_key")
+            and not meta.get("recovery_submit_owner")
+        ):
+            return False
+        self.row["status"] = terminal_status
+        self.row["last_error"] = reason
+        self.terminalizations.append((reason, terminal_status))
+        self._merge_meta({
+            "lifecycle_state": terminal_status,
+            "materialization_status": "FAILED_TERMINAL",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "current_owner": "",
+            "broker_ready": False,
+            "reason_code": reason,
+            "final_reason": reason,
+            "terminal_diagnostics": diagnostics or {},
+        })
         return True
 
     def persist_pre_submit_proof_retry(self, local_order_id, **kwargs):
@@ -2557,12 +2620,13 @@ def _pr514_ownership_execution_module():
 
 
 def _run_pr514_scoped_callback(watcher, plan, *, signal_patch=None):
+    confirmation_result = getattr(plan, "_test_confirmation_result", None)
     with patch.dict(
         sys.modules,
         {"ap.execution": _pr514_ownership_execution_module()},
     ), patch(
         "ap_entry_confirmation.check_entry_confirmation",
-        return_value=_FakeConfirmResult(),
+        return_value=confirmation_result or _FakeConfirmResult(),
     ), patch("ap.db.conn", lambda: _NoopConn()), patch(
         "ap.db.run_with_retry",
         lambda fn, *a, **k: fn(),
@@ -3083,6 +3147,112 @@ def test_pr514_stale_deferred_flag_on_real_contract_does_not_reclaim_or_select(m
 
     assert osm.claim_calls == 0
     assert selector.calls == 0
+
+
+def test_pr524_memory_real_durable_deferred_does_not_bypass_ownership(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    plan.contract_symbol = REAL_OCC
+    plan.limit_price = 2.10
+    plan.max_position_usd = 210.0
+    plan.metadata.update({"contract_deferred": True})
+    core._breach_risk_check = lambda _watched: pytest.fail(
+        "durable DEFERRED truth reached risk work"
+    )
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_OWNERSHIP_UNPROVEN"
+    assert osm.claim_calls == 0
+    assert selector.calls == 0
+    assert trace == []
+    assert stores["status"] == []
+    assert stores["signal"] == []
+
+
+def test_pr524_memory_real_durable_same_real_continues_hydrated(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    plan.contract_symbol = REAL_OCC
+    plan.limit_price = 2.10
+    plan.max_position_usd = 210.0
+    plan.metadata.update({
+        "contract_deferred": True,
+        "trigger_crossed_at": _iso(_now() - timedelta(seconds=10)),
+    })
+    osm.row.update({
+        "contract": REAL_OCC,
+        "limit_price": 1.29,
+        "reserved_cost": 129.0,
+    })
+    osm.row["meta"].update({
+        "contract_deferred": False,
+        "materialization_status": "SELECTED",
+        "materialization_generation": 7,
+        "broker_ready": True,
+        "lifecycle_state": "BROKER_READY",
+        "current_owner": "watcher:hydrated",
+        "materialization_owner": "watcher:hydrated",
+    })
+    core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+    assert osm.claim_calls == 0
+    assert selector.calls == 0
+    assert trace.index("risk") >= 0
+    assert trace.index("broker_post") >= 0
+    assert len(osm.post_payloads) == 1
+
+
+def test_pr524_recovery_materialization_broker_ready_gate_uses_exact_terminal_cas(
+    monkeypatch,
+):
+    osm, selector, master_control, core, watcher, plan, trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    owner = "recovery_retry:broker-ready"
+    _set_active_materialization(osm, owner=owner, generation=7, attempt=1)
+    master_control.final_ok_sequence = [True, True]
+    master_control.final_reason_sequence = [
+        "EXPOSURE_ALLOWED",
+        "EXPOSURE_ALLOWED",
+    ]
+    plan._test_confirmation_result = types.SimpleNamespace(
+        passed=False,
+        fail_reason="ENTRY_CONFIRMATION_REJECTED",
+        metadata={"live_entry_ts": _iso()},
+        to_meta=lambda **kwargs: {"passed": False, **kwargs},
+    )
+    marker = {
+        "_recovery_pre_claimed": True,
+        "_recovery_pre_claimed_owner": owner,
+        "_recovery_pre_claimed_generation": 7,
+        "_recovery_pre_claimed_attempt": 1,
+        "_recovery_pre_claimed_client_id": CLIENT_ID,
+        "_recovery_pre_claimed_mode": "live",
+    }
+
+    _watched, result = _run_pr514_scoped_callback(
+        watcher, plan, signal_patch=marker
+    )
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["reason_code"] == "ENTRY_CONFIRMATION_REJECTED"
+    assert selector.calls == 1
+    assert osm.post_payloads == []
+    assert len(osm.broker_ready_terminalization_calls) == 1
+    assert osm.broker_ready_terminalization_calls[0]["owner"] == owner
+    assert osm.broker_ready_terminalization_calls[0]["generation"] == 7
+    assert osm.broker_ready_terminalization_calls[0]["retry_attempt"] == 1
+    assert osm.terminalizations == [
+        (result["reason_code"], "EXPIRED"),
+    ]
+    assert osm.row["status"] == "EXPIRED"
 
 
 def test_pr514_recovery_preclaim_on_hydrated_contract_is_still_proven(monkeypatch):

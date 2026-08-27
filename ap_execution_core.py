@@ -4441,6 +4441,7 @@ class APExecutionCore:
         _prior_mat_attempt = 0
         _pv_row = None
         _hydration_bridge_applied = False
+        _materialization_copyback_succeeded = False
         _deferred_outcome_authority_proven = False
 
         def _terminalize_owned_deferred(
@@ -4452,7 +4453,28 @@ class APExecutionCore:
             """Use the exact CAS for this callback's materialization claim."""
             if self.order_state_machine is None:
                 return False
-            if _recovery_pre_claimed:
+            if _materialization_copyback_succeeded:
+                # Once the owned selector result has been copied into the
+                # durable BROKER_READY row, only the exact BROKER_READY CAS may
+                # terminalize it.  In particular, do not fall back to the
+                # broad deferred-breach terminalizer if submit intent won a
+                # concurrent race.
+                _terminalize = getattr(
+                    self.order_state_machine,
+                    "terminalize_owned_broker_ready_materialization",
+                    None,
+                )
+                _kwargs = {
+                    "reason": reason,
+                    "terminal_status": terminal_status,
+                    "owner": _mat_owner,
+                    "generation": _mat_generation,
+                    "retry_attempt": _prior_mat_attempt,
+                    "client_id": _mat_client_id,
+                    "execution_mode": _mat_exec_mode,
+                    "diagnostics": diagnostics or {},
+                }
+            elif _recovery_pre_claimed:
                 _terminalize = getattr(
                     self.order_state_machine, "terminalize_materialization_retry", None,
                 )
@@ -4556,21 +4578,116 @@ class APExecutionCore:
                 "retry_after_seconds": 5,
             }
         _preflight_contract = str(getattr(_preflight_plan, "contract_symbol", "") or "").strip()
+        _preflight_meta = getattr(_preflight_plan, "metadata", None) or {}
+        if not isinstance(_preflight_meta, dict):
+            _preflight_meta = {}
+        _preflight_contract_upper = _preflight_contract.upper()
+        _deferred_history = bool(
+            sig.get("_recovery_pre_claimed")
+            or _is_recovered
+            or _ownership_kind == "materialization_retry"
+            or sig.get("contract_deferred")
+            or _initial_meta.get("contract_deferred")
+            or _preflight_meta.get("contract_deferred")
+            or _preflight_contract_upper.startswith("DEFERRED:")
+            or str(
+                _initial_meta.get("selection_context")
+                or _preflight_meta.get("selection_context")
+                or ""
+            ).strip().lower().startswith("deferred_breach")
+            or bool(
+                _initial_meta.get("deferred_breach_selection")
+                or _preflight_meta.get("deferred_breach_selection")
+            )
+            or str(
+                sig.get("materialization_entry_path")
+                or _initial_meta.get("materialization_entry_path")
+                or _preflight_meta.get("materialization_entry_path")
+                or ""
+            ).strip().upper() == "DEFERRED_BREACH_MATERIALIZATION"
+            or str(
+                sig.get("contract_materialized_source")
+                or _initial_meta.get("contract_materialized_source")
+                or _preflight_meta.get("contract_materialized_source")
+                or ""
+            ).strip().lower() == "prebreach_hydration"
+            or bool(
+                sig.get("materialization_generation")
+                or _initial_meta.get("materialization_generation")
+                or _preflight_meta.get("materialization_generation")
+            )
+            or sig.get("recovery_submit_fenced")
+            or sig.get("recovery_submit_owner")
+            or sig.get("recovery_submit_generation")
+            or _initial_meta.get("recovery_submit_fenced")
+            or _initial_meta.get("recovery_submit_owner")
+            or _initial_meta.get("recovery_submit_generation")
+            or _preflight_meta.get("recovery_submit_fenced")
+            or _preflight_meta.get("recovery_submit_owner")
+            or _preflight_meta.get("recovery_submit_generation")
+        )
         _durable_contract = ""
-        if (
-            not APExecutionCore._is_real_occ_contract(_preflight_contract, ticker)
-            and not bool(sig.get("_recovery_pre_claimed"))
-            and self.order_state_machine is not None
-        ):
+        _durable_row_read = False
+        _durable_row = None
+        _preflight_is_real = APExecutionCore._is_real_occ_contract(
+            _preflight_contract, ticker
+        )
+        if _deferred_history and self.order_state_machine is not None:
             try:
                 _durable_row = self.order_state_machine.get_order(queue_local_order_id)
             except Exception:
                 _durable_row = None
             if isinstance(_durable_row, dict):
+                _durable_row_read = True
                 _durable_contract = str(_durable_row.get("contract") or "").strip()
+        if _deferred_history and not _durable_row_read and (
+            not _recovery_pre_claimed or _preflight_is_real
+        ):
+            log.critical(
+                "[%s] MATERIALIZATION_DURABLE_STATE_UNPROVEN order=%s "
+                "memory_contract=%r durable_row_read=%s",
+                ticker,
+                queue_local_order_id,
+                _preflight_contract,
+                _durable_row_read,
+            )
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "MATERIALIZATION_OWNERSHIP_UNPROVEN",
+                "retry_after_seconds": 5,
+            }
+        _durable_is_real = APExecutionCore._is_real_occ_contract(
+            _durable_contract, ticker
+        )
+        if (
+            _deferred_history
+            and _preflight_is_real
+            and (
+                not _durable_is_real
+                or _durable_contract.upper() != _preflight_contract_upper
+            )
+        ):
+            # A real OCC held only in memory cannot bypass the deferred
+            # ownership boundary.  Durable DEFERRED, missing, unreadable, or
+            # disagreeing contract truth stays parked before risk/capacity,
+            # selector, or broker work.
+            log.critical(
+                "[%s] MATERIALIZATION_DURABLE_STATE_UNPROVEN order=%s "
+                "memory_contract=%r durable_contract=%r",
+                ticker,
+                queue_local_order_id,
+                _preflight_contract,
+                _durable_contract,
+            )
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "MATERIALIZATION_OWNERSHIP_UNPROVEN",
+                "retry_after_seconds": 5,
+            }
         _preflight_deferred = bool(sig.get("_recovery_pre_claimed")) or (
             not APExecutionCore._is_real_occ_contract(_preflight_contract, ticker)
             and not APExecutionCore._is_real_occ_contract(_durable_contract, ticker)
+            and _deferred_history
             and (
                 (
                     _is_recovered
@@ -8269,6 +8386,7 @@ class APExecutionCore:
                         _copyback_write_ok = False
 
                     if _copyback_write_ok:
+                        _materialization_copyback_succeeded = True
                         log.info(
                             "DEFERRED_MATERIALIZATION_COPYBACK_PERSISTED "
                             "local_order_id=%s contract=%s limit=%.4f qty=%d",
