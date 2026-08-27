@@ -127,6 +127,92 @@ def test_stop_fills_during_cancel_allows_only_proven_residual():
     assert broker.cancel_calls == ["143387714"]
 
 
+def test_whole_stop_fill_with_stale_position_reread_posts_zero():
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[_stop()], []],
+        terminal={"id": "143387714", "status": "filled", "exec_quantity": 1},
+    )
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_BROKER_FLAT"
+    assert broker.cancel_calls == ["143387714"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("exec_quantity", "nan"),
+        ("exec_quantity", True),
+        ("exec_quantity", "0.5"),
+        ("remaining_quantity", 0),
+        ("remaining_quantity", "malformed"),
+    ],
+)
+def test_explicit_malformed_or_contradictory_quantity_holds_before_cancel(field, value):
+    order = _stop()
+    order[field] = value
+    broker = _Broker(positions=[[_position(1)]], orders=[order])
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["reason"] == "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS"
+    assert result["audit"]["reason"] == "quantity_unproven"
+    assert broker.cancel_calls == []
+
+
+def test_conflicting_status_aliases_hold_before_cancel():
+    order = _stop(status="filled", executed=1)
+    order["state"] = "open"
+    broker = _Broker(positions=[[_position(1)]], orders=[order])
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["reason"] == "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS"
+    assert result["audit"]["reason"] == "conflicting_status"
+    assert broker.cancel_calls == []
+
+
+def test_malformed_terminal_quantity_holds_after_cancel():
+    broker = _Broker(
+        positions=[[_position(1)]],
+        orders=[_stop()],
+        terminal={"id": "143387714", "status": "filled", "exec_quantity": "nan"},
+    )
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["reason"] == "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN"
+    assert result["audit"]["reason"] == "quantity_unproven"
+    assert broker.cancel_calls == ["143387714"]
+
+
+def test_symbol_alias_exact_occ_is_taken_over():
+    order = _stop()
+    order.pop("option_symbol")
+    order["symbol"] = CONTRACT
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[order], []],
+        terminal={"id": "143387714", "status": "canceled"},
+    )
+    result = _run(broker)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
+    assert broker.cancel_calls == ["143387714"]
+
+
+def test_missing_broker_account_identity_holds_without_order_inventory():
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[_stop()], []],
+    )
+    broker.account_id = ""
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["reason"] == "EXIT_PROTECTIVE_IDENTITY_UNPROVEN"
+    assert broker.list_orders_calls == 0
+    assert broker.cancel_calls == []
+
+
 def test_cancel_ack_but_order_still_open_holds():
     broker = _Broker(positions=[[_position(1)]], orders=[_stop()], terminal=_stop())
     result = _run(broker)
@@ -184,6 +270,17 @@ def test_same_ticker_different_occ_and_wrong_account_are_never_touched():
     )
     result = _run(broker)
     assert result["allowed"] is True
+    assert broker.cancel_calls == []
+
+
+def test_historical_terminal_sells_without_fill_do_not_block_replacement():
+    broker = _Broker(
+        positions=[[_position(1)]],
+        orders=[_stop(status="canceled"), _stop("expired", status="expired")],
+    )
+    result = _run(broker)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
     assert broker.cancel_calls == []
 
 
@@ -292,6 +389,50 @@ def test_production_tradier_malformed_order_member_holds_takeover_before_cancel_
             ]
         }
     }
+
+    def _get(path, *args, **kwargs):
+        if path.endswith("/positions"):
+            return position_payload
+        if path.endswith("/orders"):
+            return orders_payload
+        raise AssertionError(f"unexpected endpoint: {path}")
+
+    broker._get = _get
+    cancel_calls = []
+    broker.cancel_order = lambda order_id: cancel_calls.append(order_id)
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE"
+    assert "TRADIER_ORDERS_PAYLOAD_MALFORMED" in result["audit"]["error"]
+    assert cancel_calls == []
+
+
+def test_production_tradier_empty_order_list_is_authoritative_empty():
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: {"orders": {"order": []}}
+    assert broker.list_orders() == []
+
+
+@pytest.mark.parametrize(
+    "orders_payload",
+    [{}, {"orders": {}}, {"orders": None}, {"orders": {"unexpected": []}}],
+)
+def test_production_tradier_malformed_top_level_orders_hold_before_cancel(orders_payload):
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    position_payload = {"positions": {"position": {"symbol": CONTRACT, "quantity": "1"}}}
 
     def _get(path, *args, **kwargs):
         if path.endswith("/positions"):

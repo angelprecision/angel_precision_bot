@@ -422,10 +422,17 @@ class TradierBroker(BrokerAdapter):
         authoritative and must not be silently reduced to a partial list.
         """
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
-        node = j.get("orders") if isinstance(j, dict) else None
-        orders = node.get("order") if isinstance(node, dict) else node
+        if not isinstance(j, dict) or "orders" not in j:
+            raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        node = j["orders"]
+        if isinstance(node, dict):
+            if "order" not in node:
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+            orders = node["order"]
+        else:
+            orders = node
         if orders is None:
-            return []
+            raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
         if isinstance(orders, dict):
             return [orders]
         if isinstance(orders, list):
