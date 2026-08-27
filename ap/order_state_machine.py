@@ -172,7 +172,11 @@ def _normalize_client_key(client_id: str) -> str:
 
 
 def _durable_execution_mode(row: dict, meta: dict | None = None) -> str | None:
-    """Resolve the canonical mode stored on an order without runner inference."""
+    """Resolve the canonical mode stored on an order without runner inference.
+
+    ``orders.execution_mode`` is the durable authority.  Metadata can
+    corroborate it, but can never replace a blank or invalid column value.
+    """
     if not isinstance(row, dict):
         return None
     if meta is None:
@@ -195,25 +199,25 @@ def _durable_execution_mode(row: dict, meta: dict | None = None) -> str | None:
     meta_mode = (
         meta_text.lower() if meta_text.lower() in {"live", "paper"} else None
     )
-    if (column_text and column_mode is None) or (meta_text and meta_mode is None):
+    if not column_mode:
+        return None
+    if meta_text and meta_mode is None:
         return None
     if column_mode and meta_mode and column_mode != meta_mode:
         return None
-    return column_mode or meta_mode
+    return column_mode
 
 
 # Used only by deferred/materialization identity CASes below.  The predicate
-# keeps the SQL authority aligned with _durable_execution_mode(): blank columns
-# may use valid metadata, while invalid or contradictory durable values fail closed.
+# keeps the SQL authority aligned with _durable_execution_mode(): the canonical
+# column must be valid and match the expected mode; metadata may corroborate it
+# but can never fill a blank column or override the column authority.
 _DURABLE_EXECUTION_MODE_SQL = (
-    "LOWER(TRIM(COALESCE(NULLIF(TRIM(execution_mode), ''), "
-    "NULLIF(TRIM(meta->>'execution_mode'), ''), ''))) = %s "
-    "AND (NULLIF(TRIM(execution_mode), '') IS NULL "
-    "OR LOWER(TRIM(execution_mode)) IN ('live', 'paper')) "
+    "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+    "AND LOWER(TRIM(COALESCE(execution_mode, ''))) IN ('live', 'paper') "
     "AND (NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL "
     "OR LOWER(TRIM(meta->>'execution_mode')) IN ('live', 'paper')) "
-    "AND (NULLIF(TRIM(execution_mode), '') IS NULL "
-    "OR NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL "
+    "AND (NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL "
     "OR LOWER(TRIM(execution_mode)) = LOWER(TRIM(meta->>'execution_mode')))"
 )
 
@@ -727,8 +731,8 @@ class APOrderStateMachine:
             "direction":          _direction,
             "side":               _direction,   # alias — retry_engine reads both
             "symbol":             str(getattr(plan, "ticker", "") or ""),
-            # execution_mode mirrored into meta as a JSON fallback alongside the
-            # top-level orders.execution_mode column.
+            # execution_mode is mirrored into meta for corroboration alongside
+            # the top-level orders.execution_mode authority.
             "execution_mode":     _exec_mode,
 
         }
@@ -2587,7 +2591,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND COALESCE(signal_id,'') = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = %s
@@ -2665,7 +2669,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER')
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -2911,7 +2915,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3147,7 +3151,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3252,7 +3256,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3467,7 +3471,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3837,7 +3841,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(NULLIF(execution_mode, ''), meta->>'execution_mode',''))) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3920,7 +3924,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -4446,7 +4450,7 @@ class APOrderStateMachine:
                         updated_ts             = NOW()
                     WHERE local_order_id       = %s
                       AND client_id            = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind                 = 'ENTRY'
                       AND UPPER(COALESCE(status, '')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
