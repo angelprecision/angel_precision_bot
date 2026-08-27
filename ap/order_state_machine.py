@@ -1043,7 +1043,7 @@ class APOrderStateMachine:
         if _not_explicit_false(meta.get("materialization_in_flight")):
             return True
         if str(meta.get("lifecycle_state") or "").strip().upper() in {
-            "MATERIALIZING", "BROKER_READY", "SUBMITTING", "SUBMITTED",
+            "BROKER_READY", "SUBMITTING", "SUBMITTED",
         }:
             return True
         if str(meta.get("materialization_status") or "").strip().upper() in {
@@ -1228,7 +1228,7 @@ class APOrderStateMachine:
                 " AND submitted_ts IS NULL"
                 " AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NULL"
                 " AND UPPER(BTRIM(COALESCE(meta->>'lifecycle_state','')))"
-                "     NOT IN ('MATERIALIZING','BROKER_READY','SUBMITTING','SUBMITTED')"
+                "     NOT IN ('BROKER_READY','SUBMITTING','SUBMITTED')"
                 " AND UPPER(BTRIM(COALESCE(meta->>'materialization_status','')))"
                 "     NOT IN ('RUNNING','QUEUED')"
                 " AND LOWER(BTRIM(COALESCE(meta->>'broker_ready','')))"
