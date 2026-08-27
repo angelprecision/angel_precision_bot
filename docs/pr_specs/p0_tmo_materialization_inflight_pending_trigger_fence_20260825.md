@@ -1,5 +1,73 @@
 # P0 — TMO materialization-in-flight fence for PENDING_TRIGGER recovery
 
+## AMENDMENT — BINDING (2026-08-27, supersedes broadening in this spec)
+
+This spec is retained for historical context, but the following amendment is
+the binding contract for PR #521. Where the spec below appears to authorize
+broader lifecycle protection, this amendment narrows it.
+
+**Rebased on post-#524 main:**
+`ba1e86a01ed9c81423cc6b5baaa766e43310bec7`
+
+**Binding scope after amendment:**
+
+- Core canonical work in `ap/pending_trigger_classifier.py` and
+  `ap/pending_trigger_restart_recovery.py` remains as authored:
+  `MATERIALIZATION_IN_FLIGHT` classification and `MATERIALIZATION_OWNED`
+  recovery outcome, gated on FULL canonical proof
+  (`is_active_materialization_in_flight`).
+- Every retained consumer edit MUST route through the single shared
+  canonical predicate `is_active_materialization_in_flight`. No partial
+  markers (`RUNNING` alone, `QUEUED` alone, `MATERIALIZING` alone,
+  `materialization_in_flight=true` alone, `broker_ready` alone,
+  `broker_submit_*` alone) may confer active-materializer protection.
+- Partial or malformed materialization metadata MUST remain cleanable by
+  pre-existing cleanup/recovery authority. A crashed row leaving one stale
+  `RUNNING`/`QUEUED` marker MUST NOT become immortal.
+
+**Retained consumer edits (each closes a proven bypass with the canonical
+predicate):**
+
+1. `ap/order_monitor.py`:
+   - `MATERIALIZATION_OWNED` outcome routing in the recovery-outcome dispatch
+     (required by the new `_RowOutcome` enum member).
+   - `_maybe_hydrate_deferred_order`: pre-hydration `is_active_materialization_in_flight`
+     check. Bypass: the poll-loop hydration consumer does NOT route through
+     `PendingTriggerRestartRecovery` and can reselect an active #524 owner.
+2. `ap_recovery.py`:
+   - `_recover_deferred_breach_lifecycles`: pre-terminalization
+     `is_active_materialization_in_flight` check. Bypass: this loop has
+     independent 72h aging and terminal-lifecycle terminalization branches
+     that do not consult PTR.
+   - `MATERIALIZATION_OWNED` outcome routing in the two consumers of
+     `PendingTriggerRestartRecovery.execute()` outcomes (required by the
+     new enum member).
+
+**REMOVED by amendment (partial-marker broadening):**
+
+- All `ap/order_state_machine.py` edits from earlier commits on this branch
+  (`_pending_entry_has_submit_or_recovery_owner` expansion, cleanup
+  WHERE-clause additions in `cancel_pending_entry`/`expire_pending_entry`
+  paths, retry CAS broker-marker additions, and the `_meta_blocks_hydration`
+  helper with its four callsites in `record_deferred_hydration_result`).
+- `ap/order_monitor.py` ghost-sweep SQL broadening at the EOD sweep.
+- `ap_recovery.py` `broker_handoff_ambiguous_rows` bucket and the
+  `_submit_intent_without_broker` gating on the pre-existing stale-pending
+  and terminal-lifecycle branches. The base reconciler branch predicate
+  (`meta.get("submit_intent_at") and not str(order.get("broker_order_id") or "").strip()`)
+  is restored to its base form.
+
+**Forbidden by amendment (never in this PR):**
+
+- No new broker POST/cancel authority anywhere.
+- No new permanent HOLD state for malformed materialization rows.
+- No strategy, selection, spread, DTE, delta, OI, volume, premium, capital,
+  sizing, entry, or exit policy changes.
+
+The rest of this document is historical spec text preserved verbatim.
+
+---
+
 ## Status
 
 **SPEC FIRST / HARD HOLD / IMPLEMENTATION REQUIRED. DO NOT MERGE OR DEPLOY THIS PR UNTIL CODE + PRODUCTION-SHAPED REGRESSION TESTS ARE PUSHED AND RE-AUDITED.**

@@ -114,47 +114,6 @@ def _make_osm():
     return APOrderStateMachine("client@example.com")
 
 
-def test_osm_hydration_refuses_active_materialization_owner(monkeypatch, caplog):
-    """The durable copyback CAS must not overwrite a live materializer."""
-    osm = _make_osm()
-    cur = _HydrationCursor(
-        row={
-            "status": "PENDING_TRIGGER",
-            "contract": "DEFERRED:AAPL",
-            "broker_order_id": None,
-            "submitted_ts": None,
-            "meta": {
-                "lifecycle_state": "MATERIALIZING",
-                "materialization_status": "RUNNING",
-                "materialization_in_flight": True,
-                "materialization_owner": "materializer:worker-a",
-                "materialization_generation": 1,
-                "broker_ready": False,
-                "submit_intent_at": "",
-                "broker_submit_key": "",
-            },
-        },
-        update_rowcount=1,
-    )
-    _install_fake_osm_db(monkeypatch, cur)
-
-    with caplog.at_level("INFO", logger="ap.order_state_machine"):
-        ok = osm.record_deferred_hydration_result(
-            "local-123",
-            success=True,
-            status="PENDING_TRIGGER",
-            contract="AAPL260717C00200000",
-            limit_price=1.23,
-            qty=2,
-            reserved_cost=246.0,
-        )
-
-    assert ok is False
-    assert len(cur.executed) == 1
-    assert "DEFERRED_HYDRATION_STALE_SKIP" in caplog.text
-    assert "UPDATE orders" not in cur.executed[0][0]
-
-
 def test_hydrates_real_contract_without_broker_submit(monkeypatch):
     selector = MagicMock()
 

@@ -40,10 +40,7 @@ from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
 )
-from ap.pending_trigger_classifier import (
-    has_broker_handoff_evidence,
-    is_active_materialization_in_flight,
-)
+from ap.pending_trigger_classifier import is_active_materialization_in_flight
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
 
 log = logging.getLogger("ap.recovery")
@@ -2153,50 +2150,13 @@ class APStartupRecovery:
                 )
                 continue
 
-            _submit_intent_without_broker = bool(
-                str(meta.get("submit_intent_at") or "").strip()
-            ) and not str(order.get("broker_order_id") or "").strip()
-            # A broker-ready/key/hash marker without submit_intent_at is still
-            # ambiguous ownership evidence.  Do not let stale cleanup or the
-            # canonical PTR consumer reinterpret it as a zombie.  Rows with a
-            # durable submit_intent_at continue to the existing reconciler
-            # below, which is the only path allowed to resolve that crash
-            # window.
-            _handoff_consumer_exempt = lifecycle in {
-                # These states have their own canonical downstream consumer:
-                # BROKER_READY is handled by the gated recovery scaffold and
-                # PRE_SUBMIT_PROOF_RETRY is handled by proof-retry recovery.
-                # They are not trigger-zombie cleanup candidates.
-                "BROKER_READY",
-                "PRE_SUBMIT_PROOF_RETRY",
-            }
-            if (
-                has_broker_handoff_evidence(_evidence_row)
-                and not _submit_intent_without_broker
-                and not _handoff_consumer_exempt
-            ):
-                result["broker_handoff_ambiguous_rows"] = int(
-                    result.get("broker_handoff_ambiguous_rows", 0) or 0
-                ) + 1
-                log.critical(
-                    "PENDING_TRIGGER_BROKER_HANDOFF_AMBIGUOUS "
-                    "local_order_id=%s client_id=%s execution_mode=%s signal_id=%s "
-                    "broker_submission=UNKNOWN broker_cancel=NOT_ATTEMPTED "
-                    "caller=ap_recovery._recover_deferred_breach_lifecycles",
-                    local_order_id,
-                    order.get("client_id") or self.client_id,
-                    order.get("execution_mode") or recovery_mode,
-                    order.get("signal_id") or "",
-                )
-                result.setdefault("errors", []).append(
-                    f"recovery_broker_handoff_ambiguous:{local_order_id}"
-                )
-                continue
-
-            # This startup cleanup path has its own stale/terminal branches;
-            # do not rely on PTR alone to protect a live materializer.  The
-            # shared predicate must win before age-based terminalization or
-            # any other lifecycle mutation is considered.
+            # Startup deferred-breach cleanup has its own age-based (72h) and
+            # terminal-lifecycle terminalization branches immediately below
+            # that PTR does not gate on this path.  Route active #524 owners
+            # through the shared canonical predicate before those branches
+            # can mutate a live materializer.  This guard is the ONE seam
+            # retained here for that exact bypass — no partial-marker
+            # protection is added anywhere else in this consumer.
             if is_active_materialization_in_flight(_evidence_row):
                 result["materialization_in_flight_rows"] = int(
                     result.get("materialization_in_flight_rows", 0) or 0
@@ -2229,7 +2189,7 @@ class APStartupRecovery:
                 stale_pending = (now - created_at).total_seconds() > 72 * 3600
             except Exception:
                 stale_pending = False
-            if stale_pending and not _submit_intent_without_broker:
+            if stale_pending:
                 _terminalize_verified(
                     local_order_id,
                     reason_code="RECOVERY_STALE_PENDING_TRIGGER",
@@ -2238,10 +2198,7 @@ class APStartupRecovery:
                 )
                 continue
 
-            if (
-                lifecycle in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
-                and not _submit_intent_without_broker
-            ):
+            if lifecycle in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
                 _terminalize_verified(
                     local_order_id,
                     reason_code=str(meta.get("reason_code") or meta.get("final_reason") or "RECOVERY_TERMINAL_STATE"),
@@ -2264,7 +2221,7 @@ class APStartupRecovery:
             # and never terminalizes until the broker-query adoption gate is
             # wired. On RECONCILE_PENDING we retain durable ownership so the
             # row is never lost while it waits for reconciliation.
-            if _submit_intent_without_broker:
+            if meta.get("submit_intent_at") and not str(order.get("broker_order_id") or "").strip():
                 reconcile_fn = None
                 if self.execution_core is not None:
                     reconcile_fn = getattr(

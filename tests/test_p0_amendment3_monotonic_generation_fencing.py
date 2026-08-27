@@ -317,12 +317,6 @@ def test_stale_owner_terminalize_blocked_by_generation_cas(db_spy):
     ) is False
     sql, params = sink[-1]
     assert "COALESCE((meta->>'materialization_generation')::int, 0) = %s" in sql
-    assert "broker_ready" in sql
-    assert "materialization_in_flight" in sql
-    assert "lifecycle_state" in sql
-    assert "materialization_status" in sql
-    assert "submit_intent_at" in sql
-    assert "broker_submit_key" in sql
     assert params[-1] == 1
     assert params[-2] == "materializer:worker-A"
 

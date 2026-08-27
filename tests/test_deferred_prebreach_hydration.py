@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -109,6 +111,84 @@ def test_active_materializer_blocks_prebreach_selector_and_copyback(monkeypatch)
     assert result == {"attempted": False, "reason": "materialization_in_flight"}
     selector.select.assert_not_called()
     monitor.osm.record_deferred_hydration_result.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "partial_meta,label",
+    [
+        ({"materialization_status": "RUNNING"}, "running_only"),
+        ({"materialization_status": "QUEUED"}, "queued_only"),
+        ({"lifecycle_state": "MATERIALIZING"}, "materializing_only"),
+        ({"materialization_in_flight": True}, "in_flight_only"),
+        ({"materialization_in_flight": "true"}, "in_flight_string_true"),
+        ({"broker_ready": True}, "broker_ready_only"),
+        (
+            # Owner + generation but no lease at all
+            {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "materializer:worker-a",
+                "materialization_generation": 1,
+            },
+            "no_lease",
+        ),
+        (
+            # Owner + generation but expired lease
+            {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "materializer:worker-a",
+                "materialization_generation": 1,
+                "materialization_lease_until": (
+                    datetime.now(timezone.utc) - timedelta(minutes=5)
+                ).isoformat(),
+            },
+            "expired_lease",
+        ),
+        (
+            # Full-looking proof but generation=0 (invalid)
+            {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "materializer:worker-a",
+                "materialization_generation": 0,
+                "materialization_lease_until": (
+                    datetime.now(timezone.utc) + timedelta(minutes=5)
+                ).isoformat(),
+            },
+            "generation_zero",
+        ),
+    ],
+)
+def test_partial_materialization_markers_do_not_block_hydration(monkeypatch, partial_meta, label):
+    """
+    Amendment negative-control gate: the retained monitor hydration guard must NOT
+    protect rows on partial lifecycle markers. Only the canonical full-proof shape
+    (owner + generation positive int + future timezone-aware lease + RUNNING +
+    MATERIALIZING + in_flight is bool True + no broker handoff) may skip.
+
+    Any of these partial-marker shapes must reach the normal hydration path
+    (reason != 'materialization_in_flight'). Otherwise a crashed row leaves a
+    permanent HOLD and tradeflow quietly dies.
+    """
+    selector = MagicMock()
+    monitor = _make_monitor(contract_selector=selector)
+    _enable_window(monkeypatch)
+    meta = {"watcher_audit": {"reason_code": "trigger_ready"}}
+    meta.update(partial_meta)
+
+    result = monitor._maybe_hydrate_deferred_order(_make_order(meta=meta))
+
+    # The guard must NOT own the skip decision here. Either hydration
+    # proceeds normally, or it fails for a reason UNRELATED to the
+    # materialization guard.
+    assert result.get("reason") != "materialization_in_flight", (
+        f"partial marker shape {label!r} incorrectly triggered the "
+        f"materialization guard; got {result!r}"
+    )
 
 
 def test_pending_trigger_deferred_row_hydrates_to_occ_contract_and_limit_gt_point_01(monkeypatch):

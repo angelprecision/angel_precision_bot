@@ -1047,16 +1047,6 @@ class APOrderMonitor:
                           AND UPPER(contract) LIKE 'DEFERRED:%%'
                           AND kind = 'ENTRY'
                           AND created_ts < %s
-                          -- Active materialization ownership is a hard
-                          -- no-cleanup fence.  Missing legacy markers are
-                          -- allowed, but malformed/non-false values are not.
-                          AND LOWER(COALESCE(meta->>'broker_ready', '')) IN ('', 'false')
-                          AND LOWER(COALESCE(meta->>'materialization_in_flight', '')) IN ('', 'false')
-                          AND UPPER(COALESCE(meta->>'lifecycle_state', '')) <> 'MATERIALIZING'
-                          AND UPPER(COALESCE(meta->>'materialization_status', '')) NOT IN ('RUNNING', 'QUEUED')
-                          AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL
-                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL
-                          AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL
                         RETURNING local_order_id, symbol, reserved_cost, created_ts
                         """,
                         (_rule, _sweep_meta, self.client_id, _threshold),
