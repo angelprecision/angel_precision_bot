@@ -39,13 +39,20 @@ def _stop(order_id="143387714", *, contract=CONTRACT, account="ACC123", status="
     }
 
 
+def _terminal(order_id="143387714", *, status="canceled", qty=1, executed=0, **updates):
+    order = _stop(order_id, status=status, qty=qty, executed=executed)
+    order["symbol"] = "NOW"
+    order.update(updates)
+    return order
+
+
 class _Broker:
     account_id = "ACC123"
 
     def __init__(self, *, positions, orders, terminal=None, cancel_error=None):
         self._positions = list(positions)
         self._orders = orders
-        self._terminal = terminal or {"id": "143387714", "status": "canceled"}
+        self._terminal = terminal if terminal is not None else _terminal()
         self._cancel_error = cancel_error
         self.cancel_calls = []
         self.get_calls = []
@@ -106,7 +113,7 @@ def test_exact_now_positive_control_cancels_once_then_allows_one_contract():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
         orders=[[_stop()], []],
-        terminal={"id": "143387714", "status": "canceled", "exec_quantity": 0},
+        terminal=_terminal(executed=0),
     )
     result = _run(broker)
     assert result["allowed"] is True
@@ -127,7 +134,7 @@ def test_stop_fills_during_cancel_allows_only_proven_residual():
     broker = _Broker(
         positions=[[_position(2)], [_position(1)]],
         orders=[[_stop(qty=2)], []],
-        terminal={"id": "143387714", "status": "filled", "exec_quantity": 1},
+        terminal=_terminal(status="filled", qty=2, executed=1),
     )
     result = _run(broker, qty=2)
     assert result["allowed"] is True
@@ -139,12 +146,92 @@ def test_whole_stop_fill_with_stale_position_reread_posts_zero():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
         orders=[[_stop()], []],
-        terminal={"id": "143387714", "status": "filled", "exec_quantity": 1},
+        terminal=_terminal(status="filled", executed=1),
     )
     result = _run(broker)
     assert result["allowed"] is False
     assert result["replacement_qty"] == 0
-    assert result["reason"] == "EXIT_PROTECTIVE_BROKER_FLAT"
+    assert result["reason"] == "EXIT_PROTECTIVE_POSITION_UNPROVEN"
+    assert result["audit"]["reason"] == "position_snapshot_stale_after_order_fill"
+    assert broker.cancel_calls == ["143387714"]
+
+
+def test_protective_fill_in_post_inventory_requires_final_position_coherence():
+    broker = _Broker(
+        positions=[[_position(2)], [_position(2)]],
+        orders=[
+            [_stop(qty=2)],
+            [_stop(status="filled", qty=2, executed=1)],
+        ],
+        terminal=_terminal(executed=0, qty=2),
+    )
+    result = _run(broker, qty=2)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_POSITION_UNPROVEN"
+    assert result["audit"]["reason"] == "position_snapshot_stale_after_order_fill"
+    assert result["audit"]["observed_protective_execution_delta"] == 1
+    assert broker.cancel_calls == ["143387714"]
+
+
+def test_protective_fill_in_post_inventory_sizes_from_final_position_once():
+    broker = _Broker(
+        positions=[[_position(2)], [_position(1)]],
+        orders=[
+            [_stop(qty=2)],
+            [_stop(status="filled", qty=2, executed=1)],
+        ],
+        terminal=_terminal(executed=0, qty=2),
+    )
+    result = _run(broker, qty=2)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
+    assert result["audit"]["observed_protective_execution_delta"] == 1
+    assert broker.cancel_calls == ["143387714"]
+
+
+def test_cancel_terminal_proof_requires_exact_broker_order_identity():
+    terminal = _terminal()
+    terminal["id"] = "different-order"
+    broker = _Broker(
+        positions=[[_position(1)]],
+        orders=[[_stop()], []],
+        terminal=terminal,
+    )
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN"
+    assert result["audit"]["reason"] == "terminal_order_id_mismatch"
+    assert broker.cancel_calls == ["143387714"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        ("id", None, "terminal_order_id_unproven"),
+        ("option_symbol", "NOW260828P00123000", "terminal_order_contract_mismatch"),
+        ("side", "buy_to_open", "terminal_order_side_mismatch"),
+        ("account_id", "OTHER", "terminal_order_account_mismatch"),
+        ("type", "limit", "terminal_order_type_mismatch"),
+    ],
+)
+def test_cancel_terminal_proof_rejects_identity_mismatch(field, value, expected_reason):
+    terminal = _terminal()
+    if value is None:
+        terminal.pop(field)
+    else:
+        terminal[field] = value
+    broker = _Broker(
+        positions=[[_position(1)]],
+        orders=[[_stop()], []],
+        terminal=terminal,
+    )
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN"
+    assert result["audit"]["reason"] == expected_reason
     assert broker.cancel_calls == ["143387714"]
 
 
@@ -184,7 +271,7 @@ def test_malformed_terminal_quantity_holds_after_cancel():
     broker = _Broker(
         positions=[[_position(1)]],
         orders=[_stop()],
-        terminal={"id": "143387714", "status": "filled", "exec_quantity": "nan"},
+        terminal=_terminal(status="filled", executed="nan"),
     )
     result = _run(broker)
     assert result["allowed"] is False
@@ -200,7 +287,7 @@ def test_symbol_alias_exact_occ_is_taken_over():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
         orders=[[order], []],
-        terminal={"id": "143387714", "status": "canceled"},
+        terminal=_terminal(),
     )
     result = _run(broker)
     assert result["allowed"] is True
@@ -232,7 +319,7 @@ def test_cancel_exception_can_only_proceed_when_requery_is_terminal():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
         orders=[[_stop()], []],
-        terminal={"id": "143387714", "status": "canceled"},
+        terminal=_terminal(),
         cancel_error=RuntimeError("transport lost"),
     )
     assert _run(broker)["allowed"] is True
@@ -361,7 +448,7 @@ def test_post_takeover_reinventory_blocks_external_exact_active_sell():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
         orders=[[_stop()], [_stop("external-sell", status="open", qty=1)]],
-        terminal={"id": "143387714", "status": "canceled"},
+        terminal=_terminal(),
     )
     result = _run(broker)
     assert result["allowed"] is False

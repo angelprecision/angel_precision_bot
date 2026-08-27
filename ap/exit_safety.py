@@ -401,6 +401,69 @@ def _order_quantity_evidence(
     }, None
 
 
+def _terminal_order_identity_issue(
+    raw: Any,
+    *,
+    expected_broker_order_id: str,
+    target_contract: str,
+    account: str,
+) -> str | None:
+    """Require the cancel re-query to prove the exact protective order."""
+    if not isinstance(raw, dict):
+        return "get_order_malformed"
+
+    observed_ids = [
+        str(raw[key]).strip()
+        for key in ("id", "order_id")
+        if raw.get(key) not in (None, "")
+    ]
+    if not observed_ids:
+        return "terminal_order_id_unproven"
+    if len(set(observed_ids)) != 1:
+        return "terminal_order_id_conflict"
+    if observed_ids[0] != str(expected_broker_order_id or "").strip():
+        return "terminal_order_id_mismatch"
+
+    explicit_contracts = []
+    symbol_contract = ""
+    for key in ("option_symbol", "contract", "symbol"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            normalized = _normalize_contract(value)
+            if normalized:
+                if key in {"option_symbol", "contract"}:
+                    explicit_contracts.append(normalized)
+                else:
+                    symbol_contract = normalized
+    if len(set(explicit_contracts)) > 1:
+        return "terminal_order_contract_unproven"
+    if explicit_contracts:
+        if explicit_contracts[0] != target_contract:
+            return "terminal_order_contract_mismatch"
+        # Tradier includes the underlying ticker in ``symbol`` alongside the
+        # exact OCC ``option_symbol``.  The explicit OCC alias is authoritative.
+    elif symbol_contract != target_contract:
+        return "terminal_order_contract_unproven"
+
+    if _normalize_text(raw.get("side")) != "sell_to_close":
+        return "terminal_order_side_mismatch"
+
+    terminal_account = _extract_position_account_id(raw)
+    if terminal_account and account and terminal_account != account:
+        return "terminal_order_account_mismatch"
+
+    type_values = [
+        _normalize_text(raw[key]).replace(" ", "_")
+        for key in ("type", "order_type")
+        if raw.get(key) not in (None, "")
+    ]
+    if type_values and (
+        len(set(type_values)) != 1 or type_values[0] not in _PROTECTIVE_ORDER_TYPES
+    ):
+        return "terminal_order_type_mismatch"
+    return None
+
+
 def _order_snapshot_row_issue(
     raw: Any, *, target_contract: str,
 ) -> str | None:
@@ -496,6 +559,8 @@ def _terminal_order_outcome(
     )
     if quantity_issue or evidence is None:
         return None, 0, quantity_issue or "quantity_unproven"
+    if int(evidence["qty"]) != int(candidate["qty"]):
+        return None, 0, "quantity_transition"
 
     # Tradier may report a partial fill with zero remaining as
     # ``partially_filled``.  A partial status with positive remaining is still
@@ -945,6 +1010,23 @@ def resolve_protective_exit_takeover(
     if not isinstance(terminal, dict):
         audit.update(event="EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", reason="get_order_malformed")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", "audit": audit}
+    terminal_identity_issue = _terminal_order_identity_issue(
+        terminal,
+        expected_broker_order_id=broker_order_id,
+        target_contract=exact_contract,
+        account=account,
+    )
+    if terminal_identity_issue:
+        audit.update(
+            event="EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN",
+            reason=terminal_identity_issue,
+        )
+        return {
+            "allowed": False,
+            "replacement_qty": 0,
+            "reason": "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN",
+            "audit": audit,
+        }
     terminal_status, consumed_qty, terminal_issue = _terminal_order_outcome(terminal, candidate)
     audit["protective_terminal_status"] = terminal_status or "missing"
     if terminal_issue:
@@ -952,14 +1034,6 @@ def resolve_protective_exit_takeover(
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN", "audit": audit}
     audit["protective_consumed_qty"] = int(consumed_qty)
 
-    final_position = resolve_exit_broker_truth(
-        broker=broker, client_id=client_id, contract=contract,
-    )
-    final_qty = final_position.get("broker_truth_open_qty")
-    audit["final_position"] = final_position.get("audit") or {}
-    if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
-        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_position_unproven")
-        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
     try:
         post_orders = list_orders_strict()
     except Exception as exc:
@@ -983,24 +1057,111 @@ def resolve_protective_exit_takeover(
         )
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
     protective_broker_order_id = broker_order_id
+    protective_post_terminals: list[dict[str, Any]] = []
     for post_terminal in post_terminal_orders:
         post_id = str(
             post_terminal["raw"].get("id")
             or post_terminal["raw"].get("order_id")
             or ""
         ).strip()
-        if post_terminal["consumed"] > 0 and post_id != protective_broker_order_id:
+        if post_id == protective_broker_order_id:
+            protective_post_terminals.append(post_terminal)
+        elif post_terminal["consumed"] > 0:
             audit.update(
                 event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
                 reason="terminal_sell_appeared_after_takeover",
             )
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+
+    if len(protective_post_terminals) > 1:
+        audit.update(
+            event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+            reason="protective_order_duplicated_after_takeover",
+        )
+        return {
+            "allowed": False,
+            "replacement_qty": 0,
+            "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+            "audit": audit,
+        }
+
+    observed_protective_execution_delta = int(consumed_qty)
+    if protective_post_terminals:
+        post_consumed_qty = int(protective_post_terminals[0]["consumed"])
+        candidate_executed = int(candidate.get("executed") or 0)
+        if int(protective_post_terminals[0]["qty"]) != int(candidate["qty"]):
+            audit.update(
+                event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+                reason="protective_quantity_transition",
+            )
+            return {
+                "allowed": False,
+                "replacement_qty": 0,
+                "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+                "audit": audit,
+            }
+        if post_consumed_qty < candidate_executed:
+            audit.update(
+                event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+                reason="protective_execution_regressed_after_takeover",
+                post_consumed_qty=post_consumed_qty,
+                candidate_executed=candidate_executed,
+            )
+            return {
+                "allowed": False,
+                "replacement_qty": 0,
+                "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+                "audit": audit,
+            }
+        post_execution_delta = post_consumed_qty - candidate_executed
+        if post_execution_delta < int(consumed_qty):
+            audit.update(
+                event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+                reason="protective_terminal_transition_inconsistent",
+                post_execution_delta=post_execution_delta,
+                terminal_consumed_qty=int(consumed_qty),
+            )
+            return {
+                "allowed": False,
+                "replacement_qty": 0,
+                "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+                "audit": audit,
+            }
+        observed_protective_execution_delta = post_execution_delta
+        audit["protective_post_terminal_consumed_qty"] = post_consumed_qty
+    audit["observed_protective_execution_delta"] = observed_protective_execution_delta
+
+    # Keep the final position read after the post-cancel order inventory.  A
+    # protective fill can move between the cancel re-query and that inventory;
+    # the final quantity must both reflect the observed execution and remain
+    # the sole replacement-size authority.
+    final_position = resolve_exit_broker_truth(
+        broker=broker, client_id=client_id, contract=contract,
+    )
+    final_qty = final_position.get("broker_truth_open_qty")
+    audit["final_position"] = final_position.get("audit") or {}
+    if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_position_unproven")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
+    max_coherent_qty = max(initial_qty - observed_protective_execution_delta, 0)
+    if final_qty > max_coherent_qty:
+        audit.update(
+            event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
+            reason="position_snapshot_stale_after_order_fill",
+            final_qty=final_qty,
+            max_coherent_qty=max_coherent_qty,
+        )
+        return {
+            "allowed": False,
+            "replacement_qty": 0,
+            "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN",
+            "audit": audit,
+        }
     replacement_qty = min(
         requested_qty,
         max(final_qty, 0),
-        max(initial_qty - consumed_qty, 0),
     )
-    event = "EXIT_PROTECTIVE_FILLED_DURING_TAKEOVER" if terminal_status == "filled" or consumed_qty > 0 or final_qty < initial_qty else "EXIT_PROTECTIVE_CANCEL_CONFIRMED"
+    event = "EXIT_PROTECTIVE_FILLED_DURING_TAKEOVER" if terminal_status == "filled" or observed_protective_execution_delta > 0 or final_qty < initial_qty else "EXIT_PROTECTIVE_CANCEL_CONFIRMED"
     audit.update(event=event, broker_long_qty=final_qty, replacement_qty=replacement_qty)
     if replacement_qty <= 0:
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_BROKER_FLAT", "audit": audit}

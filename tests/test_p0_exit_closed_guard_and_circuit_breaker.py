@@ -367,7 +367,9 @@ def test_partial_protective_fill_rewrites_durable_payload_and_posts_residual(mon
     }], []]
     mock_broker.cancel_order.return_value = {"ok": True, "status": "canceled"}
     mock_broker.get_order.return_value = {
-        "id": "143387714", "status": "filled", "quantity": 2, "exec_quantity": 1,
+        "id": "143387714", "status": "filled", "type": "stop",
+        "side": "sell_to_close", "option_symbol": contract,
+        "quantity": 2, "exec_quantity": 1,
     }
     mock_broker.session.post.return_value = _resp(
         200, json_body={"order": {"id": "CANONICAL-RESIDUAL-1", "status": "open"}}
@@ -403,7 +405,11 @@ def test_repeated_exit_tick_keeps_one_takeover_owner_and_one_post(monkeypatch, m
         "quantity": 1, "exec_quantity": 0, "account_id": "ACC123",
     }], []]
     mock_broker.cancel_order.return_value = {"ok": True, "status": "canceled"}
-    mock_broker.get_order.return_value = {"id": "143387714", "status": "canceled"}
+    mock_broker.get_order.return_value = {
+        "id": "143387714", "status": "canceled", "type": "stop",
+        "side": "sell_to_close", "option_symbol": contract,
+        "quantity": 1, "exec_quantity": 0,
+    }
     mock_broker.session.post.return_value = _resp(
         200, json_body={"order": {"id": "CANONICAL-EXIT-ONCE", "status": "open"}}
     )
