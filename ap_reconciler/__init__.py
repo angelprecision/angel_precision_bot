@@ -63,12 +63,17 @@ def _strict_option_side(contract: str, persisted: _Any) -> "str | None":
     if not m:
         return None
     occ_side = "CALL" if m.group(2) == "C" else "PUT"
-    raw = str(persisted).strip().upper() if persisted is not None else ""
-    if not raw:
+    raw = str(persisted) if persisted is not None else ""
+    if not raw.strip():
+        # None, empty string, or whitespace-only — derive from OCC.
         return occ_side
-    if raw in {"CALL", "C"}:
+    # Uppercase but do NOT strip content: a space-padded token such as " put"
+    # or "call " is not one of the four accepted exact tokens and must fail
+    # closed rather than being silently accepted after stripping.
+    raw_upper = raw.upper()
+    if raw_upper in {"CALL", "C"}:
         persisted_side = "CALL"
-    elif raw in {"PUT", "P"}:
+    elif raw_upper in {"PUT", "P"}:
         persisted_side = "PUT"
     else:
         return None
@@ -560,8 +565,6 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
             return
 
         try:
-            from ap_exit_engine import ManagedPosition
-
             mode = _strict_execution_mode(self.execution_mode)
             if mode is None:
                 log.critical(
@@ -677,6 +680,10 @@ class APBrokerReconciler(_BaseAPBrokerReconciler):
                 return
 
             # No repair exists. Seed exactly one canonical ManagedPosition.
+            # Deferred import: only reached when safe_to_seed is True, avoiding
+            # the DB-URL check that ap_exit_engine triggers at import time for
+            # all other code paths (ADOPTED, HOLD, malformed result, etc.).
+            from ap_exit_engine import ManagedPosition
             mp = ManagedPosition(
                 ticker=self._norm_underlying(underlying or contract),
                 option_symbol=contract,
