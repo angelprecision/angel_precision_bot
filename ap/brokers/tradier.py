@@ -422,7 +422,15 @@ class TradierBroker(BrokerAdapter):
         """
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
         node = j.get("orders") if isinstance(j, dict) else None
+        # Tradier's XML→JSON conversion represents an empty collection as the
+        # literal string ``"null"`` in some responses.  Treat that proven
+        # empty shape exactly like a missing/null node while preserving the
+        # legacy filtering behavior for malformed members.
+        if isinstance(node, str) and node.strip().lower() in {"", "null"}:
+            return []
         orders = node.get("order") if isinstance(node, dict) else node
+        if isinstance(orders, str) and orders.strip().lower() in {"", "null"}:
+            return []
         if orders is None:
             return []
         if isinstance(orders, dict):
@@ -436,20 +444,30 @@ class TradierBroker(BrokerAdapter):
 
         Transport/auth failures propagate.  Missing or malformed top-level
         payloads, and any malformed order member, are rejected so money-path
-        callers cannot treat partial or ambiguous broker truth as safe.
+        callers cannot treat partial or ambiguous broker truth as safe.  The
+        documented successful-empty XML→JSON shapes (including ``null`` and
+        empty-string nodes) normalize to ``[]``.
         """
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
+        if j == {}:
+            return []
         if not isinstance(j, dict) or "orders" not in j:
             raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
         node = j["orders"]
+        if node is None or node == {} or (
+            isinstance(node, str) and node.strip().lower() in {"", "null"}
+        ):
+            return []
         if isinstance(node, dict):
             if "order" not in node:
                 raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
             orders = node["order"]
         else:
             orders = node
-        if orders is None:
-            raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        if orders is None or (
+            isinstance(orders, str) and orders.strip().lower() in {"", "null"}
+        ):
+            return []
         if isinstance(orders, dict):
             return [orders]
         if isinstance(orders, list):

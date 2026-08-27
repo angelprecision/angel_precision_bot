@@ -90,6 +90,79 @@ def _normalize_broker_submitted_ts(value) -> str | None:
         raise ValueError("broker_submitted_ts must be timezone-aware")
     return parsed.astimezone(timezone.utc).isoformat()
 
+
+def _durable_protective_order_id_for_position(
+    osm: object,
+    *,
+    position_id: str,
+    contract: str,
+    execution_mode: str,
+) -> tuple[str | None, str | None]:
+    """Read one exact standing-stop broker ID from the originating ENTRY.
+
+    The protective stop metadata is persisted on the ENTRY row.  Keep this
+    lookup optional for lightweight/test OSM doubles that do not expose the
+    position-order query, but fail closed when a production-capable query is
+    present and cannot prove a unique identity.
+    """
+    getter = getattr(osm, "get_orders_for_position", None)
+    if not callable(getter):
+        return None, None
+    try:
+        rows = getter(str(position_id))
+    except Exception as exc:
+        return None, f"durable_protective_identity_lookup_error:{exc}"
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        return None, "durable_protective_identity_rows_malformed"
+
+    concrete_ids: set[str] = set()
+    normalized_mode = str(execution_mode or "").strip().lower()
+    for row in rows:
+        if not isinstance(row, dict):
+            return None, "durable_protective_identity_row_malformed"
+        if (
+            str(row.get("position_id") or "") != str(position_id)
+            or row.get("kind") != "ENTRY"
+            or row.get("client_id") != getattr(osm, "client_id", None)
+            or str(row.get("contract") or "") != str(contract or "")
+            or str(row.get("execution_mode") or "").strip().lower() != normalized_mode
+        ):
+            continue
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                return None, "durable_protective_identity_meta_malformed"
+        if not isinstance(meta, dict):
+            return None, "durable_protective_identity_meta_malformed"
+        protective = meta.get("protective_order")
+        if protective is None:
+            continue
+        if not isinstance(protective, dict):
+            return None, "durable_protective_identity_meta_malformed"
+        protective_client = str(protective.get("client_id") or "")
+        protective_contract = str(protective.get("protective_contract") or "")
+        protective_mode = str(protective.get("execution_mode") or "").strip().lower()
+        protective_source = str(protective.get("protective_source") or "").strip().lower()
+        if (
+            protective_client and protective_client != str(getattr(osm, "client_id", None) or "")
+            or protective_contract and protective_contract != str(contract or "")
+            or protective_mode and protective_mode != normalized_mode
+            or protective_source and protective_source != "standing_stop"
+        ):
+            return None, "durable_protective_identity_metadata_mismatch"
+        candidate = str(protective.get("protective_broker_order_id") or "").strip()
+        if candidate.upper() in {"", "?", "N/A", "UNKNOWN", "NULL", "NONE", "0"}:
+            continue
+        concrete_ids.add(candidate)
+
+    if len(concrete_ids) > 1:
+        return None, "durable_protective_identity_conflict"
+    return (next(iter(concrete_ids)) if concrete_ids else None), None
+
 # P0 client-parity (2026-06-04): canonical_signal_id groups the same
 # market opportunity across every active eligible client account so the
 # parity ledger and audit queries can detect fanout failures.
@@ -6606,6 +6679,36 @@ class APOrderStateMachine:
         # the single owner fence.  Only that owner may inspect/cancel an exact
         # LIVE protective sell before the irreversible replacement POST.
         if str(execution_mode or "").strip().lower() == "live":
+            _protective_id, _protective_id_issue = _durable_protective_order_id_for_position(
+                self,
+                position_id=str(position_id),
+                contract=str(contract or ""),
+                execution_mode=str(execution_mode or ""),
+            )
+            if _protective_id_issue:
+                _takeover_audit = {
+                    "event": "EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
+                    "reason": _protective_id_issue,
+                    "client_id": self.client_id,
+                    "position_id": str(position_id),
+                    "contract": str(contract or ""),
+                    "execution_mode": str(execution_mode or "").strip().lower(),
+                }
+                _upd_takeover = getattr(self, "update_order_meta", None)
+                if callable(_upd_takeover):
+                    try:
+                        _upd_takeover(local_id, {"protective_exit_takeover": _takeover_audit})
+                    except Exception as _takeover_meta_exc:
+                        log.debug("submit_exit takeover audit write failed: %s", _takeover_meta_exc)
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.EXIT_REQUESTED,
+                    "error": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN",
+                    "reconciliation_required": True,
+                    "protective_takeover": _takeover_audit,
+                }
             _takeover = resolve_protective_exit_takeover(
                 broker=broker,
                 client_id=self.client_id,
@@ -6614,6 +6717,7 @@ class APOrderStateMachine:
                 local_order_id=str(local_id),
                 contract=str(contract or ""),
                 requested_qty=requested_qty,
+                protective_broker_order_id=_protective_id,
             )
             _takeover_audit = dict(_takeover.get("audit") or {})
             _upd_takeover = getattr(self, "update_order_meta", None)

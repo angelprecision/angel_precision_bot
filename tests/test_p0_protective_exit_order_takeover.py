@@ -84,10 +84,12 @@ class _Broker:
         self.get_calls.append(order_id)
         if isinstance(self._terminal, Exception):
             raise self._terminal
+        if isinstance(self._terminal, list):
+            return self._terminal.pop(0) if len(self._terminal) > 1 else self._terminal[0]
         return self._terminal
 
 
-def _run(broker, *, qty=1, mode="live", contract=CONTRACT):
+def _run(broker, *, qty=1, mode="live", contract=CONTRACT, protective_broker_order_id=None):
     return resolve_protective_exit_takeover(
         broker=broker,
         client_id=CLIENT,
@@ -96,6 +98,7 @@ def _run(broker, *, qty=1, mode="live", contract=CONTRACT):
         local_order_id="exit-now-live-1",
         contract=contract,
         requested_qty=qty,
+        protective_broker_order_id=protective_broker_order_id,
     )
 
 
@@ -323,6 +326,21 @@ def test_terminal_fill_delta_does_not_get_subtracted_from_final_position():
     result = _run(broker, qty=2)
     assert result["allowed"] is True
     assert result["replacement_qty"] == 1
+    assert broker.cancel_calls == []
+
+
+def test_terminal_fill_delta_requires_final_position_coherence_before_sizing():
+    initial = _stop("history-x", status="canceled", executed=0, qty=2)
+    final = _stop("history-x", status="canceled", executed=1, qty=2)
+    broker = _Broker(
+        positions=[[_position(2)], [_position(2)]],
+        orders=[[initial], [final]],
+    )
+    result = _run(broker, qty=2)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_POSITION_UNPROVEN"
+    assert result["audit"]["reason"] == "position_snapshot_stale_after_order_fill"
     assert broker.cancel_calls == []
 
 
@@ -613,6 +631,10 @@ def test_production_tradier_legacy_list_orders_filters_malformed_members_and_emp
         ({}, []),
         ({"orders": {}}, []),
         ({"orders": None}, []),
+        ({"orders": ""}, []),
+        ({"orders": "null"}, []),
+        ({"orders": {"order": ""}}, []),
+        ({"orders": {"order": "null"}}, []),
         ({"orders": {"unexpected": []}}, []),
         ({"orders": {"order": [valid, "MALFORMED_ORDER_ROW"]}}, [valid]),
     ]
@@ -624,10 +646,9 @@ def test_production_tradier_legacy_list_orders_filters_malformed_members_and_emp
 @pytest.mark.parametrize(
     "orders_payload",
     [
-        {},
-        {"orders": {}},
-        {"orders": None},
         {"orders": {"unexpected": []}},
+        {"orders": "not-null"},
+        {"orders": {"order": "not-null"}},
         {"orders": {"order": [{"id": "valid"}, "MALFORMED_ORDER_ROW"]}},
     ],
 )
@@ -642,6 +663,44 @@ def test_production_tradier_strict_list_orders_rejects_ambiguous_payload(orders_
     broker._get = lambda *args, **kwargs: orders_payload
     with pytest.raises(ValueError, match="TRADIER_ORDERS_PAYLOAD_MALFORMED"):
         broker.list_orders_strict()
+
+
+@pytest.mark.parametrize("orders_payload", [{"orders": "null"}, {"orders": {"order": "null"}}])
+def test_production_tradier_null_order_shapes_are_authoritative_empty(orders_payload):
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: orders_payload
+    assert broker.list_orders() == []
+    assert broker.list_orders_strict() == []
+
+
+@pytest.mark.parametrize(
+    "orders_payload",
+    [
+        {},
+        {"orders": None},
+        {"orders": ""},
+        {"orders": {}},
+        {"orders": {"order": None}},
+        {"orders": {"order": ""}},
+        {"orders": {"order": []}},
+    ],
+)
+def test_production_tradier_other_known_empty_order_shapes_are_authoritative_empty(orders_payload):
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: orders_payload
+    assert broker.list_orders_strict() == []
 
 
 def test_takeover_uses_strict_tradier_inventory_not_legacy_method():
@@ -669,9 +728,43 @@ def test_takeover_uses_strict_tradier_inventory_not_legacy_method():
     assert result["replacement_qty"] == 1
 
 
+def test_durable_gtc_protective_id_is_proved_when_current_order_list_is_empty():
+    protective_id = "prior-session-gtc"
+    active = _stop(protective_id)
+    terminal = _stop(protective_id, status="canceled")
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[], []],
+        terminal=[active, terminal],
+    )
+    result = _run(broker, protective_broker_order_id=protective_id)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
+    assert broker.cancel_calls == [protective_id]
+    assert broker.get_calls == [protective_id, protective_id]
+
+
+def test_durable_gtc_protective_id_get_failure_holds_before_replacement():
+    protective_id = "prior-session-gtc"
+    broker = _Broker(
+        positions=[[_position(1)]],
+        orders=[[]],
+        terminal=RuntimeError("order lookup unavailable"),
+    )
+    result = _run(broker, protective_broker_order_id=protective_id)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_IDENTITY_UNPROVEN"
+    assert broker.cancel_calls == []
+
+
 @pytest.mark.parametrize(
     "orders_payload",
-    [{}, {"orders": {}}, {"orders": None}, {"orders": {"unexpected": []}}],
+    [
+        {"orders": {"unexpected": []}},
+        {"orders": "not-null"},
+        {"orders": {"order": "not-null"}},
+    ],
 )
 def test_production_tradier_malformed_top_level_orders_hold_before_cancel(orders_payload):
     broker = TradierBroker(

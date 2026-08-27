@@ -537,15 +537,17 @@ def _terminal_order_outcome(
 
 def _merge_terminal_order_history(
     *snapshots: list[dict[str, Any]],
-) -> tuple[dict[str, dict[str, Any]], str | None]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, int], str | None]:
     """Merge terminal rows by broker ID and reject inconsistent transitions.
 
     A broker order can legitimately be present in both inventory snapshots.
     Its execution is cumulative, so the second observation is not a second
-    fill.  The returned records are used only for race/ambiguity detection;
-    current broker position truth remains the sole replacement-size authority.
+    fill.  The returned records and nonnegative execution deltas are used only
+    for race/ambiguity detection; current broker position truth remains the
+    sole replacement-size authority.
     """
     by_id: dict[str, dict[str, Any]] = {}
+    execution_deltas: dict[str, int] = {}
     for snapshot in snapshots:
         for order in snapshot:
             raw = order.get("raw") if isinstance(order, dict) else None
@@ -554,27 +556,32 @@ def _merge_terminal_order_history(
                 raw.get("id") or raw.get("order_id") or ""
             ).strip()
             if not broker_order_id:
-                return {}, "order_id_unproven"
+                return {}, {}, "order_id_unproven"
             current = dict(order)
             previous = by_id.get(broker_order_id)
             if previous is not None:
                 if current.get("status") != previous.get("status"):
-                    return {}, "status_transition"
+                    return {}, {}, "status_transition"
                 if current.get("qty") != previous.get("qty"):
-                    return {}, "quantity_transition"
+                    return {}, {}, "quantity_transition"
                 try:
                     exec_delta = int(current.get("executed", 0)) - int(previous.get("executed", 0))
                 except (TypeError, ValueError):
-                    return {}, "quantity_unproven"
+                    return {}, {}, "quantity_unproven"
                 if exec_delta < 0:
-                    return {}, "quantity_transition"
+                    return {}, {}, "quantity_transition"
                 try:
                     if int(current.get("remaining", 0)) > int(previous.get("remaining", 0)):
-                        return {}, "quantity_transition"
+                        return {}, {}, "quantity_transition"
                 except (TypeError, ValueError):
-                    return {}, "quantity_unproven"
+                    return {}, {}, "quantity_unproven"
+                execution_deltas[broker_order_id] = (
+                    execution_deltas.get(broker_order_id, 0) + exec_delta
+                )
+            else:
+                execution_deltas[broker_order_id] = 0
             by_id[broker_order_id] = current
-    return by_id, None
+    return by_id, execution_deltas, None
 
 
 def resolve_protective_exit_takeover(
@@ -586,6 +593,7 @@ def resolve_protective_exit_takeover(
     local_order_id: str,
     contract: str,
     requested_qty: int,
+    protective_broker_order_id: str | None = None,
 ) -> dict[str, Any]:
     """Prove broker sell ownership immediately before a LIVE EXIT POST.
 
@@ -643,6 +651,102 @@ def resolve_protective_exit_takeover(
     if snapshot_issue:
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason=snapshot_issue)
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
+
+    # A standing stop is GTC, while Tradier's account-order inventory is
+    # session/day scoped.  When the originating ENTRY persisted an exact
+    # protective broker ID, prove that order directly before treating its
+    # absence from today's inventory as evidence that no protective sell is
+    # live.  Missing, malformed, or identity-inconsistent proof holds closed.
+    durable_order: dict[str, Any] | None = None
+    durable_id = str(protective_broker_order_id or "").strip()
+    if durable_id.upper() in {"", "?", "N/A", "UNKNOWN", "NULL", "NONE", "0"}:
+        durable_id = ""
+    if durable_id:
+        audit["durable_protective_broker_order_id"] = durable_id
+        get_order = getattr(broker, "get_order", None)
+        if not callable(get_order):
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_get_order_unavailable")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        try:
+            durable_raw = get_order(durable_id)
+        except Exception as exc:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_get_order_error", error=str(exc))
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        if not isinstance(durable_raw, dict):
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_get_order_malformed")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        observed_id = str(durable_raw.get("id") or durable_raw.get("order_id") or "").strip()
+        if observed_id != durable_id:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_id_mismatch")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        if _exact_order_contract(durable_raw) != exact_contract:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_contract_mismatch")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        durable_account = _normalize_text(durable_raw.get("account_id") or durable_raw.get("account"))
+        if durable_account and account and durable_account != account:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_account_mismatch")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        durable_status, durable_status_issue = _order_status(durable_raw)
+        durable_evidence, durable_quantity_issue = _order_quantity_evidence(durable_raw)
+        if durable_status_issue or durable_evidence is None:
+            audit.update(
+                event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
+                reason=durable_status_issue or durable_quantity_issue or "durable_protective_quantity_unproven",
+            )
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        if durable_status in {"partially_filled", "partial_fill"} and durable_evidence["remaining"] == 0:
+            durable_status = "filled"
+        if durable_status not in (_ACTIVE_BROKER_SELL_STATUSES | _TERMINAL_BROKER_ORDER_STATUSES):
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_status_unproven")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        if _normalize_text(durable_raw.get("side")) != "sell_to_close":
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_side_mismatch")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        durable_type = _normalize_text(durable_raw.get("type") or durable_raw.get("order_type")).replace(" ", "_")
+        if durable_type and durable_type not in _PROTECTIVE_ORDER_TYPES:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_type_mismatch")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        if durable_status in _ACTIVE_BROKER_SELL_STATUSES:
+            if durable_evidence["remaining"] <= 0 or durable_type not in _PROTECTIVE_ORDER_TYPES:
+                audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_active_proof_unproven")
+                return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        durable_tag = str(durable_raw.get("tag") or "").strip()
+        if durable_tag and durable_tag in {str(local_order_id or "").strip(), canonical_broker_submit_key(local_order_id)}:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_is_canonical_exit")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        durable_order = dict(durable_raw)
+
+    inventory_orders = list(orders)
+    if durable_order is not None:
+        durable_matches = [
+            index
+            for index, row in enumerate(inventory_orders)
+            if str(row.get("id") or row.get("order_id") or "").strip() == durable_id
+        ]
+        if len(durable_matches) > 1:
+            audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason="durable_protective_id_duplicated")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+        if durable_matches:
+            listed = inventory_orders[durable_matches[0]]
+            listed_status, listed_status_issue = _order_status(listed)
+            listed_evidence, listed_quantity_issue = _order_quantity_evidence(listed)
+            if listed_status in {"partially_filled", "partial_fill"} and listed_evidence is not None and listed_evidence["remaining"] == 0:
+                listed_status = "filled"
+            if (
+                listed_status_issue
+                or listed_evidence is None
+                or listed_status != durable_status
+                or listed_evidence["qty"] != durable_evidence["qty"]
+                or _exact_order_contract(listed) != exact_contract
+                or _normalize_text(listed.get("side")) != "sell_to_close"
+            ):
+                audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason="durable_protective_snapshot_transition")
+                return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+            inventory_orders[durable_matches[0]] = durable_order
+        else:
+            # The exact GET proof is authoritative for a prior-session GTC
+            # order that cannot appear in the current-day list snapshot.
+            inventory_orders.append(durable_order)
 
     def _inventory(
         rows: list[dict[str, Any]],
@@ -710,22 +814,16 @@ def resolve_protective_exit_takeover(
             )
         return active, terminal_orders, None
 
-    active_sells, terminal_orders, inventory_issue = _inventory(orders)
+    active_sells, terminal_orders, inventory_issue = _inventory(inventory_orders)
     if inventory_issue:
         audit.update(event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", reason=inventory_issue)
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
 
     if not active_sells:
-        # Re-read after the order snapshot so a protective fill that became
-        # terminal immediately before/during classification wins the race.
-        final_position = resolve_exit_broker_truth(
-            broker=broker, client_id=client_id, contract=contract,
-        )
-        final_qty = final_position.get("broker_truth_open_qty")
-        audit["final_position"] = final_position.get("audit") or {}
-        if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
-            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_position_unproven")
-            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
+        # Obtain the second order inventory before the final position read.
+        # The position snapshot must be the last broker quantity observation so
+        # a fill that moves between order snapshots cannot leave sizing based
+        # on a stale quantity.
         try:
             post_orders = list_orders_strict()
         except Exception as exc:
@@ -748,7 +846,7 @@ def resolve_protective_exit_takeover(
                 post_takeover_active_sell_count=len(post_active_sells),
             )
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
-        terminal_by_id, terminal_history_issue = _merge_terminal_order_history(
+        terminal_by_id, execution_deltas, terminal_history_issue = _merge_terminal_order_history(
             terminal_orders, post_terminal_orders,
         )
         if terminal_history_issue:
@@ -769,6 +867,31 @@ def resolve_protective_exit_takeover(
                 terminal_sell_count=len(terminal_fill_ids),
             )
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+        observed_execution_delta = sum(
+            max(int(delta), 0) for delta in execution_deltas.values()
+        )
+        audit["observed_terminal_execution_delta"] = observed_execution_delta
+
+        # This is deliberately the last broker quantity observation in the
+        # no-active path.  Historical executions are used only as a coherence
+        # fence; they are never subtracted from this fresh position quantity.
+        final_position = resolve_exit_broker_truth(
+            broker=broker, client_id=client_id, contract=contract,
+        )
+        final_qty = final_position.get("broker_truth_open_qty")
+        audit["final_position"] = final_position.get("audit") or {}
+        if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_position_unproven")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
+        max_coherent_qty = max(initial_qty - observed_execution_delta, 0)
+        if final_qty > max_coherent_qty:
+            audit.update(
+                event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
+                reason="position_snapshot_stale_after_order_fill",
+                final_qty=final_qty,
+                max_coherent_qty=max_coherent_qty,
+            )
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
         replacement_qty = min(
             requested_qty,
             max(final_qty, 0),
