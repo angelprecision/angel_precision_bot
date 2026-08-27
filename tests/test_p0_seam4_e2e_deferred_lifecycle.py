@@ -2657,6 +2657,45 @@ def _set_active_materialization(
     })
 
 
+def _configure_pr524_ordinary_fixture(osm, core, watcher, plan):
+    """Turn the deferred harness into a normal, already-selected PAPER entry."""
+    contract = "C260828C00133000"
+    crossed_at = _iso(_now() - timedelta(seconds=10))
+
+    osm.execution_mode = "paper"
+    osm.row.update({
+        "symbol": "C",
+        "execution_mode": "paper",
+        "contract": contract,
+        "limit_price": 1.28,
+        "qty": 1,
+        "reserved_cost": 128.0,
+    })
+    osm.row["meta"] = {
+        "execution_mode": "paper",
+        "contract_deferred": False,
+        "trigger_crossed_at": crossed_at,
+        "trigger_price": 130.0,
+        "entry_cutoff_et": TEST_ENTRY_CUTOFF_ET,
+    }
+
+    plan.ticker = "C"
+    plan.contract_symbol = contract
+    plan.limit_price = 1.28
+    plan.max_position_usd = 128.0
+    plan.execution_mode = "paper"
+    plan.metadata = {
+        "execution_mode": "paper",
+        "contract_deferred": False,
+        "trigger_crossed_at": crossed_at,
+    }
+    core.execution_mode = "paper"
+    core.mode = "PAPER"
+    core.paper = True
+    core.master_control.mode = "PAPER"
+    watcher.mode = "PAPER"
+
+
 def test_pr514_fresh_deferred_claim_precedes_every_attempt_gate(monkeypatch):
     """Load-bearing order test: moving claim below any gate must fail this."""
     osm, selector, _mc, core, watcher, plan, trace, _stores = (
@@ -3209,6 +3248,78 @@ def test_pr524_memory_real_durable_same_real_continues_hydrated(monkeypatch):
     assert trace.index("risk") >= 0
     assert trace.index("broker_post") >= 0
     assert len(osm.post_payloads) == 1
+
+
+def test_pr524_ordinary_valid_plan_keeps_main_callback_path(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    _configure_pr524_ordinary_fixture(osm, core, watcher, plan)
+    core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
+    submit_calls = []
+
+    def _submit_existing_entry(**kwargs):
+        trace.append("submit")
+        submit_calls.append(kwargs)
+        return {
+            "ok": True,
+            "local_order_id": LOCAL_ORDER_ID,
+            "broker_order_id": "ordinary-paper-submit",
+            "status": "ACK",
+        }
+
+    osm.submit_existing_entry = _submit_existing_entry
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result is None or result.get("disposition") in {None, "SUBMITTED"}
+    assert trace[0] == "risk"
+    assert trace[-1] == "submit"
+    assert "claim" not in trace
+    assert selector.calls == 0
+    assert stores["status"]
+    assert len(submit_calls) == 1
+    assert submit_calls[0]["plan"] is plan
+
+
+def test_pr524_ordinary_missing_plan_uses_main_failure_path(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    _configure_pr524_ordinary_fixture(osm, core, watcher, plan)
+    core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
+    core._recover_plan_for_revalidation = lambda _watched: (
+        trace.append("recover") or None
+    )
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_ownership_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.signal.pop("_approved_plan", None)
+        result = watcher.on_trigger(watched)
+
+    assert result is None
+    assert trace[0] == "risk"
+    assert trace.index("risk") < trace.index("recover") < trace.index("expire")
+    assert selector.calls == 0
+    assert osm.post_payloads == []
+    assert stores["status"]
+    assert any(
+        len(args) > 1
+        and args[1].get("context_notes") == (
+            "approved_plan_missing_after_revalidation"
+        )
+        for args, _kwargs in stores["signal"]
+    )
 
 
 def test_pr524_recovery_materialization_broker_ready_gate_uses_exact_terminal_cas(

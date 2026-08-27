@@ -4218,6 +4218,9 @@ class APExecutionCore:
         _initial_meta = getattr(_initial_plan, "metadata", None) or {}
         if not isinstance(_initial_meta, dict):
             _initial_meta = {}
+        _signal_meta = sig.get("metadata") or {}
+        if not isinstance(_signal_meta, dict):
+            _signal_meta = {}
         _ownership_kind = str(
             sig.get("ownership_kind")
             or _initial_meta.get("ownership_kind")
@@ -4565,18 +4568,10 @@ class APExecutionCore:
                 "terminal_status": "EXPIRED",
             }
 
-        # Recover and classify the durable plan before any breach capacity or
-        # risk work.  A callback with no provable plan is ambiguous and stays
-        # owned by the watcher; it must not enter selector or broker work.
+        # Classify deferred/recovery history before deciding whether the new
+        # materialization preflight applies.  Ordinary callbacks retain the
+        # committed-main plan recovery position below the risk gate.
         _preflight_plan = sig.get("_approved_plan")
-        if _preflight_plan is None and queue_local_order_id:
-            _preflight_plan = self._recover_plan_for_revalidation(watched)
-        if _preflight_plan is None:
-            return {
-                "disposition": "KEEP_WATCHER",
-                "reason_code": "MATERIALIZATION_PLAN_RECOVERY_FAILED",
-                "retry_after_seconds": 5,
-            }
         _preflight_contract = str(getattr(_preflight_plan, "contract_symbol", "") or "").strip()
         _preflight_meta = getattr(_preflight_plan, "metadata", None) or {}
         if not isinstance(_preflight_meta, dict):
@@ -4586,27 +4581,39 @@ class APExecutionCore:
             sig.get("_recovery_pre_claimed")
             or _is_recovered
             or _ownership_kind == "materialization_retry"
+            or sig.get("materialization_retry_owner")
+            or sig.get("materialization_retry_attempt")
             or sig.get("contract_deferred")
             or _initial_meta.get("contract_deferred")
+            or _signal_meta.get("contract_deferred")
+            or str(sig.get("contract_symbol") or "").strip().upper().startswith("DEFERRED:")
+            or str(_initial_meta.get("contract_symbol") or "").strip().upper().startswith("DEFERRED:")
+            or str(_signal_meta.get("contract_symbol") or "").strip().upper().startswith("DEFERRED:")
             or _preflight_meta.get("contract_deferred")
             or _preflight_contract_upper.startswith("DEFERRED:")
             or str(
                 _initial_meta.get("selection_context")
+                or _signal_meta.get("selection_context")
                 or _preflight_meta.get("selection_context")
                 or ""
             ).strip().lower().startswith("deferred_breach")
+            or str(sig.get("selection_context") or "").strip().lower().startswith("deferred_breach")
             or bool(
-                _initial_meta.get("deferred_breach_selection")
+                sig.get("deferred_breach_selection")
+                or _signal_meta.get("deferred_breach_selection")
+                or _initial_meta.get("deferred_breach_selection")
                 or _preflight_meta.get("deferred_breach_selection")
             )
             or str(
                 sig.get("materialization_entry_path")
+                or _signal_meta.get("materialization_entry_path")
                 or _initial_meta.get("materialization_entry_path")
                 or _preflight_meta.get("materialization_entry_path")
                 or ""
             ).strip().upper() == "DEFERRED_BREACH_MATERIALIZATION"
             or str(
                 sig.get("contract_materialized_source")
+                or _signal_meta.get("contract_materialized_source")
                 or _initial_meta.get("contract_materialized_source")
                 or _preflight_meta.get("contract_materialized_source")
                 or ""
@@ -4619,13 +4626,40 @@ class APExecutionCore:
             or sig.get("recovery_submit_fenced")
             or sig.get("recovery_submit_owner")
             or sig.get("recovery_submit_generation")
+            or sig.get("materialization_retry_owner")
+            or sig.get("materialization_retry_attempt")
             or _initial_meta.get("recovery_submit_fenced")
             or _initial_meta.get("recovery_submit_owner")
             or _initial_meta.get("recovery_submit_generation")
+            or _initial_meta.get("materialization_retry_owner")
+            or _initial_meta.get("materialization_retry_attempt")
+            or _signal_meta.get("recovery_submit_fenced")
+            or _signal_meta.get("recovery_submit_owner")
+            or _signal_meta.get("recovery_submit_generation")
+            or _signal_meta.get("materialization_retry_owner")
+            or _signal_meta.get("materialization_retry_attempt")
             or _preflight_meta.get("recovery_submit_fenced")
             or _preflight_meta.get("recovery_submit_owner")
             or _preflight_meta.get("recovery_submit_generation")
         )
+        if _deferred_history:
+            # A deferred/recovery callback with no provable plan remains owned
+            # by the watcher; it must not enter selector or broker work.
+            if _preflight_plan is None and queue_local_order_id:
+                _preflight_plan = self._recover_plan_for_revalidation(watched)
+            if _preflight_plan is None:
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_PLAN_RECOVERY_FAILED",
+                    "retry_after_seconds": 5,
+                }
+            _preflight_contract = str(
+                getattr(_preflight_plan, "contract_symbol", "") or ""
+            ).strip()
+            _preflight_meta = getattr(_preflight_plan, "metadata", None) or {}
+            if not isinstance(_preflight_meta, dict):
+                _preflight_meta = {}
+            _preflight_contract_upper = _preflight_contract.upper()
         _durable_contract = ""
         _durable_row_read = False
         _durable_row = None
@@ -5200,10 +5234,16 @@ class APExecutionCore:
         # 3) Recover the already-approved queue/OSM plan.
         approved_plan = _preflight_plan
         if approved_plan is None:
+            # Ordinary callbacks keep committed-main sequencing: recover the
+            # approved plan at this point, after the breach risk gate. The
+            # deferred/recovery path has already recovered and proven it
+            # before entering that gate above.
+            approved_plan = self._recover_plan_for_revalidation(watched)
+        if approved_plan is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing after breach revalidation", ticker)
-            # NOTE: _deferred is not yet known here, and an invalid/missing plan
-            # is not a deferred-selection outcome — do not emit a deferred
-            # outcome. _terminalize_breach_failure records this terminal state.
+            # An invalid/missing plan is not a deferred-selection outcome — do
+            # not emit a deferred outcome. _terminalize_breach_failure records
+            # this terminal state.
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
