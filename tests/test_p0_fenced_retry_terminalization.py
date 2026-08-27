@@ -1327,7 +1327,7 @@ def test_final_materialization_retry_early_osm_rejection_uses_fenced_terminal():
     core.mode = "PAPER"
     core.order_state_machine = _OSM()
     core.store = MagicMock()
-    core._breach_risk_check = lambda watched, **_kwargs: True
+    core._breach_risk_check = lambda watched: True
 
     plan = SimpleNamespace(
         client_id=CLIENT_ID,

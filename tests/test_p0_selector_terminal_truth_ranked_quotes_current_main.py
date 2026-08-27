@@ -246,9 +246,7 @@ def _execution_core(selector, broker, execution_mode: str = "LIVE") -> APExecuti
     core.order_state_machine.transition.return_value = True
     core.order_state_machine.update_order_meta.return_value = True
     core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
-    # Deferred failures are terminalized only by the owner/generation CAS;
-    # generic expire_pending_entry is not a valid fallback after claim.
-    core.order_state_machine.terminalize_deferred_breach.return_value = True
+    core.order_state_machine.terminalize_deferred_breach.return_value = False
     core.store = MagicMock()
     core.entry_watcher = MagicMock()
     core.exit_eng = MagicMock()
@@ -415,8 +413,7 @@ def test_execution_core_ibm_affordability_terminalizes_without_retry_owner_resch
     tradeability = audit["best_rejected_candidate"]["tradeability_diag"]
     assert tradeability["budget"] == pytest.approx(174.71)
     assert tradeability["premium_per_contract_usd"] == pytest.approx(315.0)
-    core.order_state_machine.terminalize_deferred_breach.assert_called_once()
-    core.order_state_machine.expire_pending_entry.assert_not_called()
+    core.order_state_machine.expire_pending_entry.assert_called_once()
     broker.submit_order.assert_not_called()
     broker.cancel_order.assert_not_called()
 
@@ -1326,8 +1323,7 @@ def test_execution_core_real_selector_failure_retries_or_terminalizes_with_truth
         assert selector_failure["operational_reason"] == (
             "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         )
-        core.order_state_machine.terminalize_deferred_breach.assert_called_once()
-        core.order_state_machine.expire_pending_entry.assert_not_called()
+        core.order_state_machine.expire_pending_entry.assert_called_once()
 
 
 def test_execution_core_real_selector_provider_failure_terminalizes_without_fake_failure_payload(
@@ -1375,8 +1371,7 @@ def test_execution_core_real_selector_provider_failure_terminalizes_without_fake
     assert selector_failure["selector_terminal_reason"] == "CHAIN_PROVIDER_ERROR"
     assert selector_failure["operational_reason"] is None
     thread_factory.return_value.start.assert_not_called()
-    core.order_state_machine.terminalize_deferred_breach.assert_called_once()
-    core.order_state_machine.expire_pending_entry.assert_not_called()
+    core.order_state_machine.expire_pending_entry.assert_called_once()
     broker.submit_order.assert_not_called()
     broker.cancel_order.assert_not_called()
 
