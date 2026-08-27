@@ -768,6 +768,18 @@ def _active_materialization_proof(meta: dict) -> bool:
         return False
 
     # materialization_status must be exactly RUNNING.
+    #
+    # Write-order invariant (GC — PR #521 audit round 3):
+    # The materializer MUST write materialization_status and
+    # materialization_in_flight atomically in a single JSONB update when
+    # transitioning from RUNNING to RETRY_PENDING.  If it writes status
+    # separately (RUNNING → RETRY_PENDING first, in_flight=False second),
+    # there is a window where this proof returns False (status != "RUNNING")
+    # while in_flight is still True and the lease is still future.  Recovery
+    # would then classify the row as STUCK_TRIGGER_READY and terminalize a
+    # live materializer mid-retry.  Violation of this atomicity requirement
+    # cannot be detected or corrected here — it must be enforced in the
+    # materializer's db write path (ap/deferred_materializer.py).
     mat_status = str(meta.get("materialization_status") or "").strip().upper()
     if mat_status != "RUNNING":
         return False

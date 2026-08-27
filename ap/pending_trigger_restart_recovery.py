@@ -352,14 +352,30 @@ class PendingTriggerRestartRecovery:
         # PR #521 amendment (audit Finding 3): MATERIALIZATION_IN_FLIGHT is
         # hoisted BEFORE the second evidence fence.
         #
-        # Rationale: the second evidence fence rejects rows where
-        # trigger_crossed_at is present but trigger_crossed_at_provenance is
-        # absent (crash window).  In that crash window an active materializer
-        # may legitimately own the row — its in-flight flags are written
-        # atomically under its own lease and are independent of the trigger
-        # provenance stamp.  Firing the fence before this check would return
-        # UNRESOLVED and generate a false ownerless alarm even though the
-        # materializer is alive.
+        # Which scenario this protects
+        # ────────────────────────────
+        # The second fence (line 386) fires when _evidence_proven is False AND
+        # the row has passed the first fence (line 301).  The first fence is
+        # bypassed ONLY when watcher_owned is True — so the hoist is
+        # specifically effective for:
+        #
+        #   watcher_owned=True  AND  _evidence_proven=False  AND
+        #   cls=MATERIALIZATION_IN_FLIGHT
+        #
+        # Concrete example: the watcher is still registered for the row
+        # (trigger callback not yet evicted from _pending) while the
+        # deferred materializer concurrently holds the row under its own
+        # lease.  The watcher's registration lets it pass the first fence.
+        # trigger_crossed_at may have been persisted but
+        # trigger_crossed_at_provenance not yet flushed (crash window) →
+        # _evidence_proven=False → without the hoist the second fence would
+        # fire → UNRESOLVED + false ownerless alarm even though the
+        # materializer is alive and the 7-field proof is fully valid.
+        #
+        # For rows where watcher_owned is None or False, the first fence
+        # fires first (line 301) when evidence is also unproven — the hoisted
+        # handler is never reached in that path, and UNRESOLVED is correct
+        # (fail-closed: no watcher owns it AND trigger identity is unproven).
         #
         # Safety: the classification itself is already fail-closed — any
         # missing/expired proof field produces STUCK_TRIGGER_READY, which

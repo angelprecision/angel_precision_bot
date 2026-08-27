@@ -2162,5 +2162,110 @@ class TestInflightWithMatchingProvenance:
             f"Crash-window row with absent provenance must be UNRESOLVED; got {outcome}"
         )
         assert len(osm.cancel_calls) == 0, (
-            "No cancel must fire when trigger evidence identity is unproven"
+            "No cancel must fire when trigger evidence identity is unproven (crash window)"
+        )
+
+
+# ── Finding GB: watcher_owned=True + MATERIALIZATION_IN_FLIGHT ────────────────
+
+class TestWatcherOwnedWithInflight:
+    """PR #521 audit round 3 — Finding GB.
+
+    The F3 hoist is specifically effective when:
+      watcher_owned=True (first fence bypassed) AND
+      _evidence_proven=False (second fence would fire) AND
+      cls=MATERIALIZATION_IN_FLIGHT
+
+    Without the hoist the second fence returns UNRESOLVED.
+    With the hoist MATERIALIZATION_IN_FLIGHT is checked first → MATERIALIZATION_OWNED.
+
+    These tests mock _check_watcher_owns to return True, simulating a watcher
+    that is still registered while an active materializer concurrently holds
+    the row (e.g. watcher callback fired but not yet evicted from _pending).
+    """
+
+    def _live_recovery(self, row: dict):
+        osm = _MockOSM()
+        osm.seed(row)
+        rec = PendingTriggerRestartRecovery(
+            client_id=row["client_id"],
+            execution_mode=row["execution_mode"],
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            quote_check_fn=lambda *a, **k: False,
+        )
+        return rec, osm
+
+    def test_gb1_watcher_owned_evidence_proven_is_materialization_owned(self):
+        """Happy path: watcher_owned=True, evidence proven (no trigger_crossed_at).
+
+        First fence: watcher_owned=True → bypassed.
+        Classification: MATERIALIZATION_IN_FLIGHT (proof valid).
+        Hoisted handler fires → MATERIALIZATION_OWNED.
+        No mutation.
+        """
+        from unittest.mock import patch
+        row = _tmo_row()
+        # _inflight_meta has no trigger_crossed_at → _evidence_proven=True.
+        rec, osm = self._live_recovery(row)
+        with patch.object(rec, "_check_watcher_owns", return_value=True):
+            outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.MATERIALIZATION_OWNED, (
+            f"watcher_owned=True + inflight + proven evidence must be MATERIALIZATION_OWNED; "
+            f"got {outcome}"
+        )
+        assert len(osm.cancel_calls) == 0, "No cancel when materializer owns the row"
+
+    def test_gb2_watcher_owned_unproven_evidence_is_the_hoist_target(self):
+        """The exact case the F3 hoist was designed for:
+        watcher_owned=True, _evidence_proven=False (crossed_at present, no provenance).
+
+        Without the hoist: first fence bypassed (watcher_owned=True), second
+        fence fires (_evidence_proven=False) → UNRESOLVED.
+
+        With the hoist: MATERIALIZATION_IN_FLIGHT check fires BEFORE the second
+        fence → MATERIALIZATION_OWNED.  This test proves the hoist makes a
+        material difference and that removing it would regress to UNRESOLVED.
+        """
+        from unittest.mock import patch
+        row = _tmo_row()
+        meta = _inflight_meta()
+        # Stamp a crossing timestamp without provenance — _evidence_proven=False.
+        meta["trigger_crossed_at"] = "2026-08-25T13:39:27.905000+00:00"
+        row["meta"] = meta
+        rec, osm = self._live_recovery(row)
+        with patch.object(rec, "_check_watcher_owns", return_value=True):
+            outcome = rec.recover_one_row(row)
+        # With hoist in place: MATERIALIZATION_IN_FLIGHT fires before second
+        # fence → MATERIALIZATION_OWNED.
+        assert outcome == _RowOutcome.MATERIALIZATION_OWNED, (
+            f"F3 hoist must fire before second fence for watcher_owned=True + "
+            f"unproven evidence; got {outcome}.  "
+            f"(Without hoist this would be UNRESOLVED — a regression.)"
+        )
+        assert len(osm.cancel_calls) == 0, (
+            "No cancel must fire when materializer owns the row even in crash window"
+        )
+
+    def test_gb3_watcher_owned_failed_inflight_proof_is_unresolved(self):
+        """watcher_owned=True but inflight proof FAILS (in_flight=False) →
+        STUCK_TRIGGER_READY → second fence fires (_evidence_proven=False) →
+        UNRESOLVED.  Confirms fail-closed: watcher_owned=True does not grant
+        blanket protection — the 7-field proof must still pass.
+        """
+        from unittest.mock import patch
+        row = _tmo_row()
+        meta = _inflight_meta(in_flight=False)  # proof fails: in_flight != True
+        meta["trigger_crossed_at"] = "2026-08-25T13:39:27.905000+00:00"
+        row["meta"] = meta
+        rec, osm = self._live_recovery(row)
+        with patch.object(rec, "_check_watcher_owns", return_value=True):
+            outcome = rec.recover_one_row(row)
+        # Proof fails → STUCK_TRIGGER_READY → second fence → UNRESOLVED.
+        assert outcome == _RowOutcome.UNRESOLVED, (
+            f"Failed inflight proof with unproven evidence must be UNRESOLVED; got {outcome}"
+        )
+        assert len(osm.cancel_calls) == 0, (
+            "No cancel when trigger evidence identity is unproven even for watcher-owned row"
         )
