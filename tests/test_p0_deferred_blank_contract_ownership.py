@@ -92,7 +92,10 @@ class _PreflightOSM:
         if self.read_error is not None:
             raise self.read_error
         if self._rows:
-            return copy.deepcopy(self._rows.pop(0))
+            row_or_error = self._rows.pop(0)
+            if isinstance(row_or_error, BaseException):
+                raise row_or_error
+            return copy.deepcopy(row_or_error)
         return None
 
     def claim_deferred_materialization(self, local_order_id, **kwargs):
@@ -217,6 +220,36 @@ def test_unreadable_blank_durable_row_holds_without_mutation():
     assert osm.terminal_calls == []
     selector.select.assert_not_called()
     assert broker.method_calls == []
+
+
+def test_hydration_reread_failure_holds_after_initial_durable_occ_observation():
+    """A failed hydration reread cannot reopen unowned blank-plan selection."""
+    plan = _plan()
+    hydrated_row = _row(contract=REAL_OCC, meta={"contract_deferred": True})
+    blank_row = _row()
+    osm = _PreflightOSM(
+        [hydrated_row, RuntimeError("transient hydration reread failure"), blank_row]
+    )
+    osm.submit_existing_entry = MagicMock()
+    selector = MagicMock()
+    broker = MagicMock()
+    core = _core(osm, selector=selector, broker=broker)
+    core._breach_risk_check = lambda _watched: True
+
+    result = core._on_entry_trigger(_watched(plan))
+
+    assert result == {
+        "disposition": "KEEP_WATCHER",
+        "reason_code": "MATERIALIZATION_OWNERSHIP_UNPROVEN",
+        "retry_after_seconds": 5,
+    }
+    assert osm.get_order_calls == 2  # preflight plus the failed hydration reread
+    assert osm.claim_calls == []
+    assert osm.terminal_calls == []
+    osm.submit_existing_entry.assert_not_called()
+    selector.select.assert_not_called()
+    assert broker.method_calls == []
+    core.master_control.get_entry_capacity.assert_not_called()
 
 
 def test_client_mismatch_holds_before_claim_selector_or_broker():

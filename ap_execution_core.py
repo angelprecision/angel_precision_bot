@@ -5285,6 +5285,29 @@ class APExecutionCore:
                 local_order_id=queue_local_order_id,
                 ticker=ticker,
             )
+        if (
+            _deferred_history
+            and _durable_is_real
+            and not _preflight_is_real
+            and not _hydration_bridge_applied
+        ):
+            # The preflight saw a durable OCC row while the approved plan was
+            # still blank/deferred.  If the follow-up hydration read cannot
+            # consume that row, do not let the stale blank plan fall through
+            # into unowned selector or terminalization work.
+            log.critical(
+                "[%s] MATERIALIZATION_DURABLE_HYDRATION_UNPROVEN order=%s "
+                "preflight_contract=%r durable_contract=%r",
+                ticker,
+                queue_local_order_id,
+                _preflight_contract,
+                _durable_contract,
+            )
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "MATERIALIZATION_OWNERSHIP_UNPROVEN",
+                "retry_after_seconds": 5,
+            }
         _hydrated_master_control = getattr(self, "master_control", None)
         if _hydration_bridge_applied:
             if _hydrated_master_control is None:
