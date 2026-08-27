@@ -2657,22 +2657,25 @@ def _set_active_materialization(
     })
 
 
-def _configure_pr524_ordinary_fixture(osm, core, watcher, plan):
-    """Turn the deferred harness into a normal, already-selected PAPER entry."""
+def _configure_pr524_ordinary_fixture(
+    osm, core, watcher, plan, *, execution_mode="paper"
+):
+    """Turn the deferred harness into a normal, already-selected entry."""
     contract = "C260828C00133000"
     crossed_at = _iso(_now() - timedelta(seconds=10))
+    mode = str(execution_mode).strip().lower()
 
-    osm.execution_mode = "paper"
+    osm.execution_mode = mode
     osm.row.update({
         "symbol": "C",
-        "execution_mode": "paper",
+        "execution_mode": mode,
         "contract": contract,
         "limit_price": 1.28,
         "qty": 1,
         "reserved_cost": 128.0,
     })
     osm.row["meta"] = {
-        "execution_mode": "paper",
+        "execution_mode": mode,
         "contract_deferred": False,
         "trigger_crossed_at": crossed_at,
         "trigger_price": 130.0,
@@ -2683,17 +2686,17 @@ def _configure_pr524_ordinary_fixture(osm, core, watcher, plan):
     plan.contract_symbol = contract
     plan.limit_price = 1.28
     plan.max_position_usd = 128.0
-    plan.execution_mode = "paper"
+    plan.execution_mode = mode
     plan.metadata = {
-        "execution_mode": "paper",
+        "execution_mode": mode,
         "contract_deferred": False,
         "trigger_crossed_at": crossed_at,
     }
-    core.execution_mode = "paper"
-    core.mode = "PAPER"
-    core.paper = True
-    core.master_control.mode = "PAPER"
-    watcher.mode = "PAPER"
+    core.execution_mode = mode
+    core.mode = mode.upper()
+    core.paper = mode == "paper"
+    core.master_control.mode = mode.upper()
+    watcher.mode = mode.upper()
 
 
 def test_pr514_fresh_deferred_claim_precedes_every_attempt_gate(monkeypatch):
@@ -3286,7 +3289,9 @@ def test_pr524_ordinary_missing_plan_uses_main_failure_path(monkeypatch):
     osm, selector, _mc, core, watcher, plan, trace, stores = (
         _pr514_ownership_fixture(monkeypatch)
     )
-    _configure_pr524_ordinary_fixture(osm, core, watcher, plan)
+    _configure_pr524_ordinary_fixture(
+        osm, core, watcher, plan, execution_mode="live"
+    )
     core._breach_risk_check = lambda _watched: (trace.append("risk") or True)
     core._recover_plan_for_revalidation = lambda _watched: (
         trace.append("recover") or None
@@ -3320,6 +3325,42 @@ def test_pr524_ordinary_missing_plan_uses_main_failure_path(monkeypatch):
         )
         for args, _kwargs in stores["signal"]
     )
+
+
+def test_pr524_deferred_missing_plan_keeps_materialization_boundary(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    core._breach_risk_check = lambda _watched: pytest.fail(
+        "deferred plan recovery failure reached ordinary risk work"
+    )
+    core._recover_plan_for_revalidation = lambda _watched: None
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_ownership_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.signal.pop("_approved_plan", None)
+        result = watcher.on_trigger(watched)
+
+    assert result == {
+        "disposition": "KEEP_WATCHER",
+        "reason_code": "MATERIALIZATION_PLAN_RECOVERY_FAILED",
+        "retry_after_seconds": 5,
+    }
+    assert selector.calls == 0
+    assert osm.post_payloads == []
+    assert trace == []
+    assert stores["status"] == []
+    assert stores["signal"] == []
 
 
 def test_pr524_recovery_materialization_broker_ready_gate_uses_exact_terminal_cas(
