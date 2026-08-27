@@ -3451,6 +3451,78 @@ def test_pr524_recovery_materialization_broker_ready_gate_uses_exact_terminal_ca
 
 
 @pytest.mark.parametrize(
+    ("terminalize_ok", "expected_disposition"),
+    [(True, "TERMINAL_DURABLE"), (False, "KEEP_WATCHER")],
+)
+def test_pr524_owned_late_terminal_cas_disposition_reaches_callback(
+    monkeypatch, terminalize_ok, expected_disposition
+):
+    osm, selector, master_control, core, watcher, plan, _trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    owner = "recovery_retry:late-terminal"
+    _set_active_materialization(osm, owner=owner, generation=7, attempt=1)
+    master_control.final_ok_sequence = [True, True]
+    master_control.final_reason_sequence = [
+        "EXPOSURE_ALLOWED",
+        "EXPOSURE_ALLOWED",
+    ]
+    terminalization_calls = []
+    original_terminalize = osm.terminalize_owned_broker_ready_materialization
+
+    def _terminalize(local_order_id, **kwargs):
+        terminalization_calls.append(dict(kwargs))
+        if not terminalize_ok:
+            return False
+        return original_terminalize(local_order_id, **kwargs)
+
+    osm.terminalize_owned_broker_ready_materialization = _terminalize
+
+    def _raise_confirmation(*_args, **_kwargs):
+        raise RuntimeError("confirmation_probe")
+
+    marker = {
+        "_recovery_pre_claimed": True,
+        "_recovery_pre_claimed_owner": owner,
+        "_recovery_pre_claimed_generation": 7,
+        "_recovery_pre_claimed_attempt": 1,
+        "_recovery_pre_claimed_client_id": CLIENT_ID,
+        "_recovery_pre_claimed_mode": "live",
+    }
+
+    with patch.dict(
+        sys.modules,
+        {"ap.execution": _pr514_ownership_execution_module()},
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        side_effect=_raise_confirmation,
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(plan, LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        watched.signal.update(marker)
+        result = watcher.on_trigger(watched)
+
+    assert result["disposition"] == expected_disposition
+    assert selector.calls == 1
+    assert len(terminalization_calls) == 1
+    assert osm.post_payloads == []
+    if terminalize_ok:
+        assert result["reason_code"] == "entry_confirm_error:confirmation_probe"
+        assert osm.row["status"] == "EXPIRED"
+    else:
+        assert result == {
+            "disposition": "KEEP_WATCHER",
+            "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+            "retry_after_seconds": 5,
+        }
+        assert osm.row["status"] == "PENDING_TRIGGER"
+        assert osm.row["meta"]["lifecycle_state"] == "BROKER_READY"
+
+
+@pytest.mark.parametrize(
     ("identity_field", "drifted_value"),
     [
         ("direction", "PUT"),
