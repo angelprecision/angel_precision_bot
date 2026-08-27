@@ -284,6 +284,44 @@ def test_historical_terminal_sells_without_fill_do_not_block_replacement():
     assert broker.cancel_calls == []
 
 
+def test_identical_historical_filled_order_in_both_snapshots_uses_current_position_once():
+    historical = _stop("history-x", status="filled", executed=1)
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[historical], [dict(historical)]],
+    )
+    result = _run(broker)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
+    assert broker.cancel_calls == []
+
+
+def test_terminal_fill_delta_does_not_get_subtracted_from_final_position():
+    initial = _stop("history-x", status="canceled", executed=0)
+    final = _stop("history-x", status="canceled", executed=1)
+    broker = _Broker(
+        positions=[[_position(2)], [_position(1)]],
+        orders=[[initial], [final]],
+    )
+    result = _run(broker, qty=2)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
+    assert broker.cancel_calls == []
+
+
+def test_duplicate_terminal_order_id_is_not_multiple_terminal_fills():
+    historical = _stop("history-x", status="canceled", executed=0)
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[historical], [dict(historical)]],
+    )
+    result = _run(broker)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
+    assert result["reason"] == "EXIT_PROTECTIVE_NO_CONFLICT"
+    assert broker.cancel_calls == []
+
+
 def test_post_takeover_reinventory_blocks_external_exact_active_sell():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],

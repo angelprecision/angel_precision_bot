@@ -535,6 +535,48 @@ def _terminal_order_outcome(
     return status, int(consumed), None
 
 
+def _merge_terminal_order_history(
+    *snapshots: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    """Merge terminal rows by broker ID and reject inconsistent transitions.
+
+    A broker order can legitimately be present in both inventory snapshots.
+    Its execution is cumulative, so the second observation is not a second
+    fill.  The returned records are used only for race/ambiguity detection;
+    current broker position truth remains the sole replacement-size authority.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        for order in snapshot:
+            raw = order.get("raw") if isinstance(order, dict) else None
+            raw = raw if isinstance(raw, dict) else {}
+            broker_order_id = str(
+                raw.get("id") or raw.get("order_id") or ""
+            ).strip()
+            if not broker_order_id:
+                return {}, "order_id_unproven"
+            current = dict(order)
+            previous = by_id.get(broker_order_id)
+            if previous is not None:
+                if current.get("status") != previous.get("status"):
+                    return {}, "status_transition"
+                if current.get("qty") != previous.get("qty"):
+                    return {}, "quantity_transition"
+                try:
+                    exec_delta = int(current.get("executed", 0)) - int(previous.get("executed", 0))
+                except (TypeError, ValueError):
+                    return {}, "quantity_unproven"
+                if exec_delta < 0:
+                    return {}, "quantity_transition"
+                try:
+                    if int(current.get("remaining", 0)) > int(previous.get("remaining", 0)):
+                        return {}, "quantity_transition"
+                except (TypeError, ValueError):
+                    return {}, "quantity_unproven"
+            by_id[broker_order_id] = current
+    return by_id, None
+
+
 def resolve_protective_exit_takeover(
     *,
     broker: Any,
@@ -642,17 +684,16 @@ def resolve_protective_exit_takeover(
                         consumed = evidence["qty"] - evidence["remaining"]
                     else:
                         consumed = evidence["qty"]
-                if consumed > 0:
-                    terminal_orders.append(
-                        {
-                            "raw": row,
-                            "status": status,
-                            "qty": evidence["qty"],
-                            "executed": evidence["executed"],
-                            "remaining": evidence["remaining"],
-                            "consumed": int(consumed),
-                        }
-                    )
+                terminal_orders.append(
+                    {
+                        "raw": row,
+                        "status": status,
+                        "qty": evidence["qty"],
+                        "executed": evidence["executed"],
+                        "remaining": evidence["remaining"],
+                        "consumed": int(consumed),
+                    }
+                )
                 continue
             if status not in _ACTIVE_BROKER_SELL_STATUSES:
                 return [], [], "unknown_status"
@@ -707,19 +748,30 @@ def resolve_protective_exit_takeover(
                 post_takeover_active_sell_count=len(post_active_sells),
             )
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
-        all_terminal_orders = terminal_orders + post_terminal_orders
-        if len(all_terminal_orders) > 1:
+        terminal_by_id, terminal_history_issue = _merge_terminal_order_history(
+            terminal_orders, post_terminal_orders,
+        )
+        if terminal_history_issue:
+            audit.update(
+                event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+                reason=terminal_history_issue,
+            )
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+        terminal_fill_ids = {
+            broker_order_id
+            for broker_order_id, order in terminal_by_id.items()
+            if int(order.get("consumed") or 0) > 0
+        }
+        if len(terminal_fill_ids) > 1:
             audit.update(
                 event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
                 reason="multiple_terminal_fills",
-                terminal_sell_count=len(all_terminal_orders),
+                terminal_sell_count=len(terminal_fill_ids),
             )
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
-        consumed_qty = all_terminal_orders[0]["consumed"] if all_terminal_orders else 0
         replacement_qty = min(
             requested_qty,
             max(final_qty, 0),
-            max(initial_qty - consumed_qty, 0),
         )
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_ALLOWED", replacement_qty=replacement_qty)
         return {
