@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
 
@@ -641,6 +642,9 @@ class PendingTriggerClassification:
     WAITING_VALID              = "WAITING_VALID"
     WAITING_RETRYABLE          = "WAITING_RETRYABLE"
 
+    # Active materialization owner — recovery must observe and leave read-only
+    MATERIALIZATION_IN_FLIGHT  = "MATERIALIZATION_IN_FLIGHT"
+
     # Unsafe — must NOT be rearmed; terminal cleanup required
     STUCK_TRIGGER_READY        = "STUCK_TRIGGER_READY"
     STUCK_INVALIDATED          = "STUCK_INVALIDATED"
@@ -711,6 +715,107 @@ def _extract(row: dict, path: str, default=None):
         return default
 
 
+def _parse_iso_classifier(raw) -> Optional[datetime]:
+    """Minimal ISO-8601 parser for the classifier. Returns None on any failure.
+
+    Preserves tzinfo exactly as parsed — callers check for None tzinfo.
+    Never raises.
+    """
+    if not raw:
+        return None
+    try:
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _active_materialization_proof(meta: dict) -> bool:
+    """Return True ONLY when durable, unexpired, current materialization proof exists.
+
+    Binding invariant (PR #521):
+      A PENDING_TRIGGER row with a durably proven, current, unexpired deferred
+      materialization owner is NOT STUCK_TRIGGER_READY and pending-trigger
+      recovery must not terminalize, cancel, rearm, reselect, or advance
+      attempt counters for it.
+
+    ALL of the following must hold — ANY single failure returns False (fail-closed):
+
+      lifecycle_state         == "MATERIALIZING"
+      materialization_status  == "RUNNING"
+      materialization_in_flight  is exactly True (bool, not merely truthy)
+      materialization_owner   non-empty string
+      materialization_generation positive int (isinstance(bool) rejected as invalid)
+      materialization_lease_until parseable, timezone-aware, strictly in the future
+      no canonical terminal materialization_outcome in meta
+
+    Missing, malformed, expired, stale, or identity-conflicting proof receives
+    no protection — existing fail-closed STUCK/recovery behavior remains intact.
+    """
+    if not isinstance(meta, dict):
+        return False
+
+    # Terminal outcome wins over any stale in-flight flags.
+    outcome_raw = str(meta.get("materialization_outcome") or "").strip().upper()
+    if outcome_raw in _TERMINAL_MATERIALIZATION_OUTCOMES:
+        return False
+
+    # lifecycle_state must be exactly MATERIALIZING.
+    lifecycle_state = str(meta.get("lifecycle_state") or "").strip().upper()
+    if lifecycle_state != "MATERIALIZING":
+        return False
+
+    # materialization_status must be exactly RUNNING.
+    mat_status = str(meta.get("materialization_status") or "").strip().upper()
+    if mat_status != "RUNNING":
+        return False
+
+    # materialization_in_flight must be the bool literal True.
+    # Any other value — False, None, 1, "true", non-bool truthy — fails closed.
+    in_flight = meta.get("materialization_in_flight")
+    if in_flight is not True:
+        return False
+
+    # materialization_owner must be a non-empty string.
+    owner = meta.get("materialization_owner")
+    if not isinstance(owner, str) or not owner.strip():
+        return False
+
+    # materialization_generation must be a positive integer.
+    # bool is rejected even though bool subclasses int (True==1, False==0).
+    generation = meta.get("materialization_generation")
+    if isinstance(generation, bool):
+        return False
+    try:
+        gen_int = int(generation)
+    except (TypeError, ValueError):
+        return False
+    if gen_int <= 0:
+        return False
+
+    # materialization_lease_until must be parseable, timezone-aware, in the future.
+    lease_raw = meta.get("materialization_lease_until")
+    if not lease_raw:
+        return False
+    lease_dt = _parse_iso_classifier(lease_raw)
+    if lease_dt is None:
+        return False
+    if lease_dt.tzinfo is None:
+        # Timezone-naive lease is rejected — cannot safely compare to UTC now.
+        return False
+    try:
+        now_utc = datetime.now(timezone.utc)
+    except Exception:
+        return False
+    if lease_dt <= now_utc:
+        # Expired lease receives no protection.
+        return False
+
+    return True
+
+
 def classify_pending_trigger_row(
     row: dict,
     *,
@@ -768,10 +873,15 @@ def classify_pending_trigger_row(
         restart_rearm_status = str(meta.get("restart_rearm_status") or "").strip().upper()
         restart_rearm_next_at = meta.get("restart_rearm_next_at")
 
-        # ── Priority 1: trigger_ready without broker_order_id is the zombie ──
-        # A watcher decided the row should submit, but broker never accepted.
-        # In LIVE this is NEVER rescuable — the trigger decision is stale.
+        # ── Priority 1: trigger_ready ──
+        # When watcher_reason is trigger_ready the watcher fired a callback
+        # but the broker never accepted.  In LIVE this is normally a zombie.
+        # EXCEPTION (PR #521): if a durably proven, current, unexpired
+        # deferred materialization owner holds this row, recovery must not
+        # terminalize it — the materializer alone resolves the attempt.
         if watcher_reason == "trigger_ready":
+            if _active_materialization_proof(meta):
+                return PendingTriggerClassification.MATERIALIZATION_IN_FLIGHT
             return PendingTriggerClassification.STUCK_TRIGGER_READY
 
         # ── Priority 2: real invalidation reason ──

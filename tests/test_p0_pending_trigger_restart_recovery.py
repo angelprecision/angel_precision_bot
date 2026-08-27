@@ -1419,3 +1419,601 @@ class TestAmendment10Required:
         assert result is None, (
             f"No entry_watcher → must return None (unavailable), not False; got {result}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PR #521 — P0 MATERIALIZATION_IN_FLIGHT fence
+#
+# Binding invariant: a PENDING_TRIGGER row with a durably proven, current,
+# unexpired deferred materialization owner is NOT STUCK_TRIGGER_READY and
+# pending-trigger recovery must not terminalize, cancel, rearm, reselect, or
+# advance attempt counters for it.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from datetime import datetime, timezone, timedelta
+
+
+def _inflight_meta(
+    *,
+    owner: str = "materializer:jasoncosby1@gmail.com:live:d470966d",
+    generation: int = 1,
+    lease_future_secs: int = 60,
+    in_flight: object = True,
+    lifecycle_state: str = "MATERIALIZING",
+    mat_status: str = "RUNNING",
+    outcome: str = "",
+) -> dict:
+    """Build a valid active-materialization meta dict."""
+    lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_future_secs)).isoformat()
+    m = {
+        "watcher_audit": {"reason_code": "trigger_ready"},
+        # trigger_crossed_at intentionally absent — not a materialization proof
+        # field; its presence requires matching trigger_crossed_at_provenance
+        # which the test harness does not carry.  The evidence-identity fence
+        # in _recover_one passes when raw_crossed_at is None (no crossing yet).
+        "trigger_price": 151.50,
+        "lifecycle_state": lifecycle_state,
+        "materialization_status": mat_status,
+        "materialization_in_flight": in_flight,
+        "materialization_owner": owner,
+        "materialization_generation": generation,
+        "materialization_lease_until": lease,
+    }
+    if outcome:
+        m["materialization_outcome"] = outcome
+    return m
+
+
+def _tmo_row(**overrides) -> dict:
+    """Recreate the exact production TMO row from the 2026-08-25 incident."""
+    base = {
+        "local_order_id": "d470966d-9fe1-4d30-b2d5-b7afbc8fb387",
+        "signal_id":      "2e0afecd-224c-415e-82a4-17494ac4acb1",
+        "client_id":      "jasoncosby1@gmail.com",
+        "client_email":   "jasoncosby1@gmail.com",
+        "execution_mode": "live",
+        "status":         "PENDING_TRIGGER",
+        "direction":      "CALL",
+        "ticker":         "TMO",
+        "entry_price":    151.50,
+        "stop_price":     149.00,
+        "target_price":   155.00,
+        "contract":       "DEFERRED:TMO",
+        "meta":           _inflight_meta(
+            owner="materializer:jasoncosby1@gmail.com:live:d470966d-9fe1-4d30-b2d5-b7afbc8fb387",
+            generation=1,
+        ),
+    }
+    base.update(overrides)
+    return base
+
+
+# ── Classifier-level tests ────────────────────────────────────────────────────
+
+class TestClassifierMaterializationInFlight:
+    """classifier-only tests (no OSM/watcher needed)."""
+
+    def test_fail_first_trigger_ready_plus_active_proof_was_stuck(self):
+        """
+        FAIL-FIRST — reproduces the exact production race on unmodified base.
+
+        Before PR #521 the classifier returned STUCK_TRIGGER_READY for any
+        trigger_ready row regardless of active materialization state.
+
+        After PR #521 the classifier must return MATERIALIZATION_IN_FLIGHT.
+        Record the failing assertion here so reviewers can confirm the
+        before/after switch.
+        """
+        from ap.pending_trigger_classifier import (
+            classify_pending_trigger_row,
+            PendingTriggerClassification as PTC,
+        )
+        row = _tmo_row()
+        cls = classify_pending_trigger_row(row, watcher_owned=False)
+        # On the FIXED codebase this must be MATERIALIZATION_IN_FLIGHT.
+        # On the unmodified base this would have been STUCK_TRIGGER_READY.
+        assert cls == PTC.MATERIALIZATION_IN_FLIGHT, (
+            f"Expected MATERIALIZATION_IN_FLIGHT for trigger_ready + active proof; "
+            f"got {cls!r} — STUCK_TRIGGER_READY would indicate the pre-PR #521 race "
+            f"is still present."
+        )
+
+    def test_classifier_trigger_ready_no_proof_still_stuck(self):
+        """trigger_ready without any materialization metadata remains STUCK_TRIGGER_READY."""
+        from ap.pending_trigger_classifier import (
+            classify_pending_trigger_row,
+            PendingTriggerClassification as PTC,
+        )
+        row = _row(
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",
+            meta={"watcher_audit": {"reason_code": "trigger_ready"}},
+        )
+        cls = classify_pending_trigger_row(row, watcher_owned=False)
+        assert cls == PTC.STUCK_TRIGGER_READY
+
+    def test_classifier_active_proof_returns_in_flight(self):
+        """Full valid proof → MATERIALIZATION_IN_FLIGHT."""
+        from ap.pending_trigger_classifier import (
+            classify_pending_trigger_row,
+            PendingTriggerClassification as PTC,
+        )
+        row = _tmo_row()
+        assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.MATERIALIZATION_IN_FLIGHT
+
+
+# ── Recovery-level tests (full action path) ───────────────────────────────────
+
+class TestMaterializationInFlightFence:
+    """
+    PR #521 primary regression + negative controls.
+
+    All tests use the real PendingTriggerRestartRecovery action path,
+    not only the classifier.
+    """
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _live_recovery(self, row, **kw):
+        """Build a live-mode recovery engine seeded with `row`."""
+        osm = _MockOSM()
+        osm.seed(row)
+        rec = PendingTriggerRestartRecovery(
+            client_id=row["client_id"],
+            execution_mode=row["execution_mode"],
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            quote_check_fn=lambda *a, **k: False,
+            **kw,
+        )
+        return rec, osm
+
+    # ── Primary TMO regression ────────────────────────────────────────────────
+
+    def test_tmo_replay_recovery_observes_and_leaves_read_only(self):
+        """
+        Primary regression — exact 2026-08-25 production identity.
+
+        client_id      = jasoncosby1@gmail.com
+        execution_mode = live
+        ticker         = TMO
+        signal_id      = 2e0afecd-224c-415e-82a4-17494ac4acb1
+        local_order_id = d470966d-9fe1-4d30-b2d5-b7afbc8fb387
+
+        Recovery must:
+          classification == MATERIALIZATION_IN_FLIGHT
+          outcome        == MATERIALIZATION_OWNED (or exact dedicated equivalent)
+
+        And must perform ZERO of:
+          terminalize calls, rearm calls, selector calls, capacity/revalidation
+          calls, broker submits, broker cancels, position/proof/queue mutations.
+        """
+        row = _tmo_row()
+        rec, osm = self._live_recovery(row)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.MATERIALIZATION_OWNED, (
+            f"TMO replay: expected MATERIALIZATION_OWNED, got {outcome!r}"
+        )
+        # owner unchanged — no cancel call
+        assert len(osm.cancel_calls) == 0, (
+            f"TMO replay: recovery must not cancel under active materializer; "
+            f"cancel_calls={osm.cancel_calls}"
+        )
+        # No meta writes that advance attempt counters or reschedule
+        forbidden_keys = {
+            "materialization_attempts",
+            "materialization_next_retry_at",
+            "restart_rearm_status",
+            "restart_rearm_attempt",
+            "restart_recovery_terminal_reason",
+        }
+        for _oid, patch in osm.meta_writes:
+            overlap = forbidden_keys & set(patch.keys())
+            assert not overlap, (
+                f"TMO replay: recovery wrote forbidden keys under active materializer: "
+                f"{overlap}"
+            )
+
+    def test_tmo_replay_summary_ownerless_zero(self):
+        """recover_all summary must report ownerless=0 for the TMO row."""
+        row = _tmo_row()
+        rec, osm = self._live_recovery(row)
+        summary = rec.recover_all([row])
+        assert summary["ownerless_rows_remaining"] == 0, (
+            f"TMO replay: ownerless_rows_remaining must be 0; summary={summary}"
+        )
+        assert summary["materialization_in_flight_count"] == 1
+
+    # ── Negative control 1: trigger_ready with NO materialization → STUCK ─────
+
+    def test_nc1_trigger_ready_no_mat_meta_is_stuck(self):
+        """trigger_ready + no materialization metadata → STUCK (terminalized)."""
+        row = _tmo_row(meta={"watcher_audit": {"reason_code": "trigger_ready"},
+                              "trigger_price": 151.50})
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.TERMINALIZED, f"got {outcome}"
+        assert len(osm.cancel_calls) == 1
+
+    # ── Negative control 2: materialization_in_flight=false not protected ─────
+
+    def test_nc2_in_flight_false_not_protected(self):
+        """materialization_in_flight=False → not protected → STUCK."""
+        meta = _inflight_meta(in_flight=False)
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.TERMINALIZED, f"got {outcome}"
+
+    # ── Negative control 3: lifecycle_state missing / wrong ──────────────────
+
+    @pytest.mark.parametrize("bad_state", ["", None, "PENDING_TRIGGER", "SUBMITTED"])
+    def test_nc3_wrong_lifecycle_state_not_protected(self, bad_state):
+        """lifecycle_state != MATERIALIZING → not protected."""
+        meta = _inflight_meta(lifecycle_state=bad_state or "")
+        meta["lifecycle_state"] = bad_state  # allow None to reach the check
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.TERMINALIZED, f"bad_state={bad_state!r} got {outcome}"
+
+    # ── Negative control 4: materialization_status missing ───────────────────
+
+    @pytest.mark.parametrize("bad_status", ["", None, "RETRY_PENDING", "COMPLETED"])
+    def test_nc4_wrong_mat_status_not_protected(self, bad_status):
+        """materialization_status != RUNNING → not protected."""
+        meta = _inflight_meta(mat_status=bad_status or "RUNNING")
+        if bad_status is None:
+            meta.pop("materialization_status", None)
+        elif bad_status == "":
+            meta["materialization_status"] = ""
+        else:
+            meta["materialization_status"] = bad_status
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.TERMINALIZED, f"bad_status={bad_status!r} got {outcome}"
+
+    # ── Negative control 5: RETRY_PENDING uses existing retry behavior ────────
+
+    def test_nc5_retry_pending_uses_existing_behavior_not_inflight(self):
+        """RETRY_PENDING + trigger_ready → NOT protected as in-flight (uses retry path)."""
+        from ap.pending_trigger_classifier import (
+            classify_pending_trigger_row, PendingTriggerClassification as PTC,
+        )
+        # A row that has RETRY_PENDING (not RUNNING) should NOT be MATERIALIZATION_IN_FLIGHT
+        meta = _inflight_meta(mat_status="RETRY_PENDING")
+        row = _tmo_row(meta=meta)
+        cls = classify_pending_trigger_row(row, watcher_owned=False)
+        assert cls != PTC.MATERIALIZATION_IN_FLIGHT, (
+            f"RETRY_PENDING must not be protected as in-flight; got {cls}"
+        )
+
+    # ── Negative control 6: terminal outcome wins over stale in-flight flags ──
+
+    @pytest.mark.parametrize("terminal_outcome", [
+        "TERMINAL_NO_TRADEABLE_CONTRACT",
+        "TERMINAL_QUALITY_REJECT",
+        "TERMINAL_MATERIALIZATION_FAILED",
+        "FAILED_TERMINAL",
+    ])
+    def test_nc6_terminal_outcome_wins(self, terminal_outcome):
+        """Terminal materialization_outcome wins over stale in-flight flags."""
+        meta = _inflight_meta(outcome=terminal_outcome)
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        # terminal outcome → STUCK_TERMINAL_MATERIALIZATION → terminalized
+        assert outcome == _RowOutcome.TERMINALIZED, (
+            f"terminal_outcome={terminal_outcome!r} should terminate; got {outcome}"
+        )
+
+    # ── Negative control 7: owner missing / blank ─────────────────────────────
+
+    @pytest.mark.parametrize("bad_owner", ["", None, "   "])
+    def test_nc7_owner_missing_not_protected(self, bad_owner):
+        """materialization_owner missing/blank → not protected."""
+        meta = _inflight_meta(owner=bad_owner or "")
+        if bad_owner is None:
+            meta.pop("materialization_owner", None)
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.TERMINALIZED, f"bad_owner={bad_owner!r} got {outcome}"
+
+    # ── Negative control 8: generation missing / zero / negative / bool ───────
+
+    @pytest.mark.parametrize("bad_gen", [0, -1, None, True, False, "abc"])
+    def test_nc8_bad_generation_not_protected(self, bad_gen):
+        """Invalid materialization_generation → not protected."""
+        meta = _inflight_meta(generation=bad_gen if bad_gen != 0 else 1)
+        meta["materialization_generation"] = bad_gen
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.TERMINALIZED, f"bad_gen={bad_gen!r} got {outcome}"
+
+    # ── Negative control 9: lease missing / malformed / naive / expired ───────
+
+    def test_nc9a_lease_missing_not_protected(self):
+        """No lease field → not protected."""
+        meta = _inflight_meta()
+        meta.pop("materialization_lease_until", None)
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+
+    def test_nc9b_lease_malformed_not_protected(self):
+        """Unparseable lease → not protected."""
+        meta = _inflight_meta()
+        meta["materialization_lease_until"] = "not-a-datetime"
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+
+    def test_nc9c_lease_naive_not_protected(self):
+        """Timezone-naive lease → not protected."""
+        from datetime import datetime, timedelta
+        naive = (datetime.utcnow() + timedelta(minutes=5)).isoformat()  # no tz
+        meta = _inflight_meta()
+        meta["materialization_lease_until"] = naive
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+
+    def test_nc9d_lease_expired_not_protected(self):
+        """Expired lease (in the past) → not protected."""
+        from datetime import datetime, timezone, timedelta
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        meta = _inflight_meta()
+        meta["materialization_lease_until"] = expired
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+
+    # ── Negative control 10: terminal outcome + stale in-flight ──────────────
+
+    def test_nc10_terminal_outcome_plus_stale_inflight_still_terminal(self):
+        """Terminal outcome overrides all in-flight flags."""
+        meta = _inflight_meta(outcome="TERMINAL_NO_TRADEABLE_CONTRACT")
+        # in_flight=True and all proof fields still present
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+
+    # ── Negative control 11: wrong client_id fails closed ─────────────────────
+
+    def test_nc11_wrong_client_id_fails_closed(self):
+        """Recovery engine with mismatched client_id must return UNRESOLVED (identity fence)."""
+        row = _tmo_row()
+        osm = _MockOSM()
+        osm.seed(row)
+        rec = PendingTriggerRestartRecovery(
+            client_id="different@client.com",  # wrong
+            execution_mode="live",
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            quote_check_fn=lambda *a, **k: False,
+        )
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.UNRESOLVED, (
+            f"Wrong client_id must fail closed; got {outcome}"
+        )
+        assert len(osm.cancel_calls) == 0
+
+    # ── Negative control 12: wrong/missing execution_mode fails closed ────────
+
+    def test_nc12_wrong_execution_mode_fails_closed(self):
+        """Recovery engine with mismatched execution_mode must return UNRESOLVED."""
+        row = _tmo_row()
+        osm = _MockOSM()
+        osm.seed(row)
+        rec = PendingTriggerRestartRecovery(
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="paper",  # wrong — row is live
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            quote_check_fn=lambda *a, **k: False,
+        )
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.UNRESOLVED, (
+            f"Wrong execution_mode must fail closed; got {outcome}"
+        )
+        assert len(osm.cancel_calls) == 0
+
+    def test_nc12b_missing_execution_mode_in_row_fails_closed(self):
+        """Row with blank execution_mode fails closed at identity fence."""
+        row = _tmo_row(execution_mode="")
+        osm = _MockOSM()
+        osm.seed(row)
+        rec = PendingTriggerRestartRecovery(
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            quote_check_fn=lambda *a, **k: False,
+        )
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.UNRESOLVED
+
+    # ── Negative control 13: missing local_order_id fails closed ──────────────
+
+    def test_nc13_missing_local_order_id_fails_closed(self):
+        """Row with blank local_order_id → UNRESOLVED before any classification."""
+        row = _tmo_row(local_order_id="")
+        row["local_order_id"] = ""
+        osm = _MockOSM()
+        rec = PendingTriggerRestartRecovery(
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+        )
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.UNRESOLVED
+
+    # ── Negative control 14: stale generation cannot protect newer state ──────
+
+    def test_nc14_zero_generation_not_protected(self):
+        """generation=0 is not a positive integer → not protected."""
+        meta = _inflight_meta(generation=0)
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+
+    # ── Negative control 15: broker id / submit evidence stays in broker auth ─
+
+    def test_nc15_broker_order_id_present_not_pending_trigger(self):
+        """Row with broker_order_id is classified NOT_PENDING_TRIGGER by design."""
+        from ap.pending_trigger_classifier import (
+            classify_pending_trigger_row, PendingTriggerClassification as PTC,
+        )
+        row = _tmo_row()
+        row["broker_order_id"] = "BROKER-123"
+        cls = classify_pending_trigger_row(row, watcher_owned=False)
+        assert cls == PTC.NOT_PENDING_TRIGGER
+
+    # ── Negative control 16: non-PENDING_TRIGGER unchanged ───────────────────
+
+    @pytest.mark.parametrize("status", ["FILLED", "CANCELED", "OPEN"])
+    def test_nc16_non_pending_trigger_skipped(self, status):
+        """Non-PENDING_TRIGGER rows are SKIPPED (already resolved)."""
+        row = _tmo_row(status=status)
+        row["status"] = status
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.SKIPPED, f"status={status} got {outcome}"
+        assert len(osm.cancel_calls) == 0
+
+    # ── Negative control 17: PAPER mode isolated from LIVE ───────────────────
+
+    def test_nc17_paper_mode_inflight_also_protected(self):
+        """Protection applies in PAPER mode too — mode is not relaxed."""
+        row = _tmo_row(execution_mode="paper", client_id="paper@test.com")
+        row["meta"] = _inflight_meta(
+            owner="materializer:paper@test.com:paper:d470966d",
+        )
+        osm = _MockOSM()
+        osm.seed(row)
+        rec = PendingTriggerRestartRecovery(
+            client_id="paper@test.com",
+            execution_mode="paper",
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            quote_check_fn=lambda *a, **k: False,
+        )
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.MATERIALIZATION_OWNED, f"got {outcome}"
+        assert len(osm.cancel_calls) == 0
+
+    def test_nc17b_live_recovery_cannot_act_on_paper_row(self):
+        """A LIVE recovery engine must not act on a PAPER row (mode mismatch → UNRESOLVED)."""
+        row = _tmo_row(execution_mode="paper", client_id="jasoncosby1@gmail.com")
+        row["meta"] = _inflight_meta()
+        osm = _MockOSM()
+        osm.seed(row)
+        rec = PendingTriggerRestartRecovery(
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",   # live engine, paper row
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+        )
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
+
+    # ── Negative control 18: cross-client materialization not observable ──────
+
+    def test_nc18_cross_client_materialization_not_protected(self):
+        """A different client's materializer cannot protect another client's row."""
+        row = _tmo_row()
+        # Simulate a different client_id in the row (identity mismatch)
+        row["client_id"] = "other@client.com"
+        row["client_email"] = "other@client.com"
+        rec, osm = self._live_recovery(row)  # uses _tmo_row's client by default
+        # _live_recovery uses row["client_id"] as the engine's client_id,
+        # so build one with a deliberate mismatch instead:
+        osm2 = _MockOSM()
+        osm2.seed(row)
+        rec2 = PendingTriggerRestartRecovery(
+            client_id="jasoncosby1@gmail.com",  # different from row's client
+            execution_mode="live",
+            osm=osm2,
+            entry_watcher=None,
+            broker=None,
+        )
+        outcome = rec2.recover_one_row(row)
+        assert outcome == _RowOutcome.UNRESOLVED, (
+            f"Cross-client row must fail closed; got {outcome}"
+        )
+        assert len(osm2.cancel_calls) == 0
+
+
+# ── Active-proof unit tests (classifier helper) ───────────────────────────────
+
+class TestActiveMaterializationProof:
+    """Unit tests for _active_materialization_proof(meta)."""
+
+    def test_valid_proof_returns_true(self):
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        assert _active_materialization_proof(_inflight_meta()) is True
+
+    def test_not_a_dict_returns_false(self):
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        assert _active_materialization_proof(None) is False
+        assert _active_materialization_proof("string") is False
+
+    def test_in_flight_not_bool_true_rejected(self):
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        for bad in (1, "true", "True", 1.0, False, None, "yes"):
+            meta = _inflight_meta()
+            meta["materialization_in_flight"] = bad
+            assert _active_materialization_proof(meta) is False, f"in_flight={bad!r} should fail"
+
+    def test_generation_bool_rejected(self):
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        meta = _inflight_meta()
+        meta["materialization_generation"] = True  # bool subclasses int, must still reject
+        assert _active_materialization_proof(meta) is False
+
+    def test_generation_zero_rejected(self):
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        meta = _inflight_meta()
+        meta["materialization_generation"] = 0
+        assert _active_materialization_proof(meta) is False
+
+    def test_lease_naive_rejected(self):
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        from datetime import datetime, timedelta
+        naive = (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+        meta = _inflight_meta()
+        meta["materialization_lease_until"] = naive
+        assert _active_materialization_proof(meta) is False
+
+    def test_lease_expired_rejected(self):
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        from datetime import datetime, timezone, timedelta
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        meta = _inflight_meta()
+        meta["materialization_lease_until"] = expired
+        assert _active_materialization_proof(meta) is False
+
+    def test_terminal_outcome_wins(self):
+        from ap.pending_trigger_classifier import _active_materialization_proof
+        for outcome in (
+            "TERMINAL_NO_TRADEABLE_CONTRACT",
+            "TERMINAL_QUALITY_REJECT",
+            "TERMINAL_MATERIALIZATION_FAILED",
+            "FAILED_TERMINAL",
+        ):
+            meta = _inflight_meta(outcome=outcome)
+            assert _active_materialization_proof(meta) is False, f"outcome={outcome}"

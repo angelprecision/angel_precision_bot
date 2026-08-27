@@ -48,12 +48,15 @@ log = get_logger("ap.pending_trigger_restart_recovery")
 # ── Per-row outcome constants (Blocker 2) ─────────────────────────────────────
 
 class _RowOutcome:
-    WATCHER_OWNED = "WATCHER_OWNED"
-    RETRY_OWNED   = "RETRY_OWNED"
-    REARM_OWNED   = "REARM_OWNED"
-    TERMINALIZED  = "TERMINALIZED"
-    UNRESOLVED    = "UNRESOLVED"
-    SKIPPED       = "SKIPPED"   # NOT_PENDING_TRIGGER (already resolved)
+    WATCHER_OWNED          = "WATCHER_OWNED"
+    RETRY_OWNED            = "RETRY_OWNED"
+    REARM_OWNED            = "REARM_OWNED"
+    TERMINALIZED           = "TERMINALIZED"
+    UNRESOLVED             = "UNRESOLVED"
+    SKIPPED                = "SKIPPED"             # NOT_PENDING_TRIGGER (already resolved)
+    # PR #521: active deferred materializer owns the attempt; recovery observes
+    # and departs read-only. No terminalization, rearm, selector, or broker call.
+    MATERIALIZATION_OWNED  = "MATERIALIZATION_OWNED"
 
 
 _TERMINAL_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED", "ERROR"})
@@ -429,6 +432,22 @@ class PendingTriggerRestartRecovery:
                     "first_breach_ask":       _meta.get("first_breach_ask"),
                 },
             )
+
+        elif cls == PTC.MATERIALIZATION_IN_FLIGHT:
+            # PR #521 — Binding invariant: a durably proven, current, unexpired
+            # deferred materializer owns this row. Recovery performs ZERO mutations:
+            # no terminalization, no PENDING_TRIGGER→terminal transition, no
+            # watcher recovery-rearm, no selector/materializer invocation, no
+            # capacity/revalidation, no attempt-counter increment, no
+            # owner/generation replacement, no lease renewal, no retry scheduling,
+            # no broker submit/cancel, no position/proof_trades/queue mutation.
+            # The existing deferred retry scheduler owns any future retry.
+            log.info(
+                "RESTART_RECOVERY_MATERIALIZATION_IN_FLIGHT local=%s "
+                "— active materializer owns attempt; observing read-only",
+                local_oid,
+            )
+            return _RowOutcome.MATERIALIZATION_OWNED
 
         else:
             log.critical(
@@ -1349,6 +1368,7 @@ def _build_summary(
             _RowOutcome.REARM_OWNED,
             _RowOutcome.TERMINALIZED,
             _RowOutcome.SKIPPED,
+            _RowOutcome.MATERIALIZATION_OWNED,  # PR #521: active materializer owns
         }
     }
     return {
@@ -1379,6 +1399,8 @@ def _build_summary(
         "retry_verification_failure_count": sum(
             1 for v in failure_reasons.values() if str(v).startswith("retry_verification:")
         ),
+        # PR #521: rows where an active materializer was observed read-only
+        "materialization_in_flight_count":  _all.count(_RowOutcome.MATERIALIZATION_OWNED),
         # Blocker 2: ownerless = count(UNRESOLVED) — not arithmetic
         "ownerless_rows_remaining":         len(unresolved_row_ids),
         "resolved_row_ids":                 resolved_row_ids,
