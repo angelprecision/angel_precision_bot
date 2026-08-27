@@ -677,6 +677,14 @@ def _reset_direction_reversal_runtime_state(
         signal_meta = {}
         signal["metadata"] = signal_meta
 
+    _ticker_for_rearm = str(
+        getattr(approved_plan, "ticker", None)
+        or getattr(watched, "ticker", None)
+        or signal.get("ticker")
+        or ""
+    ).strip().upper()
+    _deferred_contract = f"DEFERRED:{_ticker_for_rearm}"
+
     prior_crossed_at = (
         signal.get("trigger_crossed_at")
         or plan_meta.get("trigger_crossed_at")
@@ -761,6 +769,15 @@ def _reset_direction_reversal_runtime_state(
         "recovery_owner": recovery_owner if recovery_owned else "",
         "direction_reversal_rearm_requires_watcher": recovery_owned,
         "broker_ready": False,
+        "contract_deferred": True,
+        "contract_selection_status": "REARM_REQUIRED",
+        "contract_symbol": _deferred_contract,
+        "selected_contract": _deferred_contract,
+        "selected_limit": 0,
+        "selected_qty": 0,
+        "selected_reserved_cost": 0,
+        "limit_price": 0,
+        "contracts": 0,
         "retry_attempt": 0,
         "retry_attempt_in_flight": 0,
         "breach_attempt_count": 0,
@@ -864,8 +881,25 @@ def _reset_direction_reversal_runtime_state(
             target.pop(key, None)
 
     signal.update(reset_patch)
+    signal["contract_symbol"] = _deferred_contract
+    signal["selected_contract"] = _deferred_contract
+    signal["contract_deferred"] = True
     for key in active_keys:
         signal.pop(key, None)
+
+    for attr, value in (
+        ("contract_symbol", _deferred_contract),
+        ("limit_price", 0),
+        ("contracts", 0),
+    ):
+        try:
+            setattr(approved_plan, attr, value)
+        except Exception as exc:
+            log.warning(
+                "DIRECTION_REVERSAL_PLAN_FIELD_RESET_FAILED attr=%s err=%s",
+                attr,
+                exc,
+            )
 
     # These fields are valid only for the synthetic in-flight recovery claim
     # that just ended. Leaving them behind makes the next real breach attempt
@@ -8910,6 +8944,8 @@ class APExecutionCore:
                 check_market_validity_gate,
                 check_trigger_age_gate,
                 GateOutcome,
+                MarketTruthAuthority,
+                classify_market_truth,
             )
 
             # Amendment 4 (hardened): collect all 6 client_id sources and verify
@@ -9224,6 +9260,134 @@ class APExecutionCore:
                         "order_id=%s reason=%s error=%s — submit still blocked",
                         ticker, str(queue_local_order_id or ""), _mv_res.reason_code, _mv_meta_exc,
                     )
+                _market_truth_authority = classify_market_truth(_mv_res)
+                if _market_truth_authority == MarketTruthAuthority.REARM_DIRECTION_REVERSAL:
+                    # The final market-validity check runs after deferred
+                    # copyback has moved the broker-unowned row to
+                    # BROKER_READY. Reuse the exact materialization owner and
+                    # generation already established above; never invent a
+                    # new watcher or retry identity at this seam.
+                    _rearm_owner = str(
+                        _deferred_claim_context.get("owner") or ""
+                    ).strip()
+                    _rearm_generation_raw = _deferred_claim_context.get(
+                        "generation"
+                    )
+                    _rearm_generation = None
+                    if not isinstance(_rearm_generation_raw, bool):
+                        try:
+                            if isinstance(_rearm_generation_raw, float) and not _rearm_generation_raw.is_integer():
+                                raise ValueError("fractional generation")
+                            _rearm_generation = int(_rearm_generation_raw)
+                        except (TypeError, ValueError, OverflowError):
+                            _rearm_generation = None
+                    _rearm_client_id = str(
+                        getattr(approved_plan, "client_id", None)
+                        or _gate_client_id
+                        or ""
+                    ).strip()
+                    _rearm_exec_mode = str(
+                        getattr(approved_plan, "execution_mode", None)
+                        or _gate_exec_mode
+                        or ""
+                    ).strip().lower()
+                    _rearm_signal_id = str(
+                        getattr(approved_plan, "signal_id", None)
+                        or signal_id
+                        or ""
+                    ).strip()
+                    _rearm_is_recovery = bool(
+                        isinstance(sig, dict)
+                        and sig.get("_recovery_pre_claimed")
+                    )
+                    _rearm_watcher_token = (
+                        "" if _rearm_is_recovery else _rearm_owner
+                    )
+                    if (
+                        not _rearm_client_id
+                        or _rearm_exec_mode not in {"live", "paper"}
+                        or not _rearm_owner
+                        or not _rearm_signal_id
+                        or _rearm_generation is None
+                        or _rearm_generation < 1
+                    ):
+                        log.critical(
+                            "[%s] LIVE_SUBMIT_GATE_REARM_BLOCKED malformed identity "
+                            "client_id=%r execution_mode=%r owner=%r generation=%r "
+                            "signal_id=%r — retaining watcher",
+                            ticker,
+                            _rearm_client_id,
+                            _rearm_exec_mode,
+                            _rearm_owner,
+                            _rearm_generation_raw,
+                            _rearm_signal_id,
+                        )
+                        return {
+                            "disposition": "KEEP_WATCHER",
+                            "reason_code": "MATERIALIZATION_REARM_WRITE_FAILED",
+                            "local_order_id": str(queue_local_order_id or ""),
+                        }
+
+                    _rearm_fn = getattr(
+                        self.order_state_machine,
+                        "rearm_deferred_materialization_direction_reversal",
+                        None,
+                    )
+                    _rearmed = bool(
+                        callable(_rearm_fn)
+                        and _rearm_fn(
+                            str(queue_local_order_id or ""),
+                            owner=_rearm_owner,
+                            watcher_token=_rearm_watcher_token,
+                            generation=_rearm_generation,
+                            signal_id=_rearm_signal_id,
+                            execution_mode=_rearm_exec_mode,
+                            market_truth_audit=_mv_res.audit,
+                        )
+                    )
+                    if not _rearmed:
+                        return {
+                            "disposition": "KEEP_WATCHER",
+                            "reason_code": "MATERIALIZATION_REARM_WRITE_FAILED",
+                            "local_order_id": str(queue_local_order_id or ""),
+                            "expected_generation": _rearm_generation,
+                        }
+
+                    # Runtime reset is deliberately after the durable CAS.
+                    _reset_direction_reversal_runtime_state(
+                        watched,
+                        approved_plan,
+                        sig,
+                        watcher_token=_rearm_watcher_token,
+                        recovery_owner=(
+                            "" if _rearm_watcher_token else _rearm_owner
+                        ),
+                        generation=_rearm_generation,
+                        market_truth_audit=_mv_res.audit,
+                    )
+                    _rearm_disposition = (
+                        "REARM_WATCHER_REQUIRED"
+                        if not _rearm_watcher_token
+                        else "KEEP_WATCHER"
+                    )
+                    _rearm_meta = getattr(approved_plan, "metadata", None) or {}
+                    if not isinstance(_rearm_meta, dict):
+                        _rearm_meta = {}
+                    return {
+                        "disposition": _rearm_disposition,
+                        "reason_code": "REARM_DIRECTION_REVERSAL",
+                        "local_order_id": str(queue_local_order_id or ""),
+                        "expected_client_id": _rearm_client_id,
+                        "expected_execution_mode": _rearm_exec_mode,
+                        "expected_signal_id": _rearm_signal_id,
+                        "expected_canonical_signal_id": str(
+                            (sig or {}).get("canonical_signal_id")
+                            or _rearm_meta.get("canonical_signal_id")
+                            or ""
+                        ),
+                        "materialization_generation": _rearm_generation,
+                        "expected_generation": _rearm_generation,
+                    }
                 _terminalize_breach_failure(f"live_submit_gate:{_mv_res.reason_code}")
                 return
             # Even on PASS in paper we log the mid so audit trails are complete
