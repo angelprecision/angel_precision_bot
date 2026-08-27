@@ -1155,7 +1155,7 @@ class TestNormalEntryRegressions:
         broker.session.post.assert_not_called()
 
     @pytest.mark.parametrize("execution_mode", ["live", "paper"])
-    def test_materialized_deferred_blank_column_rejects_meta_mode(self, execution_mode):
+    def test_materialized_deferred_blank_column_uses_meta_mode(self, execution_mode):
         osm = _make_osm()
         broker = _broker_post(broker_id=f"BID-META-{execution_mode.upper()}", status_str="open")
         row = _pending_row(execution_mode="")
@@ -1174,12 +1174,11 @@ class TestNormalEntryRegressions:
             osm, broker, row, bypass_entry_guards=True,
         )
 
-        assert result["ok"] is False
-        assert result["error"] == "MATERIALIZATION_EXECUTION_MODE_UNPROVEN"
-        broker.session.post.assert_not_called()
+        assert result["ok"] is True
+        assert broker.session.post.call_count == 1
 
     @pytest.mark.parametrize("execution_mode", ["live", "paper"])
-    def test_recovery_deferred_blank_column_rejects_meta_mode(self, execution_mode):
+    def test_recovery_deferred_blank_column_uses_meta_mode(self, execution_mode):
         osm = _make_osm()
         broker = _broker_post(broker_id=f"BID-RECOVERY-{execution_mode.upper()}", status_str="open")
         row = _pending_row(execution_mode="")
@@ -1205,9 +1204,8 @@ class TestNormalEntryRegressions:
             osm, broker, row, plan=plan, bypass_entry_guards=True,
         )
 
-        assert result["ok"] is False
-        assert result["error"] == "MATERIALIZATION_EXECUTION_MODE_UNPROVEN"
-        broker.session.post.assert_not_called()
+        assert result["ok"] is True
+        assert broker.session.post.call_count == 1
 
     def test_deferred_placeholder_never_reaches_broker(self):
         """DEFERRED: contract is hard-blocked before any POST."""

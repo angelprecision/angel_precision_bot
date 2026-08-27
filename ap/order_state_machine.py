@@ -174,8 +174,8 @@ def _normalize_client_key(client_id: str) -> str:
 def _durable_execution_mode(row: dict, meta: dict | None = None) -> str | None:
     """Resolve the canonical mode stored on an order without runner inference.
 
-    ``orders.execution_mode`` is the durable authority.  Metadata can
-    corroborate it, but can never replace a blank or invalid column value.
+    A valid column value is preferred; valid metadata may fill a blank column.
+    Nonblank malformed values and LIVE/PAPER contradictions fail closed.
     """
     if not isinstance(row, dict):
         return None
@@ -199,25 +199,26 @@ def _durable_execution_mode(row: dict, meta: dict | None = None) -> str | None:
     meta_mode = (
         meta_text.lower() if meta_text.lower() in {"live", "paper"} else None
     )
-    if not column_mode:
-        return None
-    if meta_text and meta_mode is None:
+    if (column_text and column_mode is None) or (meta_text and meta_mode is None):
         return None
     if column_mode and meta_mode and column_mode != meta_mode:
         return None
-    return column_mode
+    return column_mode or meta_mode
 
 
 # Used only by deferred/materialization identity CASes below.  The predicate
-# keeps the SQL authority aligned with _durable_execution_mode(): the canonical
-# column must be valid and match the expected mode; metadata may corroborate it
-# but can never fill a blank column or override the column authority.
+# keeps the SQL authority aligned with _durable_execution_mode(): a valid
+# metadata mode may fill a blank column, while malformed or contradictory
+# durable values fail closed.
 _DURABLE_EXECUTION_MODE_SQL = (
-    "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
-    "AND LOWER(TRIM(COALESCE(execution_mode, ''))) IN ('live', 'paper') "
+    "LOWER(TRIM(COALESCE(NULLIF(TRIM(execution_mode), ''), "
+    "NULLIF(TRIM(meta->>'execution_mode'), ''), ''))) = %s "
+    "AND (NULLIF(TRIM(execution_mode), '') IS NULL "
+    "OR LOWER(TRIM(execution_mode)) IN ('live', 'paper')) "
     "AND (NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL "
     "OR LOWER(TRIM(meta->>'execution_mode')) IN ('live', 'paper')) "
-    "AND (NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL "
+    "AND (NULLIF(TRIM(execution_mode), '') IS NULL "
+    "OR NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL "
     "OR LOWER(TRIM(execution_mode)) = LOWER(TRIM(meta->>'execution_mode')))"
 )
 

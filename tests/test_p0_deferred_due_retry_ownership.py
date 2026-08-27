@@ -2846,8 +2846,8 @@ def _base_meta(*, retry_max_attempts=None, retry_attempt: int = 1) -> dict:
     return m
 
 
-def test_deferred_retry_mode_rejects_metadata_when_column_is_blank(monkeypatch):
-    """Deferred retry requires the canonical orders.execution_mode column."""
+def test_deferred_retry_mode_uses_valid_metadata_when_column_is_blank(monkeypatch):
+    """Deferred retry keeps the canonical column/meta fallback authority."""
     meta = _base_meta(retry_attempt=1)
     meta["execution_mode"] = "paper"
     core, osm = _core_with_row(meta, monkeypatch=monkeypatch, execution_mode="paper")
@@ -2860,8 +2860,8 @@ def test_deferred_retry_mode_rejects_metadata_when_column_is_blank(monkeypatch):
         owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
     )
 
-    assert result["reason_code"] == "RETRY_INVALID_EXECUTION_MODE"
-    core._on_entry_trigger.assert_not_called()
+    assert result["reason_code"] != "RETRY_INVALID_EXECUTION_MODE"
+    core._on_entry_trigger.assert_called_once()
 
 
 def test_deferred_retry_mode_contradiction_fails_closed_before_callback(monkeypatch):

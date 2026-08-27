@@ -2116,7 +2116,7 @@ class APExecutionCore:
             return value if isinstance(value, dict) else None
 
         def _durable_execution_mode(row, meta):
-            """Resolve durable mode from the canonical order column only."""
+            """Resolve durable mode without inferring from the runner."""
             if not isinstance(row, dict) or not isinstance(meta, dict):
                 return None
             column_raw = row.get("execution_mode")
@@ -2129,13 +2129,13 @@ class APExecutionCore:
             meta_mode = (
                 _normalize_execution_mode(meta_text) if meta_text else None
             )
-            if not column_mode:
-                return None
-            if meta_text and meta_mode is None:
+            if (column_text and column_mode is None) or (
+                meta_text and meta_mode is None
+            ):
                 return None
             if column_mode and meta_mode and column_mode != meta_mode:
                 return None
-            return column_mode
+            return column_mode or meta_mode
 
         def _identity(row, meta):
             if not isinstance(meta, dict):
