@@ -647,7 +647,7 @@ def _now_iso() -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Audit additional finding: schedule_deferred_materialization_retry must use
-# the strict canonical execution_mode column and never fall back to metadata.
+# the symmetric normalized durable-mode authority predicate.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestScheduleRetryExecutionModeNormalization:
@@ -682,13 +682,13 @@ class TestScheduleRetryExecutionModeNormalization:
             "whitespace-padded durable execution_mode must still CAS-match"
         )
 
-    def test_empty_column_does_not_fall_back_to_meta_execution_mode(self):
-        """A blank canonical column must fail the retry CAS even with metadata."""
+    def test_empty_column_falls_back_to_trimmed_meta_execution_mode(self):
+        """A blank column may use a valid trimmed metadata mode."""
         _insert_row(
             local_order_id=self.LOID,
             owner="watcher:real-owner",
             generation=1,
-            meta_extra={"execution_mode": "paper"},
+            meta_extra={"execution_mode": " paper "},
         )
         with _pg_conn() as c:
             with c.cursor() as cur:
@@ -706,10 +706,11 @@ class TestScheduleRetryExecutionModeNormalization:
             selector_failure={}, signal_id="sig-item11-1",
             execution_mode="paper",
         )
-        assert ok is False
+        assert ok is True
         after = _fetch_row(self.LOID)
-        assert after["updated_ts"] == before["updated_ts"]
-        assert after["meta"] == before["meta"]
+        assert after["updated_ts"] > before["updated_ts"]
+        assert after["meta"]["execution_mode"] == " paper "
+        assert after["meta"]["materialization_status"] == "RETRY_PENDING"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

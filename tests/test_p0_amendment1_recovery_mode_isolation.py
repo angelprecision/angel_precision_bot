@@ -4,8 +4,8 @@ Proves the required matrix from PR #323 amendment §1:
 
   * paper recovery cannot load or mutate LIVE rows
   * LIVE recovery cannot load or mutate paper rows
-  * blank execution mode is rejected
-  * malformed execution mode is rejected
+  * blank execution mode with no valid mirror is rejected
+  * malformed execution-mode mirrors are rejected
   * matching client but wrong mode cannot be claimed
   * matching mode but wrong client cannot be claimed
 
@@ -13,11 +13,10 @@ Also proves:
 
   * runner mode is resolved once at the top and unknown mode short-circuits
   * OSM.client_id mismatch short-circuits before any DB call
-  * SQL query uses the canonical column execution_mode authority, retains a
-    contradiction fence for metadata, and binds runner mode as its second
-    parameter
-  * `_build_recovery_plan_from_order` no longer infers execution_mode from
-    the runner (Amendment §1 fail-closed rule)
+  * SQL query uses the symmetric normalized column/metadata authority fence
+    and binds runner mode as its second parameter
+  * `_build_recovery_plan_from_order` does not infer execution_mode from the
+    runner; a valid one-sided metadata mirror is allowed
 
 The tests exercise the *real* `_recover_deferred_breach_lifecycles` code
 path with `conn` and `run_with_retry` monkey-patched, mirroring the
@@ -155,8 +154,8 @@ def _row(**overrides):
 
 
 def test_sql_predicate_includes_execution_mode_scoping(db_spy):
-    """The SELECT must use the strict column authority and contradiction
-    fence, then bind the runner mode (lowercase) as the second parameter."""
+    """The SELECT must use the symmetric durable-mode authority predicate
+    and bind the runner mode (lowercase) as the second parameter."""
     sink, state = db_spy
     rec, _, _ = _make_recovery(client_id="jason-live", mode="LIVE")
     state["rows"] = []  # no rows needed to inspect the SQL
@@ -166,9 +165,11 @@ def test_sql_predicate_includes_execution_mode_scoping(db_spy):
 
     assert sink, "expected exactly one SQL execute"
     sql, params = sink[0]
-    assert "LOWER(BTRIM(execution_mode)) = %s" in sql
-    assert "COALESCE(NULLIF(BTRIM(execution_mode), ''), meta->>'execution_mode', '')" not in sql
-    assert "NULLIF(BTRIM(execution_mode), '') IS NULL" not in sql
+    assert "LOWER(BTRIM(COALESCE(" in sql
+    assert "NULLIF(BTRIM(execution_mode), '')" in sql
+    assert "NULLIF(BTRIM(meta->>'execution_mode'), '')" in sql
+    assert "IN ('live', 'paper')" in sql
+    assert "NULLIF(BTRIM(execution_mode), '') IS NULL" in sql
     assert "NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL" in sql
     assert "LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))" in sql
     assert params == ("jason-live", "live")
@@ -411,8 +412,8 @@ def test_plan_from_row_with_valid_mode_lowercases_it():
     assert plan.execution_mode == "live"
 
 
-def test_plan_from_row_with_blank_column_does_not_use_metadata_mode():
-    """A metadata mode cannot make a blank canonical column usable."""
+def test_plan_from_row_with_blank_column_uses_metadata_mode():
+    """A valid metadata mode may fill a blank column mirror."""
     rec, _, _ = _make_recovery(client_id="jason-live", mode="PAPER")
 
     plan = rec._build_recovery_plan_from_order({
@@ -431,10 +432,8 @@ def test_plan_from_row_with_blank_column_does_not_use_metadata_mode():
         "meta": {"execution_mode": "paper"},
     })
 
-    # APStartupRecovery keeps its legacy plan shape for this read-only helper,
-    # but must not put the metadata value into the plan's canonical mode.
     assert plan is not None
-    assert plan.execution_mode == ""
+    assert plan.execution_mode == "paper"
 
 
 def test_plan_from_row_with_conflicting_mode_mirrors_is_rejected():

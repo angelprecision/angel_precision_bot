@@ -109,11 +109,11 @@ def _canonical_execution_mode_value(raw: object) -> str:
 def _resolve_execution_mode(row: dict) -> tuple[Optional[str], Optional[str]]:
     """Resolve one durable row mode without using runner or broker context.
 
-    ``orders.execution_mode`` is the required canonical authority.  Metadata
-    may corroborate that authority, but never replaces a missing column value.
-    Two valid, disagreeing values are an authority conflict, not a repair
-    opportunity.  The resolved value must be one of the two explicitly
-    supported execution modes.
+    A nonblank ``orders.execution_mode`` value and a nonblank metadata mirror
+    are both durable identity claims.  Either claim may supply the mode when
+    the other mirror is blank, but both claims must normalize to one of the
+    two supported modes and must agree when both are present.  A disagreement
+    is an authority conflict, not a repair opportunity.
     """
     durable_row = row if isinstance(row, dict) else {}
     column_mode = _canonical_execution_mode_value(
@@ -122,13 +122,16 @@ def _resolve_execution_mode(row: dict) -> tuple[Optional[str], Optional[str]]:
     meta = _extract_meta(durable_row)
     meta_mode = _canonical_execution_mode_value(meta.get("execution_mode"))
 
-    if column_mode not in _VALID_EXECUTION_MODES:
+    if column_mode and column_mode not in _VALID_EXECUTION_MODES:
         return None, _EXECUTION_MODE_MISSING
     if meta_mode and meta_mode not in _VALID_EXECUTION_MODES:
         return None, _EXECUTION_MODE_INVALID
-    if meta_mode and meta_mode != column_mode:
+    if column_mode and meta_mode and meta_mode != column_mode:
         return None, _EXECUTION_MODE_AUTHORITY_CONFLICT
-    return column_mode, None
+    resolved_mode = column_mode or meta_mode
+    if resolved_mode not in _VALID_EXECUTION_MODES:
+        return None, _EXECUTION_MODE_MISSING
+    return resolved_mode, None
 
 
 # ── Environment-tunable limits ────────────────────────────────────────────────
@@ -283,8 +286,8 @@ class PendingTriggerRestartRecovery:
 
         # Downstream evidence validation and plan builders must see the same
         # canonical durable mode that passed this fence.  In particular, this
-        # prevents any later Python ``or`` expression from treating metadata
-        # as a replacement for the required column authority.
+        # keeps the SQL CAS and Python resolver on the same symmetric,
+        # contradiction-fenced durable-mode contract.
         row["execution_mode"] = row_mode
 
         # Identity fence: durable row identity is required. The mode above was

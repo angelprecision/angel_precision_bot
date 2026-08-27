@@ -9,14 +9,14 @@ Problem closed:
 
       LOWER(TRIM(COALESCE(execution_mode,''))) = %s
 
-  which did not consistently normalize the canonical column and left the
+  which did not consistently normalize the two durable mirrors and left the
   runtime guard out of parity with the durable mode authority.
 
   This file proves the installed guard (not the unpatched OSM stub) now handles:
-    G1: column=' paper ' (whitespace)  → cursor persisted (True)
-    G2: column=''       meta='paper'   → rejected without mutation (False)
-    G3: column=' live ' (whitespace)   → cursor persisted (True)
-    G4: column=''       meta='live'    → rejected without mutation (False)
+    G1: column=' paper ' meta='paper'  → cursor persisted (True)
+    G2: column=''       meta='paper'   → cursor persisted (True)
+    G3: column=' live ' meta='live'    → cursor persisted (True)
+    G4: column=''       meta='live'    → cursor persisted (True)
 
   And preserves the existing CAS-miss contract for non-matching rows:
     H1: wrong owner         → False
@@ -25,13 +25,14 @@ Problem closed:
     H4: wrong signal        → False
     H5: wrong lifecycle     → False
 
-  Contradiction proof (mock, no PostgreSQL):
+  Direct SQL authority proof (real PostgreSQL and mock):
     I1/I2: column='live'/meta='paper' and vice versa — the
     RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT fence in
     resume_deferred_materialization_retry() fires BEFORE cursor persist is
-    reached, so persist_selector_recovery_cursor is never called.
+    reached, and direct calls prove the SQL CAS also rejects contradictory or
+    invalid nonblank mirrors rather than allowing column-first fallback.
 
-Tests G1–H5 require a live PostgreSQL instance (INTELLIGENCE_POSTGRES_TEST_URL).
+Tests G1–P require a live PostgreSQL instance (INTELLIGENCE_POSTGRES_TEST_URL).
 In GitHub Actions the URL is required; locally they skip if not configured.
 Tests I1/I2 are always unit tests (no DB required).
 """
@@ -59,6 +60,15 @@ _SIGNAL = "sig-cursor-guard-rt-1"
 _OWNER = "watcher:guard-rt-test"
 _GENERATION = 3
 _LOCAL_ORDER_ID = "oid-cursor-guard-rt-1"
+
+# Keep the runner argument valid so these direct PostgreSQL controls exercise
+# the production SQL predicate rather than an early Python argument check.
+_DURABLE_MODE_REJECTION_CASES = [
+    ("live", "paper", "live"),
+    ("paper", "live", "paper"),
+    ("sandbox", "paper", "paper"),
+    ("paper", "sandbox", "paper"),
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PostgreSQL infrastructure helpers
@@ -207,16 +217,16 @@ def _call_guard(conn_ctx, *, local_order_id, client_id, signal_id,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# G1/G3 positive tests: whitespace is normalized on a nonblank column.
-# G2/G4 negative tests: a blank canonical column cannot use metadata.
+# G1-G4 positive tests: either valid mirror may supply a blank counterpart and
+# whitespace is normalized symmetrically.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_G1_whitespace_paper_column_guard_persists():
     """Installed guard: orders.execution_mode=' paper ' resolves to 'paper'.
 
-    The strict column-authority predicate must still normalize a nonblank
-    whitespace-padded value before comparing it with the requested mode."""
+    The durable-mode predicate must normalize both mirrors before comparing
+    the resolved mode with the requested mode."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -262,8 +272,12 @@ def test_G1_whitespace_paper_column_guard_persists():
         admin.close()
 
 
-def test_G2_blank_column_meta_paper_guard_rejects_without_mutation():
-    """Installed guard rejects blank column even when metadata says paper."""
+@pytest.mark.parametrize("column_mode,meta_mode", [
+    ("", "paper"),
+    (" ", " paper "),
+])
+def test_G2_blank_column_meta_paper_guard_persists(column_mode, meta_mode):
+    """Installed guard allows valid trimmed metadata to fill a blank column."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -282,8 +296,8 @@ def test_G2_blank_column_meta_paper_guard_rejects_without_mutation():
             local_order_id=local_order_id,
             client_id=_CLIENT,
             signal_id=_SIGNAL,
-            col_execution_mode="",          # ← blank column
-            meta_execution_mode="paper",    # ← corroborating mirror
+            col_execution_mode=column_mode,  # ← blank/whitespace column
+            meta_execution_mode=meta_mode,   # ← supplying mirror
             generation=_GENERATION,
             owner=_OWNER,
         )
@@ -299,12 +313,12 @@ def test_G2_blank_column_meta_paper_guard_rejects_without_mutation():
             generation=_GENERATION,
         )
 
-        assert result is False
+        assert result is True
         after = _read_order(conn_ctx, schema, local_order_id)
-        assert after["updated_ts"] == before["updated_ts"]
-        assert after["execution_mode"] == ""
-        assert after["meta"]["execution_mode"] == "paper"
-        assert after["meta"]["selector_recovery_cursor_v1"] is None
+        assert after["updated_ts"] > before["updated_ts"]
+        assert after["execution_mode"] == column_mode
+        assert after["meta"]["execution_mode"] == meta_mode
+        assert after["meta"]["selector_recovery_cursor_v1"] is not None
     finally:
         with admin.cursor() as acur:
             acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -357,8 +371,8 @@ def test_G3_whitespace_live_column_guard_persists():
         admin.close()
 
 
-def test_G4_blank_column_meta_live_guard_rejects_without_mutation():
-    """Installed guard rejects blank column even when metadata says live."""
+def test_G4_blank_column_meta_live_guard_persists():
+    """Installed guard allows valid LIVE metadata to fill a blank column."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -378,7 +392,7 @@ def test_G4_blank_column_meta_live_guard_rejects_without_mutation():
             client_id=_CLIENT,
             signal_id=_SIGNAL,
             col_execution_mode="",          # ← blank column
-            meta_execution_mode="live",     # ← corroborating mirror
+            meta_execution_mode="live",     # ← supplying mirror
             generation=_GENERATION,
             owner=_OWNER,
         )
@@ -394,12 +408,12 @@ def test_G4_blank_column_meta_live_guard_rejects_without_mutation():
             generation=_GENERATION,
         )
 
-        assert result is False
+        assert result is True
         after = _read_order(conn_ctx, schema, local_order_id)
-        assert after["updated_ts"] == before["updated_ts"]
+        assert after["updated_ts"] > before["updated_ts"]
         assert after["execution_mode"] == ""
         assert after["meta"]["execution_mode"] == "live"
-        assert after["meta"]["selector_recovery_cursor_v1"] is None
+        assert after["meta"]["selector_recovery_cursor_v1"] is not None
     finally:
         with admin.cursor() as acur:
             acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -426,14 +440,14 @@ def _read_order(conn_ctx, schema, local_order_id):
         return c.fetchone()
 
 
-@pytest.mark.parametrize("column_mode,meta_mode", [
-    ("live", "paper"),
-    ("paper", "live"),
-])
+@pytest.mark.parametrize(
+    "column_mode,meta_mode,requested_mode",
+    _DURABLE_MODE_REJECTION_CASES,
+)
 def test_J_osm_claim_rejects_contradictory_mode_without_mutation(
-    column_mode, meta_mode
+    column_mode, meta_mode, requested_mode
 ):
-    """The production claim CAS must not let column-first mode win."""
+    """The claim CAS rejects invalid or contradictory durable mirrors."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -474,7 +488,7 @@ def test_J_osm_claim_rejects_contradictory_mode_without_mutation(
                 trigger_price=130.0,
                 observed_underlying_price=130.05,
                 signal_id=signal_id,
-                execution_mode=column_mode,
+                execution_mode=requested_mode,
                 retry_attempt=1,
             )
         finally:
@@ -493,14 +507,14 @@ def test_J_osm_claim_rejects_contradictory_mode_without_mutation(
         admin.close()
 
 
-@pytest.mark.parametrize("column_mode,meta_mode", [
-    ("live", "paper"),
-    ("paper", "live"),
-])
+@pytest.mark.parametrize(
+    "column_mode,meta_mode,requested_mode",
+    _DURABLE_MODE_REJECTION_CASES,
+)
 def test_K_installed_cursor_guard_rejects_contradictory_mode_without_mutation(
-    column_mode, meta_mode
+    column_mode, meta_mode, requested_mode
 ):
-    """The installed cursor guard must preserve the row on mode conflict."""
+    """The installed cursor guard rejects invalid or contradictory mirrors."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -528,7 +542,7 @@ def test_K_installed_cursor_guard_rejects_contradictory_mode_without_mutation(
             local_order_id=local_order_id,
             client_id=_CLIENT,
             signal_id=_SIGNAL,
-            execution_mode_arg=column_mode,
+            execution_mode_arg=requested_mode,
             owner=_OWNER,
             generation=_GENERATION,
         )
@@ -545,14 +559,14 @@ def test_K_installed_cursor_guard_rejects_contradictory_mode_without_mutation(
         admin.close()
 
 
-@pytest.mark.parametrize("column_mode,meta_mode", [
-    ("live", "paper"),
-    ("paper", "live"),
-])
+@pytest.mark.parametrize(
+    "column_mode,meta_mode,requested_mode",
+    _DURABLE_MODE_REJECTION_CASES,
+)
 def test_L_osm_retry_schedule_rejects_contradictory_mode_without_mutation(
-    column_mode, meta_mode
+    column_mode, meta_mode, requested_mode
 ):
-    """A second #519 retry CAS must also fail closed on the same conflict."""
+    """The retry CAS rejects invalid or contradictory durable mirrors."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -595,10 +609,10 @@ def test_L_osm_retry_schedule_rejects_contradictory_mode_without_mutation(
                 next_retry_at=(now + timedelta(seconds=30)).isoformat(),
                 selector_failure={
                     "signal_id": signal_id,
-                    "execution_mode": column_mode,
+                    "execution_mode": requested_mode,
                 },
                 signal_id=signal_id,
-                execution_mode=column_mode,
+                execution_mode=requested_mode,
             )
         finally:
             osm_mod.conn = original_conn
@@ -616,14 +630,14 @@ def test_L_osm_retry_schedule_rejects_contradictory_mode_without_mutation(
         admin.close()
 
 
-@pytest.mark.parametrize("column_mode,meta_mode", [
-    ("live", "paper"),
-    ("paper", "live"),
-])
+@pytest.mark.parametrize(
+    "column_mode,meta_mode,requested_mode",
+    _DURABLE_MODE_REJECTION_CASES,
+)
 def test_N_osm_copyback_rejects_contradictory_mode_without_mutation(
-    column_mode, meta_mode
+    column_mode, meta_mode, requested_mode
 ):
-    """The materialization copyback CAS must share the same mode fence."""
+    """The broker-ready copyback CAS rejects invalid or contradictory mirrors."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -660,7 +674,7 @@ def test_N_osm_copyback_rejects_contradictory_mode_without_mutation(
                 owner=_OWNER,
                 generation=_GENERATION,
                 signal_id=signal_id,
-                execution_mode=column_mode,
+                execution_mode=requested_mode,
                 contract="RTX260117C00130000",
                 limit_price=2.10,
                 qty=1,
@@ -686,12 +700,12 @@ def test_N_osm_copyback_rejects_contradictory_mode_without_mutation(
 
 @pytest.mark.parametrize("column_mode,meta_mode", [
     ("", "paper"),
-    ("", "live"),
+    (" ", " paper "),
 ])
-def test_M_osm_claim_rejects_blank_column_even_with_metadata(
+def test_M_osm_claim_allows_blank_column_from_trimmed_metadata(
     column_mode, meta_mode
 ):
-    """The claim CAS must require a nonblank canonical mode column."""
+    """The claim CAS accepts a valid trimmed one-sided metadata mode."""
     psycopg2 = pytest.importorskip("psycopg2")
     database_url = _pg_skip_or_fail()
 
@@ -705,7 +719,7 @@ def test_M_osm_claim_rejects_blank_column_even_with_metadata(
     admin.autocommit = True
     try:
         with admin.cursor() as acur:
-            schema = _make_schema("test_m_claim_strict_column", acur)
+            schema = _make_schema("test_m_claim_metadata_fallback", acur)
         conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
         _insert_order(
             conn_ctx, schema,
@@ -739,13 +753,151 @@ def test_M_osm_claim_rejects_blank_column_even_with_metadata(
         finally:
             osm_mod.conn = original_conn
 
-        assert result is False
+        assert result is True
         row = _read_order(conn_ctx, schema, local_order_id)
-        assert row["updated_ts"] == before["updated_ts"]
+        assert row["updated_ts"] > before["updated_ts"]
+        assert row["execution_mode"] == column_mode
+        assert row["meta"]["execution_mode"] == meta_mode
+        assert row["meta"]["lifecycle_state"] == "MATERIALIZING"
+        assert row["meta"]["materialization_generation"] == _GENERATION
+    finally:
+        with admin.cursor() as acur:
+            acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+@pytest.mark.parametrize("column_mode,meta_mode", [
+    ("", "paper"),
+    (" ", " paper "),
+])
+def test_O_osm_retry_schedule_allows_trimmed_one_sided_metadata(
+    column_mode, meta_mode
+):
+    """Retry scheduling uses the same one-sided durable-mode authority."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = _pg_skip_or_fail()
+
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_mod
+
+    local_order_id = f"oid-o-schedule-{uuid.uuid4().hex}"
+    signal_id = f"sig-o-schedule-{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as acur:
+            schema = _make_schema("test_o_schedule_metadata_fallback", acur)
+        conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
+        _insert_order(
+            conn_ctx, schema,
+            local_order_id=local_order_id,
+            client_id=_CLIENT,
+            signal_id=signal_id,
+            col_execution_mode=column_mode,
+            meta_execution_mode=meta_mode,
+            generation=_GENERATION,
+            owner=_OWNER,
+            lifecycle_state="MATERIALIZING",
+        )
+        before = _read_order(conn_ctx, schema, local_order_id)
+
+        original_conn = osm_mod.conn
+        osm_mod.conn = conn_ctx
+        try:
+            osm = APOrderStateMachine(client_id=_CLIENT)
+            result = osm.schedule_deferred_materialization_retry(
+                local_order_id,
+                owner=_OWNER,
+                generation=_GENERATION,
+                reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                attempt=1,
+                max_attempts=3,
+                next_retry_at=(now + timedelta(seconds=30)).isoformat(),
+                selector_failure={
+                    "signal_id": signal_id,
+                    "execution_mode": "paper",
+                },
+                signal_id=signal_id,
+                execution_mode="paper",
+            )
+        finally:
+            osm_mod.conn = original_conn
+
+        assert result is True
+        row = _read_order(conn_ctx, schema, local_order_id)
+        assert row["updated_ts"] > before["updated_ts"]
         assert row["execution_mode"] == column_mode
         assert row["meta"]["execution_mode"] == meta_mode
         assert row["meta"]["lifecycle_state"] == "RETRY_WAIT"
-        assert row["meta"]["materialization_generation"] == _GENERATION - 1
+        assert row["meta"]["materialization_status"] == "RETRY_PENDING"
+    finally:
+        with admin.cursor() as acur:
+            acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+@pytest.mark.parametrize("column_mode,meta_mode", [
+    ("", "paper"),
+    (" ", " paper "),
+])
+def test_P_osm_broker_ready_allows_trimmed_one_sided_metadata(
+    column_mode, meta_mode
+):
+    """Broker-ready persistence uses the same one-sided durable-mode authority."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = _pg_skip_or_fail()
+
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_mod
+
+    local_order_id = f"oid-p-copyback-{uuid.uuid4().hex}"
+    signal_id = f"sig-p-copyback-{uuid.uuid4().hex}"
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as acur:
+            schema = _make_schema("test_p_copyback_metadata_fallback", acur)
+        conn_ctx = _make_conn_ctx(psycopg2, database_url, schema)
+        _insert_order(
+            conn_ctx, schema,
+            local_order_id=local_order_id,
+            client_id=_CLIENT,
+            signal_id=signal_id,
+            col_execution_mode=column_mode,
+            meta_execution_mode=meta_mode,
+            generation=_GENERATION,
+            owner=_OWNER,
+            lifecycle_state="MATERIALIZING",
+        )
+        before = _read_order(conn_ctx, schema, local_order_id)
+
+        original_conn = osm_mod.conn
+        osm_mod.conn = conn_ctx
+        try:
+            osm = APOrderStateMachine(client_id=_CLIENT)
+            result = osm.persist_deferred_broker_ready(
+                local_order_id,
+                owner=_OWNER,
+                generation=_GENERATION,
+                signal_id=signal_id,
+                execution_mode="paper",
+                contract="RTX260117C00130000",
+                limit_price=2.10,
+                qty=1,
+                reserved_cost=210.0,
+                selector_meta={"materialization_detail": "test"},
+            )
+        finally:
+            osm_mod.conn = original_conn
+
+        assert result is True
+        row = _read_order(conn_ctx, schema, local_order_id)
+        assert row["updated_ts"] > before["updated_ts"]
+        assert row["execution_mode"] == column_mode
+        assert row["meta"]["execution_mode"] == "paper"
+        assert row["meta"]["lifecycle_state"] == "BROKER_READY"
+        assert row["contract"] == "RTX260117C00130000"
     finally:
         with admin.cursor() as acur:
             acur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -932,7 +1084,7 @@ def test_H5_wrong_lifecycle_returns_false():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Contradiction proof I1/I2 — mock-based, no PostgreSQL required
+# Production-path contradiction proof I1/I2 — mock-based, no PostgreSQL required
 #
 # Contract: when column and meta authority DISAGREE (both non-blank, different
 # values), resume_deferred_materialization_retry() MUST return
@@ -940,9 +1092,8 @@ def test_H5_wrong_lifecycle_returns_false():
 # persist_selector_recovery_cursor therefore can never receive a contradictory
 # row in the production call path.
 #
-# This replaces the need for a SQL predicate that would silently reclassify an
-# authority conflict as an ownership-loss CAS miss (False), which the guard's
-# contract forbids — False is reserved exclusively for exact fenced CAS misses.
+# Direct PostgreSQL controls J–P below separately prove that the SQL predicates
+# reject the same conflict, plus invalid nonblank mirrors, without mutation.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CLIENT_I = "jose@example.com"

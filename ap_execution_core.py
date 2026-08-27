@@ -2955,8 +2955,9 @@ class APExecutionCore:
             return _term("RETRY_CLIENT_ID_MISMATCH", status="ERROR")
 
         # Parse meta early — canonical execution_mode resolution validates the
-        # metadata mirror before the mode gate below; it never supplies a
-        # missing column value.
+        # two durable mirrors before the mode gate below; one valid, nonblank
+        # mirror may supply a blank counterpart, but conflicting/invalid
+        # mirrors never pass.
         meta = row.get("meta") or {}
         if isinstance(meta, str):
             try:
@@ -2966,9 +2967,10 @@ class APExecutionCore:
         meta = meta or {}
 
         # ── FINAL AMENDMENT: canonical execution_mode resolution ─────────────
-        # Use the same durable column-authority resolver as restart recovery.
-        # A blank/invalid column, invalid metadata, or contradictory pair is
-        # unresolved and must never reach a claim, selector, or broker path.
+        # Use the same durable-mode resolver as restart recovery. A valid
+        # one-sided mirror may resolve the mode; invalid or contradictory
+        # authority is unresolved and must never reach a claim, selector, or
+        # broker path.
         _col_mode_raw = str(row.get("execution_mode") or "").strip().lower()
         _meta_mode_raw = str(meta.get("execution_mode") or "").strip().lower()
         row_mode, _mode_error = _resolve_durable_execution_mode({

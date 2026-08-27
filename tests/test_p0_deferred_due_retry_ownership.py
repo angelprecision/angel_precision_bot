@@ -3682,10 +3682,10 @@ def test_A_whitespace_paper_column_resolves_to_valid_mode():
     )
 
 
-# ── Test B: blank column with metadata is unresolved ──────────────────────────
+# ── Test B: blank column with metadata resolves correctly ─────────────────────
 
-def test_B_blank_column_with_meta_paper_fails_closed_without_side_effects():
-    """A valid metadata value cannot replace a blank canonical column."""
+def test_B_blank_column_with_meta_paper_fallback_resolves_to_paper():
+    """A valid metadata value may supply a blank durable column mirror."""
     core = _core(execution_mode="paper")
     row = _row_raw(
         col_execution_mode="",
@@ -3701,14 +3701,15 @@ def test_B_blank_column_with_meta_paper_fails_closed_without_side_effects():
         expected_retry_attempt=1,
         owner="watcher:test-B",
     )
-    assert result.get("reason_code") == "RETRY_INVALID_EXECUTION_MODE"
-    assert result.get("disposition") == "TERMINAL_REQUIRED"
-    core.order_state_machine.claim_deferred_materialization.assert_not_called()
-    core.order_state_machine.schedule_deferred_materialization_retry.assert_not_called()
-    core._on_entry_trigger.assert_not_called()
+    assert result.get("reason_code") not in {
+        "RETRY_INVALID_EXECUTION_MODE",
+        "RETRY_EXECUTION_MODE_MISMATCH",
+        "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+        "RETRY_RUNNER_EXECUTION_MODE_INVALID",
+    }, f"blank column + meta='paper' should resolve; got {result!r}"
 
 
-# ── Test C: whitespace LIVE column passes; blank-column LIVE meta is unresolved ─
+# ── Test C: whitespace and blank-column LIVE metadata resolve correctly ───────
 
 def test_C_whitespace_live_column_resolves_to_valid_mode():
     """Column \" live \" resolves to 'live' — same contract as Test A for LIVE."""
@@ -3734,8 +3735,8 @@ def test_C_whitespace_live_column_resolves_to_valid_mode():
     )
 
 
-def test_C_blank_column_with_live_meta_fails_closed_without_side_effects():
-    """A valid LIVE metadata value cannot replace a blank canonical column."""
+def test_C_blank_column_with_live_meta_fallback_resolves_to_live():
+    """A valid LIVE metadata value may supply a blank column mirror."""
     core = _core(execution_mode="live")
     row = _row_raw(col_execution_mode="", meta_execution_mode="live")
     core.order_state_machine.get_order.return_value = row
@@ -3748,11 +3749,12 @@ def test_C_blank_column_with_live_meta_fails_closed_without_side_effects():
         expected_retry_attempt=1,
         owner="watcher:test-C2",
     )
-    assert result.get("reason_code") == "RETRY_INVALID_EXECUTION_MODE"
-    assert result.get("disposition") == "TERMINAL_REQUIRED"
-    core.order_state_machine.claim_deferred_materialization.assert_not_called()
-    core.order_state_machine.schedule_deferred_materialization_retry.assert_not_called()
-    core._on_entry_trigger.assert_not_called()
+    assert result.get("reason_code") not in {
+        "RETRY_INVALID_EXECUTION_MODE",
+        "RETRY_EXECUTION_MODE_MISMATCH",
+        "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+        "RETRY_RUNNER_EXECUTION_MODE_INVALID",
+    }, f"blank column + meta='live' should resolve; got {result!r}"
 
 
 # ── Test D: contradiction negative (live vs paper in both directions) ──────────

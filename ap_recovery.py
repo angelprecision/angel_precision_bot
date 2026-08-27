@@ -1572,8 +1572,8 @@ class APStartupRecovery:
         # Preserve the builder's existing no-runner-inference contract for a
         # missing or malformed mode: callers still receive a plan with an
         # unusable blank mode and must reject it at their identity gate. A
-        # contradiction is different—the pair itself is corrupt and must not
-        # be represented as a plan at all.
+        # valid one-sided mirror, however, is a durable mode and is carried
+        # into the plan; a contradiction is not represented as a plan.
         if durable_mode_error:
             durable_mode = ""
 
@@ -1691,11 +1691,12 @@ class APStartupRecovery:
         runner mode. A paper runner MUST NOT observe or mutate LIVE rows,
         and a LIVE runner MUST NOT observe or mutate paper rows, even for
         the same client_id. The runner mode is resolved once at the top;
-        the SQL query uses the canonical column authority and rejects
-        contradictory metadata mirrors; each row is re-verified in
+        the SQL query uses the same symmetric normalized durable-mode
+        predicate as the OSM CAS writers: a valid one-sided mirror is allowed,
+        but both nonblank mirrors must agree; each row is re-verified in
         Python (defence in depth); the plan
         built from the row is re-verified before any watcher rearm or
-        submit path. A blank or invalid column, or invalid/contradictory
+        submit path. Missing or invalid authority, or invalid/contradictory
         metadata, fails identity closed here.
         """
         from ap.db import conn, run_with_retry
@@ -1734,9 +1735,19 @@ class APStartupRecovery:
                            , created_ts
                     FROM orders
                     WHERE client_id = %s
-                      AND LOWER(BTRIM(execution_mode)) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
                       AND (
-                            NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
                       )
                       AND kind = 'ENTRY'
@@ -2136,8 +2147,8 @@ class APStartupRecovery:
                 "meta": meta,
             })
             if row_mode_error:
-                # A blank/invalid column, or malformed/contradictory metadata,
-                # is not ours to repair in recovery.
+                # Missing/invalid authority, or malformed/contradictory
+                # metadata, is not ours to repair in recovery.
                 # We QUARANTINE (skip + log) rather than terminalize, because
                 # we cannot prove the row is ours without a valid mode field.
                 log.error(
@@ -3490,9 +3501,19 @@ class APStartupRecovery:
                     WHERE o.client_id = %s
                       AND o.kind = 'ENTRY'
                       AND o.status = 'PENDING_TRIGGER'
-                      AND LOWER(BTRIM(o.execution_mode)) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(o.execution_mode), ''),
+                            NULLIF(BTRIM(o.meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(o.execution_mode), ''),
+                            NULLIF(BTRIM(o.meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
                       AND (
-                            NULLIF(BTRIM(o.meta->>'execution_mode'), '') IS NULL
+                            NULLIF(BTRIM(o.execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(o.meta->>'execution_mode'), '') IS NULL
                          OR LOWER(BTRIM(o.execution_mode)) = LOWER(BTRIM(o.meta->>'execution_mode'))
                       )
                       AND o.created_ts >= %s

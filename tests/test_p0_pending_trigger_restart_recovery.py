@@ -1457,13 +1457,15 @@ class TestExecutionModeAuthorityParity:
         ("column_mode", "meta_mode", "runner_mode"),
         [
             ("paper", "paper", "paper"),
+            ("", "paper", "paper"),
+            (" ", " paper ", "paper"),
             (" live ", "live", "live"),
         ],
     )
     def test_restart_recovery_uses_one_canonical_mode_for_rearm(
         self, column_mode, meta_mode, runner_mode
     ):
-        """Valid nonblank columns are normalized and rearmed safely."""
+        """A valid one-sided or agreeing mirror is normalized and rearmed safely."""
         r = _row(
             execution_mode=column_mode,
             meta={"execution_mode": meta_mode, "trigger_price": 450.0},
@@ -1486,12 +1488,12 @@ class TestExecutionModeAuthorityParity:
 
     @pytest.mark.parametrize(
         ("column_mode", "meta_mode", "runner_mode"),
-        [("", "paper", "paper"), (" ", "live", "live")],
+        [("sandbox", "paper", "paper"), ("paper", "sandbox", "paper")],
     )
-    def test_blank_column_with_metadata_is_unresolved_without_side_effects(
+    def test_invalid_nonblank_mode_mirror_is_unresolved_without_side_effects(
         self, column_mode, meta_mode, runner_mode
     ):
-        """Metadata never replaces a missing canonical execution_mode column."""
+        """An invalid nonblank durable mode mirror cannot be repaired."""
         r = _row(
             execution_mode=column_mode,
             meta={"execution_mode": meta_mode, "trigger_price": 450.0},
@@ -1505,10 +1507,12 @@ class TestExecutionModeAuthorityParity:
             quote_result=False,
         )
 
-        assert _resolve_execution_mode(r) == (
-            None,
-            "MISSING_OR_INVALID_EXECUTION_MODE",
+        expected_error = (
+            "INVALID_EXECUTION_MODE_METADATA"
+            if meta_mode == "sandbox"
+            else "MISSING_OR_INVALID_EXECUTION_MODE"
         )
+        assert _resolve_execution_mode(r) == (None, expected_error)
         summary = rec.recover_all([r])
 
         assert summary["row_outcomes"][r["local_order_id"]] == _RowOutcome.UNRESOLVED
@@ -1520,12 +1524,14 @@ class TestExecutionModeAuthorityParity:
     @pytest.mark.parametrize(
         ("column_mode", "meta_mode", "expected"),
         [
+            ("", "paper", ("paper", None)),
+            (" ", " paper ", ("paper", None)),
             ("paper", "sandbox", (None, "INVALID_EXECUTION_MODE_METADATA")),
             ("sandbox", "paper", (None, "MISSING_OR_INVALID_EXECUTION_MODE")),
             (" PAPER ", " paper ", ("paper", None)),
         ],
     )
-    def test_resolver_validates_column_first_and_metadata_as_mirror(
+    def test_resolver_validates_and_normalizes_both_durable_mode_mirrors(
         self, column_mode, meta_mode, expected
     ):
         row = _row(
@@ -1587,13 +1593,15 @@ class TestExecutionModeAuthorityParity:
         assert osm.cancel_calls == []
         assert osm.meta_writes == []
 
-    def test_plan_builder_rejects_blank_and_conflicting_mode_mirrors(self):
+    def test_plan_builder_uses_one_sided_metadata_and_rejects_conflict(self):
         blank_row = _row(execution_mode=" ", meta={"execution_mode": "paper"})
-        assert _build_plan(blank_row) is None
-        assert _resolve_execution_mode(blank_row) == (
-            None,
-            "MISSING_OR_INVALID_EXECUTION_MODE",
-        )
+        plan = _build_plan(blank_row)
+        assert plan is not None
+        assert plan.execution_mode == "paper"
+        assert _resolve_execution_mode(blank_row) == ("paper", None)
+
+        invalid_row = _row(execution_mode="sandbox", meta={"execution_mode": "paper"})
+        assert _build_plan(invalid_row) is None
 
         conflict_row = _row(
             execution_mode="live",
@@ -1601,10 +1609,29 @@ class TestExecutionModeAuthorityParity:
         )
         assert _build_plan(conflict_row) is None
 
-    def test_terminal_reread_with_blank_column_is_unresolved_without_mutation(self):
+    def test_terminal_reread_uses_one_sided_metadata_mode(self):
         reason = "overnight_daily_invalidated"
         r = _row(
             execution_mode="",
+            meta={
+                "execution_mode": "paper",
+                "watcher_audit": {"reason_code": reason},
+            },
+        )
+        osm = _MockOSM(cancel_returns=True, get_order_status="CANCELED")
+        osm.seed(r)
+        rec, _ = _make_recovery(r, osm=osm)
+
+        outcome = rec._terminalize_with_reason(r["local_order_id"], r, reason)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert len(osm.cancel_calls) == 1
+        assert len(osm.meta_writes) == 1
+
+    def test_terminal_reread_with_invalid_column_is_unresolved_without_mutation(self):
+        reason = "overnight_daily_invalidated"
+        r = _row(
+            execution_mode="sandbox",
             meta={
                 "execution_mode": "paper",
                 "watcher_audit": {"reason_code": reason},
@@ -1620,7 +1647,7 @@ class TestExecutionModeAuthorityParity:
         assert osm.cancel_calls == []
         assert osm.meta_writes == []
 
-    def test_materialization_retry_reread_with_blank_column_is_unresolved(self):
+    def test_materialization_retry_reread_uses_one_sided_metadata_mode(self):
         r = _row(
             execution_mode="",
             meta={
@@ -1635,9 +1662,9 @@ class TestExecutionModeAuthorityParity:
             r["local_order_id"], r
         )
 
-        assert proof is None
+        assert proof is not None
 
-    def test_restart_rearm_reread_with_blank_column_is_unresolved(self):
+    def test_restart_rearm_reread_uses_one_sided_metadata_mode(self):
         now = datetime.now(timezone.utc)
         r = _row(
             execution_mode="",
@@ -1655,9 +1682,9 @@ class TestExecutionModeAuthorityParity:
             r["local_order_id"], r
         )
 
-        assert proof is None
+        assert proof is not None
 
-    def test_order_monitor_path_rejects_blank_column_without_rearm(self):
+    def test_order_monitor_path_rearms_from_one_sided_metadata_mode(self):
         from ap.order_monitor import APOrderMonitor
 
         r = _row(
@@ -1684,9 +1711,10 @@ class TestExecutionModeAuthorityParity:
 
         assert (attempted, succeeded, reason) == (
             True,
-            False,
-            "canonical_recovery_unresolved:UNRESOLVED",
+            True,
+            "canonical_recovery_watcher_owned",
         )
-        assert watcher._pending == []
+        assert len(watcher._pending) == 1
+        assert watcher._pending[0].signal["execution_mode"] == "paper"
         assert osm.cancel_calls == []
         assert osm.meta_writes == []
