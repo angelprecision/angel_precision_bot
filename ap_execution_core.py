@@ -4584,6 +4584,15 @@ class APExecutionCore:
             or str(_signal_meta.get("contract_symbol") or "").strip().upper().startswith("DEFERRED:")
             or _preflight_meta.get("contract_deferred")
             or _preflight_contract_upper.startswith("DEFERRED:")
+            # Keep ownership preflight aligned with the canonical current-plan
+            # classifier. In particular, an approved blank-contract plan is
+            # deferred even when no explicit marker has been persisted yet.
+            # _plan_is_deferred() retains the real-OCC guard, so stale deferred
+            # metadata on an already-hydrated contract does not reopen this path.
+            or (
+                _preflight_plan is not None
+                and self._plan_is_deferred(_preflight_plan, ticker)
+            )
             or str(
                 _initial_meta.get("selection_context")
                 or _signal_meta.get("selection_context")
