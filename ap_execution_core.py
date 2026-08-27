@@ -79,7 +79,11 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
         return "paper" if paper_flag else "live"
     return None
 ET  = ZoneInfo("America/New_York")
-_OCC_CONTRACT_RE = re.compile(r"\d{6}[CP]\d{5,8}")
+# Canonical compact OCC/OSI contract: 1-6 character root, YYMMDD expiry,
+# call/put right, and eight-digit strike multiplied by 1,000.  This is a
+# whole-value identity check; a valid-looking substring inside junk is not an
+# executable broker contract.
+_OCC_CONTRACT_RE = re.compile(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}")
 
 
 def _validate_deferred_selector_result(selection, ticker: str = "") -> tuple[bool, str, float, int]:
@@ -91,7 +95,7 @@ def _validate_deferred_selector_result(selection, ticker: str = "") -> tuple[boo
         contract
         and not contract_upper.startswith("DEFERRED:")
         and contract_upper != ticker_upper
-        and _OCC_CONTRACT_RE.search(contract_upper)
+        and _OCC_CONTRACT_RE.fullmatch(contract_upper)
     )
     try:
         price = float(
@@ -1915,7 +1919,7 @@ class APExecutionCore:
             return False
         if ticker and contract_symbol == ticker:
             return False
-        return bool(_OCC_CONTRACT_RE.search(contract_symbol))
+        return bool(_OCC_CONTRACT_RE.fullmatch(contract_symbol))
 
     @staticmethod
     def _plan_is_deferred(plan, ticker: str = "") -> bool:
@@ -4424,6 +4428,8 @@ class APExecutionCore:
         _mat_owner = ""
         _mat_generation = None
         _prior_mat_attempt = 0
+        _materialization_expected_direction = ""
+        _materialization_expected_contract = ""
         _pv_row = None
         _hydration_bridge_applied = False
         _materialization_copyback_succeeded = False
@@ -4457,6 +4463,8 @@ class APExecutionCore:
                     "retry_attempt": _prior_mat_attempt,
                     "client_id": _mat_client_id,
                     "execution_mode": _mat_exec_mode,
+                    "expected_direction": _materialization_expected_direction,
+                    "expected_contract_symbol": _materialization_expected_contract,
                     "diagnostics": diagnostics or {},
                 }
             elif _recovery_pre_claimed:
@@ -4947,7 +4955,9 @@ class APExecutionCore:
                 "terminal_status": ("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
             }
 
-        def _terminalize_deferred_breach_failure(reason: str, *, extra_meta: dict | None = None) -> dict:
+        def _terminalize_deferred_breach_failure(
+            reason: str, *, extra_meta: dict | None = None
+        ) -> dict | None:
             """Best-effort cleanup for deferred breach failures.
 
             Acceptance contract:
@@ -5692,7 +5702,7 @@ class APExecutionCore:
                     # revalidation, cursor identity, structural filtering)
                     # can be trusted either. Terminalize before touching the
                     # cursor at all.
-                    _terminalize_deferred_breach_failure(
+                    return _terminalize_deferred_breach_failure(
                         f"SELECTOR_RECOVERY_CURSOR_INVALID:{_attempt_conflict_reason}",
                         extra_meta={
                             "selector_recovery_cursor_load_reason": (
@@ -5712,13 +5722,6 @@ class APExecutionCore:
                             "broker_post_count": 0,
                         },
                     )
-                    return {
-                        "disposition": "TERMINAL_DURABLE",
-                        "reason_code": (
-                            f"SELECTOR_RECOVERY_CURSOR_INVALID:"
-                            f"{_attempt_conflict_reason}"
-                        ),
-                    }
                 _cursor_candidate = (
                     _cursor_meta.get("selector_recovery_cursor_v1")
                     if _cursor_enabled
@@ -5743,7 +5746,7 @@ class APExecutionCore:
                     cursor_load_reason=_cursor_load_reason,
                 )
                 if _cursor_failure_reason:
-                    _terminalize_deferred_breach_failure(
+                    return _terminalize_deferred_breach_failure(
                         f"SELECTOR_RECOVERY_CURSOR_INVALID:{_cursor_failure_reason}",
                         extra_meta={
                             "selector_recovery_cursor_load_reason": (
@@ -5754,13 +5757,6 @@ class APExecutionCore:
                             "broker_post_count": 0,
                         },
                     )
-                    return {
-                        "disposition": "TERMINAL_DURABLE",
-                        "reason_code": (
-                            f"SELECTOR_RECOVERY_CURSOR_INVALID:"
-                            f"{_cursor_failure_reason}"
-                        ),
-                    }
 
                 _cursor_pending_updates = 0
 
@@ -6089,7 +6085,7 @@ class APExecutionCore:
                             _truth_result.reason_code
                             or "MARKET_SETUP_INVALIDATED"
                         )
-                        _terminalize_deferred_breach_failure(
+                        return _terminalize_deferred_breach_failure(
                             _terminal_market_reason,
                             extra_meta={
                                 "final_market_truth": _truth_result.audit,
@@ -6098,10 +6094,6 @@ class APExecutionCore:
                                 "broker_post_count": 0,
                             },
                         )
-                        return {
-                            "disposition": "TERMINAL_DURABLE",
-                            "reason_code": _terminal_market_reason,
-                        }
                     if (
                         _truth_authority
                         == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
@@ -6126,7 +6118,7 @@ class APExecutionCore:
                                 "reason_code": "MATERIALIZATION_CONFIG_CONFLICT",
                             }
                         if _selector_attempt_number >= _max_attempts_truth:
-                            _terminalize_deferred_breach_failure(
+                            return _terminalize_deferred_breach_failure(
                                 f"BREACH_RETRY_EXHAUSTED:{_truth_result.reason_code}",
                                 extra_meta={
                                     "final_market_truth": _truth_result.audit,
@@ -6134,10 +6126,6 @@ class APExecutionCore:
                                     "broker_post_count": 0,
                                 },
                             )
-                            return {
-                                "disposition": "TERMINAL_DURABLE",
-                                "reason_code": _truth_result.reason_code,
-                            }
                         _truth_delay = _positive_int_env_config(
                             "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
                         )
@@ -6275,7 +6263,7 @@ class APExecutionCore:
 
                 if _sel is not None and not _sel_result_valid:
                     _invalid_reason = "SELECTOR_RESULT_INVALID"
-                    _terminalize_deferred_breach_failure(
+                    return _terminalize_deferred_breach_failure(
                         _invalid_reason,
                         extra_meta={
                             "failure_stage": "selector_result_validation",
@@ -6284,7 +6272,6 @@ class APExecutionCore:
                             "selector_qty": _sel_qty_candidate,
                         },
                     )
-                    return {"disposition": "TERMINAL_DURABLE"}
 
                 # A deferred breach retry can start from a durable row that
                 # already contains an OCC-shaped contract while its executable
@@ -8412,6 +8399,12 @@ class APExecutionCore:
 
                     if _copyback_write_ok:
                         _materialization_copyback_succeeded = True
+                        _materialization_expected_contract = _cb_contract.strip().upper()
+                        _materialization_expected_direction = str(
+                            getattr(approved_plan, "side", None)
+                            or getattr(approved_plan, "direction", None)
+                            or ""
+                        ).strip().upper()
                         log.info(
                             "DEFERRED_MATERIALIZATION_COPYBACK_PERSISTED "
                             "local_order_id=%s contract=%s limit=%.4f qty=%d",

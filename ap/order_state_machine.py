@@ -224,6 +224,12 @@ _DURABLE_EXECUTION_MODE_SQL = (
     "OR LOWER(TRIM(execution_mode)) = LOWER(TRIM(meta->>'execution_mode')))"
 )
 
+# Used by the narrow BROKER_READY terminal CAS below.  The expected contract
+# is an exact compact OCC/OSI value, never a substring embedded in junk.
+_CANONICAL_OCC_CONTRACT_RE = re.compile(
+    r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}"
+)
+
 
 def register_exit_engine(*args, **kwargs) -> None:
     """
@@ -4185,9 +4191,16 @@ class APOrderStateMachine:
         retry_attempt: int,
         client_id: str,
         execution_mode: str,
+        expected_direction: str,
+        expected_contract_symbol: str,
         diagnostics: dict | None = None,
     ) -> bool:
-        """Terminalize one exact owner-owned BROKER_READY materialization."""
+        """Terminalize one exact owner-owned BROKER_READY materialization.
+
+        The owner/generation/retry fence is also bound to the materialized
+        economic identity.  A concurrent direction or contract change must
+        lose this CAS just like a concurrent submit-intent write.
+        """
         import json as _json_local
 
         _reason = str(reason or "").strip()
@@ -4195,6 +4208,8 @@ class APOrderStateMachine:
         _owner = str(owner or "").strip()
         _client = str(client_id or "").strip().lower()
         _mode = str(execution_mode or "").strip().lower()
+        _direction = str(expected_direction or "").strip().upper()
+        _contract = str(expected_contract_symbol or "").strip().upper()
         try:
             _generation = int(generation)
             _attempt = int(retry_attempt)
@@ -4208,6 +4223,8 @@ class APOrderStateMachine:
             or _attempt < 0
             or not _client
             or _mode not in {"live", "paper"}
+            or _direction not in {"CALL", "PUT"}
+            or not _CANONICAL_OCC_CONTRACT_RE.fullmatch(_contract)
         ):
             return False
 
@@ -4251,6 +4268,10 @@ class APOrderStateMachine:
                       AND client_id = %s
                       AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(NULLIF(TRIM(direction), ''),
+                                        NULLIF(TRIM(meta->>'direction'), ''),
+                                        NULLIF(TRIM(meta->>'side'), ''), '')) = %s
+                      AND UPPER(TRIM(COALESCE(contract, ''))) = %s
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
@@ -4269,7 +4290,7 @@ class APOrderStateMachine:
                     """,
                     (
                         _status, _reason, _patch_json,
-                        local_order_id, _client, _mode,
+                        local_order_id, _client, _mode, _direction, _contract,
                         _owner, _owner, str(_generation), str(_attempt),
                     ),
                 )

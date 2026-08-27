@@ -13,6 +13,7 @@ import ap.order_state_machine as osm_mod
 from ap.order_state_machine import APOrderStateMachine
 from ap_recovery import APStartupRecovery
 from ap_execution_core import (
+    APExecutionCore,
     RETRYABLE_BREACH_SELECTOR_REASONS,
     _classify_materialization_handoff,
     _validate_deferred_selector_result,
@@ -136,6 +137,27 @@ def test_copyback_rejects_invalid_selector_result_without_db_write(
 def test_selector_object_is_not_success_without_occ_price_and_quantity(selection):
     valid, _, _, _ = _validate_deferred_selector_result(selection, "SPY")
     assert valid is False
+
+
+@pytest.mark.parametrize(
+    "contract",
+    [
+        "junkSPY260717C00600000",
+        "SPY260717C00600000junk",
+        "SPY260717C0060000",
+    ],
+)
+def test_selector_and_materialization_proof_require_whole_occ_value(contract):
+    selection = types.SimpleNamespace(
+        contract_symbol=contract,
+        execution_price_per_share=1.25,
+        affordable_contracts=1,
+    )
+
+    valid, _, _, _ = _validate_deferred_selector_result(selection, "SPY")
+
+    assert valid is False
+    assert APExecutionCore._is_real_occ_contract(contract, "SPY") is False
 
 
 def test_copyback_is_one_complete_cas_write(db_spy):

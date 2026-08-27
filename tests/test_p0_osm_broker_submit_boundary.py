@@ -425,6 +425,8 @@ def test_owned_broker_ready_terminal_cas_loses_to_submit_intent_without_overwrit
             retry_attempt=2,
             client_id=_CLIENT,
             execution_mode="paper",
+            expected_direction="CALL",
+            expected_contract_symbol=_CONTRACT,
             diagnostics={"failure_stage": "late_gate"},
         )
 
@@ -439,6 +441,8 @@ def test_owned_broker_ready_terminal_cas_loses_to_submit_intent_without_overwrit
     assert "broker_submit_key" in seen["sql"]
     assert "recovery_submit_owner" in seen["sql"]
     assert "current_owner" in seen["sql"]
+    assert "direction" in seen["sql"]
+    assert "contract" in seen["sql"]
     osm.transition.assert_not_called()
 
 

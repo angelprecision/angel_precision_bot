@@ -266,6 +266,8 @@ class _StatefulOSM:
         retry_attempt,
         client_id,
         execution_mode,
+        expected_direction,
+        expected_contract_symbol,
         diagnostics=None,
     ):
         assert local_order_id == LOCAL_ORDER_ID
@@ -277,6 +279,8 @@ class _StatefulOSM:
             "retry_attempt": retry_attempt,
             "client_id": client_id,
             "execution_mode": execution_mode,
+            "expected_direction": expected_direction,
+            "expected_contract_symbol": expected_contract_symbol,
             "diagnostics": diagnostics or {},
         })
         meta = self.row["meta"]
@@ -284,6 +288,8 @@ class _StatefulOSM:
             self.row.get("status") == "PENDING_TRIGGER"
             and self.row.get("client_id") == client_id
             and str(self.row.get("execution_mode") or "").lower() == str(execution_mode).lower()
+            and self.row.get("direction") == expected_direction
+            and self.row.get("contract") == expected_contract_symbol
             and not self.row.get("broker_order_id")
             and self.row.get("submitted_ts") is None
             and meta.get("lifecycle_state") == "BROKER_READY"
@@ -3167,6 +3173,36 @@ def test_pr514_owned_terminal_cas_loss_keeps_watcher_without_generic_cleanup(mon
     assert watched.signal["_deferred_breach_risk_reason"] == "kill_switch_active"
 
 
+def test_pr524_selector_terminal_cas_loss_is_returned_to_watcher(monkeypatch):
+    osm, selector, _mc, core, watcher, plan, trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    osm.terminalize_return = False
+
+    def _invalid_selector_result(_plan, *, request_context=None):
+        selector.calls += 1
+        trace.append("selector")
+        return types.SimpleNamespace(
+            contract_symbol=f"junk{REAL_OCC}",
+            execution_price_per_share=1.25,
+            affordable_contracts=1,
+        )
+
+    selector.select = _invalid_selector_result
+
+    _watched, result = _run_pr514_scoped_callback(watcher, plan)
+
+    assert result == {
+        "disposition": "KEEP_WATCHER",
+        "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+        "retry_after_seconds": 5,
+    }
+    assert selector.calls == 1
+    assert osm.post_payloads == []
+    assert osm.terminalizations == []
+    assert trace[-1] == "terminalize"
+
+
 def test_pr514_stale_deferred_flag_on_real_contract_does_not_reclaim_or_select(monkeypatch):
     osm, selector, _mc, core, watcher, plan, trace, _stores = (
         _pr514_ownership_fixture(monkeypatch)
@@ -3403,10 +3439,74 @@ def test_pr524_recovery_materialization_broker_ready_gate_uses_exact_terminal_ca
     assert osm.broker_ready_terminalization_calls[0]["owner"] == owner
     assert osm.broker_ready_terminalization_calls[0]["generation"] == 7
     assert osm.broker_ready_terminalization_calls[0]["retry_attempt"] == 1
+    assert osm.broker_ready_terminalization_calls[0]["expected_direction"] == "CALL"
+    assert (
+        osm.broker_ready_terminalization_calls[0]["expected_contract_symbol"]
+        == osm.row["contract"]
+    )
     assert osm.terminalizations == [
         (result["reason_code"], "EXPIRED"),
     ]
     assert osm.row["status"] == "EXPIRED"
+
+
+@pytest.mark.parametrize(
+    ("identity_field", "drifted_value"),
+    [
+        ("direction", "PUT"),
+        ("contract", "SPY260717P00600000"),
+    ],
+)
+def test_pr524_broker_ready_terminal_cas_rejects_economic_identity_drift(
+    monkeypatch, identity_field, drifted_value,
+):
+    osm, selector, master_control, core, watcher, plan, _trace, _stores = (
+        _pr514_ownership_fixture(monkeypatch)
+    )
+    owner = "recovery_retry:broker-ready"
+    _set_active_materialization(osm, owner=owner, generation=7, attempt=1)
+    master_control.final_ok_sequence = [True, True]
+    master_control.final_reason_sequence = [
+        "EXPOSURE_ALLOWED",
+        "EXPOSURE_ALLOWED",
+    ]
+    plan._test_confirmation_result = types.SimpleNamespace(
+        passed=False,
+        fail_reason="ENTRY_CONFIRMATION_REJECTED",
+        metadata={"live_entry_ts": _iso()},
+        to_meta=lambda **kwargs: {"passed": False, **kwargs},
+    )
+    original_persist = osm.persist_deferred_broker_ready
+
+    def _persist_then_drift(local_order_id, **kwargs):
+        result = original_persist(local_order_id, **kwargs)
+        if result:
+            osm.row[identity_field] = drifted_value
+        return result
+
+    osm.persist_deferred_broker_ready = _persist_then_drift
+    marker = {
+        "_recovery_pre_claimed": True,
+        "_recovery_pre_claimed_owner": owner,
+        "_recovery_pre_claimed_generation": 7,
+        "_recovery_pre_claimed_attempt": 1,
+        "_recovery_pre_claimed_client_id": CLIENT_ID,
+        "_recovery_pre_claimed_mode": "live",
+    }
+
+    _watched, result = _run_pr514_scoped_callback(
+        watcher, plan, signal_patch=marker
+    )
+
+    assert result == {
+        "disposition": "KEEP_WATCHER",
+        "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+        "retry_after_seconds": 5,
+    }
+    assert selector.calls == 1
+    assert osm.post_payloads == []
+    assert osm.terminalizations == []
+    assert len(osm.broker_ready_terminalization_calls) == 1
 
 
 def test_pr514_recovery_preclaim_on_hydrated_contract_is_still_proven(monkeypatch):
