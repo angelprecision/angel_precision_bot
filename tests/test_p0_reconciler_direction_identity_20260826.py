@@ -12,9 +12,48 @@ These regressions fix the line at the seam; they do not simply test the helper.
 from __future__ import annotations
 
 import inspect
+import sys
 from types import SimpleNamespace
 
 import ap_reconciler as rec
+
+
+class _FakeManagedPosition:
+    """Minimal ManagedPosition stand-in — no DATABASE_URL required.
+    Accepts the kwargs that _seed_exit_engine_from_import passes to ManagedPosition()
+    and supports every attribute assignment the method makes afterwards.
+    """
+
+    def __init__(
+        self,
+        ticker="",
+        option_symbol="",
+        side="",
+        quantity=0,
+        entry_price=0.0,
+        underlying_entry=0.0,
+        underlying_target=0.0,
+        underlying_stop=0.0,
+    ):
+        self.ticker = ticker
+        self.option_symbol = option_symbol
+        self.side = side
+        self.quantity = quantity
+        self.entry_price = entry_price
+        self.underlying_entry = underlying_entry
+        self.underlying_target = underlying_target
+        self.underlying_stop = underlying_stop
+        self.position_id = ""
+        self.client_id = ""
+        self.signal_id = ""
+        self.canonical_signal_id = ""
+        self.execution_mode = ""
+        self.current_option_price = 0.0
+        self.price_untrusted = False
+        self.underlying_entry_untrusted = False
+        self.imported_by_reconciler = False
+        self.entry_local_order_id = ""
+        self.entry_broker_order_id = ""
 
 CLIENT = "jasoncosby1@gmail.com"
 
@@ -159,6 +198,11 @@ def test_proven_side_is_identical_in_adopt_call_and_managed_position(monkeypatch
     reconciler = _reconciler()
     engine = _ExitEngine()
     reconciler.exit_engine = engine
+    monkeypatch.setitem(
+        sys.modules,
+        "ap_exit_engine",
+        SimpleNamespace(ManagedPosition=_FakeManagedPosition),
+    )
 
     # Stub out DB calls; provide enough evidence for adoption to proceed.
     evidence = {

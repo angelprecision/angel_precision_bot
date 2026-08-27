@@ -1,8 +1,49 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import ap_reconciler as rec
+
+
+class _FakeManagedPosition:
+    """Minimal ManagedPosition stand-in for tests that cannot import ap_exit_engine
+    (no DATABASE_URL in local environment).  Accepts the exact kwargs that
+    _seed_exit_engine_from_import passes to ManagedPosition() and supports every
+    attribute assignment the method makes afterwards.
+    """
+
+    def __init__(
+        self,
+        ticker="",
+        option_symbol="",
+        side="",
+        quantity=0,
+        entry_price=0.0,
+        underlying_entry=0.0,
+        underlying_target=0.0,
+        underlying_stop=0.0,
+    ):
+        self.ticker = ticker
+        self.option_symbol = option_symbol
+        self.side = side
+        self.quantity = quantity
+        self.entry_price = entry_price
+        self.underlying_entry = underlying_entry
+        self.underlying_target = underlying_target
+        self.underlying_stop = underlying_stop
+        # Post-construction attributes set by the reconciler:
+        self.position_id = ""
+        self.client_id = ""
+        self.signal_id = ""
+        self.canonical_signal_id = ""
+        self.execution_mode = ""
+        self.current_option_price = 0.0
+        self.price_untrusted = False
+        self.underlying_entry_untrusted = False
+        self.imported_by_reconciler = False
+        self.entry_local_order_id = ""
+        self.entry_broker_order_id = ""
 
 
 CLIENT = "jasoncosby1@gmail.com"
@@ -252,6 +293,11 @@ def test_no_repair_found_seeds_one_canonical_owner(monkeypatch):
     exit_engine = _ExitEngine("NO_REPAIR_FOUND")
     reconciler.exit_engine = exit_engine
     monkeypatch.setattr(reconciler, "_filled_entry_evidence", lambda *a, **k: _evidence())
+    monkeypatch.setitem(
+        sys.modules,
+        "ap_exit_engine",
+        SimpleNamespace(ManagedPosition=_FakeManagedPosition),
+    )
 
     reconciler._seed_exit_engine_from_position(
         {
@@ -420,6 +466,11 @@ def test_missing_entry_truth_stays_untrusted_instead_of_fabricated(monkeypatch):
     reconciler.exit_engine = exit_engine
     monkeypatch.setattr(reconciler, "_filled_entry_evidence", lambda *a, **k: None)
     monkeypatch.setattr(reconciler, "_get_current_underlying_price", lambda symbol: 126.62)
+    monkeypatch.setitem(
+        sys.modules,
+        "ap_exit_engine",
+        SimpleNamespace(ManagedPosition=_FakeManagedPosition),
+    )
 
     reconciler._seed_exit_engine_from_import(
         pos_id=POSITION_ID,
