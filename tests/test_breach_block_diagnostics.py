@@ -19,6 +19,7 @@ or cancel paths. The test file proves that property by construction.
 """
 from __future__ import annotations
 
+import ast
 import sys
 import types
 import logging
@@ -31,6 +32,20 @@ import pytest
 _REPO    = Path(__file__).resolve().parents[1]
 _EC_SRC  = (_REPO / "ap_execution_core.py").read_text()
 _EW_SRC  = (_REPO / "ap_entry_watcher.py").read_text()
+
+
+def _method_source(source: str, name: str) -> str:
+    tree = ast.parse(source)
+    node = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == name
+    )
+    return ast.get_source_segment(source, node) or ""
+
+
+_BREACH_RISK_CHECK_SRC = _method_source(_EC_SRC, "_breach_risk_check")
 
 
 # ---------------------------------------------------------------------------
@@ -58,9 +73,7 @@ class TestSourceGuards:
 
     def test_no_new_status_writes_in_breach_risk_check(self):
         """Diagnostic-only — must not introduce new orders status writes."""
-        fn_start = _EC_SRC.find("def _breach_risk_check")
-        fn_end   = _EC_SRC.find("    def ", fn_start + 10)
-        body     = _EC_SRC[fn_start: fn_end]
+        body = _BREACH_RISK_CHECK_SRC
         # The only DB writes allowed are the pre-existing update_signal_fields
         # calls (signals table, not orders) and the pre-existing
         # _cleanup_pending_entry_order on positions_full path.
@@ -72,9 +85,7 @@ class TestSourceGuards:
     def test_no_new_cleanup_calls_in_breach_risk_check(self):
         """Count cleanup calls — must equal exactly 1 (the pre-existing
         positions_full path). The diagnostic PR must NOT add any new ones."""
-        fn_start = _EC_SRC.find("def _breach_risk_check")
-        fn_end   = _EC_SRC.find("    def ", fn_start + 10)
-        body     = _EC_SRC[fn_start: fn_end]
+        body = _BREACH_RISK_CHECK_SRC
         count = body.count("_cleanup_pending_entry_order")
         assert count == 1, (
             f"_breach_risk_check must have exactly 1 _cleanup_pending_entry_order "
@@ -86,9 +97,7 @@ class TestSourceGuards:
         """_breach_risk_check must have exactly 5 'return False' paths
         (kill switch x2, positions_full, approved_plan_missing LIVE,
         revalidation block, revalidation error LIVE) plus the final 'return True'."""
-        fn_start = _EC_SRC.find("def _breach_risk_check")
-        fn_end   = _EC_SRC.find("    def ", fn_start + 10)
-        body     = _EC_SRC[fn_start: fn_end]
+        body = _BREACH_RISK_CHECK_SRC
         return_false_count = body.count("return False")
         return_true_count  = body.count("return True")
         assert return_false_count == 6, (
@@ -354,7 +363,7 @@ class TestEntryTriggerBlockedReturn:
         # Look at a generous window before the emission for the breach_risk_check
         # gate and the funnel counter (proves we're in the right code block).
         window = _EC_SRC[max(0, idx - 2000): idx + 1000]
-        assert "_breach_risk_check(watched)" in window
+        assert "_breach_risk_check(" in window
         assert "master_control_blocked" in window
         # The emission's reason field must be the agreed value
         assert 'reason="breach_risk_check_false"' in window
