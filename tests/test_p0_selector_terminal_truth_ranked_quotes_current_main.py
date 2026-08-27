@@ -246,7 +246,52 @@ def _execution_core(selector, broker, execution_mode: str = "LIVE") -> APExecuti
     core.order_state_machine.transition.return_value = True
     core.order_state_machine.update_order_meta.return_value = True
     core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
-    core.order_state_machine.terminalize_deferred_breach.return_value = False
+    core.order_state_machine.terminalize_deferred_breach.return_value = True
+
+    # The execution-core seam now proves deferred materialization ownership
+    # from the durable row before selector work.  Model one valid fresh claim
+    # without changing any selector or broker behavior under test.
+    durable_row = {
+        "local_order_id": "local-pr408-execution-core",
+        "client_id": core.client_id,
+        "execution_mode": execution_mode.lower(),
+        "signal_id": "sig-pr408-execution-core",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "contract": "DEFERRED:SPY",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "meta": {
+            "contract_deferred": True,
+            "lifecycle_state": "",
+            "materialization_status": "QUEUED",
+            "materialization_in_flight": False,
+            "materialization_generation": 0,
+            "retry_attempt": 0,
+        },
+    }
+
+    def _claim_deferred_materialization(*args, **kwargs):
+        durable_row["meta"].update({
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
+            "materialization_in_flight": True,
+            "materialization_owner": kwargs["owner"],
+            "materialization_generation": kwargs["generation"],
+            "materialization_lease_until": kwargs["lease_until"],
+        })
+        return True
+
+    def _get_durable_order(local_order_id):
+        if not local_order_id:
+            return None
+        durable_row["local_order_id"] = local_order_id
+        return durable_row
+
+    core.order_state_machine.get_order.side_effect = _get_durable_order
+    core.order_state_machine.claim_deferred_materialization.side_effect = (
+        _claim_deferred_materialization
+    )
     core.store = MagicMock()
     core.entry_watcher = MagicMock()
     core.exit_eng = MagicMock()
@@ -413,7 +458,8 @@ def test_execution_core_ibm_affordability_terminalizes_without_retry_owner_resch
     tradeability = audit["best_rejected_candidate"]["tradeability_diag"]
     assert tradeability["budget"] == pytest.approx(174.71)
     assert tradeability["premium_per_contract_usd"] == pytest.approx(315.0)
-    core.order_state_machine.expire_pending_entry.assert_called_once()
+    core.order_state_machine.terminalize_deferred_breach.assert_called_once()
+    core.order_state_machine.expire_pending_entry.assert_not_called()
     broker.submit_order.assert_not_called()
     broker.cancel_order.assert_not_called()
 
@@ -1323,7 +1369,8 @@ def test_execution_core_real_selector_failure_retries_or_terminalizes_with_truth
         assert selector_failure["operational_reason"] == (
             "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         )
-        core.order_state_machine.expire_pending_entry.assert_called_once()
+        core.order_state_machine.terminalize_deferred_breach.assert_called_once()
+        core.order_state_machine.expire_pending_entry.assert_not_called()
 
 
 def test_execution_core_real_selector_provider_failure_terminalizes_without_fake_failure_payload(
@@ -1371,7 +1418,8 @@ def test_execution_core_real_selector_provider_failure_terminalizes_without_fake
     assert selector_failure["selector_terminal_reason"] == "CHAIN_PROVIDER_ERROR"
     assert selector_failure["operational_reason"] is None
     thread_factory.return_value.start.assert_not_called()
-    core.order_state_machine.expire_pending_entry.assert_called_once()
+    core.order_state_machine.terminalize_deferred_breach.assert_called_once()
+    core.order_state_machine.expire_pending_entry.assert_not_called()
     broker.submit_order.assert_not_called()
     broker.cancel_order.assert_not_called()
 

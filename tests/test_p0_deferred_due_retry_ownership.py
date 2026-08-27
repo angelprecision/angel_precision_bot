@@ -1870,6 +1870,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "materialization_status": "RUNNING",
         "materialization_generation": 2,
         "materialization_owner": f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3",
+        "materialization_lease_until": _iso(now + timedelta(seconds=120)),
         "materialization_in_flight": True,
         "retry_attempt": 2,
     })
@@ -2077,6 +2078,13 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         f"claim_deferred_materialization must be called exactly once; "
         f"got {claim_call_count[0]}"
     )
+    if starting_contract != "DEFERRED:RTX":
+        # A real durable OCC is already materialized.  A stale deferred flag
+        # must not reopen selector work or create a second ownership claim.
+        assert _FakeSelector.select_count == 0
+        assert copyback_calls == []
+        assert submit_calls == []
+        return
     # Selector must have been called exactly once
     assert _FakeSelector.select_count == 1, (
         f"selector.select must be called exactly once; got {_FakeSelector.select_count}"
@@ -2836,6 +2844,41 @@ def _base_meta(*, retry_max_attempts=None, retry_attempt: int = 1) -> dict:
     if retry_max_attempts is not None:
         m["retry_max_attempts"] = retry_max_attempts
     return m
+
+
+def test_deferred_retry_mode_uses_valid_metadata_when_column_is_blank(monkeypatch):
+    """Deferred retry keeps the canonical column/meta fallback authority."""
+    meta = _base_meta(retry_attempt=1)
+    meta["execution_mode"] = "paper"
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch, execution_mode="paper")
+    osm.get_order.return_value["execution_mode"] = ""
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+
+    assert result["reason_code"] != "RETRY_INVALID_EXECUTION_MODE"
+    core._on_entry_trigger.assert_called_once()
+
+
+def test_deferred_retry_mode_contradiction_fails_closed_before_callback(monkeypatch):
+    meta = _base_meta(retry_attempt=1)
+    meta["execution_mode"] = "paper"
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch, execution_mode="live")
+    osm.get_order.return_value["execution_mode"] = "live"
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+
+    assert result["reason_code"] == "RETRY_INVALID_EXECUTION_MODE"
+    core._on_entry_trigger.assert_not_called()
 
 
 # ── Test 1: durable=3, env=5 → max_attempts raised to 5 ─────────────────────

@@ -1047,9 +1047,11 @@ def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
         "meta": {
             "contract_deferred": True,
             "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
             "materialization_in_flight": True,
             "materialization_owner": owner,
             "materialization_generation": 2,
+            "materialization_lease_until": "2099-01-01T00:00:00+00:00",
             "retry_attempt": 2,
             "breach_attempt_count": 2,
             "materialization_attempts": 2,
@@ -1153,6 +1155,31 @@ def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
         side_effect=_stateful_terminalize_deferred_breach,
     )
 
+    def _stateful_terminalize_materialization_retry(
+        local_order_id,
+        *,
+        reason,
+        terminal_status="EXPIRED",
+        owner="",
+        generation=None,
+        retry_attempt=None,
+        client_id=None,
+        execution_mode=None,
+        diagnostics=None,
+    ):
+        return _stateful_terminalize_deferred_breach(
+            local_order_id,
+            reason_code=reason,
+            terminal_status=terminal_status,
+            owner=owner,
+            generation=generation,
+            diagnostics=diagnostics,
+        )
+
+    osm.terminalize_materialization_retry = MagicMock(
+        side_effect=_stateful_terminalize_materialization_retry,
+    )
+
     selector = MagicMock()
     selector.select = MagicMock()
     selector.data_broker = MagicMock()
@@ -1249,10 +1276,10 @@ def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
     assert queue_execution_write.call_count == 0
     # The existing claimed ENTRY must be terminalized exactly once, using the
     # same ownership fence that was verified before this real runtime call.
-    osm.terminalize_deferred_breach.assert_called_once()
-    terminalize_call = osm.terminalize_deferred_breach.call_args
+    osm.terminalize_materialization_retry.assert_called_once()
+    terminalize_call = osm.terminalize_materialization_retry.call_args
     assert terminalize_call.args == (_BASE_ORDER,)
-    assert terminalize_call.kwargs["reason_code"] == (
+    assert terminalize_call.kwargs["reason"] == (
         "SELECTOR_RECOVERY_CURSOR_INVALID:MALFORMED_CURSOR:attempted_symbols"
     )
     assert terminalize_call.kwargs["terminal_status"] == "EXPIRED"
@@ -1272,7 +1299,7 @@ def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
     assert row["execution_mode"] == _BASE_MODE
     assert row["signal_id"] == _BASE_SIGNAL
     assert row["status"] == "EXPIRED"
-    assert row["last_error"] == terminalize_call.kwargs["reason_code"]
+    assert row["last_error"] == terminalize_call.kwargs["reason"]
     assert row["broker_order_id"] is None
     assert row["submitted_ts"] is None
     assert row["meta"].get("submit_intent_at") in (None, "")

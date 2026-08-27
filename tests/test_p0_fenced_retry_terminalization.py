@@ -1297,6 +1297,8 @@ def test_final_materialization_retry_early_osm_rejection_uses_fenced_terminal():
                 "local_order_id": LOCAL_ORDER_ID,
                 "client_id": CLIENT_ID,
                 "execution_mode": "paper",
+                "signal_id": SIGNAL_ID,
+                "kind": "ENTRY",
                 "status": "PENDING_TRIGGER",
                 "broker_order_id": None,
                 "submitted_ts": None,
@@ -1307,6 +1309,9 @@ def test_final_materialization_retry_early_osm_rejection_uses_fenced_terminal():
                     "materialization_owner": "retry-owner",
                     "materialization_generation": 7,
                     "retry_attempt": 3,
+                    "materialization_lease_until": (
+                        datetime.now(timezone.utc) + timedelta(seconds=30)
+                    ).isoformat(),
                 },
             }
         def terminalize_materialization_retry(self, oid, **kw):
@@ -1328,6 +1333,9 @@ def test_final_materialization_retry_early_osm_rejection_uses_fenced_terminal():
     core.order_state_machine = _OSM()
     core.store = MagicMock()
     core._breach_risk_check = lambda watched: True
+    core._cleanup_pending_entry_order = APExecutionCore._cleanup_pending_entry_order.__get__(
+        core, APExecutionCore
+    )
 
     plan = SimpleNamespace(
         client_id=CLIENT_ID,
@@ -1358,6 +1366,12 @@ def test_final_materialization_retry_early_osm_rejection_uses_fenced_terminal():
             "recovery_submit_fenced": True,
             "recovery_submit_owner": "retry-owner",
             "recovery_submit_generation": 7,
+            "_recovery_pre_claimed": True,
+            "_recovery_pre_claimed_owner": "retry-owner",
+            "_recovery_pre_claimed_generation": 7,
+            "_recovery_pre_claimed_attempt": 3,
+            "_recovery_pre_claimed_client_id": CLIENT_ID,
+            "_recovery_pre_claimed_mode": "paper",
             "_approved_plan": plan,
         },
     )

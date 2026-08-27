@@ -646,9 +646,9 @@ def _now_iso() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Audit additional finding: schedule_deferred_materialization_retry's
-# execution-mode predicate lacked TRIM and could not fall back to
-# meta.execution_mode when the durable column was an empty string (not NULL).
+# Audit additional finding: schedule_deferred_materialization_retry must use
+# the canonical execution-mode column, with valid metadata as the fallback when
+# that column is empty.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestScheduleRetryExecutionModeNormalization:
@@ -683,12 +683,8 @@ class TestScheduleRetryExecutionModeNormalization:
             "whitespace-padded durable execution_mode must still CAS-match"
         )
 
-    def test_empty_column_falls_back_to_meta_execution_mode(self):
-        """A row with an empty-string (not NULL) execution_mode column must
-        still fall back to meta.execution_mode -- COALESCE(execution_mode,
-        meta->>'execution_mode', '') never falls through when the column is
-        '' rather than NULL, since '' is not NULL. NULLIF(execution_mode,'')
-        fixes this."""
+    def test_empty_column_uses_valid_meta_execution_mode(self):
+        """A blank column may use valid metadata without runner inference."""
         _insert_row(
             local_order_id=self.LOID,
             owner="watcher:real-owner",
@@ -711,8 +707,8 @@ class TestScheduleRetryExecutionModeNormalization:
             execution_mode="paper",
         )
         assert ok is True, (
-            "empty-string durable execution_mode column must fall back to "
-            "meta.execution_mode, not permanently block the CAS"
+            "valid metadata execution_mode must support the CAS when the "
+            "durable column is blank"
         )
 
 
