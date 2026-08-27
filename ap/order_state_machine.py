@@ -680,8 +680,8 @@ class APOrderStateMachine:
             "direction":          _direction,
             "side":               _direction,   # alias — retry_engine reads both
             "symbol":             str(getattr(plan, "ticker", "") or ""),
-            # execution_mode mirrored into meta as a JSON fallback alongside the
-            # top-level orders.execution_mode column.
+            # execution_mode mirrored into meta as a consistency check
+            # alongside the top-level orders.execution_mode column.
             "execution_mode":     _exec_mode,
 
         }
@@ -2745,22 +2745,47 @@ class APOrderStateMachine:
             "execution_mode": _mode,
             "broker_ready": False,
         }
-        # P0 AMENDMENT blocker §4 (second round): atomically advance the
-        # CANONICAL retry_attempt field in the same JSONB merge as the
-        # generation advance. retry_attempt_in_flight is also written as
-        # a diagnostic alias for operators. The SQL predicate verifies the
-        # previous canonical attempt to prevent re-use of an already-claimed
-        # attempt slot (belt-and-suspenders against concurrent claimants
-        # after a lease expiry).
+        # P0 AMENDMENT blocker §4 (second round): the three durable attempt
+        # fields are one selector-attempt identity. Advance all of them in
+        # the same JSONB merge as the generation advance; otherwise a crash
+        # between this pre-claim and the later retry schedule can persist
+        # retry_attempt=N+1 beside the two prior mirrors (the exact 2/1/1
+        # production failure). retry_attempt_in_flight remains a diagnostic
+        # alias. The SQL predicate verifies the previous canonical attempt
+        # and any present mirrors, so a pre-existing split row is not silently
+        # normalized by a later claim.
         _prev_attempt: int | None = None
+        _attempt_predicate = ""
+        _attempt_params: list = []
         if retry_attempt is not None:
+            if isinstance(retry_attempt, bool):
+                return False
             try:
                 _ra = int(retry_attempt)
+                if _ra < 1:
+                    return False
                 _patch["retry_attempt"] = _ra
                 _patch["retry_attempt_in_flight"] = _ra
-                _prev_attempt = max(0, _ra - 1)
+                _patch["breach_attempt_count"] = _ra
+                _patch["materialization_attempts"] = _ra
+                _prev_attempt = _ra - 1
+                _attempt_predicate = (
+                    " AND (NULLIF(BTRIM(meta->>'retry_attempt'), '') IS NULL"
+                    " OR CASE WHEN BTRIM(meta->>'retry_attempt') ~ '^[0-9]+$'"
+                    " THEN BTRIM(meta->>'retry_attempt')::int = %s"
+                    " ELSE FALSE END)"
+                    " AND (NULLIF(BTRIM(meta->>'breach_attempt_count'), '') IS NULL"
+                    " OR CASE WHEN BTRIM(meta->>'breach_attempt_count') ~ '^[0-9]+$'"
+                    " THEN BTRIM(meta->>'breach_attempt_count')::int = %s"
+                    " ELSE FALSE END)"
+                    " AND (NULLIF(BTRIM(meta->>'materialization_attempts'), '') IS NULL"
+                    " OR CASE WHEN BTRIM(meta->>'materialization_attempts') ~ '^[0-9]+$'"
+                    " THEN BTRIM(meta->>'materialization_attempts')::int = %s"
+                    " ELSE FALSE END)"
+                )
+                _attempt_params = [_prev_attempt, _prev_attempt, _prev_attempt]
             except (TypeError, ValueError):
-                pass
+                return False
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
         except Exception:
@@ -2768,15 +2793,6 @@ class APOrderStateMachine:
 
         def _claim():
             with conn() as c:
-                _attempt_predicate = ""
-                _attempt_params: list = []
-                if _prev_attempt is not None:
-                    # Verify the canonical retry_attempt is at the expected
-                    # prior value — prevents double-claiming an attempt slot.
-                    _attempt_predicate = (
-                        " AND COALESCE((meta->>'retry_attempt')::int, 0) = %s"
-                    )
-                    _attempt_params = [_prev_attempt]
                 cur = c.execute(
                     """
                     UPDATE orders
@@ -2789,18 +2805,35 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      -- Either mirror may supply a blank counterpart, but
+                      -- both nonblank mirrors must agree and resolve validly.
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND COALESCE((meta->>'broker_ready')::boolean, false) = false
+                    """ + _attempt_predicate + """
                       AND (
                             COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
                          OR COALESCE(meta->>'materialization_lease_until','') < %s
                       )
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
-                    """ + _attempt_predicate,
+                    """,
                     (
                         _patch_json, local_order_id, self.client_id,
-                        _signal_id, _mode, _now, _expected_previous_generation,
-                        *_attempt_params,
+                        _signal_id, _mode, *_attempt_params, _now,
+                        _expected_previous_generation,
                     ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
@@ -2864,7 +2897,21 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3565,7 +3612,21 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
-                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND COALESCE(meta->>'materialization_owner','') = %s
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
@@ -3790,7 +3851,21 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(TRIM(COALESCE(NULLIF(execution_mode, ''), meta->>'execution_mode',''))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -3873,7 +3948,21 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')

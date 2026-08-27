@@ -27,6 +27,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 from ap.pending_trigger_restart_recovery import (
     PendingTriggerRestartRecovery,
     _RowOutcome,
+    _build_plan,
+    _resolve_execution_mode,
     _MAT_STATUS_FIELD,
     _MAT_NEXT_RETRY_AT,
     _MAT_ATTEMPTS_FIELD,
@@ -700,9 +702,32 @@ class TestBlocker3CanonicalRetryFields:
         assert all_meta.get(_MAT_NEXT_RETRY_AT) is not None
         # _MAT_RETRY_DEADLINE was removed — real stamp_retry_pending has no deadline field
         assert isinstance(all_meta.get(_MAT_ATTEMPTS_FIELD), int)
+        assert all_meta.get("retry_attempt") == all_meta.get(_MAT_ATTEMPTS_FIELD)
+        assert all_meta.get("breach_attempt_count") == all_meta.get(_MAT_ATTEMPTS_FIELD)
         assert all_meta.get(_MAT_REASON_FIELD)                        # reason written
         assert all_meta.get(_MAT_LAST_FAILURE_FIELD)                   # last_failure_at written
         assert all_meta.get(_MAT_BROKER_READY) is False               # broker_ready=False
+
+    def test_enter_canonical_retry_quarantines_counter_conflict(self):
+        """Restart recovery must not choose one value from a split 2/1/1 row."""
+        r = _row(meta={
+            "trigger_price": 450.0,
+            "retry_attempt": 2,
+            "breach_attempt_count": 1,
+            _MAT_ATTEMPTS_FIELD: 1,
+        })
+        r["contract"] = "DEFERRED:SPY"
+        rec, osm = _make_recovery(r)
+
+        outcome = rec._enter_canonical_retry(
+            r["local_order_id"], r, reason="counter_conflict"
+        )
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert osm.meta_writes == []
+        assert rec._row_failure_reasons[r["local_order_id"]] == (
+            "SELECTOR_RECOVERY_CURSOR_INVALID:MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1159,6 +1184,8 @@ class TestIntegrationOrderMonitor:
         import ap_recovery
 
         src = inspect.getsource(ap_recovery.APStartupRecovery._reseed_watchers)
+        assert "PendingTriggerRestartRecovery" in src
+        assert "plan_builder_fn=_plan_builder" in src
         assert "falling back to direct watch" not in src
         assert "self.entry_watcher.watch(plan, local_order_id)" not in src
         assert '_row_dict["client_id"]' not in src
@@ -1175,7 +1202,7 @@ class TestAmendment10Required:
     # 1. Real stamp_retry_pending fields written, no invented ones ─────────────
 
     def test_enter_canonical_retry_only_writes_real_stamp_fields(self):
-        """_enter_canonical_retry must write exactly the fields stamp_retry_pending writes.
+        """Write the real #323 fields plus coherent attempt-authority mirrors.
         Must NOT write: materialization_owner, materialization_retry_deadline,
         materialization_attempt_count, materialization_retry_reason."""
         r = _row(meta={"trigger_price": 450.0})
@@ -1419,3 +1446,275 @@ class TestAmendment10Required:
         assert result is None, (
             f"No entry_watcher → must return None (unavailable), not False; got {result}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PR #519 final amendment — restart execution_mode authority parity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestExecutionModeAuthorityParity:
+    @pytest.mark.parametrize(
+        ("column_mode", "meta_mode", "runner_mode"),
+        [
+            ("paper", "paper", "paper"),
+            ("", "paper", "paper"),
+            (" ", " paper ", "paper"),
+            (" live ", "live", "live"),
+        ],
+    )
+    def test_restart_recovery_uses_one_canonical_mode_for_rearm(
+        self, column_mode, meta_mode, runner_mode
+    ):
+        """A valid one-sided or agreeing mirror is normalized and rearmed safely."""
+        r = _row(
+            execution_mode=column_mode,
+            meta={"execution_mode": meta_mode, "trigger_price": 450.0},
+        )
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(
+            r,
+            watcher=watcher,
+            mode=runner_mode,
+            quote_result=False,
+        )
+
+        summary = rec.recover_all([r])
+
+        assert summary["watchers_rearmed"] == 1
+        assert summary["ownerless_rows_remaining"] == 0
+        assert watcher._pending[0].signal["execution_mode"] == runner_mode
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    @pytest.mark.parametrize(
+        ("column_mode", "meta_mode", "runner_mode"),
+        [("sandbox", "paper", "paper"), ("paper", "sandbox", "paper")],
+    )
+    def test_invalid_nonblank_mode_mirror_is_unresolved_without_side_effects(
+        self, column_mode, meta_mode, runner_mode
+    ):
+        """An invalid nonblank durable mode mirror cannot be repaired."""
+        r = _row(
+            execution_mode=column_mode,
+            meta={"execution_mode": meta_mode, "trigger_price": 450.0},
+        )
+        watcher = _MockWatcher(watch_returns=True)
+        watcher.watch = MagicMock(return_value=True)
+        rec, osm = _make_recovery(
+            r,
+            watcher=watcher,
+            mode=runner_mode,
+            quote_result=False,
+        )
+
+        expected_error = (
+            "INVALID_EXECUTION_MODE_METADATA"
+            if meta_mode == "sandbox"
+            else "MISSING_OR_INVALID_EXECUTION_MODE"
+        )
+        assert _resolve_execution_mode(r) == (None, expected_error)
+        summary = rec.recover_all([r])
+
+        assert summary["row_outcomes"][r["local_order_id"]] == _RowOutcome.UNRESOLVED
+        assert summary["ownerless_rows_remaining"] == 1
+        assert watcher.watch.call_count == 0
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    @pytest.mark.parametrize(
+        ("column_mode", "meta_mode", "expected"),
+        [
+            ("", "paper", ("paper", None)),
+            (" ", " paper ", ("paper", None)),
+            ("paper", "sandbox", (None, "INVALID_EXECUTION_MODE_METADATA")),
+            ("sandbox", "paper", (None, "MISSING_OR_INVALID_EXECUTION_MODE")),
+            (" PAPER ", " paper ", ("paper", None)),
+        ],
+    )
+    def test_resolver_validates_and_normalizes_both_durable_mode_mirrors(
+        self, column_mode, meta_mode, expected
+    ):
+        row = _row(
+            execution_mode=column_mode,
+            meta={"execution_mode": meta_mode},
+        )
+
+        assert _resolve_execution_mode(row) == expected
+
+    @pytest.mark.parametrize(
+        ("column_mode", "meta_mode"),
+        [("live", "paper"), ("paper", "live")],
+    )
+    def test_mode_conflict_is_unresolved_before_any_side_effect(
+        self, column_mode, meta_mode
+    ):
+        r = _row(
+            execution_mode=column_mode,
+            meta={"execution_mode": meta_mode, "trigger_price": 450.0},
+        )
+        watcher = _MockWatcher(watch_returns=True)
+        watcher.watch = MagicMock(return_value=True)
+        osm = _MockOSM()
+        osm.seed(r)
+        quote_check = MagicMock(return_value=False)
+        rec = PendingTriggerRestartRecovery(
+            client_id="client@test.com",
+            execution_mode=column_mode,
+            osm=osm,
+            entry_watcher=watcher,
+            broker=MagicMock(),
+            quote_check_fn=quote_check,
+        )
+
+        summary = rec.recover_all([r])
+
+        assert summary["row_outcomes"][r["local_order_id"]] == _RowOutcome.UNRESOLVED
+        assert summary["failure_reasons"][r["local_order_id"]] == (
+            "identity:execution_mode_authority_conflict"
+        )
+        assert quote_check.call_count == 0
+        watcher.watch.assert_not_called()
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_both_modes_missing_preserves_fail_closed_behavior(self):
+        r = _row(execution_mode="", meta={})
+        watcher = _MockWatcher(watch_returns=True)
+        watcher.watch = MagicMock(return_value=True)
+        rec, osm = _make_recovery(r, watcher=watcher)
+
+        summary = rec.recover_all([r])
+
+        assert summary["ownerless_rows_remaining"] == 1
+        assert summary["failure_reasons"][r["local_order_id"]] == (
+            "identity:missing_execution_mode"
+        )
+        watcher.watch.assert_not_called()
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_plan_builder_uses_one_sided_metadata_and_rejects_conflict(self):
+        blank_row = _row(execution_mode=" ", meta={"execution_mode": "paper"})
+        plan = _build_plan(blank_row)
+        assert plan is not None
+        assert plan.execution_mode == "paper"
+        assert _resolve_execution_mode(blank_row) == ("paper", None)
+
+        invalid_row = _row(execution_mode="sandbox", meta={"execution_mode": "paper"})
+        assert _build_plan(invalid_row) is None
+
+        conflict_row = _row(
+            execution_mode="live",
+            meta={"execution_mode": "paper"},
+        )
+        assert _build_plan(conflict_row) is None
+
+    def test_terminal_reread_uses_one_sided_metadata_mode(self):
+        reason = "overnight_daily_invalidated"
+        r = _row(
+            execution_mode="",
+            meta={
+                "execution_mode": "paper",
+                "watcher_audit": {"reason_code": reason},
+            },
+        )
+        osm = _MockOSM(cancel_returns=True, get_order_status="CANCELED")
+        osm.seed(r)
+        rec, _ = _make_recovery(r, osm=osm)
+
+        outcome = rec._terminalize_with_reason(r["local_order_id"], r, reason)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert len(osm.cancel_calls) == 1
+        assert len(osm.meta_writes) == 1
+
+    def test_terminal_reread_with_invalid_column_is_unresolved_without_mutation(self):
+        reason = "overnight_daily_invalidated"
+        r = _row(
+            execution_mode="sandbox",
+            meta={
+                "execution_mode": "paper",
+                "watcher_audit": {"reason_code": reason},
+            },
+        )
+        osm = _MockOSM(cancel_returns=True, get_order_status="CANCELED")
+        osm.seed(r)
+        rec, _ = _make_recovery(r, osm=osm)
+
+        outcome = rec._terminalize_with_reason(r["local_order_id"], r, reason)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_materialization_retry_reread_uses_one_sided_metadata_mode(self):
+        r = _row(
+            execution_mode="",
+            meta={
+                "execution_mode": "paper",
+                **_retry_meta(),
+            },
+        )
+        r["contract"] = "DEFERRED:SPY"
+        rec, _ = _make_recovery(r)
+
+        proof = rec._verify_materialization_retry_ownership(
+            r["local_order_id"], r
+        )
+
+        assert proof is not None
+
+    def test_restart_rearm_reread_uses_one_sided_metadata_mode(self):
+        now = datetime.now(timezone.utc)
+        r = _row(
+            execution_mode="",
+            meta={
+                "execution_mode": "paper",
+                **_restart_rearm_meta(
+                    next_at=(now + timedelta(seconds=30)).isoformat(),
+                    deadline=(now + timedelta(minutes=3)).isoformat(),
+                ),
+            },
+        )
+        rec, _ = _make_recovery(r)
+
+        proof = rec._verify_restart_rearm_retry_ownership(
+            r["local_order_id"], r
+        )
+
+        assert proof is not None
+
+    def test_order_monitor_path_rearms_from_one_sided_metadata_mode(self):
+        from ap.order_monitor import APOrderMonitor
+
+        r = _row(
+            execution_mode="",
+            meta={"execution_mode": "paper", "trigger_price": 450.0},
+        )
+        osm = _MockOSM()
+        osm.seed(r)
+        watcher = _MockWatcher(watch_returns=True)
+        monitor = APOrderMonitor.__new__(APOrderMonitor)
+        monitor.client_id = "client@test.com"
+        monitor.mode = "PAPER"
+        monitor.osm = osm
+        monitor.entry_watcher = watcher
+        monitor.broker = MagicMock()
+        monitor.broker.get_quote.return_value = {"bid": 449.5, "ask": 449.6}
+
+        attempted, succeeded, reason = monitor._canonical_pending_trigger_rearm(
+            r,
+            r["local_order_id"],
+            "SPY240101C00450000",
+            is_past_eod=False,
+        )
+
+        assert (attempted, succeeded, reason) == (
+            True,
+            True,
+            "canonical_recovery_watcher_owned",
+        )
+        assert len(watcher._pending) == 1
+        assert watcher._pending[0].signal["execution_mode"] == "paper"
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []

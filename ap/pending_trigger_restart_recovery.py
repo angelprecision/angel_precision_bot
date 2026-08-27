@@ -58,8 +58,10 @@ class _RowOutcome:
 
 _TERMINAL_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED", "ERROR"})
 
-# #323 canonical materialization retry fields — exact shape from ap/deferred_materializer.stamp_retry_pending()
-# DO NOT invent fields not present in that function.
+# #323 canonical materialization retry fields — the consumer-facing shape from
+# ap/deferred_materializer.stamp_retry_pending().  The three selector-attempt
+# mirrors below are additionally required because they describe one durable
+# authority and must advance with this writer.
 _MAT_STATUS_FIELD        = "materialization_status"      # "RETRY_PENDING"
 _MAT_NEXT_RETRY_AT       = "materialization_next_retry_at"
 _MAT_ATTEMPTS_FIELD      = "materialization_attempts"    # int — canonical attempt counter
@@ -87,6 +89,49 @@ _RR_CLOSE_REASON     = "restart_rearm_close_reason"
 _RETRY_MATERIALIZATION = "MATERIALIZATION_RETRY"
 _RETRY_RESTART_REARM  = "RESTART_REARM_RETRY"
 _RETRY_WATCHER        = "WATCHER_RETRY"
+
+_VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+_EXECUTION_MODE_AUTHORITY_CONFLICT = "EXECUTION_MODE_AUTHORITY_CONFLICT"
+_EXECUTION_MODE_MISSING = "MISSING_OR_INVALID_EXECUTION_MODE"
+_EXECUTION_MODE_INVALID = "INVALID_EXECUTION_MODE_METADATA"
+
+
+def _canonical_execution_mode_value(raw: object) -> str:
+    """Return a trimmed, case-folded durable mode value."""
+    if raw is None:
+        return ""
+    try:
+        return str(raw).strip().lower()
+    except Exception:
+        return ""
+
+
+def _resolve_execution_mode(row: dict) -> tuple[Optional[str], Optional[str]]:
+    """Resolve one durable row mode without using runner or broker context.
+
+    A nonblank ``orders.execution_mode`` value and a nonblank metadata mirror
+    are both durable identity claims.  Either claim may supply the mode when
+    the other mirror is blank, but both claims must normalize to one of the
+    two supported modes and must agree when both are present.  A disagreement
+    is an authority conflict, not a repair opportunity.
+    """
+    durable_row = row if isinstance(row, dict) else {}
+    column_mode = _canonical_execution_mode_value(
+        durable_row.get("execution_mode")
+    )
+    meta = _extract_meta(durable_row)
+    meta_mode = _canonical_execution_mode_value(meta.get("execution_mode"))
+
+    if column_mode and column_mode not in _VALID_EXECUTION_MODES:
+        return None, _EXECUTION_MODE_MISSING
+    if meta_mode and meta_mode not in _VALID_EXECUTION_MODES:
+        return None, _EXECUTION_MODE_INVALID
+    if column_mode and meta_mode and meta_mode != column_mode:
+        return None, _EXECUTION_MODE_AUTHORITY_CONFLICT
+    resolved_mode = column_mode or meta_mode
+    if resolved_mode not in _VALID_EXECUTION_MODES:
+        return None, _EXECUTION_MODE_MISSING
+    return resolved_mode, None
 
 
 # ── Environment-tunable limits ────────────────────────────────────────────────
@@ -208,13 +253,46 @@ class PendingTriggerRestartRecovery:
         self.last_watcher_registered_by_this_attempt = False
         self.last_registration_token = None
 
+        row = dict(row or {})
         local_oid  = str(row.get("local_order_id") or "").strip()
         signal_id  = str(row.get("signal_id") or "").strip()
         row_client = str(row.get("client_id") or "").strip().lower()
-        row_mode   = str(row.get("execution_mode") or "").strip().lower()
+        row_mode, row_mode_error = _resolve_execution_mode(row)
 
-        # Identity fence: raw durable row identity is required. Callers must
-        # never repair missing client/mode from active runner context.
+        if row_mode_error:
+            _mode_marker = {
+                _EXECUTION_MODE_AUTHORITY_CONFLICT:
+                    "RESTART_RECOVERY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+                _EXECUTION_MODE_MISSING:
+                    "RESTART_RECOVERY_MISSING_DURABLE_EXECUTION_MODE",
+                _EXECUTION_MODE_INVALID:
+                    "RESTART_RECOVERY_INVALID_DURABLE_EXECUTION_MODE",
+            }[row_mode_error]
+            _mode_failure = {
+                _EXECUTION_MODE_AUTHORITY_CONFLICT:
+                    "identity:execution_mode_authority_conflict",
+                _EXECUTION_MODE_MISSING: "identity:missing_execution_mode",
+                _EXECUTION_MODE_INVALID: "identity:invalid_execution_mode",
+            }[row_mode_error]
+            self._mark_failure(local_oid, _mode_failure)
+            self._log_identity_failure(
+                _mode_marker,
+                local_oid=local_oid,
+                signal_id=signal_id,
+                durable_client=row_client,
+                durable_mode=row_mode_error,
+            )
+            return _RowOutcome.UNRESOLVED
+
+        # Downstream evidence validation and plan builders must see the same
+        # canonical durable mode that passed this fence.  In particular, this
+        # keeps the SQL CAS and Python resolver on the same symmetric,
+        # contradiction-fenced durable-mode contract.
+        row["execution_mode"] = row_mode
+
+        # Identity fence: durable row identity is required. The mode above was
+        # resolved only from the row column/metadata authority pair; callers
+        # must never repair missing identity from active runner context.
         if not local_oid:
             self._mark_failure("", "missing_local_order_id")
             self._log_identity_failure(
@@ -230,17 +308,6 @@ class PendingTriggerRestartRecovery:
             self._mark_failure(local_oid, "identity:missing_client_id")
             self._log_identity_failure(
                 "RESTART_RECOVERY_MISSING_DURABLE_CLIENT_ID",
-                local_oid=local_oid,
-                signal_id=signal_id,
-                durable_client=row_client,
-                durable_mode=row_mode,
-            )
-            return _RowOutcome.UNRESOLVED
-
-        if not row_mode:
-            self._mark_failure(local_oid, "identity:missing_execution_mode")
-            self._log_identity_failure(
-                "RESTART_RECOVERY_MISSING_DURABLE_EXECUTION_MODE",
                 local_oid=local_oid,
                 signal_id=signal_id,
                 durable_client=row_client,
@@ -767,8 +834,9 @@ class PendingTriggerRestartRecovery:
 
     def _enter_canonical_retry(self, local_oid: str, row: dict, *, reason: str) -> str:
         """
-        Fix 1: write the exact fields that ap/deferred_materializer.stamp_retry_pending()
-        writes so the deployed #323 consumer can see and process the row.
+        Fix 1: write the #323 consumer fields that
+        ap/deferred_materializer.stamp_retry_pending() reads, plus the three
+        selector-attempt mirrors that must remain transactionally coherent.
 
         Real canonical schema (from stamp_retry_pending):
           materialization_status          = "RETRY_PENDING"
@@ -780,7 +848,8 @@ class PendingTriggerRestartRecovery:
 
         Removed: materialization_owner, materialization_retry_deadline,
                  materialization_attempt_count, materialization_retry_reason
-                 (none of these exist in stamp_retry_pending).
+                 (none of these exist in stamp_retry_pending); the selector
+                 mirrors are retained for durable attempt-authority proof.
         """
         _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
         try:
@@ -795,7 +864,67 @@ class PendingTriggerRestartRecovery:
         _now   = datetime.now(timezone.utc)
 
         _meta     = _extract_meta(row)
-        _attempts = int(_meta.get(_MAT_ATTEMPTS_FIELD) or 0) + 1
+        # The restart path is a live writer, so it must not advance the
+        # materialization-only counter while leaving the selector-attempt
+        # mirrors behind.  Validate every durable mirror first; a conflict is
+        # unresolved state, not evidence from which recovery may guess.
+        try:
+            from ap_execution_core import _resolve_selector_attempt_number
+
+            _durable_attempt, _counter_conflict = _resolve_selector_attempt_number(
+                retry_attempt=_meta.get("retry_attempt"),
+                breach_attempt_count=_meta.get("breach_attempt_count"),
+                materialization_attempts=_meta.get(_MAT_ATTEMPTS_FIELD),
+                recovery_pre_claimed_attempt=None,
+            )
+        except Exception as _counter_exc:
+            _durable_attempt = None
+            _counter_conflict = (
+                "MATERIALIZATION_ATTEMPT_COUNTER_CHECK_FAILED:"
+                f"{type(_counter_exc).__name__}"
+            )
+        if _counter_conflict:
+            self._mark_failure(
+                local_oid,
+                f"SELECTOR_RECOVERY_CURSOR_INVALID:{_counter_conflict}",
+            )
+            log.critical(
+                "RESTART_RECOVERY_ATTEMPT_COUNTER_CONFLICT local=%s "
+                "retry_attempt=%r breach_attempt_count=%r "
+                "materialization_attempts=%r reason=%s — UNRESOLVED",
+                local_oid,
+                _meta.get("retry_attempt"),
+                _meta.get("breach_attempt_count"),
+                _meta.get(_MAT_ATTEMPTS_FIELD),
+                _counter_conflict,
+            )
+            return _RowOutcome.UNRESOLVED
+
+        _counter_values = (
+            _meta.get("retry_attempt"),
+            _meta.get("breach_attempt_count"),
+            _meta.get(_MAT_ATTEMPTS_FIELD),
+        )
+        _has_durable_counter = any(
+            value is not None
+            and not (isinstance(value, str) and not value.strip())
+            for value in _counter_values
+        )
+        _all_counters_zero = _has_durable_counter and all(
+            value is None
+            or (isinstance(value, str) and not value.strip())
+            or value == 0
+            or (isinstance(value, str) and value.strip() == "0")
+            for value in _counter_values
+        )
+        # Preserve the legacy initial transition (no counter/explicit zero ->
+        # attempt 1), while using the validated durable identity when a real
+        # prior attempt exists.
+        _attempts = (
+            1
+            if not _has_durable_counter or _all_counters_zero
+            else int(_durable_attempt) + 1
+        )
         if _attempts > _max:
             log.warning(
                 "RESTART_RECOVERY_CANONICAL_RETRY_EXHAUSTED local=%s attempts=%d max=%d — terminalizing",
@@ -812,6 +941,8 @@ class PendingTriggerRestartRecovery:
             _MAT_STATUS_FIELD:       "RETRY_PENDING",
             _MAT_BROKER_READY:       False,
             _MAT_ATTEMPTS_FIELD:     _attempts,
+            "retry_attempt":         _attempts,
+            "breach_attempt_count":  _attempts,
             _MAT_NEXT_RETRY_AT:      _next,
             _MAT_REASON_FIELD:       reason,
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
@@ -857,6 +988,15 @@ class PendingTriggerRestartRecovery:
 
         Blocker 5: boolean return from helper is not sufficient; reread required.
         """
+        _row_mode, _row_mode_error = _resolve_execution_mode(row)
+        if _row_mode_error or _row_mode != self.execution_mode:
+            log.critical(
+                "RESTART_RECOVERY_TERMINALIZE_MODE_UNRESOLVED local=%s "
+                "resolved=%s reason=%s expected=%s — UNRESOLVED",
+                local_oid, _row_mode, _row_mode_error, self.execution_mode,
+            )
+            return _RowOutcome.UNRESOLVED
+
         if self.dry_run:
             log.info("RESTART_RECOVERY_DRY_RUN_TERMINALIZE local=%s reason=%s", local_oid, reason)
             return _RowOutcome.TERMINALIZED
@@ -915,7 +1055,7 @@ class PendingTriggerRestartRecovery:
         _rr_status = str(reread.get("status") or "").strip().upper()
         _rr_oid    = str(reread.get("local_order_id") or "").strip()
         _rr_client = str(reread.get("client_id") or reread.get("client_email") or "").strip().lower()
-        _rr_mode   = str(reread.get("execution_mode") or "").strip().lower()
+        _rr_mode, _rr_mode_error = _resolve_execution_mode(reread)
         _rr_meta   = _extract_meta(reread)
 
         if not _rr_oid or _rr_oid != local_oid:
@@ -924,8 +1064,12 @@ class PendingTriggerRestartRecovery:
         if not _rr_client or _rr_client != self.client_id.lower():
             log.critical("RESTART_RECOVERY_REREAD_CLIENT_MISMATCH local=%s got=%s", local_oid, _rr_client)
             return _RowOutcome.UNRESOLVED
-        if not _rr_mode or _rr_mode != self.execution_mode:
-            log.critical("RESTART_RECOVERY_REREAD_MODE_MISMATCH local=%s got=%s", local_oid, _rr_mode)
+        if _rr_mode_error or _rr_mode != self.execution_mode:
+            log.critical(
+                "RESTART_RECOVERY_REREAD_MODE_UNRESOLVED local=%s got=%s "
+                "reason=%s expected=%s",
+                local_oid, _rr_mode, _rr_mode_error, self.execution_mode,
+            )
             return _RowOutcome.UNRESOLVED
         if _rr_status not in _TERMINAL_STATUSES:
             log.critical(
@@ -986,7 +1130,7 @@ class PendingTriggerRestartRecovery:
         status    = str(reread.get("status") or "").strip().upper()
         rr_oid    = str(reread.get("local_order_id") or "").strip()
         rr_client = str(reread.get("client_id") or reread.get("client_email") or "").strip().lower()
-        rr_mode   = str(reread.get("execution_mode") or "").strip().lower()
+        rr_mode, rr_mode_error = _resolve_execution_mode(reread)
         contract  = str(reread.get("contract") or "").strip()
         if status != "PENDING_TRIGGER":
             return None
@@ -994,7 +1138,7 @@ class PendingTriggerRestartRecovery:
             return None
         if not rr_client or rr_client != self.client_id.lower():
             return None
-        if not rr_mode or rr_mode != self.execution_mode:
+        if rr_mode_error or rr_mode != self.execution_mode:
             return None
         if not contract or not contract.upper().startswith("DEFERRED:"):
             return None
@@ -1002,6 +1146,32 @@ class PendingTriggerRestartRecovery:
             return None
 
         meta = _extract_meta(reread)
+        try:
+            from ap_execution_core import _resolve_selector_attempt_number
+
+            _, _counter_conflict = _resolve_selector_attempt_number(
+                retry_attempt=meta.get("retry_attempt"),
+                breach_attempt_count=meta.get("breach_attempt_count"),
+                materialization_attempts=meta.get(_MAT_ATTEMPTS_FIELD),
+                recovery_pre_claimed_attempt=None,
+            )
+        except Exception as _counter_exc:
+            _counter_conflict = (
+                "MATERIALIZATION_ATTEMPT_COUNTER_CHECK_FAILED:"
+                f"{type(_counter_exc).__name__}"
+            )
+        if _counter_conflict:
+            log.critical(
+                "RESTART_RECOVERY_MATERIALIZATION_RETRY_COUNTER_CONFLICT "
+                "local=%s retry_attempt=%r breach_attempt_count=%r "
+                "materialization_attempts=%r reason=%s",
+                local_oid,
+                meta.get("retry_attempt"),
+                meta.get("breach_attempt_count"),
+                meta.get(_MAT_ATTEMPTS_FIELD),
+                _counter_conflict,
+            )
+            return None
         materialization_outcome = str(
             meta.get("materialization_outcome") or ""
         ).strip().upper()
@@ -1078,14 +1248,14 @@ class PendingTriggerRestartRecovery:
         status = str(reread.get("status") or "").strip().upper()
         rr_oid = str(reread.get("local_order_id") or "").strip()
         rr_client = str(reread.get("client_id") or "").strip().lower()
-        rr_mode = str(reread.get("execution_mode") or "").strip().lower()
+        rr_mode, rr_mode_error = _resolve_execution_mode(reread)
         if status != "PENDING_TRIGGER":
             return None
         if rr_oid != local_oid:
             return None
         if rr_client != self.client_id.lower():
             return None
-        if rr_mode != self.execution_mode:
+        if rr_mode_error or rr_mode != self.execution_mode:
             return None
         if _has_trigger_or_submit_evidence(reread):
             return None
@@ -1098,7 +1268,7 @@ class PendingTriggerRestartRecovery:
         deadline = str(meta.get(_RR_DEADLINE_FIELD) or "").strip()
         first_failed_at = str(meta.get(_RR_FIRST_FAILED_AT) or "").strip()
         rr_client_meta = str(meta.get(_RR_CLIENT_FIELD) or "").strip().lower()
-        rr_mode_meta = str(meta.get(_RR_MODE_FIELD) or "").strip().lower()
+        rr_mode_meta = _canonical_execution_mode_value(meta.get(_RR_MODE_FIELD))
         try:
             attempt = int(meta.get(_RR_ATTEMPT_FIELD))
         except (TypeError, ValueError):
@@ -1174,7 +1344,7 @@ class PendingTriggerRestartRecovery:
                 _w_oid   = str(_wsig.get("local_order_id") or "").strip()
                 _w_sid   = str(_wsig.get("signal_id") or "").strip()
                 _w_client= str(_wsig.get("client_id") or "").strip().lower()
-                _w_mode  = str(_wsig.get("execution_mode") or "").strip().lower()
+                _w_mode, _w_mode_error = _resolve_execution_mode(_wsig)
                 _w_state = str(getattr(w, "state", "") or "")
                 _quarant = bool(getattr(w, "_ownership_quarantine", False))
 
@@ -1188,10 +1358,11 @@ class PendingTriggerRestartRecovery:
                         "expected=%s got=%r", local_oid, _exp_client, _w_client,
                     )
                     return None
-                if not _w_mode or _w_mode != _exp_mode:
+                if _w_mode_error or _w_mode != _exp_mode:
                     log.warning(
                         "RESTART_RECOVERY registry execution_mode mismatch local=%s "
-                        "expected=%s got=%r", local_oid, _exp_mode, _w_mode,
+                        "expected=%s got=%r reason=%s",
+                        local_oid, _exp_mode, _w_mode, _w_mode_error,
                     )
                     return None
                 if not _w_sid or _w_sid != _exp_sid:
@@ -1426,6 +1597,12 @@ class _RecoveryPlan(SimpleNamespace):
 
 
 def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
+    row = dict(row or {})
+    execution_mode, execution_mode_error = _resolve_execution_mode(row)
+    if execution_mode_error:
+        return None
+    row["execution_mode"] = execution_mode
+
     if plan_builder_fn is not None:
         try:
             return plan_builder_fn(row)
@@ -1441,9 +1618,6 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
         )
         local_order_id = str(row.get("local_order_id") or "")
         client_id = str(row.get("client_id") or meta.get("client_id") or "")
-        execution_mode = str(
-            row.get("execution_mode") or meta.get("execution_mode") or ""
-        ).strip().lower()
         ticker = str(
             row.get("ticker")
             or row.get("symbol")

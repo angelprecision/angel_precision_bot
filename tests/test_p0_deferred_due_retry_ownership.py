@@ -1093,6 +1093,7 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
                     tier TEXT,
                     trigger_price NUMERIC,
                     meta JSONB,
+                    last_error TEXT,
                     created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
@@ -1231,6 +1232,111 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
                 (client_id, local_order_id),
             )
             assert int(c.fetchone()["entry_count"]) == 1
+
+        # Production-shaped MCD replay: two independent workers race the same
+        # generation/attempt fence. Exactly one may claim, and a process crash
+        # immediately after the claim must still leave all three durable
+        # attempt mirrors at the same value before any selector/broker work.
+        claim_barrier = threading.Barrier(2)
+        claim_results: list[tuple[str, bool]] = []
+        claim_errors: list[BaseException] = []
+
+        def _claim_worker(worker_owner: str) -> None:
+            try:
+                claim_barrier.wait(timeout=10)
+                worker_osm = APOrderStateMachine(client_id)
+                claimed = worker_osm.claim_deferred_materialization(
+                    local_order_id,
+                    owner=worker_owner,
+                    new_generation=generation + 1,
+                    lease_until=(now + timedelta(minutes=2)).isoformat(),
+                    trigger_crossed_at=(now - timedelta(seconds=10)).isoformat(),
+                    trigger_price=61.0,
+                    observed_underlying_price=61.05,
+                    signal_id=signal_id,
+                    execution_mode="live",
+                    retry_attempt=2,
+                )
+                claim_results.append((worker_owner, bool(claimed)))
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                claim_errors.append(exc)
+
+        workers = [
+            threading.Thread(target=_claim_worker, args=("worker-a",)),
+            threading.Thread(target=_claim_worker, args=("worker-b",)),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=15)
+        assert not claim_errors
+        assert len(claim_results) == 2
+        assert sum(1 for _, claimed in claim_results if claimed) == 1
+
+        claimed_owner = next(owner for owner, claimed in claim_results if claimed)
+        claimed_row = osm.get_order(local_order_id)
+        claimed_meta = claimed_row["meta"]
+        assert claimed_meta["materialization_generation"] == generation + 1
+        assert claimed_meta["materialization_owner"] == claimed_owner
+        assert {
+            claimed_meta["retry_attempt"],
+            claimed_meta["breach_attempt_count"],
+            claimed_meta["materialization_attempts"],
+        } == {2}
+        assert claimed_meta["retry_attempt_in_flight"] == 2
+        assert claimed_meta["broker_ready"] is False
+        assert claimed_row["broker_order_id"] is None
+        assert claimed_row["submitted_ts"] is None
+
+        # Simulated restart: a fresh worker cannot reuse the already-claimed
+        # attempt or replace the exact materialization owner before the first
+        # owner produces a durable outcome.
+        restart_osm = APOrderStateMachine(client_id)
+        assert restart_osm.claim_deferred_materialization(
+            local_order_id,
+            owner="worker-after-restart",
+            new_generation=generation + 1,
+            lease_until=(now + timedelta(minutes=2)).isoformat(),
+            trigger_crossed_at=(now - timedelta(seconds=10)).isoformat(),
+            trigger_price=61.0,
+            observed_underlying_price=61.05,
+            signal_id=signal_id,
+            execution_mode="live",
+            retry_attempt=2,
+        ) is False
+        restart_row = osm.get_order(local_order_id)
+        assert restart_row["meta"]["materialization_owner"] == claimed_owner
+        assert restart_row["meta"]["materialization_generation"] == generation + 1
+        assert restart_row["meta"]["retry_attempt"] == 2
+        assert restart_row["broker_order_id"] is None
+        assert restart_row["submitted_ts"] is None
+
+        assert osm.terminalize_materialization_retry(
+            local_order_id,
+            owner=claimed_owner,
+            generation=generation + 1,
+            retry_attempt=2,
+            client_id=client_id,
+            execution_mode="live",
+            terminal_status="ERROR",
+            reason="SELECTOR_RECOVERY_CURSOR_INVALID:MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT",
+            diagnostics={
+                "selector_calls": 0,
+                "direct_quote_calls": 0,
+                "broker_post_count": 0,
+            },
+        ) is True
+        terminal_row = osm.get_order(local_order_id)
+        assert terminal_row["status"] == "ERROR"
+        terminal_meta = terminal_row["meta"]
+        assert {
+            terminal_meta["retry_attempt"],
+            terminal_meta["breach_attempt_count"],
+            terminal_meta["materialization_attempts"],
+        } == {2}
+        assert terminal_meta["broker_ready"] is False
+        assert terminal_row["broker_order_id"] is None
+        assert terminal_row["submitted_ts"] is None
     finally:
         with admin.cursor() as cursor:
             cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -1784,6 +1890,9 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     EXACTLY ONCE across the entire path. The second claim inside
     _on_entry_trigger must be bypassed via the verified pre-claim markers.
 
+    Also exercises a normalized durable-row shape where the top-level
+    execution_mode column and metadata mirror agree.
+
     Does NOT mock _on_entry_trigger. Does NOT manually manufacture the
     post-callback row.
     """
@@ -1809,6 +1918,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
 
     # ── Build a production-shape durable row (RETRY_WAIT attempt=1) ──
     before_meta = {
+        "execution_mode": "paper",
         "lifecycle_state": "RETRY_WAIT",
         "materialization_status": "RETRY_PENDING",
         "materialization_generation": 1,
@@ -2699,6 +2809,226 @@ def test_blocker4_claim_writes_canonical_retry_attempt():
     assert "retry_attempt" in patch_written, "canonical retry_attempt must be in patch"
     assert patch_written["retry_attempt"] == 2
     assert patch_written.get("retry_attempt_in_flight") == 2
+    assert patch_written["breach_attempt_count"] == 2
+    assert patch_written["materialization_attempts"] == 2
+
+
+@pytest.mark.parametrize("retry_attempt", [True, False])
+def test_blocker4_boolean_retry_attempt_rejected_before_sql(retry_attempt):
+    """Boolean retry attempts must not become integer attempt authority."""
+    from copy import deepcopy
+    from unittest.mock import MagicMock, patch
+    from ap.order_state_machine import APOrderStateMachine
+
+    durable_row = _row(retry_attempt=1)
+    before = deepcopy(durable_row)
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+    fake_conn = MagicMock()
+    fake_run_with_retry = MagicMock()
+
+    with patch("ap.order_state_machine.conn", return_value=fake_conn), patch(
+        "ap.order_state_machine.run_with_retry", fake_run_with_retry
+    ):
+        claimed = osm.claim_deferred_materialization(
+            LOCAL_ORDER_ID,
+            owner="owner-bool-retry",
+            new_generation=2,
+            lease_until="2026-12-31T00:00:00+00:00",
+            trigger_crossed_at="2026-08-25T13:40:00+00:00",
+            trigger_price=130.0,
+            observed_underlying_price=130.05,
+            signal_id=SIGNAL_ID,
+            execution_mode="paper",
+            retry_attempt=retry_attempt,
+        )
+
+    assert claimed is False
+    assert durable_row == before
+    fake_conn.assert_not_called()
+    fake_run_with_retry.assert_not_called()
+
+
+def test_blocker4_claim_fences_present_attempt_mirrors_before_advancing():
+    """A pre-existing 2/1/1 row is not silently repaired by a later claim.
+
+    The claim may fill a genuinely absent legacy mirror, but every present
+    mirror must still equal the expected prior attempt in the same CAS.
+    """
+    from ap.order_state_machine import APOrderStateMachine
+    from unittest.mock import patch
+
+    statements: list[tuple[str, tuple]] = []
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            statements.append((str(sql), tuple(params)))
+            return self
+
+    class _Conn:
+        def __enter__(self):
+            return _Cursor()
+
+        def __exit__(self, *args):
+            return False
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+    with patch("ap.order_state_machine.conn", return_value=_Conn()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        assert osm.claim_deferred_materialization(
+            "8767886d-7619-4b8f-a87f-f9a2821c39c0",
+            owner="owner-x",
+            new_generation=3,
+            lease_until="2026-12-31T00:00:00+00:00",
+            trigger_crossed_at="2026-08-25T13:40:00+00:00",
+            trigger_price=449.0,
+            observed_underlying_price=448.9,
+            signal_id="73ad6808-cbf0-4218-afb5-d960a613baca",
+            execution_mode="live",
+            retry_attempt=3,
+        )
+
+    assert statements
+    sql, params = statements[0]
+    assert "meta->>'breach_attempt_count'" in sql
+    assert "meta->>'materialization_attempts'" in sql
+    assert "NULLIF(BTRIM(meta->>'retry_attempt'), '') IS NULL" in sql
+    # Three mirror predicates precede the schedule/generation fences; a real
+    # row with breach/materialization_attempts=1 cannot satisfy this claim for
+    # retry_attempt=3 (which requires prior attempt 2).
+    assert params[5:8] == (2, 2, 2)
+    assert params[-1] == 2
+
+
+def test_blocker4_due_retry_counter_conflict_is_terminal_required_before_claim():
+    """A nonterminal split counter row is classified before selector work.
+
+    The recovery consumer must not turn a claim CAS miss into a retry loop for
+    a row whose durable selector-attempt identity is already contradictory.
+    """
+    core = _core()
+    row = _row(retry_attempt=2)
+    row["meta"].update({
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+    })
+    core.order_state_machine.get_order.return_value = row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=3,
+        owner="owner-counter-conflict",
+    )
+
+    assert result["disposition"] == "TERMINAL_REQUIRED"
+    assert result["reason_code"] == (
+        "SELECTOR_RECOVERY_CURSOR_INVALID:MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+    )
+    assert result["diagnostics"]["materialization_attempt_counters"] == {
+        "retry_attempt": 2,
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+    }
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+    core._on_entry_trigger.assert_not_called()
+    assert not core.broker.method_calls
+
+
+def test_blocker4_due_retry_legacy_missing_canonical_mirror_advances_from_agreeing_mirrors():
+    """A valid legacy partial-mirror row must reach the next claim slot."""
+    core = _core()
+    row = _row(retry_attempt=1)
+    row["meta"].pop("retry_attempt")
+    row["meta"].update({
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+    })
+    core.order_state_machine.get_order.side_effect = [row, row]
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-legacy-partial-mirror",
+    )
+
+    claim = core.order_state_machine.claim_deferred_materialization
+    assert claim.call_args.kwargs["retry_attempt"] == 2
+    assert result["disposition"] == "RETRY_WAIT"
+    assert result["attempt"] == 2
+    core._on_entry_trigger.assert_called_once()
+
+
+def test_blocker4_startup_recovery_uses_agreeing_mirror_attempt():
+    """Startup recovery must pass attempt N+1, not default a missing
+    canonical retry_attempt mirror back to attempt 1."""
+    from unittest.mock import patch
+    from ap import db as db_mod
+    from ap_recovery import APStartupRecovery
+
+    row = _row(retry_attempt=1)
+    row["local_order_id"] = "oid-legacy-partial-mirror-startup"
+    _bind_trigger_evidence(row)
+    row["meta"].pop("retry_attempt")
+    row["meta"].update({
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+    })
+
+    resume_calls = []
+    core = SimpleNamespace(
+        client_id=CLIENT_ID,
+        email=CLIENT_ID,
+        execution_mode="paper",
+        mode="PAPER",
+    )
+
+    def _resume(**kwargs):
+        resume_calls.append(kwargs)
+        return {"disposition": "CLAIM_LOST", "reason_code": "test_claim_lost"}
+
+    core.resume_deferred_materialization_retry = _resume
+
+    class _OSM:
+        client_id = CLIENT_ID
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchall(self):
+            return [row]
+
+    class _Conn:
+        def __enter__(self):
+            return _Cursor()
+
+        def __exit__(self, *args):
+            return False
+
+    recovery = APStartupRecovery(
+        client_id=CLIENT_ID,
+        broker=MagicMock(),
+        osm=_OSM(),
+        pm=MagicMock(),
+        master_control=SimpleNamespace(mode="PAPER"),
+        entry_watcher=None,
+        execution_core=core,
+    )
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        recovery._recover_deferred_breach_lifecycles(result)
+
+    assert len(resume_calls) == 1
+    assert resume_calls[0]["expected_retry_attempt"] == 2
 
 
 def test_blocker5_expired_deadline_terminalizes_before_claim():
@@ -3238,3 +3568,557 @@ def test_source_less_quote_still_requires_approved_tradier_transport(base_url):
 
     assert result["valid"] is False
     assert result["reason"] == "MARKET_QUOTE_UNAPPROVED_TRANSPORT"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FINAL AMENDMENT: execution_mode parity tests (Tests A–F)
+#
+# Tests A–D: unit-level behavioral proofs of canonical execution_mode
+#   resolution in resume_deferred_materialization_retry().
+# Tests E–F: real-PostgreSQL behavioral proofs of canonical execution_mode
+#   resolution in claim_deferred_materialization() SQL CAS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _row_raw(
+    *,
+    col_execution_mode: str = "paper",
+    meta_execution_mode: str | None = None,
+    execution_mode_in_meta_explicitly: bool = False,
+    retry_attempt: int = 1,
+    breach_attempt_count: int = 1,
+    materialization_attempts: int = 1,
+    client_id: str = CLIENT_ID,
+) -> dict:
+    """Build a minimal due-retry row without auto-normalising execution_mode.
+
+    Unlike ``_row()``, this helper does NOT call ``_bind_trigger_evidence``
+    so the column and meta authority can be set independently — essential for
+    the contradiction and blank-column tests.
+    """
+    now = datetime.now(timezone.utc)
+    meta: dict = {
+        "lifecycle_state": "RETRY_WAIT",
+        "materialization_status": "RETRY_PENDING",
+        "materialization_generation": 1,
+        "watcher_token": "",
+        "retry_attempt": retry_attempt,
+        "breach_attempt_count": breach_attempt_count,
+        "materialization_attempts": materialization_attempts,
+        "retry_max_attempts": 3,
+        "next_retry_at": (now - timedelta(seconds=60)).isoformat(),
+        "materialization_next_retry_at": (now - timedelta(seconds=60)).isoformat(),
+        "trigger_crossed_at": (now - timedelta(seconds=120)).isoformat(),
+        "trigger_price": 130.0,
+        "observed_underlying_price": 130.05,
+        "client_id": client_id,
+        "signal_id": SIGNAL_ID,
+        "canonical_signal_id": SIGNAL_ID,
+        "trigger_crossed_at_provenance": {
+            "canonical_signal_id": SIGNAL_ID,
+            "client_id": client_id,
+            "execution_mode": (meta_execution_mode or col_execution_mode or "").strip().lower(),
+            "local_order_id": LOCAL_ORDER_ID,
+        },
+    }
+    if meta_execution_mode is not None or execution_mode_in_meta_explicitly:
+        meta["execution_mode"] = meta_execution_mode if meta_execution_mode is not None else ""
+    return {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": client_id,
+        "execution_mode": col_execution_mode,
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-exec-mode-1",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "symbol": "RTX",
+        "direction": "CALL",
+        "score": 78.0,
+        "tier": "B",
+        "trigger_price": 130.0,
+        "stop_underlying": 128.0,
+        "target_underlying": 133.0,
+        "pattern": "3-1-2",
+        "timeframe": "1d",
+        "contract": "DEFERRED:RTX",
+        "qty": 1,
+        "limit_price": 0.01,
+        "reserved_cost": 0.0,
+        "created_ts": now - timedelta(minutes=10),
+        "meta": meta,
+    }
+
+
+# ── Test A: whitespace PAPER column resolves correctly ────────────────────────
+
+def test_A_whitespace_paper_column_resolves_to_valid_mode():
+    """Column \" paper \" (with surrounding whitespace) must NOT trigger
+    RETRY_INVALID_EXECUTION_MODE.  Prior to this amendment, LOWER(COALESCE(...))
+    without BTRIM left the whitespace intact so \" paper \" != \"paper\"."""
+    core = _core(execution_mode="paper")
+    row = _row_raw(col_execution_mode=" paper ", meta_execution_mode="paper")
+    core.order_state_machine.get_order.return_value = row
+    # claim_deferred_materialization returns True (claims the row)
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+    # schedule_deferred_materialization_retry also returns True
+    core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=1,
+        owner="watcher:test-A",
+    )
+    # Must NOT return mode-related failure codes.
+    assert result.get("reason_code") not in {
+        "RETRY_INVALID_EXECUTION_MODE",
+        "RETRY_EXECUTION_MODE_MISMATCH",
+        "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+        "RETRY_RUNNER_EXECUTION_MODE_INVALID",
+    }, (
+        f"Whitespace column should resolve to 'paper'; got reason={result.get('reason_code')!r}"
+    )
+
+
+# ── Test B: blank column with metadata resolves correctly ─────────────────────
+
+def test_B_blank_column_with_meta_paper_fallback_resolves_to_paper():
+    """A valid metadata value may supply a blank durable column mirror."""
+    core = _core(execution_mode="paper")
+    row = _row_raw(
+        col_execution_mode="",
+        meta_execution_mode="paper",
+    )
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+    core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=1,
+        owner="watcher:test-B",
+    )
+    assert result.get("reason_code") not in {
+        "RETRY_INVALID_EXECUTION_MODE",
+        "RETRY_EXECUTION_MODE_MISMATCH",
+        "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+        "RETRY_RUNNER_EXECUTION_MODE_INVALID",
+    }, f"blank column + meta='paper' should resolve; got {result!r}"
+
+
+# ── Test C: whitespace and blank-column LIVE metadata resolve correctly ───────
+
+def test_C_whitespace_live_column_resolves_to_valid_mode():
+    """Column \" live \" resolves to 'live' — same contract as Test A for LIVE."""
+    core = _core(execution_mode="live")
+    row = _row_raw(col_execution_mode=" live ", meta_execution_mode="live")
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+    core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=1,
+        owner="watcher:test-C1",
+    )
+    assert result.get("reason_code") not in {
+        "RETRY_INVALID_EXECUTION_MODE",
+        "RETRY_EXECUTION_MODE_MISMATCH",
+        "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+        "RETRY_RUNNER_EXECUTION_MODE_INVALID",
+    }, (
+        f"Whitespace LIVE column should resolve to 'live'; got {result.get('reason_code')!r}"
+    )
+
+
+def test_C_blank_column_with_live_meta_fallback_resolves_to_live():
+    """A valid LIVE metadata value may supply a blank column mirror."""
+    core = _core(execution_mode="live")
+    row = _row_raw(col_execution_mode="", meta_execution_mode="live")
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+    core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=1,
+        owner="watcher:test-C2",
+    )
+    assert result.get("reason_code") not in {
+        "RETRY_INVALID_EXECUTION_MODE",
+        "RETRY_EXECUTION_MODE_MISMATCH",
+        "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+        "RETRY_RUNNER_EXECUTION_MODE_INVALID",
+    }, f"blank column + meta='live' should resolve; got {result!r}"
+
+
+# ── Test D: contradiction negative (live vs paper in both directions) ──────────
+
+@pytest.mark.parametrize("col_mode,meta_mode", [
+    ("live", "paper"),
+    ("paper", "live"),
+])
+def test_D_contradicting_nonblank_authorities_fail_closed(col_mode, meta_mode):
+    """When orders.execution_mode != meta->>'execution_mode' and both are
+    non-blank, resume_deferred_materialization_retry MUST return
+    RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT and must NOT call claim, selector,
+    broker, or any position-mutating function."""
+    core = _core(execution_mode=col_mode)
+    row = _row_raw(col_execution_mode=col_mode, meta_execution_mode=meta_mode)
+    core.order_state_machine.get_order.return_value = row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=1,
+        owner="watcher:test-D",
+    )
+
+    # Must hard-fail with the contradiction code.
+    assert result.get("reason_code") == "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT", (
+        f"Expected AUTHORITY_CONFLICT for col={col_mode!r}/meta={meta_mode!r}; "
+        f"got {result.get('reason_code')!r}"
+    )
+    assert result.get("disposition") == "TERMINAL_REQUIRED"
+
+    # No claim, selector, broker, or position calls made.
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_not_called()
+    core._on_entry_trigger.assert_not_called()
+
+
+# ── Test E: Real PostgreSQL — 2/1/1 counter split causes CAS miss ─────────────
+
+def test_E_real_postgres_211_counter_split_causes_claim_miss():
+    """claim_deferred_materialization with retry_attempt=2 MUST return False
+    when the durable row has retry_attempt=1, breach_attempt_count=1,
+    materialization_attempts=1 (i.e. prior attempt mirrors already set to 1).
+    The SQL predicate `BTRIM(meta->>'retry_attempt')::int = %s` checks
+    prev_attempt=1; only the retry_attempt mirror advances, leaving
+    breach_attempt_count=1 and materialization_attempts=1 behind — claim fails.
+
+    This is the exact 2/1/1 production incident shape from Jason's MCD PUT.
+    """
+    from contextlib import contextmanager
+    import json as _json
+    import uuid
+
+    psycopg2 = pytest.importorskip("psycopg2")
+    import psycopg2.extras
+
+    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+    if not database_url:
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            pytest.fail("INTELLIGENCE_POSTGRES_TEST_URL is required in GitHub Actions")
+        pytest.skip("disposable PostgreSQL URL not configured")
+
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_mod
+
+    schema = f"test_e_211_{uuid.uuid4().hex}"
+    client_id = "jasoncosby1@gmail.com"
+    local_order_id = f"oid-211-{uuid.uuid4().hex}"
+    signal_id = f"sig-211-{uuid.uuid4().hex}"
+    owner = "materializer:test-E"
+    execution_mode = "paper"
+    generation = 2   # new generation we want to claim
+    now = datetime.now(timezone.utc)
+
+    class _Wrapper:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        @property
+        def rowcount(self):
+            return self.cursor.rowcount
+
+        def execute(self, sql, params=()):
+            self.cursor.execute(sql, params)
+            return self
+
+        def fetchone(self):
+            row = self.cursor.fetchone()
+            return dict(row) if row else None
+
+        def fetchall(self):
+            return [dict(row) for row in self.cursor.fetchall()]
+
+    @contextmanager
+    def _pg_conn():
+        db = psycopg2.connect(database_url)
+        cursor = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cursor.execute(f'SET search_path TO "{schema}"')
+            yield _Wrapper(cursor)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            cursor.close()
+            db.close()
+
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA "{schema}"')
+            cur.execute(
+                f"""
+                CREATE TABLE "{schema}".orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    execution_mode TEXT,
+                    signal_id TEXT,
+                    broker_order_id TEXT,
+                    submitted_ts TIMESTAMPTZ,
+                    meta JSONB,
+                    updated_ts TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+
+        # Reproduce the production 2/1/1 incident: retry_attempt is already
+        # advanced to 2 while the two legacy mirrors remain at 1.  A next
+        # claim for attempt 3 requires prior=2 in all three predicates and
+        # must therefore fail closed without normalizing the row.
+        split_meta = {
+            "lifecycle_state": "",
+            "materialization_status": "",
+            "materialization_in_flight": False,
+            "materialization_generation": generation - 1,  # = 1
+            "broker_ready": False,
+            "retry_attempt": 2,          # already advanced
+            "breach_attempt_count": 1,   # NOT advanced → split
+            "materialization_attempts": 1, # NOT advanced → split
+            "signal_id": signal_id,
+            "execution_mode": execution_mode,
+            "client_id": client_id,
+        }
+        with _pg_conn() as c:
+            c.execute(
+                f'INSERT INTO "{schema}".orders '
+                "(local_order_id, client_id, kind, status, execution_mode, "
+                "signal_id, meta) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    local_order_id, client_id, "ENTRY", "PENDING_TRIGGER",
+                    execution_mode, signal_id,
+                    _json.dumps(split_meta),
+                ),
+            )
+
+        # Patch conn() to use our isolated schema.
+        original_conn = osm_mod.conn
+        osm_mod.conn = _pg_conn
+
+        try:
+            osm = APOrderStateMachine(client_id=client_id)
+            # Attempt to claim with retry_attempt=3, which requires prior=2 on ALL
+            # three mirrors. breach_attempt_count and materialization_attempts
+            # are only 1 in the row, so all three predicates cannot agree → False.
+            result = osm.claim_deferred_materialization(
+                local_order_id,
+                owner=owner,
+                lease_until=(now + timedelta(seconds=60)).isoformat(),
+                trigger_crossed_at=now.isoformat(),
+                trigger_price=130.0,
+                observed_underlying_price=130.05,
+                signal_id=signal_id,
+                execution_mode=execution_mode,
+                new_generation=generation,  # = 2, so expected_previous = 1
+                generation=None,
+                retry_attempt=3,            # requires prev = 2 on all mirrors
+            )
+        finally:
+            osm_mod.conn = original_conn
+
+        assert result is False, (
+            "claim_deferred_materialization must return False on 2/1/1 split "
+            f"(retry_attempt=2, breach_attempt_count=1, materialization_attempts=1) "
+            f"when new claim requires prior=2 on all three mirrors; got {result!r}"
+        )
+    finally:
+        with admin.cursor() as cur:
+            cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
+
+
+# ── Test F: Real PostgreSQL — positive 1/1/1 → 2/2/2 claim succeeds ──────────
+
+def test_F_real_postgres_111_to_222_canonical_claim_succeeds():
+    """claim_deferred_materialization with retry_attempt=2 MUST return True
+    when the durable row has all three mirrors at 1 (agreeing prior state).
+    After the CAS, the durable row must show all three mirrors advanced to 2.
+    This is the canonical counter-control proof: one claim advances all three
+    mirrors atomically."""
+    from contextlib import contextmanager
+    import json as _json
+    import uuid
+
+    psycopg2 = pytest.importorskip("psycopg2")
+    import psycopg2.extras
+
+    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+    if not database_url:
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            pytest.fail("INTELLIGENCE_POSTGRES_TEST_URL is required in GitHub Actions")
+        pytest.skip("disposable PostgreSQL URL not configured")
+
+    from ap.order_state_machine import APOrderStateMachine
+    import ap.order_state_machine as osm_mod
+
+    schema = f"test_f_canonical_{uuid.uuid4().hex}"
+    client_id = "jasoncosby1@gmail.com"
+    local_order_id = f"oid-f-{uuid.uuid4().hex}"
+    signal_id = f"sig-f-{uuid.uuid4().hex}"
+    owner = "materializer:test-F"
+    execution_mode = "paper"
+    generation = 2   # new generation to claim
+    now = datetime.now(timezone.utc)
+
+    class _Wrapper:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        @property
+        def rowcount(self):
+            return self.cursor.rowcount
+
+        def execute(self, sql, params=()):
+            self.cursor.execute(sql, params)
+            return self
+
+        def fetchone(self):
+            row = self.cursor.fetchone()
+            return dict(row) if row else None
+
+        def fetchall(self):
+            return [dict(row) for row in self.cursor.fetchall()]
+
+    @contextmanager
+    def _pg_conn():
+        db = psycopg2.connect(database_url)
+        cursor = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cursor.execute(f'SET search_path TO "{schema}"')
+            yield _Wrapper(cursor)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            cursor.close()
+            db.close()
+
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA "{schema}"')
+            cur.execute(
+                f"""
+                CREATE TABLE "{schema}".orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    execution_mode TEXT,
+                    signal_id TEXT,
+                    broker_order_id TEXT,
+                    submitted_ts TIMESTAMPTZ,
+                    meta JSONB,
+                    updated_ts TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+
+        # Insert a coherent 1/1/1 row: all three mirrors at 1.
+        coherent_meta = {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "materialization_generation": generation - 1,  # = 1
+            "broker_ready": False,
+            "retry_attempt": 1,
+            "retry_attempt_in_flight": 1,
+            "breach_attempt_count": 1,
+            "materialization_attempts": 1,
+            "signal_id": signal_id,
+            "execution_mode": execution_mode,
+            "client_id": client_id,
+        }
+        with _pg_conn() as c:
+            c.execute(
+                f'INSERT INTO "{schema}".orders '
+                "(local_order_id, client_id, kind, status, execution_mode, "
+                "signal_id, meta) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    local_order_id, client_id, "ENTRY", "PENDING_TRIGGER",
+                    execution_mode, signal_id,
+                    _json.dumps(coherent_meta),
+                ),
+            )
+
+        original_conn = osm_mod.conn
+        osm_mod.conn = _pg_conn
+
+        try:
+            osm = APOrderStateMachine(client_id=client_id)
+            result = osm.claim_deferred_materialization(
+                local_order_id,
+                owner=owner,
+                lease_until=(now + timedelta(seconds=60)).isoformat(),
+                trigger_crossed_at=now.isoformat(),
+                trigger_price=130.0,
+                observed_underlying_price=130.05,
+                signal_id=signal_id,
+                execution_mode=execution_mode,
+                new_generation=generation,  # = 2, expected_previous = 1
+                generation=None,
+                retry_attempt=2,            # requires prior = 1 on all mirrors
+            )
+
+            # Verify the claim succeeded.
+            assert result is True, (
+                f"claim_deferred_materialization must return True for coherent "
+                f"1/1/1 row when claiming attempt=2; got {result!r}"
+            )
+
+            # Verify all three mirrors were advanced to 2 atomically.
+            with _pg_conn() as c:
+                c.execute(
+                    f'SELECT meta FROM "{schema}".orders WHERE local_order_id = %s',
+                    (local_order_id,),
+                )
+                row = c.fetchone()
+            assert row is not None, "Row must still exist after claim"
+            durable_meta = row.get("meta") or {}
+            assert int(durable_meta.get("retry_attempt", -1)) == 2, (
+                f"retry_attempt must be 2 after claim; got {durable_meta.get('retry_attempt')!r}"
+            )
+            assert int(durable_meta.get("breach_attempt_count", -1)) == 2, (
+                f"breach_attempt_count must be 2 after claim; got {durable_meta.get('breach_attempt_count')!r}"
+            )
+            assert int(durable_meta.get("materialization_attempts", -1)) == 2, (
+                f"materialization_attempts must be 2 after claim; got {durable_meta.get('materialization_attempts')!r}"
+            )
+            assert int(durable_meta.get("retry_attempt_in_flight", -1)) == 2, (
+                "retry_attempt_in_flight must be 2 after claim; got "
+                f"{durable_meta.get('retry_attempt_in_flight')!r}"
+            )
+        finally:
+            osm_mod.conn = original_conn
+
+    finally:
+        with admin.cursor() as cur:
+            cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()

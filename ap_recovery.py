@@ -40,7 +40,10 @@ from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
 )
-from ap.pending_trigger_restart_recovery import _RecoveryPlan
+from ap.pending_trigger_restart_recovery import (
+    _RecoveryPlan,
+    _resolve_execution_mode as _resolve_durable_execution_mode,
+)
 
 log = logging.getLogger("ap.recovery")
 
@@ -1551,6 +1554,28 @@ class APStartupRecovery:
 
     def _build_recovery_plan_from_order(self, order: dict):
         meta = self._coerce_order_meta(order.get("meta"))
+        durable_mode, durable_mode_error = _resolve_durable_execution_mode({
+            **order,
+            "meta": meta,
+        })
+        if durable_mode_error == "EXECUTION_MODE_AUTHORITY_CONFLICT":
+            log.warning(
+                "[%s] RECOVERY: invalid_or_conflicting execution_mode "
+                "local_order_id=%s authority=%s column=%r meta=%r",
+                self.client_id,
+                order.get("local_order_id"),
+                durable_mode_error,
+                order.get("execution_mode"),
+                meta.get("execution_mode"),
+            )
+            return None
+        # Preserve the builder's existing no-runner-inference contract for a
+        # missing or malformed mode: callers still receive a plan with an
+        # unusable blank mode and must reject it at their identity gate. A
+        # valid one-sided mirror, however, is a durable mode and is carried
+        # into the plan; a contradiction is not represented as a plan.
+        if durable_mode_error:
+            durable_mode = ""
 
         contract = (
             order.get("contract")
@@ -1638,11 +1663,7 @@ class APStartupRecovery:
             strategy_type=str(meta.get("strategy_type") or ""),
             metadata=metadata,
             client_id=str(order.get("client_id") or self.client_id),
-            execution_mode=str(
-                order.get("execution_mode")
-                or meta.get("execution_mode")
-                or ""
-            ).strip().lower(),
+            execution_mode=durable_mode or "",
             local_order_id=local_order_id,
             materialization_generation=materialization_generation,
             trigger_crossed_at=(
@@ -1670,12 +1691,13 @@ class APStartupRecovery:
         runner mode. A paper runner MUST NOT observe or mutate LIVE rows,
         and a LIVE runner MUST NOT observe or mutate paper rows, even for
         the same client_id. The runner mode is resolved once at the top;
-        the SQL query filters by `LOWER(TRIM(COALESCE(execution_mode,'')))`;
-        each row is re-verified in Python (defence in depth); the plan
+        the SQL query uses the same symmetric normalized durable-mode
+        predicate as the OSM CAS writers: a valid one-sided mirror is allowed,
+        but both nonblank mirrors must agree; each row is re-verified in
+        Python (defence in depth); the plan
         built from the row is re-verified before any watcher rearm or
-        submit path. The plan builder no longer infers a missing row mode
-        from the runner (see `_build_recovery_plan_from_order`), so a row
-        with a blank/malformed persisted mode fails identity closed here.
+        submit path. Missing or invalid authority, or invalid/contradictory
+        metadata, fails identity closed here.
         """
         from ap.db import conn, run_with_retry
 
@@ -1713,7 +1735,21 @@ class APStartupRecovery:
                            , created_ts
                     FROM orders
                     WHERE client_id = %s
-                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(execution_mode), ''),
+                            NULLIF(BTRIM(meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
+                      AND (
+                            NULLIF(BTRIM(execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))
+                      )
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -1897,6 +1933,7 @@ class APStartupRecovery:
                     expected_prior_retry_attempt=_exp_prior,
                     diagnostics={
                         **(extra_diagnostics or {}),
+                        **(outcome.get("diagnostics") or {}),
                         "recovery_classification": "fenced_retry_terminal",
                         "recovery_owner": outcome.get("owner"),
                     },
@@ -2104,19 +2141,27 @@ class APStartupRecovery:
                     self.client_id, local_order_id, row_client_id,
                 )
                 continue
-            row_mode = _normalize_execution_mode(order.get("execution_mode"))
-            if row_mode is None:
-                # Blank/malformed persisted mode. Per amendment §1, this is
-                # RECOVERY_INVALID_EXECUTION_MODE. SQL should already have
-                # filtered it out; if we're here it's a defensive catch.
+            meta = self._coerce_order_meta(order.get("meta"))
+            row_mode, row_mode_error = _resolve_durable_execution_mode({
+                **order,
+                "meta": meta,
+            })
+            if row_mode_error:
+                # Missing/invalid authority, or malformed/contradictory
+                # metadata, is not ours to repair in recovery.
                 # We QUARANTINE (skip + log) rather than terminalize, because
                 # we cannot prove the row is ours without a valid mode field.
                 log.error(
-                    "[%s] RECOVERY_SKIP RECOVERY_INVALID_EXECUTION_MODE "
-                    "local_order_id=%s raw_mode=%r",
-                    self.client_id, local_order_id, order.get("execution_mode"),
+                    "[%s] RECOVERY_SKIP durable_execution_mode_error "
+                    "local_order_id=%s authority=%s column=%r meta=%r",
+                    self.client_id, local_order_id, row_mode_error,
+                    order.get("execution_mode"), meta.get("execution_mode"),
                 )
                 continue
+            row_mode = str(row_mode).upper()
+            # Downstream plan/evidence builders must see the same canonical
+            # mode that passed this authority fence.
+            order["execution_mode"] = row_mode
             if row_mode != recovery_mode:
                 log.error(
                     "[%s] RECOVERY_SKIP execution_mode_mismatch local_order_id=%s "
@@ -2125,7 +2170,6 @@ class APStartupRecovery:
                 )
                 continue
 
-            meta = self._coerce_order_meta(order.get("meta"))
             lifecycle = str(meta.get("lifecycle_state") or "").upper()
             materialization_status = str(meta.get("materialization_status") or "").upper()
 
@@ -2547,6 +2591,29 @@ class APStartupRecovery:
                         )
                         continue
 
+                    # A legacy retry row may have lost only the canonical
+                    # retry_attempt mirror while the other durable mirrors
+                    # still agree on a positive prior attempt.  Use the
+                    # shared resolver for that valid shape; keep the strict
+                    # canonical value for genuine conflicts so the due
+                    # consumer can fenced-terminalize them unchanged.
+                    try:
+                        from ap_execution_core import (
+                            _resolve_durable_selector_prior_attempt,
+                        )
+
+                        _resolved_prior_attempt, _counter_conflict = (
+                            _resolve_durable_selector_prior_attempt(
+                                retry_attempt=meta.get("retry_attempt"),
+                                breach_attempt_count=meta.get("breach_attempt_count"),
+                                materialization_attempts=meta.get("materialization_attempts"),
+                            )
+                        )
+                    except Exception:
+                        _resolved_prior_attempt, _counter_conflict = None, None
+                    if not _counter_conflict and _resolved_prior_attempt is not None:
+                        _retry_attempt = _resolved_prior_attempt
+
                 _is_due = _due_at is not None and _due_at <= now
 
                 # ── Due-retry path (blocker §4: watcher not required) ─────────
@@ -2594,6 +2661,29 @@ class APStartupRecovery:
                             self.execution_core, "resume_deferred_materialization_retry", None,
                         )
                     if not callable(_resume_fn):
+                        try:
+                            from ap_execution_core import _resolve_selector_attempt_number
+                            _, _counter_conflict = _resolve_selector_attempt_number(
+                                retry_attempt=meta.get("retry_attempt"),
+                                breach_attempt_count=meta.get("breach_attempt_count"),
+                                materialization_attempts=meta.get("materialization_attempts"),
+                                recovery_pre_claimed_attempt=None,
+                            )
+                        except Exception as _counter_exc:
+                            _counter_conflict = (
+                                f"MATERIALIZATION_ATTEMPT_COUNTER_CHECK_FAILED:{type(_counter_exc).__name__}"
+                            )
+                        if _counter_conflict:
+                            log.critical(
+                                "[%s] RECOVERY_RETRY_COUNTER_CONFLICT local_order_id=%s "
+                                "reason=%s — retaining row; no selector/broker work",
+                                self.client_id, local_order_id, _counter_conflict,
+                            )
+                            _retain_recovery_ownership(
+                                local_order_id,
+                                reason=f"retry_attempt_counter_conflict:{_counter_conflict}",
+                            )
+                            continue
                         log.warning(
                             "[%s] RECOVERY_DUE_RETRY_TAKEOVER_UNAVAILABLE "
                             "local_order_id=%s proof_reason=%s — falling through "
@@ -3382,6 +3472,8 @@ class APStartupRecovery:
                 c.execute(
                     """
                     SELECT o.local_order_id,
+                           o.client_id,
+                           o.execution_mode,
                            o.signal_id,
                            o.plan_id,
                            o.symbol,
@@ -3409,6 +3501,21 @@ class APStartupRecovery:
                     WHERE o.client_id = %s
                       AND o.kind = 'ENTRY'
                       AND o.status = 'PENDING_TRIGGER'
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(o.execution_mode), ''),
+                            NULLIF(BTRIM(o.meta->>'execution_mode'), ''),
+                            ''
+                          ))) = %s
+                      AND LOWER(BTRIM(COALESCE(
+                            NULLIF(BTRIM(o.execution_mode), ''),
+                            NULLIF(BTRIM(o.meta->>'execution_mode'), ''),
+                            ''
+                          ))) IN ('live', 'paper')
+                      AND (
+                            NULLIF(BTRIM(o.execution_mode), '') IS NULL
+                         OR NULLIF(BTRIM(o.meta->>'execution_mode'), '') IS NULL
+                         OR LOWER(BTRIM(o.execution_mode)) = LOWER(BTRIM(o.meta->>'execution_mode'))
+                      )
                       AND o.created_ts >= %s
                       AND o.broker_order_id IS NULL
                       AND o.submitted_ts IS NULL
@@ -3428,7 +3535,7 @@ class APStartupRecovery:
                       )
                     ORDER BY o.created_ts ASC
                     """,
-                    (self.client_id, cutoff_utc),
+                    (self.client_id, _mc_mode.lower(), cutoff_utc),
                 )
                 return c.fetchall()
 

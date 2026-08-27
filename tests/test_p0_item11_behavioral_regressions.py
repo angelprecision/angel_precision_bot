@@ -646,9 +646,8 @@ def _now_iso() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Audit additional finding: schedule_deferred_materialization_retry's
-# execution-mode predicate lacked TRIM and could not fall back to
-# meta.execution_mode when the durable column was an empty string (not NULL).
+# Audit additional finding: schedule_deferred_materialization_retry must use
+# the symmetric normalized durable-mode authority predicate.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestScheduleRetryExecutionModeNormalization:
@@ -683,17 +682,13 @@ class TestScheduleRetryExecutionModeNormalization:
             "whitespace-padded durable execution_mode must still CAS-match"
         )
 
-    def test_empty_column_falls_back_to_meta_execution_mode(self):
-        """A row with an empty-string (not NULL) execution_mode column must
-        still fall back to meta.execution_mode -- COALESCE(execution_mode,
-        meta->>'execution_mode', '') never falls through when the column is
-        '' rather than NULL, since '' is not NULL. NULLIF(execution_mode,'')
-        fixes this."""
+    def test_empty_column_falls_back_to_trimmed_meta_execution_mode(self):
+        """A blank column may use a valid trimmed metadata mode."""
         _insert_row(
             local_order_id=self.LOID,
             owner="watcher:real-owner",
             generation=1,
-            meta_extra={"execution_mode": "paper"},
+            meta_extra={"execution_mode": " paper "},
         )
         with _pg_conn() as c:
             with c.cursor() as cur:
@@ -702,6 +697,7 @@ class TestScheduleRetryExecutionModeNormalization:
                     (self.LOID,),
                 )
             c.commit()
+        before = _fetch_row(self.LOID)
         osm = _osm()
         ok = osm.schedule_deferred_materialization_retry(
             self.LOID, owner="watcher:real-owner", generation=1,
@@ -710,10 +706,11 @@ class TestScheduleRetryExecutionModeNormalization:
             selector_failure={}, signal_id="sig-item11-1",
             execution_mode="paper",
         )
-        assert ok is True, (
-            "empty-string durable execution_mode column must fall back to "
-            "meta.execution_mode, not permanently block the CAS"
-        )
+        assert ok is True
+        after = _fetch_row(self.LOID)
+        assert after["updated_ts"] > before["updated_ts"]
+        assert after["meta"]["execution_mode"] == " paper "
+        assert after["meta"]["materialization_status"] == "RETRY_PENDING"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

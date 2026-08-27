@@ -390,6 +390,11 @@ def stamp_failed_terminal(
     patch = {
         "materialization_status":          FAILED_TERMINAL,
         "broker_ready":                    False,
+        # Keep the legacy helper's attempt write interpretable if an older
+        # caller still reaches it: all durable selector-attempt mirrors move
+        # together rather than recreating a split counter row.
+        "retry_attempt":                   int(attempt),
+        "breach_attempt_count":            int(attempt),
         "materialization_attempts":        int(attempt),
         "materialization_reason":          str(reason_code or ""),
         "materialization_finished_at":     _now_utc().isoformat(),

@@ -36,6 +36,9 @@ from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
+from ap.pending_trigger_restart_recovery import (
+    _resolve_execution_mode as _resolve_durable_execution_mode,
+)
 from ap.utils                import now_utc_iso
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
@@ -609,6 +612,39 @@ def _resolve_selector_attempt_number(
         # not legitimate forward progress -- unreconcilable.
         return None, _CONFLICT
     return max(1, durable_attempt, pre_claimed), None
+
+
+def _resolve_durable_selector_prior_attempt(
+    *,
+    retry_attempt,
+    breach_attempt_count,
+    materialization_attempts,
+) -> tuple[int | None, str | None]:
+    """Resolve the persisted attempt immediately before a due retry.
+
+    The selector resolver intentionally maps an absent/all-zero first-attempt
+    row to attempt 1.  A due-retry claim needs the prior persisted value
+    instead, so that legacy rows with a missing canonical ``retry_attempt``
+    but agreeing positive mirrors can advance from N to N+1 without treating
+    the row as a competing worker.
+    """
+    resolved, reason = _resolve_selector_attempt_number(
+        retry_attempt=retry_attempt,
+        breach_attempt_count=breach_attempt_count,
+        materialization_attempts=materialization_attempts,
+        recovery_pre_claimed_attempt=None,
+    )
+    if reason:
+        return None, reason
+
+    values = (retry_attempt, breach_attempt_count, materialization_attempts)
+    has_positive_durable_value = any(
+        value is not None
+        and not (isinstance(value, str) and not value.strip())
+        and int(value) > 0
+        for value in values
+    )
+    return (resolved if has_positive_durable_value else 0), None
 
 
 def _selector_cursor_retry_block_reason(
@@ -1830,13 +1866,16 @@ class APExecutionCore:
                     _order_meta = {}
             if not isinstance(_order_meta, dict):
                 _order_meta = {}
-            _recovered_mode = str(
-                order.get("execution_mode") or _order_meta.get("execution_mode") or ""
-            ).strip().lower()
-            if _recovered_mode not in ("live", "paper"):
+            _recovered_mode, _recovered_mode_error = _resolve_durable_execution_mode({
+                **order,
+                "meta": _order_meta,
+            })
+            if _recovered_mode_error:
                 log.critical(
-                    "[%s] Recovered OSM order %s has invalid execution_mode=%r",
-                    watched.ticker, local_order_id, _recovered_mode,
+                    "[%s] Recovered OSM order %s has invalid execution_mode "
+                    "authority=%s column=%r meta=%r",
+                    watched.ticker, local_order_id, _recovered_mode_error,
+                    order.get("execution_mode"), _order_meta.get("execution_mode"),
                 )
                 return None
             qty = int(order.get("qty") or 0)
@@ -2915,8 +2954,45 @@ class APExecutionCore:
         if row_client != expected_client:
             return _term("RETRY_CLIENT_ID_MISMATCH", status="ERROR")
 
-        # execution_mode: row must contain a valid mode and must match runner.
-        row_mode = str(row.get("execution_mode") or "").strip().lower()
+        # Parse meta early — canonical execution_mode resolution validates the
+        # two durable mirrors before the mode gate below; one valid, nonblank
+        # mirror may supply a blank counterpart, but conflicting/invalid
+        # mirrors never pass.
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        meta = meta or {}
+
+        # ── FINAL AMENDMENT: canonical execution_mode resolution ─────────────
+        # Use the same durable-mode resolver as restart recovery. A valid
+        # one-sided mirror may resolve the mode; invalid or contradictory
+        # authority is unresolved and must never reach a claim, selector, or
+        # broker path.
+        _col_mode_raw = str(row.get("execution_mode") or "").strip().lower()
+        _meta_mode_raw = str(meta.get("execution_mode") or "").strip().lower()
+        row_mode, _mode_error = _resolve_durable_execution_mode({
+            **row,
+            "meta": meta,
+        })
+        if _mode_error == "EXECUTION_MODE_AUTHORITY_CONFLICT":
+            return _term(
+                "RETRY_EXECUTION_MODE_AUTHORITY_CONFLICT",
+                status="ERROR",
+                diagnostics={
+                    "column_execution_mode": _col_mode_raw,
+                    "meta_execution_mode": _meta_mode_raw,
+                    "selector_calls": 0,
+                    "direct_quote_calls": 0,
+                    "broker_post_count": 0,
+                },
+            )
+        if _mode_error:
+            return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
+        row_mode = str(row_mode or "").strip().lower()
+
         expected_mode = str(self.execution_mode or self.mode or "").strip().lower()
         if row_mode not in {"live", "paper"}:
             return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
@@ -2925,13 +3001,36 @@ class APExecutionCore:
         if row_mode != expected_mode:
             return _term("RETRY_EXECUTION_MODE_MISMATCH", status="ERROR")
 
-        meta = row.get("meta") or {}
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except Exception:
-                meta = {}
-        meta = meta or {}
+        # A due retry must never let one durable counter stand in for the
+        # selector-attempt identity.  Claim CAS intentionally rejects a
+        # present 2/1/1-style row; classify it here so recovery can fenced-
+        # terminalize the exact RETRY_WAIT generation instead of repeatedly
+        # reporting CLAIM_LOST and falling through to another actor.
+        durable_prior_attempt, _attempt_conflict_reason = (
+            _resolve_durable_selector_prior_attempt(
+                retry_attempt=meta.get("retry_attempt"),
+                breach_attempt_count=meta.get("breach_attempt_count"),
+                materialization_attempts=meta.get("materialization_attempts"),
+            )
+        )
+        if _attempt_conflict_reason:
+            return _term(
+                f"SELECTOR_RECOVERY_CURSOR_INVALID:{_attempt_conflict_reason}",
+                status="ERROR",
+                attempt=_expected_attempt,
+                max_attempts=None,
+                diagnostics={
+                    "selector_recovery_cursor_load_reason": _attempt_conflict_reason,
+                    "materialization_attempt_counters": {
+                        "retry_attempt": meta.get("retry_attempt"),
+                        "breach_attempt_count": meta.get("breach_attempt_count"),
+                        "materialization_attempts": meta.get("materialization_attempts"),
+                    },
+                    "selector_calls": 0,
+                    "direct_quote_calls": 0,
+                    "broker_post_count": 0,
+                },
+            )
 
         # signal_id: required — the CAS predicate needs it.
         signal_id = str(row.get("signal_id") or meta.get("signal_id") or "").strip()
@@ -2987,10 +3086,6 @@ class APExecutionCore:
             return _claim_lost(
                 f"RETRY_GENERATION_ADVANCED:durable={durable_generation}:expected={_expected_generation}"
             )
-        try:
-            durable_prior_attempt = int(meta.get("retry_attempt") or 0)
-        except (TypeError, ValueError):
-            durable_prior_attempt = 0
         if durable_prior_attempt != _expected_attempt - 1:
             return _claim_lost(
                 f"RETRY_ATTEMPT_ADVANCED:durable={durable_prior_attempt}:expected_prior={_expected_attempt - 1}"
@@ -3971,13 +4066,17 @@ class APExecutionCore:
                 _owned_attempt = int(_owned_meta.get("retry_attempt") or 0)
             except (TypeError, ValueError):
                 _owned_attempt = 0
+            _owned_mode, _owned_mode_error = _resolve_durable_execution_mode(
+                _owned_row if isinstance(_owned_row, dict) else {}
+            )
             _owned_ok = (
                 isinstance(_owned_row, dict)
                 and str(_owned_row.get("status") or "").upper() == "PENDING_TRIGGER"
                 and not str(_owned_row.get("broker_order_id") or "").strip()
                 and not _owned_row.get("submitted_ts")
                 and str(_owned_row.get("client_id") or "").strip().lower() == _callback_client_id
-                and str(_owned_row.get("execution_mode") or "").strip().lower() == _callback_mode
+                and not _owned_mode_error
+                and _owned_mode == _callback_mode
                 and str(_owned_meta.get("lifecycle_state") or "").upper() == "MATERIALIZING"
                 and str(_owned_meta.get("materialization_status") or "").upper() == "RUNNING"
                 and _owned_meta.get("materialization_in_flight") is True
@@ -4111,7 +4210,10 @@ class APExecutionCore:
                 # Never write generic diagnostics or signal state before its
                 # owner/generation/lease CAS succeeds.
                 _recovered_ok = self._cleanup_pending_entry_order(
-                    watched, action=cleanup_action, reason=reason,
+                    watched,
+                    action=cleanup_action,
+                    reason=reason,
+                    diagnostics=meta_patch,
                 )
                 if _recovered_ok:
                     if funnel_key:
@@ -4888,7 +4990,7 @@ class APExecutionCore:
                         except Exception:
                             _pvm = {}
                     _pvc = str(_pv_row.get("client_id") or "").strip().lower()
-                    _pve = str(_pv_row.get("execution_mode") or "").strip().lower()
+                    _pve, _pve_error = _resolve_durable_execution_mode(_pv_row)
                     _pvg = int((_pvm or {}).get("materialization_generation") or 0)
                     _pvo = str((_pvm or {}).get("materialization_owner") or "").strip()
                     _pvl = str((_pvm or {}).get("lifecycle_state") or "").upper()
@@ -4900,6 +5002,7 @@ class APExecutionCore:
                         and _pvg == _pre_gen
                         and _pvo == _pre_owner
                         and _pvc == _pre_client
+                        and not _pve_error
                         and _pve == _pre_mode
                         and _pva == _pre_attempt
                         and bool(_pre_owner)
@@ -6400,22 +6503,11 @@ class APExecutionCore:
                         "client=%s ticker=%s reason=%s",
                         _breach_client_id, ticker, _reason,
                     )
-                    # P0 (PR #300): stamp FAILED_TERMINAL lifecycle state.
-                    try:
-                        from ap.deferred_materializer import stamp_failed_terminal
-                        stamp_failed_terminal(
-                            self.order_state_machine,
-                            str(queue_local_order_id or ""),
-                            client_id=str(_breach_client_id or ""),
-                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                            symbol=ticker,
-                            direction=str(getattr(approved_plan, "side", "") or ""),
-                            reason_code=str(_decision_a.get("terminal_reason") or _reason or ""),
-                            attempt=int(_this_attempt_a),
-                            selector_failure=_deferred_selector_audit or {},
-                        )
-                    except Exception as _ft_exc:
-                        log.debug("[%s] stamp_failed_terminal non-critical: %s", ticker, _ft_exc)
+                    # The legacy stamp_failed_terminal helper is intentionally
+                    # not called here. Terminal status, diagnostics, and the
+                    # three attempt mirrors are persisted together by the
+                    # fenced terminal CAS below; a best-effort pre-write could
+                    # leave a crash-visible split lifecycle.
                     _final_reason_a = str(_decision_a.get("terminal_reason") or _reason)
                     _emit_deferred_outcome(
                         (
@@ -6448,37 +6540,6 @@ class APExecutionCore:
                             client_id=_breach_client_id,
                             ticker=ticker,
                         )
-                        try:
-                            _upd_a = getattr(self.order_state_machine, "update_order_meta", None)
-                            if callable(_upd_a) and queue_local_order_id:
-                                _upd_a(queue_local_order_id, {
-                                    "breach_attempt_count":            _this_attempt_a,
-                                    "last_breach_failure_reason":      str(
-                                        _decision_a.get("terminal_reason") or _reason or ""
-                                    ),
-                                    "last_breach_failure_reason_code": str(_obs_rc_a),
-                                    "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
-                                    "contract_selection_status":       _cs_status_a,
-                                    **(
-                                        _build_deferred_retry_terminal_meta(
-                                            terminal_reason=str(_decision_a.get("terminal_reason") or ""),
-                                            reason_code=_obs_rc_a,
-                                            selector_audit=_deferred_selector_audit or {},
-                                            attempt=_this_attempt_a,
-                                            max_attempts=_MAX_RETRIES_A,
-                                            client_id=_breach_client_id,
-                                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                                            local_order_id=str(queue_local_order_id or ""),
-                                            signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
-                                        )
-                                        if _decision_a["retryable_reason"]
-                                        else {
-                                            "last_breach_selector_audit": _deferred_selector_audit or {},
-                                        }
-                                    ),
-                                })
-                        except Exception as _ma_exc:
-                            log.debug("[%s] PR182 meta update non-critical: %s", ticker, _ma_exc)
                     except Exception as _obs_a_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
                     # Fix B: persist flat selector attempt audit on terminal failure (Path A)
@@ -6537,6 +6598,30 @@ class APExecutionCore:
                             "selected_contract":       _sel_contract or None,
                             "deferred_selector_audit": _deferred_selector_audit,
                             "contract_selection_status": _cs_status_a,
+                            **(
+                                _build_deferred_retry_terminal_meta(
+                                    terminal_reason=str(_decision_a.get("terminal_reason") or ""),
+                                    reason_code=_obs_rc_a,
+                                    selector_audit=_deferred_selector_audit or {},
+                                    attempt=_this_attempt_a,
+                                    max_attempts=_MAX_RETRIES_A,
+                                    client_id=_breach_client_id,
+                                    execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                                    local_order_id=str(queue_local_order_id or ""),
+                                    signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                                )
+                                if _decision_a["retryable_reason"]
+                                else {}
+                            ),
+                            "retry_attempt":            _this_attempt_a,
+                            "breach_attempt_count":     _this_attempt_a,
+                            "materialization_attempts":  _this_attempt_a,
+                            "materialization_selector_failure": _deferred_selector_audit or {},
+                            "materialization_reason":    _final_reason_a,
+                            "materialization_last_failure_at": datetime.now(timezone.utc).isoformat(),
+                            "last_breach_failure_reason": str(_final_reason_a or ""),
+                            "last_breach_failure_reason_code": str(_obs_rc_a),
+                            "last_breach_selector_audit": _deferred_selector_audit or {},
                         },
                     )
                     log.critical(
@@ -6587,26 +6672,26 @@ class APExecutionCore:
                     # (copy-back failed or returned unresolved placeholder). Write reason
                     # to trade_queue.last_error before terminal cleanup.
                     # Best-effort: failure here must never block the cleanup below.
+                    _prior_attempt_b = 0
+                    try:
+                        _prior_attempt_b = int(
+                            (getattr(approved_plan, "metadata", None) or {}).get(
+                                "breach_attempt_count", 0
+                            ) or 0
+                        )
+                    except (TypeError, ValueError):
+                        _prior_attempt_b = 0
+                    _this_attempt_b = _prior_attempt_b + 1
+                    _obs_rc_b = (
+                        _deferred_selector_audit.get("reason_code")
+                        or "DEFERRED_UNRESOLVED_AT_BREACH"
+                    )
                     try:
                         from ap.queue import write_deferred_breach_last_error
                         _queue_id_for_obs_b = (
                             sig.get("queue_id")
                             or sig.get("trade_queue_id")
                             or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
-                        )
-                        _prior_attempt_b = 0
-                        try:
-                            _prior_attempt_b = int(
-                                (getattr(approved_plan, "metadata", None) or {}).get(
-                                    "breach_attempt_count", 0
-                                ) or 0
-                            )
-                        except (TypeError, ValueError):
-                            _prior_attempt_b = 0
-                        _this_attempt_b = _prior_attempt_b + 1
-                        _obs_rc_b = (
-                            _deferred_selector_audit.get("reason_code")
-                            or "DEFERRED_UNRESOLVED_AT_BREACH"
                         )
                         write_deferred_breach_last_error(
                             _queue_id_for_obs_b,
@@ -6616,18 +6701,6 @@ class APExecutionCore:
                             client_id=_breach_client_id,
                             ticker=ticker,
                         )
-                        try:
-                            _upd_b = getattr(self.order_state_machine, "update_order_meta", None)
-                            if callable(_upd_b) and queue_local_order_id:
-                                _upd_b(queue_local_order_id, {
-                                    "breach_attempt_count":           _this_attempt_b,
-                                    "last_breach_failure_reason":     str(_reason or ""),
-                                    "last_breach_failure_reason_code": str(_obs_rc_b),
-                                    "last_breach_failure_at":         datetime.now(timezone.utc).isoformat(),
-                                    "last_breach_selector_audit":     _deferred_selector_audit or {},
-                                })
-                        except Exception as _mb_exc:
-                            log.debug("[%s] PR182 meta update non-critical: %s", ticker, _mb_exc)
                     except Exception as _obs_b_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_b_exc)
                     # Fix B: persist flat selector attempt audit on Path B (DEFERRED unresolved)
@@ -6636,7 +6709,7 @@ class APExecutionCore:
                             self.order_state_machine,
                             str(queue_local_order_id or ""),
                             selector_audit=_deferred_selector_audit or {},
-                            attempt_number=_prior_mat_attempt + 1,
+                            attempt_number=_this_attempt_b,
                             execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
                             is_paper=bool(getattr(self, "paper", False)),
                             broker_base_url=str(
@@ -6683,6 +6756,15 @@ class APExecutionCore:
                             "selected_contract":       _sel_contract or None,
                             "approved_contract":       _live_contract,
                             "deferred_selector_audit": _deferred_selector_audit,
+                            "retry_attempt":            _this_attempt_b,
+                            "breach_attempt_count":     _this_attempt_b,
+                            "materialization_attempts":  _this_attempt_b,
+                            "materialization_selector_failure": _deferred_selector_audit or {},
+                            "materialization_reason":    _reason,
+                            "materialization_last_failure_at": datetime.now(timezone.utc).isoformat(),
+                            "last_breach_failure_reason": str(_reason or ""),
+                            "last_breach_failure_reason_code": str(_obs_rc_b),
+                            "last_breach_selector_audit": _deferred_selector_audit or {},
                         },
                     )
                     log.critical(
@@ -10091,7 +10173,14 @@ class APExecutionCore:
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
 
-    def _cleanup_pending_entry_order(self, watched: WatchedSignal, *, action: str, reason: str) -> bool:
+    def _cleanup_pending_entry_order(
+        self,
+        watched: WatchedSignal,
+        *,
+        action: str,
+        reason: str,
+        diagnostics: dict | None = None,
+    ) -> bool:
         """Best-effort OSM cleanup for watcher terminal outcomes.
 
         The queue creates an ENTRY order before arming the watcher. If the
@@ -10123,6 +10212,7 @@ class APExecutionCore:
                         execution_mode=str(ownership.get("execution_mode") or ""),
                         terminal_status=terminal_status,
                         reason=reason,
+                        diagnostics=diagnostics or {},
                     ))
                 except Exception as exc:
                     log.error("[%s] materialization retry terminal CAS raised: %s", watched.ticker, exc)

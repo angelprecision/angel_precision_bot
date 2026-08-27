@@ -4,8 +4,8 @@ Proves the required matrix from PR #323 amendment §1:
 
   * paper recovery cannot load or mutate LIVE rows
   * LIVE recovery cannot load or mutate paper rows
-  * blank execution mode is rejected
-  * malformed execution mode is rejected
+  * blank execution mode with no valid mirror is rejected
+  * malformed execution-mode mirrors are rejected
   * matching client but wrong mode cannot be claimed
   * matching mode but wrong client cannot be claimed
 
@@ -13,10 +13,10 @@ Also proves:
 
   * runner mode is resolved once at the top and unknown mode short-circuits
   * OSM.client_id mismatch short-circuits before any DB call
-  * SQL query includes the `LOWER(TRIM(COALESCE(execution_mode, ''))) = %s`
-    predicate and binds the runner mode as its second parameter
-  * `_build_recovery_plan_from_order` no longer infers execution_mode from
-    the runner (Amendment §1 fail-closed rule)
+  * SQL query uses the symmetric normalized column/metadata authority fence
+    and binds runner mode as its second parameter
+  * `_build_recovery_plan_from_order` does not infer execution_mode from the
+    runner; a valid one-sided metadata mirror is allowed
 
 The tests exercise the *real* `_recover_deferred_breach_lifecycles` code
 path with `conn` and `run_with_retry` monkey-patched, mirroring the
@@ -26,6 +26,7 @@ convention used by `test_p0_deferred_breach_lifecycle_completion.py`.
 from __future__ import annotations
 
 import types
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -153,7 +154,7 @@ def _row(**overrides):
 
 
 def test_sql_predicate_includes_execution_mode_scoping(db_spy):
-    """The SELECT must scope by LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+    """The SELECT must use the symmetric durable-mode authority predicate
     and bind the runner mode (lowercase) as the second parameter."""
     sink, state = db_spy
     rec, _, _ = _make_recovery(client_id="jason-live", mode="LIVE")
@@ -164,7 +165,13 @@ def test_sql_predicate_includes_execution_mode_scoping(db_spy):
 
     assert sink, "expected exactly one SQL execute"
     sql, params = sink[0]
-    assert "LOWER(TRIM(COALESCE(execution_mode, '')))" in sql
+    assert "LOWER(BTRIM(COALESCE(" in sql
+    assert "NULLIF(BTRIM(execution_mode), '')" in sql
+    assert "NULLIF(BTRIM(meta->>'execution_mode'), '')" in sql
+    assert "IN ('live', 'paper')" in sql
+    assert "NULLIF(BTRIM(execution_mode), '') IS NULL" in sql
+    assert "NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL" in sql
+    assert "LOWER(BTRIM(execution_mode)) = LOWER(BTRIM(meta->>'execution_mode'))" in sql
     assert params == ("jason-live", "live")
 
 
@@ -330,6 +337,7 @@ def test_matching_mode_and_client_row_is_processed_normally(db_spy):
     state["rows"] = [_row(
         client_id="jason-live",
         execution_mode="LIVE",
+        created_ts=datetime.now(timezone.utc).isoformat(),
         meta={"materialization_status": "WAITING_FOR_TRIGGER"},
     )]
 
@@ -402,3 +410,50 @@ def test_plan_from_row_with_valid_mode_lowercases_it():
 
     assert plan is not None
     assert plan.execution_mode == "live"
+
+
+def test_plan_from_row_with_blank_column_uses_metadata_mode():
+    """A valid metadata mode may fill a blank column mirror."""
+    rec, _, _ = _make_recovery(client_id="jason-live", mode="PAPER")
+
+    plan = rec._build_recovery_plan_from_order({
+        "local_order_id": "loc-z",
+        "client_id": "jason-live",
+        "signal_id": "sig-z",
+        "plan_id": "plan-z",
+        "symbol": "MSFT",
+        "contract": "MSFT240119C00400000",
+        "direction": "CALL",
+        "execution_mode": "",
+        "trigger_price": 400.0,
+        "qty": 1,
+        "limit_price": 2.0,
+        "reserved_cost": 200.0,
+        "meta": {"execution_mode": "paper"},
+    })
+
+    assert plan is not None
+    assert plan.execution_mode == "paper"
+
+
+def test_plan_from_row_with_conflicting_mode_mirrors_is_rejected():
+    """A contradictory durable identity must not become a recovery plan."""
+    rec, _, _ = _make_recovery(client_id="jason-live", mode="LIVE")
+
+    plan = rec._build_recovery_plan_from_order({
+        "local_order_id": "loc-conflict",
+        "client_id": "jason-live",
+        "signal_id": "sig-conflict",
+        "plan_id": "plan-conflict",
+        "symbol": "MSFT",
+        "contract": "MSFT240119C00400000",
+        "direction": "CALL",
+        "execution_mode": "LIVE",
+        "trigger_price": 400.0,
+        "qty": 1,
+        "limit_price": 2.0,
+        "reserved_cost": 200.0,
+        "meta": {"execution_mode": "paper"},
+    })
+
+    assert plan is None

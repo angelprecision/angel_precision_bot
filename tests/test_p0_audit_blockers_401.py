@@ -43,6 +43,27 @@ class TestAttemptCounterConflictResolution:
         assert resolved is None
         assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
 
+    def test_mcd_production_split_shape_remains_fail_closed_without_proof(self):
+        """The incident shape must never be made valid by choosing a winner."""
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=2,
+            breach_attempt_count=1,
+            materialization_attempts=1,
+            recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_atomic_preclaim_shape_resolves_after_all_mirrors_advance(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=2,
+            breach_attempt_count=2,
+            materialization_attempts=2,
+            recovery_pre_claimed_attempt=2,
+        )
+        assert resolved == 2
+        assert reason is None
+
     def test_all_three_durable_counters_disagree(self):
         resolved, reason = _resolve_selector_attempt_number(
             retry_attempt=1,
