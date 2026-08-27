@@ -127,13 +127,14 @@ def _watched(plan, *, client_id: str = CLIENT_ID, execution_mode: str = "live"):
     )
 
 
-def _core(osm, selector=None, broker=None):
+def _core(osm, selector=None, broker=None, *, execution_mode: str = "live"):
+    runtime_mode = str(execution_mode).strip().lower()
     core = APExecutionCore.__new__(APExecutionCore)
     core.client_id = CLIENT_ID
     core.email = CLIENT_ID
-    core.execution_mode = "live"
-    core.mode = "LIVE"
-    core.paper = False
+    core.execution_mode = runtime_mode
+    core.mode = runtime_mode.upper()
+    core.paper = runtime_mode == "paper"
     core.order_state_machine = osm
     core.contract_selector = selector or MagicMock()
     core.broker = broker or MagicMock()
@@ -231,6 +232,87 @@ def test_client_mismatch_holds_before_claim_selector_or_broker():
     assert result["disposition"] == "KEEP_WATCHER"
     assert result["reason_code"] == "MATERIALIZATION_STATE_WRITE_FAILED"
     assert osm.claim_calls == []
+    selector.select.assert_not_called()
+    assert broker.method_calls == []
+
+
+def test_paper_runtime_live_durable_row_holds_before_claim_selector_or_broker():
+    """PAPER callbacks must not claim a durable LIVE materialization row."""
+    plan = _plan(execution_mode="paper")
+    row = _row(execution_mode="live", meta={"execution_mode": "live"})
+    osm = _PreflightOSM([row, row])
+    selector = MagicMock()
+    broker = MagicMock()
+    core = _core(
+        osm,
+        selector=selector,
+        broker=broker,
+        execution_mode="paper",
+    )
+
+    result = core._on_entry_trigger(_watched(plan, execution_mode="paper"))
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_STATE_WRITE_FAILED"
+    assert osm.claim_calls == []
+    selector.select.assert_not_called()
+    assert broker.method_calls == []
+
+
+@pytest.mark.parametrize(
+    ("durable_owner", "durable_generation"),
+    [("other-recovery-owner", 4), ("recovery-owner", 5)],
+    ids=["owner-mismatch", "generation-mismatch"],
+)
+def test_recovered_blank_plan_requires_exact_owner_generation_before_selector_or_materialization(
+    durable_owner, durable_generation
+):
+    """Restarted blank plans cannot bypass an unproven recovery preclaim."""
+    owner = "recovery-owner"
+    generation = 4
+    lease = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    plan = _plan(execution_mode="live")
+    row = _row(
+        execution_mode="live",
+        meta={
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
+            "materialization_in_flight": True,
+            "materialization_owner": durable_owner,
+            "materialization_generation": durable_generation,
+            "materialization_lease_until": lease,
+            "retry_attempt": 1,
+        },
+    )
+    osm = _PreflightOSM([row, row])
+    selector = MagicMock()
+    broker = MagicMock()
+    core = _core(osm, selector=selector, broker=broker)
+    core._breach_risk_check = lambda _watched: pytest.fail(
+        "unproven recovery ownership must return before risk/selector/materialization"
+    )
+    watched = _watched(plan)
+    watched.signal.update({
+        "recovery_submit_fenced": True,
+        "recovery_submit_owner": owner,
+        "recovery_submit_generation": generation,
+        "retry_attempt": 1,
+        "ownership_kind": "materialization_retry",
+        "_recovery_pre_claimed": True,
+        "_recovery_pre_claimed_owner": owner,
+        "_recovery_pre_claimed_generation": generation,
+        "_recovery_pre_claimed_attempt": 1,
+        "_recovery_pre_claimed_client_id": CLIENT_ID,
+        "_recovery_pre_claimed_mode": "live",
+    })
+
+    result = core._on_entry_trigger(watched)
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED"
+    assert osm.get_order_calls == 2  # callback preflight + exact preclaim proof
+    assert osm.claim_calls == []
+    assert osm.terminal_calls == []
     selector.select.assert_not_called()
     assert broker.method_calls == []
 
