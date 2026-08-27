@@ -757,7 +757,7 @@ def test_M_osm_claim_allows_blank_column_from_trimmed_metadata(
         row = _read_order(conn_ctx, schema, local_order_id)
         assert row["updated_ts"] > before["updated_ts"]
         assert row["execution_mode"] == column_mode
-        assert row["meta"]["execution_mode"] == meta_mode
+        assert row["meta"]["execution_mode"] == meta_mode.strip().lower()
         assert row["meta"]["lifecycle_state"] == "MATERIALIZING"
         assert row["meta"]["materialization_generation"] == _GENERATION
     finally:
