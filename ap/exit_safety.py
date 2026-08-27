@@ -126,6 +126,42 @@ def _extract_long_position_qty(raw: dict[str, Any]) -> int:
     return int(qty)
 
 
+def _strict_position_quantity(raw: dict[str, Any]) -> Optional[int]:
+    """Return one proven nonnegative integral position quantity, or ``None``."""
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    observed: list[int] = []
+    for container in (raw, nested):
+        for key in ("quantity", "qty", "quantity_remaining", "remaining_quantity"):
+            if key not in container:
+                continue
+            value = container.get(key)
+            if isinstance(value, bool) or value in (None, ""):
+                return None
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(parsed) or not parsed.is_integer() or parsed < 0:
+                return None
+            observed.append(int(parsed))
+    if not observed or len(set(observed)) != 1:
+        return None
+    side_text = " ".join(
+        str(v or "")
+        for v in (
+            raw.get("side"),
+            raw.get("position_type"),
+            raw.get("direction"),
+            nested.get("side"),
+            nested.get("position_type"),
+            nested.get("direction"),
+        )
+    ).strip().lower()
+    if "short" in side_text:
+        return None
+    return observed[0]
+
+
 def resolve_exit_broker_truth(
     *,
     broker: Any,
@@ -199,7 +235,34 @@ def resolve_exit_broker_truth(
         row_account = _extract_position_account_id(raw)
         if row_account and account_id and row_account != account_id:
             continue
+        proven_qty = _strict_position_quantity(raw)
+        if proven_qty is None:
+            audit.update(
+                {
+                    "snapshot_status": "broker_positions_malformed",
+                    "exact_contract_match": True,
+                    "error": "exact_contract_quantity_unproven",
+                }
+            )
+            return {
+                "broker_truth_open_qty": None,
+                "is_fresh_exact": False,
+                "audit": audit,
+            }
         long_qty = _extract_long_position_qty(raw)
+        if long_qty != proven_qty:
+            audit.update(
+                {
+                    "snapshot_status": "broker_positions_malformed",
+                    "exact_contract_match": True,
+                    "error": "exact_contract_direction_unproven",
+                }
+            )
+            return {
+                "broker_truth_open_qty": None,
+                "is_fresh_exact": False,
+                "audit": audit,
+            }
         broker_truth_open_qty += max(int(long_qty), 0)
         matched_rows.append(
             {
@@ -338,6 +401,90 @@ def _order_quantity_evidence(
     }, None
 
 
+def _order_snapshot_row_issue(
+    raw: Any, *, target_contract: str,
+) -> str | None:
+    """Reject rows that cannot safely participate in an account order snapshot."""
+    if not isinstance(raw, dict):
+        return "row_malformed"
+    aliases: list[tuple[str, str]] = []
+    for key in ("option_symbol", "contract", "symbol"):
+        value = raw.get(key)
+        normalized = _normalize_contract(value) if value not in (None, "") else ""
+        if normalized:
+            aliases.append((key, normalized))
+    if not aliases:
+        return "contract_unproven"
+    explicit_contracts = [
+        value for key, value in aliases if key in {"option_symbol", "contract"}
+    ]
+    if len(set(explicit_contracts)) > 1:
+        return "conflicting_contract"
+    symbol_contract = next(
+        (value for key, value in aliases if key == "symbol"), ""
+    )
+    if (
+        target_contract
+        and symbol_contract == target_contract
+        and explicit_contracts
+        and target_contract not in explicit_contracts
+    ):
+        return "conflicting_contract"
+
+    # Exact-contract rows are validated by the takeover inventory so existing
+    # ambiguity classifications (status/quantity/side) remain specific. Rows
+    # that cannot identify a contract at all are malformed at the snapshot
+    # boundary and must not disappear as unrelated inventory.
+    if _exact_order_contract(raw) == target_contract:
+        return None
+
+    broker_order_id = str(raw.get("id") or raw.get("order_id") or "").strip()
+    if not broker_order_id:
+        return "order_id_unproven"
+    status, status_issue = _order_status(raw)
+    if status_issue:
+        return status_issue
+    if status not in (_ACTIVE_BROKER_SELL_STATUSES | _TERMINAL_BROKER_ORDER_STATUSES):
+        return "unknown_status"
+    if not _normalize_text(raw.get("side")):
+        return "side_unproven"
+    quantity_key = "quantity" if "quantity" in raw else "qty" if "qty" in raw else None
+    if quantity_key is None:
+        return "quantity_unproven"
+    quantity = raw.get(quantity_key)
+    if isinstance(quantity, bool) or quantity in (None, ""):
+        return "quantity_unproven"
+    try:
+        quantity_float = float(quantity)
+    except (TypeError, ValueError):
+        return "quantity_unproven"
+    if not math.isfinite(quantity_float) or quantity_float <= 0:
+        return "quantity_unproven"
+    for key in ("exec_quantity", "remaining_quantity"):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if isinstance(value, bool) or value in (None, ""):
+            return "quantity_unproven"
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return "quantity_unproven"
+        if not math.isfinite(parsed) or parsed < 0:
+            return "quantity_unproven"
+    return None
+
+
+def _order_snapshot_issue(rows: Any, *, target_contract: str) -> str | None:
+    if not isinstance(rows, list):
+        return "snapshot_malformed"
+    for row in rows:
+        issue = _order_snapshot_row_issue(row, target_contract=target_contract)
+        if issue:
+            return issue
+    return None
+
+
 def _terminal_order_outcome(
     raw: dict[str, Any], candidate: dict[str, Any],
 ) -> tuple[str | None, int, str | None]:
@@ -450,6 +597,10 @@ def resolve_protective_exit_takeover(
     if not isinstance(orders, list) or any(not isinstance(row, dict) for row in orders):
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_malformed")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
+    snapshot_issue = _order_snapshot_issue(orders, target_contract=exact_contract)
+    if snapshot_issue:
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason=snapshot_issue)
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
 
     def _inventory(
         rows: list[dict[str, Any]],
@@ -462,14 +613,20 @@ def resolve_protective_exit_takeover(
             row_account = _normalize_text(row.get("account_id") or row.get("account"))
             if row_account and account and row_account != account:
                 continue
-            if _normalize_text(row.get("side")) != "sell_to_close":
-                continue
+            broker_order_id = str(row.get("id") or row.get("order_id") or "").strip()
+            if not broker_order_id:
+                return [], [], "order_id_unproven"
             status, status_issue = _order_status(row)
             if status_issue:
                 return [], [], status_issue
             evidence, quantity_issue = _order_quantity_evidence(row)
             if quantity_issue or evidence is None:
                 return [], [], quantity_issue or "quantity_unproven"
+            side = _normalize_text(row.get("side"))
+            if not side:
+                return [], [], "side_unproven"
+            if side != "sell_to_close":
+                continue
             if status in {"partially_filled", "partial_fill"} and evidence["remaining"] == 0:
                 status = "filled"
             if status in _TERMINAL_BROKER_ORDER_STATUSES:
@@ -535,6 +692,12 @@ def resolve_protective_exit_takeover(
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
         if not isinstance(post_orders, list) or any(not isinstance(row, dict) for row in post_orders):
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_list_orders_malformed")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
+        post_snapshot_issue = _order_snapshot_issue(
+            post_orders, target_contract=exact_contract,
+        )
+        if post_snapshot_issue:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason=post_snapshot_issue)
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
         post_active_sells, post_terminal_orders, post_inventory_issue = _inventory(post_orders)
         if post_inventory_issue or post_active_sells:
@@ -629,6 +792,12 @@ def resolve_protective_exit_takeover(
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
     if not isinstance(post_orders, list) or any(not isinstance(row, dict) for row in post_orders):
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_list_orders_malformed")
+        return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
+    post_snapshot_issue = _order_snapshot_issue(
+        post_orders, target_contract=exact_contract,
+    )
+    if post_snapshot_issue:
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason=post_snapshot_issue)
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
     post_active_sells, post_terminal_orders, post_inventory_issue = _inventory(post_orders)
     if post_inventory_issue or post_active_sells:

@@ -347,6 +347,46 @@ def test_production_tradier_malformed_positions_are_unproven():
     assert result["is_fresh_exact"] is False
 
 
+@pytest.mark.parametrize("quantity", [-1, 0.5, 1.5, "0.5"])
+def test_production_tradier_negative_or_fractional_position_quantity_is_unproven(quantity):
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: {
+        "positions": {"position": {"symbol": CONTRACT, "quantity": quantity}}
+    }
+    result = resolve_exit_broker_truth(
+        broker=broker, client_id=CLIENT, contract=CONTRACT,
+    )
+    assert result["broker_truth_open_qty"] is None
+    assert result["is_fresh_exact"] is False
+    assert result["audit"]["snapshot_status"] == "broker_positions_malformed"
+    assert result["audit"]["error"] == "exact_contract_quantity_unproven"
+
+
+def test_production_tradier_explicit_zero_position_quantity_remains_authoritative_flat():
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: {
+        "positions": {"position": {"symbol": CONTRACT, "quantity": 0}}
+    }
+    result = resolve_exit_broker_truth(
+        broker=broker, client_id=CLIENT, contract=CONTRACT,
+    )
+    assert result["broker_truth_open_qty"] == 0
+    assert result["is_fresh_exact"] is True
+    assert result["audit"]["snapshot_status"] == "exact_match"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -405,6 +445,90 @@ def test_production_tradier_malformed_order_member_holds_takeover_before_cancel_
     assert result["replacement_qty"] == 0
     assert result["reason"] == "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE"
     assert "TRADIER_ORDERS_PAYLOAD_MALFORMED" in result["audit"]["error"]
+    assert cancel_calls == []
+
+
+@pytest.mark.parametrize(
+    ("order", "expected_reason"),
+    [
+        ({}, "EXIT_PROTECTIVE_ORDERS_MALFORMED"),
+        (
+            {"id": "malformed", "status": "open", "option_symbol": CONTRACT, "quantity": 1},
+            "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+        ),
+        (
+            {
+                "id": "conflicting",
+                "status": "open",
+                "side": "sell_to_close",
+                "type": "stop",
+                "option_symbol": "NOW",
+                "symbol": CONTRACT,
+                "quantity": 1,
+            },
+            "EXIT_PROTECTIVE_ORDERS_MALFORMED",
+        ),
+    ],
+)
+def test_generic_malformed_order_rows_hold_before_cancel(order, expected_reason):
+    broker = _Broker(
+        positions=[[_position(1)]],
+        orders=[order],
+    )
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == expected_reason
+    assert broker.cancel_calls == []
+
+
+@pytest.mark.parametrize(
+    ("order", "expected_reason"),
+    [
+        ({}, "EXIT_PROTECTIVE_ORDERS_MALFORMED"),
+        (
+            {"id": "malformed", "status": "open", "option_symbol": CONTRACT, "quantity": 1},
+            "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
+        ),
+        (
+            {
+                "id": "conflicting",
+                "status": "open",
+                "side": "sell_to_close",
+                "type": "stop",
+                "option_symbol": "NOW",
+                "symbol": CONTRACT,
+                "quantity": 1,
+            },
+            "EXIT_PROTECTIVE_ORDERS_MALFORMED",
+        ),
+    ],
+)
+def test_production_tradier_malformed_order_rows_hold_before_takeover(order, expected_reason):
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    position_payload = {"positions": {"position": {"symbol": CONTRACT, "quantity": "1"}}}
+    orders_payload = {"orders": {"order": [order]}}
+
+    def _get(path, *args, **kwargs):
+        if path.endswith("/positions"):
+            return position_payload
+        if path.endswith("/orders"):
+            return orders_payload
+        raise AssertionError(f"unexpected endpoint: {path}")
+
+    broker._get = _get
+    cancel_calls = []
+    broker.cancel_order = lambda order_id: cancel_calls.append(order_id)
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == expected_reason
     assert cancel_calls == []
 
 
