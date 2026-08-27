@@ -627,14 +627,14 @@ def resolve_protective_exit_takeover(
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="broker_already_flat")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_BROKER_FLAT", "audit": audit}
 
-    list_orders = getattr(broker, "list_orders", None)
-    if not callable(list_orders):
-        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_unavailable")
+    list_orders_strict = getattr(broker, "list_orders_strict", None)
+    if not callable(list_orders_strict):
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_strict_unavailable")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
     try:
-        orders = list_orders()
+        orders = list_orders_strict()
     except Exception as exc:
-        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_error", error=str(exc))
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_strict_error", error=str(exc))
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
     if not isinstance(orders, list) or any(not isinstance(row, dict) for row in orders):
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_malformed")
@@ -727,9 +727,9 @@ def resolve_protective_exit_takeover(
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_position_unproven")
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
         try:
-            post_orders = list_orders()
+            post_orders = list_orders_strict()
         except Exception as exc:
-            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_list_orders_error", error=str(exc))
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_list_orders_strict_error", error=str(exc))
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
         if not isinstance(post_orders, list) or any(not isinstance(row, dict) for row in post_orders):
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_list_orders_malformed")
@@ -838,9 +838,9 @@ def resolve_protective_exit_takeover(
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_position_unproven")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
     try:
-        post_orders = list_orders()
+        post_orders = list_orders_strict()
     except Exception as exc:
-        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_list_orders_error", error=str(exc))
+        audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_list_orders_strict_error", error=str(exc))
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
     if not isinstance(post_orders, list) or any(not isinstance(row, dict) for row in post_orders):
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_list_orders_malformed")

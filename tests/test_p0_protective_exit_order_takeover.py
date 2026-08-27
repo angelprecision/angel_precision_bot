@@ -50,6 +50,7 @@ class _Broker:
         self.cancel_calls = []
         self.get_calls = []
         self.list_orders_calls = 0
+        self.list_orders_strict_calls = 0
 
     def list_positions(self):
         current = self._positions.pop(0) if len(self._positions) > 1 else self._positions[0]
@@ -68,6 +69,10 @@ class _Broker:
         ):
             return self._orders.pop(0)
         return self._orders
+
+    def list_orders_strict(self):
+        self.list_orders_strict_calls += 1
+        return self.list_orders()
 
     def cancel_order(self, order_id):
         self.cancel_calls.append(order_id)
@@ -243,6 +248,18 @@ def test_list_orders_unavailable_holds():
     result = _run(broker)
     assert result["allowed"] is False
     assert result["reason"] == "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE"
+
+
+def test_takeover_requires_strict_order_inventory_instead_of_legacy_fallback():
+    broker = _Broker(positions=[[_position(1)]], orders=[_stop()])
+    broker.list_orders_strict = None
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE"
+    assert result["audit"]["reason"] == "list_orders_strict_unavailable"
+    assert broker.list_orders_calls == 0
+    assert broker.cancel_calls == []
 
 
 def test_multiple_exact_active_sells_hold_without_cancel():
@@ -580,6 +597,76 @@ def test_production_tradier_empty_order_list_is_authoritative_empty():
     )
     broker._get = lambda *args, **kwargs: {"orders": {"order": []}}
     assert broker.list_orders() == []
+    assert broker.list_orders_strict() == []
+
+
+def test_production_tradier_legacy_list_orders_filters_malformed_members_and_empty_nodes():
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    valid = {"id": "valid"}
+    payloads = [
+        ({}, []),
+        ({"orders": {}}, []),
+        ({"orders": None}, []),
+        ({"orders": {"unexpected": []}}, []),
+        ({"orders": {"order": [valid, "MALFORMED_ORDER_ROW"]}}, [valid]),
+    ]
+    for payload, expected in payloads:
+        broker._get = lambda *args, _payload=payload, **kwargs: _payload
+        assert broker.list_orders() == expected
+
+
+@pytest.mark.parametrize(
+    "orders_payload",
+    [
+        {},
+        {"orders": {}},
+        {"orders": None},
+        {"orders": {"unexpected": []}},
+        {"orders": {"order": [{"id": "valid"}, "MALFORMED_ORDER_ROW"]}},
+    ],
+)
+def test_production_tradier_strict_list_orders_rejects_ambiguous_payload(orders_payload):
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    broker._get = lambda *args, **kwargs: orders_payload
+    with pytest.raises(ValueError, match="TRADIER_ORDERS_PAYLOAD_MALFORMED"):
+        broker.list_orders_strict()
+
+
+def test_takeover_uses_strict_tradier_inventory_not_legacy_method():
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="ACC123",
+        )
+    )
+    position_payload = {"positions": {"position": {"symbol": CONTRACT, "quantity": "1"}}}
+    orders_payload = {"orders": {"order": []}}
+
+    def _get(path, *args, **kwargs):
+        if path.endswith("/positions"):
+            return position_payload
+        if path.endswith("/orders"):
+            return orders_payload
+        raise AssertionError(f"unexpected endpoint: {path}")
+
+    broker._get = _get
+    broker.list_orders = lambda: (_ for _ in ()).throw(AssertionError("legacy list_orders used"))
+    result = _run(broker)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
 
 
 @pytest.mark.parametrize(

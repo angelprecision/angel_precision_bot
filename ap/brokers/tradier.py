@@ -413,13 +413,30 @@ class TradierBroker(BrokerAdapter):
             return {"status": "ERROR", "reason": str(e)}
 
     def list_orders(self) -> List[Dict[str, Any]]:
-        """Return account orders for exact-tag crash-window reconciliation.
+        """Return account orders using the legacy compatibility contract.
 
-        Unlike ``get_order`` this deliberately propagates transport/auth errors:
-        callers must distinguish an authoritative empty result from an unavailable
-        broker query before deciding that a new POST is safe. Structural payload
-        errors also propagate; an order snapshot with any malformed row is not
-        authoritative and must not be silently reduced to a partial list.
+        Existing reconciliation callers rely on empty/missing order nodes being
+        represented as ``[]`` and on malformed members being filtered from an
+        otherwise usable list.  Authoritative money-path callers must use
+        ``list_orders_strict`` instead.
+        """
+        j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
+        node = j.get("orders") if isinstance(j, dict) else None
+        orders = node.get("order") if isinstance(node, dict) else node
+        if orders is None:
+            return []
+        if isinstance(orders, dict):
+            return [orders]
+        if isinstance(orders, list):
+            return [order for order in orders if isinstance(order, dict)]
+        raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+
+    def list_orders_strict(self) -> List[Dict[str, Any]]:
+        """Return an authoritative Tradier order snapshot.
+
+        Transport/auth failures propagate.  Missing or malformed top-level
+        payloads, and any malformed order member, are rejected so money-path
+        callers cannot treat partial or ambiguous broker truth as safe.
         """
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
         if not isinstance(j, dict) or "orders" not in j:

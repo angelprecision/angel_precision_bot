@@ -163,6 +163,10 @@ def mock_broker():
     broker.account_id = "ACC123"
     broker.session = MagicMock()
     broker.list_orders.return_value = []
+    # The protective takeover requires the authoritative order capability;
+    # keep this test double's strict method tied to the legacy-configured
+    # response so existing scenarios exercise the same inventory sequence.
+    broker.list_orders_strict = broker.list_orders
     return broker
 
 
