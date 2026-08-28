@@ -53,14 +53,14 @@ def _external_exit_identity(client_id: str, position_id: str) -> dict | None:
                   AND position_id::text=%s
                   AND UPPER(COALESCE(kind,''))='EXIT'
                   AND UPPER(COALESCE(status,'')) IN ('EXIT_FILLED','EXIT_PARTIAL_FILL')
-                  AND COALESCE(local_order_id,'') LIKE 'external-exit:%'
+                  AND COALESCE(local_order_id,'') LIKE %s
                   AND COALESCE(broker_order_id,'') <> ''
                   AND COALESCE(filled_qty,0) > 0
                   AND fill_price IS NOT NULL
                 ORDER BY filled_ts DESC NULLS LAST, updated_ts DESC NULLS LAST, id DESC
                 LIMIT 1
                 """,
-                (client_id, position_id),
+                (client_id, position_id, f"{_EXTERNAL_PREFIX}%"),
             )
             row = c.fetchone()
             return dict(row) if row else None

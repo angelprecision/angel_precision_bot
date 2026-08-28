@@ -24,7 +24,12 @@ class _Cursor:
         text = " ".join(str(sql).split())
         self.calls.append((text, params))
         self.rowcount = 0
-        if "FROM orders" in text and "external-exit:%" in text:
+        if (
+            "FROM orders" in text
+            and "LIKE %s" in text
+            and params
+            and "external-exit:%" in params
+        ):
             self._one = {
                 "local_order_id": EXTERNAL_LOCAL_ID,
                 "broker_order_id": BROKER_EXIT_ID,
@@ -84,6 +89,11 @@ def test_live_official_manual_close_remains_official_but_is_not_training(monkeyp
     assert stamp["exit_local_order_id"] == EXTERNAL_LOCAL_ID
     assert stamp["manual_external_close"] is True
     assert "manual_external_close_training_excluded" in stamp["taxonomy_reason"]
+
+    sql, params = next(call for call in cursor.calls if "FROM orders" in call[0])
+    assert "LIKE %s" in sql
+    assert "external-exit:%" not in sql
+    assert params[-1] == "external-exit:%"
 
 
 def test_non_external_live_official_trade_is_not_quarantined(monkeypatch):
