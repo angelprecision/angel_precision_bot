@@ -1015,13 +1015,14 @@ class APBrokerReconciler:
                             o.fill_price,
                             o.filled_qty,
                             o.filled_ts,
-                            o.broker_order_id
+                            o.broker_order_id,
+                            o.meta
                         FROM orders o
                         JOIN positions p ON p.id = o.position_id AND p.client_id = o.client_id
                         WHERE o.client_id = %s
                           AND o.kind = 'EXIT'
                           AND o.status = 'EXIT_FILLED'
-                          AND COALESCE(o.local_order_id, '') NOT LIKE 'external-exit:%'
+                          AND COALESCE(o.local_order_id, '') NOT LIKE %s
                           AND LOWER(COALESCE(o.meta->>'external_broker_order', 'false')) <> 'true'
                           AND o.fill_price IS NOT NULL
                           AND COALESCE(o.filled_qty, 0) > 0
@@ -1036,7 +1037,7 @@ class APBrokerReconciler:
                         ORDER BY o.filled_ts DESC
                         LIMIT 50
                         """,
-                        (self.client_id,),
+                        (self.client_id, "external-exit:%"),
                     )
                     return c.fetchall()
 
