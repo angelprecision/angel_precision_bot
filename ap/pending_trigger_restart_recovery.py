@@ -23,6 +23,7 @@ BLOCKER FIXES (PR #328 amendment):
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
@@ -36,6 +37,8 @@ from ap_entry_watcher import (
 from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
+    has_broker_handoff_evidence,
+    is_active_materialization_in_flight,
 )
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
@@ -48,12 +51,15 @@ log = get_logger("ap.pending_trigger_restart_recovery")
 # ── Per-row outcome constants (Blocker 2) ─────────────────────────────────────
 
 class _RowOutcome:
-    WATCHER_OWNED = "WATCHER_OWNED"
-    RETRY_OWNED   = "RETRY_OWNED"
-    REARM_OWNED   = "REARM_OWNED"
-    TERMINALIZED  = "TERMINALIZED"
-    UNRESOLVED    = "UNRESOLVED"
-    SKIPPED       = "SKIPPED"   # NOT_PENDING_TRIGGER (already resolved)
+    WATCHER_OWNED          = "WATCHER_OWNED"
+    RETRY_OWNED            = "RETRY_OWNED"
+    REARM_OWNED            = "REARM_OWNED"
+    TERMINALIZED           = "TERMINALIZED"
+    UNRESOLVED             = "UNRESOLVED"
+    SKIPPED                = "SKIPPED"             # NOT_PENDING_TRIGGER (already resolved)
+    # PR #521: active deferred materializer owns the attempt; recovery observes
+    # and departs read-only. No terminalization, rearm, selector, or broker call.
+    MATERIALIZATION_OWNED  = "MATERIALIZATION_OWNED"
 
 
 _TERMINAL_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED", "ERROR"})
@@ -298,6 +304,77 @@ class PendingTriggerRestartRecovery:
         if watcher_owned is not True and not _evidence_proven:
             return _reject_unproven_trigger_evidence()
 
+        # A contradictory broker-ready or submit marker is not permission to
+        # classify the row as a zombie.  The broker may have accepted an
+        # order before the durable identity write completed.  Hold this row
+        # before quote work and before the STUCK cleanup action; the dedicated
+        # broker-intent reconciler, when available, is the only authority that
+        # may resolve that ambiguity.
+        if has_broker_handoff_evidence(row):
+            meta = _extract_meta(row)
+            self._mark_failure(local_oid, "broker_handoff_ambiguous")
+            log.critical(
+                "PENDING_TRIGGER_BROKER_HANDOFF_AMBIGUOUS "
+                "local_order_id=%s client_id=%s execution_mode=%s signal_id=%s "
+                "broker_submission=UNKNOWN broker_cancel=NOT_ATTEMPTED caller=%s "
+                "submit_intent_at=%s broker_submit_key=%s "
+                "broker_submit_payload_hash=%s broker_ready=%s",
+                local_oid,
+                row_client,
+                row_mode,
+                signal_id,
+                self.caller_source,
+                bool(str(meta.get("submit_intent_at") or "").strip()),
+                bool(str(meta.get("broker_submit_key") or "").strip()),
+                bool(str(meta.get("broker_submit_payload_hash") or "").strip()),
+                meta.get("broker_ready"),
+            )
+            return _RowOutcome.UNRESOLVED
+
+        # Classify the durable owner before doing any quote work.  An active
+        # materializer is already the sole authority for this attempt; even a
+        # read-only external quote request is unnecessary and can delay the
+        # owner while another cleanup path races the same row.
+        cls = classify_pending_trigger_row(
+            row,
+            watcher_owned=watcher_owned,
+            is_past_eod=self.is_past_eod,
+            live_quote_already_through_trigger=None,
+        )
+
+        def _observe_materialization_owner() -> str:
+            meta = row.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            log.info(
+                "PENDING_TRIGGER_MATERIALIZATION_IN_FLIGHT "
+                "local_order_id=%s client_id=%s execution_mode=%s signal_id=%s "
+                "materialization_owner=%s materialization_generation=%s "
+                "materialization_lease_until=%s broker_submission=NOT_ATTEMPTED "
+                "broker_cancel=NOT_ATTEMPTED caller=%s",
+                local_oid,
+                row.get("client_id") or self.client_id,
+                row.get("execution_mode") or self.execution_mode,
+                row.get("signal_id") or "",
+                meta.get("materialization_owner") or "",
+                meta.get("materialization_generation") or "",
+                meta.get("materialization_lease_until") or "",
+                self.caller_source,
+            )
+            return _RowOutcome.MATERIALIZATION_OWNED
+
+        if cls == PTC.MATERIALIZATION_IN_FLIGHT:
+            # The shared predicate is repeated here so this early no-quote
+            # optimization cannot become a protection bypass if the
+            # classifier priority changes later.
+            if is_active_materialization_in_flight(row):
+                return _observe_materialization_owner()
+
         # Live quote check.
         live_quote_abt: Optional[bool] = None
         _side    = str(row.get("direction") or row.get("side") or "").strip().upper()
@@ -309,7 +386,8 @@ class PendingTriggerRestartRecovery:
             except Exception as _qe:
                 log.debug("RESTART_RECOVERY quote check failed local=%s: %s", local_oid, _qe)
 
-        # Classification.
+        # Reclassify after the optional quote check so quote-derived unsafe
+        # states retain their existing priority for non-active rows.
         cls = classify_pending_trigger_row(
             row,
             watcher_owned=watcher_owned,
@@ -346,10 +424,51 @@ class PendingTriggerRestartRecovery:
                 "treating as orphan", local_oid,
             )
 
+        # PR #521 amendment (audit Finding 3): MATERIALIZATION_IN_FLIGHT is
+        # hoisted BEFORE the second evidence fence.
+        #
+        # Which scenario this protects
+        # ────────────────────────────
+        # The second fence (line 386) fires when _evidence_proven is False AND
+        # the row has passed the first fence (line 301).  The first fence is
+        # bypassed ONLY when watcher_owned is True — so the hoist is
+        # specifically effective for:
+        #
+        #   watcher_owned=True  AND  _evidence_proven=False  AND
+        #   cls=MATERIALIZATION_IN_FLIGHT
+        #
+        # Concrete example: the watcher is still registered for the row
+        # (trigger callback not yet evicted from _pending) while the
+        # deferred materializer concurrently holds the row under its own
+        # lease.  The watcher's registration lets it pass the first fence.
+        # trigger_crossed_at may have been persisted but
+        # trigger_crossed_at_provenance not yet flushed (crash window) →
+        # _evidence_proven=False → without the hoist the second fence would
+        # fire → UNRESOLVED + false ownerless alarm even though the
+        # materializer is alive and the 7-field proof is fully valid.
+        #
+        # For rows where watcher_owned is None or False, the first fence
+        # fires first (line 301) when evidence is also unproven — the hoisted
+        # handler is never reached in that path, and UNRESOLVED is correct
+        # (fail-closed: no watcher owns it AND trigger identity is unproven).
+        #
+        # Safety: the classification itself is already fail-closed — any
+        # missing/expired proof field produces STUCK_TRIGGER_READY, which
+        # then hits the second fence and returns UNRESOLVED as before.  Only
+        # rows whose 7-field proof is fully valid reach this branch.
+        if cls == PTC.MATERIALIZATION_IN_FLIGHT:
+            # Binding invariant: ZERO mutations. No terminalize, rearm,
+            # selector, materializer invocation, capacity/revalidation,
+            # attempt-counter increment, owner/generation replacement, lease
+            # renewal, retry scheduling, broker submit/cancel, or
+            # position/proof_trades/queue mutation.
+            return _observe_materialization_owner()
+
         # Every path that would classify, terminalize, retry, or rearm an
         # order with confirmed-trigger evidence still requires durable
         # lifecycle identity.  Only the proven already-owned fast path above
-        # is allowed to return before this fence.
+        # and the MATERIALIZATION_IN_FLIGHT read-only path are allowed to
+        # return before this fence.
         if not _evidence_proven:
             return _reject_unproven_trigger_evidence()
 
@@ -1349,6 +1468,7 @@ def _build_summary(
             _RowOutcome.REARM_OWNED,
             _RowOutcome.TERMINALIZED,
             _RowOutcome.SKIPPED,
+            _RowOutcome.MATERIALIZATION_OWNED,  # PR #521: active materializer owns
         }
     }
     return {
@@ -1379,6 +1499,8 @@ def _build_summary(
         "retry_verification_failure_count": sum(
             1 for v in failure_reasons.values() if str(v).startswith("retry_verification:")
         ),
+        # PR #521: rows where an active materializer was observed read-only
+        "materialization_in_flight_count":  _all.count(_RowOutcome.MATERIALIZATION_OWNED),
         # Blocker 2: ownerless = count(UNRESOLVED) — not arithmetic
         "ownerless_rows_remaining":         len(unresolved_row_ids),
         "resolved_row_ids":                 resolved_row_ids,
@@ -1394,11 +1516,12 @@ def _emit_summary(summary: dict) -> None:
         "PENDING_TRIGGER_RESTART_RECOVERY_SUMMARY "
         "client=%s mode=%s examined=%d "
         "rearmed=%d retry=%d terminalized=%d skipped=%d "
-        "unresolved=%d ownerless=%d",
+        "inflight=%d unresolved=%d ownerless=%d",
         summary["client_id"], summary["execution_mode"],
         summary["rows_examined"],
         summary["watchers_rearmed"], summary["retry_rows_owned"],
         summary["terminalized"], summary["skipped_not_pending_trigger"],
+        summary["materialization_in_flight_count"],
         summary["unresolved_cleanup_failures"],
         summary["ownerless_rows_remaining"],
     )

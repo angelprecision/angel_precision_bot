@@ -1717,6 +1717,10 @@ class APOrderMonitor:
                 return (True, True, "canonical_recovery_retry_owned")
             elif _outcome == _RowOutcome.TERMINALIZED:
                 return (True, False, "canonical_recovery_terminalized")
+            elif _outcome == _RowOutcome.MATERIALIZATION_OWNED:
+                # The deferred materializer owns the attempt.  Do not report
+                # a rearm attempt or fall through to any legacy watcher path.
+                return (False, False, "canonical_recovery_materialization_owned")
             elif _outcome == _RowOutcome.SKIPPED:
                 return (False, False, "canonical_recovery_not_pending_trigger")
             else:
@@ -2000,8 +2004,61 @@ class APOrderMonitor:
             return {"attempted": False, "reason": "non_entry"}
         if order.get("broker_order_id") or order.get("submitted_ts"):
             return {"attempted": False, "reason": "already_submitted"}
-        if str(order.get("execution_mode") or self.client_mode or "").strip().lower() != str(self.client_mode or "").strip().lower():
+
+        # Execution-mode identity is a durable-only invariant.  The runner's
+        # own client_mode MUST NOT be substituted for a missing/blank/malformed
+        # durable value on the row.  Runner-context inference would let a
+        # malformed row receive the retained materialization-in-flight fence,
+        # which would be inconsistent with the classifier and ap_recovery
+        # consumers that both reject missing/malformed durable mode before
+        # classification.
+        #
+        # Route through the canonical resolver merged in #524
+        # (ap.order_state_machine._durable_execution_mode) so the retained
+        # hydration bypass accepts exactly the durable-mode shapes #524
+        # writes and accepts elsewhere in the system:
+        #   * valid orders.execution_mode column is preferred
+        #   * blank column may fall back to a valid meta.execution_mode
+        #   * malformed nonblank column fails closed
+        #   * malformed nonblank meta.execution_mode fails closed
+        #   * column/meta contradiction (live vs paper) fails closed
+        #   * both blank fails closed
+        # No independent third resolver is introduced — the SAME resolver
+        # is reused so any future evolution of the canonical semantics
+        # propagates to this consumer for free.
+        from ap.order_state_machine import _durable_execution_mode
+        durable_mode = _durable_execution_mode(order)
+        if durable_mode is None:
+            return {"attempted": False, "reason": "execution_mode_missing_or_invalid"}
+        runtime_mode = str(self.client_mode or "").strip().lower()
+        if runtime_mode not in {"live", "paper"}:
+            return {"attempted": False, "reason": "runtime_execution_mode_invalid"}
+        if durable_mode != runtime_mode:
             return {"attempted": False, "reason": "execution_mode_mismatch"}
+
+        # Hydration is a selector/write path.  It must observe the same
+        # durable active-materialization owner as restart recovery; otherwise
+        # this poll-loop consumer can reselect and overwrite an attempt while
+        # the canonical materializer is still running.
+        try:
+            from ap.pending_trigger_classifier import is_active_materialization_in_flight
+            if is_active_materialization_in_flight(order):
+                log.info(
+                    "[%s] DEFERRED_HYDRATION_SKIPPED local=%s "
+                    "reason=materialization_in_flight",
+                    self.client_id,
+                    order.get("local_order_id") or "",
+                )
+                return {"attempted": False, "reason": "materialization_in_flight"}
+        except Exception as exc:
+            log.error(
+                "[%s] DEFERRED_HYDRATION_GUARD_UNAVAILABLE local=%s exc=%s "
+                "— preserving row without selector/write",
+                self.client_id,
+                order.get("local_order_id") or "",
+                exc,
+            )
+            return {"attempted": False, "reason": "materialization_guard_unavailable"}
 
         try:
             limit_price = float(order.get("limit_price")) if order.get("limit_price") is not None else None

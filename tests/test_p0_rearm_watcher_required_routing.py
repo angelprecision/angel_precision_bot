@@ -864,6 +864,93 @@ def _build_reseed_scenario(monkeypatch, *, quote_bid=98.0, quote_ask=98.5):
     return fresh_recovery, osm, row_store, watcher, selector, broker_calls
 
 
+def test_startup_cleanup_preserves_stale_active_materializer(monkeypatch):
+    """Age-based startup cleanup must not terminalize an active owner."""
+    recovery, _core, osm, row_store, _watcher, _selector, broker_calls = (
+        _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+    )
+    row_store["row"]["created_ts"] = (
+        datetime.now(timezone.utc) - timedelta(days=4)
+    ).isoformat()
+    row_store["row"]["meta"] = _materializing_meta()
+    osm.terminalize_deferred_breach = MagicMock(return_value=True)
+
+    result = {"errors": []}
+    recovery._recover_deferred_breach_lifecycles(result)
+
+    osm.terminalize_deferred_breach.assert_not_called()
+    assert result["materialization_in_flight_rows"] == 1
+    assert broker_calls["post"] == []
+    assert broker_calls["cancel"] == []
+
+
+@pytest.mark.parametrize(
+    "mutate,label",
+    [
+        (lambda m: m.update({"materialization_owner": ""}), "owner_missing"),
+        (lambda m: m.pop("materialization_generation", None), "generation_missing"),
+        (lambda m: m.update({"materialization_generation": 0}), "generation_zero"),
+        (lambda m: m.update({"materialization_generation": -1}), "generation_negative"),
+        (lambda m: m.update({"materialization_generation": True}), "generation_bool"),
+        (lambda m: m.pop("materialization_lease_until", None), "lease_missing"),
+        (
+            lambda m: m.update({"materialization_lease_until": "not-a-date"}),
+            "lease_malformed",
+        ),
+        (
+            lambda m: m.update({"materialization_lease_until": "1999-01-01T00:00:00+00:00"}),
+            "lease_expired",
+        ),
+        (
+            lambda m: m.update({"materialization_lease_until": "2099-01-01T00:00:00"}),
+            "lease_naive",
+        ),
+        (lambda m: m.update({"materialization_in_flight": "true"}), "in_flight_string"),
+        (lambda m: m.update({"materialization_status": "QUEUED"}), "status_queued"),
+        (lambda m: m.update({"lifecycle_state": "BROKER_READY"}), "lifecycle_broker_ready"),
+        (lambda m: m.update({"materialization_outcome": "TERMINAL_ERROR"}), "terminal_outcome"),
+        (lambda m: m.update({"broker_ready": True}), "broker_ready_true"),
+        (lambda m: m.update({"submit_intent_at": "2026-08-27T12:00:00+00:00"}), "submit_intent"),
+    ],
+)
+def test_startup_cleanup_does_not_protect_partial_or_malformed_materialization(
+    monkeypatch, mutate, label
+):
+    """
+    Amendment negative-control gate for the retained ap_recovery startup guard.
+    Rows with partial/malformed/expired materialization proof must NOT enter
+    the materialization_in_flight_rows bucket — they must fall through to
+    the existing 72h aging / terminal-lifecycle authority. This is the exact
+    guarantee the amendment demands: a crashed process leaving one stale
+    RUNNING/QUEUED marker MUST NOT become immortal.
+    """
+    recovery, _core, osm, row_store, _watcher, _selector, broker_calls = (
+        _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+    )
+    # 4 days old — well past the 72h stale cutoff.  Without full canonical
+    # proof, the row must be eligible for the existing terminalize path.
+    row_store["row"]["created_ts"] = (
+        datetime.now(timezone.utc) - timedelta(days=4)
+    ).isoformat()
+    meta = _materializing_meta()
+    mutate(meta)
+    row_store["row"]["meta"] = meta
+
+    result = {"errors": []}
+    recovery._recover_deferred_breach_lifecycles(result)
+
+    # Whatever the outcome (terminalized, reconciled, or otherwise handled by
+    # pre-existing authority), the amendment forbids this row from claiming
+    # active-materializer protection.  Zero broker mutations must still hold.
+    assert result.get("materialization_in_flight_rows", 0) == 0, (
+        f"partial/malformed shape {label!r} incorrectly received "
+        "active-materializer protection — this is exactly the immortality "
+        "regression the amendment prohibits"
+    )
+    assert broker_calls["post"] == []
+    assert broker_calls["cancel"] == []
+
+
 class TestStartupFreshWatcherAdoptionSucceeds:
     """Test A — PTR creates a real watcher for a direction-reversal
     watcher-required row; durable adoption CAS succeeds; the reread

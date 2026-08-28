@@ -40,6 +40,7 @@ from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
 )
+from ap.pending_trigger_classifier import is_active_materialization_in_flight
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
 
 log = logging.getLogger("ap.recovery")
@@ -2149,6 +2150,33 @@ class APStartupRecovery:
                 )
                 continue
 
+            # Startup deferred-breach cleanup has its own age-based (72h) and
+            # terminal-lifecycle terminalization branches immediately below
+            # that PTR does not gate on this path.  Route active #524 owners
+            # through the shared canonical predicate before those branches
+            # can mutate a live materializer.  This guard is the ONE seam
+            # retained here for that exact bypass — no partial-marker
+            # protection is added anywhere else in this consumer.
+            if is_active_materialization_in_flight(_evidence_row):
+                result["materialization_in_flight_rows"] = int(
+                    result.get("materialization_in_flight_rows", 0) or 0
+                ) + 1
+                log.info(
+                    "PENDING_TRIGGER_MATERIALIZATION_IN_FLIGHT "
+                    "local_order_id=%s client_id=%s execution_mode=%s signal_id=%s "
+                    "materialization_owner=%s materialization_generation=%s "
+                    "materialization_lease_until=%s broker_submission=NOT_ATTEMPTED "
+                    "broker_cancel=NOT_ATTEMPTED caller=ap_recovery._recover_deferred_breach_lifecycles",
+                    local_order_id,
+                    order.get("client_id") or self.client_id,
+                    order.get("execution_mode") or recovery_mode,
+                    order.get("signal_id") or "",
+                    meta.get("materialization_owner") or "",
+                    meta.get("materialization_generation") or "",
+                    meta.get("materialization_lease_until") or "",
+                )
+                continue
+
             created_raw = order.get("created_ts")
             try:
                 created_at = (
@@ -3158,6 +3186,18 @@ class APStartupRecovery:
                                         _rwr_fail("skipped_unconfirmed")
                                 elif _rwr_outcome == _RWR_RowOutcome.UNRESOLVED:
                                     _rwr_fail("ptr_unresolved")
+                                elif _rwr_outcome == _RWR_RowOutcome.MATERIALIZATION_OWNED:
+                                    # The deferred materializer remains the
+                                    # sole owner.  This branch is explicitly
+                                    # read-only so it cannot fall through to
+                                    # recovery ownership or watcher handling.
+                                    recovered += 1
+                                    log.info(
+                                        "[%s] REARM_WATCHER_REQUIRED_MATERIALIZATION_IN_FLIGHT "
+                                        "local_order_id=%s — preserving active materializer owner",
+                                        self.client_id,
+                                        local_order_id,
+                                    )
                                 # TERMINALIZED or any other PTR-owned terminal
                                 # result: PTR already durably disposed the
                                 # row; no further action for this row.
@@ -3913,6 +3953,14 @@ class APStartupRecovery:
                         log.info(
                             "[%s] RECOVERY: skipped (not PENDING_TRIGGER) | local_order_id=%s",
                             self.client_id, local_order_id,
+                        )
+                    elif _outcome == _RowOutcome.MATERIALIZATION_OWNED:
+                        already_verified_owner_rows += 1
+                        log.info(
+                            "[%s] RECOVERY: materialization_in_flight_owned | "
+                            "local_order_id=%s — preserving active materializer owner",
+                            self.client_id,
+                            local_order_id,
                         )
                     else:
                         log.critical(
