@@ -2805,21 +2805,32 @@ class APOrderStateMachine:
             "execution_mode": _mode,
             "broker_ready": False,
         }
-        # P0 AMENDMENT (fix/p0-attempt-mirror-atomic-advance-20260827):
-        # ``retry_attempt``, ``breach_attempt_count``, and
-        # ``materialization_attempts`` are one durable selector-attempt identity.
-        # When a new attempt is claimed, all three mirrors MUST advance together
-        # in this same JSONB merge; the CAS predicate MUST fence each mirror at
-        # the expected prior value so a mid-lifecycle split (e.g. the exact
-        # production 2/1/1 shape) can neither be created here nor silently
-        # normalized by a subsequent claim. Malformed durable values fail closed
-        # via a strict integer regex — no lossy cast, no ``COALESCE`` default
-        # that would turn missing-and-invalid into "0".
+        # P0 AMENDMENT (fix/p0-attempt-mirror-atomic-advance-20260827,
+        # post-audit blocker §3-§5): ``retry_attempt``, ``breach_attempt_count``,
+        # and ``materialization_attempts`` are one durable selector-attempt
+        # identity. A new claim MUST advance all three mirrors together in this
+        # same JSONB merge; the CAS predicate MUST fence prior state so a
+        # mid-lifecycle split (e.g. the exact production 2/1/1 shape) can
+        # neither be created here nor silently normalized by a subsequent claim.
         #
-        # First-attempt authority: blank/absent mirror sides are acceptable when
-        # ``_prev_attempt == 0``. A positive prior value in ANY mirror requires
-        # the same positive value in every present mirror. Any bool, negative,
-        # non-integer string, or contradictory positive value fails closed.
+        # First-attempt vs positive-prior authority is deliberately asymmetric:
+        #
+        #   _prev_attempt == 0 (first attempt):
+        #       Each mirror may be JSON-absent/null OR strictly ``'^[0-9]+$'``
+        #       equal to 0. Any non-integer text (``true``, ``1.5``, ``-1``,
+        #       whitespace, garbage) fails closed.
+        #
+        #   _prev_attempt > 0 (retry): STRICT N/N/N REQUIRED.
+        #       Every mirror MUST be present, MUST regex-match ``^[0-9]+$``,
+        #       and MUST equal ``_prev_attempt``. A missing mirror in any
+        #       position (e.g. ``1/NULL/1``, ``1/1/NULL``, ``NULL/NULL/NULL``)
+        #       fails closed — caller-supplied ``retry_attempt`` MUST NOT
+        #       manufacture positive durable authority from insufficient prior
+        #       durable proof. This is the audit blocker fix.
+        #
+        # Contradictory positive states (2/1/1, 1/2/1, 3/2/2, etc.) already
+        # fail via the strict equality; there is no ``max()`` / ``min()`` /
+        # column-first / caller-memory fallback.
         _prev_attempt: int | None = None
         if retry_attempt is not None:
             # Strict int required. Reject:
@@ -2849,30 +2860,41 @@ class APOrderStateMachine:
                 _attempt_predicate = ""
                 _attempt_params: list = []
                 if _prev_attempt is not None:
-                    # All three durable mirrors are one attempt identity. Each
-                    # mirror is either absent/blank (valid legacy or first-
-                    # attempt shape) OR a strict non-negative integer equal to
-                    # the expected prior value. A mirror present as any other
-                    # shape (bool text, float, negative, non-integer string)
-                    # matches zero rows and the claim fails closed. The three
-                    # ``%s`` placeholders each bind ``_prev_attempt``.
-                    # Each mirror is either truly absent (JSON key missing or
-                    # JSON null — ``meta->>`` returns SQL NULL) OR a strict
-                    # ``^[0-9]+$`` text form equal to ``_prev_attempt``. Any
-                    # other text value — empty string, whitespace, ``true``,
-                    # ``1.0``, ``-1``, garbage — matches zero rows.
-                    _attempt_predicate = (
-                        " AND (meta->>'retry_attempt' IS NULL"
-                        "      OR (meta->>'retry_attempt' ~ '^[0-9]+$'"
-                        "          AND (meta->>'retry_attempt')::int = %s))"
-                        " AND (meta->>'breach_attempt_count' IS NULL"
-                        "      OR (meta->>'breach_attempt_count' ~ '^[0-9]+$'"
-                        "          AND (meta->>'breach_attempt_count')::int = %s))"
-                        " AND (meta->>'materialization_attempts' IS NULL"
-                        "      OR (meta->>'materialization_attempts' ~ '^[0-9]+$'"
-                        "          AND (meta->>'materialization_attempts')::int = %s))"
-                    )
-                    _attempt_params = [_prev_attempt, _prev_attempt, _prev_attempt]
+                    if _prev_attempt == 0:
+                        # First attempt: each mirror may be absent (JSON key
+                        # missing or JSON null) OR strictly "0". Any other
+                        # value — including any positive integer left over
+                        # from a bad prior state — fails closed.
+                        _mirror_first_attempt = (
+                            "(meta->>'{k}' IS NULL"
+                            " OR (meta->>'{k}' ~ '^[0-9]+$'"
+                            "     AND (meta->>'{k}')::int = 0))"
+                        )
+                        _attempt_predicate = (
+                            " AND " + _mirror_first_attempt.format(k="retry_attempt") +
+                            " AND " + _mirror_first_attempt.format(k="breach_attempt_count") +
+                            " AND " + _mirror_first_attempt.format(k="materialization_attempts")
+                        )
+                        # No params — the constant 0 is inlined into the SQL
+                        # predicate since it is invariant for this branch.
+                    else:
+                        # Positive-prior retry: STRICT canonical N/N/N. Every
+                        # mirror MUST be present, MUST be a strict integer text
+                        # form, and MUST equal _prev_attempt. Missing-mirror
+                        # shapes and split shapes both fail closed. This
+                        # forbids caller memory from creating positive durable
+                        # authority.
+                        _mirror_strict = (
+                            "(meta->>'{k}' IS NOT NULL"
+                            " AND meta->>'{k}' ~ '^[0-9]+$'"
+                            " AND (meta->>'{k}')::int = %s)"
+                        )
+                        _attempt_predicate = (
+                            " AND " + _mirror_strict.format(k="retry_attempt") +
+                            " AND " + _mirror_strict.format(k="breach_attempt_count") +
+                            " AND " + _mirror_strict.format(k="materialization_attempts")
+                        )
+                        _attempt_params = [_prev_attempt, _prev_attempt, _prev_attempt]
                 cur = c.execute(
                     """
                     UPDATE orders

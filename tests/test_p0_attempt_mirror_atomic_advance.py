@@ -348,23 +348,76 @@ def test_08_first_attempt_shape_advances_to_1(shape):
         assert _mirror_tuple(row["meta"]) == (1, 1, 1)
 
 
-def test_08b_partial_legacy_shape_with_positive_mirror_advances_if_all_agree():
-    """Legacy row: canonical retry_attempt absent but two mirrors positive & agree."""
+def test_08b_positive_prior_missing_mirror_shapes_reject():
+    """AMENDMENT §5/§8: for positive prior attempts, missing-mirror shapes
+    MUST fail closed. Caller-supplied ``retry_attempt`` cannot manufacture
+    positive durable authority from insufficient prior durable proof.
+
+    For prior attempt 1 (claim attempt 2), every combination where one or
+    more mirrors is absent while at least one is positive rejects.
+    """
+    missing_mirror_shapes = [
+        # (retry_attempt, breach_attempt_count, materialization_attempts)
+        (1,    None, 1),      # § retry present, breach absent, mat present
+        (1,    1,    None),   # § retry+breach present, mat absent
+        (1,    None, None),   # § retry alone
+        (None, 1,    None),   # § breach alone
+        (None, None, 1),      # § materialization_attempts alone
+        (None, 1,    1),      # § canonical retry_attempt absent, siblings positive
+                              #   — legacy NULL/N/N exception NOT retained
+    ]
+    for ra, bac, mats in missing_mirror_shapes:
+        with _isolated_schema() as (schema, pg_conn):
+            cid, loid, sid = "c@x.io", f"oid-{uuid.uuid4().hex}", f"sig-{uuid.uuid4().hex}"
+            seed = _base_seed(generation=1, signal_id=sid,
+                              execution_mode="paper", client_id=cid,
+                              ra=ra, bac=bac, mats=mats)
+            _seed_row(pg_conn, schema, local_order_id=loid, client_id=cid,
+                      signal_id=sid, execution_mode="paper", meta=seed)
+            with _route_osm_writes(pg_conn) as OSM:
+                ok = OSM(client_id=cid).claim_deferred_materialization(
+                    loid, signal_id=sid, **{k: v for k, v in _claim_kwargs(
+                        signal_id=sid, retry_attempt=2,
+                        new_generation=2).items() if k != "signal_id"})
+            row = _read_row(pg_conn, schema, loid)
+            m = row["meta"]
+            assert ok is False, f"expected reject for {(ra, bac, mats)}, got claim=True"
+            # Row untouched — zero mutation on reject
+            assert (m.get("retry_attempt"), m.get("breach_attempt_count"),
+                    m.get("materialization_attempts")) == (ra, bac, mats), \
+                f"mutation observed on rejected {(ra, bac, mats)}"
+            assert m["materialization_generation"] == 1
+            assert m["materialization_owner"] == ""
+            assert m["materialization_status"] == "RETRY_PENDING"
+            assert m["lifecycle_state"] == "RETRY_WAIT"
+
+
+def test_08c_positive_prior_all_null_with_positive_claim_rejects():
+    """AMENDMENT §7: caller memory alone cannot manufacture durable authority.
+
+    Durable NULL/NULL/NULL + claim attempt=2 MUST reject. This is the most
+    permissive shape the old predicate accepted and the audit blocker names
+    it explicitly.
+    """
     with _isolated_schema() as (schema, pg_conn):
         cid, loid, sid = "c@x.io", f"oid-{uuid.uuid4().hex}", f"sig-{uuid.uuid4().hex}"
-        # retry_attempt absent, siblings both = 1
-        seed = _base_seed(generation=1, signal_id=sid, execution_mode="paper",
-                          client_id=cid, bac=1, mats=1)
+        # Absent all three attempt mirrors, but a generation exists — a
+        # positive retry request against a row with no prior attempt proof.
         _seed_row(pg_conn, schema, local_order_id=loid, client_id=cid,
-                  signal_id=sid, execution_mode="paper", meta=seed)
+                  signal_id=sid, execution_mode="paper",
+                  meta=_base_seed(generation=1, signal_id=sid,
+                                  execution_mode="paper", client_id=cid))
         with _route_osm_writes(pg_conn) as OSM:
             ok = OSM(client_id=cid).claim_deferred_materialization(
                 loid, signal_id=sid, **{k: v for k, v in _claim_kwargs(
                     signal_id=sid, retry_attempt=2,
                     new_generation=2).items() if k != "signal_id"})
-        row = _read_row(pg_conn, schema, loid)
-        assert ok is True
-        assert _mirror_tuple(row["meta"]) == (2, 2, 2)
+        m = _read_row(pg_conn, schema, loid)["meta"]
+        assert ok is False
+        assert m.get("retry_attempt") is None
+        assert m.get("breach_attempt_count") is None
+        assert m.get("materialization_attempts") is None
+        assert m["materialization_generation"] == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
