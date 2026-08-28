@@ -1005,6 +1005,20 @@ class APBrokerReconciler:
             from ap.db import conn, run_with_retry
             from ap.position_manager import APPositionManager
 
+            expected_mode = _normalize_execution_mode(self.execution_mode)
+            if expected_mode is None:
+                summary.setdefault("errors", []).append(
+                    "reconciler_exit_fill_heal_execution_mode_missing"
+                )
+                summary["positions_alerted"] = int(
+                    summary.get("positions_alerted") or 0
+                ) + 1
+                log.error(
+                    "[%s] EXIT_FILLED heal blocked: expected execution_mode missing",
+                    self.client_id,
+                )
+                return
+
             def _fn():
                 with conn() as c:
                     c.execute(
@@ -1016,7 +1030,9 @@ class APBrokerReconciler:
                             o.filled_qty,
                             o.filled_ts,
                             o.broker_order_id,
-                            o.meta
+                            o.meta,
+                            p.execution_mode AS position_execution_mode,
+                            o.execution_mode AS order_execution_mode
                         FROM orders o
                         JOIN positions p ON p.id = o.position_id AND p.client_id = o.client_id
                         WHERE o.client_id = %s
@@ -1024,6 +1040,11 @@ class APBrokerReconciler:
                           AND o.status = 'EXIT_FILLED'
                           AND COALESCE(o.local_order_id, '') NOT LIKE %s
                           AND LOWER(COALESCE(o.meta->>'external_broker_order', 'false')) <> 'true'
+                          AND LOWER(TRIM(COALESCE(p.execution_mode, ''))) = %s
+                          AND (
+                              NULLIF(TRIM(COALESCE(o.execution_mode, '')), '') IS NULL
+                              OR LOWER(TRIM(o.execution_mode)) = %s
+                          )
                           AND o.fill_price IS NOT NULL
                           AND COALESCE(o.filled_qty, 0) > 0
                           AND p.avg_fill IS NOT NULL
@@ -1037,7 +1058,12 @@ class APBrokerReconciler:
                         ORDER BY o.filled_ts DESC
                         LIMIT 50
                         """,
-                        (self.client_id, "external-exit:%"),
+                        (
+                            self.client_id,
+                            "external-exit:%",
+                            expected_mode,
+                            expected_mode,
+                        ),
                     )
                     return c.fetchall()
 
@@ -1056,6 +1082,30 @@ class APBrokerReconciler:
                     and str(meta.get("external_broker_order") or "").lower() == "true"
                 )
                 if local_order_id.startswith("external-exit:") or external_marker:
+                    continue
+
+                position_mode = _normalize_execution_mode(
+                    row.get("position_execution_mode")
+                )
+                raw_order_mode = str(
+                    row.get("order_execution_mode") or ""
+                ).strip().lower()
+                if (
+                    position_mode != expected_mode
+                    or (raw_order_mode and raw_order_mode != expected_mode)
+                ):
+                    summary.setdefault("errors", []).append(
+                        "reconciler_exit_fill_execution_mode_mismatch"
+                    )
+                    log.error(
+                        "[%s] EXIT_FILLED heal blocked execution_mode mismatch | "
+                        "pos=%s position=%s order=%s expected=%s",
+                        self.client_id,
+                        row.get("position_id"),
+                        position_mode,
+                        raw_order_mode or None,
+                        expected_mode,
+                    )
                     continue
                 filtered_rows.append(row)
             rows = filtered_rows
