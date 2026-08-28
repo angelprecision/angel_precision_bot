@@ -263,6 +263,29 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             or signal.get("_ownership_quarantine")
         )
 
+    @staticmethod
+    def _is_recovery_prebreach_admission(signal: dict) -> bool:
+        """Allow recovery co-arming only before durable breach evidence."""
+        signal = signal if isinstance(signal, dict) else {}
+        if not bool(signal.get("__recovery_rearm")):
+            return False
+        if bool(
+            signal.get("__watcher_rearm_pending")
+            or signal.get("__materialization_resume")
+            or signal.get("rearm_mode")
+            or signal.get("_ownership_quarantine")
+        ):
+            return False
+        metadata = signal.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return not bool(
+            signal.get("trigger_crossed_at")
+            or signal.get("triggered_at")
+            or metadata.get("trigger_crossed_at")
+            or metadata.get("triggered_at")
+        )
+
     def _opposite_conflict_applies(self, watched, opposite) -> bool:
         if not self._is_ordinary_admission(getattr(watched, "signal", {}) or {}):
             return True
@@ -653,7 +676,10 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             ):
                 return False
             opposites = self._opposites(ticker, side, signal)
-            incoming_can_coarm = self._is_ordinary_admission(signal)
+            incoming_can_coarm = (
+                self._is_ordinary_admission(signal)
+                or self._is_recovery_prebreach_admission(signal)
+            )
             protected_opposites = [
                 item for item in opposites
                 if not incoming_can_coarm or not self._is_coarmable_opposite(item)
