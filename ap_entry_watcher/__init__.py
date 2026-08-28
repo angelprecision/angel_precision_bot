@@ -287,7 +287,11 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         )
 
     def _opposite_conflict_applies(self, watched, opposite) -> bool:
-        if not self._is_ordinary_admission(getattr(watched, "signal", {}) or {}):
+        incoming_signal = getattr(watched, "signal", {}) or {}
+        if not (
+            self._is_ordinary_admission(incoming_signal)
+            or self._is_recovery_prebreach_admission(incoming_signal)
+        ):
             return True
         incoming_key = self._ownership_key(watched)
         opposite_key = self._ownership_key(opposite)
