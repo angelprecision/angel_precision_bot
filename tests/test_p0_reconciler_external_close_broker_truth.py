@@ -430,7 +430,8 @@ def test_reconciler_healer_skips_adopted_external_exit_rows(monkeypatch):
     query, params = executed_sql[0]
     query = query.lower()
     assert "not like %s" in query
-    assert params == (CLIENT, "external-exit:%")
+    assert "p.execution_mode" in query
+    assert params == (CLIENT, "external-exit:%", "live", "live")
     assert "o.meta" in query
     assert "external_broker_order" in query
 
