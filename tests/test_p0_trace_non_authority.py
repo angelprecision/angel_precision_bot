@@ -325,6 +325,14 @@ def test_real_fill_monitor_reaches_canonical_handoff_helpers_after_trace(monkeyp
                 self.position_row["broker_order_id"] = broker_order_id
                 return
 
+            if normalized.startswith("UPDATE orders SET meta=COALESCE(meta"):
+                _, local_order_id, client_id, contract, execution_mode = params
+                assert local_order_id == self.order_row["local_order_id"]
+                assert client_id == self.order_row["client_id"]
+                assert contract == self.order_row["contract"]
+                assert execution_mode == self.order_row["execution_mode"]
+                return type("Cursor", (), {"rowcount": 1})()
+
             if normalized.startswith("UPDATE orders SET position_id=%s,"):
                 position_id, client_id, local_order_id = params
                 assert client_id == self.order_row["client_id"]
