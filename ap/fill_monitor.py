@@ -1670,24 +1670,29 @@ def _place_standing_stop_best_effort(
     qty: int,
     entry_price: float,
 ):
-    """Optional secondary broker-side stop, after local position persistence."""
-    def _persist_identity(stop_id, stop_status, source):
+    """Place the optional stop only after a durable pending marker succeeds."""
+    protective_created_at = now_utc_iso()
+
+    def _persist_identity(
+        stop_id, stop_status, source, *, ownership_state: Optional[str] = None,
+    ) -> bool:
         concrete_id = str(stop_id or "").strip()
         if concrete_id in {"", "?", "N/A", "UNKNOWN", "0"}:
             concrete_id = ""
         normalized_status = str(stop_status or "").strip().lower()
-        if concrete_id and normalized_status in {
-            "ok", "accepted", "ack", "new", "open", "pending", "submitted", "working",
-        }:
-            ownership_state = "ACTIVE" if normalized_status in {"new", "open", "pending", "working"} else "SUBMITTED"
-        else:
-            ownership_state = "OUTCOME_UNPROVEN"
+        if ownership_state is None:
+            if concrete_id and normalized_status in {
+                "ok", "accepted", "ack", "new", "open", "pending", "submitted", "working",
+            }:
+                ownership_state = "ACTIVE" if normalized_status in {"new", "open", "pending", "working"} else "SUBMITTED"
+            else:
+                ownership_state = "OUTCOME_UNPROVEN"
         payload = {
-            "protective_order_state": ownership_state,
+            "protective_order_state": str(ownership_state).strip().upper(),
             "protective_broker_order_id": concrete_id or None,
             "protective_contract": str(order.get("contract") or ""),
             "protective_qty": int(qty),
-            "protective_created_at": now_utc_iso(),
+            "protective_created_at": protective_created_at,
             "protective_status": normalized_status or "unknown",
             "protective_source": "standing_stop",
             "protective_transport": source,
@@ -1712,9 +1717,12 @@ def _place_standing_stop_best_effort(
                     )
                     return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
             if run_with_retry(_write) <= 0:
-                log.warning("[%s] Standing stop identity persistence missed exact ENTRY row", order.get("symbol", "?"))
+                log.critical("[%s] Standing stop identity persistence missed exact ENTRY row", order.get("symbol", "?"))
+                return False
+            return True
         except Exception as exc:
-            log.warning("[%s] Standing stop identity persistence failed: %s", order.get("symbol", "?"), exc)
+            log.critical("[%s] Standing stop identity persistence failed: %s", order.get("symbol", "?"), exc)
+            return False
 
     try:
         if qty <= 0 or entry_price <= 0:
@@ -1724,9 +1732,37 @@ def _place_standing_stop_best_effort(
         stop_px = round(entry_price * (1 - stop_pct), 2)
         contract = order.get("contract", "")
         ticker = (order.get("symbol") or "").upper()
+        stop_helper = getattr(broker, "place_stop_order", None)
+        base_url = (
+            getattr(broker, "base_url", None)
+            or getattr(getattr(broker, "cfg", None), "base_url", None)
+            or getattr(broker, "_base_url", None)
+        )
+        account_id = (
+            getattr(broker, "account_id", None)
+            or getattr(getattr(broker, "cfg", None), "account_id", None)
+            or getattr(broker, "_account_id", None)
+        )
+        has_rest_stop = bool(base_url and account_id and getattr(broker, "session", None))
 
-        if hasattr(broker, "place_stop_order"):
-            stop_resp = broker.place_stop_order(symbol=contract, qty=qty, stop_price=stop_px)
+        if not callable(stop_helper) and not has_rest_stop:
+            log.warning("[%s] Standing stop skipped — broker stop interface unavailable", ticker)
+            return
+
+        # A successful broker stop POST without a durable marker creates a
+        # restart window in which list_orders() may omit the GTC stop and the
+        # exit path cannot distinguish "never placed" from "still live".
+        if not _persist_identity(
+            None,
+            "pending",
+            "pre_submit",
+            ownership_state="PLACEMENT_PENDING",
+        ):
+            log.critical("[%s] Standing stop skipped — pending identity was not durable", ticker)
+            return
+
+        if callable(stop_helper):
+            stop_resp = stop_helper(symbol=contract, qty=qty, stop_price=stop_px)
             stop_id = None
             stop_stat = "unknown"
             if isinstance(stop_resp, dict):
@@ -1751,21 +1787,6 @@ def _place_standing_stop_best_effort(
             )
             return
 
-        base_url = (
-            getattr(broker, "base_url", None)
-            or getattr(getattr(broker, "cfg", None), "base_url", None)
-            or getattr(broker, "_base_url", None)
-        )
-        account_id = (
-            getattr(broker, "account_id", None)
-            or getattr(getattr(broker, "cfg", None), "account_id", None)
-            or getattr(broker, "_account_id", None)
-        )
-
-        if not base_url or not account_id or not getattr(broker, "session", None):
-            log.warning("[%s] Standing stop skipped — broker stop interface unavailable", ticker)
-            return
-
         resp = broker.session.post(
             f"{base_url}/v1/accounts/{account_id}/orders",
             data={
@@ -1783,8 +1804,8 @@ def _place_standing_stop_best_effort(
 
         if resp.status_code < 300:
             stop_data = (resp.json() or {}).get("order", {}) or {}
-            stop_id = stop_data.get("id", "?")
-            stop_stat = stop_data.get("status", "unknown")
+            stop_id = stop_data.get("id") or stop_data.get("order_id") or stop_data.get("broker_order_id")
+            stop_stat = stop_data.get("status") or stop_data.get("state") or "unknown"
             _persist_identity(stop_id, stop_stat, "rest")
             log.info(
                 "[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",

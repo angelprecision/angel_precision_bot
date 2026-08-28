@@ -147,6 +147,9 @@ def _durable_protective_order_id_for_position(
         protective_contract = str(protective.get("protective_contract") or "")
         protective_mode = str(protective.get("execution_mode") or "").strip().lower()
         protective_source = str(protective.get("protective_source") or "").strip().lower()
+        protective_state = str(
+            protective.get("protective_order_state") or ""
+        ).strip().upper()
         if (
             protective_client and protective_client != str(getattr(osm, "client_id", None) or "")
             or protective_contract and protective_contract != str(contract or "")
@@ -154,9 +157,13 @@ def _durable_protective_order_id_for_position(
             or protective_source and protective_source != "standing_stop"
         ):
             return None, "durable_protective_identity_metadata_mismatch"
+        if protective_state and protective_state not in {
+            "ACTIVE", "SUBMITTED", "OUTCOME_UNPROVEN", "PLACEMENT_PENDING",
+        }:
+            return None, "durable_protective_identity_state_unproven"
         candidate = str(protective.get("protective_broker_order_id") or "").strip()
         if candidate.upper() in {"", "?", "N/A", "UNKNOWN", "NULL", "NONE", "0"}:
-            continue
+            return None, "durable_protective_identity_unproven"
         concrete_ids.add(candidate)
 
     if len(concrete_ids) > 1:

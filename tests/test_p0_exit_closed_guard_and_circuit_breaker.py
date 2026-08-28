@@ -547,6 +547,51 @@ def test_exit_circuit_breaker_trips_at_threshold_for_error_broker_rejects(monkey
     assert mock_broker.session.post.call_count == 0
 
 
+def test_circuit_breaker_override_does_not_bypass_unresolved_protective_stop(monkeypatch, mock_broker):
+    """Broker-open truth may override the rejection gate, never takeover safety."""
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+    )
+    contract = "NOW260828P00122000"
+    stop = {
+        "id": "143387714",
+        "status": "open",
+        "class": "option",
+        "type": "stop",
+        "side": "sell_to_close",
+        "option_symbol": contract,
+        "quantity": 1,
+        "exec_quantity": 0,
+        "duration": "gtc",
+        "account_id": "ACC123",
+    }
+    mock_broker.list_positions.return_value = [
+        {"symbol": contract, "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+    ]
+    mock_broker.list_orders.return_value = [stop]
+    mock_broker.cancel_order.return_value = {"ok": True, "status": "canceled"}
+    mock_broker.get_order.return_value = dict(stop)
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-breaker-protective",
+        contract=contract,
+        symbol="NOW",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN"
+    mock_broker.cancel_order.assert_called_once_with("143387714")
+    assert mock_broker.session.post.call_count == 0
+
+
 def test_exit_circuit_breaker_does_not_trip_below_threshold(monkeypatch, mock_broker):
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
     _patch_db(

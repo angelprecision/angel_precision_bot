@@ -14,6 +14,7 @@ from ap.exit_safety import resolve_protective_exit_takeover  # noqa: E402
 from ap.exit_safety import resolve_exit_broker_truth  # noqa: E402
 from ap.brokers.tradier import TradierBroker, TradierConfig  # noqa: E402
 from ap import fill_monitor as fill_monitor_mod  # noqa: E402
+from ap.order_state_machine import _durable_protective_order_id_for_position  # noqa: E402
 
 
 CLIENT = "jasoncosby1@gmail.com"
@@ -142,6 +143,21 @@ def test_stop_fills_during_cancel_allows_only_proven_residual():
     assert broker.cancel_calls == ["143387714"]
 
 
+def test_partial_protective_fill_before_cancel_requires_total_position_coherence():
+    broker = _Broker(
+        positions=[[_position(2)], [_position(2)]],
+        orders=[[_stop(qty=2, executed=1)], []],
+        terminal=_terminal(status="canceled", qty=2, executed=1),
+    )
+    result = _run(broker, qty=2)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_POSITION_UNPROVEN"
+    assert result["audit"]["reason"] == "position_snapshot_stale_after_order_fill"
+    assert result["audit"]["observed_protective_execution_total"] == 1
+    assert broker.cancel_calls == ["143387714"]
+
+
 def test_whole_stop_fill_with_stale_position_reread_posts_zero():
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
@@ -264,6 +280,28 @@ def test_conflicting_status_aliases_hold_before_cancel():
     assert result["allowed"] is False
     assert result["reason"] == "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS"
     assert result["audit"]["reason"] == "conflicting_status"
+    assert broker.cancel_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        ("order_id", "different-order", "order_id_conflict"),
+        ("qty", 2, "quantity_conflict"),
+        ("order_type", "market", "order_type_conflict"),
+        ("class", "equity", "order_class_mismatch"),
+        ("order_class", "equity", "order_class_conflict"),
+    ],
+)
+def test_exact_order_shape_conflicts_hold_before_cancel(field, value, expected_reason):
+    order = _stop()
+    order[field] = value
+    broker = _Broker(positions=[[_position(1)]], orders=[order])
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS"
+    assert result["audit"]["reason"] == expected_reason
     assert broker.cancel_calls == []
 
 
@@ -391,15 +429,18 @@ def test_historical_terminal_sells_without_fill_do_not_block_replacement():
     assert broker.cancel_calls == []
 
 
-def test_identical_historical_filled_order_in_both_snapshots_uses_current_position_once():
+def test_identical_terminal_filled_order_in_both_snapshots_holds_on_stale_position():
     historical = _stop("history-x", status="filled", executed=1)
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
         orders=[[historical], [dict(historical)]],
     )
     result = _run(broker)
-    assert result["allowed"] is True
-    assert result["replacement_qty"] == 1
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_POSITION_UNPROVEN"
+    assert result["audit"]["reason"] == "position_snapshot_stale_after_order_fill"
+    assert result["audit"]["observed_terminal_execution_total"] == 1
     assert broker.cancel_calls == []
 
 
@@ -943,10 +984,88 @@ def test_standing_stop_identity_is_durable_only_with_concrete_broker_id(
         entry_price=1.54,
     )
 
-    assert len(writes) == 1
-    payload = __import__("json").loads(writes[0][1][0])["protective_order"]
+    assert len(writes) == 2
+    pending = __import__("json").loads(writes[0][1][0])["protective_order"]
+    assert pending["protective_order_state"] == "PLACEMENT_PENDING"
+    assert pending["protective_broker_order_id"] is None
+    payload = __import__("json").loads(writes[-1][1][0])["protective_order"]
     assert payload["protective_order_state"] == expected_state
     assert payload["protective_broker_order_id"] == expected_id
     assert payload["client_id"] == CLIENT
     assert payload["execution_mode"] == "live"
     assert payload["protective_contract"] == CONTRACT
+
+
+def test_standing_stop_is_not_posted_when_pending_identity_persistence_misses(monkeypatch):
+    writes = []
+    placement_calls = []
+
+    class _Cursor:
+        rowcount = 0
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params):
+            writes.append((sql, params))
+            return _Cursor()
+
+    class _StopBroker:
+        def place_stop_order(self, **kwargs):
+            placement_calls.append(kwargs)
+            return {"id": "must-not-be-placed", "status": "open"}
+
+    monkeypatch.setattr(fill_monitor_mod, "conn", lambda: _Conn())
+    monkeypatch.setattr(fill_monitor_mod, "run_with_retry", lambda fn, *a, **k: fn())
+    fill_monitor_mod._place_standing_stop_best_effort(
+        broker=_StopBroker(),
+        order={
+            "local_order_id": "entry-now-1",
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "contract": CONTRACT,
+            "symbol": "NOW",
+        },
+        qty=1,
+        entry_price=1.54,
+    )
+
+    assert len(writes) == 1
+    assert placement_calls == []
+
+
+def test_unproven_standing_stop_marker_blocks_durable_identity_lookup():
+    class _OSM:
+        client_id = CLIENT
+
+        def get_orders_for_position(self, position_id):
+            return [
+                {
+                    "position_id": position_id,
+                    "kind": "ENTRY",
+                    "client_id": CLIENT,
+                    "contract": CONTRACT,
+                    "execution_mode": "live",
+                    "meta": {
+                        "protective_order": {
+                            "protective_order_state": "OUTCOME_UNPROVEN",
+                            "protective_broker_order_id": None,
+                            "protective_contract": CONTRACT,
+                            "protective_source": "standing_stop",
+                            "execution_mode": "live",
+                            "client_id": CLIENT,
+                        }
+                    },
+                }
+            ]
+
+    assert _durable_protective_order_id_for_position(
+        _OSM(),
+        position_id="position-now-live-1",
+        contract=CONTRACT,
+        execution_mode="live",
+    ) == (None, "durable_protective_identity_unproven")

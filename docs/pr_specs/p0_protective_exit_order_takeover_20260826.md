@@ -1,7 +1,7 @@
 # P0 — Protective broker sell takeover before canonical EXIT submit
 
 Date: 2026-08-26
-Base: `main@de87e3b0460e8908bc271590d425cc1fcfb9ae3d`
+Base: `main@7a0a2f435be33531d03db67653db91426c3415c6`
 Status: **SPEC FIRST / HARD HOLD / IMPLEMENTATION REQUIRED / DO NOT MERGE OR DEPLOY**
 
 ## Incident
@@ -334,8 +334,16 @@ client_id
 
 Rules:
 
+- persist a durable `PLACEMENT_PENDING` marker before any standing-stop broker POST;
+  if that write misses or errors, do not place the stop;
+- if the post-identity update fails, retain the pending marker as
+  `OUTCOME_UNPROVEN` so restart/recovery holds rather than inferring that no
+  stop exists;
 - concrete broker order id required before state may be `SUBMITTED/ACTIVE`;
 - missing id or response ambiguity = `OUTCOME_UNPROVEN`;
+- cumulative terminal execution is a coherence fence, including fills already
+  present in the first order snapshot; final position truth remains the only
+  replacement-size authority;
 - never automatically resubmit a stop from an ambiguous prior attempt;
 - recovery must not replay historical broker mutation merely because an old ENTRY row is FILLED;
 - terminal close must clear/terminalize protective ownership diagnostics without fabricating broker chronology.

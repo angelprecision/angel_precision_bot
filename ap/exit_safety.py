@@ -344,6 +344,74 @@ def _order_status(raw: dict[str, Any]) -> tuple[str | None, str | None]:
     return normalized, None
 
 
+def _order_id_evidence(raw: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return one concrete broker ID and reject conflicting aliases."""
+    observed_ids: list[str] = []
+    for key in ("id", "order_id"):
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, bool):
+            return None, "order_id_unproven"
+        normalized = str(value).strip()
+        if not normalized:
+            continue
+        observed_ids.append(normalized)
+    if not observed_ids:
+        return None, "order_id_unproven"
+    if len(set(observed_ids)) != 1:
+        return None, "order_id_conflict"
+    if observed_ids[0].upper() in {"?", "N/A", "UNKNOWN", "NULL", "NONE", "0"}:
+        return None, "order_id_unproven"
+    return observed_ids[0], None
+
+
+def _order_type_evidence(
+    raw: dict[str, Any], *, required: bool = True,
+) -> tuple[str | None, str | None]:
+    """Return one canonical order type and reject conflicting aliases."""
+    type_values = [
+        _normalize_text(raw[key]).replace(" ", "_")
+        for key in ("type", "order_type")
+        if raw.get(key) not in (None, "")
+    ]
+    if not type_values:
+        return (None, "order_type_unproven") if required else (None, None)
+    if len(set(type_values)) != 1:
+        return None, "order_type_conflict"
+    return type_values[0], None
+
+
+def _order_class_issue(raw: dict[str, Any], *, required: bool = True) -> str | None:
+    """Require one unambiguous option-order class for an exact OCC row."""
+    class_values = [
+        _normalize_text(raw[key]).replace(" ", "_")
+        for key in ("class", "order_class")
+        if raw.get(key) not in (None, "")
+    ]
+    if not class_values:
+        return "order_class_unproven" if required else None
+    if len(set(class_values)) != 1:
+        return "order_class_conflict"
+    if class_values[0] != "option":
+        return "order_class_mismatch"
+    return None
+
+
+def _order_account_issue(raw: dict[str, Any], account: str) -> str | None:
+    """Reject contradictory or mismatched account aliases when supplied."""
+    account_values = [
+        _normalize_text(raw[key])
+        for key in ("account_id", "account", "account_number")
+        if raw.get(key) not in (None, "")
+    ]
+    if len(set(account_values)) > 1:
+        return "order_account_conflict"
+    if account and account_values and account_values[0] != account:
+        return "order_account_mismatch"
+    return None
+
+
 def _strict_nonnegative_order_int(value: Any) -> Optional[int]:
     if isinstance(value, bool) or value in (None, ""):
         return None
@@ -364,11 +432,20 @@ def _strict_positive_order_int(value: Any) -> Optional[int]:
 def _order_quantity_evidence(
     raw: dict[str, Any], *, fallback_qty: Optional[int] = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    quantity_key = "quantity" if "quantity" in raw else "qty" if "qty" in raw else None
-    if quantity_key is None:
+    quantity_values: list[int] = []
+    for key in ("quantity", "qty"):
+        if key not in raw:
+            continue
+        parsed = _strict_positive_order_int(raw.get(key))
+        if parsed is None:
+            return None, "quantity_unproven"
+        quantity_values.append(parsed)
+    if not quantity_values:
         qty = fallback_qty
     else:
-        qty = _strict_positive_order_int(raw.get(quantity_key))
+        if len(set(quantity_values)) != 1:
+            return None, "quantity_conflict"
+        qty = quantity_values[0]
     if qty is None:
         return None, "quantity_unproven"
 
@@ -401,6 +478,48 @@ def _order_quantity_evidence(
     }, None
 
 
+def _exact_order_snapshot_row_issue(
+    raw: Any, *, target_contract: str, account: str = "",
+    require_class: bool = False, require_type: bool = True,
+) -> str | None:
+    """Validate non-contradictory proof for an exact OCC order row."""
+    if not isinstance(raw, dict):
+        return "row_malformed"
+    if _exact_order_contract(raw) != target_contract:
+        return None
+
+    _, id_issue = _order_id_evidence(raw)
+    if id_issue:
+        return id_issue
+    status, status_issue = _order_status(raw)
+    if status_issue:
+        return status_issue
+    if status not in (_ACTIVE_BROKER_SELL_STATUSES | _TERMINAL_BROKER_ORDER_STATUSES):
+        return "unknown_status"
+    account_issue = _order_account_issue(raw, account)
+    # A row explicitly belonging to another account is unrelated inventory,
+    # not ambiguous truth for this account.  The takeover inventory will skip
+    # it after this account-boundary check; conflicting aliases still hold.
+    if account_issue == "order_account_mismatch":
+        return None
+    if account_issue:
+        return account_issue
+    class_issue = _order_class_issue(raw, required=require_class)
+    if class_issue:
+        return class_issue
+    if not _normalize_text(raw.get("side")):
+        return "side_unproven"
+    _, quantity_issue = _order_quantity_evidence(raw)
+    if quantity_issue:
+        return quantity_issue
+    _, type_issue = _order_type_evidence(raw, required=require_type)
+    if type_issue:
+        return type_issue
+    if "duration" in raw and not _normalize_text(raw.get("duration")):
+        return "duration_unproven"
+    return None
+
+
 def _terminal_order_identity_issue(
     raw: Any,
     *,
@@ -412,16 +531,12 @@ def _terminal_order_identity_issue(
     if not isinstance(raw, dict):
         return "get_order_malformed"
 
-    observed_ids = [
-        str(raw[key]).strip()
-        for key in ("id", "order_id")
-        if raw.get(key) not in (None, "")
-    ]
-    if not observed_ids:
+    observed_id, id_issue = _order_id_evidence(raw)
+    if id_issue == "order_id_unproven":
         return "terminal_order_id_unproven"
-    if len(set(observed_ids)) != 1:
+    if id_issue == "order_id_conflict":
         return "terminal_order_id_conflict"
-    if observed_ids[0] != str(expected_broker_order_id or "").strip():
+    if observed_id != str(expected_broker_order_id or "").strip():
         return "terminal_order_id_mismatch"
 
     explicit_contracts = []
@@ -448,24 +563,25 @@ def _terminal_order_identity_issue(
     if _normalize_text(raw.get("side")) != "sell_to_close":
         return "terminal_order_side_mismatch"
 
-    terminal_account = _extract_position_account_id(raw)
-    if terminal_account and account and terminal_account != account:
+    account_issue = _order_account_issue(raw, account)
+    if account_issue == "order_account_conflict":
+        return "terminal_order_account_conflict"
+    if account_issue == "order_account_mismatch":
         return "terminal_order_account_mismatch"
 
-    type_values = [
-        _normalize_text(raw[key]).replace(" ", "_")
-        for key in ("type", "order_type")
-        if raw.get(key) not in (None, "")
-    ]
-    if type_values and (
-        len(set(type_values)) != 1 or type_values[0] not in _PROTECTIVE_ORDER_TYPES
-    ):
+    class_issue = _order_class_issue(raw, required=False)
+    if class_issue:
+        return f"terminal_{class_issue}"
+    order_type, type_issue = _order_type_evidence(raw, required=False)
+    if type_issue:
+        return f"terminal_{type_issue}"
+    if order_type and order_type not in _PROTECTIVE_ORDER_TYPES:
         return "terminal_order_type_mismatch"
     return None
 
 
 def _order_snapshot_row_issue(
-    raw: Any, *, target_contract: str,
+    raw: Any, *, target_contract: str, account: str = "",
 ) -> str | None:
     """Reject rows that cannot safely participate in an account order snapshot."""
     if not isinstance(raw, dict):
@@ -495,15 +611,15 @@ def _order_snapshot_row_issue(
         return "conflicting_contract"
 
     # Exact-contract rows are validated by the takeover inventory so existing
-    # ambiguity classifications (status/quantity/side) remain specific. Rows
-    # that cannot identify a contract at all are malformed at the snapshot
-    # boundary and must not disappear as unrelated inventory.
+    # ambiguity classifications remain specific. Rows that cannot identify a
+    # contract at all are malformed at the snapshot boundary and must not
+    # disappear as unrelated inventory.
     if _exact_order_contract(raw) == target_contract:
         return None
 
-    broker_order_id = str(raw.get("id") or raw.get("order_id") or "").strip()
-    if not broker_order_id:
-        return "order_id_unproven"
+    _, id_issue = _order_id_evidence(raw)
+    if id_issue:
+        return id_issue
     status, status_issue = _order_status(raw)
     if status_issue:
         return status_issue
@@ -511,38 +627,21 @@ def _order_snapshot_row_issue(
         return "unknown_status"
     if not _normalize_text(raw.get("side")):
         return "side_unproven"
-    quantity_key = "quantity" if "quantity" in raw else "qty" if "qty" in raw else None
-    if quantity_key is None:
-        return "quantity_unproven"
-    quantity = raw.get(quantity_key)
-    if isinstance(quantity, bool) or quantity in (None, ""):
-        return "quantity_unproven"
-    try:
-        quantity_float = float(quantity)
-    except (TypeError, ValueError):
-        return "quantity_unproven"
-    if not math.isfinite(quantity_float) or quantity_float <= 0:
-        return "quantity_unproven"
-    for key in ("exec_quantity", "remaining_quantity"):
-        if key not in raw:
-            continue
-        value = raw.get(key)
-        if isinstance(value, bool) or value in (None, ""):
-            return "quantity_unproven"
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return "quantity_unproven"
-        if not math.isfinite(parsed) or parsed < 0:
-            return "quantity_unproven"
+    _, quantity_issue = _order_quantity_evidence(raw)
+    if quantity_issue:
+        return quantity_issue
     return None
 
 
-def _order_snapshot_issue(rows: Any, *, target_contract: str) -> str | None:
+def _order_snapshot_issue(
+    rows: Any, *, target_contract: str, account: str = "",
+) -> str | None:
     if not isinstance(rows, list):
         return "snapshot_malformed"
     for row in rows:
-        issue = _order_snapshot_row_issue(row, target_contract=target_contract)
+        issue = _order_snapshot_row_issue(
+            row, target_contract=target_contract, account=account,
+        )
         if issue:
             return issue
     return None
@@ -618,7 +717,7 @@ def _merge_terminal_order_history(
             raw = order.get("raw") if isinstance(order, dict) else None
             raw = raw if isinstance(raw, dict) else {}
             broker_order_id = str(
-                raw.get("id") or raw.get("order_id") or ""
+                order.get("broker_order_id") if isinstance(order, dict) else ""
             ).strip()
             if not broker_order_id:
                 return {}, {}, "order_id_unproven"
@@ -712,7 +811,9 @@ def resolve_protective_exit_takeover(
     if not isinstance(orders, list) or any(not isinstance(row, dict) for row in orders):
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_malformed")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
-    snapshot_issue = _order_snapshot_issue(orders, target_contract=exact_contract)
+    snapshot_issue = _order_snapshot_issue(
+        orders, target_contract=exact_contract, account=account,
+    )
     if snapshot_issue:
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason=snapshot_issue)
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
@@ -740,16 +841,31 @@ def resolve_protective_exit_takeover(
         if not isinstance(durable_raw, dict):
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_get_order_malformed")
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
-        observed_id = str(durable_raw.get("id") or durable_raw.get("order_id") or "").strip()
+        durable_shape_issue = _exact_order_snapshot_row_issue(
+            durable_raw, target_contract=exact_contract, account=account,
+        )
+        if durable_shape_issue:
+            audit.update(
+                event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
+                reason=f"durable_protective_{durable_shape_issue}",
+            )
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
+        observed_id, observed_id_issue = _order_id_evidence(durable_raw)
+        if observed_id_issue:
+            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason=f"durable_protective_{observed_id_issue}")
+            return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
         if observed_id != durable_id:
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_id_mismatch")
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
         if _exact_order_contract(durable_raw) != exact_contract:
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_contract_mismatch")
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
-        durable_account = _normalize_text(durable_raw.get("account_id") or durable_raw.get("account"))
-        if durable_account and account and durable_account != account:
-            audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="durable_protective_account_mismatch")
+        durable_account_issue = _order_account_issue(durable_raw, account)
+        if durable_account_issue:
+            audit.update(
+                event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
+                reason=f"durable_protective_{durable_account_issue}",
+            )
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_IDENTITY_UNPROVEN", "audit": audit}
         durable_status, durable_status_issue = _order_status(durable_raw)
         durable_evidence, durable_quantity_issue = _order_quantity_evidence(durable_raw)
@@ -821,12 +937,22 @@ def resolve_protective_exit_takeover(
         for row in rows:
             if _exact_order_contract(row) != exact_contract:
                 continue
-            row_account = _normalize_text(row.get("account_id") or row.get("account"))
+            row_shape_issue = _exact_order_snapshot_row_issue(
+                row, target_contract=exact_contract, account=account,
+            )
+            if row_shape_issue:
+                return [], [], row_shape_issue
+            row_accounts = [
+                _normalize_text(row[key])
+                for key in ("account_id", "account", "account_number")
+                if row.get(key) not in (None, "")
+            ]
+            row_account = row_accounts[0] if row_accounts else ""
             if row_account and account and row_account != account:
                 continue
-            broker_order_id = str(row.get("id") or row.get("order_id") or "").strip()
-            if not broker_order_id:
-                return [], [], "order_id_unproven"
+            broker_order_id, broker_order_id_issue = _order_id_evidence(row)
+            if broker_order_id_issue or not broker_order_id:
+                return [], [], broker_order_id_issue or "order_id_unproven"
             status, status_issue = _order_status(row)
             if status_issue:
                 return [], [], status_issue
@@ -838,6 +964,9 @@ def resolve_protective_exit_takeover(
                 return [], [], "side_unproven"
             if side != "sell_to_close":
                 continue
+            order_type, order_type_issue = _order_type_evidence(row)
+            if order_type_issue or not order_type:
+                return [], [], order_type_issue or "order_type_unproven"
             if status in {"partially_filled", "partial_fill"} and evidence["remaining"] == 0:
                 status = "filled"
             if status in _TERMINAL_BROKER_ORDER_STATUSES:
@@ -856,11 +985,13 @@ def resolve_protective_exit_takeover(
                 terminal_orders.append(
                     {
                         "raw": row,
+                        "broker_order_id": broker_order_id,
                         "status": status,
                         "qty": evidence["qty"],
                         "executed": evidence["executed"],
                         "remaining": evidence["remaining"],
                         "consumed": int(consumed),
+                        "order_type": order_type,
                     }
                 )
                 continue
@@ -871,10 +1002,12 @@ def resolve_protective_exit_takeover(
             active.append(
                 {
                     "raw": row,
+                    "broker_order_id": broker_order_id,
                     "status": status,
                     "qty": evidence["qty"],
                     "executed": evidence["executed"],
                     "remaining": evidence["remaining"],
+                    "order_type": order_type,
                 }
             )
         return active, terminal_orders, None
@@ -898,7 +1031,7 @@ def resolve_protective_exit_takeover(
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_list_orders_malformed")
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
         post_snapshot_issue = _order_snapshot_issue(
-            post_orders, target_contract=exact_contract,
+            post_orders, target_contract=exact_contract, account=account,
         )
         if post_snapshot_issue:
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason=post_snapshot_issue)
@@ -936,10 +1069,15 @@ def resolve_protective_exit_takeover(
             max(int(delta), 0) for delta in execution_deltas.values()
         )
         audit["observed_terminal_execution_delta"] = observed_execution_delta
+        terminal_consumed_qty = sum(
+            max(int(order.get("consumed") or 0), 0)
+            for order in terminal_by_id.values()
+        )
+        audit["observed_terminal_execution_total"] = terminal_consumed_qty
 
         # This is deliberately the last broker quantity observation in the
-        # no-active path.  Historical executions are used only as a coherence
-        # fence; they are never subtracted from this fresh position quantity.
+        # no-active path.  Cumulative terminal execution is a coherence fence;
+        # the final broker position remains the sole replacement-size authority.
         final_position = resolve_exit_broker_truth(
             broker=broker, client_id=client_id, contract=contract,
         )
@@ -948,7 +1086,10 @@ def resolve_protective_exit_takeover(
         if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
             audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_order_position_unproven")
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
-        max_coherent_qty = max(initial_qty - observed_execution_delta, 0)
+        max_coherent_qty = max(
+            initial_qty - max(observed_execution_delta, terminal_consumed_qty),
+            0,
+        )
         if final_qty > max_coherent_qty:
             audit.update(
                 event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
@@ -974,8 +1115,8 @@ def resolve_protective_exit_takeover(
 
     candidate = active_sells[0]
     raw = candidate["raw"]
-    order_type = _normalize_text(raw.get("type") or raw.get("order_type")).replace(" ", "_")
-    broker_order_id = str(raw.get("id") or raw.get("order_id") or "").strip()
+    order_type = str(candidate.get("order_type") or "").strip()
+    broker_order_id = str(candidate.get("broker_order_id") or "").strip()
     tag = str(raw.get("tag") or "").strip()
     canonical_tag = canonical_broker_submit_key(local_order_id)
     if tag and tag in {str(local_order_id or "").strip(), canonical_tag}:
@@ -1043,7 +1184,7 @@ def resolve_protective_exit_takeover(
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_list_orders_malformed")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_MALFORMED", "audit": audit}
     post_snapshot_issue = _order_snapshot_issue(
-        post_orders, target_contract=exact_contract,
+        post_orders, target_contract=exact_contract, account=account,
     )
     if post_snapshot_issue:
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason=post_snapshot_issue)
@@ -1059,11 +1200,7 @@ def resolve_protective_exit_takeover(
     protective_broker_order_id = broker_order_id
     protective_post_terminals: list[dict[str, Any]] = []
     for post_terminal in post_terminal_orders:
-        post_id = str(
-            post_terminal["raw"].get("id")
-            or post_terminal["raw"].get("order_id")
-            or ""
-        ).strip()
+        post_id = str(post_terminal.get("broker_order_id") or "").strip()
         if post_id == protective_broker_order_id:
             protective_post_terminals.append(post_terminal)
         elif post_terminal["consumed"] > 0:
@@ -1085,10 +1222,13 @@ def resolve_protective_exit_takeover(
             "audit": audit,
         }
 
+    candidate_executed = int(candidate.get("executed") or 0)
     observed_protective_execution_delta = int(consumed_qty)
+    observed_protective_execution_total = max(
+        candidate_executed + int(consumed_qty), candidate_executed,
+    )
     if protective_post_terminals:
         post_consumed_qty = int(protective_post_terminals[0]["consumed"])
-        candidate_executed = int(candidate.get("executed") or 0)
         if int(protective_post_terminals[0]["qty"]) != int(candidate["qty"]):
             audit.update(
                 event="EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS",
@@ -1128,8 +1268,12 @@ def resolve_protective_exit_takeover(
                 "audit": audit,
             }
         observed_protective_execution_delta = post_execution_delta
+        observed_protective_execution_total = max(
+            post_consumed_qty, observed_protective_execution_total,
+        )
         audit["protective_post_terminal_consumed_qty"] = post_consumed_qty
     audit["observed_protective_execution_delta"] = observed_protective_execution_delta
+    audit["observed_protective_execution_total"] = observed_protective_execution_total
 
     # Keep the final position read after the post-cancel order inventory.  A
     # protective fill can move between the cancel re-query and that inventory;
@@ -1143,7 +1287,7 @@ def resolve_protective_exit_takeover(
     if final_position.get("is_fresh_exact") is not True or not isinstance(final_qty, int):
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="post_cancel_position_unproven")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN", "audit": audit}
-    max_coherent_qty = max(initial_qty - observed_protective_execution_delta, 0)
+    max_coherent_qty = max(initial_qty - observed_protective_execution_total, 0)
     if final_qty > max_coherent_qty:
         audit.update(
             event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
