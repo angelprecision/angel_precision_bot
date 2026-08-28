@@ -94,6 +94,7 @@ class _PostgresHarness:
         client_id: str,
         *,
         complete: bool = False,
+        execution_mode: str | None = "live",
     ) -> None:
         if complete:
             finalization = (0.99, 1.41, 90.0, 0)
@@ -102,11 +103,11 @@ class _PostgresHarness:
         self.execute(
             """
             INSERT INTO positions (
-                id, client_id, avg_fill, exit_price, realized_pnl,
+                id, client_id, execution_mode, avg_fill, exit_price, realized_pnl,
                 realized_pnl_pct, quantity_remaining
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (position_id, client_id, 0.52, *finalization),
+            (position_id, client_id, execution_mode, 0.52, *finalization),
         )
 
     def insert_order(
@@ -120,13 +121,15 @@ class _PostgresHarness:
         fill_price: float | None = 0.99,
         filled_qty: int | None = 3,
         meta: dict | None = None,
+        execution_mode: str | None = "live",
     ) -> None:
         self.execute(
             """
             INSERT INTO orders (
                 local_order_id, position_id, client_id, kind, status,
-                fill_price, filled_qty, filled_ts, broker_order_id, meta
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                fill_price, filled_qty, filled_ts, broker_order_id,
+                execution_mode, meta
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             """,
             (
                 local_order_id,
@@ -138,6 +141,7 @@ class _PostgresHarness:
                 filled_qty,
                 FILLED_TS,
                 f"broker-{local_order_id}",
+                execution_mode,
                 json.dumps(meta or {}),
             ),
         )
@@ -185,6 +189,7 @@ def postgres_harness():
                 CREATE TEMP TABLE positions (
                     id TEXT NOT NULL,
                     client_id TEXT NOT NULL,
+                    execution_mode TEXT,
                     avg_fill NUMERIC,
                     exit_price NUMERIC,
                     realized_pnl NUMERIC,
@@ -205,6 +210,7 @@ def postgres_harness():
                     filled_qty INTEGER,
                     filled_ts TIMESTAMPTZ,
                     broker_order_id TEXT,
+                    execution_mode TEXT,
                     meta JSONB
                 )
                 """
@@ -216,13 +222,17 @@ def postgres_harness():
         connection.close()
 
 
-def _reconciler(client_id: str = CLIENT, broker=None) -> APBrokerReconciler:
+def _reconciler(
+    client_id: str = CLIENT,
+    broker=None,
+    execution_mode: str | None = "live",
+) -> APBrokerReconciler:
     return APBrokerReconciler(
         broker=broker or MagicMock(),
         client_id=client_id,
         osm=MagicMock(),
         pm=MagicMock(),
-        execution_mode="live",
+        execution_mode=execution_mode,
     )
 
 
@@ -275,6 +285,27 @@ def test_real_postgres_query_enforces_ownership_and_is_idempotent(
             status=status,
         )
 
+    # Execution-mode ownership controls. A LIVE reconciler must not
+    # heal PAPER or unknown-mode rows, even when client_id matches.
+    harness.insert_position("pos-paper", CLIENT, execution_mode="paper")
+    harness.insert_order(
+        "paper-exit",
+        "pos-paper",
+        execution_mode="paper",
+    )
+    harness.insert_position("pos-unknown-mode", CLIENT, execution_mode=None)
+    harness.insert_order(
+        "unknown-mode-exit",
+        "pos-unknown-mode",
+        execution_mode=None,
+    )
+    harness.insert_position("pos-order-mode-mismatch", CLIENT, execution_mode="live")
+    harness.insert_order(
+        "paper-labeled-exit",
+        "pos-order-mode-mismatch",
+        execution_mode="paper",
+    )
+
     # Fill-truth controls.
     harness.insert_position("pos-null-price", CLIENT)
     harness.insert_order("exit-null-price", "pos-null-price", fill_price=None)
@@ -325,6 +356,8 @@ def test_real_postgres_query_enforces_ownership_and_is_idempotent(
     assert selected_row["filled_qty"] == 3
     assert selected_row["broker_order_id"] == "broker-bot-exit-positive"
     assert selected_row["meta"] == {"selected_row_marker": "present"}
+    assert selected_row["position_execution_mode"] == "live"
+    assert selected_row["order_execution_mode"] == "live"
 
     query, params = harness.executions[0]
     # Finalizer updates use the direct connection so the bound reconciler query
@@ -332,7 +365,9 @@ def test_real_postgres_query_enforces_ownership_and_is_idempotent(
     compact_query = " ".join(query.split())
     assert "o.meta" in compact_query
     assert "COALESCE(o.local_order_id, '') NOT LIKE %s" in compact_query
-    assert params == (CLIENT, "external-exit:%")
+    assert "LOWER(TRIM(COALESCE(p.execution_mode, ''))) = %s" in compact_query
+    assert "NULLIF(TRIM(COALESCE(o.execution_mode, '')), '') IS NULL" in compact_query
+    assert params == (CLIENT, "external-exit:%", "live", "live")
 
     # No broker mutation surface is touched by this database-only repair.
     broker.submit_order.assert_not_called()
@@ -358,6 +393,8 @@ def test_application_fence_rechecks_returned_metadata_and_preserves_bound_patter
         "filled_qty": 3,
         "filled_ts": "2026-08-27T16:00:00+00:00",
         "broker_order_id": "broker-meta-double",
+        "position_execution_mode": "live",
+        "order_execution_mode": "live",
         "meta": {"external_broker_order": True},
     }
     executions: list[tuple[str, tuple]] = []
@@ -392,4 +429,21 @@ def test_application_fence_rechecks_returned_metadata_and_preserves_bound_patter
     query, params = executions[0]
     assert "o.meta" in query
     assert "NOT LIKE %s" in query
-    assert params == (CLIENT, "external-exit:%")
+    assert "p.execution_mode" in query
+    assert params == (CLIENT, "external-exit:%", "live", "live")
+
+
+def test_unknown_reconciler_execution_mode_fails_closed(monkeypatch):
+    import ap.db as db_mod
+
+    def _unexpected_db_use():
+        pytest.fail("unknown execution_mode must not query the database")
+
+    monkeypatch.setattr(db_mod, "conn", _unexpected_db_use)
+    rec = _reconciler(execution_mode=None)
+    summary = _empty_summary(CLIENT)
+
+    rec._heal_exit_filled_positions_from_orders(summary)
+
+    assert summary["positions_alerted"] == 1
+    assert "reconciler_exit_fill_heal_execution_mode_missing" in summary["errors"]
