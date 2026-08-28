@@ -2805,22 +2805,40 @@ class APOrderStateMachine:
             "execution_mode": _mode,
             "broker_ready": False,
         }
-        # P0 AMENDMENT blocker §4 (second round): atomically advance the
-        # CANONICAL retry_attempt field in the same JSONB merge as the
-        # generation advance. retry_attempt_in_flight is also written as
-        # a diagnostic alias for operators. The SQL predicate verifies the
-        # previous canonical attempt to prevent re-use of an already-claimed
-        # attempt slot (belt-and-suspenders against concurrent claimants
-        # after a lease expiry).
+        # P0 AMENDMENT (fix/p0-attempt-mirror-atomic-advance-20260827):
+        # ``retry_attempt``, ``breach_attempt_count``, and
+        # ``materialization_attempts`` are one durable selector-attempt identity.
+        # When a new attempt is claimed, all three mirrors MUST advance together
+        # in this same JSONB merge; the CAS predicate MUST fence each mirror at
+        # the expected prior value so a mid-lifecycle split (e.g. the exact
+        # production 2/1/1 shape) can neither be created here nor silently
+        # normalized by a subsequent claim. Malformed durable values fail closed
+        # via a strict integer regex — no lossy cast, no ``COALESCE`` default
+        # that would turn missing-and-invalid into "0".
+        #
+        # First-attempt authority: blank/absent mirror sides are acceptable when
+        # ``_prev_attempt == 0``. A positive prior value in ANY mirror requires
+        # the same positive value in every present mirror. Any bool, negative,
+        # non-integer string, or contradictory positive value fails closed.
         _prev_attempt: int | None = None
         if retry_attempt is not None:
-            try:
-                _ra = int(retry_attempt)
-                _patch["retry_attempt"] = _ra
-                _patch["retry_attempt_in_flight"] = _ra
-                _prev_attempt = max(0, _ra - 1)
-            except (TypeError, ValueError):
-                pass
+            # Strict int required. Reject:
+            #  * bool (int subclass in Python; ``int(True)==1`` would silently
+            #    coerce a boolean into a "valid" attempt count)
+            #  * str (``int("2")`` succeeds but string inputs to a durable
+            #    authority field are ambiguous; require the caller to normalize)
+            #  * float (``int(1.5)==1`` silently truncates; NaN/inf raise)
+            #  * any other type
+            if isinstance(retry_attempt, bool) or not isinstance(retry_attempt, int):
+                return False
+            _ra = retry_attempt
+            if _ra < 1:
+                return False
+            _patch["retry_attempt"] = _ra
+            _patch["retry_attempt_in_flight"] = _ra
+            _patch["breach_attempt_count"] = _ra
+            _patch["materialization_attempts"] = _ra
+            _prev_attempt = _ra - 1
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
         except Exception:
@@ -2831,12 +2849,30 @@ class APOrderStateMachine:
                 _attempt_predicate = ""
                 _attempt_params: list = []
                 if _prev_attempt is not None:
-                    # Verify the canonical retry_attempt is at the expected
-                    # prior value — prevents double-claiming an attempt slot.
+                    # All three durable mirrors are one attempt identity. Each
+                    # mirror is either absent/blank (valid legacy or first-
+                    # attempt shape) OR a strict non-negative integer equal to
+                    # the expected prior value. A mirror present as any other
+                    # shape (bool text, float, negative, non-integer string)
+                    # matches zero rows and the claim fails closed. The three
+                    # ``%s`` placeholders each bind ``_prev_attempt``.
+                    # Each mirror is either truly absent (JSON key missing or
+                    # JSON null — ``meta->>`` returns SQL NULL) OR a strict
+                    # ``^[0-9]+$`` text form equal to ``_prev_attempt``. Any
+                    # other text value — empty string, whitespace, ``true``,
+                    # ``1.0``, ``-1``, garbage — matches zero rows.
                     _attempt_predicate = (
-                        " AND COALESCE((meta->>'retry_attempt')::int, 0) = %s"
+                        " AND (meta->>'retry_attempt' IS NULL"
+                        "      OR (meta->>'retry_attempt' ~ '^[0-9]+$'"
+                        "          AND (meta->>'retry_attempt')::int = %s))"
+                        " AND (meta->>'breach_attempt_count' IS NULL"
+                        "      OR (meta->>'breach_attempt_count' ~ '^[0-9]+$'"
+                        "          AND (meta->>'breach_attempt_count')::int = %s))"
+                        " AND (meta->>'materialization_attempts' IS NULL"
+                        "      OR (meta->>'materialization_attempts' ~ '^[0-9]+$'"
+                        "          AND (meta->>'materialization_attempts')::int = %s))"
                     )
-                    _attempt_params = [_prev_attempt]
+                    _attempt_params = [_prev_attempt, _prev_attempt, _prev_attempt]
                 cur = c.execute(
                     """
                     UPDATE orders
