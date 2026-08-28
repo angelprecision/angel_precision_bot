@@ -391,11 +391,11 @@ def test_reconciler_healer_skips_adopted_external_exit_rows(monkeypatch):
         "broker_order_id": "broker-a",
         "meta": {"external_broker_order": True},
     }
-    executed_sql: list[str] = []
+    executed_sql: list[tuple[str, tuple]] = []
 
     class _Cursor:
         def execute(self, sql, params=None):
-            executed_sql.append(" ".join(str(sql).split()))
+            executed_sql.append((" ".join(str(sql).split()), tuple(params or ())))
 
         def fetchall(self):
             return [external_row]
@@ -427,8 +427,11 @@ def test_reconciler_healer_skips_adopted_external_exit_rows(monkeypatch):
 
     finalizer.assert_not_called()
     assert executed_sql
-    query = executed_sql[0].lower()
-    assert "not like 'external-exit:%'" in query
+    query, params = executed_sql[0]
+    query = query.lower()
+    assert "not like %s" in query
+    assert params == (CLIENT, "external-exit:%")
+    assert "o.meta" in query
     assert "external_broker_order" in query
 
 
