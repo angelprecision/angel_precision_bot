@@ -9,6 +9,68 @@ broader lifecycle protection, this amendment narrows it.
 **Rebased on post-#524 main:**
 `ba1e86a01ed9c81423cc6b5baaa766e43310bec7`
 
+### Amendment round 3 (2026-08-27, post-r2 audit) — #524 canonical mode parity
+
+One merge-blocker compatibility regression closed.
+
+**Finding:** r2 tightened `_maybe_hydrate_deferred_order`'s durable-mode
+check to inspect only the `orders.execution_mode` column. Merged #524
+canonically resolves mode via
+`ap.order_state_machine._durable_execution_mode`, which prefers the
+valid column but accepts a valid `meta.execution_mode` as fallback
+when the column is blank. r2 therefore rejected legitimate #524 rows
+in the exact shape:
+
+```
+orders.execution_mode = ""    (blank)
+meta.execution_mode   = "live"
+runner                = LIVE
+```
+
+This did NOT make lower-quality trades eligible — it introduced a
+tradeflow regression by blocking hydration of valid deferred rows.
+
+**Fix:** The retained hydration bypass now reuses the canonical
+resolver directly:
+
+```python
+from ap.order_state_machine import _durable_execution_mode
+durable_mode = _durable_execution_mode(order)
+if durable_mode is None:
+    return {"attempted": False, "reason": "execution_mode_missing_or_invalid"}
+runtime_mode = str(self.client_mode or "").strip().lower()
+if runtime_mode not in {"live", "paper"}:
+    return {"attempted": False, "reason": "runtime_execution_mode_invalid"}
+if durable_mode != runtime_mode:
+    return {"attempted": False, "reason": "execution_mode_mismatch"}
+```
+
+No independent third resolver introduced — same shared authority as
+#524's classifier and ap_recovery consumers. No runner-context inference
+for missing durable identity. Import verified non-circular
+(`ap.order_state_machine` does not import from `ap.order_monitor`).
+
+**Mandatory mode matrix (all pass on r3 HEAD):**
+
+- `col=live, meta=blank, runner=live` → passes gate.
+- `col=paper, meta=blank, runner=paper` → passes gate.
+- `col=blank, meta=live, runner=live` → **passes gate** (the r2 regression).
+- `col=blank, meta=paper, runner=paper` → passes gate.
+- `col=live, meta=live, runner=live` → passes gate.
+- `col=blank, meta=live, runner=paper` → `execution_mode_mismatch`.
+- `col=banana, meta=live, runner=live` → `execution_mode_missing_or_invalid` (no fallback to metadata when column is malformed nonblank).
+- `col=live, meta=banana, runner=live` → `execution_mode_missing_or_invalid`.
+- `col=live, meta=paper, runner=live` → `execution_mode_missing_or_invalid` (durable contradiction).
+- `col=blank, meta=blank` → `execution_mode_missing_or_invalid`.
+- `col=blank, meta=live, runner=live` + **full active #524 owner proof** → `materialization_in_flight`, 0 selector calls, 0 OSM copyback (mandatory combined case).
+- `col=blank, meta=live, runner=paper` + full active owner proof → `execution_mode_mismatch` (materialization guard MUST NOT override cross-mode isolation).
+- `runner="banana"` → `runtime_execution_mode_invalid`.
+
+**Explicitly out of r3 scope (separate follow-up):** the classifier
+precedence issue where `watcher_audit.reason_code=trigger_ready` can
+outrank `materialization_status=RETRY_PENDING` + future
+`materialization_next_retry_at`. Not touched here.
+
 ### Amendment round 2 (2026-08-27, follow-up audit) — fail-closed strictness
 
 Two fail-closed gaps closed:

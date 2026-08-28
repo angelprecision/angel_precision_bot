@@ -2007,15 +2007,32 @@ class APOrderMonitor:
 
         # Execution-mode identity is a durable-only invariant.  The runner's
         # own client_mode MUST NOT be substituted for a missing/blank/malformed
-        # durable value on the row.  Runner-context inference would let a row
-        # with execution_mode = NULL / "" / "banana" receive the retained
-        # materialization-in-flight fence below, which would be inconsistent
-        # with the classifier and ap_recovery consumers that both reject
-        # missing/malformed durable mode before classification.  Fail closed.
-        durable_mode = str(order.get("execution_mode") or "").strip().lower()
-        runtime_mode = str(self.client_mode or "").strip().lower()
-        if durable_mode not in {"live", "paper"}:
+        # durable value on the row.  Runner-context inference would let a
+        # malformed row receive the retained materialization-in-flight fence,
+        # which would be inconsistent with the classifier and ap_recovery
+        # consumers that both reject missing/malformed durable mode before
+        # classification.
+        #
+        # Route through the canonical resolver merged in #524
+        # (ap.order_state_machine._durable_execution_mode) so the retained
+        # hydration bypass accepts exactly the durable-mode shapes #524
+        # writes and accepts elsewhere in the system:
+        #   * valid orders.execution_mode column is preferred
+        #   * blank column may fall back to a valid meta.execution_mode
+        #   * malformed nonblank column fails closed
+        #   * malformed nonblank meta.execution_mode fails closed
+        #   * column/meta contradiction (live vs paper) fails closed
+        #   * both blank fails closed
+        # No independent third resolver is introduced — the SAME resolver
+        # is reused so any future evolution of the canonical semantics
+        # propagates to this consumer for free.
+        from ap.order_state_machine import _durable_execution_mode
+        durable_mode = _durable_execution_mode(order)
+        if durable_mode is None:
             return {"attempted": False, "reason": "execution_mode_missing_or_invalid"}
+        runtime_mode = str(self.client_mode or "").strip().lower()
+        if runtime_mode not in {"live", "paper"}:
+            return {"attempted": False, "reason": "runtime_execution_mode_invalid"}
         if durable_mode != runtime_mode:
             return {"attempted": False, "reason": "execution_mode_mismatch"}
 

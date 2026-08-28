@@ -284,6 +284,249 @@ def test_hydration_execution_mode_mismatch_still_wins_over_materialization_guard
     monitor.osm.record_deferred_hydration_result.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# Amendment r3 — #524 canonical durable-mode authority parity
+#
+# The retained hydration bypass MUST accept exactly the durable-mode shapes
+# _durable_execution_mode() accepts (valid column preferred, valid meta may
+# fill a blank column) and MUST fail closed on exactly the shapes the
+# canonical resolver rejects (malformed nonblank column, malformed nonblank
+# meta, column/meta contradiction, both blank).  Runner-context inference
+# for missing durable identity remains forbidden.
+# ---------------------------------------------------------------------------
+
+
+def _order_for_mode(*, column, meta_mode, meta_extras=None):
+    """Construct an order with a specific durable mode shape.
+
+    - column is written to orders.execution_mode as-is (None or a string).
+    - meta_mode is written to meta.execution_mode as-is (None or a string).
+    - meta_extras (optional) is merged into meta, e.g. a full active-owner
+      shape for the active-materializer combined tests.
+    """
+    meta = {"watcher_audit": {"reason_code": "trigger_ready"}}
+    if meta_extras:
+        meta.update(meta_extras)
+    # Blow away the base fixture's meta.execution_mode so the parameter wins.
+    if meta_mode is None:
+        meta.pop("execution_mode", None)
+    else:
+        meta["execution_mode"] = meta_mode
+    order = _make_order(meta=meta)
+    order["execution_mode"] = column
+    return order
+
+
+def _prepare_selector_success(selector):
+    """Wire the selector to return a valid contract so, if we reach it,
+    hydration will run to completion rather than fail on selector output."""
+
+    def _select(plan):
+        plan.contract_symbol = "AAPL260717C00200000"
+        plan.limit_price = 1.23
+        plan.contracts = 2
+        return SimpleNamespace(
+            contract_symbol="AAPL260717C00200000",
+            execution_price_per_share=1.23,
+            affordable_contracts=2,
+        )
+
+    selector.select.side_effect = _select
+    selector.get_last_failure.return_value = None
+
+
+# Cases where the mode gate MUST PASS — hydration proceeds past the gate.
+# We don't assert full hydration success (that depends on selector wiring
+# and other gates); we assert that the mode-related refusal reasons are
+# NOT what stops the row.
+_MODE_GATE_PASS_CASES = [
+    ("live",  None,     "live",  "col_live_meta_blank_runner_live"),
+    ("paper", None,     "paper", "col_paper_meta_blank_runner_paper"),
+    # THE #524 COMPATIBILITY REGRESSION — this is what r2 rejected.
+    (None,    "live",   "live",  "col_blank_meta_live_runner_live"),
+    (None,    "paper",  "paper", "col_blank_meta_paper_runner_paper"),
+    ("",      "live",   "live",  "col_emptystr_meta_live_runner_live"),
+    ("   ",   "live",   "live",  "col_whitespace_meta_live_runner_live"),
+    # column and meta both valid AND agree — canonical resolver accepts.
+    ("live",  "live",   "live",  "col_live_meta_live_runner_live"),
+]
+
+
+@pytest.mark.parametrize("column,meta_mode,runner,label", _MODE_GATE_PASS_CASES)
+def test_hydration_mode_gate_passes_for_valid_524_durable_shapes(
+    monkeypatch, column, meta_mode, runner, label
+):
+    """r3 — canonical #524 durable-mode shapes must pass the hydration mode gate.
+
+    The `column=blank, meta=live, runner=live` case is the primary
+    regression closed here: pre-r3 (r2) rejected this exact shape with
+    reason=execution_mode_missing_or_invalid, blocking legitimate #524
+    rows from hydration.
+    """
+    selector = MagicMock()
+    _prepare_selector_success(selector)
+    monitor = _make_monitor(contract_selector=selector)
+    monitor.client_mode = runner
+    _enable_window(monkeypatch)
+
+    order = _order_for_mode(column=column, meta_mode=meta_mode)
+    result = monitor._maybe_hydrate_deferred_order(order)
+
+    # The gate must not be what stops the row.  Any refusal reason coming
+    # back must be UNRELATED to mode resolution.
+    forbidden_reasons = {
+        "execution_mode_missing_or_invalid",
+        "execution_mode_mismatch",
+        "runtime_execution_mode_invalid",
+    }
+    reason = result.get("reason")
+    assert reason not in forbidden_reasons, (
+        f"shape {label!r} incorrectly stopped at the mode gate; got {result!r}"
+    )
+
+
+# Cases where the mode gate MUST FAIL CLOSED at a specific mode-refusal reason.
+_MODE_GATE_FAIL_CASES = [
+    # Cross-mode: column blank, meta LIVE, runner PAPER.
+    (None,    "live",   "paper", "execution_mode_mismatch",
+     "col_blank_meta_live_runner_paper"),
+    # Malformed nonblank column MUST NOT fall back to valid meta.
+    ("banana", "live",  "live",  "execution_mode_missing_or_invalid",
+     "col_banana_meta_live_runner_live"),
+    ("LIVE_OR_PAPER", "live", "live", "execution_mode_missing_or_invalid",
+     "col_junk_meta_live_runner_live"),
+    # Malformed nonblank meta fails closed even with a valid column.
+    ("live",  "banana", "live",  "execution_mode_missing_or_invalid",
+     "col_live_meta_banana_runner_live"),
+    # Durable column/meta contradiction.
+    ("live",  "paper",  "live",  "execution_mode_missing_or_invalid",
+     "col_live_meta_paper_contradiction_runner_live"),
+    ("paper", "live",   "paper", "execution_mode_missing_or_invalid",
+     "col_paper_meta_live_contradiction_runner_paper"),
+    # Both blank.
+    (None,    None,     "live",  "execution_mode_missing_or_invalid",
+     "col_blank_meta_blank_runner_live"),
+    ("",      "",       "live",  "execution_mode_missing_or_invalid",
+     "col_empty_meta_empty_runner_live"),
+    # Cross-mode with valid column.
+    ("live",  None,     "paper", "execution_mode_mismatch",
+     "col_live_runner_paper"),
+    ("paper", None,     "live",  "execution_mode_mismatch",
+     "col_paper_runner_live"),
+]
+
+
+@pytest.mark.parametrize(
+    "column,meta_mode,runner,expected_reason,label", _MODE_GATE_FAIL_CASES
+)
+def test_hydration_mode_gate_fails_closed_on_amendment_r3_matrix(
+    monkeypatch, column, meta_mode, runner, expected_reason, label
+):
+    """r3 — every shape the canonical resolver rejects (or that the runner
+    mismatches) must fail closed at the mode gate, BEFORE the materialization
+    guard is consulted.  No selector call, no OSM copyback.
+    """
+    selector = MagicMock()
+    _prepare_selector_success(selector)
+    monitor = _make_monitor(contract_selector=selector)
+    monitor.client_mode = runner
+    _enable_window(monkeypatch)
+
+    order = _order_for_mode(column=column, meta_mode=meta_mode)
+    result = monitor._maybe_hydrate_deferred_order(order)
+
+    assert result == {"attempted": False, "reason": expected_reason}, (
+        f"shape {label!r} produced unexpected result: {result!r}"
+    )
+    # Materialization guard must never be reached for a mode-refused row.
+    assert result.get("reason") != "materialization_in_flight"
+    selector.select.assert_not_called()
+    monitor.osm.record_deferred_hydration_result.assert_not_called()
+
+
+def test_r3_mandatory_case_column_blank_meta_live_with_active_owner_reaches_materialization_guard(
+    monkeypatch,
+):
+    """r3 — the specific combined case the amendment marks MANDATORY.
+
+    A #524-shape row with:
+        orders.execution_mode = blank
+        meta.execution_mode   = "live"
+        runner                = LIVE
+      + FULL canonical active #524 materialization owner proof
+
+    must resolve durable mode = LIVE (canonical resolver), pass the mode
+    gate, and then be caught by the retained materialization-in-flight
+    fence — attempted=False, reason=materialization_in_flight, zero
+    selector calls, zero OSM copyback writes.  This proves the retained
+    hydration consumer accepts #524 metadata fallback AND correctly
+    respects the active materializer at the same time.
+    """
+    selector = MagicMock()
+    _prepare_selector_success(selector)
+    monitor = _make_monitor(contract_selector=selector)
+    monitor.client_mode = "live"
+    _enable_window(monkeypatch)
+
+    order = _order_for_mode(
+        column=None,
+        meta_mode="live",
+        meta_extras=_full_active_meta(),
+    )
+    result = monitor._maybe_hydrate_deferred_order(order)
+
+    assert result == {"attempted": False, "reason": "materialization_in_flight"}
+    selector.select.assert_not_called()
+    monitor.osm.record_deferred_hydration_result.assert_not_called()
+
+
+def test_r3_cross_mode_active_owner_still_fails_closed_at_mode_gate(monkeypatch):
+    """r3 — cross-mode isolation must beat the materialization guard.
+
+    A row with column blank, meta.execution_mode=live, runner=paper, AND
+    a full active-owner proof must fail closed with
+    reason=execution_mode_mismatch, NOT reason=materialization_in_flight.
+    The active materializer runs in ITS mode; the paper runner has no
+    authority to observe (or protect) a live materializer, and vice versa.
+    """
+    selector = MagicMock()
+    _prepare_selector_success(selector)
+    monitor = _make_monitor(contract_selector=selector)
+    monitor.client_mode = "paper"
+    _enable_window(monkeypatch)
+
+    order = _order_for_mode(
+        column=None,
+        meta_mode="live",
+        meta_extras=_full_active_meta(),
+    )
+    result = monitor._maybe_hydrate_deferred_order(order)
+
+    assert result == {"attempted": False, "reason": "execution_mode_mismatch"}
+    assert result.get("reason") != "materialization_in_flight"
+    selector.select.assert_not_called()
+    monitor.osm.record_deferred_hydration_result.assert_not_called()
+
+
+def test_r3_runtime_mode_invalid_fails_closed(monkeypatch):
+    """r3 — a runner in an invalid mode ("banana") must fail closed
+    with reason=runtime_execution_mode_invalid, not fall through to the
+    materialization or selector paths.
+    """
+    selector = MagicMock()
+    _prepare_selector_success(selector)
+    monitor = _make_monitor(contract_selector=selector)
+    monitor.client_mode = "banana"  # invalid runtime
+    _enable_window(monkeypatch)
+
+    order = _order_for_mode(column="live", meta_mode=None)
+    result = monitor._maybe_hydrate_deferred_order(order)
+
+    assert result == {"attempted": False, "reason": "runtime_execution_mode_invalid"}
+    selector.select.assert_not_called()
+    monitor.osm.record_deferred_hydration_result.assert_not_called()
+
+
 def test_pending_trigger_deferred_row_hydrates_to_occ_contract_and_limit_gt_point_01(monkeypatch):
     selector = MagicMock()
 
