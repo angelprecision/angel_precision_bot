@@ -636,6 +636,108 @@ class _FakeCursor:
         return self._fetchone
 
 
+class _ManualCloseStateCursor:
+    def __init__(self, *, positions=None, orders=None):
+        self.positions = list(positions or [])
+        self.orders = list(orders or [])
+        self.executed = []
+        self._fetchall = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=()):
+        compact = " ".join(str(sql).split())
+        self.executed.append((compact, params))
+        if "FROM positions" in compact:
+            self._fetchall = list(self.positions)
+        elif "FROM orders" in compact:
+            self._fetchall = list(self.orders)
+        else:  # pragma: no cover
+            raise AssertionError(f"unexpected SQL: {compact}")
+        return self
+
+    def fetchall(self):
+        return list(self._fetchall)
+
+
+def _state_external_order(broker_order_id, local_order_id, metadata):
+    return {
+        "broker_order_id": broker_order_id,
+        "local_order_id": local_order_id,
+        "position_id": POSITION_ID,
+        "filled_qty": 1,
+        "fill_price": 0.90,
+        "filled_ts": datetime(2026, 7, 21, 15, 57, 39, tzinfo=timezone.utc),
+        "execution_mode": "live",
+        "status": "EXIT_FILLED",
+        "contract": CONTRACT,
+        "direction": "CALL",
+        "meta": metadata,
+    }
+
+
+def test_durable_restart_loader_requires_exact_external_identity_and_provenance(monkeypatch):
+    metadata = {
+        "source": "manual_client_close_broker_fill",
+        "external_broker_order": True,
+        "adopted_without_submit": True,
+        "exit_fill_timestamp_source": manual_mod.BROKER_FILL_TIMESTAMP_SOURCE,
+        "exit_fill_timestamp_key": "last_fill_date",
+    }
+    rows = [
+        _state_external_order(
+            "WRONG-CLIENT",
+            "external-exit:other@example.com:WRONG-CLIENT",
+            metadata,
+        ),
+        _state_external_order(
+            "LEGACY",
+            f"external-exit:{CLIENT}:LEGACY",
+            {"exit_fill_timestamp_source": "broker_response", "exit_fill_timestamp_key": "last_fill_date"},
+        ),
+        _state_external_order(
+            "VALID",
+            f"external-exit:{CLIENT}:VALID",
+            metadata,
+        ),
+        _state_external_order("BOT", "bot-exit-1", {}),
+    ]
+    cursor = _ManualCloseStateCursor(orders=rows)
+    monkeypatch.setattr(db_mod, "conn", lambda: cursor)
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+
+    _, bot_ids, adopted = manual_mod.load_manual_close_state(CLIENT, "live")
+
+    assert bot_ids == {"BOT"}
+    assert [fill["broker_order_id"] for fill in adopted[POSITION_ID]] == ["VALID"]
+    assert adopted[POSITION_ID][0]["local_order_id"] == (
+        f"external-exit:{CLIENT}:VALID"
+    )
+
+
+def test_terminal_recovery_candidate_query_requires_canonical_external_identity(monkeypatch):
+    cursor = _ManualCloseStateCursor()
+    monkeypatch.setattr(db_mod, "conn", lambda: cursor)
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+
+    assert manual_mod.load_terminal_recovery_candidates(CLIENT, "live") == []
+
+    sql, params = cursor.executed[0]
+    assert "contracts_exited" in sql
+    assert "o.local_order_id = CONCAT(" in sql
+    assert "o.meta->>'source'" in sql
+    assert "o.meta->>'external_broker_order'" in sql
+    assert "o.meta->>'adopted_without_submit'" in sql
+    assert "o.meta->>'exit_fill_timestamp_source'" in sql
+    assert "o.meta->>'exit_fill_timestamp_key'" in sql
+    assert "LIKE %s" not in sql
+    assert manual_mod.BROKER_FILL_TIMESTAMP_SOURCE in params
+
+
 def test_external_fill_adoption_writes_real_exit_lifecycle_shape(monkeypatch):
     rows: list[dict] = []
     cursor = _FakeCursor(rows)

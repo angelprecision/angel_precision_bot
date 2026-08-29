@@ -131,6 +131,19 @@ def positive_int(value: Any) -> int:
     return int(numeric)
 
 
+def nonnegative_int(value: Any) -> int | None:
+    """Parse a durable non-negative integer without coercing bad truth."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
 def parse_timestamp(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
@@ -615,6 +628,17 @@ def _validate_durable_fills(
                 client_id, position_id,
             )
             continue
+        durable_local_order_id = str(f.get("local_order_id") or "").strip()
+        if durable_local_order_id and (
+            not client_id
+            or durable_local_order_id != _external_local_order_id(client_id, bid)
+        ):
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_LOCAL_ID_MISMATCH pos=%s "
+                "broker_id=%s local_order_id=%r — rejected",
+                client_id, position_id, bid, durable_local_order_id,
+            )
+            continue
         if filled_qty <= 0 or fill_price <= 0:
             log.warning(
                 "[%s] MANUAL_CLOSE_DURABLE_FILL_ECONOMICS_INVALID pos=%s "
@@ -939,7 +963,13 @@ def load_manual_close_state(
                 local_order_id = str(row.get("local_order_id") or "").strip()
                 position_id = str(row.get("position_id") or "").strip()
                 if local_order_id.startswith(EXTERNAL_LOCAL_ID_PREFIX):
-                    if not position_id:
+                    if (
+                        not position_id
+                        or local_order_id
+                        != _external_local_order_id(client_id, broker_order_id)
+                    ):
+                        # An external-looking prefix is never a bot-owned
+                        # fallback. It must be the exact client/order identity.
                         continue
                     row_status = str(row.get("status") or "").upper().strip()
                     if row_status not in DURABLE_EXIT_FILLED_STATUSES:
@@ -948,6 +978,15 @@ def load_manual_close_state(
                         # recovery evidence; skip without adding to bot_ids.
                         continue
                     metadata = _metadata_object(row.get("meta"))
+                    if (
+                        metadata.get("source")
+                        != "manual_client_close_broker_fill"
+                        or metadata.get("external_broker_order") is not True
+                        or metadata.get("adopted_without_submit") is not True
+                    ):
+                        # Legacy/adulterated external rows are not restart
+                        # truth and must not reach the finalizer.
+                        continue
                     timestamp_source = str(
                         metadata.get("exit_fill_timestamp_source") or ""
                     ).strip()
@@ -969,6 +1008,7 @@ def load_manual_close_state(
                     if filled_qty > 0 and fill_price > 0 and filled_at is not None:
                         fill_dict: dict = {
                             "broker_order_id": broker_order_id,
+                            "local_order_id": local_order_id,
                             "filled_qty": filled_qty,
                             "fill_price": fill_price,
                             "filled_at": filled_at,
@@ -1020,6 +1060,7 @@ def load_terminal_recovery_candidates(
                     status,
                     quantity_remaining,
                     qty,
+                    contracts_exited,
                     exit_price,
                     realized_pnl,
                     realized_pnl_pct,
@@ -1043,7 +1084,16 @@ def load_terminal_recovery_candidates(
                         AND LOWER(COALESCE(o.execution_mode, '')) = %s
                         AND UPPER(COALESCE(o.kind, '')) = 'EXIT'
                         AND UPPER(COALESCE(o.status, '')) = ANY(%s)
-                        AND o.local_order_id LIKE %s
+                        AND COALESCE(o.broker_order_id, '') <> ''
+                        AND o.local_order_id = CONCAT(
+                            'external-exit:', p.client_id, ':', o.broker_order_id
+                        )
+                        AND COALESCE(o.meta->>'source', '') =
+                            'manual_client_close_broker_fill'
+                        AND COALESCE(o.meta->>'external_broker_order', '') = 'true'
+                        AND COALESCE(o.meta->>'adopted_without_submit', '') = 'true'
+                        AND COALESCE(o.meta->>'exit_fill_timestamp_source', '') = %s
+                        AND COALESCE(o.meta->>'exit_fill_timestamp_key', '') = ANY(%s)
                   )
                 """,
                 (
@@ -1052,7 +1102,8 @@ def load_terminal_recovery_candidates(
                     list(_terminal_position_statuses()),
                     norm_mode,
                     list(DURABLE_EXIT_FILLED_STATUSES),
-                    f"{EXTERNAL_LOCAL_ID_PREFIX}%",
+                    BROKER_FILL_TIMESTAMP_SOURCE,
+                    list(BROKER_FILL_TIMESTAMP_KEYS),
                 ),
             )
             return [dict(row) for row in (cursor.fetchall() or [])]
@@ -1528,21 +1579,48 @@ def detect_manual_closes(self) -> None:
                 continue
             adopted_qty = sum(int(f["filled_qty"]) for f in valid_durable)
             required_qty = positive_int(candidate.get("qty"))
-            if required_qty <= 0 or adopted_qty != required_qty:
+            raw_contracts_exited = candidate.get("contracts_exited")
+            if raw_contracts_exited in (None, ""):
+                contracts_exited = 0
+            else:
+                contracts_exited = nonnegative_int(raw_contracts_exited)
+            expected_external_qty = (
+                required_qty - contracts_exited
+                if contracts_exited is not None
+                else 0
+            )
+            if (
+                required_qty <= 0
+                or contracts_exited is None
+                or contracts_exited > required_qty
+                or expected_external_qty <= 0
+                or adopted_qty != expected_external_qty
+            ):
                 log.warning(
                     "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_QTY_MISMATCH "
-                    "pos=%s required=%s adopted=%s — deferring",
-                    client_id, candidate_id, required_qty, adopted_qty,
+                    "pos=%s total=%s prior_exited=%s expected_external=%s "
+                    "adopted=%s — deferring",
+                    client_id, candidate_id, required_qty, contracts_exited,
+                    expected_external_qty, adopted_qty,
                 )
                 continue
-            weighted_notional = sum(
-                float(f["fill_price"]) * int(f["filled_qty"]) for f in valid_durable
-            )
-            avg_price = weighted_notional / adopted_qty
-            durable_evidence = {
-                "filled_qty": adopted_qty,
-                "fill_price": round(avg_price, 6),
-            }
+            # A full external close can prove the persisted aggregate from
+            # the external rows themselves. For a mixed bot-partial/manual
+            # close, the external rows prove only the residual; the recovery
+            # method must revalidate the already-terminal persisted truth and
+            # must not be handed an external-only aggregate as if it covered
+            # the original position quantity.
+            durable_evidence = None
+            if adopted_qty == required_qty:
+                weighted_notional = sum(
+                    float(f["fill_price"]) * int(f["filled_qty"])
+                    for f in valid_durable
+                )
+                avg_price = weighted_notional / adopted_qty
+                durable_evidence = {
+                    "filled_qty": adopted_qty,
+                    "fill_price": round(avg_price, 6),
+                }
             try:
                 ok, reason = recovery_method(
                     candidate_id,
