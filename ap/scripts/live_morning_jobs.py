@@ -175,6 +175,19 @@ def _resolve_scoped_clients() -> tuple[str, list[str], str | None]:
     return live_client, paper_clients, mode_filter
 
 
+def _resolved_calls_error(calls, *, job_name: str, mode_filter: str | None) -> str | None:
+    """Return a fail-closed diagnostic when an expected scheduler scope is empty.
+
+    A LIVE recovery used to build only PAPER/MIXED calls and then filter them all
+    out. The process reported ok=true because failures stayed at zero. Empty work
+    is not success for a configured morning job; surface it as an explicit failure.
+    """
+    if calls:
+        return None
+    scope = mode_filter or "all"
+    return f"no_calls_resolved_for_expected_scope:job={job_name}:mode={scope}"
+
+
 def main() -> int:
     bot_url = str(os.getenv("BOT_URL", os.getenv("AP_BOT_URL", "")) or "").strip()
     signing_secret = str(
@@ -218,6 +231,30 @@ def main() -> int:
     )
     if mode_filter is not None:
         calls = [call for call in calls if call.execution_mode == mode_filter]
+
+    no_calls_error = _resolved_calls_error(
+        calls,
+        job_name=job_name,
+        mode_filter=mode_filter,
+    )
+    if no_calls_error:
+        summary = {
+            "ok": False,
+            "job": job_name,
+            "executed": 0,
+            "failures": 1,
+            "error": no_calls_error,
+            "execution_mode": mode_filter or "all",
+            "results": [],
+        }
+        log.error(
+            "AUTONOMY_JOB_EMPTY_SCOPE job=%s execution_mode=%s error=%s",
+            job_name,
+            mode_filter or "all",
+            no_calls_error,
+        )
+        print(json.dumps(summary, default=str))
+        return 2
 
     execution_modes = ",".join(sorted({call.execution_mode for call in calls})) or "none"
     client_mode_hints = {
