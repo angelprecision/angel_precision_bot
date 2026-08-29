@@ -622,7 +622,12 @@ def test_jason_reconciler_shape_binds_before_seed_and_preserves_plan(monkeypatch
         exit_engine=object(),
     )
 
-    assert calls == ["standing_stop", "bind", "seed"]
+    # AMENDMENT (PR #544): the standing broker stop is no longer submitted
+    # from fill reconciliation. The monkeypatch above stays as a defense —
+    # if a future change re-adds the call, "standing_stop" will appear in
+    # ``calls`` and this assertion will fail.
+    assert calls == ["bind", "seed"]
+    assert "standing_stop" not in calls
     assert db.orders[LOCAL_ORDER_ID]["position_id"] == POSITION_ID
     assert db.positions[POSITION_ID]["local_order_id"] == LOCAL_ORDER_ID
     assert db.positions[POSITION_ID]["broker_order_id"] == BROKER_ORDER_ID
@@ -636,7 +641,9 @@ def test_handoff_binds_before_seed_and_does_not_add_broker_authority(monkeypatch
         seed_result=(True, "SEEDED"),
     )
 
-    assert calls == ["standing_stop", "bind", "seed"]
+    # AMENDMENT (PR #544): standing broker stop removed; canonical exit owns.
+    assert calls == ["bind", "seed"]
+    assert "standing_stop" not in calls
     assert markers == []
     assert [kind for kind, _ in broker.mutations] == []
     assert osm.transitions[0][1] == "FILLED"
@@ -649,7 +656,9 @@ def test_bind_failure_marks_exact_entry_and_skips_seed(monkeypatch):
         seed_result=(True, "SEEDED"),
     )
 
-    assert calls == ["standing_stop", "bind"]
+    # AMENDMENT (PR #544): standing broker stop removed; canonical exit owns.
+    assert calls == ["bind"]
+    assert "standing_stop" not in calls
     assert markers == [(CLIENT, LOCAL_ORDER_ID, "FILLED_ENTRY_POSITION_IDENTITY_BIND_FAILED")]
     assert [kind for kind, _ in broker.mutations] == []
 
@@ -661,6 +670,8 @@ def test_owner_unproven_marks_exact_entry_without_second_seed(monkeypatch):
         seed_result=(False, "ADOPTION_RETRY"),
     )
 
-    assert calls == ["standing_stop", "bind", "seed"]
+    # AMENDMENT (PR #544): standing broker stop removed; canonical exit owns.
+    assert calls == ["bind", "seed"]
+    assert "standing_stop" not in calls
     assert markers == [(CLIENT, LOCAL_ORDER_ID, "FILLED_ENTRY_CANONICAL_OWNER_UNPROVEN")]
     assert [kind for kind, _ in broker.mutations] == []
