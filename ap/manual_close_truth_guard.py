@@ -33,6 +33,21 @@ log = logging.getLogger("ap.manual_close_truth_guard")
 _PATCHED = "_AP_MANUAL_CLOSE_TRUTH_GUARD_PATCHED"
 _EXTERNAL_PREFIX = "external-exit:"
 _STALE_QUEUE_STATES = ("NEW", "PROCESSING", "WATCHING", "ARMED")
+_KNOWN_TERMINAL_QUEUE_STATES = frozenset({
+    "REJECTED",
+    "ERROR",
+    "SUBMITTED",
+    "FILLED",
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+    "DONE",
+})
+_QUEUE_CLEANUP_SUCCESS_OUTCOMES = frozenset({
+    "STALE_ROW_TERMINALIZED",
+    "ALREADY_TERMINAL",
+    "NO_STALE_OWNERSHIP",
+})
 _MANUAL_TAXONOMY_REASON = (
     "tradier_exit_proof_lock_passed_manual_external_close_training_excluded"
 )
@@ -324,20 +339,21 @@ def _persist_manual_close_proof_truth(
 
 def _terminalize_stale_queue_after_manual_close(
     *, client_id: str, position_id: str, broker_exit_order_id: str
-) -> int:
+) -> str:
     """CAS-terminalize stale queue ownership after a proven external close.
 
     Queue is an entry/admission lifecycle. Once a canonical position has opened
     and is now broker-confirmed closed, a leftover ARMED/WATCHING/PROCESSING/NEW
     row for that exact originating signal is stale ownership. We move only those
     nonterminal states to FILLED, which is already a canonical terminal queue
-    state. Existing terminal states are never overwritten.
+    state. Existing terminal states are never overwritten. The explicit outcome
+    is consumed by the caller before downstream recovery ownership is released.
     """
     client_id = str(client_id or "").strip().lower()
     position_id = str(position_id or "").strip()
     broker_exit_order_id = str(broker_exit_order_id or "").strip()
     if not client_id or not position_id or not broker_exit_order_id:
-        return 0
+        return "AMBIGUOUS"
 
     from ap.position_manager import PositionStatus
 
@@ -381,48 +397,86 @@ def _terminalize_stale_queue_after_manual_close(
                         position_id,
                         len(identity_rows),
                     )
-                return 0
+                return "AMBIGUOUS"
             position = identity_rows[0]
             signal_id = str(position.get("signal_id") or "").strip()
             mode = str(position.get("execution_mode") or "").strip().lower()
             if not signal_id or mode not in _VALID_EXECUTION_MODES:
-                return 0
+                return "AMBIGUOUS"
 
             c.execute(
                 """
-                SELECT id
+                SELECT id, status, payload
                 FROM trade_queue
                 WHERE client_id=%s
                   AND signal_id=%s
-                  AND LOWER(COALESCE(payload->>'execution_mode',''))=%s
-                  AND UPPER(COALESCE(status,'')) = ANY(%s)
                 ORDER BY id
                 LIMIT 2
                 FOR UPDATE
                 """,
-                (client_id, signal_id, mode, list(_STALE_QUEUE_STATES)),
+                (client_id, signal_id),
             )
             queue_rows = [dict(row) for row in (c.fetchall() or [])]
-            if len(queue_rows) != 1:
-                if len(queue_rows) > 1:
-                    log.error(
-                        "manual close stale queue cardinality invalid client=%s "
-                        "position=%s signal=%s rows=%s",
-                        client_id,
-                        position_id,
-                        signal_id,
-                        len(queue_rows),
-                    )
-                return 0
-            queue_id = queue_rows[0].get("id")
+            if not queue_rows:
+                return "NO_STALE_OWNERSHIP"
+            if len(queue_rows) > 1:
+                log.error(
+                    "manual close stale queue cardinality invalid client=%s "
+                    "position=%s signal=%s rows=%s",
+                    client_id,
+                    position_id,
+                    signal_id,
+                    len(queue_rows),
+                )
+                return "AMBIGUOUS"
+            queue = queue_rows[0]
+            queue_id = queue.get("id")
             if queue_id in (None, ""):
-                return 0
+                return "AMBIGUOUS"
+
+            payload = queue.get("payload")
+            if payload is None:
+                queue_mode = ""
+            elif isinstance(payload, dict):
+                queue_mode = str(payload.get("execution_mode") or "").strip().lower()
+            else:
+                log.error(
+                    "manual close stale queue payload shape invalid client=%s "
+                    "position=%s signal=%s",
+                    client_id,
+                    position_id,
+                    signal_id,
+                )
+                return "MODE_CONFLICT"
+            if queue_mode and queue_mode != mode:
+                log.error(
+                    "manual close stale queue execution mode conflict client=%s "
+                    "position=%s signal=%s queue_mode=%s expected_mode=%s",
+                    client_id,
+                    position_id,
+                    signal_id,
+                    queue_mode,
+                    mode,
+                )
+                return "MODE_CONFLICT"
+
+            queue_status = str(queue.get("status") or "").strip().upper()
+            if queue_status in _KNOWN_TERMINAL_QUEUE_STATES:
+                return "ALREADY_TERMINAL"
+            if queue_status not in _STALE_QUEUE_STATES:
+                return "AMBIGUOUS"
 
             cur = c.execute(
                 """
                 UPDATE trade_queue
                 SET status='FILLED',
                     finished_ts=COALESCE(finished_ts, NOW()),
+                    payload=CASE
+                        WHEN NULLIF(BTRIM(COALESCE(payload->>'execution_mode','')), '') IS NULL
+                        THEN COALESCE(payload, '{}'::jsonb)
+                             || jsonb_build_object('execution_mode', %s)
+                        ELSE payload
+                    END,
                     last_error='terminalized_after_manual_external_close_position_closed',
                     result_json=COALESCE(result_json, '{}'::jsonb)
                         || jsonb_build_object(
@@ -434,36 +488,41 @@ def _terminalize_stale_queue_after_manual_close(
                 WHERE id=%s
                   AND client_id=%s
                   AND signal_id=%s
-                  AND LOWER(COALESCE(payload->>'execution_mode',''))=%s
                   AND UPPER(COALESCE(status,'')) = ANY(%s)
+                  AND (
+                      NULLIF(BTRIM(COALESCE(payload->>'execution_mode','')), '') IS NULL
+                      OR LOWER(BTRIM(payload->>'execution_mode'))=%s
+                  )
                 """,
                 (
+                    mode,
                     position_id,
                     broker_exit_order_id,
                     mode,
                     queue_id,
                     client_id,
                     signal_id,
-                    mode,
                     list(_STALE_QUEUE_STATES),
+                    mode,
                 ),
             )
-            return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+            rowcount = int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+            return "STALE_ROW_TERMINALIZED" if rowcount == 1 else "AMBIGUOUS"
 
     try:
-        updated = int(db.run_with_retry(_write) or 0)
-        if updated:
+        outcome = str(db.run_with_retry(_write) or "AMBIGUOUS")
+        if outcome == "STALE_ROW_TERMINALIZED":
             log.warning(
-                "MANUAL_CLOSE_STALE_QUEUE_TERMINALIZED client=%s position=%s rows=%s",
-                client_id, position_id, updated,
+                "MANUAL_CLOSE_STALE_QUEUE_TERMINALIZED client=%s position=%s",
+                client_id, position_id,
             )
-        return updated
+        return outcome
     except Exception as exc:
         log.error(
             "manual close stale queue terminalization failed client=%s position=%s error=%s",
             client_id, position_id, exc,
         )
-        return 0
+        return "AMBIGUOUS"
 
 
 def _install_proof_stamp_patch() -> None:
@@ -541,11 +600,20 @@ def _install_manual_finalizer_patch() -> None:
                 proof_bound,
             )
             return False
-        _terminalize_stale_queue_after_manual_close(
+        queue_outcome = _terminalize_stale_queue_after_manual_close(
             client_id=client_id,
             position_id=position_id,
             broker_exit_order_id=broker_exit_order_id,
         )
+        if queue_outcome not in _QUEUE_CLEANUP_SUCCESS_OUTCOMES:
+            log.error(
+                "manual close finalizer queue truth not confirmed client=%s "
+                "position=%s outcome=%s — downstream mutations deferred",
+                client_id,
+                position_id,
+                queue_outcome,
+            )
+            return False
         return True
 
     setattr(wrapped, _PATCHED, True)
@@ -592,11 +660,20 @@ def _recover_manual_close_downstream_truth(
             proof_bound,
         )
         return False
-    _terminalize_stale_queue_after_manual_close(
+    queue_outcome = _terminalize_stale_queue_after_manual_close(
         client_id=client_id,
         position_id=position_id,
         broker_exit_order_id=expected_broker_id,
     )
+    if queue_outcome not in _QUEUE_CLEANUP_SUCCESS_OUTCOMES:
+        log.error(
+            "manual close restart queue truth not confirmed client=%s "
+            "position=%s outcome=%s — eviction deferred",
+            client_id,
+            position_id,
+            queue_outcome,
+        )
+        return False
     return True
 
 

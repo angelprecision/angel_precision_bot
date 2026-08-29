@@ -209,7 +209,7 @@ def _install_scan_boundaries(
     monkeypatch.setattr(
         truth_guard,
         "_terminalize_stale_queue_after_manual_close",
-        lambda **kwargs: 0,
+        lambda **kwargs: "NO_STALE_OWNERSHIP",
     )
     monkeypatch.setattr(manual_mod.time, "time", lambda: DETECTED_EPOCH)
     monkeypatch.setattr(
@@ -1102,7 +1102,7 @@ def test_two_finalization_attempts_produce_one_terminal_economic_result(monkeypa
     monkeypatch.setattr(
         truth_guard,
         "_terminalize_stale_queue_after_manual_close",
-        lambda **kwargs: 0,
+        lambda **kwargs: "NO_STALE_OWNERSHIP",
     )
 
     call_count = [0]

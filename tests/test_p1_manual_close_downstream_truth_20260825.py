@@ -39,9 +39,9 @@ class _Cursor:
             "fill_price": 1.22,
             "execution_mode": "live",
             "contract": "NOW260828P00122000",
-            "direction": "CALL",
+            "direction": "PUT",
             "position_contract": "NOW260828P00122000",
-            "position_direction": "CALL",
+            "position_direction": "PUT",
             "meta": {
                 "source": "manual_client_close_broker_fill",
                 "external_broker_order": True,
@@ -60,7 +60,11 @@ class _Cursor:
             if identity_rows is not None
             else [{"execution_mode": "live", "signal_id": SIGNAL_ID}]
         )
-        self.queue_rows = list(queue_rows if queue_rows is not None else [{"id": 41}])
+        self.queue_rows = list(
+            queue_rows
+            if queue_rows is not None
+            else [{"id": 41, "status": "ARMED", "payload": {"execution_mode": "live"}}]
+        )
         self.calls = []
         self.updates = []
         self.rowcount = 0
@@ -83,7 +87,7 @@ class _Cursor:
             self._many = list(self.proof_rows)
         elif "SELECT DISTINCT p.execution_mode, o.signal_id" in text:
             self._many = list(self.identity_rows)
-        elif "SELECT id FROM trade_queue" in text:
+        elif "FROM trade_queue" in text and "FOR UPDATE" in text:
             self._many = list(self.queue_rows)
         elif "UPDATE trade_queue" in text:
             self.rowcount = 1
@@ -110,6 +114,43 @@ def _ctx(cursor):
 def _wire(monkeypatch, cursor):
     monkeypatch.setattr(db, "conn", lambda: _ctx(cursor))
     monkeypatch.setattr(db, "run_with_retry", lambda fn, *a, **k: fn())
+
+
+class _QueueLifecycleCursor(_Cursor):
+    """Model the production-shaped stale NOW row through terminalization."""
+
+    def execute(self, sql, params=None):
+        text = " ".join(str(sql).split())
+        if "SELECT id, status, payload" in text and "FROM trade_queue" in text:
+            self.calls.append((text, params))
+            self.rowcount = 0
+            self._many = [
+                row
+                for row in self.queue_rows
+                if row.get("client_id") == params[0]
+                and row.get("signal_id") == params[1]
+            ]
+            self._one = None
+            return self
+        if "UPDATE trade_queue" in text:
+            self.calls.append((text, params))
+            self.rowcount = 1
+            self.updates.append((text, params))
+            row = self.queue_rows[0]
+            row["status"] = "FILLED"
+            row["finished_ts"] = "set"
+            payload = dict(row.get("payload") or {})
+            if not str(payload.get("execution_mode") or "").strip():
+                payload["execution_mode"] = params[0]
+            row["payload"] = payload
+            row["result_json"] = {
+                "manual_external_close_terminalized": True,
+                "position_id": params[1],
+                "broker_exit_order_id": params[2],
+                "execution_mode": params[3],
+            }
+            return self
+        return super().execute(sql, params)
 
 
 def test_live_official_manual_close_remains_official_but_is_not_training(monkeypatch):
@@ -187,20 +228,24 @@ def test_stale_queue_terminalization_is_exact_signal_and_cas_guarded(monkeypatch
         broker_exit_order_id=BROKER_EXIT_ID,
     )
 
-    assert updated == 1
+    assert updated == "STALE_ROW_TERMINALIZED"
     sql, params = next(call for call in cursor.calls if "UPDATE trade_queue" in call[0])
     assert "SET status='FILLED'" in sql
     assert "client_id=%s" in sql
     assert "signal_id=%s" in sql
     assert "payload->>'execution_mode'" in sql
     assert "WHERE id=%s" in sql
-    assert "FOR UPDATE" in next(
-        call[0] for call in cursor.calls if "SELECT id FROM trade_queue" in call[0]
+    queue_sql, queue_params = next(
+        call for call in cursor.calls
+        if "FROM trade_queue" in call[0] and "FOR UPDATE" in call[0]
     )
+    assert "WHERE client_id=%s AND signal_id=%s" in queue_sql
+    assert "execution_mode" not in queue_sql
+    assert queue_params == (CLIENT, SIGNAL_ID)
     assert "UPPER(COALESCE(status,'')) = ANY(%s)" in sql
     assert CLIENT in params
     assert SIGNAL_ID in params
-    states = params[-1]
+    states = params[-2]
     assert set(states) == {"NEW", "PROCESSING", "WATCHING", "ARMED"}
     assert "FILLED" not in states
     assert "SUBMITTED" not in states
@@ -223,7 +268,10 @@ def test_proof_update_refuses_duplicate_live_candidates(monkeypatch):
 
 
 def test_queue_cleanup_refuses_missing_or_ambiguous_mode_identity(monkeypatch):
-    for queue_rows in ([], [{"id": 41}, {"id": 42}]):
+    for queue_rows, expected in (
+        ([], "NO_STALE_OWNERSHIP"),
+        ([{"id": 41}, {"id": 42}], "AMBIGUOUS"),
+    ):
         cursor = _Cursor(queue_rows=queue_rows)
         _wire(monkeypatch, cursor)
 
@@ -231,15 +279,109 @@ def test_queue_cleanup_refuses_missing_or_ambiguous_mode_identity(monkeypatch):
             client_id=CLIENT,
             position_id=POSITION_ID,
             broker_exit_order_id=BROKER_EXIT_ID,
-        ) == 0
+        ) == expected
         assert not any("UPDATE trade_queue" in sql for sql, _ in cursor.updates)
+
+
+def test_queue_cleanup_accepts_already_terminal_exact_row_without_update(monkeypatch):
+    cursor = _Cursor(
+        queue_rows=[
+            {
+                "id": 42212,
+                "status": "FILLED",
+                "payload": {"execution_mode": "live"},
+            }
+        ]
+    )
+    _wire(monkeypatch, cursor)
+
+    assert guard._terminalize_stale_queue_after_manual_close(
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        broker_exit_order_id=BROKER_EXIT_ID,
+    ) == "ALREADY_TERMINAL"
+    assert not any("UPDATE trade_queue" in sql for sql, _ in cursor.updates)
+
+
+def test_production_now_stale_queue_row_is_terminalized_and_mode_backfilled(monkeypatch):
+    untouched = {
+        "id": 42213,
+        "client_id": CLIENT,
+        "signal_id": "other-signal",
+        "status": "ARMED",
+        "payload": {"after_hours_deferred": True},
+    }
+    cursor = _QueueLifecycleCursor(
+        identity_rows=[{"execution_mode": "live", "signal_id": SIGNAL_ID}],
+        queue_rows=[
+            {
+                "id": 42212,
+                "client_id": CLIENT,
+                "signal_id": SIGNAL_ID,
+                "status": "ARMED",
+                "payload": {"after_hours_deferred": True},
+            },
+            untouched,
+        ],
+    )
+    _wire(monkeypatch, cursor)
+
+    outcome = guard._terminalize_stale_queue_after_manual_close(
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        broker_exit_order_id=BROKER_EXIT_ID,
+    )
+
+    row = cursor.queue_rows[0]
+    assert outcome == "STALE_ROW_TERMINALIZED"
+    assert row["status"] == "FILLED"
+    assert row["finished_ts"] is not None
+    assert row["payload"] == {
+        "after_hours_deferred": True,
+        "execution_mode": "live",
+    }
+    assert row["result_json"]["manual_external_close_terminalized"] is True
+    assert cursor.queue_rows[1] == untouched
+    assert sum("UPDATE trade_queue" in sql for sql, _ in cursor.updates) == 1
+
+
+def test_production_now_queue_mode_conflict_holds_without_mutation(monkeypatch):
+    cursor = _QueueLifecycleCursor(
+        identity_rows=[{"execution_mode": "live", "signal_id": SIGNAL_ID}],
+        queue_rows=[
+            {
+                "id": 42212,
+                "client_id": CLIENT,
+                "signal_id": SIGNAL_ID,
+                "status": "ARMED",
+                "payload": {
+                    "after_hours_deferred": True,
+                    "execution_mode": "paper",
+                },
+            }
+        ],
+    )
+    _wire(monkeypatch, cursor)
+
+    outcome = guard._terminalize_stale_queue_after_manual_close(
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        broker_exit_order_id=BROKER_EXIT_ID,
+    )
+
+    row = cursor.queue_rows[0]
+    assert outcome == "MODE_CONFLICT"
+    assert row["status"] == "ARMED"
+    assert "finished_ts" not in row
+    assert row["payload"]["execution_mode"] == "paper"
+    assert not any("UPDATE trade_queue" in sql for sql, _ in cursor.updates)
 
 
 def test_external_identity_rejects_wrong_contract_direction_or_provenance(monkeypatch):
     base = _Cursor().external_row
     invalid_rows = (
         {**base, "contract": "NOW260828P00123000"},
-        {**base, "direction": "PUT"},
+        {**base, "direction": "CALL"},
         {**base, "execution_mode": "paper"},
         {**base, "fill_price": float("nan")},
         {**base, "meta": {**base["meta"], "adopted_without_submit": False}},
@@ -298,7 +440,7 @@ def test_successful_manual_finalizer_stamps_proof_and_queue(monkeypatch):
     monkeypatch.setattr(
         guard,
         "_terminalize_stale_queue_after_manual_close",
-        lambda **kwargs: calls["queue"].append(kwargs) or 1,
+        lambda **kwargs: calls["queue"].append(kwargs) or "STALE_ROW_TERMINALIZED",
     )
 
     import ap.manual_close_reconciliation as manual
@@ -336,6 +478,42 @@ def test_successful_manual_finalizer_stamps_proof_and_queue(monkeypatch):
     assert calls["queue"][0]["client_id"] == CLIENT
     assert calls["queue"][0]["position_id"] == POSITION_ID
     assert calls["queue"][0]["broker_exit_order_id"] == BROKER_EXIT_ID
+
+
+def test_manual_finalizer_queue_mode_conflict_defers_success(monkeypatch):
+    monkeypatch.setattr(
+        guard,
+        "_external_exit_identity",
+        lambda *a, **k: {
+            "local_order_id": EXTERNAL_LOCAL_ID,
+            "broker_order_id": BROKER_EXIT_ID,
+        },
+    )
+    monkeypatch.setattr(
+        guard,
+        "_persist_manual_close_proof_truth",
+        lambda **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        guard,
+        "_terminalize_stale_queue_after_manual_close",
+        lambda **kwargs: "MODE_CONFLICT",
+    )
+
+    import ap.manual_close_reconciliation as manual
+
+    monkeypatch.setattr(manual, "_finalize_position", lambda **kwargs: True)
+    guard._install_manual_finalizer_patch()
+
+    ok = manual._finalize_position(
+        finalizer=lambda **kwargs: True,
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        contract="NOW260828P00122000",
+        evidence={},
+    )
+
+    assert ok is False
 
 
 def test_manual_finalizer_proof_bind_failure_defers_queue_cleanup(monkeypatch):
@@ -434,6 +612,34 @@ def test_restart_downstream_proof_bind_failure_defers_queue_cleanup(monkeypatch)
     assert calls["queue"] == 0
 
 
+def test_restart_queue_mode_conflict_defers_eviction(monkeypatch):
+    monkeypatch.setattr(
+        guard,
+        "_external_exit_identity",
+        lambda *a, **k: {
+            "local_order_id": EXTERNAL_LOCAL_ID,
+            "broker_order_id": BROKER_EXIT_ID,
+        },
+    )
+    monkeypatch.setattr(
+        guard,
+        "_persist_manual_close_proof_truth",
+        lambda **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        guard,
+        "_terminalize_stale_queue_after_manual_close",
+        lambda **kwargs: "MODE_CONFLICT",
+    )
+
+    assert guard._recover_manual_close_downstream_truth(
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        broker_exit_order_id=BROKER_EXIT_ID,
+        execution_mode="live",
+    ) is False
+
+
 def test_restart_pass0_repairs_downstream_truth_after_proof_binding(monkeypatch):
     import ap.manual_close_reconciliation as manual
 
@@ -459,7 +665,7 @@ def test_restart_pass0_repairs_downstream_truth_after_proof_binding(monkeypatch)
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
         "db_contract": "NOW260828P00122000",
-        "db_direction": "CALL",
+        "db_direction": "PUT",
     }
     monkeypatch.setattr(
         manual,
@@ -474,8 +680,8 @@ def test_restart_pass0_repairs_downstream_truth_after_proof_binding(monkeypatch)
             "client_id": CLIENT,
             "execution_mode": "live",
             "contract": "NOW260828P00122000",
-            "side": "CALL",
-            "direction": "CALL",
+            "side": "PUT",
+            "direction": "PUT",
             "qty": 1,
             "quantity_remaining": 0,
             "entry_ts": "2026-08-25T18:00:00+00:00",
