@@ -1451,14 +1451,14 @@ def _recover_manual_close_downstream_truth(
     position_id: str,
     broker_exit_order_id: str,
     execution_mode: str,
-) -> None:
+) -> bool:
     """No-op until the downstream-truth guard is installed.
 
     The mandatory lifecycle guard replaces this hook at startup. Keeping the
     default inert preserves the reconciler's fail-closed behavior on branches
     where that optional guard is not present.
     """
-    return None
+    return False
 
 
 def detect_manual_closes(self) -> None:
@@ -1661,13 +1661,17 @@ def detect_manual_closes(self) -> None:
             broker_exit_order_id = str(
                 latest_durable.get("broker_order_id") or ""
             ).strip()
+            downstream_bound = False
             if broker_exit_order_id:
                 try:
-                    _recover_manual_close_downstream_truth(
-                        client_id=client_id,
-                        position_id=candidate_id,
-                        broker_exit_order_id=broker_exit_order_id,
-                        execution_mode=runner_mode,
+                    downstream_bound = (
+                        _recover_manual_close_downstream_truth(
+                            client_id=client_id,
+                            position_id=candidate_id,
+                            broker_exit_order_id=broker_exit_order_id,
+                            execution_mode=runner_mode,
+                        )
+                        is True
                     )
                 except Exception as exc:
                     log.error(
@@ -1677,6 +1681,14 @@ def detect_manual_closes(self) -> None:
                         candidate_id,
                         exc,
                     )
+            if not downstream_bound:
+                log.warning(
+                    "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_DOWNSTREAM_DEFERRED "
+                    "pos=%s — proof not bound; retaining exit-engine ownership",
+                    client_id,
+                    candidate_id,
+                )
+                continue
             _core = getattr(self, "core", None)
             _exit_eng = getattr(_core, "exit_eng", None) if _core is not None else None
             _mark = getattr(_exit_eng, "mark_position_closed", None)

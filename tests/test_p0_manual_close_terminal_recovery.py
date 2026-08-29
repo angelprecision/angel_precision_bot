@@ -534,10 +534,16 @@ def test_terminal_proof_lock_serializes_overlapping_workers(monkeypatch):
 
 # ═══ Reconciler PASS 0 wiring (proof-only recovery in detect_manual_closes) ═
 
-def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
+@pytest.mark.parametrize(
+    ("downstream_bound", "expected_closed"),
+    ((True, [POSITION_ID]), (False, [])),
+)
+def test_reconciler_pass0_gates_exit_engine_on_downstream_truth(
+    monkeypatch, downstream_bound, expected_closed
+):
     """detect_manual_closes must invoke repair_terminal_proof_from_persisted
     for each terminal-recovery candidate and evict the exit engine ONLY
-    after proof binding is proven."""
+    after downstream proof binding is proven."""
     class _Broker:
         cfg = types.SimpleNamespace(account_id="LIVE-ACCOUNT")
         def _get(self, path): return {"positions": "null"} if "/positions" in path else {"orders": "null"}
@@ -584,7 +590,7 @@ def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
                             "entry_ts": "2026-07-21T15:26:58.911238+00:00",
                         }])
     monkeypatch.setattr(manual_mod, "_recover_manual_close_downstream_truth",
-                        lambda **kwargs: None)
+                        lambda **kwargs: downstream_bound)
     monkeypatch.setattr(manual_mod.time, "time",
                         lambda: datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp())
 
@@ -592,8 +598,8 @@ def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
 
     # Recovery method was called exactly once for the candidate.
     assert any(c.get("__recovery__") == POSITION_ID for c in runner.position_manager.calls)
-    # Exit engine evicted AFTER recovery succeeded.
-    assert runner.core.exit_eng.closed == [POSITION_ID]
+    # Exit engine evicted only AFTER downstream proof binding succeeded.
+    assert runner.core.exit_eng.closed == expected_closed
 
 
 def test_reconciler_pass0_does_not_evict_when_recovery_defers(monkeypatch):
@@ -706,7 +712,7 @@ def test_reconciler_pass0_recovers_manual_residual_after_bot_partial(monkeypatch
     monkeypatch.setattr(
         manual_mod,
         "_recover_manual_close_downstream_truth",
-        lambda **kwargs: downstream_calls.append(kwargs),
+        lambda **kwargs: downstream_calls.append(kwargs) or True,
     )
     monkeypatch.setattr(
         manual_mod.time,

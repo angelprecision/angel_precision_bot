@@ -186,6 +186,31 @@ def _install_scan_boundaries(
     adopted_fills_by_pos=None,
     adopt=True,
 ):
+    import ap.manual_close_truth_guard as truth_guard
+
+    # These tests exercise reconciler ordering and broker-truth validation.
+    # Supply the downstream guard's success contract explicitly rather than
+    # depending on a real database lookup for proof identity.
+    monkeypatch.setattr(
+        truth_guard,
+        "_external_exit_identity",
+        lambda client_id, position_id, **kwargs: {
+            "local_order_id": (
+                f"external-exit:{str(client_id).strip().lower()}:test"
+            ),
+            "broker_order_id": "TEST-EXTERNAL",
+        },
+    )
+    monkeypatch.setattr(
+        truth_guard,
+        "_persist_manual_close_proof_truth",
+        lambda **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        truth_guard,
+        "_terminalize_stale_queue_after_manual_close",
+        lambda **kwargs: 0,
+    )
     monkeypatch.setattr(manual_mod.time, "time", lambda: DETECTED_EPOCH)
     monkeypatch.setattr(
         manual_mod,
@@ -1057,6 +1082,28 @@ def test_two_finalization_attempts_produce_one_terminal_economic_result(monkeypa
     position_manager.py; this test verifies the reconciler's call-through contract.
     """
     import ap.manual_close_reconciliation as manual_local
+    import ap.manual_close_truth_guard as truth_guard
+
+    monkeypatch.setattr(
+        truth_guard,
+        "_external_exit_identity",
+        lambda client_id, position_id, **kwargs: {
+            "local_order_id": (
+                f"external-exit:{str(client_id).strip().lower()}:test"
+            ),
+            "broker_order_id": "TEST-EXTERNAL",
+        },
+    )
+    monkeypatch.setattr(
+        truth_guard,
+        "_persist_manual_close_proof_truth",
+        lambda **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        truth_guard,
+        "_terminalize_stale_queue_after_manual_close",
+        lambda **kwargs: 0,
+    )
 
     call_count = [0]
 

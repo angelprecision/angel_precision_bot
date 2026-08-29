@@ -521,14 +521,26 @@ def _install_manual_finalizer_patch() -> None:
                 client_id,
                 position_id,
             )
-            return True
+            # The canonical position mutation already happened, but downstream
+            # truth is not proven. Return False so the caller retains recovery
+            # ownership and the next scan can retry the proof/queue handoff.
+            return False
         external_local_order_id = str(external.get("local_order_id") or "").strip()
         broker_exit_order_id = str(external.get("broker_order_id") or "").strip()
-        _persist_manual_close_proof_truth(
+        proof_bound = _persist_manual_close_proof_truth(
             client_id=client_id,
             position_id=position_id,
             external_local_order_id=external_local_order_id,
         )
+        if proof_bound != 1:
+            log.error(
+                "manual close finalizer proof truth not bound client=%s "
+                "position=%s updated=%s — downstream mutations deferred",
+                client_id,
+                position_id,
+                proof_bound,
+            )
+            return False
         _terminalize_stale_queue_after_manual_close(
             client_id=client_id,
             position_id=position_id,
@@ -546,7 +558,7 @@ def _recover_manual_close_downstream_truth(
     position_id: str,
     broker_exit_order_id: str,
     execution_mode: str,
-) -> None:
+) -> bool:
     """Repair proof/queue downstream state from validated restart evidence."""
     external = _external_exit_identity(
         client_id,
@@ -565,17 +577,27 @@ def _recover_manual_close_downstream_truth(
             position_id,
             expected_broker_id,
         )
-        return
-    _persist_manual_close_proof_truth(
+        return False
+    proof_bound = _persist_manual_close_proof_truth(
         client_id=client_id,
         position_id=position_id,
         external_local_order_id=str(external.get("local_order_id") or "").strip(),
     )
+    if proof_bound != 1:
+        log.error(
+            "manual close restart proof truth not bound client=%s "
+            "position=%s updated=%s — queue cleanup and eviction deferred",
+            client_id,
+            position_id,
+            proof_bound,
+        )
+        return False
     _terminalize_stale_queue_after_manual_close(
         client_id=client_id,
         position_id=position_id,
         broker_exit_order_id=expected_broker_id,
     )
+    return True
 
 
 def install_manual_close_truth_guard() -> None:

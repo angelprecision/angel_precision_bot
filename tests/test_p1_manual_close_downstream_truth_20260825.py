@@ -338,6 +338,102 @@ def test_successful_manual_finalizer_stamps_proof_and_queue(monkeypatch):
     assert calls["queue"][0]["broker_exit_order_id"] == BROKER_EXIT_ID
 
 
+def test_manual_finalizer_proof_bind_failure_defers_queue_cleanup(monkeypatch):
+    calls = {"queue": 0}
+    monkeypatch.setattr(
+        guard,
+        "_external_exit_identity",
+        lambda *a, **k: {
+            "local_order_id": EXTERNAL_LOCAL_ID,
+            "broker_order_id": BROKER_EXIT_ID,
+        },
+    )
+    monkeypatch.setattr(
+        guard,
+        "_persist_manual_close_proof_truth",
+        lambda **kwargs: 0,
+    )
+    monkeypatch.setattr(
+        guard,
+        "_terminalize_stale_queue_after_manual_close",
+        lambda **kwargs: calls.__setitem__("queue", calls["queue"] + 1),
+    )
+
+    import ap.manual_close_reconciliation as manual
+
+    monkeypatch.setattr(manual, "_finalize_position", lambda **kwargs: True)
+    guard._install_manual_finalizer_patch()
+
+    ok = manual._finalize_position(
+        finalizer=lambda **kwargs: True,
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        contract="NOW260828P00122000",
+        evidence={},
+    )
+
+    assert ok is False
+    assert calls["queue"] == 0
+
+
+def test_manual_finalizer_missing_external_identity_defers_queue_cleanup(monkeypatch):
+    calls = {"queue": 0}
+    monkeypatch.setattr(guard, "_external_exit_identity", lambda *a, **k: None)
+    monkeypatch.setattr(
+        guard,
+        "_terminalize_stale_queue_after_manual_close",
+        lambda **kwargs: calls.__setitem__("queue", calls["queue"] + 1),
+    )
+
+    import ap.manual_close_reconciliation as manual
+
+    monkeypatch.setattr(manual, "_finalize_position", lambda **kwargs: True)
+    guard._install_manual_finalizer_patch()
+
+    ok = manual._finalize_position(
+        finalizer=lambda **kwargs: True,
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        contract="NOW260828P00122000",
+        evidence={},
+    )
+
+    assert ok is False
+    assert calls["queue"] == 0
+
+
+def test_restart_downstream_proof_bind_failure_defers_queue_cleanup(monkeypatch):
+    calls = {"queue": 0}
+    monkeypatch.setattr(
+        guard,
+        "_external_exit_identity",
+        lambda *a, **k: {
+            "local_order_id": EXTERNAL_LOCAL_ID,
+            "broker_order_id": BROKER_EXIT_ID,
+        },
+    )
+    monkeypatch.setattr(
+        guard,
+        "_persist_manual_close_proof_truth",
+        lambda **kwargs: 0,
+    )
+    monkeypatch.setattr(
+        guard,
+        "_terminalize_stale_queue_after_manual_close",
+        lambda **kwargs: calls.__setitem__("queue", calls["queue"] + 1),
+    )
+
+    ok = guard._recover_manual_close_downstream_truth(
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        broker_exit_order_id=BROKER_EXIT_ID,
+        execution_mode="live",
+    )
+
+    assert ok is False
+    assert calls["queue"] == 0
+
+
 def test_restart_pass0_repairs_downstream_truth_after_proof_binding(monkeypatch):
     import ap.manual_close_reconciliation as manual
 
@@ -389,7 +485,7 @@ def test_restart_pass0_repairs_downstream_truth_after_proof_binding(monkeypatch)
     monkeypatch.setattr(
         manual,
         "_recover_manual_close_downstream_truth",
-        lambda **kwargs: calls.append(kwargs),
+        lambda **kwargs: calls.append(kwargs) or True,
     )
     monkeypatch.setattr(
         manual.time,
