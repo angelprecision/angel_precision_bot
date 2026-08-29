@@ -318,6 +318,22 @@ def test_malformed_terminal_quantity_holds_after_cancel():
     assert broker.cancel_calls == ["143387714"]
 
 
+def test_terminal_cancel_without_fill_or_remaining_evidence_holds_after_cancel():
+    terminal = _terminal()
+    terminal.pop("exec_quantity")
+    broker = _Broker(
+        positions=[[_position(1)]],
+        orders=[[_stop()], []],
+        terminal=terminal,
+    )
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_CANCEL_OUTCOME_UNPROVEN"
+    assert result["audit"]["reason"] == "quantity_unproven"
+    assert broker.cancel_calls == ["143387714"]
+
+
 def test_symbol_alias_exact_occ_is_taken_over():
     order = _stop()
     order.pop("option_symbol")
@@ -426,6 +442,21 @@ def test_historical_terminal_sells_without_fill_do_not_block_replacement():
     result = _run(broker)
     assert result["allowed"] is True
     assert result["replacement_qty"] == 1
+    assert broker.cancel_calls == []
+
+
+def test_historical_terminal_without_fill_or_remaining_evidence_holds():
+    historical = _stop("history-x", status="canceled")
+    historical.pop("exec_quantity")
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[historical], []],
+    )
+    result = _run(broker)
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS"
+    assert result["audit"]["reason"] == "quantity_unproven"
     assert broker.cancel_calls == []
 
 
@@ -774,6 +805,7 @@ def test_production_tradier_legacy_list_orders_filters_malformed_members_and_emp
 @pytest.mark.parametrize(
     "orders_payload",
     [
+        {},
         {"orders": {"unexpected": []}},
         {"orders": "not-null"},
         {"orders": {"order": "not-null"}},
@@ -810,7 +842,6 @@ def test_production_tradier_null_order_shapes_are_authoritative_empty(orders_pay
 @pytest.mark.parametrize(
     "orders_payload",
     [
-        {},
         {"orders": None},
         {"orders": ""},
         {"orders": {}},
@@ -889,6 +920,7 @@ def test_durable_gtc_protective_id_get_failure_holds_before_replacement():
 @pytest.mark.parametrize(
     "orders_payload",
     [
+        {},
         {"orders": {"unexpected": []}},
         {"orders": "not-null"},
         {"orders": {"order": "not-null"}},

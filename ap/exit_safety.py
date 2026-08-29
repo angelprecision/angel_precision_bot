@@ -671,6 +671,14 @@ def _terminal_order_outcome(
     if status not in _TERMINAL_BROKER_ORDER_STATUSES:
         return None, 0, "order_not_terminal"
 
+    # A non-filled terminal status does not prove that zero contracts were
+    # consumed when the broker omits both execution and remaining quantity.
+    # Treat that shape as unknown rather than authorizing a duplicate sell.
+    if status != "filled" and not (
+        evidence["has_exec"] or evidence["has_remaining"]
+    ):
+        return None, 0, "quantity_unproven"
+
     candidate_executed = int(candidate.get("executed") or 0)
     candidate_remaining = int(candidate["remaining"])
     if status == "filled":
@@ -970,6 +978,10 @@ def resolve_protective_exit_takeover(
             if status in {"partially_filled", "partial_fill"} and evidence["remaining"] == 0:
                 status = "filled"
             if status in _TERMINAL_BROKER_ORDER_STATUSES:
+                if status != "filled" and not (
+                    evidence["has_exec"] or evidence["has_remaining"]
+                ):
+                    return [], [], "quantity_unproven"
                 consumed = evidence["executed"]
                 if status == "filled":
                     if evidence["has_exec"]:

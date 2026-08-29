@@ -449,8 +449,6 @@ class TradierBroker(BrokerAdapter):
         empty-string nodes) normalize to ``[]``.
         """
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
-        if j == {}:
-            return []
         if not isinstance(j, dict) or "orders" not in j:
             raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
         node = j["orders"]
