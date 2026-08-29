@@ -386,13 +386,17 @@ def test_real_fill_monitor_reaches_canonical_handoff_helpers_after_trace(monkeyp
         exit_engine=ExitEngine(),
     )
 
-    assert [event[0] for event in events[:4]] == [
+    # AMENDMENT (PR #544): standing broker stop is no longer submitted from
+    # fill reconciliation — the canonical exit engine is the sole exit
+    # authority. The prior sequence ended with ``"stop"`` at index 3; that
+    # step is gone. The remaining ordered prefix is trace → pair → position,
+    # followed by an unordered ``link`` and ``seed`` pair.
+    assert [event[0] for event in events[:3]] == [
         "trace",
         "pair",
         "position",
-        "stop",
     ]
-    assert sorted(event[0] for event in events[4:]) == ["link", "seed"]
+    assert sorted(event[0] for event in events[3:]) == ["link", "seed"]
 
 
 def test_current_fill_monitor_retains_the_production_trace_shape() -> None:

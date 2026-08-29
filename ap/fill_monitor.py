@@ -7,7 +7,7 @@ This file preserves the production behaviors from the larger legacy monitor:
 - structured observability events
 - entry equity/symbol-lock release
 - 1-1 pair cancel after confirmed entry fill
-- optional broker-side standing stop after local position persistence
+- no broker-side standing stop; canonical exit engine owns exits
 - exit price/dashboard sync
 - legacy fallback helpers, but disabled in production unless explicitly allowed
 
@@ -25,7 +25,7 @@ Critical safety rules:
 - MUST NOT poll non-broker PENDING_TRIGGER watch plans.
 - MUST NOT use legacy direct DB lifecycle writes in production unless
   ALLOW_LEGACY_FILL_MONITOR=1.
-- MUST persist local position before optional broker-side standing stop.
+- MUST NOT place broker-side standing stops from fill reconciliation.
 - MUST cancel broker order before marking pair-opposite local order CANCELED.
 - filled_qty MUST be cumulative broker fill quantity, not incremental.
 """
@@ -1670,116 +1670,23 @@ def _place_standing_stop_best_effort(
     qty: int,
     entry_price: float,
 ):
-    """Optional secondary broker-side stop, after local position persistence."""
-    try:
-        if qty <= 0 or entry_price <= 0:
-            return
+    """Deprecated no-op: canonical exit execution owns all protective exits.
 
-        stop_pct = float(os.getenv("BROKER_STANDING_STOP_PCT", "0.30"))
-        stop_px = round(entry_price * (1 - stop_pct), 2)
-        contract = order.get("contract", "")
-        ticker = (order.get("symbol") or "").upper()
-
-        if hasattr(broker, "place_stop_order"):
-            stop_resp = broker.place_stop_order(symbol=contract, qty=qty, stop_price=stop_px)
-            stop_id = None
-            stop_stat = "unknown"
-            if isinstance(stop_resp, dict):
-                stop_id = stop_resp.get("id") or stop_resp.get("order_id") or stop_resp.get("broker_order_id")
-                stop_stat = str(stop_resp.get("status") or stop_resp.get("state") or "unknown")
-            log.info("[%s] Standing stop placed via broker helper @ $%.2f | broker_stop=%s status=%s", ticker, stop_px, stop_id or "?", stop_stat)
-            audit(
-                order["client_id"],
-                "INFO",
-                "STOP_ORDER_PLACED",
-                {
-                    "local_order_id": order.get("local_order_id"),
-                    "ticker": ticker,
-                    "contract": contract,
-                    "qty": int(qty),
-                    "stop_px": stop_px,
-                    "broker_stop_order_id": stop_id,
-                    "broker_stop_status": stop_stat,
-                    "source": "broker_helper",
-                },
-            )
-            return
-
-        base_url = (
-            getattr(broker, "base_url", None)
-            or getattr(getattr(broker, "cfg", None), "base_url", None)
-            or getattr(broker, "_base_url", None)
-        )
-        account_id = (
-            getattr(broker, "account_id", None)
-            or getattr(getattr(broker, "cfg", None), "account_id", None)
-            or getattr(broker, "_account_id", None)
-        )
-
-        if not base_url or not account_id or not getattr(broker, "session", None):
-            log.warning("[%s] Standing stop skipped — broker stop interface unavailable", ticker)
-            return
-
-        resp = broker.session.post(
-            f"{base_url}/v1/accounts/{account_id}/orders",
-            data={
-                "class": "option",
-                "option_symbol": contract,
-                "side": "sell_to_close",
-                "quantity": qty,
-                "type": "stop",
-                "stop": stop_px,
-                "duration": "gtc",
-            },
-            headers={"Accept": "application/json"},
-            timeout=10,
-        )
-
-        if resp.status_code < 300:
-            stop_data = (resp.json() or {}).get("order", {}) or {}
-            stop_id = stop_data.get("id", "?")
-            stop_stat = stop_data.get("status", "unknown")
-            log.info(
-                "[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",
-                ticker,
-                stop_px,
-                stop_id,
-                stop_stat,
-            )
-            audit(
-                order["client_id"],
-                "INFO",
-                "STOP_ORDER_PLACED",
-                {
-                    "local_order_id": order.get("local_order_id"),
-                    "ticker": ticker,
-                    "contract": contract,
-                    "qty": int(qty),
-                    "stop_px": stop_px,
-                    "broker_stop_order_id": stop_id,
-                    "broker_stop_status": stop_stat,
-                    "source": "rest",
-                },
-            )
-        else:
-            err_body = getattr(resp, "text", "")[:200]
-            log.warning("[%s] Standing stop FAILED — exit engine sole protection | %s", ticker, err_body)
-            audit(
-                order["client_id"],
-                "WARNING",
-                "STOP_ORDER_FAILED",
-                {
-                    "local_order_id": order.get("local_order_id"),
-                    "ticker": ticker,
-                    "stop_px": stop_px,
-                    "body": err_body,
-                },
-            )
-
-    except Exception as exc:
-        log.warning("[%s] Standing stop placement error: %s", order.get("symbol", "?"), exc)
-
-
+    A broker-side standing sell reserves the filled quantity at Tradier and can
+    cause the later canonical CLOSE_ALL order to be rejected as oversized.
+    Keep this compatibility shim for older imports, but never submit a broker
+    order from fill reconciliation.
+    """
+    ticker = (order.get("symbol") or "").upper()
+    log.info(
+        "[%s] Standing broker stop disabled; canonical exit engine owns exits | "
+        "local_order_id=%s qty=%s entry_price=%s",
+        ticker,
+        order.get("local_order_id"),
+        qty,
+        entry_price,
+    )
+    return None
 def _load_managed_position_class():
     """Resolve ManagedPosition across legacy/hardened exit-engine module paths."""
     configured = os.getenv("AP_MANAGED_POSITION_MODULE", "").strip()
@@ -2824,14 +2731,6 @@ def process_pending_order(
                     local_id=local_id,
                     broker=broker,
                     quote_broker=data_broker,
-                )
-
-                # Secondary broker-side stop is best-effort only.
-                _place_standing_stop_best_effort(
-                    broker=broker,
-                    order=order,
-                    qty=qty,
-                    entry_price=price,
                 )
 
                 bind_ok, bind_reason = _bind_filled_entry_durable_identity(
