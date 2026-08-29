@@ -4285,6 +4285,13 @@ class APBrokerReconciler:
             return 0.0
 
         if value > 0:
+            position_id = str(
+                pos.get("id") or pos.get("position_id") or ""
+            ).strip()
+            position_contract = self._norm_contract(
+                pos.get("contract") or pos.get("symbol") or ""
+            )
+            expected_contract = self._norm_contract(contract)
             try:
                 from ap.order_state_machine import _durable_execution_mode
 
@@ -4299,7 +4306,10 @@ class APBrokerReconciler:
                 expected_client = ""
 
             if (
-                position_client
+                position_id
+                and position_contract
+                and position_contract == expected_contract
+                and position_client
                 and position_client == expected_client
                 and expected_mode is not None
                 and position_mode == expected_mode
@@ -4309,12 +4319,15 @@ class APBrokerReconciler:
             log.warning(
                 "[%s] POSITION_ENTRY_UNDERLYING_UNPROVEN "
                 "position_id=%s client=%s mode=%s expected_mode=%s "
+                "contract=%s expected_contract=%s "
                 "— falling through to exact filled-entry history",
                 self.client_id,
-                str(pos.get("id") or pos.get("position_id") or "").strip(),
+                position_id,
                 position_client or "<missing>",
                 position_mode or "<missing>",
                 expected_mode or "<missing>",
+                position_contract or "<missing>",
+                expected_contract or "<missing>",
             )
 
         position_id = str(pos.get("id") or pos.get("position_id") or "").strip()
