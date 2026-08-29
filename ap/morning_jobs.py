@@ -34,11 +34,14 @@ MORNING_HANDOFF_AUDIT_ENDPOINT = "/admin/morning_handoff_audit"
 RELEASE_AFTER_HOURS_DEFERRED_ENDPOINT = "/admin/release_after_hours_deferred"
 PAPER_RESTART_GUARD_ENDPOINT = "/admin/paper_rescue_restart_guard"
 
+# The authoritative overnight pass begins only once the regular session is open.
+# Premarket can still leave WATCHING inventory staged, but morning automation no
+# longer assumes Tradier has the current-session data required to finish the pass.
 JOB_TARGET_MINUTE = {
-    OVERNIGHT_REEVAL_BATCH_JOB: (9, 18),
-    MORNING_HANDOFF_PRIMARY_JOB: (9, 25),
-    MORNING_HANDOFF_BACKUP_JOB: (9, 31),
-    MORNING_RECOVERY_JOB: (9, 37),
+    OVERNIGHT_REEVAL_BATCH_JOB: (9, 30),
+    MORNING_HANDOFF_PRIMARY_JOB: (9, 30),  # compatibility/manual alias only
+    MORNING_HANDOFF_BACKUP_JOB: (9, 32),
+    MORNING_RECOVERY_JOB: (9, 36),
 }
 
 
@@ -238,7 +241,6 @@ def build_job_calls(
 ) -> list[MorningJobCall]:
     live_client = str(live_client).strip()
     paper_client_list = _normalize_clients(paper_clients or DEFAULT_PAPER_CLIENTS)
-    all_clients = [live_client, *paper_client_list]
     if job_name == OVERNIGHT_REEVAL_BATCH_JOB:
         return [
             MorningJobCall(
@@ -291,32 +293,56 @@ def build_job_calls(
         live_release_enabled = str(
             _os.getenv("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN", "false")
         ).strip().lower() in ("1", "true", "yes")
-        release_clients = all_clients if live_release_enabled else list(paper_client_list)
-        release_scope = "live+paper" if live_release_enabled else "paper_only"
-        return [
-            MorningJobCall(
-                job_name=f"release_after_hours_deferred_{release_scope}",
-                endpoint=RELEASE_AFTER_HOURS_DEFERRED_ENDPOINT,
-                payload=build_release_after_hours_deferred_payload(
-                    clients=release_clients,
-                    force=True,
-                    lookback_h=36,
-                ),
-                client_scope=",".join(release_clients),
-                execution_mode="paper" if not live_release_enabled else "mixed",
-            ),
-            MorningJobCall(
-                job_name="paper_rescue_restart_guard",
-                endpoint=PAPER_RESTART_GUARD_ENDPOINT,
-                payload=build_paper_rescue_restart_guard_payload(
-                    clients=paper_client_list,
-                    lookback_h=36,
-                    dry_run=False,
-                ),
-                client_scope=",".join(paper_client_list),
-                execution_mode="paper",
-            ),
-        ]
+
+        # Recovery calls are mode-pure. The old combined call was tagged
+        # execution_mode="mixed", so a LIVE-scoped scheduler filtered it out
+        # before execution. That let a LIVE recovery cron exit green after doing
+        # zero work. Keep live and paper authority separate all the way to the
+        # endpoint payload.
+        calls: list[MorningJobCall] = []
+        if live_release_enabled and live_client:
+            calls.append(
+                MorningJobCall(
+                    job_name="release_after_hours_deferred_live",
+                    endpoint=RELEASE_AFTER_HOURS_DEFERRED_ENDPOINT,
+                    payload=build_release_after_hours_deferred_payload(
+                        clients=[live_client],
+                        force=True,
+                        lookback_h=36,
+                    ),
+                    client_scope=live_client,
+                    execution_mode="live",
+                )
+            )
+
+        if paper_client_list:
+            calls.extend(
+                [
+                    MorningJobCall(
+                        job_name="release_after_hours_deferred_paper",
+                        endpoint=RELEASE_AFTER_HOURS_DEFERRED_ENDPOINT,
+                        payload=build_release_after_hours_deferred_payload(
+                            clients=paper_client_list,
+                            force=True,
+                            lookback_h=36,
+                        ),
+                        client_scope=",".join(paper_client_list),
+                        execution_mode="paper",
+                    ),
+                    MorningJobCall(
+                        job_name="paper_rescue_restart_guard",
+                        endpoint=PAPER_RESTART_GUARD_ENDPOINT,
+                        payload=build_paper_rescue_restart_guard_payload(
+                            clients=paper_client_list,
+                            lookback_h=36,
+                            dry_run=False,
+                        ),
+                        client_scope=",".join(paper_client_list),
+                        execution_mode="paper",
+                    ),
+                ]
+            )
+        return calls
     raise ValueError(f"unsupported MORNING_JOB={job_name!r}")
 
 
