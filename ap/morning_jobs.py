@@ -40,7 +40,9 @@ PAPER_RESTART_GUARD_ENDPOINT = "/admin/paper_rescue_restart_guard"
 JOB_TARGET_MINUTE = {
     OVERNIGHT_REEVAL_BATCH_JOB: (9, 30),
     MORNING_HANDOFF_PRIMARY_JOB: (9, 30),  # compatibility/manual alias only
-    MORNING_HANDOFF_BACKUP_JOB: (9, 32),
+    # The evaluator has a 120-second HTTP work budget. Keep the reconciliation
+    # watchdog outside that budget so it cannot race a still-running 09:30 pass.
+    MORNING_HANDOFF_BACKUP_JOB: (9, 34),
     MORNING_RECOVERY_JOB: (9, 36),
 }
 
