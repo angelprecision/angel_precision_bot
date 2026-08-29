@@ -19,14 +19,20 @@ from ap.order_state_machine import _durable_protective_order_id_for_position  # 
 
 CLIENT = "jasoncosby1@gmail.com"
 CONTRACT = "NOW260828P00122000"
+CURRENT_ENTRY_TS = "2026-08-28T15:00:00+00:00"
+HISTORICAL_FILL_TS = "2026-08-28T14:59:00+00:00"
+CURRENT_FILL_TS = "2026-08-28T15:01:00+00:00"
 
 
 def _position(qty, contract=CONTRACT, account="ACC123"):
     return {"symbol": contract, "quantity": qty, "side": "PUT", "account_id": account}
 
 
-def _stop(order_id="143387714", *, contract=CONTRACT, account="ACC123", status="open", qty=1, executed=0):
-    return {
+def _stop(
+    order_id="143387714", *, contract=CONTRACT, account="ACC123", status="open",
+    qty=1, executed=0, fill_ts=None,
+):
+    order = {
         "id": order_id,
         "status": status,
         "class": "option",
@@ -38,10 +44,18 @@ def _stop(order_id="143387714", *, contract=CONTRACT, account="ACC123", status="
         "duration": "gtc",
         "account_id": account,
     }
+    if fill_ts is not None:
+        order["last_fill_date"] = fill_ts
+    return order
 
 
-def _terminal(order_id="143387714", *, status="canceled", qty=1, executed=0, **updates):
-    order = _stop(order_id, status=status, qty=qty, executed=executed)
+def _terminal(
+    order_id="143387714", *, status="canceled", qty=1, executed=0,
+    fill_ts=None, **updates,
+):
+    order = _stop(
+        order_id, status=status, qty=qty, executed=executed, fill_ts=fill_ts,
+    )
     order["symbol"] = "NOW"
     order.update(updates)
     return order
@@ -97,7 +111,10 @@ class _Broker:
         return self._terminal
 
 
-def _run(broker, *, qty=1, mode="live", contract=CONTRACT, protective_broker_order_id=None):
+def _run(
+    broker, *, qty=1, mode="live", contract=CONTRACT,
+    protective_broker_order_id=None, entry_ts=None,
+):
     return resolve_protective_exit_takeover(
         broker=broker,
         client_id=CLIENT,
@@ -107,6 +124,7 @@ def _run(broker, *, qty=1, mode="live", contract=CONTRACT, protective_broker_ord
         contract=contract,
         requested_qty=qty,
         protective_broker_order_id=protective_broker_order_id,
+        current_position_entry_ts=entry_ts,
     )
 
 
@@ -460,17 +478,64 @@ def test_historical_terminal_without_fill_or_remaining_evidence_holds():
     assert broker.cancel_calls == []
 
 
-def test_identical_terminal_filled_order_in_both_snapshots_holds_on_stale_position():
-    historical = _stop("history-x", status="filled", executed=1)
+def test_same_occ_reentry_ignores_pre_entry_terminal_fill_in_both_snapshots():
+    historical = _stop(
+        "history-x",
+        status="filled",
+        executed=1,
+        fill_ts=HISTORICAL_FILL_TS,
+    )
     broker = _Broker(
         positions=[[_position(1)], [_position(1)]],
         orders=[[historical], [dict(historical)]],
     )
-    result = _run(broker)
+    result = _run(broker, entry_ts=CURRENT_ENTRY_TS)
+    assert result["allowed"] is True
+    assert result["replacement_qty"] == 1
+    assert result["reason"] == "EXIT_PROTECTIVE_NO_CONFLICT"
+    assert result["audit"]["terminal_historical_fill_ids"] == ["history-x"]
+    assert result["audit"]["observed_terminal_execution_total"] == 0
+    assert broker.cancel_calls == []
+
+
+def test_current_position_terminal_fill_after_entry_still_holds_on_stale_position():
+    current_fill = _stop(
+        "current-fill",
+        status="filled",
+        executed=1,
+        fill_ts=CURRENT_FILL_TS,
+    )
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[current_fill], [dict(current_fill)]],
+    )
+    result = _run(broker, entry_ts=CURRENT_ENTRY_TS)
     assert result["allowed"] is False
     assert result["replacement_qty"] == 0
     assert result["reason"] == "EXIT_PROTECTIVE_POSITION_UNPROVEN"
     assert result["audit"]["reason"] == "position_snapshot_stale_after_order_fill"
+    assert result["audit"]["terminal_current_fill_ids"] == ["current-fill"]
+    assert result["audit"]["observed_terminal_execution_total"] == 1
+    assert broker.cancel_calls == []
+
+
+def test_durable_current_protective_fill_counts_from_first_terminal_inventory():
+    protective_id = "current-protective"
+    current_fill = _stop(protective_id, status="filled", executed=1)
+    broker = _Broker(
+        positions=[[_position(1)], [_position(1)]],
+        orders=[[current_fill], [dict(current_fill)]],
+        terminal=current_fill,
+    )
+    result = _run(
+        broker,
+        entry_ts=CURRENT_ENTRY_TS,
+        protective_broker_order_id=protective_id,
+    )
+    assert result["allowed"] is False
+    assert result["replacement_qty"] == 0
+    assert result["reason"] == "EXIT_PROTECTIVE_POSITION_UNPROVEN"
+    assert result["audit"]["terminal_current_fill_ids"] == [protective_id]
     assert result["audit"]["observed_terminal_execution_total"] == 1
     assert broker.cancel_calls == []
 
@@ -482,9 +547,11 @@ def test_terminal_fill_delta_does_not_get_subtracted_from_final_position():
         positions=[[_position(2)], [_position(1)]],
         orders=[[initial], [final]],
     )
-    result = _run(broker, qty=2)
+    result = _run(broker, qty=2, entry_ts=CURRENT_ENTRY_TS)
     assert result["allowed"] is True
     assert result["replacement_qty"] == 1
+    assert result["audit"]["terminal_current_fill_ids"] == ["history-x"]
+    assert result["audit"]["observed_terminal_execution_delta"] == 1
     assert broker.cancel_calls == []
 
 

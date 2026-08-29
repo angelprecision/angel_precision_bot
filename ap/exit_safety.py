@@ -317,6 +317,13 @@ _TERMINAL_BROKER_ORDER_STATUSES = {
     "canceled", "cancelled", "expired", "filled", "rejected",
 }
 _PROTECTIVE_ORDER_TYPES = {"stop", "stop_limit", "stop-limit", "stoplimit"}
+_BROKER_EXECUTION_TIMESTAMP_KEYS = (
+    "last_fill_date",
+    "filled_at",
+    "filled_ts",
+    "fill_ts",
+    "transaction_date",
+)
 
 
 def _exact_order_contract(raw: dict[str, Any]) -> str:
@@ -476,6 +483,83 @@ def _order_quantity_evidence(
         "has_exec": has_exec,
         "has_remaining": has_remaining,
     }, None
+
+
+def _parse_trusted_broker_execution_timestamp(value: Any) -> Optional[datetime]:
+    """Parse an explicit broker execution timestamp, or return ``None``.
+
+    Order creation/update timestamps are deliberately excluded.  A timestamp
+    can fence a historical terminal fill only when it is timezone-aware (or an
+    unambiguous numeric epoch); a naive broker value is not sufficient proof
+    of which position lifecycle consumed the contracts.
+    """
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+        try:
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+        except Exception:
+            return None
+    elif isinstance(value, (int, float)):
+        try:
+            raw = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(raw):
+            return None
+        if raw > 10_000_000_000:
+            raw /= 1000.0
+        try:
+            parsed = datetime.fromtimestamp(raw, tz=timezone.utc)
+        except Exception:
+            return None
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except Exception:
+            return None
+        try:
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+        except Exception:
+            return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _order_execution_timestamp(
+    raw: dict[str, Any], *, status: str,
+) -> tuple[Optional[datetime], str | None, str | None]:
+    """Return one unambiguous broker execution timestamp for an order row.
+
+    ``transaction_date`` is a last-update field in Tradier's response and is
+    accepted only for a terminal FILLED order.  A present malformed field or
+    contradictory execution aliases is an evidence gap, not a reason to fall
+    back to an order creation timestamp.
+    """
+    candidates: list[tuple[str, datetime]] = []
+    for key in _BROKER_EXECUTION_TIMESTAMP_KEYS:
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        if key == "transaction_date" and status != "filled":
+            continue
+        parsed = _parse_trusted_broker_execution_timestamp(value)
+        if parsed is None:
+            return None, None, "execution_timestamp_unproven"
+        candidates.append((key, parsed))
+    if not candidates:
+        return None, None, None
+    first_key, first_timestamp = candidates[0]
+    if any(timestamp != first_timestamp for _, timestamp in candidates[1:]):
+        return None, None, "execution_timestamp_conflict"
+    return first_timestamp, first_key, None
 
 
 def _exact_order_snapshot_row_issue(
@@ -756,6 +840,86 @@ def _merge_terminal_order_history(
     return by_id, execution_deltas, None
 
 
+def _scope_terminal_order_history(
+    terminal_by_id: dict[str, dict[str, Any]],
+    execution_deltas: dict[str, int],
+    *,
+    protective_broker_order_id: str,
+    current_position_entry_ts: Optional[datetime],
+) -> tuple[dict[str, dict[str, Any]], dict[str, int], dict[str, Any], str | None]:
+    """Fence cumulative terminal fills to the current position lifecycle.
+
+    A terminal sell with no execution delta is current only when its exact
+    durable protective ID proves ownership or its trusted broker execution
+    timestamp is at/after the canonical position entry.  A positive execution
+    delta observed across this takeover attempt is current race evidence.  A
+    pre-entry unchanged fill is historical noise and is excluded from the
+    coherence subtraction.  Anything else remains unproven and holds closed.
+    """
+    current: dict[str, dict[str, Any]] = {}
+    current_deltas: dict[str, int] = {}
+    historical_ids: list[str] = []
+    historical_consumed_qty = 0
+    unproven_ids: list[str] = []
+
+    for broker_order_id, order in terminal_by_id.items():
+        try:
+            consumed = max(int(order.get("consumed") or 0), 0)
+            execution_delta = max(int(execution_deltas.get(broker_order_id, 0) or 0), 0)
+        except (TypeError, ValueError):
+            return {}, {}, {}, "quantity_unproven"
+        if consumed <= 0:
+            continue
+
+        execution_timestamp = order.get("execution_timestamp")
+        exact_durable_id = bool(
+            protective_broker_order_id
+            and broker_order_id == protective_broker_order_id
+        )
+        observed_during_takeover = execution_delta > 0
+
+        # A dynamic execution increase is strong race evidence.  If the same
+        # row also carries a trusted pre-entry timestamp, the evidence is
+        # contradictory rather than something to silently prefer.
+        if (
+            current_position_entry_ts is not None
+            and execution_timestamp is not None
+            and execution_timestamp < current_position_entry_ts
+            and (exact_durable_id or observed_during_takeover)
+        ):
+            return {}, {}, {}, "terminal_execution_lifecycle_conflict"
+
+        if exact_durable_id or observed_during_takeover:
+            current[broker_order_id] = order
+            current_deltas[broker_order_id] = execution_delta
+        elif (
+            current_position_entry_ts is not None
+            and execution_timestamp is not None
+            and execution_timestamp >= current_position_entry_ts
+        ):
+            current[broker_order_id] = order
+            current_deltas[broker_order_id] = execution_delta
+        elif (
+            current_position_entry_ts is not None
+            and execution_timestamp is not None
+            and execution_timestamp < current_position_entry_ts
+        ):
+            historical_ids.append(broker_order_id)
+            historical_consumed_qty += consumed
+        else:
+            unproven_ids.append(broker_order_id)
+
+    audit = {
+        "terminal_current_fill_ids": sorted(current),
+        "terminal_historical_fill_ids": sorted(historical_ids),
+        "terminal_historical_consumed_qty": int(historical_consumed_qty),
+        "terminal_unproven_fill_ids": sorted(unproven_ids),
+    }
+    if unproven_ids:
+        return current, current_deltas, audit, "terminal_fill_lifecycle_unproven"
+    return current, current_deltas, audit, None
+
+
 def resolve_protective_exit_takeover(
     *,
     broker: Any,
@@ -766,6 +930,7 @@ def resolve_protective_exit_takeover(
     contract: str,
     requested_qty: int,
     protective_broker_order_id: str | None = None,
+    current_position_entry_ts: Any = None,
 ) -> dict[str, Any]:
     """Prove broker sell ownership immediately before a LIVE EXIT POST.
 
@@ -775,6 +940,7 @@ def resolve_protective_exit_takeover(
     mode = str(execution_mode or "").strip().lower()
     exact_contract = _normalize_contract(contract)
     account = _extract_broker_account_id(broker)
+    parsed_position_entry_ts = _parse_entry_ts(current_position_entry_ts)
     audit: dict[str, Any] = {
         "event": "EXIT_PROTECTIVE_PREFLIGHT_START",
         "checked_at": now_utc_iso(),
@@ -785,6 +951,12 @@ def resolve_protective_exit_takeover(
         "contract": str(contract or ""),
         "requested_qty": requested_qty,
         "account": account,
+        "current_position_entry_ts": (
+            parsed_position_entry_ts.isoformat()
+            if parsed_position_entry_ts is not None
+            else None
+        ),
+        "current_position_entry_ts_proven": parsed_position_entry_ts is not None,
     }
     if mode != "live" or not exact_contract or not isinstance(requested_qty, int) \
             or isinstance(requested_qty, bool) or requested_qty <= 0:
@@ -978,6 +1150,11 @@ def resolve_protective_exit_takeover(
             if status in {"partially_filled", "partial_fill"} and evidence["remaining"] == 0:
                 status = "filled"
             if status in _TERMINAL_BROKER_ORDER_STATUSES:
+                execution_timestamp, execution_timestamp_key, execution_timestamp_issue = (
+                    _order_execution_timestamp(row, status=status)
+                )
+                if execution_timestamp_issue:
+                    return [], [], execution_timestamp_issue
                 if status != "filled" and not (
                     evidence["has_exec"] or evidence["has_remaining"]
                 ):
@@ -1004,6 +1181,8 @@ def resolve_protective_exit_takeover(
                         "remaining": evidence["remaining"],
                         "consumed": int(consumed),
                         "order_type": order_type,
+                        "execution_timestamp": execution_timestamp,
+                        "execution_timestamp_key": execution_timestamp_key,
                     }
                 )
                 continue
@@ -1065,9 +1244,32 @@ def resolve_protective_exit_takeover(
                 reason=terminal_history_issue,
             )
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
+        (
+            scoped_terminal_by_id,
+            scoped_execution_deltas,
+            lifecycle_audit,
+            lifecycle_issue,
+        ) = _scope_terminal_order_history(
+            terminal_by_id,
+            execution_deltas,
+            protective_broker_order_id=durable_id,
+            current_position_entry_ts=parsed_position_entry_ts,
+        )
+        audit.update(lifecycle_audit)
+        if lifecycle_issue:
+            audit.update(
+                event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED",
+                reason=lifecycle_issue,
+            )
+            return {
+                "allowed": False,
+                "replacement_qty": 0,
+                "reason": "EXIT_PROTECTIVE_POSITION_UNPROVEN",
+                "audit": audit,
+            }
         terminal_fill_ids = {
             broker_order_id
-            for broker_order_id, order in terminal_by_id.items()
+            for broker_order_id, order in scoped_terminal_by_id.items()
             if int(order.get("consumed") or 0) > 0
         }
         if len(terminal_fill_ids) > 1:
@@ -1078,12 +1280,12 @@ def resolve_protective_exit_takeover(
             )
             return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_ACTIVE_BROKER_SELL_AMBIGUOUS", "audit": audit}
         observed_execution_delta = sum(
-            max(int(delta), 0) for delta in execution_deltas.values()
+            max(int(delta), 0) for delta in scoped_execution_deltas.values()
         )
         audit["observed_terminal_execution_delta"] = observed_execution_delta
         terminal_consumed_qty = sum(
             max(int(order.get("consumed") or 0), 0)
-            for order in terminal_by_id.values()
+            for order in scoped_terminal_by_id.values()
         )
         audit["observed_terminal_execution_total"] = terminal_consumed_qty
 

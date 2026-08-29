@@ -6725,6 +6725,12 @@ class APOrderStateMachine:
                 contract=str(contract or ""),
                 requested_qty=requested_qty,
                 protective_broker_order_id=_protective_id,
+                current_position_entry_ts=(
+                    (safety.get("position_state") or {}).get("entry_ts")
+                    if isinstance(safety, dict)
+                    and isinstance(safety.get("position_state"), dict)
+                    else None
+                ),
             )
             _takeover_audit = dict(_takeover.get("audit") or {})
             _upd_takeover = getattr(self, "update_order_meta", None)
