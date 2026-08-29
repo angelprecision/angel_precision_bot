@@ -70,12 +70,6 @@ jobs:
 
       - name: Run P0 plus cohesion tests
         env:
-          # PR #388 CI fix: PGSSLMODE=disable so ap.db never tries SSL
-          # against CI's localhost Postgres. Prior runs hit
-          # "server does not support SSL, but SSL was required" on every
-          # DB access, which caused source-truth tests that legitimately
-          # patch _fetch_watching_signals to instead fail because the
-          # compat layer's fallback path attempted an SSL connect.
           PGSSLMODE: "disable"
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
@@ -128,6 +122,7 @@ jobs:
             tests/test_fill_monitor_mvp_hardening.py \
             tests/test_p0_trace_non_authority.py \
             tests/test_p0_filled_entry_durable_identity_handoff.py \
+            tests/test_p0_disable_standing_protective_stop.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
             tests/test_p0_pending_trigger_restart_recovery.py \
