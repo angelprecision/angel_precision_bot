@@ -16,12 +16,16 @@ _TABLE_READY = False
 PROCESSING_STALE_MINUTES = int(os.getenv("PREOPEN_PROCESSING_STALE_MINUTES", "10"))
 WATCHING_ORPHAN_GRACE_MINUTES = int(os.getenv("PREOPEN_WATCHING_ORPHAN_GRACE_MINUTES", "5"))
 PENDING_TRIGGER_LOOKBACK_HOURS = int(os.getenv("STARTUP_WATCHER_RESEED_LOOKBACK_HOURS", "48"))
+# Premarket Tradier data is not authoritative for the overnight handoff. Keep
+# readiness diagnostic before the bell and begin fail-closed enforcement only
+# once the regular session opens and the reevaluation can use current-session
+# data.
 READINESS_ENFORCEMENT_START_HOUR_ET = int(os.getenv("PREOPEN_READINESS_START_HOUR_ET", "9"))
-READINESS_ENFORCEMENT_START_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_START_MINUTE_ET", "0"))
+READINESS_ENFORCEMENT_START_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_START_MINUTE_ET", "30"))
 READINESS_ENFORCEMENT_END_HOUR_ET = int(os.getenv("PREOPEN_READINESS_END_HOUR_ET", "10"))
 READINESS_ENFORCEMENT_END_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_END_MINUTE_ET", "0"))
 OVERNIGHT_REEVAL_DUE_HOUR_ET = int(os.getenv("OVERNIGHT_REEVAL_DUE_HOUR_ET", "9"))
-OVERNIGHT_REEVAL_DUE_MINUTE_ET = int(os.getenv("OVERNIGHT_REEVAL_DUE_MINUTE_ET", "18"))
+OVERNIGHT_REEVAL_DUE_MINUTE_ET = int(os.getenv("OVERNIGHT_REEVAL_DUE_MINUTE_ET", "30"))
 
 
 def _now_et(now: datetime | None = None) -> datetime:
