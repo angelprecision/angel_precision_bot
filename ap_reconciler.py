@@ -203,6 +203,7 @@ def _historical_underlying_from_mapping(value) -> tuple[float, bool]:
         return 0.0, False
 
     values: list[float] = []
+    saw_explicit_zero = False
     for key in _HISTORICAL_UNDERLYING_KEYS:
         if key not in value:
             continue
@@ -218,6 +219,7 @@ def _historical_underlying_from_mapping(value) -> tuple[float, bool]:
         if not math.isfinite(numeric):
             return 0.0, True
         if numeric == 0:
+            saw_explicit_zero = True
             continue
         if numeric < 0:
             return 0.0, True
@@ -225,6 +227,10 @@ def _historical_underlying_from_mapping(value) -> tuple[float, bool]:
 
     if not values:
         return 0.0, False
+    # An explicit zero alongside a positive alias is contradictory evidence.
+    # Treat it as malformed instead of allowing a later alias to override it.
+    if saw_explicit_zero:
+        return 0.0, True
     if any(candidate != values[0] for candidate in values[1:]):
         return 0.0, True
     return values[0], False
@@ -4162,15 +4168,20 @@ class APBrokerReconciler:
 
         try:
             from ap.db import conn, run_with_retry
+            from ap.order_state_machine import (
+                _DURABLE_EXECUTION_MODE_SQL,
+                _durable_execution_mode,
+            )
 
             def _fetch() -> list[dict]:
                 with conn() as c:
                     c.execute(
-                        """
-                        SELECT fill_price, filled_qty, filled_ts, meta
+                        f"""
+                        SELECT fill_price, filled_qty, filled_ts,
+                               execution_mode, meta
                         FROM orders
                         WHERE client_id=%s
-                          AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s
+                          AND {_DURABLE_EXECUTION_MODE_SQL}
                           AND UPPER(TRIM(COALESCE(contract,'')))=%s
                           AND UPPER(TRIM(COALESCE(kind,'')))='ENTRY'
                           AND UPPER(TRIM(COALESCE(status,''))) IN ('FILLED','PARTIAL_FILL')
@@ -4196,6 +4207,15 @@ class APBrokerReconciler:
                 return 0.0
 
             row = rows[0]
+            row_mode = _durable_execution_mode(row)
+            if row_mode != mode:
+                log.critical(
+                    "[%s] FILLED_ENTRY_UNDERLYING_MODE_UNPROVEN "
+                    "contract=%s expected_mode=%s row_mode=%s position_id=%s",
+                    client_id, contract, mode, row_mode, position_id,
+                )
+                return 0.0
+
             fill_price = _positive_finite_float(row.get("fill_price"))
             filled_qty = _positive_finite_float(row.get("filled_qty"))
             if (
