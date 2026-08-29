@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+from pathlib import Path
+import re
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text()
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{path}: expected exactly one match, found {count}: {old!r}")
+    p.write_text(text.replace(old, new, 1))
+
+
+def replace_func(path: str, name: str, replacement: str) -> None:
+    p = Path(path)
+    text = p.read_text()
+    pattern = re.compile(rf"def {re.escape(name)}\([^\n]*\):\n.*?(?=\ndef |\Z)", re.S)
+    match = pattern.search(text)
+    if not match:
+        raise SystemExit(f"{path}: function not found: {name}")
+    p.write_text(text[: match.start()] + replacement.rstrip() + "\n\n" + text[match.end() :])
+
+
+replace_once(
+    "client_runner.py",
+    "    def _overnight_reeval_window_start(self, today):\n        return datetime(today.year, today.month, today.day, 9, 0, 0, tzinfo=_ET)",
+    "    def _overnight_reeval_window_start(self, today):\n        # Required Tradier morning data is not authoritative premarket.\n        # Stage inventory before open, but do not run the authoritative\n        # overnight reevaluation until the regular session begins.\n        return datetime(today.year, today.month, today.day, 9, 30, 0, tzinfo=_ET)",
+)
+
+# Keep PAPER and LIVE on the same open-time authority.
+paper_path = Path(".github/workflows/paper-morning-jobs.yml")
+paper_text = paper_path.read_text().replace('"32 13 * * 1-5"', '"34 13 * * 1-5"').replace(
+    '"32 14 * * 1-5"', '"34 14 * * 1-5"'
+)
+paper_path.write_text(paper_text)
+
+new_test = Path("tests/test_open_time_morning_autonomy.py")
+new_test.write_text(new_test.read_text().replace('"32 13 * * 1-5"', '"34 13 * * 1-5"'))
+
+# Source-contract counts now reflect 3 LIVE jobs x EDT/EST, not four jobs.
+auto_path = Path("tests/test_p0_autonomous_morning_handoff.py")
+auto_text = auto_path.read_text().replace(
+    'assert src.count("MORNING_JOB_EXECUTION_MODE, value: live") == 8',
+    'assert src.count("MORNING_JOB_EXECUTION_MODE, value: live") == 6',
+).replace(
+    'assert src.count("MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com") == 8',
+    'assert src.count("MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com") == 6',
+)
+auto_path.write_text(auto_text)
+
+live_tests = "tests/test_p0_live_morning_jobs.py"
+replace_func(
+    live_tests,
+    "test_workflow_is_backup_only_and_uses_module_invocation",
+    '''def test_workflow_is_backup_only_and_uses_module_invocation():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
+    for expr in (
+        "40 13 * * 1-5",
+        "40 14 * * 1-5",
+        "50 13 * * 1-5",
+        "50 14 * * 1-5",
+    ):
+        assert expr in workflow
+    assert "18 13 * * 1-5" not in workflow
+    assert "26 13 * * 1-5" not in workflow
+    assert "python3 -m ap.scripts.live_morning_jobs" in workflow
+    assert "python3 ap/scripts/live_morning_jobs.py" not in workflow
+''',
+)
+replace_func(
+    live_tests,
+    "test_render_blueprint_defines_primary_render_cron_jobs",
+    '''def test_render_blueprint_defines_primary_render_cron_jobs():
+    blueprint = (REPO_ROOT / "render.yaml").read_text()
+    assert blueprint.count("type: cron") == 8
+    for expr in (
+        "30 13 * * 1-5",
+        "30 14 * * 1-5",
+        "34 13 * * 1-5",
+        "34 14 * * 1-5",
+        "36 13 * * 1-5",
+        "36 14 * * 1-5",
+        "50 19 * * 1-5",
+        "50 20 * * 1-5",
+    ):
+        assert expr in blueprint
+    assert "18 13 * * 1-5" not in blueprint
+    assert "26 13 * * 1-5" not in blueprint
+    assert "32 13 * * 1-5" not in blueprint
+    assert 'startCommand: "python -m ap.scripts.live_morning_jobs"' in blueprint
+''',
+)
+replace_func(
+    live_tests,
+    "test_render_primary_crons_are_live_scoped_to_jason_only",
+    '''def test_render_primary_crons_are_live_scoped_to_jason_only():
+    blueprint = (REPO_ROOT / "render.yaml").read_text()
+    assert blueprint.count("MORNING_JOB_EXECUTION_MODE, value: live") == 6
+    assert blueprint.count("MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com") == 6
+''',
+)
+replace_func(
+    live_tests,
+    "test_recovery_release_is_paper_only_by_default",
+    '''def test_recovery_builds_canonical_live_reeval_and_paper_recovery():
+    calls = build_job_calls(MORNING_RECOVERY_JOB)
+    live_calls = [call for call in calls if call.execution_mode == "live"]
+    paper_calls = [call for call in calls if call.execution_mode == "paper"]
+    assert len(live_calls) == 1
+    assert live_calls[0].endpoint == "/admin/overnight_reeval"
+    assert live_calls[0].payload["clients"] == [DEFAULT_LIVE_CLIENT]
+    assert live_calls[0].payload["force"] is True
+    assert [call.endpoint for call in paper_calls] == [
+        "/admin/release_after_hours_deferred",
+        "/admin/paper_rescue_restart_guard",
+    ]
+''',
+)
+replace_func(
+    live_tests,
+    "test_recovery_release_includes_live_only_when_flag_set",
+    '''def test_recovery_never_uses_mixed_execution_mode():
+    calls = build_job_calls(MORNING_RECOVERY_JOB)
+    assert all(call.execution_mode in {"live", "paper"} for call in calls)
+    assert all(call.execution_mode != "mixed" for call in calls)
+''',
+)
+replace_func(
+    live_tests,
+    "test_paper_workflow_uses_batch_job_name_and_paper_only_env",
+    '''def test_paper_workflow_uses_batch_job_name_and_paper_only_env():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "paper-morning-jobs.yml").read_text()
+    assert 'default: "overnight_reeval_batch"' in workflow
+    assert '          - overnight_reeval_batch' in workflow
+    assert '"30 13 * * 1-5"|"30 14 * * 1-5") JOB="overnight_reeval_batch"' in workflow
+    assert '"34 13 * * 1-5"|"34 14 * * 1-5") JOB="morning_handoff_backup"' in workflow
+    assert '"36 13 * * 1-5"|"36 14 * * 1-5") JOB="morning_recovery"' in workflow
+    assert "BOT_URL:" in workflow
+    assert "MORNING_JOB_EXECUTION_MODE: paper" in workflow
+    assert "MORNING_JOB_PAPER_CLIENTS:" in workflow
+    assert 'MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "10"' in workflow
+    assert "jasoncosby1@gmail.com" not in workflow
+''',
+)
+
+retry_tests = "tests/test_p0_overnight_reeval_retry_liveness.py"
+retry_path = Path(retry_tests)
+retry_path.write_text(
+    retry_path.read_text().replace(
+        "scheduler's 9:00–9:45 ET window",
+        "scheduler's 9:30–9:45 ET window",
+    )
+)
+replace_func(
+    retry_tests,
+    "test_first_all_deferred_stall_schedules_retry_and_skips_post_handoff",
+    '''def test_first_all_deferred_stall_schedules_retry_and_skips_post_handoff(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: calls.append(kwargs) or _result())
+    runner = _runner()
+
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9, 30), source="scheduler")
+
+    assert result["result_class"] == "RETRYABLE_ALL_DEFERRED"
+    assert result["retryable"] is True
+    assert runner._overnight_reeval_success_date is None
+    assert runner._overnight_reeval_next_retry_at is not None
+    assert runner.post_calls == []
+    assert len(calls) == 1
+''',
+)
+replace_func(
+    retry_tests,
+    "test_premarket_9am_attempt_retries_on_interval_not_post_open",
+    '''def test_premarket_9am_attempt_is_staging_only_and_skips_engine(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: calls.append(kwargs) or _result())
+    runner = _runner()
+
+    assert runner._overnight_reeval_in_window(_dt(9, 29, 59)) is False
+    assert runner._overnight_reeval_in_window(_dt(9, 30, 0)) is True
+    assert runner._overnight_reeval_window_end(_dt(9, 30).date()) == _dt(9, 45)
+
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9), source="scheduler")
+
+    assert result["result_class"] == "SKIPPED_NOT_DUE"
+    assert result["attempt_performed"] is False
+    assert calls == []
+    assert runner._overnight_reeval_attempt_count == 0
+    assert runner._overnight_reeval_next_retry_at is None
+''',
+)
+replace_func(
+    retry_tests,
+    "test_second_attempt_success_sets_success_clears_retry_and_runs_post_once",
+    '''def test_second_attempt_success_sets_success_clears_retry_and_runs_post_once(monkeypatch):
+    results = [
+        _result(),
+        _result(
+            armed=8,
+            rejected=117,
+            skipped=0,
+            stalled=False,
+            completed=True,
+            retryable=False,
+            retry_reason=None,
+            result_class="COMPLETED_WITH_DECISIONS",
+        ),
+    ]
+    monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: results.pop(0))
+    runner = _runner()
+
+    runner.run_overnight_reeval_attempt(now_et=_dt(9, 30), source="scheduler")
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9, 31, 30), source="scheduler")
+
+    assert result["completed"] is True
+    assert runner._overnight_reeval_success_date == _dt(9, 30).date()
+    assert runner._overnight_reeval_next_retry_at is None
+    assert len(runner.post_calls) == 1
+''',
+)
+
+# Deadline-enforcement tests must model the same actual runtime window.
+deadline_path = Path("tests/test_p0_readiness_deadline_enforcement.py")
+deadline_text = deadline_path.read_text().replace(
+    "trading-day ticks outside 9:00-9:45 window (SKIPPED_NOT_DUE)",
+    "trading-day ticks outside 9:30-9:45 window (SKIPPED_NOT_DUE)",
+).replace(
+    "        et.hour == 9 and 0 <= et.minute < 45\n",
+    "        et.hour == 9 and 30 <= et.minute < 45\n",
+)
+deadline_path.write_text(deadline_text)
+replace_func(
+    "tests/test_p0_readiness_deadline_enforcement.py",
+    "test_waiting_for_retry_before_deadline_does_not_enforce",
+    '''def test_premarket_skipped_not_due_before_deadline_does_not_enforce(rr_env):
+    """Premarket is staging-only; no authoritative attempt or readiness block."""
+    cr, fake_ready, _ = rr_env
+    fake_ready.enforcement_active = False
+    runner = _mk_runner(cr, mode="live")
+    now_et = _et_time(9, 5, cr)
+
+    result = runner.run_overnight_reeval_attempt(force=False, source="tick", now_et=now_et)
+
+    assert result["result_class"] == "SKIPPED_NOT_DUE"
+    assert fake_ready.calls == []
+    assert runner._entered_degraded == []
+''',
+)
+
+# Temporary patch plumbing never belongs in the PR.
+for temp in (
+    ".github/workflows/one-shot-open-time-runner-patch.yml",
+    ".github/workflows/one-shot-open-time-runner-patch-v2.yml",
+    "tools/one_shot_open_time_patch.py",
+):
+    p = Path(temp)
+    if p.exists():
+        p.unlink()
