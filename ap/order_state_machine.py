@@ -2846,6 +2846,12 @@ class APOrderStateMachine:
             if _ra < 1:
                 return False
             _patch["retry_attempt"] = _ra
+            # DIAGNOSTIC ONLY (issue #536). retry_attempt_in_flight is written
+            # for operator observability. ``retry_attempt``,
+            # ``breach_attempt_count``, and ``materialization_attempts`` are the
+            # canonical authority — do NOT treat retry_attempt_in_flight as a
+            # fourth authority field or CAS-fence it. Direction reversal also
+            # resets it to zero.
             _patch["retry_attempt_in_flight"] = _ra
             _patch["breach_attempt_count"] = _ra
             _patch["materialization_attempts"] = _ra
@@ -2855,46 +2861,60 @@ class APOrderStateMachine:
         except Exception:
             return False
 
+        # P0 (issue #535, post-#530 hardening): the first-attempt mirror shape
+        # predicate applies BOTH when the caller passes ``retry_attempt=1``
+        # (``_prev_attempt == 0``) AND when the caller passes no
+        # ``retry_attempt`` at all (``_prev_attempt is None`` — the initial-
+        # materialization path from ``_claim_deferred_materialization_for_trigger``
+        # in ``ap_execution_core``). In both cases the durable row must be in
+        # a legitimate first-attempt shape: every mirror JSON-absent/null OR
+        # strictly ``= 0``. A stale positive mirror (e.g. a lingering ``2/2/2``
+        # from a botched prior lifecycle) fails closed — rejecting the claim
+        # upfront instead of advancing generation and dying downstream on
+        # SELECTOR_RECOVERY_CURSOR_INVALID.
+        _mirror_first_attempt_sql = (
+            "(meta->>'{k}' IS NULL"
+            " OR (meta->>'{k}' ~ '^[0-9]+$'"
+            "     AND (meta->>'{k}')::int = 0))"
+        )
+        _first_attempt_predicate = (
+            " AND " + _mirror_first_attempt_sql.format(k="retry_attempt") +
+            " AND " + _mirror_first_attempt_sql.format(k="breach_attempt_count") +
+            " AND " + _mirror_first_attempt_sql.format(k="materialization_attempts")
+        )
+
         def _claim():
             with conn() as c:
                 _attempt_predicate = ""
                 _attempt_params: list = []
-                if _prev_attempt is not None:
-                    if _prev_attempt == 0:
-                        # First attempt: each mirror may be absent (JSON key
-                        # missing or JSON null) OR strictly "0". Any other
-                        # value — including any positive integer left over
-                        # from a bad prior state — fails closed.
-                        _mirror_first_attempt = (
-                            "(meta->>'{k}' IS NULL"
-                            " OR (meta->>'{k}' ~ '^[0-9]+$'"
-                            "     AND (meta->>'{k}')::int = 0))"
-                        )
-                        _attempt_predicate = (
-                            " AND " + _mirror_first_attempt.format(k="retry_attempt") +
-                            " AND " + _mirror_first_attempt.format(k="breach_attempt_count") +
-                            " AND " + _mirror_first_attempt.format(k="materialization_attempts")
-                        )
-                        # No params — the constant 0 is inlined into the SQL
-                        # predicate since it is invariant for this branch.
-                    else:
-                        # Positive-prior retry: STRICT canonical N/N/N. Every
-                        # mirror MUST be present, MUST be a strict integer text
-                        # form, and MUST equal _prev_attempt. Missing-mirror
-                        # shapes and split shapes both fail closed. This
-                        # forbids caller memory from creating positive durable
-                        # authority.
-                        _mirror_strict = (
-                            "(meta->>'{k}' IS NOT NULL"
-                            " AND meta->>'{k}' ~ '^[0-9]+$'"
-                            " AND (meta->>'{k}')::int = %s)"
-                        )
-                        _attempt_predicate = (
-                            " AND " + _mirror_strict.format(k="retry_attempt") +
-                            " AND " + _mirror_strict.format(k="breach_attempt_count") +
-                            " AND " + _mirror_strict.format(k="materialization_attempts")
-                        )
-                        _attempt_params = [_prev_attempt, _prev_attempt, _prev_attempt]
+                if _prev_attempt is None:
+                    # Caller did not pass ``retry_attempt``. This is the
+                    # initial-materialization path (first-time claim for a
+                    # fresh breach). Enforce the first-attempt shape so a row
+                    # carrying stale positive mirrors cannot be claimed as a
+                    # brand-new materialization.
+                    _attempt_predicate = _first_attempt_predicate
+                elif _prev_attempt == 0:
+                    # Caller passed ``retry_attempt=1``. Same first-attempt
+                    # shape requirement.
+                    _attempt_predicate = _first_attempt_predicate
+                else:
+                    # Positive-prior retry: STRICT canonical N/N/N. Every
+                    # mirror MUST be present, MUST be a strict integer text
+                    # form, and MUST equal ``_prev_attempt``. Missing-mirror
+                    # shapes and split shapes both fail closed. This forbids
+                    # caller memory from creating positive durable authority.
+                    _mirror_strict = (
+                        "(meta->>'{k}' IS NOT NULL"
+                        " AND meta->>'{k}' ~ '^[0-9]+$'"
+                        " AND (meta->>'{k}')::int = %s)"
+                    )
+                    _attempt_predicate = (
+                        " AND " + _mirror_strict.format(k="retry_attempt") +
+                        " AND " + _mirror_strict.format(k="breach_attempt_count") +
+                        " AND " + _mirror_strict.format(k="materialization_attempts")
+                    )
+                    _attempt_params = [_prev_attempt, _prev_attempt, _prev_attempt]
                 cur = c.execute(
                     """
                     UPDATE orders
