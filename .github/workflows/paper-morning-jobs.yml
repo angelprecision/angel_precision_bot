@@ -2,12 +2,14 @@ name: Paper Morning Jobs
 
 on:
   schedule:
-    - cron: "18 13 * * 1-5"
-    - cron: "18 14 * * 1-5"
-    - cron: "25 13 * * 1-5"
-    - cron: "25 14 * * 1-5"
-    - cron: "31 13 * * 1-5"
-    - cron: "31 14 * * 1-5"
+    # Same authoritative lifecycle as LIVE: evaluate only once the regular
+    # session opens, reconcile ownership shortly after, then run paper recovery.
+    - cron: "30 13 * * 1-5"
+    - cron: "30 14 * * 1-5"
+    - cron: "32 13 * * 1-5"
+    - cron: "32 14 * * 1-5"
+    - cron: "36 13 * * 1-5"
+    - cron: "36 14 * * 1-5"
   workflow_dispatch:
     inputs:
       job:
@@ -19,6 +21,7 @@ on:
           - overnight_reeval_batch
           - morning_handoff_primary
           - morning_handoff_backup
+          - morning_recovery
       force_window:
         description: "Bypass ET timing window for manual recovery"
         required: false
@@ -48,9 +51,9 @@ jobs:
         run: |
           JOB=""
           case "${{ github.event.schedule }}" in
-            "18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval_batch" ;;
-            "25 13 * * 1-5"|"25 14 * * 1-5") JOB="morning_handoff_primary" ;;
-            "31 13 * * 1-5"|"31 14 * * 1-5") JOB="morning_handoff_backup" ;;
+            "30 13 * * 1-5"|"30 14 * * 1-5") JOB="overnight_reeval_batch" ;;
+            "32 13 * * 1-5"|"32 14 * * 1-5") JOB="morning_handoff_backup" ;;
+            "36 13 * * 1-5"|"36 14 * * 1-5") JOB="morning_recovery" ;;
           esac
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             JOB="${{ github.event.inputs.job }}"
@@ -67,7 +70,7 @@ jobs:
           MORNING_JOB_CLIENT_ID: ${{ matrix.client_id }}
           MORNING_JOB_EXECUTION_MODE: paper
           MORNING_JOB_TIMEOUT_SECONDS: "180"
-          MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "20"
+          MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "10"
           MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_window == 'true' && '1' || '0' }}
         run: |
           python3 ap/scripts/live_morning_jobs.py
