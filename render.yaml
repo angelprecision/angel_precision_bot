@@ -13,14 +13,15 @@
 #   Target ET   EDT (UTC-4)   EST (UTC-5)   MORNING_JOB
 #   ─────────   ───────────   ───────────   ───────────
 #   09:30 ET    13:30 UTC     14:30 UTC     overnight_reeval_batch
-#   09:32 ET    13:32 UTC     14:32 UTC     morning_handoff_backup
+#   09:34 ET    13:34 UTC     14:34 UTC     morning_handoff_backup
 #   09:36 ET    13:36 UTC     14:36 UTC     morning_recovery
 #
 # There is intentionally no independent morning_handoff_primary cron. A
 # successful overnight reevaluation already invokes the post-overnight handoff
-# and readiness path in-process. The 09:32 job is reconciliation-only backup.
-# The 09:36 LIVE recovery reruns the canonical overnight evaluator, which again
-# owns the handoff on successful completion.
+# and readiness path in-process. The 09:34 job is reconciliation-only backup and
+# sits outside the evaluator's 120-second work budget. The 09:36 LIVE recovery
+# reruns the canonical overnight evaluator, which again owns the handoff on
+# successful completion.
 #
 # GitHub Actions (.github/workflows/overnight-reeval.yml) remains a later backup
 # for a missed/delayed Render invocation.
@@ -67,11 +68,11 @@ services:
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
 
-  # ── 09:32 ET — reconciliation-only handoff backup ──────────────────────
+  # ── 09:34 ET — reconciliation-only handoff backup ──────────────────────
   - type: cron
     name: ap-morning-handoff-backup-edt
     runtime: python
-    schedule: "32 13 * * 1-5"   # 13:32 UTC = 09:32 EDT
+    schedule: "34 13 * * 1-5"   # 13:34 UTC = 09:34 EDT
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python -m ap.scripts.live_morning_jobs"
     envVars:
@@ -85,7 +86,7 @@ services:
   - type: cron
     name: ap-morning-handoff-backup-est
     runtime: python
-    schedule: "32 14 * * 1-5"   # 14:32 UTC = 09:32 EST
+    schedule: "34 14 * * 1-5"   # 14:34 UTC = 09:34 EST
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python -m ap.scripts.live_morning_jobs"
     envVars:
