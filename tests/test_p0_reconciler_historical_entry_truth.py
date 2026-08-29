@@ -20,6 +20,8 @@ CLIENT = "historical-entry@example.com"
 CONTRACT = "NOW260828P00122000"
 POSITION_ID = "canonical-position-1"
 
+_DEFAULT_FILLED_TS = object()
+
 
 class _Broker:
     def __init__(self, quote: float = 126.62):
@@ -115,7 +117,7 @@ class _PostgresHistoryHarness:
         status="FILLED",
         fill_price=1.30,
         filled_qty=1,
-        filled_ts=None,
+        filled_ts=_DEFAULT_FILLED_TS,
     ):
         self.execute(
             """
@@ -133,7 +135,11 @@ class _PostgresHistoryHarness:
                 position_id,
                 fill_price,
                 filled_qty,
-                filled_ts or datetime(2026, 8, 25, 13, 54, tzinfo=timezone.utc),
+                (
+                    datetime(2026, 8, 25, 13, 54, tzinfo=timezone.utc)
+                    if filled_ts is _DEFAULT_FILLED_TS
+                    else filled_ts
+                ),
                 json.dumps(meta or {}),
             ),
         )
@@ -472,3 +478,107 @@ def test_real_postgres_zero_plus_positive_historical_aliases_fail_closed(
     )
 
     assert value == 0.0
+
+
+@pytest.mark.parametrize(
+    "row_overrides",
+    [
+        pytest.param(
+            {"client_id": "other-client@example.com"},
+            id="wrong-client",
+        ),
+        pytest.param(
+            {
+                "execution_mode": "paper",
+                "meta": {
+                    "execution_mode": "paper",
+                    "underlying_entry": 127.425,
+                },
+            },
+            id="wrong-mode",
+        ),
+        pytest.param(
+            {"contract": "NOW260828C00122000"},
+            id="wrong-contract",
+        ),
+        pytest.param(
+            {"kind": "EXIT"},
+            id="wrong-kind",
+        ),
+        pytest.param(
+            {"status": "OPEN"},
+            id="wrong-status",
+        ),
+        pytest.param(
+            {"position_id": "different-position"},
+            id="wrong-position",
+        ),
+        pytest.param(
+            {"fill_price": None},
+            id="missing-fill-price",
+        ),
+        pytest.param(
+            {"filled_qty": None},
+            id="missing-filled-quantity",
+        ),
+        pytest.param(
+            {"filled_qty": 0},
+            id="zero-filled-quantity",
+        ),
+        pytest.param(
+            {"filled_qty": 1.5},
+            id="fractional-filled-quantity",
+        ),
+        pytest.param(
+            {"filled_ts": None},
+            id="missing-filled-timestamp",
+        ),
+    ],
+)
+def test_real_postgres_identity_and_fill_fences_fail_closed(
+    postgres_history_harness,
+    monkeypatch,
+    row_overrides,
+):
+    harness = postgres_history_harness
+    overrides = {
+        "meta": {
+            "execution_mode": "live",
+            "underlying_entry": 127.425,
+        }
+    }
+    overrides.update(row_overrides)
+    harness.insert_entry(**overrides)
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == 0.0
+
+
+def test_real_postgres_partial_fill_is_a_valid_historical_entry_control(
+    postgres_history_harness,
+    monkeypatch,
+):
+    harness = postgres_history_harness
+    harness.insert_entry(
+        status="PARTIAL_FILL",
+        filled_qty=1,
+        meta={
+            "execution_mode": "live",
+            "underlying_entry": 127.425,
+        },
+    )
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == pytest.approx(127.425)
