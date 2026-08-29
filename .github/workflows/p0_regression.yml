@@ -199,6 +199,7 @@ jobs:
             tests/test_p0_nonterminal_ownership_poisoning.py \
             tests/test_p0_reconciler_external_close_broker_truth.py \
             tests/test_p0_reconciler_exit_filled_query_parameterization.py \
+            tests/test_p0_reconciler_historical_entry_truth.py \
             tests/test_p0_live_readiness_blocked_keys.py \
             tests/test_p0_readiness_deadline_enforcement.py \
             tests/test_p0_startup_readiness_fail_closed.py \
