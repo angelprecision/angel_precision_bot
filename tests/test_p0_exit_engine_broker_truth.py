@@ -2,7 +2,7 @@
 tests/test_p0_exit_engine_broker_truth.py
 P0: exit-engine broker-truth visibility repair.
 """
-import os, re, sqlite3, pytest, types, sys
+import json, os, re, sqlite3, pytest, types, sys
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
@@ -30,7 +30,7 @@ def test_upsert_on_conflict_requery():
     upsert_end   = EE_SRC.find("\n    def ", upsert_start + 1)
     upsert_body  = EE_SRC[upsert_start:upsert_end]
     assert "ON CONFLICT DO NOTHING" in upsert_body
-    assert "SELECT id FROM positions" in upsert_body, (
+    assert "SELECT *" in upsert_body and "FROM positions" in upsert_body, (
         "ON CONFLICT fallback must re-query by client_id+contract to return existing id"
     )
     assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in upsert_body
@@ -42,6 +42,8 @@ def test_load_db_row_exact_mode_filter_present():
     load_end   = EE_SRC.find("\n    def ", load_start + 1)
     load_body  = EE_SRC[load_start:load_end]
     assert "signal_id, execution_mode" in load_body
+    for column in ("underlying_entry", "stop_underlying", "target_underlying"):
+        assert column in load_body
     assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in load_body
 
 def test_upsert_persists_execution_mode_column():
@@ -189,7 +191,7 @@ def _postgres_positions_table(monkeypatch):
     cur.execute(
         """
         CREATE TEMP TABLE positions (
-            id TEXT PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+            id TEXT NOT NULL PRIMARY KEY,
             client_id TEXT,
             underlying TEXT,
             contract TEXT,
@@ -201,10 +203,37 @@ def _postgres_positions_table(monkeypatch):
             quantity_remaining INTEGER,
             avg_fill DOUBLE PRECISION,
             entry_price DOUBLE PRECISION,
+            underlying_entry DOUBLE PRECISION,
+            stop_underlying DOUBLE PRECISION,
+            target_underlying DOUBLE PRECISION,
             entry_ts TIMESTAMPTZ,
             status TEXT,
             signal_id TEXT,
+            local_order_id TEXT,
+            broker_order_id TEXT,
             updated_at TIMESTAMPTZ DEFAULT NOW()
+        ) ON COMMIT PRESERVE ROWS;
+
+        CREATE TEMP TABLE orders (
+            id TEXT PRIMARY KEY,
+            client_id TEXT,
+            execution_mode TEXT,
+            contract TEXT,
+            kind TEXT,
+            status TEXT,
+            filled_qty INTEGER,
+            fill_price DOUBLE PRECISION,
+            filled_ts TIMESTAMPTZ,
+            updated_ts TIMESTAMPTZ,
+            created_ts TIMESTAMPTZ,
+            position_id TEXT,
+            signal_id TEXT,
+            local_order_id TEXT,
+            broker_order_id TEXT,
+            underlying_entry DOUBLE PRECISION,
+            stop_underlying DOUBLE PRECISION,
+            target_underlying DOUBLE PRECISION,
+            meta JSONB
         ) ON COMMIT PRESERVE ROWS
         """
     )
@@ -265,12 +294,123 @@ def _postgres_positions_table(monkeypatch):
             pass
         try:
             _teardown_cur = pg_conn.cursor()
+            _teardown_cur.execute("DROP TABLE IF EXISTS orders")
             _teardown_cur.execute("DROP TABLE IF EXISTS positions")
             pg_conn.commit()
             _teardown_cur.close()
         except Exception:
             pass
         cur.close()
+        pg_conn.close()
+
+
+@contextmanager
+def _postgres_shared_positions_table(monkeypatch):
+    """Create a shared-schema PostgreSQL fixture for multi-connection races."""
+    if not _DATABASE_URL:
+        pytest.skip("DATABASE_URL not configured for PostgreSQL coverage")
+    psycopg2 = pytest.importorskip("psycopg2")
+    import uuid
+
+    schema = f"broker_repair_test_{uuid.uuid4().hex}"
+    pg_conn = psycopg2.connect(_DATABASE_URL)
+    pg_conn.autocommit = True
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            f"""
+            CREATE SCHEMA {schema};
+            CREATE TABLE {schema}.positions (
+                id TEXT NOT NULL PRIMARY KEY,
+                client_id TEXT,
+                underlying TEXT,
+                contract TEXT,
+                option_symbol TEXT,
+                execution_mode TEXT,
+                side TEXT,
+                direction TEXT,
+                qty INTEGER,
+                quantity_remaining INTEGER,
+                avg_fill DOUBLE PRECISION,
+                entry_price DOUBLE PRECISION,
+                underlying_entry DOUBLE PRECISION,
+                stop_underlying DOUBLE PRECISION,
+                target_underlying DOUBLE PRECISION,
+                entry_ts TIMESTAMPTZ,
+                status TEXT,
+                signal_id TEXT,
+                local_order_id TEXT,
+                broker_order_id TEXT,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE TABLE {schema}.orders (
+                id TEXT PRIMARY KEY,
+                client_id TEXT,
+                execution_mode TEXT,
+                contract TEXT,
+                kind TEXT,
+                status TEXT,
+                filled_qty INTEGER,
+                fill_price DOUBLE PRECISION,
+                filled_ts TIMESTAMPTZ,
+                updated_ts TIMESTAMPTZ,
+                created_ts TIMESTAMPTZ,
+                position_id TEXT,
+                signal_id TEXT,
+                local_order_id TEXT,
+                broker_order_id TEXT,
+                underlying_entry DOUBLE PRECISION,
+                stop_underlying DOUBLE PRECISION,
+                target_underlying DOUBLE PRECISION,
+                meta JSONB
+            );
+            SET search_path TO {schema}, public
+            """
+        )
+
+    class _ConnWrapper:
+        def __init__(self, connection, cursor):
+            self._conn = connection
+            self._cur = cursor
+
+        def execute(self, sql, params=()):
+            self._cur.execute(sql, params)
+            return self
+
+        def fetchone(self):
+            row = self._cur.fetchone()
+            return dict(row) if row else None
+
+        def fetchall(self):
+            return [dict(r) for r in (self._cur.fetchall() or [])]
+
+    @contextmanager
+    def shared_conn():
+        connection = psycopg2.connect(_DATABASE_URL)
+        connection.autocommit = False
+        cursor = connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cursor.execute(f"SET search_path TO {schema}, public")
+            yield _ConnWrapper(connection, cursor)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
+
+    fake_db = types.SimpleNamespace(
+        conn=shared_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema}, public")
+        yield pg_conn
+    finally:
+        with pg_conn.cursor() as cur:
+            cur.execute(f"DROP SCHEMA {schema} CASCADE")
         pg_conn.close()
 
 
@@ -392,6 +532,298 @@ def test_upsert_broker_position_to_db_persists_exact_mode_in_postgres(monkeypatc
 
 
 @_skip_if_no_mod
+def test_postgres_recovery_reuses_canonical_filled_entry_identity(monkeypatch):
+    """The real recovery INSERT keeps the filled ENTRY's canonical id and geometry."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "NOW260825P00122000"
+        client = "canonical-recovery@example.com"
+        canonical_id = "2fe10f52-e459-4bc5-a57a-1a80e3618040"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    id, client_id, execution_mode, contract, kind, status,
+                    filled_qty, fill_price, filled_ts, position_id, signal_id,
+                    local_order_id, broker_order_id,
+                    underlying_entry, stop_underlying, target_underlying
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    "entry-order-1", client, "live", contract, "ENTRY", "PARTIAL_FILL",
+                    1, 1.30, "2026-08-25T13:54:01+00:00", canonical_id,
+                    "signal-1", "local-entry-1", "broker-entry-1",
+                    127.425, 130.44, 124.78,
+                ),
+            )
+        pg_conn.commit()
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(
+            mode="live",
+            account_id="canonical-acct",
+            list_positions=lambda: [{
+                "symbol": contract,
+                "quantity": 1,
+                "cost_basis": 130.0,
+                "side": "PUT",
+            }],
+        )
+        eng._fetch_broker_quote = lambda sym: {}
+
+        assert eng._broker_position_precheck() is True
+        active = eng.active_positions()
+        assert len(active) == 1
+        assert active[0].position_id == canonical_id
+        assert active[0].execution_mode == "live"
+        assert active[0].underlying_entry == pytest.approx(127.425)
+        assert active[0].underlying_stop == pytest.approx(130.44)
+        assert active[0].underlying_target == pytest.approx(124.78)
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, client_id, execution_mode, contract, signal_id,
+                       local_order_id, broker_order_id,
+                       underlying_entry, stop_underlying, target_underlying
+                FROM positions
+                WHERE id = %s
+                """,
+                (canonical_id,),
+            )
+            row = cur.fetchone()
+        assert row == (
+            canonical_id, client, "live", contract, "signal-1",
+            "local-entry-1", "broker-entry-1",
+            127.425, 130.44, 124.78,
+        )
+
+
+@_skip_if_no_mod
+def test_postgres_recovery_generates_uuid_without_proven_entry_position_id(monkeypatch):
+    """A matching fill without a proven id gets an explicit UUID in PostgreSQL."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "QQQ260821P00450000"
+        client = "uuid-recovery@example.com"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    id, client_id, execution_mode, contract, kind, status,
+                    filled_qty, fill_price, filled_ts, position_id, signal_id,
+                    underlying_entry, stop_underlying, target_underlying
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    "entry-order-without-position-id", client, "paper", contract,
+                    "ENTRY", "FILLED", 1, 1.50,
+                    "2026-08-25T13:54:01+00:00", None, "signal-uuid",
+                    450.0, 455.0, 440.0,
+                ),
+            )
+        pg_conn.commit()
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="paper")
+
+        row_id = eng._upsert_broker_position_to_db(
+            contract,
+            {
+                "quantity": 1,
+                "cost_basis": 150.0,
+                "date_acquired": "2026-08-25T13:54:01+00:00",
+            },
+        )
+
+        import uuid
+        assert uuid.UUID(str(row_id))
+        assert row_id.repair_row["execution_mode"] == "paper"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, client_id, execution_mode, contract, signal_id,
+                       underlying_entry, stop_underlying, target_underlying
+                FROM positions
+                WHERE id = %s
+                """,
+                (str(row_id),),
+            )
+            row = cur.fetchone()
+        assert row == (
+            str(row_id), client, "paper", contract, "signal-uuid",
+            450.0, 455.0, 440.0,
+        )
+
+
+@_skip_if_no_mod
+def test_upsert_fails_closed_on_contradictory_historical_aliases(monkeypatch):
+    """Zero plus a positive historical alias is contradictory evidence."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        client = "contradictory-history@example.com"
+        contract = "NOW260825P00122000"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    id, client_id, execution_mode, contract, kind, status,
+                    filled_qty, fill_price, filled_ts, position_id,
+                    underlying_entry, meta
+                ) VALUES (
+                    %s, %s, %s, %s, 'ENTRY', 'FILLED',
+                    1, 1.30, %s, NULL,
+                    0, %s
+                )
+                """,
+                (
+                    "contradictory-history-order",
+                    client,
+                    "live",
+                    contract,
+                    "2026-08-25T13:54:01+00:00",
+                    json.dumps({
+                        "execution_mode": "live",
+                        "underlying_entry_price": 127.42,
+                    }),
+                ),
+            )
+        pg_conn.commit()
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng.broker = types.SimpleNamespace(mode="live")
+
+        assert eng._upsert_broker_position_to_db(
+            contract,
+            {"quantity": 1, "cost_basis": 130.0},
+        ) is None
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM positions WHERE client_id = %s",
+                (client,),
+            )
+            assert cur.fetchone()[0] == 0
+
+
+@_skip_if_no_mod
+def test_upsert_is_idempotent_for_repeated_same_client_mode_contract(monkeypatch):
+    """Restart/retry repair must reuse one active owner, not mint UUIDs."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        client = "idempotent-repair@example.com"
+        contract = "QQQ260821P00450000"
+        broker_position = {"quantity": 2, "cost_basis": 150.0}
+
+        def _new_engine():
+            eng = engine_cls.__new__(engine_cls)
+            eng._email = client
+            eng.broker = types.SimpleNamespace(mode="paper")
+            return eng
+
+        first_id = _new_engine()._upsert_broker_position_to_db(contract, broker_position)
+        second_id = _new_engine()._upsert_broker_position_to_db(contract, broker_position)
+
+        assert first_id
+        assert second_id == first_id
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM positions
+                WHERE client_id = %s
+                  AND execution_mode = 'paper'
+                  AND contract = %s
+                  AND status = 'OPEN'
+                """,
+                (client, contract),
+            )
+            assert cur.fetchone()[0] == 1
+
+
+@_skip_if_no_mod
+def test_upsert_concurrent_repairs_share_one_active_owner(monkeypatch):
+    """Two PostgreSQL connections racing to repair one contract stay idempotent."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    import threading
+
+    with _postgres_shared_positions_table(monkeypatch) as pg_conn:
+        client = "concurrent-repair@example.com"
+        contract = "SPY260821C00650000"
+        broker_position = {"quantity": 1, "cost_basis": 130.0}
+        ready = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def _worker():
+            eng = engine_cls.__new__(engine_cls)
+            eng._email = client
+            eng.broker = types.SimpleNamespace(mode="live")
+
+            def _find(*_args, **_kwargs):
+                # Both transactions finish their lookup before either reaches
+                # the advisory lock/insert section.
+                ready.wait(timeout=10)
+                return None
+
+            eng._find_exact_filled_entry_order = _find
+            try:
+                results.append(
+                    eng._upsert_broker_position_to_db(contract, broker_position)
+                )
+            except Exception as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert not errors
+        assert len(results) == 2
+        assert results[0]
+        assert results[1] == results[0]
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM positions
+                WHERE client_id = %s
+                  AND execution_mode = 'live'
+                  AND contract = %s
+                  AND status = 'OPEN'
+                """,
+                (client, contract),
+            )
+            assert cur.fetchone()[0] == 1
+
+
+@_skip_if_no_mod
 def test_normal_load_preserves_zero_qty():
     """
     Test 6: normal DB-only load (prefer_qty_override=False, default).
@@ -482,10 +914,10 @@ def test_upsert_on_conflict_fallback_sqlite():
     Test 7: ON CONFLICT returns no row, re-query finds existing id.
     """
     # Build the re-query SQL from source
-    idx = EE_SRC.find("SELECT id FROM positions")
-    fallback_region = EE_SRC[idx:idx + 400]
+    idx = EE_SRC.rfind("SELECT *")
+    fallback_region = EE_SRC[idx:idx + 1200]
     assert "client_id" in fallback_region
-    assert "UPPER(contract)" in fallback_region
+    assert "UPPER(TRIM(COALESCE(contract" in fallback_region
 
     # Simple structural check — the re-query EXISTS in source
     assert "ORDER BY entry_ts DESC NULLS LAST" in fallback_region
@@ -624,6 +1056,427 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
         f"ManagedPosition.quantity_remaining must be broker qty=3, got {mp.quantity_remaining}"
     )
 
+
+@_skip_if_no_mod
+def test_find_exact_filled_entry_evidence_is_client_mode_contract_scoped(monkeypatch):
+    """Real PostgreSQL must enforce client, durable mode, contract, and status scope."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        client = "evidence@example.com"
+        contract = "NOW260825P00122000"
+        valid_position_id = "canonical-position-1"
+
+        def _insert_order(
+            order_id,
+            *,
+            client_value=client,
+            mode="live",
+            contract_value=contract,
+            kind="ENTRY",
+            status="FILLED",
+            filled_qty=1,
+            fill_price=1.30,
+            position_id=None,
+            meta=None,
+        ):
+            with pg_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO orders (
+                        id, client_id, execution_mode, contract, kind, status,
+                        filled_qty, fill_price, filled_ts, position_id, meta
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        order_id, client_value, mode, contract_value, kind, status,
+                        filled_qty, fill_price,
+                        "2026-08-25T13:54:01+00:00",
+                        position_id,
+                        json.dumps(meta) if meta is not None else None,
+                    ),
+                )
+            pg_conn.commit()
+
+        _insert_order("wrong-client", client_value="other@example.com", meta={"execution_mode": "live"})
+        _insert_order("wrong-mode", mode="paper", meta={"execution_mode": "paper"})
+        _insert_order("contradictory-mode", meta={"execution_mode": "paper"})
+        _insert_order(
+            "wrong-contract",
+            contract_value="NOW260825C00122000",
+            meta={"execution_mode": "live"},
+        )
+        _insert_order("exit-order", kind="EXIT", meta={"execution_mode": "live"})
+        _insert_order("cancelled-order", status="CANCELED", meta={"execution_mode": "live"})
+        _insert_order(
+            "valid-order",
+            position_id=valid_position_id,
+            meta={"execution_mode": "live"},
+        )
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng.broker = types.SimpleNamespace(mode="live")
+
+        found = eng._find_exact_filled_entry_order(
+            contract,
+            "live",
+            {"quantity": 1, "cost_basis": 130.0},
+        )
+        assert found is not None
+        assert found["id"] == "valid-order"
+        assert found["position_id"] == valid_position_id
+
+        # A blank column may be completed by durable metadata, but only when
+        # that metadata is itself valid and non-contradictory.
+        meta_only_contract = "NOW260825P00123000"
+        _insert_order(
+            "meta-only-order",
+            mode=None,
+            contract_value=meta_only_contract,
+            meta={"execution_mode": "live"},
+        )
+        found_meta_only = eng._find_exact_filled_entry_order(
+            meta_only_contract,
+            "live",
+            {"quantity": 1, "cost_basis": 130.0},
+        )
+        assert found_meta_only is not None
+        assert found_meta_only["id"] == "meta-only-order"
+
+
+@_skip_if_no_mod
+def test_upsert_reuses_proven_position_id_and_entry_geometry(monkeypatch):
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "canonical@example.com"
+    eng.broker = types.SimpleNamespace(mode="live")
+
+    calls = []
+
+    class _Cursor:
+        def __init__(self):
+            self.last_sql = ""
+            self.last_params = ()
+
+        def execute(self, sql, params=()):
+            self.last_sql = str(sql)
+            self.last_params = params
+            calls.append((self.last_sql, params))
+
+        def fetchone(self):
+            if "INSERT INTO positions" in self.last_sql:
+                return {"id": "canonical-position-1"}
+            return None
+
+    cursor = _Cursor()
+
+    @contextmanager
+    def fake_conn():
+        yield cursor
+
+    fake_db = types.SimpleNamespace(
+        conn=fake_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
+    eng._find_exact_filled_entry_order = lambda sym, mode, bp: {
+        "position_id": "canonical-position-1",
+        "signal_id": "signal-1",
+        "fill_price": 1.30,
+        "filled_qty": 1,
+        "filled_ts": "2026-08-25T13:54:01+00:00",
+        "underlying_entry": 127.425,
+        "stop_underlying": 130.44,
+        "target_underlying": 124.78,
+    }
+
+    row_id = eng._upsert_broker_position_to_db(
+        "NOW260825P00122000",
+        {
+            "quantity": 1,
+            "cost_basis": 130.0,
+            "date_acquired": "2026-08-25T13:54:01+00:00",
+        },
+    )
+
+    assert row_id == "canonical-position-1"
+    insert_sql, params = next(item for item in calls if "INSERT INTO positions" in item[0])
+    assert "id, client_id" in insert_sql
+    assert params[0] == "canonical-position-1"
+    assert params[1] == eng._email
+    assert params[3] == "NOW260825P00122000"
+    assert params[5] == "live"
+    assert params[12:15] == (127.425, 130.44, 124.78)
+    assert params[16] == "signal-1"
+
+
+@_skip_if_no_mod
+def test_upsert_generates_explicit_uuid_when_entry_has_no_proven_position_id(monkeypatch):
+    import uuid
+
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "uuid@example.com"
+    eng.broker = types.SimpleNamespace(mode="paper")
+
+    state = {"sql": "", "params": ()}
+
+    class _Cursor:
+        def execute(self, sql, params=()):
+            state["sql"] = str(sql)
+            state["params"] = params
+
+        def fetchone(self):
+            if "INSERT INTO positions" in state["sql"]:
+                return {"id": state["params"][0]}
+            return None
+
+    @contextmanager
+    def fake_conn():
+        yield _Cursor()
+
+    fake_db = types.SimpleNamespace(
+        conn=fake_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
+    eng._find_exact_filled_entry_order = lambda sym, mode, bp: None
+
+    row_id = eng._upsert_broker_position_to_db(
+        "QQQ260821P00450000",
+        {"quantity": 2, "cost_basis": 150.0},
+    )
+
+    assert row_id == state["params"][0]
+    assert uuid.UUID(str(row_id))
+    assert state["params"][0]
+    assert state["params"][0] != "None"
+
+
+@_skip_if_no_mod
+def test_ambiguous_filled_entry_evidence_holds_repair_without_newest_choice(monkeypatch):
+    """Two equally plausible fills must not silently choose one lifecycle id."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "ambiguous@example.com"
+    eng.broker = types.SimpleNamespace(mode="live")
+
+    rows = [
+        {
+            "id": "entry-a",
+            "client_id": eng._email,
+            "execution_mode": "live",
+            "contract": "NOW260825P00122000",
+            "kind": "ENTRY",
+            "status": "FILLED",
+            "filled_qty": 1,
+            "fill_price": 1.30,
+            "position_id": "canonical-a",
+            "underlying_entry": 127.425,
+            "stop_underlying": 130.44,
+            "target_underlying": 124.78,
+        },
+        {
+            "id": "entry-b",
+            "client_id": eng._email,
+            "execution_mode": "live",
+            "contract": "NOW260825P00122000",
+            "kind": "ENTRY",
+            "status": "PARTIAL_FILL",
+            "filled_qty": 1,
+            "fill_price": 1.30,
+            "position_id": "canonical-b",
+            "underlying_entry": 127.525,
+            "stop_underlying": 131.44,
+            "target_underlying": 123.78,
+        },
+    ]
+    calls = []
+
+    class _Cursor:
+        def execute(self, sql, params=()):
+            calls.append((str(sql), params))
+
+        def fetchall(self):
+            return rows
+
+        def fetchone(self):
+            return None
+
+    @contextmanager
+    def fake_conn():
+        yield _Cursor()
+
+    fake_db = types.SimpleNamespace(
+        conn=fake_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
+
+    broker_position = {
+        "quantity": 1,
+        "cost_basis": 130.0,
+    }
+    lookup = eng._find_exact_filled_entry_order(
+        "NOW260825P00122000", "live", broker_position
+    )
+    assert lookup["_lookup_status"] == "AMBIGUOUS"
+    assert not any("LIMIT 1" in sql.upper() for sql, _ in calls)
+
+    assert eng._upsert_broker_position_to_db(
+        "NOW260825P00122000", broker_position
+    ) is None
+    assert not any("INSERT INTO positions" in sql for sql, _ in calls)
+
+
+@_skip_if_no_mod
+def test_managed_position_recovery_preserves_proven_entry_geometry():
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "geometry@example.com"
+    eng.broker = types.SimpleNamespace(mode="live")
+    row = {
+        "id": "canonical-position-2",
+        "contract": "NOW260825P00122000",
+        "option_symbol": "NOW260825P00122000",
+        "underlying": "NOW",
+        "side": "PUT",
+        "qty": 1,
+        "quantity_remaining": 1,
+        "entry_price": 1.30,
+        "underlying_entry": 127.425,
+        "stop_underlying": 130.44,
+        "target_underlying": 124.78,
+        "execution_mode": "live",
+    }
+    mp = eng._managed_position_from_row(row, qty_override=1, prefer_qty_override=True)
+    assert mp.position_id == "canonical-position-2"
+    assert mp.underlying_entry == pytest.approx(127.425)
+    assert mp.underlying_stop == pytest.approx(130.44)
+    assert mp.underlying_target == pytest.approx(124.78)
+
+
+@_skip_if_no_mod
+def test_load_db_position_row_returns_underlying_entry_stop_target_columns(monkeypatch):
+    """F1 regression: `_load_db_position_row` must SELECT the three durable
+    underlying columns so `_managed_position_from_row` can hydrate them.
+
+    Without the SELECT change, `row.get("underlying_entry")` returns None on
+    the DB-found path even when the positions row has the value set, silently
+    reverting the engine to underlying_entry=0.0 on every broker-precheck
+    that finds an existing DB row (the common case).
+    """
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "NOW260828P00122000"
+        client = "underlying-hydration@example.com"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO positions (
+                    id, client_id, underlying, contract, option_symbol, execution_mode,
+                    side, direction, qty, quantity_remaining, avg_fill, entry_price,
+                    underlying_entry, stop_underlying, target_underlying,
+                    entry_ts, status, signal_id
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s,
+                    NOW(), %s, %s
+                )
+                """,
+                (
+                    "canonical-position-hydration", client, "NOW", contract, contract, "live",
+                    "PUT", "PUT", 1, 1, 1.30, 1.30,
+                    127.425, 130.44, 124.78,
+                    "OPEN", "sig-hydration",
+                ),
+            )
+        pg_conn.commit()
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="live")
+
+        row = eng._load_db_position_row(contract)
+        assert row is not None
+        assert row["id"] == "canonical-position-hydration"
+        # F1: without the SELECT-list fix these come back missing (None from
+        # dict.get), so the assertion below fails and the underlying-entry
+        # hydration silently degrades to 0.0 downstream.
+        assert row.get("underlying_entry") == pytest.approx(127.425)
+        assert row.get("stop_underlying") == pytest.approx(130.44)
+        assert row.get("target_underlying") == pytest.approx(124.78)
+
+        # End-to-end: hydration must flow all the way through to the
+        # ManagedPosition the exit engine consumes.
+        mp = eng._managed_position_from_row(row, qty_override=1, prefer_qty_override=True)
+        assert mp.underlying_entry == pytest.approx(127.425)
+        assert mp.underlying_stop == pytest.approx(130.44)
+        assert mp.underlying_target == pytest.approx(124.78)
+
+
+@_skip_if_no_mod
+def test_broker_precheck_retries_after_db_repair_failure_without_owner(caplog):
+    import threading
+
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    contract = "NOW260825P00122000"
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "hold@example.com"
+    eng._lock = threading.Lock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng.broker = types.SimpleNamespace(
+        mode="live",
+        account_id="acct-1",
+        list_positions=lambda: [{
+            "symbol": contract,
+            "quantity": 1,
+            "cost_basis": 130.0,
+        }],
+    )
+    eng._load_db_position_row = lambda sym: None
+    attempts = []
+
+    def failed_repair(sym, bp):
+        attempts.append((sym, bp))
+        return None
+
+    eng._upsert_broker_position_to_db = failed_repair
+    eng._fetch_broker_quote = lambda sym: {}
+    added = []
+    eng.add_position = lambda pos: added.append(pos)
+
+    with caplog.at_level("ERROR"):
+        assert eng._broker_position_precheck() is False
+    assert added == []
+    assert eng._positions == []
+    assert not eng._positions_by_id
+    assert len(attempts) == 1
+    assert any("EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED" in rec.message for rec in caplog.records)
+
+    # A failed cycle does not manufacture ownership or suppress the next retry.
+    with caplog.at_level("ERROR"):
+        assert eng._broker_position_precheck() is False
+    assert len(attempts) == 2
+    assert added == []
+    assert eng._positions == []
+    assert not eng._positions_by_id
+
+
 def test_log_honesty_repair_failed_reason_in_added_log():
     """
     Fix 3: EXIT_BROKER_POSITION_ADDED_TO_ENGINE log must include repair_failed_reason=%s,
@@ -643,46 +1496,36 @@ def test_log_honesty_repair_failed_reason_in_added_log():
         "ADDED_TO_ENGINE log must pass repair_failed_reason variable"
     )
 
-def test_repaired_syms_only_for_real_db_rows():
-    """
-    Fix 2/Option A: repaired_syms must only be appended when new_id is truthy.
-    Synthetic-id loads go to engine_loaded_synthetic_syms.
-    """
-    assert "engine_loaded_synthetic_syms" in EE_SRC, (
-        "engine_loaded_synthetic_syms list must exist in precheck"
-    )
-    # repaired_syms.append must be guarded by `if new_id:`
-    idx = EE_SRC.find("repaired_syms.append(sym)")
-    region = EE_SRC[max(0, idx - 150) : idx + 50]
-    assert "if new_id" in region, (
-        "repaired_syms.append must only run when new_id is a real DB id"
-    )
-    # engine_loaded_synthetic_syms.append must be in the else branch
-    idx2 = EE_SRC.find("engine_loaded_synthetic_syms.append(sym)")
-    assert idx2 > 0, "engine_loaded_synthetic_syms.append must be called in the else branch"
+def test_recovery_requires_confirmed_db_id_before_engine_add():
+    """A broker recovery owner cannot be installed without a DB identity."""
+    precheck_start = EE_SRC.find("def _broker_position_precheck")
+    precheck_end = EE_SRC.find("\n    def ", precheck_start + 1)
+    precheck_body = EE_SRC[precheck_start:precheck_end]
+    assert "engine_loaded_synthetic_syms" not in precheck_body
+    assert "if not new_id:" in precheck_body
+    assert 'raise RuntimeError(repair_failed_reason)' in precheck_body
+    assert "repaired_syms.append(sym)" in precheck_body
 
-def test_summary_includes_engine_loaded_synthetic():
-    """Fix 4: summary log must include engine_loaded_synthetic field."""
+def test_summary_reports_only_confirmed_recovery():
+    """Summary must distinguish DB-confirmed recovery from repair failure."""
     idx = EE_SRC.rfind("EXIT_BROKER_PRECHECK_SUMMARY")
     region = EE_SRC[idx:idx + 600]
-    assert "engine_loaded_synthetic" in region, (
-        "EXIT_BROKER_PRECHECK_SUMMARY must include engine_loaded_synthetic field"
-    )
+    assert "engine_loaded_synthetic" not in region
     assert "repaired_from_broker" in region, (
         "EXIT_BROKER_PRECHECK_SUMMARY must still include repaired_from_broker (DB-confirmed only)"
     )
+    assert "repair_failed" in region
 
-def test_synthetic_path_sets_db_repaired_false():
-    """
-    Fix 1 (existing): when upsert returns None, db_repaired must be set False
-    before add_position is called.
-    """
-    idx = EE_SRC.find("db_repaired         = False")
-    assert idx > 0, "db_repaired=False must be set in the synthetic-id path"
-    region = EE_SRC[idx : idx + 300]
-    assert "db_upsert_returned_no_id" in region or "synthetic" in region, (
-        "db_repaired=False path must be near synthetic id logic"
-    )
+def test_upsert_has_explicit_id_and_uuid_fallback():
+    """The production INSERT must always receive id explicitly."""
+    upsert_start = EE_SRC.find("def _upsert_broker_position_to_db")
+    upsert_end = EE_SRC.find("\n    def ", upsert_start + 1)
+    upsert_body = EE_SRC[upsert_start:upsert_end]
+    insert_start = upsert_body.find("INSERT INTO positions (")
+    insert_end = upsert_body.find("ON CONFLICT DO NOTHING", insert_start)
+    insert_block = upsert_body[insert_start:insert_end]
+    assert "id, client_id" in insert_block
+    assert "position_id = proven_position_id or str(_uuid.uuid4())" in upsert_body
 
 
 # =============================================================================
@@ -802,15 +1645,15 @@ class TestDbDictRowContract:
         class _Cur:
             def execute(self, sql, params=()):
                 state["call"] += 1
-                state["queries"].append((state["call"], sql.strip().splitlines()[0]))
+                state["queries"].append((state["call"], str(sql)))
                 return self
 
             def fetchone(self):
-                # Cycle: first fetchone on SELECT/RETURNING flow.
-                if "INSERT INTO positions" in state["queries"][-1][1]:
+                sql = state["queries"][-1][1].upper()
+                if "INSERT INTO POSITIONS" in sql:
                     return ({"id": state["insert_id"]}
                             if state["insert_id"] is not None else None)
-                if "SELECT id FROM positions" in state["queries"][-1][1]:
+                if "FROM POSITIONS" in sql and "SELECT *" in sql:
                     return ({"id": state["existing_id"]}
                             if state["existing_id"] is not None else None)
                 # Regular load path.

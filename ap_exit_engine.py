@@ -60,6 +60,8 @@ import time
 import threading
 import logging
 import math
+import json as _json
+import uuid as _uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
@@ -3391,6 +3393,219 @@ def _is_runner_protective_reason(reason: str) -> bool:
 
 def _is_same_or_equivalent_runner_protection(pending_reason: str, new_reason: str) -> bool:
     return _is_runner_protective_reason(pending_reason) and _is_runner_protective_reason(new_reason)
+
+
+def _broker_repair_float(value) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _broker_repair_positive_float(value) -> float:
+    result = _broker_repair_float(value)
+    return result if result is not None and result > 0.0 else 0.0
+
+
+def _broker_repair_positive_int(value) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0.0 or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
+def _broker_repair_timestamp(value) -> Optional[datetime]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        result = value
+    else:
+        try:
+            result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if result.tzinfo is None:
+        return result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
+
+
+def _broker_repair_entry_timestamp(broker_position: dict):
+    """Read date_acquired without changing the broker adapter contract."""
+    if not isinstance(broker_position, dict):
+        return None
+    direct = broker_position.get("date_acquired")
+    if _broker_repair_timestamp(direct) is not None:
+        return direct
+    raw = broker_position.get("raw")
+    if isinstance(raw, dict):
+        return raw.get("date_acquired")
+    return None
+
+
+def _broker_repair_order_meta(value) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = _json.loads(value)
+            return dict(decoded) if isinstance(decoded, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+
+_BROKER_REPAIR_ENTRY_GEOMETRY_KEYS = (
+    "underlying_entry",
+    "entry_underlying",
+    "underlying_price_at_entry",
+    "underlying_entry_price",
+    "entry_underlying_price",
+)
+_BROKER_REPAIR_STOP_GEOMETRY_KEYS = (
+    "stop_underlying",
+    "underlying_stop",
+)
+_BROKER_REPAIR_TARGET_GEOMETRY_KEYS = (
+    "target_underlying",
+    "underlying_target",
+)
+
+
+def _broker_repair_historical_value(
+    *mappings, keys: tuple[str, ...],
+) -> tuple[float, bool]:
+    """Read historical aliases and reject malformed/contradictory evidence.
+
+    A zero is evidence, not "missing": zero alongside any positive alias is
+    contradictory.  The same rule applies across the order row and its JSON
+    metadata because both are durable historical claims.
+    """
+    values: list[float] = []
+    saw_explicit_zero = False
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        for key in keys:
+            if key not in mapping:
+                continue
+            raw = mapping.get(key)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            if isinstance(raw, bool):
+                return 0.0, True
+            try:
+                numeric = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0, True
+            if not math.isfinite(numeric):
+                return 0.0, True
+            if numeric == 0.0:
+                saw_explicit_zero = True
+                continue
+            if numeric < 0.0:
+                return 0.0, True
+            values.append(numeric)
+
+    if saw_explicit_zero and values:
+        return 0.0, True
+    if any(candidate != values[0] for candidate in values[1:]):
+        return 0.0, True
+    return (values[0] if values else 0.0), False
+
+
+def _broker_repair_text_value(
+    order: dict, meta: dict, key: str,
+) -> tuple[Optional[str], bool]:
+    """Read one text identity from row/meta and reject conflicting copies."""
+    values: list[str] = []
+    for mapping in (order, meta):
+        if not isinstance(mapping, dict) or key not in mapping:
+            continue
+        raw = mapping.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text or text.lower() in {"none", "null", "nan", "unknown"}:
+            continue
+        values.append(text)
+    if any(candidate != values[0] for candidate in values[1:]):
+        return None, True
+    return (values[0] if values else None), False
+
+
+def _broker_repair_position_id(value) -> str:
+    candidate = str(value or "").strip()
+    if not candidate or candidate.lower() in {
+        "0", "none", "null", "nan", "na", "n/a", "nil", "unknown",
+        "undefined", "unavailable", "missing", "placeholder", "true", "false",
+        "?", "-",
+    }:
+        return ""
+    if candidate.lower().startswith("broker-repair-"):
+        return ""
+    return candidate
+
+
+def _broker_repair_lookup_marker(status: str, reason: str = "") -> dict:
+    return {"_lookup_status": status, "_lookup_reason": reason}
+
+
+def _broker_repair_order_matches(order: dict, broker_position: dict) -> bool:
+    """Require enough fill evidence before reusing an existing position id."""
+    broker_qty = _broker_repair_positive_int(broker_position.get("quantity"))
+    order_qty = _broker_repair_positive_int(order.get("filled_qty"))
+    if broker_qty is None or order_qty is None or order_qty < broker_qty:
+        return False
+
+    broker_raw_ts = _broker_repair_entry_timestamp(broker_position)
+    broker_ts = _broker_repair_timestamp(broker_raw_ts)
+    order_ts = _broker_repair_timestamp(order.get("filled_ts"))
+    # Tradier's production list_positions shape may omit date_acquired. The
+    # broker price/quantity and exact client/mode/OCC ENTRY scope remain
+    # mandatory proof; timestamp fencing is applied whenever the broker
+    # actually supplies a timestamp, but its absence is not a mismatch.
+    if broker_raw_ts not in (None, ""):
+        if broker_ts is None or order_ts is None:
+            return False
+        # Tradier commonly reports date_acquired as a date rather than a
+        # fill-time timestamp. A same-day match is the strongest proof
+        # available in that shape; timestamp-bearing broker data gets the
+        # tighter fence.
+        if isinstance(broker_raw_ts, str) and len(broker_raw_ts.strip()) == 10:
+            if broker_ts.date() != order_ts.date():
+                return False
+        elif abs((order_ts - broker_ts).total_seconds()) > 600.0:
+            return False
+
+    broker_cost_basis = _broker_repair_float(broker_position.get("cost_basis"))
+    order_fill = _broker_repair_positive_float(order.get("fill_price"))
+    if broker_cost_basis is None or abs(broker_cost_basis) <= 0.0 or order_fill <= 0.0:
+        return False
+    broker_entry_price = abs(broker_cost_basis) / broker_qty / 100.0
+    return math.isclose(
+        order_fill,
+        broker_entry_price,
+        rel_tol=0.05,
+        abs_tol=0.02,
+    )
+
+
+class _BrokerRepairIdentity(str):
+    """String-compatible id carrying only the row data needed this cycle."""
+
+    def __new__(cls, value: str, row: Optional[dict] = None):
+        instance = super().__new__(cls, str(value))
+        instance.repair_row = dict(row or {})
+        return instance
 
 
 class APExitEngine:
@@ -6879,6 +7094,106 @@ class APExitEngine:
             )
         return detail["mode"]
 
+    def _find_exact_filled_entry_order(
+        self, sym: str, mode: str, broker_position: Optional[dict] = None
+    ) -> dict | None:
+        """Find one exact client/mode/OCC ENTRY fill for broker recovery."""
+        contract = str(sym or "").strip().upper()
+        normalized_mode = str(mode or "").strip().lower()
+        if (
+            not self._email
+            or not contract
+            or normalized_mode not in {"live", "paper"}
+        ):
+            return None
+        try:
+            from ap.db import conn, run_with_retry
+            from ap.order_state_machine import (
+                _DURABLE_EXECUTION_MODE_SQL,
+                _durable_execution_mode,
+            )
+        except Exception as _mode_import_err:
+            log.error(
+                "[exit_eng] BROKER_REPAIR_ENTRY_LOOKUP_UNAVAILABLE "
+                "client=%s mode=%s contract=%s mode_authority_error=%s: %s",
+                self._email, normalized_mode, contract,
+                type(_mode_import_err).__name__, _mode_import_err,
+            )
+            return _broker_repair_lookup_marker(
+                "UNAVAILABLE",
+                f"mode_authority:{type(_mode_import_err).__name__}:{_mode_import_err}",
+            )
+
+        try:
+            def _query():
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        SELECT *
+                        FROM orders
+                        WHERE client_id = %s
+                          AND {_DURABLE_EXECUTION_MODE_SQL}
+                          AND UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                          AND UPPER(TRIM(COALESCE(kind, ''))) = 'ENTRY'
+                          AND UPPER(TRIM(COALESCE(status, ''))) IN ('FILLED', 'PARTIAL_FILL')
+                          AND COALESCE(filled_qty, 0) > 0
+                        ORDER BY filled_ts DESC NULLS LAST,
+                                 updated_ts DESC NULLS LAST,
+                                 created_ts DESC NULLS LAST
+                        """,
+                        (self._email, normalized_mode, contract),
+                    )
+                    return [dict(row) for row in (c.fetchall() or [])]
+
+            candidates = run_with_retry(_query) or []
+
+            # Redundant with SQL by design: driver-faithful wrappers and test
+            # doubles must not be able to launder an out-of-scope row into an
+            # identity reuse.
+            def _row_is_exact(row: dict) -> bool:
+                if not isinstance(row, dict):
+                    return False
+                if str(row.get("client_id") or "").strip() != str(self._email).strip():
+                    return False
+                if str(row.get("contract") or "").strip().upper() != contract:
+                    return False
+                if str(row.get("kind") or "").strip().upper() != "ENTRY":
+                    return False
+                if str(row.get("status") or "").strip().upper() not in {"FILLED", "PARTIAL_FILL"}:
+                    return False
+                if _durable_execution_mode(row) != normalized_mode:
+                    return False
+                return _broker_repair_positive_int(row.get("filled_qty")) is not None
+
+            candidates = [row for row in candidates if _row_is_exact(row)]
+            if broker_position is not None:
+                candidates = [
+                    row for row in candidates
+                    if _broker_repair_order_matches(row, broker_position)
+                ]
+            if len(candidates) == 1:
+                return candidates[0]
+            if len(candidates) > 1:
+                log.warning(
+                    "[exit_eng] BROKER_REPAIR_ENTRY_EVIDENCE_AMBIGUOUS "
+                    "client=%s mode=%s contract=%s candidate_count=%d",
+                    self._email, normalized_mode, contract, len(candidates),
+                )
+                return _broker_repair_lookup_marker(
+                    "AMBIGUOUS", "multiple_exact_entry_matches"
+                )
+            return None
+        except Exception as _oe:
+            log.warning(
+                "[exit_eng] BROKER_REPAIR_ENTRY_EVIDENCE_UNAVAILABLE "
+                "client=%s mode=%s contract=%s error=%s: %s",
+                self._email, normalized_mode, contract,
+                type(_oe).__name__, _oe,
+            )
+            return _broker_repair_lookup_marker(
+                "UNAVAILABLE", f"{type(_oe).__name__}:{_oe}"
+            )
+
     def _load_db_position_row(self, sym: str) -> dict | None:
         """Look up an active positions row for this client + contract symbol.
 
@@ -6901,7 +7216,9 @@ class APExitEngine:
                         """
                         SELECT id, underlying, contract, option_symbol, side, direction,
                                qty, quantity_remaining, avg_fill, entry_price,
-                               entry_ts, status, signal_id, execution_mode
+                               underlying_entry, stop_underlying, target_underlying,
+                               entry_ts, status, signal_id, execution_mode,
+                               local_order_id, broker_order_id
                         FROM positions
                         WHERE client_id = %s
                           AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
@@ -6932,15 +7249,7 @@ class APExitEngine:
             return None
 
     def _upsert_broker_position_to_db(self, sym: str, bp: dict) -> str | None:
-        """
-        Create a minimal OPEN positions row from broker data. Returns row id or None.
-
-        Production-safe: does NOT write optional columns (source, account_id, etc.)
-        that may not exist in the production schema. Uses only guaranteed columns.
-
-        ON CONFLICT fallback: if INSERT returns None (row already exists), re-query
-        by client_id + contract so repair can proceed with the existing id.
-        """
+        """Persist one broker-open position with an explicit lifecycle id."""
         _mode = self._resolved_execution_mode()
         if _mode not in {"live", "paper"}:
             log.critical(
@@ -6948,81 +7257,301 @@ class APExitEngine:
                 sym, self._email,
             )
             return None
+
+        broker_position = bp if isinstance(bp, dict) else {}
+        contract = str(sym or "").strip().upper()
+        qty = _broker_repair_positive_int(broker_position.get("quantity"))
+        raw_cost_basis = broker_position.get("cost_basis")
+        cost_basis_value = _broker_repair_float(raw_cost_basis)
+        entry_ts = _broker_repair_entry_timestamp(broker_position)
+        if (
+            not self._email
+            or not contract
+            or qty is None
+            or (
+                raw_cost_basis not in (None, "")
+                and cost_basis_value is None
+            )
+            or (entry_ts not in (None, "") and _broker_repair_timestamp(entry_ts) is None)
+        ):
+            log.error(
+                "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s "
+                "qty=%s cost_basis=%s date_acquired=%s",
+                self._email, contract, broker_position.get("quantity"),
+                raw_cost_basis, entry_ts,
+            )
+            return None
+
+        side = self._parse_occ_side(contract)
+        if side not in {"CALL", "PUT"}:
+            log.error(
+                "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s side=%s",
+                self._email, contract, side,
+            )
+            return None
+
         try:
             from ap.db import conn, run_with_retry
-            underlying = self._underlying_from_occ(sym)
-            side       = self._parse_occ_side(sym)
-            qty        = int(bp.get("quantity") or 0)
-            cost_basis = float(bp.get("cost_basis") or 0)
-            entry_px   = round(cost_basis / max(qty, 1) / 100, 6) if qty > 0 and cost_basis > 0 else 0.0
-            entry_ts   = bp.get("date_acquired")
+
+            lookup = self._find_exact_filled_entry_order(
+                contract, _mode, broker_position
+            )
+            if isinstance(lookup, dict) and lookup.get("_lookup_status"):
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_ENTRY_LOOKUP_%s client=%s mode=%s "
+                    "contract=%s — recovery held",
+                    str(lookup.get("_lookup_status") or "UNAVAILABLE").upper(),
+                    self._email, _mode, contract,
+                )
+                return None
+            order = dict(lookup or {})
+            order_fill = _broker_repair_positive_float(order.get("fill_price"))
+            broker_entry_price = (
+                round(abs(cost_basis_value) / qty / 100.0, 6)
+                if cost_basis_value is not None and abs(cost_basis_value) > 0.0
+                else 0.0
+            )
+            entry_px = broker_entry_price or order_fill
+            if entry_px <= 0.0:
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s "
+                    "qty=%d entry_price=%s",
+                    self._email, contract, qty, entry_px,
+                )
+                return None
+
+            proven_position_id = _broker_repair_position_id(order.get("position_id"))
+            position_id = proven_position_id or str(_uuid.uuid4())
+            meta = _broker_repair_order_meta(order.get("meta"))
+
+            local_order_id, local_order_id_conflict = _broker_repair_text_value(
+                order, meta, "local_order_id"
+            )
+            broker_order_id, broker_order_id_conflict = _broker_repair_text_value(
+                order, meta, "broker_order_id"
+            )
+            if local_order_id_conflict or broker_order_id_conflict:
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s "
+                    "reason=contradictory_order_identity_metadata",
+                    self._email, contract,
+                )
+                return None
+
+            signal_id = str(
+                order.get("signal_id") or order.get("canonical_signal_id") or ""
+            ).strip() or None
+            underlying_entry, entry_geometry_malformed = _broker_repair_historical_value(
+                order, meta, keys=_BROKER_REPAIR_ENTRY_GEOMETRY_KEYS
+            )
+            underlying_stop, stop_geometry_malformed = _broker_repair_historical_value(
+                order, meta, keys=_BROKER_REPAIR_STOP_GEOMETRY_KEYS
+            )
+            underlying_target, target_geometry_malformed = _broker_repair_historical_value(
+                order, meta, keys=_BROKER_REPAIR_TARGET_GEOMETRY_KEYS
+            )
+            if (
+                entry_geometry_malformed
+                or stop_geometry_malformed
+                or target_geometry_malformed
+            ):
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s "
+                    "reason=contradictory_historical_geometry",
+                    self._email, contract,
+                )
+                return None
+
+            if order.get("filled_ts") and _broker_repair_timestamp(order.get("filled_ts")):
+                entry_ts = order.get("filled_ts")
+
+            repair_row = {
+                "id": position_id,
+                "client_id": self._email,
+                "underlying": self._underlying_from_occ(contract),
+                "contract": contract,
+                "option_symbol": contract,
+                "execution_mode": _mode,
+                "side": side,
+                "direction": side,
+                "qty": qty,
+                "quantity_remaining": qty,
+                "entry_price": entry_px,
+                "avg_fill": entry_px,
+                "underlying_entry": underlying_entry,
+                "stop_underlying": underlying_stop,
+                "target_underlying": underlying_target,
+                "status": "OPEN",
+                "entry_ts": entry_ts,
+                "signal_id": signal_id,
+                "local_order_id": local_order_id,
+                "broker_order_id": broker_order_id,
+            }
+
+            def _remember(row_id, row: Optional[dict] = None):
+                cached = dict(row or repair_row)
+                cached["id"] = str(row_id)
+                return _BrokerRepairIdentity(str(row_id), cached)
 
             def _ins():
                 with conn() as c:
+                    # All same client/mode/contract repairs serialize on this
+                    # transaction-scoped lock. The active-row recheck below
+                    # makes restart/concurrent repair idempotent even though
+                    # every UUID fallback would otherwise be distinct.
+                    lock_key = f"broker-repair:{self._email}:{_mode}:{contract}"
+                    c.execute(
+                        "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
+                        (lock_key,),
+                    )
+                    c.execute(
+                        """
+                        SELECT *
+                        FROM positions
+                        WHERE client_id = %s
+                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                          AND UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                          AND UPPER(TRIM(COALESCE(status, ''))) IN
+                              ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                          AND COALESCE(quantity_remaining, qty, 0) > 0
+                        ORDER BY entry_ts DESC NULLS LAST,
+                                 updated_at DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        (self._email, _mode, contract),
+                    )
+                    existing_active = c.fetchone()
+                    if existing_active:
+                        existing_row = dict(existing_active)
+                        existing_id = existing_row.get("id")
+                        if not existing_id:
+                            return None
+                        if proven_position_id and str(existing_id) != proven_position_id:
+                            log.error(
+                                "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s "
+                                "mode=%s contract=%s reason=active_identity_conflict "
+                                "proven_position_id=%s existing_position_id=%s",
+                                self._email, _mode, contract,
+                                proven_position_id, existing_id,
+                            )
+                            return None
+                        log.info(
+                            "[exit_eng] BROKER_REPAIR_DB_IDENTITY_REUSED client=%s "
+                            "mode=%s contract=%s position_id=%s",
+                            self._email, _mode, contract, existing_id,
+                        )
+                        return _remember(existing_id, existing_row)
+
                     c.execute(
                         """
                         INSERT INTO positions (
-                            client_id, underlying, contract, option_symbol,
+                            id, client_id, underlying, contract, option_symbol,
                             execution_mode,
                             side, direction,
                             qty, quantity_remaining,
                             entry_price, avg_fill,
-                            status, entry_ts, updated_at
+                            underlying_entry, stop_underlying, target_underlying,
+                            status, entry_ts, signal_id,
+                            local_order_id, broker_order_id, updated_at
                         ) VALUES (
-                            %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s,
                             %s,
                             %s, %s,
                             %s, %s,
                             %s, %s,
-                            'OPEN', %s, NOW()
+                            %s, %s, %s,
+                            'OPEN', %s, %s,
+                            %s, %s, NOW()
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING id
                         """,
-                        (self._email, underlying, sym, sym,
-                         _mode,
-                         side, side,
-                         qty, qty,
-                         entry_px, entry_px,
-                         entry_ts),
+                        (
+                            position_id, self._email, repair_row["underlying"],
+                            contract, contract, _mode,
+                            side, side, qty, qty,
+                            entry_px, entry_px,
+                            underlying_entry, underlying_stop, underlying_target,
+                            entry_ts, signal_id,
+                            local_order_id, broker_order_id,
+                        ),
                     )
-                    # Production ap.db returns dict rows keyed by column name;
-                    # RETURNING id therefore surfaces as {"id": ...}, not a tuple.
                     row = c.fetchone()
                     if row:
                         row_id = row.get("id")
                         if row_id:
-                            return str(row_id)
-                    # ON CONFLICT DO NOTHING — row already exists; re-query to get id
+                            return _remember(row_id)
+
+                    # If the filled ENTRY already named a position id, an
+                    # unrelated same-contract row is not an acceptable
+                    # substitute for that canonical identity.
+                    if proven_position_id:
+                        c.execute(
+                            """
+                            SELECT *
+                            FROM positions
+                            WHERE id = %s
+                              AND client_id = %s
+                              AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                              AND UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                              AND UPPER(TRIM(COALESCE(status, ''))) IN
+                                  ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                              AND COALESCE(quantity_remaining, qty, 0) > 0
+                            LIMIT 1
+                            """,
+                            (proven_position_id, self._email, _mode, contract),
+                        )
+                        exact_existing = c.fetchone()
+                        if exact_existing:
+                            exact_row = dict(exact_existing)
+                            exact_id = exact_row.get("id")
+                            if exact_id:
+                                return _remember(exact_id, exact_row)
+                        return None
+
                     c.execute(
                         """
-                        SELECT id FROM positions
+                        SELECT *
+                        FROM positions
                         WHERE client_id = %s
                           AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                          AND (
-                            UPPER(contract)         = UPPER(%s)
-                            OR UPPER(option_symbol) = UPPER(%s)
-                          )
-                        ORDER BY entry_ts DESC NULLS LAST, updated_at DESC NULLS LAST
+                          AND UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                          AND UPPER(TRIM(COALESCE(status, ''))) IN
+                              ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                          AND COALESCE(quantity_remaining, qty, 0) > 0
+                        ORDER BY entry_ts DESC NULLS LAST,
+                                 updated_at DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self._email, _mode, sym, sym),
+                        (self._email, _mode, contract),
                     )
                     existing = c.fetchone()
                     if existing:
-                        existing_id = existing.get("id")
+                        existing_row = dict(existing)
+                        existing_id = existing_row.get("id")
                         if existing_id:
                             log.info(
-                                "[exit_eng] _upsert_broker_position_to_db ON CONFLICT re-query "
-                                "returned existing id for %s client=%s",
-                                sym, self._email,
+                                "[exit_eng] _upsert_broker_position_to_db ON CONFLICT "
+                                "re-query returned existing active id for %s client=%s",
+                                contract, self._email,
                             )
-                            return str(existing_id)
+                            return _remember(existing_id, existing_row)
                     return None
-            return run_with_retry(_ins)
+
+            result = run_with_retry(_ins)
+            if result:
+                log.info(
+                    "[exit_eng] BROKER_REPAIR_DB_IDENTITY_CONFIRMED client=%s mode=%s "
+                    "contract=%s position_id=%s source=%s",
+                    self._email, _mode, contract, result,
+                    "filled_entry_order" if proven_position_id else "generated_repair_uuid",
+                )
+            return result
         except Exception as _ue:
-            log.error("[exit_eng] _upsert_broker_position_to_db %s failed: %s: %s",
-                      sym, type(_ue).__name__, _ue)
+            log.error(
+                "[exit_eng] _upsert_broker_position_to_db %s failed: %s: %s",
+                contract, type(_ue).__name__, _ue,
+            )
             return None
 
     def _managed_position_from_row(
@@ -7073,6 +7602,20 @@ class APExitEngine:
             import datetime as _dt
             opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
 
+        underlying_entry, entry_geometry_malformed = _broker_repair_historical_value(
+            row, keys=_BROKER_REPAIR_ENTRY_GEOMETRY_KEYS
+        )
+        underlying_target, target_geometry_malformed = _broker_repair_historical_value(
+            row, keys=_BROKER_REPAIR_TARGET_GEOMETRY_KEYS
+        )
+        underlying_stop, stop_geometry_malformed = _broker_repair_historical_value(
+            row, keys=_BROKER_REPAIR_STOP_GEOMETRY_KEYS
+        )
+        historical_geometry_malformed = (
+            entry_geometry_malformed
+            or target_geometry_malformed
+            or stop_geometry_malformed
+        )
         _now = datetime.now(timezone.utc)
         _row_mode = str(row.get("execution_mode") or row.get("executionmode") or "").strip().lower()
         _execution_mode = _row_mode if _row_mode in {"live", "paper"} else self._resolved_execution_mode()
@@ -7082,9 +7625,9 @@ class APExitEngine:
             side             = side,
             quantity         = qty,
             entry_price      = entry_px,
-            underlying_entry = 0.0,   # unknown from broker data — exits use current price
-            underlying_target= 0.0,   # no target on repair — trailing/EOD rules still apply
-            underlying_stop  = 0.0,   # no stop on repair — EOD/expiry rules protect
+            underlying_entry = underlying_entry,
+            underlying_target= underlying_target,
+            underlying_stop  = underlying_stop,
             position_id      = pos_id,
             client_id        = self._email,
             signal_id        = sig_id,
@@ -7092,6 +7635,22 @@ class APExitEngine:
             quantity_remaining = qty,
             opened_at        = opened_at or _now,
         )
+        for _identity_attr in ("entry_local_order_id", "entry_broker_order_id"):
+            _identity_value = row.get(_identity_attr)
+            if _identity_value not in (None, ""):
+                setattr(mp, _identity_attr, str(_identity_value).strip())
+
+        if historical_geometry_malformed:
+            _mark_adoption_identity_quarantined(
+                mp,
+                "broker_repair_historical_geometry_contradictory",
+            )
+            log.critical(
+                "[exit_eng] BROKER_REPAIR_HISTORICAL_GEOMETRY_CONTRADICTORY "
+                "client=%s contract=%s position_id=%s — position quarantined",
+                self._email, sym, pos_id or "unknown",
+            )
+
         if prefer_qty_override and not _execution_mode:
             _mark_adoption_identity_quarantined(
                 mp,
@@ -7267,7 +7826,6 @@ class APExitEngine:
         repaired_syms               = []   # DB insert/re-query confirmed real id
         loaded_db_syms              = []   # existing DB row found and loaded
         repair_failed_syms          = []   # add_position never called
-        engine_loaded_synthetic_syms = []  # engine loaded but no confirmed DB row
 
         for sym in sorted(missing_from_engine):
             bp         = broker_map[sym]
@@ -7362,30 +7920,32 @@ class APExitEngine:
                 try:
                     new_id = self._upsert_broker_position_to_db(sym, bp)
 
-                    # Determine real id: use DB id when available; otherwise a
-                    # synthetic id so the engine can track this position without
-                    # claiming a DB row exists.
-                    if new_id:
-                        _pos_id    = new_id
-                        db_repaired = True
-                    else:
-                        # Upsert returned None — engine still loads with synthetic id
-                        # so the position is visible and will evaluate this cycle.
-                        # db_repaired stays False: no confirmed DB row.
-                        _pos_id             = f"broker-repair-{self._email}-{sym}"
-                        db_repaired         = False
-                        repair_failed_reason = (
-                            "db_upsert_returned_no_id_engine_loaded_synthetic"
-                        )
+                    # A broker recovery owner is usable only after the INSERT
+                    # (or its exact conflict re-query) returned a real id.
+                    # Never install an engine-only synthetic lifecycle object.
+                    if not new_id:
+                        repair_failed_reason = "db_upsert_returned_no_id"
                         log.warning(
                             "[exit_eng] EXIT_BROKER_POSITION_UPSERT_NO_ID "
-                            "client=%s contract_symbol=%s — using synthetic position_id; "
-                            "engine will still load and evaluate this position",
-                            self._email, sym,
+                            "client=%s account=%s contract_symbol=%s "
+                            "— DB owner not confirmed; broker recovery held",
+                            self._email, _account_id, sym,
                         )
+                        raise RuntimeError(repair_failed_reason)
+                    _pos_id = str(new_id)
+                    db_repaired = True
+                    _repair_row = getattr(new_id, "repair_row", None)
+                    _recovery_mode = ""
+                    if isinstance(_repair_row, dict):
+                        _recovery_mode = str(
+                            _repair_row.get("execution_mode") or ""
+                        ).strip().lower()
+                    if _recovery_mode not in {"live", "paper"}:
+                        _recovery_mode = self._resolved_execution_mode()
 
                     minimal_row = {
                         "id":                 _pos_id,
+                        "client_id":          self._email,
                         "contract":           sym,
                         "option_symbol":      sym,
                         "underlying":         self._underlying_from_occ(sym),
@@ -7394,8 +7954,31 @@ class APExitEngine:
                         "quantity_remaining": broker_qty,
                         "entry_price":        entry_px,
                         "avg_fill":           entry_px,
-                        "entry_ts":           bp.get("date_acquired"),
+                        "entry_ts":           (
+                            bp.get("date_acquired")
+                            or (
+                                bp.get("raw", {}).get("date_acquired")
+                                if isinstance(bp.get("raw"), dict) else None
+                            )
+                        ),
+                        "execution_mode":     _recovery_mode,
                     }
+                    if isinstance(_repair_row, dict):
+                        minimal_row.update(_repair_row)
+                    # Broker truth controls current quantity and exact recovery
+                    # identity even when the attached row came from a conflict
+                    # path.
+                    minimal_row.update(
+                        {
+                            "id": _pos_id,
+                            "client_id": self._email,
+                            "contract": sym,
+                            "option_symbol": sym,
+                            "qty": broker_qty,
+                            "quantity_remaining": broker_qty,
+                            "execution_mode": _recovery_mode,
+                        }
+                    )
                     pos = self._managed_position_from_row(
                         minimal_row,
                         qty_override=broker_qty,
@@ -7407,10 +7990,7 @@ class APExitEngine:
                     )
                     if not _loaded_active:
                         raise RuntimeError("add_position did not install behavior-active broker owner")
-                    if new_id:
-                        repaired_syms.append(sym)              # confirmed DB row
-                    else:
-                        engine_loaded_synthetic_syms.append(sym)  # engine-only, no DB row
+                    repaired_syms.append(sym)              # confirmed DB row
                 except Exception as _re_err:
                     repair_failed_syms.append(sym)
                     repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
@@ -7531,13 +8111,13 @@ class APExitEngine:
             "client=%s account=%s broker_position_count=%d broker_symbols=%s "
             "engine_position_count=%d engine_symbols=%s missing_from_engine=%s "
             "loaded_from_db=%s repaired_from_broker=%s "
-            "engine_loaded_synthetic=%s repair_failed=%s",
+            "repair_failed=%s",
             self._email, _account_id,
             len(broker_syms), sorted(broker_syms),
             len(engine_syms), sorted(engine_syms),
             sorted(missing_from_engine),
             loaded_db_syms, repaired_syms,
-            engine_loaded_synthetic_syms, repair_failed_syms,
+            repair_failed_syms,
         )
 
         return len(repair_failed_syms) == 0
