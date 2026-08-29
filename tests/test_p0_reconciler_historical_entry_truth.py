@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import pytest
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import sys
