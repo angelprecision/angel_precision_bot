@@ -996,6 +996,64 @@ def test_broker_truth_exact_occ_allows_protective_close(monkeypatch, mock_broker
     assert any("UPDATE orders " in sql and "SET meta = COALESCE(meta, '{}'::jsonb)" in sql for sql, _ in fake_conn.queries)
 
 
+def test_terminal_no_order_stop_marker_keeps_canonical_exit_eligible(monkeypatch, mock_broker):
+    """A broker-proven rejected optional stop must not fence the real exit."""
+    contract = "NOW260828P00122000"
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": contract, "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+    ]
+    mock_broker.list_orders.return_value = []
+    mock_broker.session.post.return_value = _resp(
+        200,
+        json_body={"order": {"id": "CANONICAL-EXIT-REJECTED-STOP", "status": "open"}},
+    )
+
+    class _RejectedStopOSM(_MockOSM):
+        def get_orders_for_position(self, position_id):
+            return [
+                {
+                    "position_id": position_id,
+                    "kind": "ENTRY",
+                    "client_id": self.client_id,
+                    "contract": contract,
+                    "execution_mode": "live",
+                    "meta": {
+                        "protective_order": {
+                            "protective_order_state": "TERMINAL_NO_ORDER",
+                            "protective_broker_order_id": None,
+                            "protective_contract": contract,
+                            "protective_source": "standing_stop",
+                            "execution_mode": "live",
+                            "client_id": self.client_id,
+                        }
+                    },
+                }
+            ]
+
+    result = _RejectedStopOSM().submit_exit(
+        broker=mock_broker,
+        position_id="position-now-live-rejected-stop",
+        contract=contract,
+        symbol="NOW",
+        direction="PUT",
+        qty=1,
+        limit_price=1.08,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is True
+    assert mock_broker.cancel_order.call_count == 0
+    assert mock_broker.list_positions.call_count >= 1
+    assert mock_broker.list_orders_strict.call_count >= 1
+    assert mock_broker.session.post.call_count == 1
+    assert mock_broker.session.post.call_args.kwargs["data"]["side"] == "sell_to_close"
+    assert mock_broker.session.post.call_args.kwargs["data"]["quantity"] == 1
+
+
 def test_broker_flat_exact_match_blocks_without_broker_post_and_marks_stale(monkeypatch, mock_broker):
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
     fake_conn = _patch_db(

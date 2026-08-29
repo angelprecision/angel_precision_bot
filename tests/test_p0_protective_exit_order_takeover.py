@@ -1042,6 +1042,7 @@ def test_unknown_active_status_holds_without_cancel():
     [
         ({"id": "143387714", "status": "open"}, "ACTIVE", "143387714"),
         ({"status": "ok"}, "OUTCOME_UNPROVEN", None),
+        ({"status": "rejected"}, "TERMINAL_NO_ORDER", None),
     ],
 )
 def test_standing_stop_identity_is_durable_only_with_concrete_broker_id(
@@ -1093,6 +1094,77 @@ def test_standing_stop_identity_is_durable_only_with_concrete_broker_id(
     assert payload["client_id"] == CLIENT
     assert payload["execution_mode"] == "live"
     assert payload["protective_contract"] == CONTRACT
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_state"),
+    [
+        (422, "TERMINAL_NO_ORDER"),
+        (409, "OUTCOME_UNPROVEN"),
+        (500, "OUTCOME_UNPROVEN"),
+    ],
+)
+def test_rest_stop_rejection_distinguishes_proven_no_order_from_ambiguity(
+    monkeypatch, status_code, expected_state,
+):
+    writes = []
+
+    class _Cursor:
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params):
+            writes.append((sql, params))
+            return _Cursor()
+
+    class _Response:
+        def __init__(self):
+            self.status_code = status_code
+            self.text = "stop rejected"
+
+    class _Session:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return _Response()
+
+    class _StopBroker:
+        base_url = "https://api.tradier.com"
+        account_id = "ACC123"
+
+        def __init__(self):
+            self.session = _Session()
+
+    broker = _StopBroker()
+    monkeypatch.setattr(fill_monitor_mod, "conn", lambda: _Conn())
+    monkeypatch.setattr(fill_monitor_mod, "run_with_retry", lambda fn, *a, **k: fn())
+    monkeypatch.setattr(fill_monitor_mod, "audit", lambda *a, **k: None)
+
+    fill_monitor_mod._place_standing_stop_best_effort(
+        broker=broker,
+        order={
+            "local_order_id": "entry-now-1",
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "contract": CONTRACT,
+            "symbol": "NOW",
+        },
+        qty=1,
+        entry_price=1.54,
+    )
+
+    payload = __import__("json").loads(writes[-1][1][0])["protective_order"]
+    assert payload["protective_order_state"] == expected_state
+    assert payload["protective_broker_order_id"] is None
+    assert len(broker.session.calls) == 1
 
 
 def test_standing_stop_is_not_posted_when_pending_identity_persistence_misses(monkeypatch):
@@ -1168,3 +1240,36 @@ def test_unproven_standing_stop_marker_blocks_durable_identity_lookup():
         contract=CONTRACT,
         execution_mode="live",
     ) == (None, "durable_protective_identity_unproven")
+
+
+def test_terminal_no_order_marker_does_not_claim_a_protective_owner():
+    class _OSM:
+        client_id = CLIENT
+
+        def get_orders_for_position(self, position_id):
+            return [
+                {
+                    "position_id": position_id,
+                    "kind": "ENTRY",
+                    "client_id": CLIENT,
+                    "contract": CONTRACT,
+                    "execution_mode": "live",
+                    "meta": {
+                        "protective_order": {
+                            "protective_order_state": "TERMINAL_NO_ORDER",
+                            "protective_broker_order_id": None,
+                            "protective_contract": CONTRACT,
+                            "protective_source": "standing_stop",
+                            "execution_mode": "live",
+                            "client_id": CLIENT,
+                        }
+                    },
+                }
+            ]
+
+    assert _durable_protective_order_id_for_position(
+        _OSM(),
+        position_id="position-now-live-1",
+        contract=CONTRACT,
+        execution_mode="live",
+    ) == (None, None)

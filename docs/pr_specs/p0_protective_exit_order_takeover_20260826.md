@@ -340,7 +340,12 @@ Rules:
   `OUTCOME_UNPROVEN` so restart/recovery holds rather than inferring that no
   stop exists;
 - concrete broker order id required before state may be `SUBMITTED/ACTIVE`;
-- missing id or response ambiguity = `OUTCOME_UNPROVEN`;
+- missing id without a definitive rejection, or response ambiguity, is
+  `OUTCOME_UNPROVEN`;
+- a definitive broker rejection before acceptance with no broker id is
+  `TERMINAL_NO_ORDER`; it owns no protective broker order, so canonical EXIT
+  still runs strict broker preflight; transport, timeout, malformed, and
+  otherwise ambiguous outcomes remain `OUTCOME_UNPROVEN`;
 - cumulative terminal execution is a coherence fence, including fills already
   present in the first order snapshot; final position truth remains the only
   replacement-size authority;

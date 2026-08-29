@@ -87,10 +87,42 @@ ACTIVE_BROKER_STATUSES = {
 
 TERMINAL_FAILURE_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
 
+_DEFINITIVE_PROTECTIVE_REJECTION_STATUSES = frozenset({
+    "reject",
+    "rejected",
+    "denied",
+    "declined",
+    "not_placed",
+    "not_submitted",
+    "failed_before_acceptance",
+    "rejected_before_acceptance",
+})
+_AMBIGUOUS_PROTECTIVE_REJECTION_HTTP_STATUSES = frozenset({408, 409, 425, 429})
+
 UNKNOWN_ERROR_ESCALATE_AFTER = int(os.getenv("FILL_MONITOR_UNKNOWN_ERROR_ESCALATE_AFTER", "3"))
 FILL_ANOMALY_STATUS = os.getenv("FILL_MONITOR_ANOMALY_STATUS", "BROKER_FILL_ANOMALY").strip().upper()
 
 _BROKER_STATE_ANOMALY_COUNTS: dict[str, int] = {}
+
+
+def _is_definitive_protective_rejection_status(status: object) -> bool:
+    normalized = re.sub(r"[\s-]+", "_", str(status or "").strip().lower())
+    return normalized in _DEFINITIVE_PROTECTIVE_REJECTION_STATUSES
+
+
+def _is_definitive_protective_rejection_http_status(status_code: object) -> bool:
+    if isinstance(status_code, bool):
+        return False
+    if isinstance(status_code, int):
+        code = status_code
+    elif isinstance(status_code, str) and status_code.strip().isdigit():
+        code = int(status_code.strip())
+    else:
+        return False
+    return (
+        400 <= code < 500
+        and code not in _AMBIGUOUS_PROTECTIVE_REJECTION_HTTP_STATUSES
+    )
 
 
 def _order_count_key(client_id: str, local_order_id: str, broker_order_id: str | None = None) -> str:
@@ -1675,13 +1707,22 @@ def _place_standing_stop_best_effort(
 
     def _persist_identity(
         stop_id, stop_status, source, *, ownership_state: Optional[str] = None,
+        status_code: object = None,
     ) -> bool:
         concrete_id = str(stop_id or "").strip()
         if concrete_id in {"", "?", "N/A", "UNKNOWN", "0"}:
             concrete_id = ""
         normalized_status = str(stop_status or "").strip().lower()
         if ownership_state is None:
-            if concrete_id and normalized_status in {
+            if (
+                not concrete_id
+                and (
+                    _is_definitive_protective_rejection_status(normalized_status)
+                    or _is_definitive_protective_rejection_http_status(status_code)
+                )
+            ):
+                ownership_state = "TERMINAL_NO_ORDER"
+            elif concrete_id and normalized_status in {
                 "ok", "accepted", "ack", "new", "open", "pending", "submitted", "working",
             }:
                 ownership_state = "ACTIVE" if normalized_status in {"new", "open", "pending", "working"} else "SUBMITTED"
@@ -1768,7 +1809,12 @@ def _place_standing_stop_best_effort(
             if isinstance(stop_resp, dict):
                 stop_id = stop_resp.get("id") or stop_resp.get("order_id") or stop_resp.get("broker_order_id")
                 stop_stat = str(stop_resp.get("status") or stop_resp.get("state") or "unknown")
-            _persist_identity(stop_id, stop_stat, "broker_helper")
+            _persist_identity(
+                stop_id,
+                stop_stat,
+                "broker_helper",
+                status_code=stop_resp.get("status_code") if isinstance(stop_resp, dict) else None,
+            )
             log.info("[%s] Standing stop placed via broker helper @ $%.2f | broker_stop=%s status=%s", ticker, stop_px, stop_id or "?", stop_stat)
             audit(
                 order["client_id"],
@@ -1832,7 +1878,13 @@ def _place_standing_stop_best_effort(
         else:
             err_body = getattr(resp, "text", "")[:200]
             log.warning("[%s] Standing stop FAILED — exit engine sole protection | %s", ticker, err_body)
-            _persist_identity(None, "rejected", "rest")
+            status_code = getattr(resp, "status_code", None)
+            _persist_identity(
+                None,
+                "rejected" if _is_definitive_protective_rejection_http_status(status_code) else "error",
+                "rest",
+                status_code=status_code,
+            )
             audit(
                 order["client_id"],
                 "WARNING",

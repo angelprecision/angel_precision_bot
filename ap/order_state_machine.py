@@ -158,10 +158,14 @@ def _durable_protective_order_id_for_position(
         ):
             return None, "durable_protective_identity_metadata_mismatch"
         if protective_state and protective_state not in {
-            "ACTIVE", "SUBMITTED", "OUTCOME_UNPROVEN", "PLACEMENT_PENDING",
+            "ACTIVE", "SUBMITTED", "OUTCOME_UNPROVEN", "PLACEMENT_PENDING", "TERMINAL_NO_ORDER",
         }:
             return None, "durable_protective_identity_state_unproven"
         candidate = str(protective.get("protective_broker_order_id") or "").strip()
+        if protective_state == "TERMINAL_NO_ORDER":
+            if candidate.upper() not in {"", "?", "N/A", "UNKNOWN", "NULL", "NONE", "0"}:
+                return None, "durable_protective_identity_state_id_conflict"
+            continue
         if candidate.upper() in {"", "?", "N/A", "UNKNOWN", "NULL", "NONE", "0"}:
             return None, "durable_protective_identity_unproven"
         concrete_ids.add(candidate)
