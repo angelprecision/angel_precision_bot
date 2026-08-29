@@ -3865,7 +3865,9 @@ class APBrokerReconciler:
             return None
 
     def _find_db_position_by_id(self, pos_id: str) -> Optional[dict]:
-        if not pos_id:
+        """Find one position only inside this reconciler's client/mode scope."""
+        normalized_mode = _normalize_execution_mode(self.execution_mode)
+        if not pos_id or normalized_mode is None:
             return None
         try:
             from ap.db import conn, run_with_retry
@@ -3873,8 +3875,15 @@ class APBrokerReconciler:
             def _fetch():
                 with conn() as c:
                     c.execute(
-                        "SELECT * FROM positions WHERE client_id=%s AND id=%s LIMIT 1",
-                        (self.client_id, pos_id),
+                        """
+                        SELECT *
+                        FROM positions
+                        WHERE client_id=%s
+                          AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s
+                          AND id=%s
+                        LIMIT 1
+                        """,
+                        (self.client_id, normalized_mode, pos_id),
                     )
                     row = c.fetchone()
                     return dict(row) if row else None
@@ -4262,12 +4271,51 @@ class APBrokerReconciler:
         underlying: str,
         contract: str,
     ) -> float:
-        """Use persisted or exact filled-ENTRY history; never current market data."""
+        """Use proven position truth or exact filled-ENTRY history only.
+
+        A positive alias on an unscoped mapping is not enough to establish
+        historical truth.  Position rows may be stale, cross-mode, or imported
+        from another client; only a mapping carrying the current client and a
+        durable mode that resolves to this reconciler's mode may donate its
+        persisted value.  Otherwise recovery falls through to the exact
+        filled-ENTRY lookup, which applies the full order identity predicate.
+        """
         value, malformed = _historical_underlying_from_mapping(pos)
         if malformed:
             return 0.0
+
         if value > 0:
-            return value
+            try:
+                from ap.order_state_machine import _durable_execution_mode
+
+                expected_mode = _normalize_execution_mode(self.execution_mode)
+                position_mode = _durable_execution_mode(pos)
+                position_client = str(pos.get("client_id") or "").strip().lower()
+                expected_client = str(self.client_id or "").strip().lower()
+            except Exception:
+                expected_mode = None
+                position_mode = None
+                position_client = ""
+                expected_client = ""
+
+            if (
+                position_client
+                and position_client == expected_client
+                and expected_mode is not None
+                and position_mode == expected_mode
+            ):
+                return value
+
+            log.warning(
+                "[%s] POSITION_ENTRY_UNDERLYING_UNPROVEN "
+                "position_id=%s client=%s mode=%s expected_mode=%s "
+                "— falling through to exact filled-entry history",
+                self.client_id,
+                str(pos.get("id") or pos.get("position_id") or "").strip(),
+                position_client or "<missing>",
+                position_mode or "<missing>",
+                expected_mode or "<missing>",
+            )
 
         position_id = str(pos.get("id") or pos.get("position_id") or "").strip()
         return self._filled_entry_underlying_for_position(
