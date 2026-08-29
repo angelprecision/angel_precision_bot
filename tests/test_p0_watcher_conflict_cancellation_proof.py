@@ -1392,3 +1392,57 @@ def test_unproven_loser_cancellation_retries_after_deferred_hold():
     assert osm.rows["put-lo"]["status"] == "CANCELED"
     assert watcher.has_order("put-lo") is False
     assert watcher.has_order("call-lo") is False
+
+
+def test_recovery_rearm_coarms_healthy_prebreach_opposite_without_cancel():
+    old = signal(signal_id="old", local_order_id="old-lo", side="PUT", score=70)
+    new = signal(signal_id="new", local_order_id="new-lo", side="CALL", score=95)
+    new["__recovery_rearm"] = True
+    osm = FakeOSM(
+        {"old-lo": row_for(old), "new-lo": row_for(new)},
+        cancel_results={"old-lo": False},
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    existing = seed(watcher, old)
+
+    assert watcher.add_signal(dict(new)) is True
+    assert active_directions(watcher) == {"CALL", "PUT"}
+    assert existing in watcher._pending
+    assert "old" in watcher._dedup_set
+    assert osm.cancel_calls == []
+
+
+def test_recovery_rearm_still_blocks_on_durable_confirmed_breach():
+    old = signal(signal_id="old", local_order_id="old-lo", side="PUT", score=70)
+    new = signal(signal_id="new", local_order_id="new-lo", side="CALL", score=60)
+    new["__recovery_rearm"] = True
+    osm = FakeOSM(
+        {"old-lo": row_for(old), "new-lo": row_for(new)},
+        cancel_results={"old-lo": False},
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    existing = seed(watcher, old)
+    existing.trigger_crossed_at = "2026-08-28T13:44:55+00:00"
+
+    assert watcher.add_signal(dict(new)) is False
+    assert_retained(watcher, existing, old)
+    assert "new" not in watcher._dedup_set
+    assert osm.cancel_calls == []
+
+
+def test_recovery_materialization_resume_does_not_coarm_opposite():
+    old = signal(signal_id="old", local_order_id="old-lo", side="PUT", score=70)
+    new = signal(signal_id="new", local_order_id="new-lo", side="CALL", score=60)
+    new["__recovery_rearm"] = True
+    new["__materialization_resume"] = True
+    osm = FakeOSM(
+        {"old-lo": row_for(old), "new-lo": row_for(new)},
+        cancel_results={"old-lo": False},
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    existing = seed(watcher, old)
+
+    assert watcher.add_signal(dict(new)) is False
+    assert_retained(watcher, existing, old)
+    assert "new" not in watcher._dedup_set
+    assert osm.cancel_calls == []
