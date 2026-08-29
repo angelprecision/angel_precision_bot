@@ -49,22 +49,18 @@ jobs:
               new_text = text[:match.start()] + replacement.rstrip() + "\n\n" + text[match.end():]
               p.write_text(new_text)
 
-          # Runtime authority: the in-process health loop must obey the same
-          # market-open boundary as Render/GitHub scheduling.
           replace_once(
               "client_runner.py",
               "    def _overnight_reeval_window_start(self, today):\n        return datetime(today.year, today.month, today.day, 9, 0, 0, tzinfo=_ET)",
               "    def _overnight_reeval_window_start(self, today):\n        # Required Tradier morning data is not authoritative premarket.\n        # Stage inventory before open, but do not run the authoritative\n        # overnight reevaluation until the regular session begins.\n        return datetime(today.year, today.month, today.day, 9, 30, 0, tzinfo=_ET)",
           )
 
-          # PAPER follows the same open-time schedule as LIVE.
           paper_path = Path(".github/workflows/paper-morning-jobs.yml")
           paper_text = paper_path.read_text()
           paper_text = paper_text.replace('"32 13 * * 1-5"', '"34 13 * * 1-5"')
           paper_text = paper_text.replace('"32 14 * * 1-5"', '"34 14 * * 1-5"')
           paper_path.write_text(paper_text)
 
-          # New behavioral suite tracks the final 09:30/09:34/09:36 shape.
           new_test = Path("tests/test_open_time_morning_autonomy.py")
           new_text = new_test.read_text().replace('"32 13 * * 1-5"', '"34 13 * * 1-5"')
           insert_after = '''def test_authoritative_overnight_scheduler_target_is_market_open():\n    assert morning_jobs.JOB_TARGET_MINUTE[morning_jobs.OVERNIGHT_REEVAL_BATCH_JOB] == (9, 30)\n    assert not morning_jobs.should_run_now(\n        morning_jobs.OVERNIGHT_REEVAL_BATCH_JOB,\n        now=_et(9, 29),\n        tolerance_minutes=0,\n    )\n    assert morning_jobs.should_run_now(\n        morning_jobs.OVERNIGHT_REEVAL_BATCH_JOB,\n        now=_et(9, 30),\n        tolerance_minutes=0,\n    )\n'''
@@ -75,8 +71,6 @@ jobs:
               new_text = new_text.replace(insert_after, insert_after + runner_test, 1)
           new_test.write_text(new_text)
 
-          # Existing source-contract test: six LIVE morning cron services remain
-          # (09:30/09:34/09:36 x EDT/EST); archive crons are not client-scoped.
           auto_path = Path("tests/test_p0_autonomous_morning_handoff.py")
           auto_text = auto_path.read_text()
           auto_text = auto_text.replace(
@@ -219,7 +213,6 @@ jobs:
               assert len(runner.post_calls) == 1
           ''')
 
-          # The transient workflow must not be part of the PR diff.
           Path(".github/workflows/one-shot-open-time-runner-patch.yml").unlink()
           PY
 
@@ -227,10 +220,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest
 
       - name: Run morning autonomy regression suite
         run: |
-          pytest -q \
+          python -m pytest -q \
             tests/test_open_time_morning_autonomy.py \
             tests/test_p0_live_morning_jobs.py \
             tests/test_p0_autonomous_morning_handoff.py \
