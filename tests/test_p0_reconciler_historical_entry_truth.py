@@ -299,6 +299,27 @@ def test_real_postgres_nonmatching_identity_row_fails_closed(
     assert value == 0.0
 
 
+def test_real_postgres_partial_fill_with_positive_evidence_is_recoverable(
+    postgres_history_harness,
+    monkeypatch,
+):
+    harness = postgres_history_harness
+    harness.insert_entry(
+        status="PARTIAL_FILL",
+        filled_qty=1,
+        meta=_live_meta(underlying_entry=127.425),
+    )
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == pytest.approx(127.425)
+
+
 def test_real_postgres_conflicting_mode_authorities_fail_closed(
     postgres_history_harness,
     monkeypatch,
@@ -455,6 +476,7 @@ def test_scoped_position_mapping_can_supply_its_persisted_historical_value(
             "id": POSITION_ID,
             "client_id": CLIENT,
             "execution_mode": "live",
+            "contract": CONTRACT,
             "underlying_entry": 127.425,
         },
         underlying="NOW",
