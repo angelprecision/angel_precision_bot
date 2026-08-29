@@ -12,7 +12,8 @@ Critical recovery invariant:
   If the broker has an open option position and the DB has no matching OPEN/CLOSING
   position, the reconciler imports a conservative OPEN position into DB and seeds
   the exit engine. This prevents restart/orphan failures. Imported/reseeded
-  positions must carry the best available underlying_entry and price-trust flags
+  positions must carry the best available proven historical underlying_entry and
+  price-trust flags
   so exit logic does not silently operate on fake state.
 
 Checks:
@@ -77,6 +78,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
@@ -173,6 +175,65 @@ BROKER_TO_OSM = {
 # OCC option symbology: root(variable) + YYMMDD(6) + C|P(1) + 8-digit strike.
 # Anchored to end-of-string so it cannot match a P inside the root ticker.
 _OCC_CP_RE = re.compile(r'([CP])\d{8}$')
+
+
+def _positive_finite_float(value) -> float:
+    """Return a finite positive number, never a boolean or non-finite value."""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return result if math.isfinite(result) and result > 0 else 0.0
+
+
+_HISTORICAL_UNDERLYING_KEYS = (
+    "underlying_entry",
+    "entry_underlying",
+    "underlying_price_at_entry",
+    "underlying_entry_price",
+    "entry_underlying_price",
+)
+
+
+def _historical_underlying_from_mapping(value) -> tuple[float, bool]:
+    """Read explicit historical aliases and reject malformed/conflicting values."""
+    if not isinstance(value, dict):
+        return 0.0, False
+
+    values: list[float] = []
+    saw_explicit_zero = False
+    for key in _HISTORICAL_UNDERLYING_KEYS:
+        if key not in value:
+            continue
+        raw = value.get(key)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        if isinstance(raw, bool):
+            return 0.0, True
+        try:
+            numeric = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0, True
+        if not math.isfinite(numeric):
+            return 0.0, True
+        if numeric == 0:
+            saw_explicit_zero = True
+            continue
+        if numeric < 0:
+            return 0.0, True
+        values.append(numeric)
+
+    if not values:
+        return 0.0, False
+    # An explicit zero alongside a positive alias is contradictory evidence.
+    # Treat it as malformed instead of allowing a later alias to override it.
+    if saw_explicit_zero:
+        return 0.0, True
+    if any(candidate != values[0] for candidate in values[1:]):
+        return 0.0, True
+    return values[0], False
 
 
 def _row_first_value(row, key: str = "id"):
@@ -3804,7 +3865,9 @@ class APBrokerReconciler:
             return None
 
     def _find_db_position_by_id(self, pos_id: str) -> Optional[dict]:
-        if not pos_id:
+        """Find one position only inside this reconciler's client/mode scope."""
+        normalized_mode = _normalize_execution_mode(self.execution_mode)
+        if not pos_id or normalized_mode is None:
             return None
         try:
             from ap.db import conn, run_with_retry
@@ -3812,8 +3875,15 @@ class APBrokerReconciler:
             def _fetch():
                 with conn() as c:
                     c.execute(
-                        "SELECT * FROM positions WHERE client_id=%s AND id=%s LIMIT 1",
-                        (self.client_id, pos_id),
+                        """
+                        SELECT *
+                        FROM positions
+                        WHERE client_id=%s
+                          AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s
+                          AND id=%s
+                        LIMIT 1
+                        """,
+                        (self.client_id, normalized_mode, pos_id),
                     )
                     row = c.fetchone()
                     return dict(row) if row else None
@@ -3904,9 +3974,7 @@ class APBrokerReconciler:
 
             stop_u             = self._safe_float(stop_underlying, 0.0)
             target_u           = self._safe_float(target_underlying, 0.0)
-            underlying_entry_u = self._safe_float(underlying_entry, 0.0)
-            if underlying_entry_u <= 0:
-                underlying_entry_u = self._get_current_underlying_price(underlying)
+            underlying_entry_u = _positive_finite_float(underlying_entry)
             if underlying_entry_u <= 0:
                 self._alert(
                     f"EXIT_ENGINE_SEED_UNDERLYING_ENTRY_UNKNOWN | {contract} | "
@@ -4075,22 +4143,126 @@ class APBrokerReconciler:
         underlying: str,
         contract: str,
     ) -> float:
-        """
-        Imported positions should not seed the exit engine with underlying_entry=0
-        if the broker or quote path exposes anything better.
-        """
-        for key in (
-            "underlying_entry", "underlying_entry_price", "entry_underlying",
-            "underlying_price_at_entry", "underlying_price", "underlier_price",
-            "root_price", "underlying_last", "current_underlying",
-        ):
-            val = self._safe_float(bp.get(key), 0.0)
-            if val > 0:
-                return val
+        """Return only explicitly historical broker-import entry metadata.
 
-        # Last resort: current underlying is safer than hardcoded zero, but still
-        # treated as approximate by the exit engine via underlying_entry_untrusted.
-        return self._get_current_underlying_price(self._norm_underlying(underlying or contract))
+        A broker position snapshot is current exposure evidence.  Its mark,
+        last, or current-underlying fields are not historical fill truth and
+        must not become the denominator for later exit decisions.
+        """
+        value, _malformed = _historical_underlying_from_mapping(bp)
+        return value
+
+    def _filled_entry_underlying_for_position(
+        self,
+        *,
+        contract: str,
+        position_id: str,
+    ) -> float:
+        """Recover one exact filled-ENTRY historical underlying value.
+
+        This is deliberately narrower than a general order lookup.  A canonical
+        position ID, exact client/mode/OCC identity, positive fill quantity and
+        price, and a fill timestamp are all required before metadata can donate
+        historical entry truth.  Multiple matching rows or malformed evidence
+        remain untrusted.
+        """
+        import json as _json
+
+        client_id = str(self.client_id or "").strip()
+        mode = _normalize_execution_mode(self.execution_mode)
+        contract = self._norm_contract(contract)
+        position_id = str(position_id or "").strip()
+        if not client_id or mode is None or not contract or not position_id:
+            return 0.0
+
+        try:
+            from ap.db import conn, run_with_retry
+            from ap.order_state_machine import (
+                _DURABLE_EXECUTION_MODE_SQL,
+                _durable_execution_mode,
+            )
+
+            def _fetch() -> list[dict]:
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        SELECT fill_price, filled_qty, filled_ts,
+                               execution_mode, meta
+                        FROM orders
+                        WHERE client_id=%s
+                          AND {_DURABLE_EXECUTION_MODE_SQL}
+                          AND UPPER(TRIM(COALESCE(contract,'')))=%s
+                          AND UPPER(TRIM(COALESCE(kind,'')))='ENTRY'
+                          AND UPPER(TRIM(COALESCE(status,''))) IN ('FILLED','PARTIAL_FILL')
+                          AND position_id::text=%s
+                          AND COALESCE(filled_qty,0)>0
+                          AND fill_price IS NOT NULL
+                          AND filled_ts IS NOT NULL
+                        ORDER BY filled_ts DESC NULLS LAST
+                        LIMIT 2
+                        """,
+                        (client_id, mode, contract, position_id),
+                    )
+                    return [dict(row) for row in (c.fetchall() or [])]
+
+            rows = run_with_retry(_fetch) or []
+            if len(rows) != 1:
+                if len(rows) > 1:
+                    log.critical(
+                        "[%s] FILLED_ENTRY_UNDERLYING_AMBIGUOUS "
+                        "contract=%s mode=%s position_id=%s candidates=%d",
+                        client_id, contract, mode, position_id, len(rows),
+                    )
+                return 0.0
+
+            row = rows[0]
+            row_mode = _durable_execution_mode(row)
+            if row_mode != mode:
+                log.critical(
+                    "[%s] FILLED_ENTRY_UNDERLYING_MODE_UNPROVEN "
+                    "contract=%s expected_mode=%s row_mode=%s position_id=%s",
+                    client_id, contract, mode, row_mode, position_id,
+                )
+                return 0.0
+
+            fill_price = _positive_finite_float(row.get("fill_price"))
+            filled_qty = _positive_finite_float(row.get("filled_qty"))
+            if (
+                fill_price <= 0
+                or filled_qty <= 0
+                or filled_qty != int(filled_qty)
+            ):
+                return 0.0
+
+            filled_ts = row.get("filled_ts")
+            if isinstance(filled_ts, datetime):
+                pass
+            elif isinstance(filled_ts, str) and filled_ts.strip():
+                try:
+                    datetime.fromisoformat(filled_ts.strip().replace("Z", "+00:00"))
+                except ValueError:
+                    return 0.0
+            else:
+                return 0.0
+
+            meta = row.get("meta")
+            if isinstance(meta, str) and meta.strip():
+                try:
+                    meta = _json.loads(meta)
+                except (TypeError, ValueError):
+                    return 0.0
+            if not isinstance(meta, dict):
+                return 0.0
+
+            value, malformed = _historical_underlying_from_mapping(meta)
+            return 0.0 if malformed else value
+        except Exception as exc:
+            log.warning(
+                "[%s] FILLED_ENTRY_UNDERLYING_LOOKUP_FAILED "
+                "contract=%s mode=%s position_id=%s error=%s",
+                client_id, contract, mode, position_id, exc,
+            )
+            return 0.0
 
     def _derive_underlying_entry_from_position(
         self,
@@ -4099,17 +4271,70 @@ class APBrokerReconciler:
         underlying: str,
         contract: str,
     ) -> float:
-        """Use DB metadata first when reseeding an existing open position."""
-        for key in (
-            "underlying_entry", "entry_underlying", "trigger_price",
-            "underlying_entry_price", "entry_underlying_price", "opened_underlying",
-        ):
-            val = self._safe_float(pos.get(key), 0.0)
-            if val > 0:
-                return val
+        """Use proven position truth or exact filled-ENTRY history only.
 
-        # Do NOT infer entry from stop/target; that corrupts progress math.
-        return self._get_current_underlying_price(self._norm_underlying(underlying or contract))
+        A positive alias on an unscoped mapping is not enough to establish
+        historical truth.  Position rows may be stale, cross-mode, or imported
+        from another client; only a mapping carrying the current client and a
+        durable mode that resolves to this reconciler's mode may donate its
+        persisted value.  Otherwise recovery falls through to the exact
+        filled-ENTRY lookup, which applies the full order identity predicate.
+        """
+        value, malformed = _historical_underlying_from_mapping(pos)
+        if malformed:
+            return 0.0
+
+        if value > 0:
+            position_id = str(
+                pos.get("id") or pos.get("position_id") or ""
+            ).strip()
+            position_contract = self._norm_contract(
+                pos.get("contract") or pos.get("symbol") or ""
+            )
+            expected_contract = self._norm_contract(contract)
+            try:
+                from ap.order_state_machine import _durable_execution_mode
+
+                expected_mode = _normalize_execution_mode(self.execution_mode)
+                position_mode = _durable_execution_mode(pos)
+                position_client = str(pos.get("client_id") or "").strip().lower()
+                expected_client = str(self.client_id or "").strip().lower()
+            except Exception:
+                expected_mode = None
+                position_mode = None
+                position_client = ""
+                expected_client = ""
+
+            if (
+                position_id
+                and position_contract
+                and position_contract == expected_contract
+                and position_client
+                and position_client == expected_client
+                and expected_mode is not None
+                and position_mode == expected_mode
+            ):
+                return value
+
+            log.warning(
+                "[%s] POSITION_ENTRY_UNDERLYING_UNPROVEN "
+                "position_id=%s client=%s mode=%s expected_mode=%s "
+                "contract=%s expected_contract=%s "
+                "— falling through to exact filled-entry history",
+                self.client_id,
+                position_id,
+                position_client or "<missing>",
+                position_mode or "<missing>",
+                expected_mode or "<missing>",
+                position_contract or "<missing>",
+                expected_contract or "<missing>",
+            )
+
+        position_id = str(pos.get("id") or pos.get("position_id") or "").strip()
+        return self._filled_entry_underlying_for_position(
+            contract=contract,
+            position_id=position_id,
+        )
 
     def _active_exit_order_exists(
         self,
