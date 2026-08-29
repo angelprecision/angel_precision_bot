@@ -288,33 +288,24 @@ def build_job_calls(
             ),
         ]
     if job_name == MORNING_RECOVERY_JOB:
-        import os as _os
-
-        live_release_enabled = str(
-            _os.getenv("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN", "false")
-        ).strip().lower() in ("1", "true", "yes")
-
-        # Recovery calls are mode-pure. The old combined call was tagged
-        # execution_mode="mixed", so a LIVE-scoped scheduler filtered it out
-        # before execution. That let a LIVE recovery cron exit green after doing
-        # zero work. Keep live and paper authority separate all the way to the
-        # endpoint payload.
+        # LIVE recovery must reuse the canonical overnight evaluator. A successful
+        # evaluator attempt already invokes the post-overnight handoff/readiness
+        # path, so this recovers both fresh-data evaluation and watcher ownership
+        # without introducing a second LIVE release authority.
         calls: list[MorningJobCall] = []
-        if live_release_enabled and live_client:
+        if live_client:
             calls.append(
                 MorningJobCall(
-                    job_name="release_after_hours_deferred_live",
-                    endpoint=RELEASE_AFTER_HOURS_DEFERRED_ENDPOINT,
-                    payload=build_release_after_hours_deferred_payload(
-                        clients=[live_client],
-                        force=True,
-                        lookback_h=36,
-                    ),
+                    job_name="morning_recovery_live_overnight_reeval",
+                    endpoint=OVERNIGHT_REEVAL_ENDPOINT,
+                    payload=build_overnight_reeval_payload(clients=[live_client]),
                     client_scope=live_client,
                     execution_mode="live",
                 )
             )
 
+        # Preserve the existing paper recovery behavior. These calls remain
+        # paper-only and can never survive a LIVE execution-mode filter.
         if paper_client_list:
             calls.extend(
                 [
