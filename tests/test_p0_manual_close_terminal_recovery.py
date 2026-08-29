@@ -583,6 +583,8 @@ def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
                             "qty": 2, "quantity_remaining": 0,
                             "entry_ts": "2026-07-21T15:26:58.911238+00:00",
                         }])
+    monkeypatch.setattr(manual_mod, "_recover_manual_close_downstream_truth",
+                        lambda **kwargs: None)
     monkeypatch.setattr(manual_mod.time, "time",
                         lambda: datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp())
 
@@ -637,6 +639,8 @@ def test_reconciler_pass0_does_not_evict_when_recovery_defers(monkeypatch):
                             "qty": 2, "quantity_remaining": 0,
                             "entry_ts": "2026-07-21T15:26:58.911238+00:00",
                         }])
+    monkeypatch.setattr(manual_mod, "_recover_manual_close_downstream_truth",
+                        lambda **kwargs: None)
     monkeypatch.setattr(manual_mod.time, "time",
                         lambda: datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp())
 

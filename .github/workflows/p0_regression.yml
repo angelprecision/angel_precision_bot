@@ -205,6 +205,7 @@ jobs:
             tests/test_p0_manual_close_production_shape.py \
             tests/test_p0_manual_close_idempotency_and_validation.py \
             tests/test_p0_manual_close_terminal_recovery.py \
+            tests/test_p1_manual_close_downstream_truth_20260825.py \
             tests/test_p0_terminal_proof_lock_postgres_concurrency.py \
             tests/test_p0_queue_deferral_truth.py \
             tests/test_p0_manual_rescue_restart_guard_bypass.py \

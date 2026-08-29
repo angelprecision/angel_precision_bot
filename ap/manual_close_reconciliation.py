@@ -993,10 +993,12 @@ def load_terminal_recovery_candidates(
     client_id: str,
     execution_mode: str,
 ) -> list[dict]:
-    """PR #386 fix 2: candidates for proof-only restart recovery.
+    """PR #386 fix 2: candidates for proof/queue-only restart recovery.
 
     Returns terminal positions with zero remaining quantity that also carry
-    at least one externally-adopted EXIT row in the durable ledger.
+    at least one externally-adopted EXIT row in the durable ledger. Existing
+    proof rows are intentionally not excluded: a crash after proof binding but
+    before downstream queue cleanup must remain discoverable on restart.
     Scoped to the exact execution mode of the current runner.
 
     Handed to APPositionManager.repair_terminal_proof_from_persisted, which
@@ -1042,12 +1044,6 @@ def load_terminal_recovery_candidates(
                         AND UPPER(COALESCE(o.kind, '')) = 'EXIT'
                         AND UPPER(COALESCE(o.status, '')) = ANY(%s)
                         AND o.local_order_id LIKE %s
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM proof_trades pt
-                      WHERE pt.client_email = p.client_id
-                        AND pt.system_version = 'v2'
-                        AND pt.position_id = p.id
                   )
                 """,
                 (
@@ -1398,6 +1394,22 @@ def _evict_exit_engine(
             )
 
 
+def _recover_manual_close_downstream_truth(
+    *,
+    client_id: str,
+    position_id: str,
+    broker_exit_order_id: str,
+    execution_mode: str,
+) -> None:
+    """No-op until the downstream-truth guard is installed.
+
+    The mandatory lifecycle guard replaces this hook at startup. Keeping the
+    default inert preserves the reconciler's fail-closed behavior on branches
+    where that optional guard is not present.
+    """
+    return None
+
+
 def detect_manual_closes(self) -> None:
     """Finalize externally closed positions from exact broker fill truth.
 
@@ -1464,11 +1476,12 @@ def detect_manual_closes(self) -> None:
     # PASS 1/2 fence machinery below.
     detected_at = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
 
-    # ── PASS 0: proof-only recovery for terminal-without-proof rows ────────
-    # A crash after position commit but before proof persist leaves a
-    # terminal row (qty_remaining <= 0) with durable EXIT evidence but no
-    # canonical proof. This pass repairs proof through the canonical
-    # function using ONLY persisted position economics; it never calls the
+    # ── PASS 0: proof/queue recovery for terminal external-close rows ─────
+    # A crash after position commit but before proof persist, or after proof
+    # binding but before downstream queue cleanup, leaves a terminal row
+    # (qty_remaining <= 0) with durable EXIT evidence. This pass repairs the
+    # proof through the canonical function and replays the downstream truth
+    # hook using ONLY persisted position/fill economics; it never calls the
     # broker, never reopens the position, and evicts the exit engine only
     # after proof binding is proven.
     if callable(recovery_method):
@@ -1563,6 +1576,29 @@ def detect_manual_closes(self) -> None:
                 "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_BOUND pos=%s reason=%s",
                 client_id, candidate_id, reason,
             )
+            latest_durable = max(
+                valid_durable,
+                key=lambda fill: fill["filled_at"],
+            )
+            broker_exit_order_id = str(
+                latest_durable.get("broker_order_id") or ""
+            ).strip()
+            if broker_exit_order_id:
+                try:
+                    _recover_manual_close_downstream_truth(
+                        client_id=client_id,
+                        position_id=candidate_id,
+                        broker_exit_order_id=broker_exit_order_id,
+                        execution_mode=runner_mode,
+                    )
+                except Exception as exc:
+                    log.error(
+                        "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_DOWNSTREAM_ERROR "
+                        "pos=%s err=%s",
+                        client_id,
+                        candidate_id,
+                        exc,
+                    )
             _core = getattr(self, "core", None)
             _exit_eng = getattr(_core, "exit_eng", None) if _core is not None else None
             _mark = getattr(_exit_eng, "mark_position_closed", None)

@@ -62,7 +62,8 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
     }),
     # PR #362 — proof performance taxonomy / LIVE learning isolation.
     "proof_trades": frozenset({
-        "position_id", "client_email", "closed_at", "execution_mode",
+        "id", "position_id", "client_email", "closed_at", "execution_mode",
+        "exit_local_order_id",
         "official_live_performance_eligible", "performance_taxonomy",
         "training_eligible", "taxonomy_reason", "quote_domain_consistent",
     }),
@@ -71,6 +72,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
     # guard filters them dynamically via _table_columns()).
     "positions": frozenset({
         "id", "client_id", "contract", "status", "qty", "entry_ts",
+        "direction",
         "execution_mode",
         "exit_in_flight", "pending_exit_qty",
         "pending_exit_local_order_id", "pending_exit_broker_order_id",
@@ -81,7 +83,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
     "orders": frozenset({
         "local_order_id", "broker_order_id", "client_id", "position_id",
         "kind", "status", "meta", "created_ts", "direction", "contract",
-        "qty", "filled_qty", "fill_price", "signal_id", "execution_mode",
+        "qty", "filled_qty", "fill_price", "filled_ts", "signal_id", "execution_mode",
         "canonical_signal_id",
     }),
     # PR #152 — morning handoff DB-level idempotency.
@@ -92,7 +94,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
     # Queue claiming (FOR UPDATE SKIP LOCKED path + idempotent enqueue).
     "trade_queue": frozenset({
         "id", "client_id", "signal_id", "idempotency_key", "status",
-        "payload", "result_json", "last_error", "created_ts",
+        "payload", "result_json", "last_error", "created_ts", "finished_ts",
     }),
 }
 
