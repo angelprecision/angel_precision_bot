@@ -60,6 +60,7 @@ import time
 import threading
 import logging
 import math
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
@@ -162,6 +163,15 @@ PROFIT_FLOOR = {
 IMMEDIATE_TP_PCT      = 0.12   # +12% → ACTIVATES trailing stop (was 15%)
 HARD_STOP_PCT         = -0.33  # -33% → hard stop (gives one recovery breath vs -30%)
 PROFIT_LOCK_PCT       = 0.12   # once past 15%, don't fall below +12% (protects a real gain)
+
+# A touched-profit pullback is allowed a bounded recovery window only while
+# the position is still below its canonical runner-arm threshold.  The clock
+# starts when the fresh executable BID first breaches the applicable floor;
+# it must never be measured from entry because an old position can have a new
+# pullback.  ``MAX_HOLD_MINUTES_WHILE_RED`` remains a backwards-compatible
+# fallback for existing deployments; the new name makes the scope explicit.
+_PROFIT_PULLBACK_RECOVERY_DEFAULT_MIN = 5.0
+_PROFIT_PULLBACK_RECOVERY_MAX_MIN = 15.0
 
 # PR-A / BUG-4: Unified minimum-hold floor. Previously read twice via
 # os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", default) with default
@@ -1403,6 +1413,15 @@ class ManagedPosition:
     _underlying_stop_breach_ts:   Optional[datetime] = None
     _underlying_stop_breach_quote_ts: Optional[datetime] = None
 
+    # Bounded winner-pullback recovery state.  This is deliberately separate
+    # from ``opened_at``: recovery time begins at the current fresh-BID floor
+    # breach, not at entry.  It is persisted in positions.meta by the engine
+    # and restored on startup so a restart cannot erase the timer/high-water
+    # context used by winner protection.
+    profit_pullback_started_at:   Optional[datetime] = None
+    profit_pullback_floor:        float = 0.0
+    profit_pullback_peak_pct:     float = 0.0
+
     # PR-B: Execution-core ghost fields. Previously assigned dynamically
     # in ap_execution_core.py via `# type: ignore[attr-defined]`:
     #   pos._exit_submit_ts  / pos._exit_attempts — drive step-down ladder
@@ -1675,6 +1694,118 @@ def _position_age_minutes(
     except Exception:
         pass
     return 999.0  # unknown age — do not block exits
+
+
+def _finite_nonnegative(value, default: float = 0.0) -> float:
+    """Return a finite non-negative float, or ``default`` for bad state."""
+    try:
+        parsed = float(value)
+        if math.isfinite(parsed) and parsed >= 0.0:
+            return parsed
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return float(default)
+
+
+def _persisted_bool(value) -> bool:
+    """Parse a DB boolean without treating the string ``false`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value == 1)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    return False
+
+
+def _profit_pullback_recovery_minutes() -> float:
+    """Return a finite, bounded recovery window for a profitable pullback."""
+    raw = os.getenv("PROFIT_PULLBACK_RECOVERY_MINUTES")
+    if raw in (None, ""):
+        raw = os.getenv(
+            "MAX_HOLD_MINUTES_WHILE_RED",
+            str(_PROFIT_PULLBACK_RECOVERY_DEFAULT_MIN),
+        )
+    try:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        value = _PROFIT_PULLBACK_RECOVERY_DEFAULT_MIN
+    return max(0.0, min(value, _PROFIT_PULLBACK_RECOVERY_MAX_MIN))
+
+
+def _profit_floor_for_peak(peak_pnl: float) -> float:
+    """Return the touched-profit floor for a validated BID high-water mark."""
+    peak = _finite_nonnegative(peak_pnl)
+    if peak >= 0.25:
+        return 0.12
+    if peak >= 0.15:
+        return 0.08
+    if peak >= 0.10:
+        return 0.05
+    if peak >= 0.05:
+        return 0.03
+    return 0.0
+
+
+def _reset_profit_pullback_state(pos: ManagedPosition) -> None:
+    """Clear a recovery timer after a quote recovers or the thesis changes."""
+    pos.profit_pullback_started_at = None
+    pos.profit_pullback_floor = 0.0
+    pos.profit_pullback_peak_pct = 0.0
+
+
+def _hold_for_profit_pullback_recovery(
+    pos: ManagedPosition,
+    *,
+    now_utc: datetime,
+    current_pnl: float,
+    floor: float,
+    peak_pnl: float,
+    confirming_reason: str,
+) -> Optional[ExitDecision]:
+    """Return a bounded HOLD while a pre-runner winner may recover.
+
+    This helper is called only after fresh executable option and underlying
+    truth has passed, and only while the current BID is still positive and
+    below the applicable profit floor.  Hard stops, confirmed underlying
+    stops, EOD, and runner-eligible profit locks are evaluated before this
+    helper and therefore cannot be delayed by it.
+    """
+    if current_pnl <= 0.0:
+        _reset_profit_pullback_state(pos)
+        return None
+
+    started_at = getattr(pos, "profit_pullback_started_at", None)
+    started_at = _normalize_hard_ref_ts(started_at, now_utc=now_utc) if started_at else None
+    if started_at is None:
+        started_at = now_utc
+        pos.profit_pullback_started_at = started_at
+
+    pos.profit_pullback_floor = float(floor)
+    pos.profit_pullback_peak_pct = max(
+        _finite_nonnegative(getattr(pos, "profit_pullback_peak_pct", 0.0)),
+        _finite_nonnegative(peak_pnl),
+    )
+    try:
+        elapsed_sec = max(0.0, (now_utc - started_at).total_seconds())
+    except Exception:
+        elapsed_sec = 0.0
+    window_min = _profit_pullback_recovery_minutes()
+    if elapsed_sec < window_min * 60.0:
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=(
+                f"PROFIT PULLBACK RECOVERY — peaked +{peak_pnl*100:.0f}% "
+                f"now +{current_pnl*100:.0f}% below floor +{floor*100:.0f}% "
+                f"| elapsed={elapsed_sec/60.0:.1f}m/{window_min:.1f}m "
+                f"| {confirming_reason}"
+            ),
+            urgency="NORMAL", pnl_pct=current_pnl,
+            reason_code="PROFIT_PULLBACK_RECOVERY",
+        )
+    return None
 
 
 def _technical_stop_identity_proven(pos: ManagedPosition) -> bool:
@@ -2039,17 +2170,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         if _tp_option_gate is not None:
             return _tp_option_gate
 
-        _max = pos.max_profit_seen or 0
-        if _max >= 0.25:
-            _floor = 0.12   # secured 12% minimum
-        elif _max >= 0.15:
-            _floor = 0.08   # secured 8% minimum
-        elif _max >= 0.10:
-            _floor = 0.05   # secured 5% minimum
-        elif _max >= 0.05:
-            _floor = 0.03   # secured 3% minimum — goal is 25% avg winner
-        else:
-            _floor = 0.00   # any green: floor at breakeven
+        # Hydrated rows can briefly disagree across the two high-water fields
+        # while QPM and the exit engine converge.  Protection must use the
+        # stronger proven high-water value, never the lower one.
+        _max = max(
+            _finite_nonnegative(getattr(pos, "max_profit_seen", 0.0)),
+            _finite_nonnegative(getattr(pos, "peak_pnl_pct", 0.0)),
+        )
+        _floor = _profit_floor_for_peak(_max)
 
         # Use exec_pnl (BID-based) for the floor comparison, not midpoint.
         _tp_pnl = exec_pnl if exec_pnl is not None else option_pnl
@@ -2062,30 +2190,52 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
             # Underlying data is fresh and available — check direction.
             # A single penny drop on a cheap contract (-9%) is not a real signal
-            # if the underlying is still moving in our direction.
-            _age_min = _position_age_minutes(pos, now_utc=now_utc)
+            # if the underlying is still moving in our direction.  Only a
+            # pre-runner winner gets this bounded recovery window; once the
+            # canonical runner arm is reached, profit-floor/runner protection
+            # remains authoritative and closes the giveback.
             _confirming, _confirm_reason = _underlying_still_confirming(pos)
-            _MAX_THESIS_OVERRIDE = float(
-                os.getenv("MAX_HOLD_MINUTES_WHILE_RED", "5")
-            )
-            if _confirming and _age_min < _MAX_THESIS_OVERRIDE:
-                # Underlying still in our direction — hold, don't exit on noise
-                log.info(
-                    "[%s] TOUCHED_PROFIT_STOP suppressed — underlying still confirming "
-                    "(%s) | age=%.1fmin < %.0fmin thesis window | exec_pnl=%.1f%%",
-                    pos.ticker, _confirm_reason, _age_min,
-                    _MAX_THESIS_OVERRIDE, _tp_pnl * 100,
+            if _confirming and 0.0 < _max < _immediate_tp:
+                # LIVE positions normally pass through the mandatory
+                # touched-profit BID-confirmation wrapper.  Leave its
+                # candidate CLOSE_ALL intact so that wrapper can count the
+                # distinct observations, then apply the same bounded timer.
+                _live_confirmation_guard_installed = bool(
+                    globals().get("_AP_TOUCHED_PROFIT_CONFIRMATION_PATCHED", False)
+                    and str(getattr(pos, "execution_mode", "") or "").strip().lower() != "paper"
                 )
+                if not _live_confirmation_guard_installed:
+                    _pullback_hold = _hold_for_profit_pullback_recovery(
+                        pos,
+                        now_utc=now_utc,
+                        current_pnl=_tp_pnl,
+                        floor=_floor,
+                        peak_pnl=_max,
+                        confirming_reason=_confirm_reason,
+                    )
+                    if _pullback_hold is not None:
+                        log.info(
+                            "[%s] TOUCHED_PROFIT_STOP deferred for bounded pullback recovery "
+                            "(%s) | peak=%.1f%% exec_pnl=%.1f%%",
+                            pos.ticker, _confirm_reason, _max * 100, _tp_pnl * 100,
+                        )
+                        return _pullback_hold
             else:
-                return ExitDecision(
-                    action="CLOSE_ALL", quantity=qty_rem,
-                    reason=(
-                        f"TOUCHED PROFIT STOP — peaked +{_max*100:.0f}% "
-                        f"now {_tp_pnl*100:.0f}% (exec/bid) — floor={_floor*100:.0f}% | "
-                        f"underlying={'confirming' if _confirming else 'not confirming'}"
-                    ),
-                    urgency="IMMEDIATE", pnl_pct=_tp_pnl,
-                )
+                _reset_profit_pullback_state(pos)
+
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"TOUCHED PROFIT STOP — peaked +{_max*100:.0f}% "
+                    f"now {_tp_pnl*100:.0f}% (exec/bid) — floor={_floor*100:.0f}% | "
+                    f"underlying={'confirming' if _confirming else 'not confirming'}"
+                ),
+                urgency="IMMEDIATE", pnl_pct=_tp_pnl,
+            )
+        else:
+            # The option BID reclaimed its floor.  The next breach is a new
+            # pullback and must start a fresh bounded recovery window.
+            _reset_profit_pullback_state(pos)
 
     # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
     # Scale-out ladder:
@@ -2141,7 +2291,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # requests.post() here under self._lock.
     # P0: Uses executable BID P&L for both peak and drawdown comparisons.
     _single_contract = (qty_rem == 1 and pos.scale_outs_done == 0)
-    if (pos.scale_outs_done >= 1 or _single_contract) and pos.peak_pnl_pct >= IMMEDIATE_TP_PCT:
+    if (pos.scale_outs_done >= 1 or _single_contract) and pos.peak_pnl_pct >= _immediate_tp:
         # ── Option executable truth gate ─────────────────────────────────────
         _runner_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
         if _runner_opt_gate is not None:
@@ -3445,6 +3595,7 @@ class APExitEngine:
         self._last_peak_persist_ts:       dict[str, float] = {}   # pid -> epoch
         self._last_peak_persist_value:    dict[str, float] = {}   # pid -> peak
         self._last_peak_persist_touched:  dict[str, bool]  = {}   # pid -> touched
+        self._last_peak_persist_pullback: dict[str, tuple] = {}  # pid -> timer fingerprint
         self._EXIT_DB_PERSIST_THROTTLE_SEC = float(
             os.getenv("EXIT_DB_PERSIST_THROTTLE_SEC", "5.0")
         )
@@ -3501,6 +3652,26 @@ class APExitEngine:
             touched_now = bool(getattr(pos, "touched_profit", False))
             opt_pnl     = float(getattr(pos, "option_pnl_pct", 0.0) or 0.0)
             cur_opt     = float(getattr(pos, "current_option_price", 0.0) or 0.0)
+            pullback_started = getattr(pos, "profit_pullback_started_at", None)
+            if isinstance(pullback_started, datetime):
+                if pullback_started.tzinfo is None:
+                    pullback_started = pullback_started.replace(tzinfo=timezone.utc)
+                else:
+                    pullback_started = pullback_started.astimezone(timezone.utc)
+                pullback_started_text = pullback_started.isoformat()
+            else:
+                pullback_started_text = None
+            pullback_floor = _finite_nonnegative(
+                getattr(pos, "profit_pullback_floor", 0.0)
+            )
+            pullback_peak = _finite_nonnegative(
+                getattr(pos, "profit_pullback_peak_pct", 0.0)
+            )
+            pullback_fingerprint = (
+                pullback_started_text,
+                round(pullback_floor, 8),
+                round(pullback_peak, 8),
+            )
 
             now = time.time()
             last_ts      = self._last_peak_persist_ts.get(pid, 0.0)
@@ -3509,9 +3680,12 @@ class APExitEngine:
             elapsed = now - last_ts
             peak_delta = abs(peak_now - last_peak)
             touched_changed = (last_touched is None) or (touched_now != last_touched)
+            pullback_changed = (
+                self._last_peak_persist_pullback.get(pid) != pullback_fingerprint
+            )
             time_ok = elapsed >= float(getattr(self, "_EXIT_DB_PERSIST_THROTTLE_SEC", 5.0))
             peak_ok = peak_delta >= float(getattr(self, "_EXIT_DB_PERSIST_PEAK_DELTA", 0.02))
-            if not (time_ok or peak_ok or touched_changed):
+            if not (time_ok or peak_ok or touched_changed or pullback_changed):
                 return False
 
             from ap.db import conn, run_with_retry  # local import avoids cycle
@@ -3526,10 +3700,14 @@ class APExitEngine:
                             touched_profit      = %s,
                             option_pnl_pct      = %s,
                             current_option_price= COALESCE(NULLIF(%s, 0), current_option_price),
+                            meta                = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
                             updated_at          = NOW()
                         WHERE id        = %s
                           AND client_id = %s
-                          AND status   IN ('OPEN', 'CLOSING')
+                          AND (
+                              UPPER(COALESCE(status, '')) IN ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                              OR COALESCE(quantity_remaining, 0) > 0
+                          )
                         """,
                         (
                             peak_now,
@@ -3537,6 +3715,16 @@ class APExitEngine:
                             touched_now,
                             opt_pnl,
                             cur_opt if cur_opt > 0 else 0.0,
+                            json.dumps(
+                                {
+                                    "profit_pullback": {
+                                        "started_at": pullback_started_text,
+                                        "floor_pct": pullback_floor,
+                                        "peak_pct": pullback_peak,
+                                    }
+                                },
+                                default=str,
+                            ),
                             pid,
                             client_id,
                         ),
@@ -3547,6 +3735,7 @@ class APExitEngine:
             self._last_peak_persist_ts[pid]      = now
             self._last_peak_persist_value[pid]   = peak_now
             self._last_peak_persist_touched[pid] = touched_now
+            self._last_peak_persist_pullback[pid] = pullback_fingerprint
             return rowcount > 0
         except Exception as exc:
             log.debug(
@@ -6539,6 +6728,11 @@ class APExitEngine:
                             _raw_ticker, _ticker, _contract_sym, row.get("id"),
                         )
                     _underlying_entry = float(row.get("underlying_entry", 0) or 0)
+                    _seed_now = datetime.now(timezone.utc)
+                    _entry_ts = _normalize_hard_ref_ts(
+                        row.get("entry_ts") or row.get("opened_at"),
+                        now_utc=_seed_now,
+                    )
 
                     mp = ManagedPosition(
                         ticker=_ticker,
@@ -6554,6 +6748,7 @@ class APExitEngine:
                         signal_id=str(row.get("signal_id") or ""),
                         # PR #176: carry execution_mode from positions row
                         execution_mode=str(row.get("execution_mode") or "").lower().strip(),
+                        opened_at=_entry_ts or _seed_now,
                     )
                     mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
                     _qty_remaining = int(row.get("quantity_remaining", 0) or 0)
@@ -6561,6 +6756,16 @@ class APExitEngine:
                         mp.quantity_remaining = min(_qty_remaining, mp.quantity) if mp.quantity > 0 else _qty_remaining
                     else:
                         mp.quantity_remaining = mp.quantity
+                    # Restore executable-BID high-water state before the first
+                    # post-restart evaluation.  Losing this state would lower
+                    # the profit floor and could turn a protected winner into
+                    # an unprotected trade.  Bad/contradictory DB values are
+                    # ignored rather than promoted into exit authority.
+                    _seed_peak = _finite_nonnegative(row.get("peak_pnl_pct"))
+                    _seed_max = _finite_nonnegative(row.get("max_profit_seen"))
+                    mp.peak_pnl_pct = max(_seed_peak, _seed_max)
+                    mp.max_profit_seen = mp.peak_pnl_pct
+                    mp.touched_profit = _persisted_bool(row.get("touched_profit"))
                     log.debug(
                         "seed_from_db: %s original_qty=%d qty_remaining=%d scale_outs=%d",
                         mp.ticker, mp.quantity, mp.quantity_remaining, mp.scale_outs_done,
@@ -6696,6 +6901,23 @@ class APExitEngine:
                             _meta = json.loads(_meta)
                         except Exception:
                             _meta = {}
+                    _persisted_pullback = (
+                        _meta.get("profit_pullback") if isinstance(_meta, dict) else None
+                    )
+                    if isinstance(_persisted_pullback, dict) and mp.touched_profit:
+                        _pullback_started = _normalize_hard_ref_ts(
+                            _persisted_pullback.get("started_at"),
+                            now_utc=_seed_now,
+                        )
+                        if _pullback_started is not None:
+                            mp.profit_pullback_started_at = _pullback_started
+                            mp.profit_pullback_floor = _finite_nonnegative(
+                                _persisted_pullback.get("floor_pct")
+                            )
+                            mp.profit_pullback_peak_pct = max(
+                                mp.peak_pnl_pct,
+                                _finite_nonnegative(_persisted_pullback.get("peak_pct")),
+                            )
                     if isinstance(_meta, dict) and _meta.get("protective_monitoring_state") in {
                         PROTECTIVE_STATE_DEGRADED,
                         PROTECTIVE_STATE_UNPERSISTED,
@@ -7986,6 +8208,10 @@ class APExitEngine:
                     # (P0-3 force-close-all is handled by the pre-gate above
                     # so positions can close even with stale quotes.)
                     decision = evaluate_exit(pos, now_et)
+                    # evaluate_exit() may start or clear the bounded
+                    # pullback-recovery timer.  Persist that transition in
+                    # the same non-fatal, identity-scoped path as peak state.
+                    self._persist_peak_state_to_db(pos)
                     decision.reason_code = _classify_exit_decision(decision)
                     _ledger_exit_decision(pos, decision, client_id=getattr(pos, "client_id", "") or getattr(self, "client_id", ""))
                     self._emit_exit_decision_stamp(pos, decision, now_et=now_et)

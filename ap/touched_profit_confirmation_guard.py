@@ -9,7 +9,9 @@ that merely armed ``touched_profit`` must not be fully liquidated from one
 transient executable BID observation below its profit floor.  Canonical PAPER
 positions remain unchanged.  The candidate exit must be reproduced on a
 configurable number of *distinct* BID observations.  A recovered quote resets
-the confirmation state.
+the confirmation state.  Once the BID breach is confirmed, a still-positive
+pre-runner winner also receives the exit engine's bounded pullback-recovery
+window; the timer starts at the first real floor breach, not at entry.
 
 The July 27 NVDA incident is the motivating production shape:
 
@@ -103,6 +105,59 @@ def _reset_state(pos: Any) -> None:
     setattr(pos, _STATE_STARTED, None)
 
 
+def _prepare_pullback_recovery(pos: Any, decision: Any, now_et=None):
+    """Start/continue the shared bounded recovery timer for a live candidate."""
+    try:
+        current_pnl = _float(getattr(decision, "pnl_pct", 0.0))
+        if current_pnl <= 0.0:
+            return None
+
+        import ap_exit_engine as engine_module
+
+        peak_pnl = max(
+            _float(getattr(pos, "peak_pnl_pct", 0.0)),
+            _float(getattr(pos, "max_profit_seen", 0.0)),
+        )
+        try:
+            session_date = now_et.astimezone(engine_module.ET).date() if now_et else None
+        except Exception:
+            session_date = None
+        _, runner_arm, _ = engine_module._effective_thresholds(
+            pos, session_date=session_date,
+        )
+        if not (0.0 < peak_pnl < float(runner_arm)):
+            engine_module._reset_profit_pullback_state(pos)
+            return None
+
+        floor = engine_module._profit_floor_for_peak(peak_pnl)
+        if current_pnl > floor:
+            engine_module._reset_profit_pullback_state(pos)
+            return None
+
+        confirming, confirming_reason = engine_module._underlying_still_confirming(pos)
+        if not confirming:
+            engine_module._reset_profit_pullback_state(pos)
+            return None
+
+        now_utc = engine_module._evaluation_now_utc(now_et, pos=pos)
+        # Establish the timer on the first fresh candidate.  Calling the
+        # helper here also validates persisted state without producing an
+        # extra decision before BID-confirmation is complete.
+        return engine_module._hold_for_profit_pullback_recovery(
+            pos,
+            now_utc=now_utc,
+            current_pnl=current_pnl,
+            floor=floor,
+            peak_pnl=peak_pnl,
+            confirming_reason=confirming_reason,
+        )
+    except Exception as exc:
+        # A recovery-policy failure must not rewrite the existing
+        # broker-truth/confirmation decision.
+        log.debug("profit pullback recovery helper unavailable: %s", exc)
+        return None
+
+
 def _decision_code(decision: Any, classify_decision: Callable[[Any], str]) -> str:
     try:
         code = classify_decision(decision)
@@ -159,6 +214,12 @@ def wrap_evaluate_exit(
                 reason_code="TOUCHED_PROFIT_STOP_CONFIRMING",
             )
 
+        # The first positive floor breach starts the timer, but the existing
+        # distinct-BID confirmation response remains the externally visible
+        # contract until the required observations arrive.
+        if _float(getattr(decision, "pnl_pct", 0.0)) > 0.0:
+            _prepare_pullback_recovery(pos, decision, now_et)
+
         prior_key = str(getattr(pos, _STATE_KEY, "") or "")
         count = int(getattr(pos, _STATE_COUNT, 0) or 0)
 
@@ -171,6 +232,19 @@ def wrap_evaluate_exit(
 
         required = _required_confirmations()
         if count >= required:
+            pullback_hold = _prepare_pullback_recovery(pos, decision, now_et)
+            if pullback_hold is not None:
+                log.warning(
+                    "[%s] TOUCHED_PROFIT_STOP confirmed but deferred for bounded "
+                    "pullback recovery | peak=%.1f%% pnl=%.1f%%",
+                    getattr(pos, "ticker", ""),
+                    max(
+                        _float(getattr(pos, "peak_pnl_pct", 0.0)),
+                        _float(getattr(pos, "max_profit_seen", 0.0)),
+                    ) * 100,
+                    _float(getattr(decision, "pnl_pct", 0.0)) * 100,
+                )
+                return pullback_hold
             log.warning(
                 "[%s] TOUCHED_PROFIT_STOP_CONFIRMED observations=%s/%s "
                 "bid=%.4f pnl=%.1f%%",

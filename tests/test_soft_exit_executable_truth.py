@@ -1495,7 +1495,7 @@ class TestAmendment2EntryGrace:
         decision = evaluate_exit(pos, now_et)
         assert decision.action == "SCALE_OUT", f"{decision.action}: {decision.reason}"
 
-    def test_one_minute_touched_winner_giveback_still_profit_protects(self):
+    def test_one_minute_pre_runner_touched_winner_gets_bounded_recovery(self):
         pos = _make_pos(
             entry_price=1.00,
             current_bid=1.02, current_ask=1.06, current_option_price=1.04,
@@ -1508,8 +1508,12 @@ class TestAmendment2EntryGrace:
         )
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)
-        assert decision.action == "CLOSE_ALL", f"{decision.action}: {decision.reason}"
-        assert "LOCK" in decision.reason or "TOUCHED PROFIT STOP" in decision.reason
+        # ABT is an equity 0DTE contract in this fixture, so the canonical
+        # runner arm is +22%.  A +20% peak is still pre-runner: keep a
+        # positive pullback bounded for recovery, then close at the existing
+        # floor once the timer expires.
+        assert decision.action == "HOLD", f"{decision.action}: {decision.reason}"
+        assert decision.reason_code == "PROFIT_PULLBACK_RECOVERY"
 
     def test_one_minute_soft_loss_remains_entry_grace_protected(self):
         pos = _make_pos(

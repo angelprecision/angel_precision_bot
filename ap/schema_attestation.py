@@ -72,6 +72,9 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
     "positions": frozenset({
         "id", "client_id", "contract", "status", "qty", "entry_ts",
         "execution_mode",
+        # Winner-pullback recovery state is merged into this JSONB document;
+        # it must survive restart without overwriting other position metadata.
+        "meta",
         "exit_in_flight", "pending_exit_qty",
         "pending_exit_local_order_id", "pending_exit_broker_order_id",
         "quantity_remaining", "contracts_exited",
