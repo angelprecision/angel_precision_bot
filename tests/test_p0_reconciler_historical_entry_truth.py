@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
-import pytest
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import sys
 from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/test")
 
@@ -19,8 +20,7 @@ import ap_reconciler as rec
 CLIENT = "historical-entry@example.com"
 CONTRACT = "NOW260828P00122000"
 POSITION_ID = "canonical-position-1"
-
-_DEFAULT_FILLED_TS = object()
+FILLED_TS = datetime(2026, 8, 25, 13, 54, tzinfo=timezone.utc)
 
 
 class _Broker:
@@ -31,30 +31,6 @@ class _Broker:
     def get_quote(self, symbol):
         self.quote_calls.append(symbol)
         return {"last": self.quote, "bid": self.quote - 0.02, "ask": self.quote + 0.02}
-
-
-class _Cursor:
-    def __init__(self, rows, executions):
-        self.rows = rows
-        self.executions = executions
-
-    def execute(self, sql, params=None):
-        self.executions.append((str(sql), tuple(params or ())))
-
-    def fetchall(self):
-        return self.rows
-
-
-def _install_db(monkeypatch, rows):
-    executions = []
-
-    @contextmanager
-    def _conn():
-        yield _Cursor(rows, executions)
-
-    monkeypatch.setattr(db, "conn", _conn)
-    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
-    return executions
 
 
 class _RecordingPostgresCursor:
@@ -117,7 +93,7 @@ class _PostgresHistoryHarness:
         status="FILLED",
         fill_price=1.30,
         filled_qty=1,
-        filled_ts=_DEFAULT_FILLED_TS,
+        filled_ts=FILLED_TS,
     ):
         self.execute(
             """
@@ -135,11 +111,7 @@ class _PostgresHistoryHarness:
                 position_id,
                 fill_price,
                 filled_qty,
-                (
-                    datetime(2026, 8, 25, 13, 54, tzinfo=timezone.utc)
-                    if filled_ts is _DEFAULT_FILLED_TS
-                    else filled_ts
-                ),
+                filled_ts,
                 json.dumps(meta or {}),
             ),
         )
@@ -204,47 +176,215 @@ def _reconciler(broker=None):
     return reconciler
 
 
-def _filled_entry_row(**overrides):
-    row = {
-        # Production-shaped fields returned by RealDictCursor.
-        "client_id": CLIENT,
-        "execution_mode": "live",
-        "contract": CONTRACT,
-        "kind": "ENTRY",
-        "status": "FILLED",
-        "position_id": POSITION_ID,
-        "fill_price": 1.30,
-        "filled_qty": 1,
-        "filled_ts": "2026-08-25T13:54:01.682835+00:00",
-        "meta": {"underlying_entry": 127.425},
-    }
-    row.update(overrides)
-    return row
+def _bind_postgres_history(monkeypatch, harness):
+    monkeypatch.setattr(db, "conn", harness.conn)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
 
 
-def test_exact_filled_entry_metadata_is_the_only_recovery_fallback(monkeypatch):
-    executions = _install_db(monkeypatch, [_filled_entry_row()])
-    reconciler = _reconciler()
+def _live_meta(**extra):
+    return {"execution_mode": "live", **extra}
 
-    value = reconciler._derive_underlying_entry_from_position(
+
+def test_real_postgres_historical_entry_lookup_executes_with_durable_row_shape(
+    postgres_history_harness,
+    monkeypatch,
+):
+    harness = postgres_history_harness
+    harness.insert_entry(meta=_live_meta(underlying_entry=127.425))
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
         {"id": POSITION_ID, "underlying_entry": None},
         underlying="NOW",
         contract=CONTRACT,
     )
 
-    assert value == 127.425
-    assert executions
-    sql, params = executions[0]
+    assert value == pytest.approx(127.425)
+    assert len(harness.executions) == 1
+    sql, params = harness.executions[0]
+    assert "meta->>'execution_mode'" in sql
     assert "client_id=%s" in sql
-    assert "execution_mode" in sql
-    assert "contract" in sql
     assert "position_id::text=%s" in sql
     assert params == (CLIENT, "live", CONTRACT, POSITION_ID)
 
 
-def test_missing_history_does_not_call_current_quote_or_fabricate_entry(monkeypatch):
+def test_real_postgres_filled_entry_lookup_isolates_every_identity_predicate(
+    postgres_history_harness,
+    monkeypatch,
+):
+    harness = postgres_history_harness
+
+    # The canonical row must be the only row satisfying the complete predicate.
+    harness.insert_entry(meta=_live_meta(underlying_entry=127.425))
+
+    # Each decoy differs from the canonical row in exactly one identity/filter
+    # dimension. If any WHERE predicate is omitted, LIMIT 2 makes the result
+    # ambiguous and the reconciler must fail closed.
+    harness.insert_entry(
+        client_id="other-client@example.com",
+        meta=_live_meta(underlying_entry=201.01),
+    )
+    harness.insert_entry(
+        execution_mode="paper",
+        meta={"execution_mode": "paper", "underlying_entry": 202.02},
+    )
+    harness.insert_entry(
+        contract="NOW260828P00123000",
+        meta=_live_meta(underlying_entry=203.03),
+    )
+    harness.insert_entry(
+        kind="EXIT",
+        meta=_live_meta(underlying_entry=204.04),
+    )
+    harness.insert_entry(
+        status="CANCELED",
+        meta=_live_meta(underlying_entry=205.05),
+    )
+    harness.insert_entry(
+        position_id="different-position",
+        meta=_live_meta(underlying_entry=206.06),
+    )
+    harness.insert_entry(
+        filled_qty=0,
+        meta=_live_meta(underlying_entry=207.07),
+    )
+    harness.insert_entry(
+        fill_price=None,
+        meta=_live_meta(underlying_entry=208.08),
+    )
+    harness.insert_entry(
+        filled_ts=None,
+        meta=_live_meta(underlying_entry=209.09),
+    )
+
+    _bind_postgres_history(monkeypatch, harness)
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == pytest.approx(127.425)
+
+
+@pytest.mark.parametrize(
+    "decoy",
+    [
+        {"client_id": "other-client@example.com"},
+        {"execution_mode": "paper", "meta": {"execution_mode": "paper"}},
+        {"contract": "NOW260828P00123000"},
+        {"kind": "EXIT"},
+        {"status": "CANCELED"},
+        {"position_id": "different-position"},
+    ],
+    ids=["client", "mode", "contract", "kind", "status", "position"],
+)
+def test_real_postgres_nonmatching_identity_row_fails_closed(
+    postgres_history_harness,
+    monkeypatch,
+    decoy,
+):
+    harness = postgres_history_harness
+    fields = dict(decoy)
+    fields.setdefault("meta", _live_meta(underlying_entry=127.425))
+    harness.insert_entry(**fields)
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == 0.0
+
+
+def test_real_postgres_conflicting_mode_authorities_fail_closed(
+    postgres_history_harness,
+    monkeypatch,
+):
+    harness = postgres_history_harness
+    harness.insert_entry(
+        meta={"execution_mode": "paper", "underlying_entry": 127.425}
+    )
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == 0.0
+
+
+def test_real_postgres_metadata_only_mode_remains_compatible_with_shared_resolver(
+    postgres_history_harness,
+    monkeypatch,
+):
+    harness = postgres_history_harness
+    harness.insert_entry(
+        execution_mode=None,
+        meta={"execution_mode": "live", "underlying_entry": 127.425},
+    )
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == pytest.approx(127.425)
+
+
+def test_real_postgres_zero_plus_positive_historical_aliases_fail_closed(
+    postgres_history_harness,
+    monkeypatch,
+):
+    harness = postgres_history_harness
+    harness.insert_entry(
+        meta={
+            "execution_mode": "live",
+            "underlying_entry": 0,
+            "underlying_entry_price": 127.425,
+        }
+    )
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == 0.0
+
+
+def test_real_postgres_multiple_matching_rows_fail_closed(
+    postgres_history_harness,
+    monkeypatch,
+):
+    harness = postgres_history_harness
+    harness.insert_entry(meta=_live_meta(underlying_entry=127.425))
+    harness.insert_entry(meta=_live_meta(underlying_entry=127.425))
+    _bind_postgres_history(monkeypatch, harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {"id": POSITION_ID, "underlying_entry": None},
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == 0.0
+
+
+def test_missing_history_does_not_call_current_quote_or_fabricate_entry(
+    postgres_history_harness,
+    monkeypatch,
+):
     broker = _Broker()
-    _install_db(monkeypatch, [])
+    _bind_postgres_history(monkeypatch, postgres_history_harness)
     reconciler = _reconciler(broker)
 
     value = reconciler._derive_underlying_entry_from_position(
@@ -262,31 +402,69 @@ def test_missing_history_does_not_call_current_quote_or_fabricate_entry(monkeypa
     assert broker.quote_calls == []
 
 
-def test_ambiguous_or_malformed_filled_entry_evidence_stays_untrusted(monkeypatch):
-    for rows in (
-        [_filled_entry_row(), _filled_entry_row()],
-        [_filled_entry_row(fill_price=0)],
-        [_filled_entry_row(filled_qty=1.5)],
-        [_filled_entry_row(filled_ts="not-a-timestamp")],
-        [_filled_entry_row(meta={"current_underlying_price": 127.425})],
-        [_filled_entry_row(meta={
+@pytest.mark.parametrize(
+    "position",
+    [
+        {"id": POSITION_ID, "underlying_entry": 127.425},
+        {
+            "id": POSITION_ID,
+            "client_id": "other-client@example.com",
+            "execution_mode": "live",
             "underlying_entry": 127.425,
-            "underlying_entry_price": 126.62,
-        })],
-    ):
-        _install_db(monkeypatch, rows)
-        reconciler = _reconciler()
-        assert (
-            reconciler._derive_underlying_entry_from_position(
-                {"id": POSITION_ID, "underlying_entry": None},
-                underlying="NOW",
-                contract=CONTRACT,
-            )
-            == 0.0
-        )
+        },
+        {
+            "id": POSITION_ID,
+            "client_id": CLIENT,
+            "execution_mode": "paper",
+            "underlying_entry": 127.425,
+        },
+        {
+            "id": POSITION_ID,
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "meta": {"execution_mode": "paper"},
+            "underlying_entry": 127.425,
+        },
+    ],
+    ids=["unscoped", "wrong-client", "wrong-mode", "contradictory-meta"],
+)
+def test_unproven_position_mapping_cannot_bypass_exact_history(
+    postgres_history_harness,
+    monkeypatch,
+    position,
+):
+    _bind_postgres_history(monkeypatch, postgres_history_harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        position,
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == 0.0
 
 
-def test_broker_snapshot_current_fields_are_not_historical_entry(monkeypatch):
+def test_scoped_position_mapping_can_supply_its_persisted_historical_value(
+    postgres_history_harness,
+    monkeypatch,
+):
+    _bind_postgres_history(monkeypatch, postgres_history_harness)
+
+    value = _reconciler()._derive_underlying_entry_from_position(
+        {
+            "id": POSITION_ID,
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "underlying_entry": 127.425,
+        },
+        underlying="NOW",
+        contract=CONTRACT,
+    )
+
+    assert value == pytest.approx(127.425)
+
+
+def test_broker_snapshot_current_fields_are_not_historical_entry():
     broker = _Broker()
     reconciler = _reconciler(broker)
 
@@ -316,8 +494,11 @@ def test_explicit_historical_broker_field_is_allowed():
     assert value == 127.425
 
 
-def test_nonfinite_historical_values_stay_untrusted(monkeypatch):
-    _install_db(monkeypatch, [])
+def test_nonfinite_historical_values_stay_untrusted(
+    postgres_history_harness,
+    monkeypatch,
+):
+    _bind_postgres_history(monkeypatch, postgres_history_harness)
     reconciler = _reconciler()
 
     assert (
@@ -378,207 +559,3 @@ def test_import_seed_keeps_unknown_underlying_zero_and_untrusted(monkeypatch):
     assert seeded.underlying_entry == 0.0
     assert seeded.underlying_entry_untrusted is True
     assert broker.quote_calls == []
-
-
-def _bind_postgres_history(monkeypatch, harness):
-    monkeypatch.setattr(db, "conn", harness.conn)
-    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
-
-
-def test_real_postgres_historical_entry_lookup_executes_with_durable_row_shape(
-    postgres_history_harness,
-    monkeypatch,
-):
-    harness = postgres_history_harness
-    harness.insert_entry(
-        meta={
-            "execution_mode": "live",
-            "underlying_entry": 127.425,
-        }
-    )
-    _bind_postgres_history(monkeypatch, harness)
-
-    value = _reconciler()._derive_underlying_entry_from_position(
-        {"id": POSITION_ID, "underlying_entry": None},
-        underlying="NOW",
-        contract=CONTRACT,
-    )
-
-    assert value == pytest.approx(127.425)
-    assert len(harness.executions) == 1
-    sql, params = harness.executions[0]
-    assert "meta->>'execution_mode'" in sql
-    assert "NULLIF(TRIM(execution_mode), '') IS NULL" in sql
-    assert params == (CLIENT, "live", CONTRACT, POSITION_ID)
-
-
-def test_real_postgres_conflicting_mode_authorities_fail_closed(
-    postgres_history_harness,
-    monkeypatch,
-):
-    harness = postgres_history_harness
-    harness.insert_entry(
-        meta={
-            "execution_mode": "paper",
-            "underlying_entry": 127.425,
-        }
-    )
-    _bind_postgres_history(monkeypatch, harness)
-
-    value = _reconciler()._derive_underlying_entry_from_position(
-        {"id": POSITION_ID, "underlying_entry": None},
-        underlying="NOW",
-        contract=CONTRACT,
-    )
-
-    assert value == 0.0
-
-
-def test_real_postgres_metadata_only_mode_is_recoverable(
-    postgres_history_harness,
-    monkeypatch,
-):
-    harness = postgres_history_harness
-    harness.insert_entry(
-        execution_mode=None,
-        meta={
-            "execution_mode": "live",
-            "underlying_entry": 127.425,
-        }
-    )
-    _bind_postgres_history(monkeypatch, harness)
-
-    value = _reconciler()._derive_underlying_entry_from_position(
-        {"id": POSITION_ID, "underlying_entry": None},
-        underlying="NOW",
-        contract=CONTRACT,
-    )
-
-    assert value == pytest.approx(127.425)
-
-
-def test_real_postgres_zero_plus_positive_historical_aliases_fail_closed(
-    postgres_history_harness,
-    monkeypatch,
-):
-    harness = postgres_history_harness
-    harness.insert_entry(
-        meta={
-            "execution_mode": "live",
-            "underlying_entry": 0,
-            "underlying_entry_price": 127.425,
-        }
-    )
-    _bind_postgres_history(monkeypatch, harness)
-
-    value = _reconciler()._derive_underlying_entry_from_position(
-        {"id": POSITION_ID, "underlying_entry": None},
-        underlying="NOW",
-        contract=CONTRACT,
-    )
-
-    assert value == 0.0
-
-
-@pytest.mark.parametrize(
-    "row_overrides",
-    [
-        pytest.param(
-            {"client_id": "other-client@example.com"},
-            id="wrong-client",
-        ),
-        pytest.param(
-            {
-                "execution_mode": "paper",
-                "meta": {
-                    "execution_mode": "paper",
-                    "underlying_entry": 127.425,
-                },
-            },
-            id="wrong-mode",
-        ),
-        pytest.param(
-            {"contract": "NOW260828C00122000"},
-            id="wrong-contract",
-        ),
-        pytest.param(
-            {"kind": "EXIT"},
-            id="wrong-kind",
-        ),
-        pytest.param(
-            {"status": "OPEN"},
-            id="wrong-status",
-        ),
-        pytest.param(
-            {"position_id": "different-position"},
-            id="wrong-position",
-        ),
-        pytest.param(
-            {"fill_price": None},
-            id="missing-fill-price",
-        ),
-        pytest.param(
-            {"filled_qty": None},
-            id="missing-filled-quantity",
-        ),
-        pytest.param(
-            {"filled_qty": 0},
-            id="zero-filled-quantity",
-        ),
-        pytest.param(
-            {"filled_qty": 1.5},
-            id="fractional-filled-quantity",
-        ),
-        pytest.param(
-            {"filled_ts": None},
-            id="missing-filled-timestamp",
-        ),
-    ],
-)
-def test_real_postgres_identity_and_fill_fences_fail_closed(
-    postgres_history_harness,
-    monkeypatch,
-    row_overrides,
-):
-    harness = postgres_history_harness
-    overrides = {
-        "meta": {
-            "execution_mode": "live",
-            "underlying_entry": 127.425,
-        }
-    }
-    overrides.update(row_overrides)
-    harness.insert_entry(**overrides)
-    _bind_postgres_history(monkeypatch, harness)
-
-    value = _reconciler()._derive_underlying_entry_from_position(
-        {"id": POSITION_ID, "underlying_entry": None},
-        underlying="NOW",
-        contract=CONTRACT,
-    )
-
-    assert value == 0.0
-
-
-def test_real_postgres_partial_fill_is_a_valid_historical_entry_control(
-    postgres_history_harness,
-    monkeypatch,
-):
-    harness = postgres_history_harness
-    harness.insert_entry(
-        status="PARTIAL_FILL",
-        filled_qty=1,
-        meta={
-            "execution_mode": "live",
-            "underlying_entry": 127.425,
-        },
-    )
-    _bind_postgres_history(monkeypatch, harness)
-
-    value = _reconciler()._derive_underlying_entry_from_position(
-        {"id": POSITION_ID, "underlying_entry": None},
-        underlying="NOW",
-        contract=CONTRACT,
-    )
-
-    assert value == pytest.approx(127.425)
