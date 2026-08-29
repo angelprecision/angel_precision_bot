@@ -655,8 +655,22 @@ def test_19_crash_after_claim_leaves_coherent_row():
 # 23. Retry backoff observation must NOT increment
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_23_calling_without_retry_attempt_does_not_increment_mirrors():
-    """Passing retry_attempt=None does not touch the three mirrors."""
+def test_23_retry_attempt_none_on_positive_mirror_row_now_rejects():
+    """AMENDMENT (issue #535, post-#530): passing ``retry_attempt=None`` on
+    a row with positive mirrors NOW rejects.
+
+    Prior to #535, this shape was silently accepted — the CAS advanced
+    generation without touching mirrors and the row was left in a
+    contradictory state (initial-materialization owner claiming a row that
+    already had attempt history). #535 closes that seam: the
+    ``retry_attempt=None`` calling convention requires the durable row to
+    be in a legitimate first-attempt shape (mirrors absent or 0/0/0).
+
+    Historical note: an earlier version of this test asserted the opposite
+    (claim=True + mirrors unchanged). That assertion encoded the pre-#535
+    seam and has been superseded by tests 24-27, which exercise the full
+    stale-shape rejection matrix.
+    """
     with _isolated_schema() as (schema, pg_conn):
         cid, loid, sid = "c@x.io", f"oid-{uuid.uuid4().hex}", f"sig-{uuid.uuid4().hex}"
         _seed_row(pg_conn, schema, local_order_id=loid, client_id=cid,
@@ -671,6 +685,140 @@ def test_23_calling_without_retry_attempt_does_not_increment_mirrors():
                     signal_id=sid, retry_attempt=None,
                     new_generation=1).items() if k != "signal_id"})
         m = _read_row(pg_conn, schema, loid)["meta"]
-        # Claim succeeded (no attempt requested), and mirrors stay at 1
-        assert ok is True
+        assert ok is False
+        # Mirrors + generation untouched on rejection
         assert _mirror_tuple(m) == (1, 1, 1)
+        assert m["materialization_generation"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 24–26. Issue #535 — first-attempt-shape invariant on retry_attempt=None path
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The retry_attempt=None calling convention exists for the initial-materialization
+# path from ap_execution_core::_claim_deferred_materialization_for_trigger. That
+# path expects the durable row to be in a legitimate first-attempt shape (mirrors
+# absent or 0/0/0). PR #530 fenced the retry_attempt-provided path but left this
+# path structurally unfenced. Issue #535 closes that seam.
+
+@pytest.mark.parametrize("stale_shape", [
+    (1, 1, 1),  # nonzero mirrors but "coherent" — still not first-attempt
+    (2, 2, 2),  # exact stale-from-prior-retry shape
+    (5, 5, 5),
+    (1, 0, 0),  # split
+    (0, 1, 0),  # split
+    (0, 0, 1),  # split
+    (2, 1, 1),  # exact production incident shape from #530
+])
+def test_24_retry_attempt_none_rejects_stale_positive_mirrors(stale_shape):
+    """#535: caller passes no retry_attempt (initial-materialization path).
+
+    A row with ANY positive mirror value must fail closed. The row must
+    not have generation advanced, must not have owner written, must retain
+    its original mirrors exactly.
+    """
+    ra_seed, bac_seed, mats_seed = stale_shape
+    with _isolated_schema() as (schema, pg_conn):
+        cid, loid, sid = "c@x.io", f"oid-{uuid.uuid4().hex}", f"sig-{uuid.uuid4().hex}"
+        seed = _base_seed(generation=1, signal_id=sid, execution_mode="paper",
+                          client_id=cid, ra=ra_seed, bac=bac_seed, mats=mats_seed,
+                          lifecycle="", mat_status="")
+        _seed_row(pg_conn, schema, local_order_id=loid, client_id=cid,
+                  signal_id=sid, execution_mode="paper", meta=seed)
+        with _route_osm_writes(pg_conn) as OSM:
+            # NOTE: retry_attempt kwarg is deliberately absent — this is the
+            # ap_execution_core::_claim_deferred_materialization_for_trigger path.
+            ok = OSM(client_id=cid).claim_deferred_materialization(
+                loid, signal_id=sid, **{k: v for k, v in _claim_kwargs(
+                    signal_id=sid, retry_attempt=None,
+                    new_generation=2).items() if k != "signal_id"})
+        m = _read_row(pg_conn, schema, loid)["meta"]
+        assert ok is False, f"expected reject for stale {stale_shape}, got claim=True"
+        # Row untouched — zero mutation on reject
+        assert _mirror_tuple(m) == stale_shape, \
+            f"mirrors mutated on reject for {stale_shape}: {_mirror_tuple(m)}"
+        assert m["materialization_generation"] == 1, "generation must not advance"
+        assert m["materialization_owner"] == "", "owner must not be written"
+
+
+def test_25_retry_attempt_none_accepts_fresh_row_absent_mirrors():
+    """#535: fresh row with mirrors absent — retry_attempt=None claim succeeds.
+
+    Regression guard: the first-attempt-shape predicate must not break the
+    normal initial-materialization path for a genuinely fresh row.
+    """
+    with _isolated_schema() as (schema, pg_conn):
+        cid, loid, sid = "c@x.io", f"oid-{uuid.uuid4().hex}", f"sig-{uuid.uuid4().hex}"
+        # No attempt mirrors at all — pristine fresh row
+        _seed_row(pg_conn, schema, local_order_id=loid, client_id=cid,
+                  signal_id=sid, execution_mode="paper",
+                  meta=_base_seed(generation=0, signal_id=sid,
+                                  execution_mode="paper", client_id=cid,
+                                  lifecycle="", mat_status=""))
+        with _route_osm_writes(pg_conn) as OSM:
+            ok = OSM(client_id=cid).claim_deferred_materialization(
+                loid, signal_id=sid, **{k: v for k, v in _claim_kwargs(
+                    signal_id=sid, retry_attempt=None,
+                    new_generation=1).items() if k != "signal_id"})
+        m = _read_row(pg_conn, schema, loid)["meta"]
+        assert ok is True
+        # Mirrors stay absent — retry_attempt=None means don't touch them
+        assert m.get("retry_attempt") is None
+        assert m.get("breach_attempt_count") is None
+        assert m.get("materialization_attempts") is None
+        # But generation, owner, lifecycle DID advance
+        assert m["materialization_generation"] == 1
+        assert m["materialization_owner"] == "materializer:mirror-test"
+        assert m["materialization_status"] == "RUNNING"
+        assert m["lifecycle_state"] == "MATERIALIZING"
+
+
+def test_26_retry_attempt_none_accepts_explicit_zero_mirrors():
+    """#535: fresh row with mirrors explicitly 0/0/0 — retry_attempt=None claim succeeds.
+
+    Some code paths seed 0 explicitly rather than leaving mirrors absent.
+    Both must be accepted as legitimate first-attempt shape.
+    """
+    with _isolated_schema() as (schema, pg_conn):
+        cid, loid, sid = "c@x.io", f"oid-{uuid.uuid4().hex}", f"sig-{uuid.uuid4().hex}"
+        _seed_row(pg_conn, schema, local_order_id=loid, client_id=cid,
+                  signal_id=sid, execution_mode="paper",
+                  meta=_base_seed(generation=0, signal_id=sid,
+                                  execution_mode="paper", client_id=cid,
+                                  ra=0, bac=0, mats=0,
+                                  lifecycle="", mat_status=""))
+        with _route_osm_writes(pg_conn) as OSM:
+            ok = OSM(client_id=cid).claim_deferred_materialization(
+                loid, signal_id=sid, **{k: v for k, v in _claim_kwargs(
+                    signal_id=sid, retry_attempt=None,
+                    new_generation=1).items() if k != "signal_id"})
+        m = _read_row(pg_conn, schema, loid)["meta"]
+        assert ok is True
+        # Mirrors stay at 0 — retry_attempt=None doesn't overwrite them
+        assert m.get("retry_attempt") == 0
+        assert m.get("breach_attempt_count") == 0
+        assert m.get("materialization_attempts") == 0
+        assert m["materialization_generation"] == 1
+
+
+@pytest.mark.parametrize("malformed", ["true", "false", "1.5", "-1", "abc"])
+def test_27_retry_attempt_none_rejects_malformed_durable_mirrors(malformed):
+    """#535: caller passes no retry_attempt AND a mirror is malformed text.
+
+    Fresh-row semantics require valid absence or 0; garbage text fails closed
+    just like it does on the retry_attempt-provided path.
+    """
+    with _isolated_schema() as (schema, pg_conn):
+        cid, loid, sid = "c@x.io", f"oid-{uuid.uuid4().hex}", f"sig-{uuid.uuid4().hex}"
+        seed = _base_seed(generation=0, signal_id=sid, execution_mode="paper",
+                          client_id=cid, ra=0, bac=0, mats=0,
+                          lifecycle="", mat_status="")
+        seed["breach_attempt_count"] = malformed  # inject bad text form
+        _seed_row(pg_conn, schema, local_order_id=loid, client_id=cid,
+                  signal_id=sid, execution_mode="paper", meta=seed)
+        with _route_osm_writes(pg_conn) as OSM:
+            ok = OSM(client_id=cid).claim_deferred_materialization(
+                loid, signal_id=sid, **{k: v for k, v in _claim_kwargs(
+                    signal_id=sid, retry_attempt=None,
+                    new_generation=1).items() if k != "signal_id"})
+        assert ok is False
