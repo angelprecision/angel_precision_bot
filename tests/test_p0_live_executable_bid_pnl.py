@@ -1240,7 +1240,8 @@ class TestCanonicalPlusRepairCollapse:
         if mode == "paper":
             assert getattr(adopted, "canonical_signal_id", "") == _SIG
 
-    def test_broker_precheck_with_only_quarantined_repair_installs_broker_owner(self):
+    def test_broker_precheck_quarantined_unknown_repair_rejects_unproven_owner(self):
+        """Unknown client/mode repair cannot be displaced by another provisional owner."""
         from ap_exit_engine import APExitEngine
 
         class _Broker:
@@ -1271,13 +1272,11 @@ class TestCanonicalPlusRepairCollapse:
         }
 
         assert engine.active_positions() == []
-        assert engine._broker_position_precheck() is True
+        assert engine._broker_position_precheck() is False
 
-        active = engine.active_positions()
-        assert len(active) == 1
-        assert active[0].position_id == "canon-from-broker"
-        assert active[0].execution_mode == "live"
-        assert repair in engine._positions
+        assert engine.active_positions() == []
+        assert "canon-from-broker" not in engine._positions_by_id
+        assert engine._positions == [repair]
         assert getattr(repair, "adoption_identity_quarantined", False) is True
 
     def test_successful_re_adoption_clears_prior_quarantine_flags(self):
