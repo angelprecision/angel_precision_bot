@@ -3305,7 +3305,6 @@ def test_source_less_quote_still_requires_approved_tradier_transport(base_url):
     assert result["reason"] == "MARKET_QUOTE_UNAPPROVED_TRANSPORT"
 
 
-@pytest.mark.integration
 def test_real_postgres_recovery_dispatches_due_retry_to_execution_core(monkeypatch):
     """Exercise the real APRecovery SQL load and due-executor boundary.
 
@@ -3426,6 +3425,6 @@ def test_real_postgres_recovery_dispatches_due_retry_to_execution_core(monkeypat
     assert kwargs["local_order_id"] == local_order_id
     assert kwargs["expected_generation"] == 1
     assert kwargs["expected_retry_attempt"] == 2
-    assert result.get("recovered") == 1
+    assert result.get("deferred_lifecycles_recovered") == 1
     core.broker.submit_order.assert_not_called()
     core.broker.cancel_order.assert_not_called()
