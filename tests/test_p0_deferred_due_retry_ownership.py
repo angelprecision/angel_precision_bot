@@ -3363,6 +3363,28 @@ def test_real_postgres_recovery_dispatches_due_retry_to_execution_core(monkeypat
                         created_ts timestamptz
                     )
                 """)
+                # Other CI tests may have created a minimal orders table
+                # already. Add the exact columns required by APRecovery's
+                # production SELECT so this acceptance fixture is idempotent.
+                for column, sql_type in (
+                    ("local_order_id", "text"), ("client_id", "text"),
+                    ("signal_id", "text"), ("plan_id", "text"),
+                    ("symbol", "text"), ("contract", "text"),
+                    ("direction", "text"), ("score", "double precision"),
+                    ("tier", "text"), ("trigger_price", "double precision"),
+                    ("stop_underlying", "double precision"),
+                    ("target_underlying", "double precision"),
+                    ("pattern", "text"), ("timeframe", "text"),
+                    ("execution_mode", "text"), ("qty", "integer"),
+                    ("limit_price", "double precision"),
+                    ("reserved_cost", "double precision"), ("status", "text"),
+                    ("broker_order_id", "text"), ("submitted_ts", "timestamptz"),
+                    ("kind", "text"), ("meta", "jsonb"),
+                    ("created_ts", "timestamptz"),
+                ):
+                    cur.execute(
+                        f"ALTER TABLE orders ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+                    )
                 cur.execute("DELETE FROM orders WHERE local_order_id = %s", (local_order_id,))
                 cur.execute("""
                     INSERT INTO orders (
