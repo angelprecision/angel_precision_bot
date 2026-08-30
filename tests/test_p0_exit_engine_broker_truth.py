@@ -211,6 +211,7 @@ def _postgres_positions_table(monkeypatch):
             signal_id TEXT,
             local_order_id TEXT,
             broker_order_id TEXT,
+            meta JSONB,
             updated_at TIMESTAMPTZ DEFAULT NOW()
         ) ON COMMIT PRESERVE ROWS;
 
@@ -340,6 +341,7 @@ def _postgres_shared_positions_table(monkeypatch):
                 signal_id TEXT,
                 local_order_id TEXT,
                 broker_order_id TEXT,
+                meta JSONB,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
             CREATE TABLE {schema}.orders (
@@ -1841,7 +1843,8 @@ def test_postgres_provisional_uuid_converges_to_later_canonical_identity(monkeyp
 
         with pg_conn.cursor() as cur:
             cur.execute(
-                """SELECT id, status, quantity_remaining
+                """SELECT id, status, quantity_remaining,
+                          meta->>'broker_repair_provenance'
                    FROM positions
                    WHERE client_id = %s
                      AND execution_mode = 'live'
@@ -1849,7 +1852,9 @@ def test_postgres_provisional_uuid_converges_to_later_canonical_identity(monkeyp
                 (client, contract),
             )
             initial_rows = cur.fetchall()
-        assert initial_rows == [(repair_id, "OPEN", 1)]
+        assert initial_rows == [
+            (repair_id, "OPEN", 1, "broker_recovery_uuid")
+        ]
 
         # The repair owner is installed in the engine before the canonical
         # fill lifecycle becomes visible.
@@ -1919,6 +1924,33 @@ def test_postgres_provisional_uuid_converges_to_later_canonical_identity(monkeyp
             underlying_target=440.0,
         )
         assert result.adopted is True
+        assert [p.position_id for p in eng.active_positions()] == [canonical_id]
+        canonical_owner = eng.active_positions()[0]
+        assert getattr(
+            canonical_owner, "broker_repair_provisional", False
+        ) is False
+        assert getattr(
+            canonical_owner, "brokerrepairprovisional", False
+        ) is False
+
+        # Canonical fill monitoring is retryable. A second adoption must be
+        # idempotent and must not classify/remove canonical B as a repair.
+        repeated = eng.adopt_canonical_position_identity(
+            contract=contract,
+            canonical_position_id=canonical_id,
+            local_order_id="local-entry-b",
+            broker_order_id="broker-entry-b",
+            signal_id="canonical-signal",
+            canonical_signal_id="canonical-signal",
+            entry_fill=1.50,
+            entry_ts=None,
+            execution_mode="live",
+            client_id=client,
+            underlying_entry=450.0,
+            underlying_stop=455.0,
+            underlying_target=440.0,
+        )
+        assert repeated.adopted is True
         assert [p.position_id for p in eng.active_positions()] == [canonical_id]
 
         with pg_conn.cursor() as cur:
@@ -2116,3 +2148,249 @@ def test_postgres_repair_vs_canonical_writer_converges_to_one_owner(monkeypatch)
             )
             engine.add_position(canonical)
             assert [p.position_id for p in engine.active_positions()] == [canonical_id]
+
+
+
+@_skip_if_no_mod
+def test_postgres_restart_does_not_infer_provisional_from_unlinked_fill(monkeypatch):
+    """Missing filled-ENTRY position_id is unknown, not repair provenance."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+    import threading
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        client = "canonical-restart@example.com"
+        contract = "IWM260830P00220000"
+        canonical_id = "canonical-existing-row"
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO positions (
+                       id, client_id, underlying, contract, option_symbol,
+                       execution_mode, side, direction, qty, quantity_remaining,
+                       avg_fill, entry_price, entry_ts, status, signal_id, meta
+                   ) VALUES (
+                       %s, %s, 'IWM', %s, %s, 'live', 'PUT', 'PUT', 1, 1,
+                       1.25, 1.25, NOW(), 'OPEN', 'canonical-signal', '{}'::jsonb
+                   )""",
+                (canonical_id, client, contract, contract),
+            )
+            cur.execute(
+                """INSERT INTO orders (
+                       id, client_id, execution_mode, contract, kind, status,
+                       filled_qty, fill_price, filled_ts, position_id, meta
+                   ) VALUES (
+                       %s, %s, 'live', %s, 'ENTRY', 'FILLED',
+                       1, 1.25, NOW(), NULL, %s
+                   )""",
+                (
+                    "unlinked-filled-entry",
+                    client,
+                    contract,
+                    json.dumps({"execution_mode": "live"}),
+                ),
+            )
+        pg_conn.commit()
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = threading.RLock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(
+            mode="live",
+            account_id="canonical-restart-account",
+            list_positions=lambda: [{
+                "symbol": contract,
+                "quantity": 1,
+                "cost_basis": 125.0,
+            }],
+        )
+        eng._fetch_broker_quote = lambda _sym: {}
+
+        assert eng._broker_position_precheck() is True
+        active = eng.active_positions()
+        assert [p.position_id for p in active] == [canonical_id]
+        assert getattr(active[0], "broker_repair_provisional", False) is False
+        assert getattr(active[0], "brokerrepairprovisional", False) is False
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """SELECT status, quantity_remaining,
+                          meta->>'broker_repair_provenance'
+                   FROM positions
+                   WHERE id = %s AND client_id = %s""",
+                (canonical_id, client),
+            )
+            assert cur.fetchone() == ("OPEN", 1, None)
+
+
+@_skip_if_no_mod
+def test_provisional_cannot_evict_quarantined_canonical_same_domain():
+    """A lower-authority UUID repair may not retire a quarantined canonical owner."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+    import threading
+
+    client = "quarantine-owner@example.com"
+    contract = "SPY260830C00650000"
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = client
+    eng._lock = threading.RLock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng.broker = types.SimpleNamespace(mode="live")
+
+    canonical = eng._managed_position_from_row({
+        "id": "canonical-quarantined",
+        "client_id": client,
+        "underlying": "SPY",
+        "contract": contract,
+        "option_symbol": contract,
+        "execution_mode": "live",
+        "side": "CALL",
+        "qty": 1,
+        "quantity_remaining": 1,
+        "entry_price": 1.30,
+        "status": "OPEN",
+    })
+    _EE_MOD._mark_adoption_identity_quarantined(
+        canonical, "canonical_geometry_requires_review"
+    )
+    eng._positions = [canonical]
+    eng._positions_by_id = {canonical.position_id: canonical}
+
+    provisional = eng._managed_position_from_row({
+        "id": "82f9669f-7874-4abd-b3a4-f8ed52ef0170",
+        "client_id": client,
+        "underlying": "SPY",
+        "contract": contract,
+        "option_symbol": contract,
+        "execution_mode": "live",
+        "side": "CALL",
+        "qty": 1,
+        "quantity_remaining": 1,
+        "entry_price": 1.30,
+        "status": "OPEN",
+        "broker_repair_provisional": True,
+    })
+
+    eng.add_position(provisional)
+
+    assert canonical.closed is False
+    assert canonical.quantity_remaining == 1
+    assert eng._positions == [canonical]
+    assert provisional not in eng._positions
+
+
+@_skip_if_no_mod
+@pytest.mark.parametrize(
+    ("incoming_client", "incoming_mode"),
+    [
+        ("foreign@example.com", "live"),
+        ("quarantine-owner@example.com", "paper"),
+    ],
+)
+def test_provisional_quarantine_bypass_requires_exact_client_and_mode(
+    incoming_client, incoming_mode
+):
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+    import threading
+
+    client = "quarantine-owner@example.com"
+    contract = "QQQ260830P00450000"
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = client
+    eng._lock = threading.RLock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng.broker = types.SimpleNamespace(mode="live")
+
+    existing = eng._managed_position_from_row({
+        "id": "3d47bd77-d366-4599-bda3-a0886cc47062",
+        "underlying": "QQQ",
+        "contract": contract,
+        "option_symbol": contract,
+        "execution_mode": "live",
+        "side": "PUT",
+        "qty": 1,
+        "quantity_remaining": 1,
+        "entry_price": 1.50,
+        "status": "OPEN",
+        "broker_repair_provisional": True,
+    })
+    _EE_MOD._mark_adoption_identity_quarantined(existing, "repair_needs_review")
+    eng._positions = [existing]
+    eng._positions_by_id = {existing.position_id: existing}
+
+    incoming = eng._managed_position_from_row({
+        "id": "6ffdfae4-f551-46b7-a70e-c8eb86abc793",
+        "underlying": "QQQ",
+        "contract": contract,
+        "option_symbol": contract,
+        "execution_mode": incoming_mode,
+        "side": "PUT",
+        "qty": 1,
+        "quantity_remaining": 1,
+        "entry_price": 1.50,
+        "status": "OPEN",
+        "broker_repair_provisional": True,
+    })
+    incoming.client_id = incoming_client
+
+    eng.add_position(incoming)
+
+    assert existing.closed is False
+    assert existing.quantity_remaining == 1
+    assert eng._positions == [existing]
+
+
+@_skip_if_no_mod
+def test_exact_provisional_replaces_quarantined_repair_with_critical_log(caplog):
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+    import logging
+    import threading
+
+    client = "quarantine-owner@example.com"
+    contract = "DIA260830C00460000"
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = client
+    eng._lock = threading.RLock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng.broker = types.SimpleNamespace(mode="live")
+
+    def repair(row_id):
+        return eng._managed_position_from_row({
+            "id": row_id,
+            "underlying": "DIA",
+            "contract": contract,
+            "option_symbol": contract,
+            "execution_mode": "live",
+            "side": "CALL",
+            "qty": 1,
+            "quantity_remaining": 1,
+            "entry_price": 1.10,
+            "status": "OPEN",
+            "broker_repair_provisional": True,
+        })
+
+    existing = repair("db50c2c9-9537-4a31-beb7-2de78fa96cb3")
+    incoming = repair("49f2059f-69c3-4d31-b7cc-5d81a707b36b")
+    _EE_MOD._mark_adoption_identity_quarantined(existing, "repair_needs_review")
+    eng._positions = [existing]
+    eng._positions_by_id = {existing.position_id: existing}
+
+    with caplog.at_level(logging.CRITICAL):
+        eng.add_position(incoming)
+
+    assert existing.closed is True
+    assert existing.quantity_remaining == 0
+    assert eng.active_positions() == [incoming]
+    assert "ADD_POSITION_PROVISIONAL_BYPASSES_QUARANTINED_REPAIR" in caplog.text
