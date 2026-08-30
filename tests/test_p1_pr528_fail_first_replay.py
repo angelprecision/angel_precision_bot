@@ -13,6 +13,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
+os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
+
 from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
