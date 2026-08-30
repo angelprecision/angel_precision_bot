@@ -934,10 +934,25 @@ class PendingTriggerRestartRecovery:
             )
 
         _next = (_now + timedelta(seconds=_delay)).isoformat()
+        # Keep the recovery-owned write congruent with the due executor's
+        # canonical retry shape.  APRecovery and the OSM CAS fence consume
+        # these mirrors; writing materialization_attempts alone would create
+        # a retry that this verifier correctly could not later own.
+        _generation_raw = _meta.get(_MAT_GENERATION_FIELD, 1)
+        if (
+            isinstance(_generation_raw, bool)
+            or not isinstance(_generation_raw, int)
+            or _generation_raw < 1
+        ):
+            return _RowOutcome.UNRESOLVED
         _ok = self._safe_meta_update(local_oid, {
             _MAT_STATUS_FIELD:       "RETRY_PENDING",
             _MAT_BROKER_READY:       False,
             _MAT_ATTEMPTS_FIELD:     _attempts,
+            _MAT_RETRY_ATTEMPT_FIELD: _attempts,
+            _MAT_BREACH_ATTEMPT_FIELD: _attempts,
+            _MAT_GENERATION_FIELD:   _generation_raw,
+            _MAT_MAX_ATTEMPTS_FIELD: _max,
             _MAT_NEXT_RETRY_AT:      _next,
             _MAT_REASON_FIELD:       reason,
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
