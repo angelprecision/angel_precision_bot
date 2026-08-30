@@ -355,7 +355,7 @@ class TestRetryableCanonicalFields:
             _MAT_STATUS_FIELD:       "RETRY_PENDING",
             _MAT_NEXT_RETRY_AT:      (_now + timedelta(minutes=1)).isoformat(),
             _MAT_ATTEMPTS_FIELD:     1,
-            _MAT_REASON_FIELD:       "test_retry",
+            _MAT_REASON_FIELD:       "PROVIDER_TIMEOUT",
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
             _MAT_BROKER_READY:       True,   # contradicts RETRY_PENDING
         })
@@ -1676,7 +1676,7 @@ class TestAmendment10Required:
         r = _row(meta={"trigger_price": 450.0})
         r["contract"] = "DEFERRED:SPY"
         rec, osm = _make_recovery(r)
-        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="zero_quotes")
+        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="PROVIDER_TIMEOUT")
 
         assert outcome == _RowOutcome.RETRY_OWNED
         all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
