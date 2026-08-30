@@ -1783,65 +1783,143 @@ def test_postgres_fixture_wrapper_returns_dict_rows(monkeypatch):
 
 @_skip_if_no_mod
 def test_postgres_provisional_uuid_converges_to_later_canonical_identity(monkeypatch):
-    """Real PostgreSQL proof: UUID repair A converges to canonical B."""
+    """Real PostgreSQL proof: actual UUID repair A converges to canonical B."""
     engine_cls = getattr(_EE_MOD, "APExitEngine", None)
     if engine_cls is None:
         pytest.skip("APExitEngine not found")
+    import threading
+    import uuid
+
     with _postgres_positions_table(monkeypatch) as pg_conn:
         client = "convergence@example.com"
         contract = "QQQ260830P00450000"
-        repair_id = "7d2f9f1e-7e31-4cb1-9b7e-2cf5f6a0b001"
         canonical_id = "canonical-position-b"
+        broker_position = {"quantity": 1, "cost_basis": 150.0}
+
+        # No canonical positions row exists.  There is only a filled ENTRY
+        # with no proven position_id, which is the production fallback case.
         with pg_conn.cursor() as cur:
-            for pid in (repair_id, canonical_id):
-                cur.execute(
-                    """INSERT INTO positions (
-                           id, client_id, underlying, contract, option_symbol,
-                           execution_mode, side, direction, qty, quantity_remaining,
-                           avg_fill, entry_price, underlying_entry, stop_underlying,
-                           target_underlying, status, signal_id
-                       ) VALUES (
-                           %s, %s, %s, %s, %s, 'live', 'PUT', 'PUT', 1, 1,
-                           1.50, 1.50, 450.0, 455.0, 440.0, 'OPEN', %s)""",
-                    (pid, client, "QQQ", contract, contract, pid),
-                )
+            cur.execute(
+                """INSERT INTO orders (
+                       id, client_id, execution_mode, contract, kind, status,
+                       filled_qty, fill_price, filled_ts, position_id,
+                       local_order_id, broker_order_id
+                   ) VALUES (
+                       %s, %s, 'live', %s, 'ENTRY', 'FILLED',
+                       1, 1.50, NOW(), NULL, %s, %s
+                   )""",
+                (
+                    "filled-entry-without-position",
+                    client,
+                    contract,
+                    "local-entry-a",
+                    "broker-entry-a",
+                ),
+            )
         pg_conn.commit()
+
         eng = engine_cls.__new__(engine_cls)
         eng._email = client
-        eng._lock = __import__("threading").RLock()
+        eng._lock = threading.RLock()
         eng._positions = []
         eng._positions_by_id = {}
         eng.broker = types.SimpleNamespace(mode="live")
-        repair = eng._managed_position_from_row({
-            "id": repair_id, "client_id": client, "underlying": "QQQ",
-            "contract": contract, "option_symbol": contract, "execution_mode": "live",
-            "side": "PUT", "qty": 1, "quantity_remaining": 1,
-            "entry_price": 1.50, "underlying_entry": 450.0,
-            "stop_underlying": 455.0, "target_underlying": 440.0,
-            "status": "OPEN", "broker_repair_provisional": True,
-        }, qty_override=1, prefer_qty_override=True)
+
+        # Exercise the actual broker-repair writer.  It must generate and
+        # persist an explicit UUID because the filled ENTRY has no position_id.
+        repair_ref = eng._upsert_broker_position_to_db(
+            contract, broker_position
+        )
+        assert repair_ref is not None
+        repair_id = str(repair_ref)
+        uuid.UUID(repair_id)
+        assert repair_id != canonical_id
+
+        repair_row = getattr(repair_ref, "repair_row", None)
+        assert isinstance(repair_row, dict)
+        assert repair_row["broker_repair_provisional"] is True
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status, quantity_remaining
+                   FROM positions
+                   WHERE client_id = %s
+                     AND execution_mode = 'live'
+                     AND contract = %s""",
+                (client, contract),
+            )
+            initial_rows = cur.fetchall()
+        assert initial_rows == [(repair_id, "OPEN", 1)]
+
+        # The repair owner is installed in the engine before the canonical
+        # fill lifecycle becomes visible.
+        repair = eng._managed_position_from_row(
+            dict(repair_row),
+            qty_override=1,
+            prefer_qty_override=True,
+        )
         eng.add_position(repair)
+        assert [p.position_id for p in eng.active_positions()] == [repair_id]
+
+        # The later canonical writer exposes position_id B.
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO positions (
+                       id, client_id, underlying, contract, option_symbol,
+                       execution_mode, side, direction, qty, quantity_remaining,
+                       avg_fill, entry_price, underlying_entry, stop_underlying,
+                       target_underlying, status, signal_id,
+                       local_order_id, broker_order_id
+                   ) VALUES (
+                       %s, %s, 'QQQ', %s, %s, 'live', 'PUT', 'PUT', 1, 1,
+                       1.50, 1.50, 450.0, 455.0, 440.0, 'OPEN',
+                       'canonical-signal', 'local-entry-b', 'broker-entry-b'
+                   )""",
+                (canonical_id, client, contract, contract),
+            )
+        pg_conn.commit()
+
         result = eng.adopt_canonical_position_identity(
-            contract=contract, canonical_position_id=canonical_id,
-            local_order_id="", broker_order_id="", signal_id="",
-            canonical_signal_id="", entry_fill=1.50, entry_ts=None,
-            execution_mode="live", client_id=client,
-            underlying_entry=450.0, underlying_stop=455.0,
+            contract=contract,
+            canonical_position_id=canonical_id,
+            local_order_id="local-entry-b",
+            broker_order_id="broker-entry-b",
+            signal_id="canonical-signal",
+            canonical_signal_id="canonical-signal",
+            entry_fill=1.50,
+            entry_ts=None,
+            execution_mode="live",
+            client_id=client,
+            underlying_entry=450.0,
+            underlying_stop=455.0,
             underlying_target=440.0,
         )
         assert result.adopted is True
-        assert repair_id != canonical_id
         assert [p.position_id for p in eng.active_positions()] == [canonical_id]
+
         with pg_conn.cursor() as cur:
             cur.execute(
-                """SELECT id, status, quantity_remaining FROM positions
-                   WHERE client_id = %s AND execution_mode = 'live' AND contract = %s
-                   ORDER BY id""", (client, contract))
+                """SELECT id, status, quantity_remaining
+                   FROM positions
+                   WHERE client_id = %s
+                     AND execution_mode = 'live'
+                     AND contract = %s
+                   ORDER BY id""",
+                (client, contract),
+            )
             rows = cur.fetchall()
-        active = [r for r in rows if r[1] in ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")]
+
+        active = [
+            row for row in rows
+            if row[1] in ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
+            and int(row[2] or 0) > 0
+        ]
         assert len(active) == 1
         assert active[0][0] == canonical_id
-        assert any(r[0] == repair_id and r[1] == "CLOSED" and r[2] == 0 for r in rows)
+        assert any(
+            row[0] == repair_id and row[1] == "CLOSED" and row[2] == 0
+            for row in rows
+        )
 
 
 @_skip_if_no_mod
