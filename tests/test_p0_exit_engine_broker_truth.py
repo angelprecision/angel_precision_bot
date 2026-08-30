@@ -1842,3 +1842,175 @@ def test_postgres_provisional_uuid_converges_to_later_canonical_identity(monkeyp
         assert len(active) == 1
         assert active[0][0] == canonical_id
         assert any(r[0] == repair_id and r[1] == "CLOSED" and r[2] == 0 for r in rows)
+
+
+@_skip_if_no_mod
+def test_postgres_repair_vs_canonical_writer_converges_to_one_owner(monkeypatch):
+    """Real PostgreSQL overlap: repair and canonical writers converge."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+    import threading
+    psycopg2 = pytest.importorskip("psycopg2")
+
+    with _postgres_shared_positions_table(monkeypatch) as pg_conn:
+        client = "repair-canonical-race@example.com"
+        contract = "SPY260830C00650000"
+        canonical_id = "canonical-race-b"
+        broker_position = {"quantity": 1, "cost_basis": 130.0}
+        barrier = threading.Barrier(2)
+        repair_results = []
+        errors = []
+
+        with pg_conn.cursor() as cur:
+            cur.execute("SELECT current_schema()")
+            schema = cur.fetchone()[0]
+
+        def canonical_writer():
+            connection = psycopg2.connect(_DATABASE_URL)
+            try:
+                connection.autocommit = False
+                with connection.cursor() as cur:
+                    cur.execute(f"SET search_path TO {schema}, public")
+                    barrier.wait(timeout=10)
+                    cur.execute(
+                        """INSERT INTO positions (
+                               id, client_id, underlying, contract, option_symbol,
+                               execution_mode, side, direction, qty, quantity_remaining,
+                               avg_fill, entry_price, underlying_entry, stop_underlying,
+                               target_underlying, status, signal_id
+                           ) VALUES (
+                               %s, %s, 'SPY', %s, %s, 'live', 'CALL', 'CALL',
+                               1, 1, 1.30, 1.30, 650.0, 645.0, 660.0,
+                               'OPEN', 'canonical-race-signal'
+                           )""",
+                        (canonical_id, client, contract, contract),
+                    )
+                connection.commit()
+            except Exception as exc:
+                errors.append(exc)
+                connection.rollback()
+            finally:
+                connection.close()
+
+        def repair_writer():
+            engine = engine_cls.__new__(engine_cls)
+            engine._email = client
+            engine.broker = types.SimpleNamespace(mode="live")
+
+            def lookup(*_args, **_kwargs):
+                barrier.wait(timeout=10)
+                return None
+
+            engine._find_exact_filled_entry_order = lookup
+            try:
+                repair_results.append(
+                    engine._upsert_broker_position_to_db(contract, broker_position)
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=canonical_writer),
+            threading.Thread(target=repair_writer),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert not errors
+        assert len(repair_results) == 1
+        assert repair_results[0]
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status, quantity_remaining
+                   FROM positions
+                   WHERE client_id = %s
+                     AND execution_mode = 'live'
+                     AND contract = %s
+                   ORDER BY id""",
+                (client, contract),
+            )
+            rows = cur.fetchall()
+
+        active = [
+            row for row in rows
+            if row[1] in ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
+            and int(row[2] or 0) > 0
+        ]
+        assert len(active) in (1, 2)
+        assert any(row[0] == canonical_id for row in active)
+
+        # If repair won the overlap, invoke the exact canonical-adoption seam
+        # against the durable canonical row. It must retire/rename the
+        # provisional owner rather than leave two active lifecycles.
+        provisional_ids = [row[0] for row in active if row[0] != canonical_id]
+        engine = engine_cls.__new__(engine_cls)
+        engine._email = client
+        engine._lock = threading.RLock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        engine.broker = types.SimpleNamespace(mode="live")
+        if provisional_ids:
+            provisional_id = provisional_ids[0]
+            repair = engine._managed_position_from_row(
+                {
+                    "id": provisional_id, "client_id": client,
+                    "underlying": "SPY", "contract": contract,
+                    "option_symbol": contract, "execution_mode": "live",
+                    "side": "CALL", "qty": 1, "quantity_remaining": 1,
+                    "entry_price": 1.30, "underlying_entry": 650.0,
+                    "stop_underlying": 645.0, "target_underlying": 660.0,
+                    "status": "OPEN", "broker_repair_provisional": True,
+                },
+                qty_override=1, prefer_qty_override=True,
+            )
+            engine.add_position(repair)
+
+        if provisional_ids:
+            adoption = engine.adopt_canonical_position_identity(
+                contract=contract, canonical_position_id=canonical_id,
+                local_order_id="", broker_order_id="", signal_id="",
+                canonical_signal_id="", entry_fill=1.30, entry_ts=None,
+                execution_mode="live", client_id=client,
+                underlying_entry=650.0, underlying_stop=645.0,
+                underlying_target=660.0,
+            )
+            assert adoption.adopted is True
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status, quantity_remaining
+                   FROM positions
+                   WHERE client_id = %s
+                     AND execution_mode = 'live'
+                     AND contract = %s
+                     AND UPPER(TRIM(COALESCE(status, ''))) IN
+                         ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                     AND COALESCE(quantity_remaining, qty, 0) > 0
+                   """,
+                (client, contract),
+            )
+            final_active = cur.fetchall()
+
+        assert len(final_active) == 1
+        assert final_active[0][0] == canonical_id
+        if provisional_ids:
+            assert [p.position_id for p in engine.active_positions()] == [canonical_id]
+        else:
+            canonical = engine._managed_position_from_row(
+                {
+                    "id": canonical_id, "client_id": client,
+                    "underlying": "SPY", "contract": contract,
+                    "option_symbol": contract, "execution_mode": "live",
+                    "side": "CALL", "qty": 1, "quantity_remaining": 1,
+                    "entry_price": 1.30, "underlying_entry": 650.0,
+                    "stop_underlying": 645.0, "target_underlying": 660.0,
+                    "status": "OPEN",
+                },
+                qty_override=1, prefer_qty_override=True,
+            )
+            engine.add_position(canonical)
+            assert [p.position_id for p in engine.active_positions()] == [canonical_id]

@@ -4354,7 +4354,7 @@ class APExitEngine:
                     _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
                     _incoming_is_proven_canonical = (
                         _incoming_id
-                        and not _is_broker_repair_provisional(existing)
+                        and not _is_broker_repair_provisional(pos)
                         and _incoming_client
                         and _incoming_mode in {"live", "paper"}
                     )
