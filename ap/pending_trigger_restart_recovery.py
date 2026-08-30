@@ -64,6 +64,17 @@ class _RowOutcome:
 
 _TERMINAL_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED", "ERROR"})
 
+# Keep terminal materialization cleanup aligned with the classifier's three
+# persisted outcome surfaces. Classification can see a nested legacy outcome,
+# so cleanup must preserve that exact decision rather than writing a blank
+# trailing-colon reason.
+_TERMINAL_MATERIALIZATION_OUTCOMES = frozenset({
+    "TERMINAL_NO_TRADEABLE_CONTRACT",
+    "TERMINAL_QUALITY_REJECT",
+    "TERMINAL_MATERIALIZATION_FAILED",
+    "FAILED_TERMINAL",
+})
+
 # #323 canonical materialization retry fields — exact shape from ap/deferred_materializer.stamp_retry_pending()
 # DO NOT invent fields not present in that function.
 _MAT_STATUS_FIELD        = "materialization_status"      # "RETRY_PENDING"
@@ -519,7 +530,7 @@ class PendingTriggerRestartRecovery:
             )
 
         elif cls == PTC.STUCK_TERMINAL_MATERIALIZATION:
-            _outcome = (row.get("meta") or {}).get("materialization_outcome", "")
+            _outcome = _terminal_materialization_outcome(row)
             return self._terminalize_with_reason(
                 local_oid, row,
                 f"restart_stuck_terminal_materialization:{_outcome}",
@@ -586,10 +597,6 @@ class PendingTriggerRestartRecovery:
             proof = self._verify_materialization_retry_ownership(local_oid, row)
             if proof is not None:
                 self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
-                self._safe_meta_update(local_oid, {
-                    "restart_recovery_cls": PTC.ORPHAN_NO_WATCHER,
-                    "restart_recovery_at":  _now_iso(),
-                })
                 return _RowOutcome.RETRY_OWNED
             log.critical(
                 "RESTART_RECOVERY_ORPHAN_RETRY_OWNERSHIP_UNPROVEN local=%s — UNRESOLVED",
@@ -617,11 +624,6 @@ class PendingTriggerRestartRecovery:
             if proof is not None:
                 self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
                 log.info("RESTART_RECOVERY_MATERIALIZATION_RETRY_OWNED local=%s proof=%s", local_oid, proof)
-                self._safe_meta_update(local_oid, {
-                    "restart_recovery_cls": PTC.WAITING_RETRYABLE,
-                    "restart_recovery_retry_subtype": _RETRY_MATERIALIZATION,
-                    "restart_recovery_at": _now_iso(),
-                })
                 return _RowOutcome.RETRY_OWNED
             self._mark_failure(local_oid, "retry_verification:materialization")
             log.critical("RESTART_RECOVERY_MATERIALIZATION_RETRY_UNPROVEN local=%s", local_oid)
@@ -1106,21 +1108,50 @@ class PendingTriggerRestartRecovery:
         rr_oid    = str(reread.get("local_order_id") or "").strip()
         rr_client = str(reread.get("client_id") or reread.get("client_email") or "").strip().lower()
         rr_mode   = str(reread.get("execution_mode") or "").strip().lower()
+        rr_signal = str(reread.get("signal_id") or "").strip()
+        rr_kind   = str(reread.get("kind") or "").strip().upper()
+        expected_signal = str((row or {}).get("signal_id") or "").strip()
+        expected_kind   = str((row or {}).get("kind") or "").strip().upper()
         contract  = str(reread.get("contract") or "").strip()
         if status != "PENDING_TRIGGER":
             return None
         if not rr_oid or rr_oid != local_oid:
             return None
+        if expected_kind != "ENTRY" or rr_kind != "ENTRY":
+            return None
+        if not expected_signal or not rr_signal or rr_signal != expected_signal:
+            return None
         if not rr_client or rr_client != self.client_id.lower():
             return None
         if not rr_mode or rr_mode != self.execution_mode:
-            return None
-        if not contract or not contract.upper().startswith("DEFERRED:"):
             return None
         if reread.get("broker_order_id") or reread.get("submitted_ts"):
             return None
 
         meta = _extract_meta(reread)
+        # The classifier inspects every persisted outcome surface; the durable
+        # reread must apply the same authority rule, including nested legacy
+        # materialization payloads.
+        for _surface in (
+            meta,
+            meta.get("materialization") if isinstance(meta.get("materialization"), dict) else {},
+        ):
+            for _key in ("materialization_outcome", "outcome"):
+                _outcome = str(_surface.get(_key) or "").strip().upper()
+                if _outcome and _outcome not in {
+                    "RETRY_LATER_SELECTOR_BUDGET",
+                    "RETRY_LATER_DATA_UNAVAILABLE",
+                }:
+                    return None
+        _lifecycle = str(meta.get("lifecycle_state") or "").strip().upper()
+        if _lifecycle in {"CANCELED", "EXPIRED", "REJECTED", "ERROR"}:
+            return None
+        _is_deferred_contract = contract.upper().startswith("DEFERRED:")
+        _is_marked_blank_deferred = (
+            not contract and meta.get("contract_deferred") is True
+        )
+        if not (_is_deferred_contract or _is_marked_blank_deferred):
+            return None
         materialization_outcome = str(
             meta.get("materialization_outcome") or ""
         ).strip().upper()
@@ -1134,9 +1165,9 @@ class PendingTriggerRestartRecovery:
         next_at      = str(meta.get(_MAT_NEXT_RETRY_AT) or "").strip()
         reason       = str(meta.get(_MAT_REASON_FIELD) or "").strip()
         last_fail    = str(meta.get(_MAT_LAST_FAILURE_FIELD) or "").strip()
-        try:
-            attempts = int(meta.get(_MAT_ATTEMPTS_FIELD))
-        except (TypeError, ValueError):
+        attempts = meta.get(_MAT_ATTEMPTS_FIELD)
+        # Durable JSONB proof must be typed, not merely int-coercible.
+        if isinstance(attempts, bool) or not isinstance(attempts, int):
             return None
 
         try:
@@ -1154,7 +1185,7 @@ class PendingTriggerRestartRecovery:
             return None
         if attempts < 1 or attempts > _max:
             return None
-        if not next_at or not reason:
+        if not next_at or not reason or _parse_iso(last_fail) is None:
             return None
         next_dt = _parse_iso(next_at)
         if next_dt is None:
@@ -1658,6 +1689,23 @@ def _extract_meta(row: dict) -> dict:
         except Exception:
             meta = {}
     return meta if isinstance(meta, dict) else {}
+
+
+def _terminal_materialization_outcome(row: dict) -> str:
+    """Return the recognized terminal outcome from any persisted surface."""
+    meta = _extract_meta(row)
+    nested = meta.get("materialization")
+    nested = nested if isinstance(nested, dict) else {}
+    values = (
+        meta.get("materialization_outcome"),
+        nested.get("outcome"),
+        nested.get("materialization_outcome"),
+    )
+    for value in values:
+        outcome = str(value or "").strip()
+        if outcome and outcome.upper() in _TERMINAL_MATERIALIZATION_OUTCOMES:
+            return outcome
+    return ""
 
 
 def _canonical_underlying_trigger(row: dict) -> Optional[float]:

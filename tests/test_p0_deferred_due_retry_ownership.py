@@ -2881,6 +2881,26 @@ def test_deferred_retry_mode_contradiction_fails_closed_before_callback(monkeypa
     core._on_entry_trigger.assert_not_called()
 
 
+def test_deferred_retry_blank_contract_marker_reaches_due_executor(monkeypatch):
+    """#526 blank ownership remains executable by the canonical due path."""
+    meta = _base_meta(retry_attempt=1)
+    meta["execution_mode"] = "paper"
+    meta["contract_deferred"] = True
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch, execution_mode="paper")
+    osm.get_order.return_value["contract"] = ""
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-blank-contract",
+    )
+
+    assert result["disposition"] == "RETRY_WAIT"
+    core.order_state_machine.claim_deferred_materialization.assert_called_once()
+    core._on_entry_trigger.assert_called_once()
+
+
 # ── Test 1: durable=3, env=5 → max_attempts raised to 5 ─────────────────────
 
 def test_am1_durable_3_env_5_raises_to_5(monkeypatch):

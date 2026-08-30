@@ -67,6 +67,7 @@ def _row(
         "client_id":      client_id,
         "client_email":   client_id,
         "execution_mode": execution_mode,
+        "kind":           "ENTRY",
         "status":         status,
         "direction":      direction,
         "ticker":         ticker,
@@ -204,6 +205,59 @@ def _restart_rearm_meta(*, next_at=None, deadline=None, attempts=1,
     }
 
 
+def _canonical_trigger_ready_retry_row(
+    *,
+    next_retry_at=None,
+    attempts=1,
+    reason="PROVIDER_TIMEOUT",
+    last_failure_at=None,
+    outcome="RETRY_LATER_DATA_UNAVAILABLE",
+    contract="DEFERRED:SPY",
+):
+    """Build the production-shaped #528 trigger-ready retry row."""
+    from ap_canonical_signal import build_canonical_signal_id
+
+    now = datetime.now(timezone.utc)
+    signal_id = "sig-pr528-retry"
+    next_retry_at = next_retry_at or (now + timedelta(minutes=1)).isoformat()
+    last_failure_at = last_failure_at or now.isoformat()
+    row = _row(
+        client_id="client@test.com",
+        execution_mode="paper",
+        signal_id=signal_id,
+        meta={
+            "watcher_audit": {"reason_code": "trigger_ready"},
+            "canonical_signal_id": build_canonical_signal_id(signal_id),
+            "trigger_crossed_at": (now - timedelta(seconds=5)).isoformat(),
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": signal_id,
+                "client_id": "client@test.com",
+                "execution_mode": "paper",
+                "local_order_id": "placeholder",
+            },
+            "trigger_price": 450.0,
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "contract_deferred": not bool(str(contract or "").strip()),
+            "materialization_generation": 1,
+            "materialization_attempts": attempts,
+            "retry_attempt": attempts,
+            "retry_max_attempts": 5,
+            "materialization_next_retry_at": next_retry_at,
+            "next_retry_at": next_retry_at,
+            "materialization_reason": reason,
+            "materialization_last_failure_at": last_failure_at,
+            "materialization_outcome": outcome,
+            "retry_owner": "materializer:client@test.com:paper:sig-pr528-retry",
+            "broker_ready": False,
+        },
+    )
+    row["contract"] = contract
+    row["meta"]["trigger_crossed_at_provenance"]["local_order_id"] = row["local_order_id"]
+    return row
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test 1 — Valid waiting orphan rearmed + registry verified (Blockers 4, 5)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -330,6 +384,148 @@ class TestRetryableCanonicalFields:
         # _RR_OWNER_FIELD was removed — not in real stamp_retry_pending
         assert summary["retry_rows_owned"] == 1
         assert summary["restart_rearm_retry_owned_count"] == 1
+
+
+class TestTriggerReadyMaterializationRetryFence:
+    """PR #528: canonical deferred retry outranks stale trigger-ready evidence."""
+
+    @pytest.mark.parametrize(
+        "reason,outcome",
+        [
+            ("PROVIDER_TIMEOUT", "RETRY_LATER_DATA_UNAVAILABLE"),
+            ("SELECTOR_REQUEST_BUDGET_EXHAUSTED", "RETRY_LATER_SELECTOR_BUDGET"),
+        ],
+    )
+    def test_trigger_ready_with_canonical_retry_is_not_terminalized(self, reason, outcome):
+        """FAIL-FIRST: the pre-#528 classifier terminalizes this row."""
+        from ap.pending_trigger_classifier import classify_pending_trigger_row
+
+        row = _canonical_trigger_ready_retry_row(reason=reason, outcome=outcome)
+        assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.WAITING_RETRYABLE
+
+        rec, osm = _make_recovery(row, watcher=None)
+        recovery_outcome = rec.recover_one_row(row)
+
+        assert recovery_outcome == _RowOutcome.RETRY_OWNED
+        assert osm.cancel_calls == []
+
+    def test_due_canonical_retry_remains_owned_by_due_executor(self):
+        """Due timing does not let pending-trigger recovery terminalize the retry."""
+        due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        row = _canonical_trigger_ready_retry_row(next_retry_at=due_at)
+        rec, osm = _make_recovery(row, watcher=None)
+
+        assert rec.recover_one_row(row) == _RowOutcome.RETRY_OWNED
+        assert osm.cancel_calls == []
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("materialization_next_retry_at", "not-an-iso-timestamp"),
+            ("materialization_next_retry_at", ""),
+            ("materialization_last_failure_at", ""),
+            ("materialization_reason", ""),
+            ("materialization_attempts", 0),
+            ("materialization_attempts", True),
+            ("materialization_attempts", "1"),
+            ("broker_ready", "false"),
+        ],
+    )
+    def test_malformed_retry_shape_does_not_outrank_trigger_ready(self, field, value):
+        """Malformed retry metadata remains on the existing stuck path."""
+        from ap.pending_trigger_classifier import classify_pending_trigger_row
+
+        row = _canonical_trigger_ready_retry_row()
+        row["meta"][field] = value
+
+        assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.STUCK_TRIGGER_READY
+
+    def test_real_occ_contract_does_not_enter_deferred_retry_path(self):
+        from ap.pending_trigger_classifier import classify_pending_trigger_row
+
+        row = _canonical_trigger_ready_retry_row(contract="SPY260918C00450000")
+
+        assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.STUCK_TRIGGER_READY
+
+    def test_nested_terminal_outcome_wins_over_retry_shape(self):
+        from ap.pending_trigger_classifier import classify_pending_trigger_row
+
+        row = _canonical_trigger_ready_retry_row()
+        row["meta"].pop("materialization_outcome")
+        row["meta"]["materialization"] = {"outcome": "FAILED_TERMINAL"}
+
+        assert (
+            classify_pending_trigger_row(row, watcher_owned=False)
+            == PTC.STUCK_TERMINAL_MATERIALIZATION
+        )
+
+    def test_nested_terminal_outcome_reason_is_preserved_by_recovery(self):
+        row = _canonical_trigger_ready_retry_row()
+        row["meta"].pop("materialization_outcome")
+        row["meta"]["materialization"] = {"outcome": "FAILED_TERMINAL"}
+
+        rec, osm = _make_recovery(row, watcher=None)
+
+        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert osm.cancel_calls == [
+            (row["local_order_id"],
+             "restart_stuck_terminal_materialization:FAILED_TERMINAL")
+        ]
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [("signal_id", "different-signal"), ("kind", "EXIT")],
+    )
+    def test_durable_identity_contradiction_is_unresolved(self, field, value):
+        row = _canonical_trigger_ready_retry_row()
+        rec, osm = _make_recovery(row, watcher=None)
+
+        # _MockOSM.seed intentionally shallow-copies the row. Give the
+        # durable reread its own top-level/meta mapping to model a concurrent
+        # durable contradiction without changing the classifier snapshot.
+        durable = dict(row)
+        durable["meta"] = dict(row["meta"])
+        durable[field] = value
+        osm._rows[row["local_order_id"]] = durable
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.cancel_calls == []
+
+    def test_marked_blank_deferred_contract_survives_pending_recovery(self):
+        from ap.pending_trigger_classifier import classify_pending_trigger_row
+
+        row = _canonical_trigger_ready_retry_row(contract="")
+
+        assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.WAITING_RETRYABLE
+        rec, osm = _make_recovery(row, watcher=None)
+
+        assert rec.recover_one_row(row) == _RowOutcome.RETRY_OWNED
+        assert osm.cancel_calls == []
+
+    def test_repeated_recovery_polls_preserve_retry_clock_and_attempt(self):
+        """Pending-trigger recovery only observes a retry; it does not advance it."""
+        row = _canonical_trigger_ready_retry_row()
+        retry_fields = {
+            key: row["meta"][key]
+            for key in (
+                "materialization_status",
+                "materialization_attempts",
+                "materialization_next_retry_at",
+                "materialization_reason",
+                "materialization_last_failure_at",
+            )
+        }
+        rec, osm = _make_recovery(row, watcher=None)
+
+        assert [rec.recover_one_row(row) for _ in range(2)] == [
+            _RowOutcome.RETRY_OWNED,
+            _RowOutcome.RETRY_OWNED,
+        ]
+        assert osm.cancel_calls == []
+        assert {
+            key: osm._rows[row["local_order_id"]]["meta"][key]
+            for key in retry_fields
+        } == retry_fields
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1605,7 +1801,7 @@ class TestClassifierMaterializationInFlight:
         assert _active_materialization_proof(meta) is False
         assert classify_pending_trigger_row(
             _tmo_row(meta=meta), watcher_owned=False
-        ) == PTC.STUCK_TRIGGER_READY
+        ) == PTC.STUCK_TERMINAL_MATERIALIZATION
 
     @pytest.mark.parametrize(
         "outcome",
