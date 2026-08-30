@@ -42,6 +42,7 @@ from ap.pending_trigger_classifier import (
 )
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
+    is_retryable_selector_reason,
     resolve_deferred_materialization_max_attempts,
 )
 
@@ -83,6 +84,10 @@ _MAT_ATTEMPTS_FIELD      = "materialization_attempts"    # int — canonical att
 _MAT_REASON_FIELD        = "materialization_reason"      # reason_code str
 _MAT_LAST_FAILURE_FIELD  = "materialization_last_failure_at"
 _MAT_BROKER_READY        = "broker_ready"               # must be False on RETRY_PENDING rows
+_MAT_GENERATION_FIELD      = "materialization_generation"
+_MAT_RETRY_ATTEMPT_FIELD    = "retry_attempt"
+_MAT_BREACH_ATTEMPT_FIELD  = "breach_attempt_count"
+_MAT_MAX_ATTEMPTS_FIELD    = "retry_max_attempts"
 # Max attempts from the same env var the deferred materializer reads
 _MAT_MAX_ATTEMPTS_ENV    = "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS"
 
@@ -1166,8 +1171,20 @@ class PendingTriggerRestartRecovery:
         reason       = str(meta.get(_MAT_REASON_FIELD) or "").strip()
         last_fail    = str(meta.get(_MAT_LAST_FAILURE_FIELD) or "").strip()
         attempts = meta.get(_MAT_ATTEMPTS_FIELD)
-        # Durable JSONB proof must be typed, not merely int-coercible.
-        if isinstance(attempts, bool) or not isinstance(attempts, int):
+        retry_attempt = meta.get(_MAT_RETRY_ATTEMPT_FIELD)
+        breach_attempt_count = meta.get(_MAT_BREACH_ATTEMPT_FIELD)
+        generation = meta.get(_MAT_GENERATION_FIELD)
+        durable_max = meta.get(_MAT_MAX_ATTEMPTS_FIELD)
+        # Durable JSONB proof must be typed, not merely int-coercible.  These
+        # are the same mirrors consumed by APRecovery and the OSM CAS fence.
+        counters = (attempts, retry_attempt, breach_attempt_count, generation, durable_max)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in counters):
+            return None
+        if retry_attempt != attempts or breach_attempt_count != attempts:
+            return None
+        if generation < 1 or durable_max < attempts:
+            return None
+        if not is_retryable_selector_reason(reason):
             return None
 
         try:
@@ -1183,7 +1200,7 @@ class PendingTriggerRestartRecovery:
             return None
         if broker_ready is not False:
             return None
-        if attempts < 1 or attempts > _max:
+        if attempts < 1 or attempts > _max or durable_max != _max:
             return None
         if not next_at or not reason or _parse_iso(last_fail) is None:
             return None

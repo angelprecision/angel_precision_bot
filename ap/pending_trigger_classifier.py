@@ -53,6 +53,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
 
 from ap.logger import get_logger
+from ap.selector_retry_policy import (
+    DeferredMaterializationConfigConflict,
+    is_retryable_selector_reason,
+    resolve_deferred_materialization_max_attempts,
+)
 
 log = get_logger("ap.pending_trigger_classifier")
 
@@ -983,6 +988,31 @@ def _has_canonical_materialization_retry_candidate(row: dict, meta: dict) -> boo
     # outrank a trigger-ready terminal boundary.
     attempts = meta.get("materialization_attempts")
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        return False
+
+    # The due executor and OSM CAS fence use the mirrored retry counters and
+    # generation, not materialization_attempts alone.  Require the complete
+    # durable shape here so a legacy/incomplete row is left on the existing
+    # fail-closed stuck path instead of being advertised as RETRY_OWNED.
+    retry_attempt = meta.get("retry_attempt")
+    breach_attempt_count = meta.get("breach_attempt_count")
+    generation = meta.get("materialization_generation")
+    max_attempts = meta.get("retry_max_attempts")
+    counters = (retry_attempt, breach_attempt_count, generation, max_attempts)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in counters):
+        return False
+    if retry_attempt != attempts or breach_attempt_count != attempts:
+        return False
+    if generation < 1 or max_attempts < attempts:
+        return False
+    try:
+        if max_attempts != resolve_deferred_materialization_max_attempts():
+            return False
+    except (DeferredMaterializationConfigConflict, TypeError, ValueError):
+        return False
+
+    reason = str(meta.get("materialization_reason") or "").strip()
+    if not reason or not is_retryable_selector_reason(reason):
         return False
 
     next_retry_at = meta.get("materialization_next_retry_at")

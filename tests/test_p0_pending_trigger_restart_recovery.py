@@ -177,12 +177,16 @@ def _make_recovery(row_or_rows=None, *, osm=None, watcher=None, mode="paper",
     return rec, _osm
 
 
-def _retry_meta(*, next_at=None, attempts=1, reason="test_retry"):
+def _retry_meta(*, next_at=None, attempts=1, reason="PROVIDER_TIMEOUT"):
     _now = datetime.now(timezone.utc)
     return {
         _MAT_STATUS_FIELD:       "RETRY_PENDING",
         _MAT_NEXT_RETRY_AT:      next_at or (_now + timedelta(minutes=1)).isoformat(),
         _MAT_ATTEMPTS_FIELD:     attempts,
+        "materialization_generation": 1,
+        "retry_attempt": attempts,
+        "breach_attempt_count": attempts,
+        "retry_max_attempts": 5,
         _MAT_REASON_FIELD:       reason,
         _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
         _MAT_BROKER_READY:       False,
@@ -243,6 +247,7 @@ def _canonical_trigger_ready_retry_row(
             "materialization_generation": 1,
             "materialization_attempts": attempts,
             "retry_attempt": attempts,
+            "breach_attempt_count": attempts,
             "retry_max_attempts": 5,
             "materialization_next_retry_at": next_retry_at,
             "next_retry_at": next_retry_at,
@@ -439,6 +444,44 @@ class TestTriggerReadyMaterializationRetryFence:
         row["meta"][field] = value
 
         assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.STUCK_TRIGGER_READY
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("retry_attempt", None),
+            ("breach_attempt_count", 2),
+            ("materialization_generation", None),
+            ("retry_max_attempts", 4),
+        ],
+    )
+    def test_retry_authority_mirrors_missing_or_split_fail_closed(self, field, value):
+        from ap.pending_trigger_classifier import classify_pending_trigger_row
+
+        row = _canonical_trigger_ready_retry_row()
+        if value is None:
+            row["meta"].pop(field, None)
+        else:
+            row["meta"][field] = value
+
+        assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.STUCK_TRIGGER_READY
+
+    def test_unknown_materialization_reason_fails_closed(self):
+        from ap.pending_trigger_classifier import classify_pending_trigger_row
+
+        row = _canonical_trigger_ready_retry_row(reason="MADE_UP_RETRY_REASON")
+        assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.STUCK_TRIGGER_READY
+
+    def test_durable_reread_rejects_unknown_reason_and_counter_split(self):
+        row = _canonical_trigger_ready_retry_row()
+        rec, osm = _make_recovery(row, watcher=None)
+        durable = dict(row)
+        durable["meta"] = dict(row["meta"])
+        durable["meta"]["materialization_reason"] = "MADE_UP_RETRY_REASON"
+        durable["meta"]["retry_attempt"] = 2
+        osm._rows[row["local_order_id"]] = durable
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.cancel_calls == []
 
     def test_real_occ_contract_does_not_enter_deferred_retry_path(self):
         from ap.pending_trigger_classifier import classify_pending_trigger_row
