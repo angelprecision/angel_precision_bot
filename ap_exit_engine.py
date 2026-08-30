@@ -4376,6 +4376,11 @@ class APExitEngine:
                             getattr(existing, "position_id", ""),
                             getattr(pos, "option_symbol", ""),
                         )
+                        # Retain the quarantined object for audit visibility, but
+                        # retire it as an active owner before installing the
+                        # replacement durable owner.
+                        existing.closed = True
+                        existing.quantity_remaining = 0
                         continue
                     log.debug(
                         "[%s] Exit engine already tracking %s | pos_id=%s",
