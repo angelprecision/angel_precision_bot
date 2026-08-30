@@ -4362,7 +4362,13 @@ class APExitEngine:
                         same_sym
                         and not same_id
                         and _is_adoption_identity_quarantined(existing)
-                        and _incoming_is_proven_canonical
+                        and (
+                            _incoming_is_proven_canonical
+                            or (
+                                _is_broker_repair_provisional(pos)
+                                and str(getattr(existing, "position_id", "") or "").startswith("broker-repair-")
+                            )
+                        )
                     ):
                         log.warning(
                             "[exit_eng] ADD_POSITION_CANONICAL_BYPASSES_QUARANTINED_REPAIR "
