@@ -434,5 +434,16 @@ def run_reconciliation(client_id: str, broker=None, limit: int = 50) -> dict:
     except Exception:
         pass
 
+    # P0: alert-only invariant check for positions that reached a terminal
+    # CLOSED/quantity_remaining=0 state with no recorded exit economics.
+    # Never touches the broker, never mutates a position, never blocks or
+    # delays this cycle's return -- a failure here must not affect
+    # reconciliation itself. See ap/closed_position_price_audit.py.
+    try:
+        from ap import closed_position_price_audit as _cppa
+        _cppa.audit_unpriced_closures(client_id)
+    except Exception:
+        pass
+
     return {"ok": True, "client_id": client_id, "processed": processed}
 
