@@ -27,6 +27,8 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -41,7 +43,7 @@ jobs:
       - name: Validate Python syntax and patch whitespace
         run: |
           python -m compileall -q ap ap_recovery.py tests/test_p0_pending_trigger_restart_recovery.py tests/test_p0_deferred_due_retry_ownership.py
-          git diff --check HEAD^1 HEAD
+          git diff --check origin/main...HEAD
 
       - name: Apply exit decision generation migration
         env:
