@@ -1253,7 +1253,7 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
         assert reread["meta"]["restart_recovery_cls"] == (
             PendingTriggerClassification.WAITING_RETRYABLE
         )
-        assert reread["meta"]["restart_recovery_retry_subtype"] == "materialization"
+        assert reread["meta"]["restart_recovery_retry_subtype"] == "MATERIALIZATION_RETRY"
         assert reread["meta"]["restart_recovery_at"]
         assert reread["meta"]["materialization_outcome"] == (
             "RETRY_LATER_SELECTOR_BUDGET"

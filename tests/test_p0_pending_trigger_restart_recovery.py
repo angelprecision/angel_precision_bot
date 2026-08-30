@@ -444,7 +444,7 @@ class TestTriggerReadyMaterializationRetryFence:
         assert _materialization_retry_authority(durable_meta) == before_authority
         assert durable_meta["watcher_audit"] == before_watcher_audit
         assert durable_meta["restart_recovery_cls"] == PTC.WAITING_RETRYABLE
-        assert durable_meta["restart_recovery_retry_subtype"] == "materialization"
+        assert durable_meta["restart_recovery_retry_subtype"] == "MATERIALIZATION_RETRY"
         assert durable_meta["restart_recovery_at"]
 
     def test_due_canonical_retry_remains_owned_by_due_executor(self):
@@ -638,7 +638,7 @@ class TestTriggerReadyMaterializationRetryFence:
             for key in retry_fields
         } == retry_fields
         assert durable_meta["restart_recovery_cls"] == PTC.WAITING_RETRYABLE
-        assert durable_meta["restart_recovery_retry_subtype"] == "materialization"
+        assert durable_meta["restart_recovery_retry_subtype"] == "MATERIALIZATION_RETRY"
         assert durable_meta["restart_recovery_at"]
 
 
@@ -1447,7 +1447,7 @@ class TestIntegrationOrderMonitor:
         assert _materialization_retry_authority(durable_meta) == before_authority
         assert durable_meta["watcher_audit"] == before_watcher_audit
         assert durable_meta["restart_recovery_cls"] == PTC.WAITING_RETRYABLE
-        assert durable_meta["restart_recovery_retry_subtype"] == "materialization"
+        assert durable_meta["restart_recovery_retry_subtype"] == "MATERIALIZATION_RETRY"
 
     def test_canonical_rearm_observes_active_materializer_read_only(self):
         """The order-monitor consumer must preserve MATERIALIZATION_OWNED."""
