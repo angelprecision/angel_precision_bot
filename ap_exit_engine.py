@@ -3582,62 +3582,89 @@ def _converge_broker_repair_db_identity(
         return True
     try:
         from ap.db import conn, run_with_retry
-        def _converge():
+        def _converge_once():
             with conn() as cur:
-                    lock_key = f"broker-repair:{client_id}:{execution_mode}:{contract}"
+                lock_key = f"broker-repair:{client_id}:{execution_mode}:{contract}"
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
+                    (lock_key,),
+                )
+                cur.execute(
+                    """SELECT id FROM positions
+                       WHERE id = %s AND client_id = %s
+                         AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                         AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                         AND UPPER(TRIM(COALESCE(status, ''))) IN
+                             ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                         AND COALESCE(quantity_remaining, qty, 0) > 0
+                       LIMIT 1""",
+                    (provisional_id, client_id, execution_mode, contract),
+                )
+                if cur.fetchone() is None:
+                    return True
+                cur.execute(
+                    """SELECT id FROM positions
+                       WHERE id = %s AND client_id = %s
+                         AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                         AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                         AND UPPER(TRIM(COALESCE(status, ''))) IN
+                             ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                         AND COALESCE(quantity_remaining, qty, 0) > 0
+                       LIMIT 1""",
+                    (canonical_id, client_id, execution_mode, contract),
+                )
+                if cur.fetchone() is not None:
                     cur.execute(
-                        "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
-                        (lock_key,),
-                    )
-                    cur.execute(
-                        """SELECT id FROM positions
-                           WHERE id = %s AND client_id = %s
-                             AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                             AND UPPER(TRIM(COALESCE(contract, ''))) = %s
-                             AND UPPER(TRIM(COALESCE(status, ''))) IN
-                                 ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
-                             AND COALESCE(quantity_remaining, qty, 0) > 0
-                           LIMIT 1""",
-                        (provisional_id, client_id, execution_mode, contract),
-                    )
-                    if cur.fetchone() is None:
-                        return True
-                    cur.execute(
-                        """SELECT id FROM positions
-                           WHERE id = %s AND client_id = %s
-                             AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                             AND UPPER(TRIM(COALESCE(contract, ''))) = %s
-                             AND UPPER(TRIM(COALESCE(status, ''))) IN
-                                 ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
-                             AND COALESCE(quantity_remaining, qty, 0) > 0
-                           LIMIT 1""",
-                        (canonical_id, client_id, execution_mode, contract),
-                    )
-                    if cur.fetchone() is not None:
-                        cur.execute(
-                            """UPDATE positions
-                               SET status = 'CLOSED', quantity_remaining = 0,
-                                   qty = 0, updated_at = NOW()
-                               WHERE id = %s AND client_id = %s
-                                 AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                                 AND UPPER(TRIM(COALESCE(contract, ''))) = %s
-                                 AND UPPER(TRIM(COALESCE(status, ''))) IN
-                                     ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
-                                 AND COALESCE(quantity_remaining, qty, 0) > 0""",
-                            (provisional_id, client_id, execution_mode, contract),
-                        )
-                        return cur.rowcount == 1
-                    cur.execute(
-                        """UPDATE positions SET id = %s
+                        """UPDATE positions
+                           SET status = 'CLOSED', quantity_remaining = 0,
+                               qty = 0, updated_at = NOW()
                            WHERE id = %s AND client_id = %s
                              AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                              AND UPPER(TRIM(COALESCE(contract, ''))) = %s
                              AND UPPER(TRIM(COALESCE(status, ''))) IN
                                  ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
                              AND COALESCE(quantity_remaining, qty, 0) > 0""",
-                        (canonical_id, provisional_id, client_id, execution_mode, contract),
+                        (provisional_id, client_id, execution_mode, contract),
                     )
                     return cur.rowcount == 1
+                cur.execute(
+                    """UPDATE positions SET id = %s
+                       WHERE id = %s AND client_id = %s
+                         AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                         AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                         AND UPPER(TRIM(COALESCE(status, ''))) IN
+                             ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                         AND COALESCE(quantity_remaining, qty, 0) > 0""",
+                    (canonical_id, provisional_id, client_id, execution_mode, contract),
+                )
+                return cur.rowcount == 1
+
+        def _converge():
+            # A canonical writer does not need the repair advisory lock to
+            # insert B.  If it commits after the existence check but before
+            # the provisional rename, PostgreSQL raises UniqueViolation on
+            # the primary key.  The failed transaction is discarded by
+            # conn(); retry from a fresh transaction and retire A instead.
+            for attempt in range(2):
+                try:
+                    return _converge_once()
+                except Exception as exc:
+                    try:
+                        from psycopg2 import errors as _pg_errors
+                        _is_unique_violation = isinstance(
+                            exc, _pg_errors.UniqueViolation
+                        )
+                    except Exception:
+                        _is_unique_violation = (
+                            type(exc).__name__ == "UniqueViolation"
+                        )
+                    if not _is_unique_violation or attempt:
+                        raise
+                    log.warning(
+                        "[exit_eng] canonical identity arrived during provisional "
+                        "rename; retrying convergence client=%s mode=%s contract=%s",
+                        client_id, execution_mode, contract,
+                    )
         return bool(run_with_retry(_converge))
     except Exception as exc:
         log.critical(
@@ -7515,6 +7542,10 @@ class APExitEngine:
             def _remember(row_id, row: Optional[dict] = None):
                 cached = dict(row or repair_row)
                 cached["id"] = str(row_id)
+                # A conflict re-query may return a UUID row without the
+                # in-memory provenance marker.  Reapply the marker from the
+                # exact evidence selected for this broker-repair attempt.
+                cached["broker_repair_provisional"] = not bool(proven_position_id)
                 return _BrokerRepairIdentity(str(row_id), cached)
 
             def _ins():
@@ -7987,6 +8018,35 @@ class APExitEngine:
             # ── 3a. Try DB load ───────────────────────────────────────────────
             db_row = self._load_db_position_row(sym)
             if db_row:
+                # Reconstruct repair provenance after a process restart from
+                # the exact filled-ENTRY evidence.  The production positions
+                # schema has no provenance column: a canonical order linked to
+                # this row proves it is canonical; an exact fill with no
+                # position_id (or a different canonical id) proves this row
+                # is a provisional broker-repair owner.
+                try:
+                    _repair_evidence = self._find_exact_filled_entry_order(
+                        sym, self._resolved_execution_mode(), bp
+                    )
+                    if (
+                        isinstance(_repair_evidence, dict)
+                        and not _repair_evidence.get("_lookup_status")
+                    ):
+                        _db_position_id = str(db_row.get("id") or "").strip()
+                        _evidence_position_id = _broker_repair_position_id(
+                            _repair_evidence.get("position_id")
+                        )
+                        if _db_position_id:
+                            db_row["broker_repair_provisional"] = (
+                                not _evidence_position_id
+                                or _evidence_position_id != _db_position_id
+                            )
+                except Exception as _provenance_err:
+                    log.debug(
+                        "[exit_eng] broker-repair provenance recheck failed "
+                        "for %s: %s",
+                        sym, _provenance_err,
+                    )
                 db_seen          = True
                 db_status_before = db_row.get("status")
                 db_qty_before    = int(db_row.get("quantity_remaining") or 0)
