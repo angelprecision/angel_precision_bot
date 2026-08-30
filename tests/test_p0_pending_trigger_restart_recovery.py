@@ -193,6 +193,31 @@ def _retry_meta(*, next_at=None, attempts=1, reason="PROVIDER_TIMEOUT"):
     }
 
 
+_MATERIALIZATION_RETRY_AUTHORITY_FIELDS = (
+    "materialization_status",
+    "broker_ready",
+    "materialization_attempts",
+    "retry_attempt",
+    "breach_attempt_count",
+    "materialization_generation",
+    "retry_max_attempts",
+    "materialization_next_retry_at",
+    "next_retry_at",
+    "materialization_reason",
+    "materialization_last_failure_at",
+    "materialization_outcome",
+    "retry_owner",
+    "current_owner",
+)
+
+
+def _materialization_retry_authority(meta: dict) -> dict:
+    return {
+        key: meta.get(key)
+        for key in _MATERIALIZATION_RETRY_AUTHORITY_FIELDS
+    }
+
+
 def _restart_rearm_meta(*, next_at=None, deadline=None, attempts=1,
                         owner="restart_rearm:client@test.com:paper:test-oid",
                         reason="quote_unavailable"):
@@ -406,6 +431,8 @@ class TestTriggerReadyMaterializationRetryFence:
         from ap.pending_trigger_classifier import classify_pending_trigger_row
 
         row = _canonical_trigger_ready_retry_row(reason=reason, outcome=outcome)
+        before_authority = _materialization_retry_authority(row["meta"])
+        before_watcher_audit = dict(row["meta"]["watcher_audit"])
         assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.WAITING_RETRYABLE
 
         rec, osm = _make_recovery(row, watcher=None)
@@ -413,6 +440,12 @@ class TestTriggerReadyMaterializationRetryFence:
 
         assert recovery_outcome == _RowOutcome.RETRY_OWNED
         assert osm.cancel_calls == []
+        durable_meta = osm._rows[row["local_order_id"]]["meta"]
+        assert _materialization_retry_authority(durable_meta) == before_authority
+        assert durable_meta["watcher_audit"] == before_watcher_audit
+        assert durable_meta["restart_recovery_cls"] == PTC.WAITING_RETRYABLE
+        assert durable_meta["restart_recovery_retry_subtype"] == "materialization"
+        assert durable_meta["restart_recovery_at"]
 
     def test_due_canonical_retry_remains_owned_by_due_executor(self):
         """Due timing does not let pending-trigger recovery terminalize the retry."""
@@ -434,6 +467,7 @@ class TestTriggerReadyMaterializationRetryFence:
             ("materialization_attempts", True),
             ("materialization_attempts", "1"),
             ("broker_ready", "false"),
+            ("materialization", "corrupt-nested-authority"),
         ],
     )
     def test_malformed_retry_shape_does_not_outrank_trigger_ready(self, field, value):
@@ -478,6 +512,17 @@ class TestTriggerReadyMaterializationRetryFence:
         durable["meta"] = dict(row["meta"])
         durable["meta"]["materialization_reason"] = "MADE_UP_RETRY_REASON"
         durable["meta"]["retry_attempt"] = 2
+        osm._rows[row["local_order_id"]] = durable
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.cancel_calls == []
+
+    def test_durable_reread_rejects_malformed_nested_materialization(self):
+        row = _canonical_trigger_ready_retry_row()
+        rec, osm = _make_recovery(row, watcher=None)
+        durable = dict(row)
+        durable["meta"] = dict(row["meta"])
+        durable["meta"]["materialization"] = ["corrupt"]
         osm._rows[row["local_order_id"]] = durable
 
         assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
@@ -573,18 +618,28 @@ class TestTriggerReadyMaterializationRetryFence:
             )
         }
         rec, osm = _make_recovery(row, watcher=None)
-        before_meta = dict(osm._rows[row["local_order_id"]]["meta"])
+        before_authority = _materialization_retry_authority(
+            osm._rows[row["local_order_id"]]["meta"]
+        )
+        before_watcher_audit = dict(
+            osm._rows[row["local_order_id"]]["meta"]["watcher_audit"]
+        )
 
         assert [rec.recover_one_row(row) for _ in range(2)] == [
             _RowOutcome.RETRY_OWNED,
             _RowOutcome.RETRY_OWNED,
         ]
         assert osm.cancel_calls == []
-        assert osm._rows[row["local_order_id"]]["meta"] == before_meta
+        durable_meta = osm._rows[row["local_order_id"]]["meta"]
+        assert _materialization_retry_authority(durable_meta) == before_authority
+        assert durable_meta["watcher_audit"] == before_watcher_audit
         assert {
-            key: osm._rows[row["local_order_id"]]["meta"][key]
+            key: durable_meta[key]
             for key in retry_fields
         } == retry_fields
+        assert durable_meta["restart_recovery_cls"] == PTC.WAITING_RETRYABLE
+        assert durable_meta["restart_recovery_retry_subtype"] == "materialization"
+        assert durable_meta["restart_recovery_at"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1364,7 +1419,12 @@ class TestIntegrationOrderMonitor:
         row = _canonical_trigger_ready_retry_row()
         osm = _MockOSM()
         osm.seed(row)
-        before_meta = dict(osm._rows[row["local_order_id"]]["meta"])
+        before_authority = _materialization_retry_authority(
+            osm._rows[row["local_order_id"]]["meta"]
+        )
+        before_watcher_audit = dict(
+            osm._rows[row["local_order_id"]]["meta"]["watcher_audit"]
+        )
 
         monitor = APOrderMonitor.__new__(APOrderMonitor)
         monitor.client_id = "client@test.com"
@@ -1383,7 +1443,11 @@ class TestIntegrationOrderMonitor:
         assert (attempted, succeeded) == (True, True)
         assert reason == "canonical_recovery_retry_owned"
         assert osm.cancel_calls == []
-        assert osm._rows[row["local_order_id"]]["meta"] == before_meta
+        durable_meta = osm._rows[row["local_order_id"]]["meta"]
+        assert _materialization_retry_authority(durable_meta) == before_authority
+        assert durable_meta["watcher_audit"] == before_watcher_audit
+        assert durable_meta["restart_recovery_cls"] == PTC.WAITING_RETRYABLE
+        assert durable_meta["restart_recovery_retry_subtype"] == "materialization"
 
     def test_canonical_rearm_observes_active_materializer_read_only(self):
         """The order-monitor consumer must preserve MATERIALIZATION_OWNED."""

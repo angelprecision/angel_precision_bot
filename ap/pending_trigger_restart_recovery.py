@@ -76,8 +76,10 @@ _TERMINAL_MATERIALIZATION_OUTCOMES = frozenset({
     "FAILED_TERMINAL",
 })
 
-# #323 canonical materialization retry fields — exact shape from ap/deferred_materializer.stamp_retry_pending()
-# DO NOT invent fields not present in that function.
+# Active production materialization-retry authority is written atomically by
+# APOrderStateMachine.schedule_deferred_materialization_retry(). Repository-wide
+# production search found no caller of the legacy stamp_retry_pending() helper.
+# These mirrors are consumed by APRecovery and the OSM generation/attempt CAS.
 _MAT_STATUS_FIELD        = "materialization_status"      # "RETRY_PENDING"
 _MAT_NEXT_RETRY_AT       = "materialization_next_retry_at"
 _MAT_ATTEMPTS_FIELD      = "materialization_attempts"    # int — canonical attempt counter
@@ -602,6 +604,10 @@ class PendingTriggerRestartRecovery:
             proof = self._verify_materialization_retry_ownership(local_oid, row)
             if proof is not None:
                 self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
+                self._safe_meta_update(local_oid, {
+                    "restart_recovery_cls": PTC.ORPHAN_NO_WATCHER,
+                    "restart_recovery_at":  _now_iso(),
+                })
                 return _RowOutcome.RETRY_OWNED
             log.critical(
                 "RESTART_RECOVERY_ORPHAN_RETRY_OWNERSHIP_UNPROVEN local=%s — UNRESOLVED",
@@ -629,6 +635,11 @@ class PendingTriggerRestartRecovery:
             if proof is not None:
                 self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
                 log.info("RESTART_RECOVERY_MATERIALIZATION_RETRY_OWNED local=%s proof=%s", local_oid, proof)
+                self._safe_meta_update(local_oid, {
+                    "restart_recovery_cls": PTC.WAITING_RETRYABLE,
+                    "restart_recovery_retry_subtype": _RETRY_MATERIALIZATION,
+                    "restart_recovery_at": _now_iso(),
+                })
                 return _RowOutcome.RETRY_OWNED
             self._mark_failure(local_oid, "retry_verification:materialization")
             log.critical("RESTART_RECOVERY_MATERIALIZATION_RETRY_UNPROVEN local=%s", local_oid)
@@ -892,21 +903,12 @@ class PendingTriggerRestartRecovery:
     # ── Canonical retry ownership (#323 fields) ────────────────────────────────
 
     def _enter_canonical_retry(self, local_oid: str, row: dict, *, reason: str) -> str:
-        """
-        Fix 1: write the exact fields that ap/deferred_materializer.stamp_retry_pending()
-        writes so the deployed #323 consumer can see and process the row.
+        """Persist the active OSM-compatible retry authority shape.
 
-        Real canonical schema (from stamp_retry_pending):
-          materialization_status          = "RETRY_PENDING"
-          broker_ready                    = False
-          materialization_attempts        = int
-          materialization_next_retry_at   = isoformat
-          materialization_reason          = str
-          materialization_last_failure_at = isoformat
-
-        Removed: materialization_owner, materialization_retry_deadline,
-                 materialization_attempt_count, materialization_retry_reason
-                 (none of these exist in stamp_retry_pending).
+        This legacy recovery writer currently has no production caller, but if
+        reactivated it must emit the same typed attempt mirrors, generation, and
+        maximum-attempt authority consumed by APRecovery and the OSM CAS. It
+        deliberately does not create a second owner or retry scheduler.
         """
         _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
         try:
@@ -1104,15 +1106,13 @@ class PendingTriggerRestartRecovery:
         expected_next_at: str = "",
         expected_attempts: int = 0,
     ) -> "dict | None":
-        """
-        Fix 1: prove canonical #323 retry ownership using the real stamp_retry_pending fields.
+        """Prove active OSM retry ownership from an exact durable reread.
 
-        Required fields: materialization_status=RETRY_PENDING, broker_ready=False,
-          materialization_attempts (int >= 1), materialization_next_retry_at,
-          materialization_reason, materialization_last_failure_at.
-
-        Removed: materialization_owner, materialization_retry_deadline,
-                 materialization_attempt_count, materialization_retry_reason.
+        The production handoff writes RETRY_PENDING, literal broker_ready=False,
+        coherent typed attempt mirrors, generation, configured maximum, schedule,
+        retry reason, last-failure timestamp, and retry-later outcome. Partial,
+        legacy-only, or malformed shapes are not executable retry authority and
+        fail closed without terminalization from this verifier.
         """
         get_fn = getattr(self.osm, "get_order", None)
         if not callable(get_fn):
@@ -1149,13 +1149,15 @@ class PendingTriggerRestartRecovery:
             return None
 
         meta = _extract_meta(reread)
+        nested_materialization = meta.get("materialization")
+        if nested_materialization is not None and not isinstance(
+            nested_materialization, dict
+        ):
+            return None
         # The classifier inspects every persisted outcome surface; the durable
         # reread must apply the same authority rule, including nested legacy
         # materialization payloads.
-        for _surface in (
-            meta,
-            meta.get("materialization") if isinstance(meta.get("materialization"), dict) else {},
-        ):
+        for _surface in (meta, nested_materialization or {}):
             for _key in ("materialization_outcome", "outcome"):
                 _outcome = str(_surface.get(_key) or "").strip().upper()
                 if _outcome and _outcome not in {

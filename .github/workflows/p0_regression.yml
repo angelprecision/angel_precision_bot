@@ -42,8 +42,27 @@ jobs:
 
       - name: Validate Python syntax and patch whitespace
         run: |
-          python -m compileall -q ap ap_recovery.py tests/test_p0_pending_trigger_restart_recovery.py tests/test_p0_deferred_due_retry_ownership.py
+          python -m compileall -q ap ap_recovery.py tests/test_p0_pending_trigger_restart_recovery.py tests/test_p0_deferred_due_retry_ownership.py tests/test_p1_pr528_fail_first_replay.py
           git diff --check origin/main...HEAD
+
+      - name: Prove PR 528 base failure and corrected head behavior
+        env:
+          PR528_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python -m pytest -q tests/test_p1_pr528_fail_first_replay.py
+          if [ -n "$PR528_BASE_SHA" ]; then
+            base_dir="${RUNNER_TEMP}/pr528-base"
+            git worktree add --detach "$base_dir" "$PR528_BASE_SHA"
+            cleanup_worktree() {
+              git worktree remove --force "$base_dir" >/dev/null 2>&1 || true
+            }
+            trap cleanup_worktree EXIT
+            cp tests/test_p1_pr528_fail_first_replay.py "$base_dir/tests/"
+            (
+              cd "$base_dir"
+              PR528_EXPECT_BASE=1 python -m pytest -q                 tests/test_p1_pr528_fail_first_replay.py
+            )
+          fi
 
       - name: Apply exit decision generation migration
         env:

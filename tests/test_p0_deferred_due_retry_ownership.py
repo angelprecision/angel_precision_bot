@@ -1121,6 +1121,7 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
                 "local_order_id": local_order_id,
             },
             "trigger_price": 61.0,
+            "watcher_audit": {"reason_code": "trigger_ready"},
         }
         with _pg_conn() as c:
             c.execute(
@@ -1197,6 +1198,30 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
         assert row["local_order_id"] == local_order_id
         assert row["status"] == "PENDING_TRIGGER"
 
+        retry_authority_keys = (
+            "lifecycle_state",
+            "materialization_status",
+            "materialization_in_flight",
+            "materialization_owner",
+            "materialization_generation",
+            "retry_attempt",
+            "breach_attempt_count",
+            "materialization_attempts",
+            "retry_max_attempts",
+            "materialization_next_retry_at",
+            "next_retry_at",
+            "materialization_reason",
+            "materialization_last_failure_at",
+            "materialization_outcome",
+            "retry_owner",
+            "current_owner",
+            "broker_ready",
+        )
+        before_retry_authority = {
+            key: meta.get(key)
+            for key in retry_authority_keys
+        }
+
         classification = classify_pending_trigger_row(
             row,
             watcher_owned=None,
@@ -1220,6 +1245,16 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
 
         reread = osm.get_order(local_order_id)
         assert reread["status"] == "PENDING_TRIGGER"
+        assert {
+            key: reread["meta"].get(key)
+            for key in retry_authority_keys
+        } == before_retry_authority
+        assert reread["meta"]["watcher_audit"]["reason_code"] == "trigger_ready"
+        assert reread["meta"]["restart_recovery_cls"] == (
+            PendingTriggerClassification.WAITING_RETRYABLE
+        )
+        assert reread["meta"]["restart_recovery_retry_subtype"] == "materialization"
+        assert reread["meta"]["restart_recovery_at"]
         assert reread["meta"]["materialization_outcome"] == (
             "RETRY_LATER_SELECTOR_BUDGET"
         )

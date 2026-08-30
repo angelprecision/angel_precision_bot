@@ -6,6 +6,39 @@
 
 Created: 2026-08-27
 
+## Implementation-base writer resolution — 2026-08-30
+
+The writer assumption captured at spec creation is historical. A full production
+tree search on the rebased implementation base found no caller of
+`ap.deferred_materializer.stamp_retry_pending()`; only its definition and
+documentation references remain.
+
+The active production `RUNNING -> RETRY_PENDING` handoff is:
+
+```text
+APExecutionCore
+-> APOrderStateMachine.schedule_deferred_materialization_retry()
+-> one fenced PostgreSQL JSONB merge
+```
+
+It atomically writes `RETRY_WAIT`, literal `broker_ready=false`, clears active
+owner/lease fields, and persists matching `retry_attempt`,
+`breach_attempt_count`, `materialization_attempts`,
+`materialization_generation`, and `retry_max_attempts`. Those mirrors are
+consumed by APRecovery and the OSM retry-claim CAS. A six-field legacy-only or
+partially mirrored row is not executable retry authority and must fail closed.
+
+The merge gate therefore requires the real OSM writer transition, including
+`watcher_audit.reason_code=trigger_ready`, to survive classifier and durable
+restart recovery without terminalization, owner replacement, attempt drift,
+broker calls, or loss of restart-recovery diagnostics. CI also replays the same
+fixture against the exact PR base SHA and proves the original
+`STUCK_TRIGGER_READY -> terminal/cancel` action path before proving the fixed
+head behavior.
+
+This resolution supersedes references below that call the legacy helper the
+current production writer; those sections remain as the original defect record.
+
 Reference `main` at creation:
 
 ```text

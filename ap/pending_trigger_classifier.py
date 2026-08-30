@@ -944,13 +944,24 @@ def _has_canonical_materialization_retry_candidate(row: dict, meta: dict) -> boo
     contract, attempt bounds, and the durable row before returning
     ``RETRY_OWNED``.
 
-    Active materializer fields are not used as retry proof.  The legacy
-    ``stamp_retry_pending`` writer can leave those fields behind, while the
-    current OSM retry handoff clears them atomically.  In either shape,
+    Active materializer fields are not used as retry proof. The active
+    ``APOrderStateMachine.schedule_deferred_materialization_retry`` handoff
+    clears them atomically and writes the mirrored counters/generation consumed
+    by startup recovery and the retry CAS. The legacy ``stamp_retry_pending``
+    helper has no production call site and is not executable retry authority.
     ``materialization_status=RETRY_PENDING`` remains distinct from the #521
     ``RUNNING`` proof.
     """
     if not isinstance(row, dict) or not isinstance(meta, dict):
+        return False
+
+    # The active OSM writer persists retry authority at the top level and may
+    # carry an optional nested materialization diagnostics mapping. A malformed
+    # nested container is durable corruption, not an absent legacy surface.
+    nested_materialization = meta.get("materialization")
+    if nested_materialization is not None and not isinstance(
+        nested_materialization, dict
+    ):
         return False
 
     if str(meta.get("materialization_status") or "").strip().upper() != "RETRY_PENDING":
