@@ -173,7 +173,7 @@ def test_pr528_exact_base_terminalizes_and_head_preserves_retry():
         assert osm.row["meta"]["restart_recovery_cls"] == PTC.WAITING_RETRYABLE
         assert (
             osm.row["meta"]["restart_recovery_retry_subtype"]
-            == "materialization"
+            == "MATERIALIZATION_RETRY"
         )
         assert osm.row["meta"]["restart_recovery_at"]
 
