@@ -1016,10 +1016,16 @@ def _has_canonical_materialization_retry_candidate(row: dict, meta: dict) -> boo
         return False
     if generation < 1 or max_attempts < attempts:
         return False
+    # The persisted row ceiling and the current live ceiling are
+    # independent authorities. A config change must not invalidate an
+    # otherwise coherent in-flight row merely because its stored max was
+    # written under the prior value. The effective ceiling is the lower of
+    # the two; the due executor applies the same hard live ceiling.
     try:
-        if max_attempts != resolve_deferred_materialization_max_attempts():
-            return False
+        live_max_attempts = resolve_deferred_materialization_max_attempts()
     except (DeferredMaterializationConfigConflict, TypeError, ValueError):
+        return False
+    if attempts > live_max_attempts:
         return False
 
     reason = str(meta.get("materialization_reason") or "").strip()

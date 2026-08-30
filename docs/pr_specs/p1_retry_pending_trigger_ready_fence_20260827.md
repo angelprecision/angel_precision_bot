@@ -531,6 +531,15 @@ reason non-empty
 
 Prefer keeping this verifier the post-classification authority.
 
+### Retry maximum changes during a live session
+
+retry_max_attempts is the persisted ceiling for the row and the current
+canonical environment resolver is the live hard ceiling. They are not required
+to be equal. Recovery accepts a coherent row when its attempt is within both
+ceilings, effectively attempts <= min(stored_max, live_max). A changed
+environment value must therefore not invalidate an otherwise valid in-flight
+retry solely because the stored maximum came from the prior configuration.
+Malformed or conflicting environment configuration still fails closed loudly.
 If #521 or later merged work has changed canonical durable mode resolution, generation fencing, or row shape, rebase first and use the merged canonical contract. Do not freeze this spec's snapshot over newer authoritative code.
 
 ---

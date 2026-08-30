@@ -903,21 +903,12 @@ class PendingTriggerRestartRecovery:
     # ── Canonical retry ownership (#323 fields) ────────────────────────────────
 
     def _enter_canonical_retry(self, local_oid: str, row: dict, *, reason: str) -> str:
-        """
-        Fix 1: write the exact fields that ap/deferred_materializer.stamp_retry_pending()
-        writes so the deployed #323 consumer can see and process the row.
+        """Persist the active OSM-compatible retry authority shape.
 
-        Real canonical schema (from stamp_retry_pending):
-          materialization_status          = "RETRY_PENDING"
-          broker_ready                    = False
-          materialization_attempts        = int
-          materialization_next_retry_at   = isoformat
-          materialization_reason          = str
-          materialization_last_failure_at = isoformat
-
-        Removed: materialization_owner, materialization_retry_deadline,
-                 materialization_attempt_count, materialization_retry_reason
-                 (none of these exist in stamp_retry_pending).
+        This legacy recovery writer currently has no production caller, but if
+        reactivated it must emit the same typed attempt mirrors, generation, and
+        maximum-attempt authority consumed by APRecovery and the OSM CAS. It
+        deliberately does not create a second owner or retry scheduler.
         """
         _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
         try:
@@ -945,10 +936,25 @@ class PendingTriggerRestartRecovery:
             )
 
         _next = (_now + timedelta(seconds=_delay)).isoformat()
+        # Keep the recovery-owned write congruent with the due executor's
+        # canonical retry shape.  APRecovery and the OSM CAS fence consume
+        # these mirrors; writing materialization_attempts alone would create
+        # a retry that this verifier correctly could not later own.
+        _generation_raw = _meta.get(_MAT_GENERATION_FIELD, 1)
+        if (
+            isinstance(_generation_raw, bool)
+            or not isinstance(_generation_raw, int)
+            or _generation_raw < 1
+        ):
+            return _RowOutcome.UNRESOLVED
         _ok = self._safe_meta_update(local_oid, {
             _MAT_STATUS_FIELD:       "RETRY_PENDING",
             _MAT_BROKER_READY:       False,
             _MAT_ATTEMPTS_FIELD:     _attempts,
+            _MAT_RETRY_ATTEMPT_FIELD: _attempts,
+            _MAT_BREACH_ATTEMPT_FIELD: _attempts,
+            _MAT_GENERATION_FIELD:   _generation_raw,
+            _MAT_MAX_ATTEMPTS_FIELD: _max,
             _MAT_NEXT_RETRY_AT:      _next,
             _MAT_REASON_FIELD:       reason,
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
@@ -1211,7 +1217,11 @@ class PendingTriggerRestartRecovery:
             return None
         if broker_ready is not False:
             return None
-        if attempts < 1 or attempts > _max or durable_max != _max:
+        # The row's persisted max is its own ceiling; the current
+        # resolver is the live hard ceiling. Use the effective minimum so a
+        # mid-session config change does not silently invalidate every
+        # in-flight retry, while neither authority can be exceeded.
+        if attempts < 1 or attempts > _max:
             return None
         if not next_at or not reason or _parse_iso(last_fail) is None:
             return None

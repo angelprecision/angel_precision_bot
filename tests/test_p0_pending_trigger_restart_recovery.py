@@ -447,6 +447,27 @@ class TestTriggerReadyMaterializationRetryFence:
         assert durable_meta["restart_recovery_retry_subtype"] == "MATERIALIZATION_RETRY"
         assert durable_meta["restart_recovery_at"]
 
+    @pytest.mark.parametrize(
+        "stored_max,live_max",
+        [(3, 5), (5, 3)],
+    )
+    def test_config_change_keeps_inflight_retry_valid(self, monkeypatch, stored_max, live_max):
+        """Persisted and live retry ceilings may differ without canceling a
+        coherent in-flight retry; the effective ceiling is min(stored, live)."""
+        monkeypatch.delenv("MAX_BREACH_SELECTOR_RETRIES", raising=False)
+        monkeypatch.delenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", raising=False)
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", str(live_max))
+
+        row = _canonical_trigger_ready_retry_row()
+        row["meta"]["retry_max_attempts"] = stored_max
+
+        assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.WAITING_RETRYABLE
+
+        rec, osm = _make_recovery(row, watcher=None)
+        assert rec.recover_one_row(row) == _RowOutcome.RETRY_OWNED
+        assert osm.cancel_calls == []
+        assert osm._rows[row["local_order_id"]]["status"] == "PENDING_TRIGGER"
+
     def test_due_canonical_retry_remains_owned_by_due_executor(self):
         """Due timing does not let pending-trigger recovery terminalize the retry."""
         due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
@@ -997,6 +1018,29 @@ class TestBlocker2UnresolvedAddsToOwnerless:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestBlocker3CanonicalRetryFields:
+    def test_enter_canonical_retry_writes_323_fields(self):
+        """_enter_canonical_retry must write the exact fields the #323 consumer reads."""
+        r = _row(meta={"trigger_price": 450.0})
+        r["contract"] = "DEFERRED:SPY"
+        rec, osm = _make_recovery(r)
+        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="PROVIDER_TIMEOUT")
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
+        assert all_meta.get(_MAT_STATUS_FIELD) == "RETRY_PENDING"
+        assert all_meta.get(_MAT_NEXT_RETRY_AT) is not None
+        # _MAT_RETRY_DEADLINE was removed — real stamp_retry_pending has no deadline field
+        assert isinstance(all_meta.get(_MAT_ATTEMPTS_FIELD), int)
+        assert all_meta.get(_MAT_REASON_FIELD)                        # reason written
+        assert all_meta.get(_MAT_LAST_FAILURE_FIELD)                   # last_failure_at written
+        assert all_meta.get(_MAT_BROKER_READY) is False               # broker_ready=False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Blocker 4 — registry proof rejects weak ownership
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBlocker4RegistryProof:
     def test_quarantined_watcher_rejected(self):
         r = _row()
         watcher = _MockWatcher(watch_returns=True)
@@ -1517,9 +1561,41 @@ class TestIntegrationOrderMonitor:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestAmendment10Required:
-    """Focused regression tests for identity and fail-closed recovery."""
+    """10 tests required by the final amendment review."""
 
     # 1. Real stamp_retry_pending fields written, no invented ones ─────────────
+
+    def test_enter_canonical_retry_only_writes_real_stamp_fields(self):
+        """_enter_canonical_retry must write exactly the fields stamp_retry_pending writes.
+        Must NOT write: materialization_owner, materialization_retry_deadline,
+        materialization_attempt_count, materialization_retry_reason."""
+        r = _row(meta={"trigger_price": 450.0})
+        r["contract"] = "DEFERRED:SPY"
+        rec, osm = _make_recovery(r)
+        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="PROVIDER_TIMEOUT")
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
+
+        # Real fields must be present
+        assert all_meta.get(_MAT_STATUS_FIELD) == "RETRY_PENDING"
+        assert all_meta.get(_MAT_BROKER_READY) is False
+        assert isinstance(all_meta.get(_MAT_ATTEMPTS_FIELD), int)
+        assert all_meta.get(_MAT_NEXT_RETRY_AT)
+        assert all_meta.get(_MAT_REASON_FIELD) == "PROVIDER_TIMEOUT"
+        assert all_meta.get(_MAT_LAST_FAILURE_FIELD)
+
+        # Invented fields must NOT be present
+        assert "materialization_owner" not in all_meta, \
+            "materialization_owner is not a real stamp_retry_pending field"
+        assert "materialization_retry_deadline" not in all_meta, \
+            "materialization_retry_deadline is not a real stamp_retry_pending field"
+        assert "materialization_attempt_count" not in all_meta, \
+            "materialization_attempt_count is not a real stamp_retry_pending field"
+        assert "materialization_retry_reason" not in all_meta, \
+            "materialization_retry_reason is not a real stamp_retry_pending field"
+
+    # 2. broker_ready=False required for RETRY_PENDING proof ──────────────────
 
     def test_verify_materialization_retry_rejects_broker_ready_true(self):
         """stamp_retry_pending always sets broker_ready=False.
@@ -1575,6 +1651,27 @@ class TestAmendment10Required:
         assert proof is None, "Non-DEFERRED contract must fail materialization retry proof"
 
     # 4. DEFERRED_MATERIALIZATION_MAX_ATTEMPTS env var respected ──────────────
+
+    def test_enter_canonical_retry_respects_max_attempts_env(self):
+        """Retry exhaustion uses DEFERRED_MATERIALIZATION_MAX_ATTEMPTS, not a
+        PR #328-invented env var."""
+        import os as _os
+        _os.environ["DEFERRED_MATERIALIZATION_MAX_ATTEMPTS"] = "1"
+        try:
+            osm = _MockOSM()
+            r = _row(meta={"trigger_price": 450.0, _MAT_ATTEMPTS_FIELD: 1})
+            osm.seed(r)
+            rec, _ = _make_recovery(r, osm=osm)
+            outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="exhausted")
+            # attempts=1 + 1 = 2 > max=1 → terminalize
+            assert outcome == _RowOutcome.TERMINALIZED, (
+                f"Retry exhaustion (attempts > DEFERRED_MATERIALIZATION_MAX_ATTEMPTS) "
+                f"must terminalize; got {outcome}"
+            )
+        finally:
+            _os.environ.pop("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", None)
+
+    # 5. Fix 2: _check_watcher_owns is row-aware ──────────────────────────────
 
     def test_check_watcher_owns_rejects_wrong_client_in_registry(self):
         """Fix 3: _check_watcher_owns must return False (not None or True)
@@ -1655,6 +1752,55 @@ class TestAmendment10Required:
             "Reread row with blank local_order_id must be UNRESOLVED "
             "(Fix 4: strict oid check)"
         )
+
+    # 8. _enter_canonical_retry proof agrees on next_at and attempts ──────────
+
+    def test_canonical_retry_proof_matches_written_fields(self):
+        """Proof from _verify_materialization_retry_ownership must agree with
+        the exact values written by _enter_canonical_retry."""
+        r = _row(meta={"trigger_price": 450.0})
+        r["contract"] = "DEFERRED:SPY"
+        rec, osm = _make_recovery(r)
+        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="PROVIDER_TIMEOUT")
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
+        written_next = all_meta.get(_MAT_NEXT_RETRY_AT)
+        written_attempts = all_meta.get(_MAT_ATTEMPTS_FIELD)
+
+        # Run proof independently and verify it sees the same values
+        proof = rec._verify_materialization_retry_ownership(
+            r["local_order_id"], r,
+            expected_next_at=written_next,
+            expected_attempts=written_attempts,
+        )
+        assert proof is not None, "Proof must accept the values written by _enter_canonical_retry"
+        assert proof["materialization_next_retry_at"] == written_next
+        assert proof["materialization_attempts"] == written_attempts
+
+    # 9. Consumer visibility: RETRY_PENDING + broker_ready=False queried ──────
+
+    def test_canonical_retry_fields_visible_to_223_consumer_query(self):
+        """The #323 deferred materializer worker queries:
+           materialization_status = 'RETRY_PENDING'
+           broker_ready = false
+           materialization_next_retry_at is due
+        Verify written fields satisfy that query shape."""
+        r = _row(meta={"trigger_price": 450.0})
+        rec, osm = _make_recovery(r)
+        rec._enter_canonical_retry(r["local_order_id"], r, reason="provider_timeout")
+
+        all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
+        assert all_meta.get(_MAT_STATUS_FIELD) == "RETRY_PENDING", \
+            f"Consumer queries materialization_status; got {all_meta.get(_MAT_STATUS_FIELD)}"
+        assert all_meta.get(_MAT_BROKER_READY) is False, \
+            f"Consumer filters broker_ready=false; got {all_meta.get(_MAT_BROKER_READY)}"
+        assert all_meta.get(_MAT_NEXT_RETRY_AT), \
+            "Consumer queries materialization_next_retry_at; field missing"
+        assert all_meta.get(_MAT_REASON_FIELD), \
+            "Consumer stores materialization_reason; field missing"
+
+    # 10. row-aware _check_watcher_owns vs None-returning on absent watcher ───
 
     def test_check_watcher_owns_returns_none_when_watcher_unavailable(self):
         """_check_watcher_owns must return None (not False) when entry_watcher=None."""
