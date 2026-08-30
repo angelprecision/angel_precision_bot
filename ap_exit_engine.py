@@ -3583,8 +3583,7 @@ def _converge_broker_repair_db_identity(
     try:
         from ap.db import conn, run_with_retry
         def _converge():
-            with conn() as db:
-                with db.cursor() as cur:
+            with conn() as cur:
                     lock_key = f"broker-repair:{client_id}:{execution_mode}:{contract}"
                     cur.execute(
                         "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
@@ -7744,9 +7743,22 @@ class APExitEngine:
             opened_at        = opened_at or _now,
         )
         for _identity_attr in ("entry_local_order_id", "entry_broker_order_id"):
+            _persisted_attr = _identity_attr.replace("entry_", "", 1)
             _identity_value = row.get(_identity_attr)
+            if _identity_value in (None, ""):
+                _identity_value = row.get(_persisted_attr)
             if _identity_value not in (None, ""):
-                setattr(mp, _identity_attr, str(_identity_value).strip())
+                _normalized_identity = str(_identity_value).strip()
+                if _normalized_identity.lower() not in {
+                    "none", "null", "nan", "unknown", "n/a", "unavailable",
+                }:
+                    setattr(mp, _identity_attr, _normalized_identity)
+        if bool(row.get("broker_repair_provisional")) or (
+            str(row.get("broker_repair_provenance") or "").strip().lower()
+            == "broker_recovery"
+        ):
+            mp.broker_repair_provisional = True
+            mp.brokerrepairprovisional = True
 
         if historical_geometry_malformed:
             _mark_adoption_identity_quarantined(
