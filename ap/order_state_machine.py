@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -56,6 +57,17 @@ from typing import Optional
 from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.db import conn, run_with_retry
 from ap.exit_safety import (
+    _ACTIVE_BROKER_SELL_STATUSES,
+    _TERMINAL_BROKER_ORDER_STATUSES,
+    _declared_broker_capability,
+    _extract_broker_account_id,
+    _exact_order_contract,
+    _order_account_issue,
+    _order_class_issue,
+    _order_id_evidence,
+    _order_quantity_evidence,
+    _order_status,
+    _order_type_evidence,
     alert_exit_submission_halted,
     evaluate_exit_submission_safety,
     resolve_protective_exit_takeover,
@@ -2357,11 +2369,13 @@ class APOrderStateMachine:
         qty: int,
         payload_hash: str,
         broker_submit_key: str,
+        order_type: str | None = None,
     ) -> bool:
         """Fence one exact EXIT_REQUESTED row before any broker POST."""
         mode = str(execution_mode or "").strip().lower()
         submit_key = canonical_broker_submit_key(broker_submit_key)
         payload_hash = str(payload_hash or "").strip()
+        durable_order_type = str(order_type or "").strip().lower()
         if (
             mode not in {"live", "paper"}
             or not submit_key
@@ -2369,15 +2383,25 @@ class APOrderStateMachine:
             or not isinstance(qty, int)
             or isinstance(qty, bool)
             or qty <= 0
+            or (
+                durable_order_type
+                and durable_order_type not in {"limit", "market"}
+            )
         ):
             return False
-        patch = json.dumps({
+        intent_patch = {
             "lifecycle_state": "SUBMITTING",
             "submit_intent_at": now_utc_iso(),
             "broker_submit_key": submit_key,
             "broker_submit_payload_hash": payload_hash,
             "current_owner": f"broker_submit:{submit_key}",
-        })
+        }
+        if durable_order_type:
+            # Preserve the exact broker payload identity across a restart;
+            # a market EXIT may legitimately carry a positive quote-derived
+            # limit_price in the durable row.
+            intent_patch["order_type"] = durable_order_type
+        patch = json.dumps(intent_patch)
 
         def _persist():
             with conn() as c:
@@ -2472,6 +2496,639 @@ class APOrderStateMachine:
             log.warning(
                 "[%s] rewrite_exit_submit_intent_payload failed order=%s: %s",
                 self.client_id, local_order_id, exc,
+            )
+            return False
+
+    @staticmethod
+    def _coerce_json_object(value) -> tuple[dict, bool]:
+        """Return one JSON object and whether the durable value parsed cleanly."""
+        if value is None:
+            return {}, True
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return {}, False
+        if not isinstance(value, dict):
+            return {}, False
+        return dict(value), True
+
+    def _build_exit_submit_payload(
+        self,
+        *,
+        symbol: str,
+        contract: str,
+        qty: int,
+        limit_price,
+        order_type: str,
+        local_order_id: str,
+    ) -> dict | None:
+        """Build the one canonical EXIT payload used by submit and recovery."""
+        try:
+            lp = float(limit_price or 0)
+        except (TypeError, ValueError):
+            return None
+        is_market = (order_type == "market") or (lp <= 0 and order_type != "limit")
+        if lp <= 0 and not is_market:
+            return None
+        underlying = self._resolve_underlying_symbol(
+            symbol=symbol,
+            contract=contract,
+        )
+        payload = {
+            "class": "option",
+            "symbol": underlying,
+            "option_symbol": contract,
+            "side": "sell_to_close",
+            "quantity": int(qty),
+            "type": "market" if is_market else "limit",
+            "duration": "day",
+            "tag": canonical_broker_submit_key(local_order_id),
+        }
+        if not is_market:
+            payload["price"] = round(lp, 2)
+        return payload
+
+    @staticmethod
+    def _canonical_exit_order_identity_issue(
+        raw: dict,
+        *,
+        target_contract: str,
+        account: str,
+        expected_qty: int,
+        expected_payload: dict | None = None,
+    ) -> str | None:
+        """Validate one exact broker row before adopting canonical EXIT ownership."""
+        if not isinstance(raw, dict):
+            return "broker_order_row_malformed"
+
+        observed_id, id_issue = _order_id_evidence(raw)
+        if id_issue or not observed_id:
+            return id_issue or "broker_order_id_unproven"
+
+        status, status_issue = _order_status(raw)
+        if status_issue:
+            return status_issue
+        if status not in (_ACTIVE_BROKER_SELL_STATUSES | _TERMINAL_BROKER_ORDER_STATUSES):
+            return "broker_order_status_unproven"
+
+        account_issue = _order_account_issue(raw, account)
+        if account_issue:
+            return account_issue
+
+        class_issue = _order_class_issue(raw, required=True)
+        if class_issue:
+            return class_issue
+
+        explicit_contracts = []
+        for key in ("option_symbol", "contract"):
+            value = raw.get(key)
+            if value in (None, ""):
+                continue
+            normalized = str(value).strip().upper().replace(" ", "")
+            if normalized:
+                explicit_contracts.append(normalized)
+        if explicit_contracts:
+            if len(set(explicit_contracts)) != 1:
+                return "broker_order_contract_conflict"
+            observed_contract = explicit_contracts[0]
+        else:
+            observed_contract = _exact_order_contract(raw)
+        if not observed_contract:
+            return "broker_order_contract_unproven"
+        if observed_contract != target_contract:
+            return "broker_order_contract_mismatch"
+
+        side = str(raw.get("side") or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if side != "sell_to_close":
+            return "broker_order_side_mismatch"
+
+        quantity, quantity_issue = _order_quantity_evidence(raw)
+        if quantity_issue or quantity is None:
+            return quantity_issue or "broker_order_quantity_unproven"
+        if quantity.get("qty") != expected_qty:
+            return "broker_order_quantity_mismatch"
+
+        if expected_payload is not None:
+            expected_type = str(expected_payload.get("type") or "").strip().lower()
+            observed_type, type_issue = _order_type_evidence(raw, required=True)
+            if type_issue or not observed_type:
+                return type_issue or "broker_order_type_unproven"
+            if observed_type != expected_type:
+                return "broker_order_type_mismatch"
+
+            expected_duration = str(
+                expected_payload.get("duration") or ""
+            ).strip().lower()
+            observed_duration = str(raw.get("duration") or "").strip().lower()
+            if expected_duration and observed_duration != expected_duration:
+                return (
+                    "broker_order_duration_unproven"
+                    if not observed_duration
+                    else "broker_order_duration_mismatch"
+                )
+
+            expected_symbol = str(expected_payload.get("symbol") or "").strip()
+            observed_symbol = str(raw.get("symbol") or "").strip()
+            if expected_symbol and observed_symbol:
+                if observed_symbol.upper().replace(" ", "") != expected_symbol.upper().replace(" ", ""):
+                    return "broker_order_symbol_mismatch"
+
+            expected_price = expected_payload.get("price")
+            observed_prices = []
+            for key in ("price", "limit_price"):
+                if raw.get(key) in (None, ""):
+                    continue
+                try:
+                    parsed_price = float(raw.get(key))
+                except (TypeError, ValueError):
+                    return "broker_order_price_unproven"
+                if not math.isfinite(parsed_price):
+                    return "broker_order_price_unproven"
+                observed_prices.append(round(parsed_price, 2))
+            if len(set(observed_prices)) > 1:
+                return "broker_order_price_conflict"
+            if expected_price is not None:
+                if not observed_prices:
+                    return "broker_order_price_unproven"
+                try:
+                    if observed_prices[0] != round(float(expected_price), 2):
+                        return "broker_order_price_mismatch"
+                except (TypeError, ValueError):
+                    return "broker_order_price_unproven"
+            elif observed_prices and observed_prices[0] != 0:
+                return "broker_order_price_mismatch"
+        return None
+
+    def _reconcile_canonical_exit_submit_intent(
+        self,
+        *,
+        broker,
+        local_order_id: str,
+        position_id: str,
+        contract: str,
+        requested_qty: int,
+        execution_mode: str,
+        broker_submit_key: str,
+        expected_payload: dict | None = None,
+    ) -> dict:
+        """Reconcile one durable EXIT tag before any recovery broker mutation."""
+        base = {
+            "local_order_id": str(local_order_id or ""),
+            "broker_submit_key": str(broker_submit_key or ""),
+            "position_id": str(position_id or ""),
+            "contract": str(contract or ""),
+            "execution_mode": str(execution_mode or "").strip().lower(),
+        }
+        account = _extract_broker_account_id(broker)
+        if not account:
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_BROKER_ACCOUNT_UNAVAILABLE",
+                "reconciliation_required": True,
+            }
+
+        list_orders_strict = _declared_broker_capability(
+            broker, "list_orders_strict"
+        )
+        if not callable(list_orders_strict):
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_STRICT_ORDER_INVENTORY_UNAVAILABLE",
+                "reconciliation_required": True,
+            }
+        try:
+            orders = list_orders_strict()
+        except Exception as exc:
+            log.warning(
+                "[%s] canonical EXIT tag inventory unavailable local=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_STRICT_ORDER_INVENTORY_UNAVAILABLE",
+                "error": f"{type(exc).__name__}:{exc}",
+                "reconciliation_required": True,
+            }
+        if not isinstance(orders, list) or any(not isinstance(row, dict) for row in orders):
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_STRICT_ORDER_INVENTORY_MALFORMED",
+                "reconciliation_required": True,
+            }
+
+        tag = str(broker_submit_key or "")
+        tagged = [row for row in orders if row.get("tag") == tag]
+        if not tagged:
+            return {
+                **base,
+                "disposition": "CANONICAL_TAG_ABSENT",
+                "reason_code": "EXIT_SUBMIT_INTENT_CANONICAL_TAG_ABSENT",
+                "account": account,
+                "strict_order_snapshot": True,
+            }
+        if len(tagged) != 1:
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_CANONICAL_TAG_AMBIGUOUS",
+                "match_count": len(tagged),
+                "reconciliation_required": True,
+            }
+
+        remote = dict(tagged[0])
+        broker_expected_qty = requested_qty
+        if isinstance(expected_payload, dict):
+            payload_qty = expected_payload.get("quantity")
+            if (
+                isinstance(payload_qty, int)
+                and not isinstance(payload_qty, bool)
+                and payload_qty > 0
+            ):
+                broker_expected_qty = payload_qty
+        identity_issue = self._canonical_exit_order_identity_issue(
+            remote,
+            target_contract=str(contract or "").strip().upper().replace(" ", ""),
+            account=account,
+            expected_qty=broker_expected_qty,
+            expected_payload=expected_payload,
+        )
+        if identity_issue:
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_CANONICAL_TAG_IDENTITY_CONFLICT",
+                "identity_issue": identity_issue,
+                "broker_order": remote,
+                "reconciliation_required": True,
+            }
+
+        broker_order_id, _ = _order_id_evidence(remote)
+        adopter = getattr(self, "adopt_broker_owned_exit_request", None)
+        if not callable(adopter) or not broker_order_id:
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_CANONICAL_ADOPTION_UNAVAILABLE",
+                "broker_order": remote,
+                "reconciliation_required": True,
+            }
+        try:
+            adoption = adopter(
+                local_order_id,
+                broker_order_id=broker_order_id,
+                execution_mode=str(execution_mode or "").strip().lower(),
+                position_id=str(position_id or ""),
+                expected_qty=requested_qty,
+                client_id=self.client_id,
+                source="canonical_exit_submit_intent_recovery",
+            )
+        except Exception as exc:
+            log.critical(
+                "[%s] canonical EXIT ownership adoption raised local=%s broker=%s: %s",
+                self.client_id,
+                local_order_id,
+                broker_order_id,
+                exc,
+            )
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_CANONICAL_ADOPTION_FAILED",
+                "error": f"{type(exc).__name__}:{exc}",
+                "broker_order_id": broker_order_id,
+                "reconciliation_required": True,
+            }
+        adoption = adoption if isinstance(adoption, dict) else {}
+        adoption_disposition = str(adoption.get("disposition") or "").strip().upper()
+        if adoption_disposition not in {
+            "ADOPTED",
+            "ALREADY_BROKER_OWNED_ACTIVE",
+            "ALREADY_TERMINAL",
+        }:
+            return {
+                **base,
+                "disposition": "HOLD",
+                "reason_code": "EXIT_SUBMIT_INTENT_CANONICAL_ADOPTION_FAILED",
+                "broker_order_id": broker_order_id,
+                "adoption": adoption,
+                "reconciliation_required": True,
+            }
+        return {
+            **base,
+            "disposition": "CANONICAL_BROKER_OWNED",
+            "reason_code": "EXIT_SUBMIT_INTENT_CANONICAL_TAG_ADOPTED",
+            "broker_order_id": broker_order_id,
+            "broker_order": remote,
+            "adoption": adoption,
+            "status": adoption.get("status") or OrderStatus.EXIT_SUBMITTED,
+            "strict_order_snapshot": True,
+        }
+
+    def _validate_exit_submit_intent_recovery(
+        self,
+        *,
+        order: dict,
+        local_order_id: str,
+        position_id: str,
+        contract: str,
+        symbol: str,
+        requested_qty: int,
+        limit_price,
+        order_type: str,
+        execution_mode: str,
+    ) -> dict:
+        """Validate durable recovery identity and exact payload before broker reads."""
+        local_id = str(local_order_id or "").strip()
+        mode = str(execution_mode or "").strip().lower()
+        if not isinstance(order, dict):
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_ROW_UNAVAILABLE"}
+        if (
+            not local_id
+            or str(order.get("local_order_id") or "").strip() != local_id
+            or order.get("client_id") != self.client_id
+            or order.get("kind") != "EXIT"
+            or order.get("status") != OrderStatus.EXIT_REQUESTED
+            or str(order.get("position_id") or "") != str(position_id or "")
+            or str(order.get("contract") or "") != str(contract or "")
+            or order.get("qty") != requested_qty
+            or str(order.get("execution_mode") or "").strip().lower() != mode
+            or mode not in {"live", "paper"}
+            or order.get("broker_order_id") not in (None, "")
+            or order.get("submitted_ts") not in (None, "")
+        ):
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_IDENTITY_MISMATCH"}
+
+        meta, parsed = self._coerce_json_object(order.get("meta"))
+        if not parsed:
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_META_MALFORMED"}
+        intent_at = str(meta.get("submit_intent_at") or "").strip()
+        expected_tag = canonical_broker_submit_key(local_id)
+        stored_tag = meta.get("broker_submit_key")
+        stored_hash = meta.get("broker_submit_payload_hash")
+        if (
+            not intent_at
+            or not isinstance(stored_tag, str)
+            or stored_tag != expected_tag
+            or not isinstance(stored_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", stored_hash)
+            or meta.get("current_owner") != f"broker_submit:{expected_tag}"
+            or meta.get("split_brain_quarantine")
+        ):
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_IDENTITY_MISMATCH"}
+
+        try:
+            durable_limit_price = float(limit_price or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_UNPROVEN"}
+        if not math.isfinite(durable_limit_price):
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_UNPROVEN"}
+        durable_order_type = (
+            meta.get("order_type")
+            or meta.get("exit_order_type")
+            or ("limit" if durable_limit_price > 0 else "market")
+        )
+        durable_order_type = str(durable_order_type or "").strip().lower()
+        if durable_order_type not in {"limit", "market"}:
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_UNPROVEN"}
+
+        payload_qty = requested_qty
+        replacement_qty = meta.get("protective_takeover_replacement_qty")
+        replacement_stamp = str(
+            meta.get("protective_takeover_payload_rewritten_at") or ""
+        ).strip()
+        if replacement_qty is not None or replacement_stamp:
+            if (
+                not replacement_stamp
+                or isinstance(replacement_qty, bool)
+                or not isinstance(replacement_qty, int)
+                or replacement_qty <= 0
+                or replacement_qty > requested_qty
+            ):
+                return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_UNPROVEN"}
+            payload_qty = replacement_qty
+
+        if not str(symbol or "").strip() or not str(contract or "").strip():
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_UNPROVEN"}
+        payload = self._build_exit_submit_payload(
+            symbol=str(symbol),
+            contract=str(contract),
+            qty=payload_qty,
+            limit_price=durable_limit_price,
+            order_type=durable_order_type,
+            local_order_id=local_id,
+        )
+        if payload is None:
+            return {"ok": False, "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_UNPROVEN"}
+        payload_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if stored_hash != payload_hash:
+            return {
+                "ok": False,
+                "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_IDENTITY_MISMATCH",
+            }
+        return {
+            "ok": True,
+            "meta": meta,
+            "payload": payload,
+            "payload_hash": payload_hash,
+            "payload_qty": payload_qty,
+            "broker_submit_key": expected_tag,
+        }
+
+    def resume_exit_submit_intent(self, *, broker, local_order_id: str) -> dict:
+        """Resume one durable EXIT submit owner through the canonical OSM path."""
+        local_id = str(local_order_id or "").strip()
+        getter = getattr(self, "get_order", None) or getattr(self, "_get_order", None)
+        try:
+            raw_order = getter(local_id) if callable(getter) else None
+        except Exception as exc:
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "status": OrderStatus.EXIT_REQUESTED,
+                "error": f"EXIT_SUBMIT_INTENT_RECOVERY_ROW_READ_FAILED:{type(exc).__name__}",
+                "reconciliation_required": True,
+            }
+        order = dict(raw_order) if raw_order else None
+        if not isinstance(order, dict):
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "status": OrderStatus.EXIT_REQUESTED,
+                "error": "EXIT_SUBMIT_INTENT_RECOVERY_ROW_UNAVAILABLE",
+                "reconciliation_required": True,
+            }
+        meta, parsed = self._coerce_json_object(order.get("meta"))
+        if not parsed:
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "status": order.get("status") or OrderStatus.EXIT_REQUESTED,
+                "error": "EXIT_SUBMIT_INTENT_RECOVERY_META_MALFORMED",
+                "reconciliation_required": True,
+            }
+        mode = str(order.get("execution_mode") or "").strip().lower()
+        qty = order.get("qty")
+        contract = str(order.get("contract") or "")
+        position_id = str(order.get("position_id") or "")
+        symbol = str(order.get("symbol") or "")
+        if (
+            not local_id
+            or mode not in {"live", "paper"}
+            or isinstance(qty, bool)
+            or not isinstance(qty, int)
+            or qty <= 0
+            or not position_id
+            or not contract
+            or not symbol
+        ):
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "status": order.get("status") or OrderStatus.EXIT_REQUESTED,
+                "error": "EXIT_SUBMIT_INTENT_RECOVERY_IDENTITY_MISMATCH",
+                "reconciliation_required": True,
+            }
+        try:
+            limit_price = float(order.get("limit_price") or 0)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "status": order.get("status") or OrderStatus.EXIT_REQUESTED,
+                "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_UNPROVEN",
+                "reconciliation_required": True,
+            }
+        order_type = (
+            meta.get("order_type")
+            or meta.get("exit_order_type")
+            or ("limit" if limit_price > 0 else "market")
+        )
+        order_type = str(order_type or "").strip().lower()
+        if order_type not in {"limit", "market"}:
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "status": order.get("status") or OrderStatus.EXIT_REQUESTED,
+                "error": "EXIT_SUBMIT_INTENT_RECOVERY_PAYLOAD_UNPROVEN",
+                "reconciliation_required": True,
+            }
+        return self.submit_exit(
+            broker=broker,
+            position_id=position_id,
+            contract=contract,
+            symbol=symbol,
+            direction=str(order.get("direction") or ""),
+            qty=qty,
+            limit_price=limit_price if limit_price > 0 else None,
+            plan_id=order.get("plan_id"),
+            signal_id=order.get("signal_id"),
+            order_type=order_type,
+            execution_mode=mode,
+            local_order_id=local_id,
+            resume_existing_submit_intent=True,
+        )
+
+    def claim_exit_submit_intent_recovery(
+        self,
+        local_order_id: str,
+        *,
+        position_id: str,
+        execution_mode: str,
+        contract: str,
+        durable_qty: int,
+        broker_submit_key: str,
+        payload_hash: str,
+    ) -> bool:
+        """Claim the still-owned EXIT intent before recovery broker mutations.
+
+        ``current_owner`` remains the canonical broker-submit owner.  The
+        separate short recovery lease closes the worker-vs-worker race between
+        an absent canonical tag and the optional protective takeover.  An
+        expired lease is recoverable after a crash; an unexpired lease is a
+        hard CAS miss and therefore cannot authorize a second cancel or POST.
+        """
+        local_id = str(local_order_id or "").strip()
+        mode = str(execution_mode or "").strip().lower()
+        submit_key = str(broker_submit_key or "")
+        owner = f"broker_submit:{submit_key}"
+        if (
+            not local_id
+            or mode not in {"live", "paper"}
+            or submit_key != canonical_broker_submit_key(local_id)
+            or not isinstance(durable_qty, int)
+            or isinstance(durable_qty, bool)
+            or durable_qty <= 0
+            or not isinstance(payload_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", payload_hash)
+        ):
+            return False
+        recovery_owner = (
+            f"canonical_exit_recovery:{self.client_id}:{local_id}:"
+            f"{uuid.uuid4().hex}"
+        )
+        recovery_claimed_at = datetime.now(timezone.utc)
+        patch = json.dumps({
+            "recovery_submit_owner": recovery_owner,
+            "recovery_submit_claimed_at": recovery_claimed_at.isoformat(),
+            "recovery_submit_lease_until": (
+                recovery_claimed_at + timedelta(seconds=60)
+            ).isoformat(),
+            "recovery_submit_mode": "canonical_exit_submit_intent",
+        })
+
+        def _claim():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders SET "
+                    "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, updated_ts=NOW() "
+                    "WHERE local_order_id=%s AND client_id=%s AND position_id=%s "
+                    "AND kind='EXIT' AND status=%s "
+                    "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
+                    "AND COALESCE(contract,'')=%s AND COALESCE(qty,0)=%s "
+                    "AND COALESCE(broker_order_id,'')='' AND submitted_ts IS NULL "
+                    "AND NULLIF(COALESCE(meta->>'submit_intent_at',''), '') IS NOT NULL "
+                    "AND COALESCE(meta->>'broker_submit_key','')=%s "
+                    "AND COALESCE(meta->>'broker_submit_payload_hash','')=%s "
+                    "AND COALESCE(meta->>'current_owner','')=%s "
+                    "AND COALESCE((meta->>'split_brain_quarantine')::boolean, false)=false "
+                    "AND ("
+                    "      COALESCE(meta->>'recovery_submit_owner','')='' "
+                    "   OR NULLIF(COALESCE(meta->>'recovery_submit_lease_until',''), '') IS NULL "
+                    "   OR NULLIF(COALESCE(meta->>'recovery_submit_lease_until',''), '')::timestamptz <= NOW()"
+                    "    )",
+                    (
+                        patch,
+                        local_id,
+                        self.client_id,
+                        str(position_id or ""),
+                        OrderStatus.EXIT_REQUESTED,
+                        mode,
+                        str(contract or ""),
+                        durable_qty,
+                        submit_key,
+                        payload_hash,
+                        owner,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_claim) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] claim_exit_submit_intent_recovery failed order=%s: %s",
+                self.client_id,
+                local_id,
+                exc,
             )
             return False
 
@@ -6162,6 +6819,7 @@ class APOrderStateMachine:
         order_type: str = "limit",
         execution_mode: str | None = None,
         local_order_id: str | None = None,
+        resume_existing_submit_intent: bool = False,
     ) -> dict:
         if not execution_mode:
             try:
@@ -6290,6 +6948,110 @@ class APOrderStateMachine:
                 limit_price=limit_price, local_order_id=reserved_local_id or None,
                 execution_mode=execution_mode,
             )
+
+        _is_exit_submit_intent_recovery = bool(resume_existing_submit_intent)
+        _recovery_payload_qty = requested_qty
+        if _is_exit_submit_intent_recovery:
+            _recovery_validation = self._validate_exit_submit_intent_recovery(
+                order=existing,
+                local_order_id=local_id,
+                position_id=str(position_id or ""),
+                contract=str(contract or ""),
+                symbol=str(symbol or ""),
+                requested_qty=requested_qty,
+                limit_price=limit_price,
+                order_type=order_type,
+                execution_mode=str(execution_mode or ""),
+            )
+            if not _recovery_validation.get("ok"):
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.EXIT_REQUESTED,
+                    "error": str(
+                        _recovery_validation.get("error")
+                        or "EXIT_SUBMIT_INTENT_RECOVERY_IDENTITY_MISMATCH"
+                    ),
+                    "reconciliation_required": True,
+                    "submit_intent_preserved": True,
+                }
+            _recovery_payload_qty = int(
+                _recovery_validation.get("payload_qty") or requested_qty
+            )
+            _canonical_recovery = self._reconcile_canonical_exit_submit_intent(
+                broker=broker,
+                local_order_id=local_id,
+                position_id=str(position_id or ""),
+                contract=str(contract or ""),
+                requested_qty=requested_qty,
+                execution_mode=str(execution_mode or ""),
+                broker_submit_key=str(
+                    _recovery_validation.get("broker_submit_key") or ""
+                ),
+                expected_payload=_recovery_validation.get("payload"),
+            )
+            _canonical_disposition = str(
+                _canonical_recovery.get("disposition") or ""
+            ).strip().upper()
+            if _canonical_disposition == "CANONICAL_BROKER_OWNED":
+                _adoption = _canonical_recovery.get("adoption") or {}
+                return {
+                    "ok": True,
+                    "local_order_id": local_id,
+                    "broker_order_id": _canonical_recovery.get("broker_order_id"),
+                    "status": _canonical_recovery.get("status") or OrderStatus.EXIT_SUBMITTED,
+                    "error": None,
+                    "reconciled_by_canonical_tag": True,
+                    "recovery_disposition": _canonical_disposition,
+                    "adoption": _adoption,
+                }
+            if _canonical_disposition != "CANONICAL_TAG_ABSENT":
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": _canonical_recovery.get("broker_order_id"),
+                    "status": OrderStatus.EXIT_REQUESTED,
+                    "error": str(
+                        _canonical_recovery.get("reason_code")
+                        or "EXIT_SUBMIT_INTENT_RECOVERY_HELD"
+                    ),
+                    "reconciliation_required": True,
+                    "submit_intent_preserved": True,
+                    "recovery_disposition": _canonical_disposition or "HOLD",
+                    "recovery": _canonical_recovery,
+                }
+
+            # Reserve the continuation before inspecting/canceling any
+            # protective sell.  This is still the same durable canonical EXIT
+            # owner; the lease only prevents two recovery workers from both
+            # reaching the optional takeover and broker POST.
+            _recovery_claim = getattr(
+                self, "claim_exit_submit_intent_recovery", None
+            )
+            if not callable(_recovery_claim) or not _recovery_claim(
+                local_id,
+                position_id=str(position_id or ""),
+                execution_mode=str(execution_mode or ""),
+                contract=str(contract or ""),
+                durable_qty=requested_qty,
+                broker_submit_key=str(
+                    _recovery_validation.get("broker_submit_key") or ""
+                ),
+                payload_hash=str(
+                    _recovery_validation.get("payload_hash") or ""
+                ),
+            ):
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.EXIT_REQUESTED,
+                    "error": "EXIT_SUBMIT_INTENT_RECOVERY_CAS_LOST",
+                    "reconciliation_required": True,
+                    "submit_intent_preserved": True,
+                }
+
         broker_truth = resolve_exit_broker_truth(
             broker=broker,
             client_id=self.client_id,
@@ -6305,6 +7067,27 @@ class APOrderStateMachine:
                     _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
                 except Exception as _upd_bt_exc:
                     log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
+        if _is_exit_submit_intent_recovery:
+            # A durable submit intent makes a missing/ambiguous position
+            # snapshot an ownership ambiguity, never permission to POST.
+            # Recovery must use the strict adapter capability; the legacy
+            # permissive list_positions() contract is not authoritative here.
+            if (
+                not callable(_declared_broker_capability(
+                    broker, "list_positions_strict"
+                ))
+                or broker_truth.get("is_fresh_exact") is not True
+                or not isinstance(broker_truth_qty, int)
+            ):
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.EXIT_REQUESTED,
+                    "error": "EXIT_SUBMIT_INTENT_STRICT_POSITION_TRUTH_UNAVAILABLE",
+                    "reconciliation_required": True,
+                    "submit_intent_preserved": True,
+                }
         if broker_truth.get("is_fresh_exact") and int(broker_truth_qty or 0) == 0:
             blocked_reason = "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
             broker_truth_audit.update(
@@ -6374,6 +7157,11 @@ class APOrderStateMachine:
             and broker_truth_qty is not None
             and int(broker_truth_qty) > 0
             and requested_qty > int(broker_truth_qty)
+            and not (
+                _is_exit_submit_intent_recovery
+                and _recovery_payload_qty <= int(broker_truth_qty)
+                and _recovery_payload_qty < requested_qty
+            )
         ):
             blocked_reason = "EXIT_BLOCKED_BROKER_QTY_INSUFFICIENT"
             broker_truth_audit.update(
@@ -6599,22 +7387,46 @@ class APOrderStateMachine:
         account_id = (getattr(broker, "account_id", None)
                       or getattr(getattr(broker, "cfg", None), "account_id", None)
                       or "")
-        underlying    = self._resolve_underlying_symbol(symbol=symbol, contract=contract)
         error_msg     = broker_order_id = None
         # ── Build order payload ONCE ──────────────────────────────────────────
-        _is_market_payload = (order_type == "market") or (lp <= 0 and order_type != "limit")
-        _order_data = {
-            "class": "option", "symbol": underlying, "option_symbol": contract,
-            "side": "sell_to_close", "quantity": int(qty),
-            "type": "market" if _is_market_payload else "limit",
-            "duration": "day",
-        }
-        if not _is_market_payload:
-            _order_data["price"] = round(lp, 2)
-        # Tradier accepts a 'tag' field — using local_id provides client-side
-        # idempotency. If we retry on ambiguous response, we can find this tag
-        # in /orders to confirm the order landed without double-submitting.
-        _order_data["tag"] = canonical_broker_submit_key(local_id)
+        # Recovery reuses the helper so its payload hash is reconstructed from
+        # the same canonical shape.  Keep the ordinary submit construction
+        # unchanged; it is outside this restart seam.
+        if _is_exit_submit_intent_recovery:
+            _order_data = self._build_exit_submit_payload(
+                symbol=str(symbol),
+                contract=str(contract),
+                qty=_recovery_payload_qty,
+                limit_price=limit_price,
+                order_type=order_type,
+                local_order_id=local_id,
+            )
+        else:
+            _order_data = {
+                "class": "option",
+                "symbol": self._resolve_underlying_symbol(
+                    symbol=symbol,
+                    contract=contract,
+                ),
+                "option_symbol": contract,
+                "side": "sell_to_close",
+                "quantity": int(requested_qty),
+                "type": "market" if _is_market else "limit",
+                "duration": "day",
+                "tag": canonical_broker_submit_key(local_id),
+            }
+            if not _is_market:
+                _order_data["price"] = round(lp, 2)
+        if _order_data is None:
+            error_msg = "invalid_exit_limit_price"
+            self.transition(local_id, OrderStatus.ERROR, last_error=error_msg)
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": None,
+                "status": OrderStatus.ERROR,
+                "error": error_msg,
+            }
 
         # Make absence of submit evidence authoritative.  Recovery may retire
         # an EXIT_REQUESTED row only while this exact CAS has never succeeded;
@@ -6653,27 +7465,32 @@ class APOrderStateMachine:
                 and meta.get("broker_submit_payload_hash") == _exit_payload_hash
                 and meta.get("current_owner") == f"broker_submit:{_order_data['tag']}"
                 and not meta.get("split_brain_quarantine")
-                and not meta.get("reconciliation_required")
+                and (
+                    _is_exit_submit_intent_recovery
+                    or not meta.get("reconciliation_required")
+                )
             )
             return proven, row
 
-        if not self.persist_exit_submit_intent(
-            local_id,
-            position_id=str(position_id),
-            execution_mode=str(execution_mode or ""),
-            contract=str(contract or ""),
-            qty=requested_qty,
-            payload_hash=_exit_payload_hash,
-            broker_submit_key=_order_data["tag"],
-        ):
-            return {
-                "ok": False,
-                "local_order_id": local_id,
-                "broker_order_id": None,
-                "status": OrderStatus.EXIT_REQUESTED,
-                "error": "EXIT_SUBMIT_INTENT_FENCE_LOST",
-                "reconciliation_required": True,
-            }
+        if not _is_exit_submit_intent_recovery:
+            if not self.persist_exit_submit_intent(
+                local_id,
+                position_id=str(position_id),
+                execution_mode=str(execution_mode or ""),
+                contract=str(contract or ""),
+                qty=requested_qty,
+                payload_hash=_exit_payload_hash,
+                broker_submit_key=_order_data["tag"],
+                order_type="market" if _is_market else "limit",
+            ):
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.EXIT_REQUESTED,
+                    "error": "EXIT_SUBMIT_INTENT_FENCE_LOST",
+                    "reconciliation_required": True,
+                }
 
         _intent_proven, _intent_row = _exit_submit_intent_proven()
         if not _intent_proven:

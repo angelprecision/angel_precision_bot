@@ -4026,11 +4026,12 @@ class APExecutionCore:
         *,
         local_order_id: str,
     ) -> dict:
-        """Read-only reconciliation for an EXIT submit-intent crash window.
+        """Resume one durable EXIT submit owner after a crash.
 
-        This method never POSTs or cancels. It only reads broker truth through
-        the existing account order listing and adopts an exact EXIT match
-        through the order state machine.
+        The OSM recovery seam reconciles the exact canonical broker tag first.
+        It adopts an existing exact order without a POST, or continues the
+        same fenced owner only after strict broker proof that the tag is absent
+        and the position remains open. Ambiguous broker truth stays held.
         """
         _base = {
             "local_order_id": local_order_id,
@@ -4089,96 +4090,44 @@ class APExecutionCore:
             }
 
         broker = getattr(self, "broker", None)
-        list_orders = getattr(broker, "list_orders", None)
-        if not callable(list_orders):
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_BROKER_QUERY_UNAVAILABLE"}
+        resume = getattr(osm, "resume_exit_submit_intent", None)
+        if not callable(resume):
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_CANONICAL_EXIT_RECOVERY_UNAVAILABLE",
+            }
         try:
-            broker_orders = list_orders()
+            recovery = resume(
+                broker=broker,
+                local_order_id=local_order_id,
+            ) or {}
         except Exception as exc:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}"}
-
-        tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
-        exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
-        expected_contract = str(row.get("contract") or "")
-        expected_qty = int(row.get("qty") or 0)
-        strong = [
-            o for o in exact_tag
-            if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
-            and str(o.get("side") or "").lower() == "sell_to_close"
-            and int(float(o.get("quantity") or 0)) == expected_qty
-        ]
-        if len(exact_tag) > 1 or len(strong) > 1:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
-        if exact_tag and not strong:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH"}
-        if not strong:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD"}
-
-        remote = strong[0]
-        remote_id = str(remote.get("id") or remote.get("order_id") or "")
-        remote_status = str(remote.get("status") or "").lower().replace("-", "_")
-        if not remote_id:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MATCH_MISSING_ORDER_ID"}
-
-        status_map = {
-            "open": "EXIT_SUBMITTED",
-            "submitted": "EXIT_SUBMITTED",
-            "pending": "EXIT_SUBMITTED",
-            "accepted": "EXIT_SUBMITTED",
-            "partially_filled": "EXIT_PARTIAL_FILL",
-            "partial_filled": "EXIT_PARTIAL_FILL",
-            "filled": "EXIT_FILLED",
-            "rejected": "REJECTED",
-            "canceled": "CANCELED",
-            "cancelled": "CANCELED",
-            "expired": "EXPIRED",
-        }
-        local_status = status_map.get(remote_status, "EXIT_SUBMITTED")
-
-        adopted = osm.transition(
-            local_order_id,
-            "EXIT_SUBMITTED",
-            broker_order_id=remote_id,
-            submitted_ts=now_utc_iso(),
-        )
-        if not adopted:
-            current_status = str(row.get("status") or "").strip().upper()
-            attach = getattr(osm, "_attach_broker_identity_if_missing", None)
-            if current_status in {"EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL"} and callable(attach):
-                adopted = bool(attach(
-                    local_order_id,
-                    broker_order_id=remote_id,
-                    current_status=current_status,
-                    current_execution_mode=str(row.get("execution_mode") or ""),
-                ))
-            if not adopted:
-                return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
-
-        if local_status != "EXIT_SUBMITTED":
-            osm.transition(
-                local_order_id,
-                local_status,
-                broker_order_id=remote_id,
-                filled_qty=remote.get("exec_quantity") or remote.get("filled_quantity"),
-                fill_price=remote.get("avg_fill_price"),
-                last_error=(str(remote.get("reason") or remote.get("message") or "") or None),
-            )
-
-        if callable(getattr(osm, "update_order_meta", None)):
-            osm.update_order_meta(local_order_id, {
-                "reconciled_at": now_utc_iso(),
-                "recovery_classification": "BROKER_ORDER_ADOPTED",
-                "broker_reconcile_status": remote_status,
-                "broker_reconcile_response": remote,
-                "current_owner": "ORDER_MONITOR",
-                "lifecycle_state": local_status,
-            })
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": f"RECONCILE_CANONICAL_EXIT_RECOVERY_FAILED:{type(exc).__name__}",
+            }
+        if recovery.get("ok"):
+            return {
+                **_base,
+                "disposition": "ALREADY_RECONCILED",
+                "reason_code": str(
+                    recovery.get("error")
+                    or "RECONCILE_CANONICAL_EXIT_RECOVERED"
+                ),
+                "broker_order_id": str(recovery.get("broker_order_id") or ""),
+                "status": str(recovery.get("status") or "EXIT_SUBMITTED"),
+            }
         return {
             **_base,
-            "disposition": "ALREADY_RECONCILED",
-            "reason_code": "BROKER_ORDER_ADOPTED",
-            "broker_order_id": remote_id,
-            "status": local_status,
+            "disposition": "RECONCILE_PENDING",
+            "reason_code": str(
+                recovery.get("error")
+                or "RECONCILE_CANONICAL_EXIT_RECOVERY_HELD"
+            ),
+            "broker_order_id": str(recovery.get("broker_order_id") or ""),
+            "status": str(recovery.get("status") or "EXIT_REQUESTED"),
         }
 
     def _on_entry_trigger(self, watched: WatchedSignal):

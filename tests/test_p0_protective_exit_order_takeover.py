@@ -646,6 +646,21 @@ def test_production_tradier_malformed_positions_are_unproven():
     assert result["is_fresh_exact"] is False
 
 
+def test_strict_position_snapshot_none_is_not_authoritative_flat():
+    class _StrictNoneBroker:
+        account_id = "ACC123"
+
+        def list_positions_strict(self):
+            return None
+
+    result = resolve_exit_broker_truth(
+        broker=_StrictNoneBroker(), client_id=CLIENT, contract=CONTRACT,
+    )
+    assert result["broker_truth_open_qty"] is None
+    assert result["is_fresh_exact"] is False
+    assert result["audit"]["snapshot_status"] == "broker_positions_malformed"
+
+
 @pytest.mark.parametrize("quantity", [-1, 0.5, 1.5, "0.5"])
 def test_production_tradier_negative_or_fractional_position_quantity_is_unproven(quantity):
     broker = TradierBroker(

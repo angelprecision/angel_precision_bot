@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -13,6 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from ap import exit_safety as exit_safety_mod  # noqa: E402
 from ap import order_state_machine as osm_mod  # noqa: E402
+from ap.broker_submit_identity import canonical_broker_submit_key  # noqa: E402
 from ap.order_state_machine import APOrderStateMachine  # noqa: E402
 
 
@@ -1313,3 +1316,463 @@ def test_duplicate_exit_guard_still_blocks_before_override(monkeypatch, mock_bro
     assert result["ok"] is False
     assert result["error"].startswith("active_exit_already_exists")
     assert mock_broker.session.post.call_count == 0
+
+
+class _RecoveryOSM(_MockOSM):
+    """Small durable-row harness that keeps the production recovery methods."""
+
+    _coerce_json_object = staticmethod(APOrderStateMachine._coerce_json_object)
+    _canonical_exit_order_identity_issue = staticmethod(
+        APOrderStateMachine._canonical_exit_order_identity_issue
+    )
+    _build_exit_submit_payload = APOrderStateMachine._build_exit_submit_payload
+    _validate_exit_submit_intent_recovery = (
+        APOrderStateMachine._validate_exit_submit_intent_recovery
+    )
+    _reconcile_canonical_exit_submit_intent = (
+        APOrderStateMachine._reconcile_canonical_exit_submit_intent
+    )
+    resume_exit_submit_intent = APOrderStateMachine.resume_exit_submit_intent
+
+    def __init__(self):
+        super().__init__()
+        self.recovery_claim_calls = 0
+        self.adoption_calls = []
+        self.position_orders = []
+
+    def get_orders_for_position(self, position_id):
+        return [
+            dict(row)
+            for row in self.position_orders
+            if row.get("position_id") == position_id
+        ]
+
+    def claim_exit_submit_intent_recovery(self, local_order_id, **kwargs):
+        self.recovery_claim_calls += 1
+        self.recovery_claim_kwargs = kwargs
+        return True
+
+    def adopt_broker_owned_exit_request(self, local_order_id, **kwargs):
+        self.adoption_calls.append((local_order_id, dict(kwargs)))
+        self.exit_row["broker_order_id"] = kwargs["broker_order_id"]
+        self.exit_row["status"] = "EXIT_SUBMITTED"
+        return {
+            "disposition": "ADOPTED",
+            "status": "EXIT_SUBMITTED",
+            "broker_order_id": kwargs["broker_order_id"],
+        }
+
+
+def _durable_restart_exit(osm, *, local_id="L-EXIT-RESTART"):
+    contract = "NOW260828P00122000"
+    payload = osm._build_exit_submit_payload(
+        symbol="NOW",
+        contract=contract,
+        qty=1,
+        limit_price=1.08,
+        order_type="limit",
+        local_order_id=local_id,
+    )
+    payload_hash = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    tag = canonical_broker_submit_key(local_id)
+    osm.exit_row = {
+        "local_order_id": local_id,
+        "client_id": osm.client_id,
+        "position_id": "position-now-live-restart",
+        "kind": "EXIT",
+        "status": "EXIT_REQUESTED",
+        "execution_mode": "live",
+        "contract": contract,
+        "symbol": "NOW",
+        "direction": "PUT",
+        "qty": 1,
+        "limit_price": 1.08,
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "meta": {
+            "lifecycle_state": "SUBMITTING",
+            "submit_intent_at": "2026-08-28T14:00:00+00:00",
+            "broker_submit_key": tag,
+            "broker_submit_payload_hash": payload_hash,
+            "current_owner": f"broker_submit:{tag}",
+            "order_type": "limit",
+        },
+    }
+    return contract, tag, payload_hash
+
+
+def _configure_strict_recovery_broker(mock_broker, *, contract, positions):
+    # The fixture's strict order method is an explicitly attached capability;
+    # add the same explicit capability for positions so recovery cannot use
+    # the legacy permissive parser as authority.
+    mock_broker.list_positions_strict = mock_broker.list_positions
+    mock_broker.list_positions_strict.return_value = positions
+    mock_broker.list_orders_strict.return_value = []
+    mock_broker.cancel_order.reset_mock()
+    mock_broker.session.post.reset_mock()
+    return mock_broker
+
+
+def _canonical_broker_exit(*, tag, contract, order_id="BROKER-CANONICAL-1", **updates):
+    order = {
+        "id": order_id,
+        "tag": tag,
+        "status": "open",
+        "class": "option",
+        "type": "limit",
+        "side": "sell_to_close",
+        "option_symbol": contract,
+        "symbol": "NOW",
+        "quantity": 1,
+        "exec_quantity": 0,
+        "price": 1.08,
+        "duration": "day",
+        "account_id": "ACC123",
+    }
+    order.update(updates)
+    return order
+
+
+def test_restart_after_protective_cancel_resumes_same_canonical_exit_once(
+    monkeypatch, mock_broker
+):
+    contract = "NOW260828P00122000"
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    osm = _RecoveryOSM()
+    contract, tag, payload_hash = _durable_restart_exit(osm)
+    osm.position_orders = [{
+        "local_order_id": "L-ENTRY-NOW-RESTART",
+        "client_id": osm.client_id,
+        "position_id": "position-now-live-restart",
+        "kind": "ENTRY",
+        "execution_mode": "live",
+        "contract": contract,
+        "meta": {
+            "protective_order": {
+                "protective_broker_order_id": "143387714",
+                "protective_order_state": "ACTIVE",
+                "protective_source": "standing_stop",
+                "client_id": osm.client_id,
+                "protective_contract": contract,
+                "execution_mode": "live",
+            }
+        },
+    }]
+    _configure_strict_recovery_broker(
+        mock_broker,
+        contract=contract,
+        positions=[
+            {"symbol": contract, "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+        ],
+    )
+    mock_broker.list_orders_strict.return_value = [{
+        "id": "143387714",
+        "status": "canceled",
+        "class": "option",
+        "type": "stop",
+        "side": "sell_to_close",
+        "option_symbol": contract,
+        "quantity": 1,
+        "exec_quantity": 0,
+        "duration": "gtc",
+        "account_id": "ACC123",
+    }]
+    mock_broker.get_order.return_value = {
+        "id": "143387714",
+        "status": "canceled",
+        "class": "option",
+        "type": "stop",
+        "side": "sell_to_close",
+        "option_symbol": contract,
+        "quantity": 1,
+        "exec_quantity": 0,
+        "duration": "gtc",
+        "account_id": "ACC123",
+    }
+    mock_broker.session.post.return_value = _resp(
+        200, json_body={"order": {"id": "CANONICAL-EXIT-RESTART", "status": "open"}}
+    )
+
+    result = osm.resume_exit_submit_intent(
+        broker=mock_broker,
+        local_order_id=osm.exit_row["local_order_id"],
+    )
+
+    assert result["ok"] is True
+    assert result["broker_order_id"] == "CANONICAL-EXIT-RESTART"
+    assert mock_broker.cancel_order.call_count == 0
+    mock_broker.get_order.assert_called_once_with("143387714")
+    assert mock_broker.session.post.call_count == 1
+    submitted = mock_broker.session.post.call_args.kwargs["data"]
+    assert submitted["tag"] == tag
+    assert submitted["quantity"] == 1
+    assert osm.exit_row["local_order_id"] == "L-EXIT-RESTART"
+    assert osm.exit_row["meta"]["broker_submit_key"] == tag
+    assert osm.exit_row["meta"]["broker_submit_payload_hash"] == payload_hash
+    assert osm.exit_row["meta"]["current_owner"] == f"broker_submit:{tag}"
+    assert osm.recovery_claim_calls == 1
+
+
+def test_restart_adopts_canonical_exit_accepted_before_local_ownership_write(
+    monkeypatch, mock_broker
+):
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    osm = _RecoveryOSM()
+    contract, tag, _payload_hash = _durable_restart_exit(osm)
+    _configure_strict_recovery_broker(
+        mock_broker,
+        contract=contract,
+        positions=[
+            {"symbol": contract, "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+        ],
+    )
+    mock_broker.list_orders_strict.return_value = [
+        _canonical_broker_exit(tag=tag, contract=contract)
+    ]
+
+    result = osm.resume_exit_submit_intent(
+        broker=mock_broker,
+        local_order_id=osm.exit_row["local_order_id"],
+    )
+
+    assert result["ok"] is True
+    assert result["reconciled_by_canonical_tag"] is True
+    assert result["broker_order_id"] == "BROKER-CANONICAL-1"
+    assert osm.exit_row["broker_order_id"] == "BROKER-CANONICAL-1"
+    assert osm.exit_row["status"] == "EXIT_SUBMITTED"
+    assert len(osm.adoption_calls) == 1
+    assert mock_broker.session.post.call_count == 0
+    assert mock_broker.cancel_order.call_count == 0
+    assert mock_broker.list_positions_strict.call_count == 0
+
+
+def test_restart_holds_when_strict_order_inventory_is_unavailable(
+    monkeypatch, mock_broker
+):
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    osm = _RecoveryOSM()
+    contract, tag, payload_hash = _durable_restart_exit(osm)
+    _configure_strict_recovery_broker(
+        mock_broker,
+        contract=contract,
+        positions=[
+            {"symbol": contract, "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+        ],
+    )
+    mock_broker.list_orders_strict.side_effect = TimeoutError("orders timeout")
+
+    result = osm.resume_exit_submit_intent(
+        broker=mock_broker,
+        local_order_id=osm.exit_row["local_order_id"],
+    )
+
+    assert result["ok"] is False
+    assert "STRICT_ORDER_INVENTORY_UNAVAILABLE" in result["error"]
+    assert mock_broker.session.post.call_count == 0
+    assert mock_broker.cancel_order.call_count == 0
+    assert osm.recovery_claim_calls == 0
+    assert osm.exit_row["meta"]["submit_intent_at"]
+    assert osm.exit_row["meta"]["broker_submit_key"] == tag
+    assert osm.exit_row["meta"]["broker_submit_payload_hash"] == payload_hash
+    assert osm.exit_row["meta"]["current_owner"] == f"broker_submit:{tag}"
+
+
+def test_restart_with_strict_broker_flat_routes_to_existing_close_truth(
+    monkeypatch, mock_broker
+):
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    osm = _RecoveryOSM()
+    contract, tag, _payload_hash = _durable_restart_exit(osm)
+    _configure_strict_recovery_broker(mock_broker, contract=contract, positions=[])
+
+    result = osm.resume_exit_submit_intent(
+        broker=mock_broker,
+        local_order_id=osm.exit_row["local_order_id"],
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+    assert mock_broker.session.post.call_count == 0
+    assert mock_broker.cancel_order.call_count == 0
+    assert osm.exit_row["status"] == "CANCELED"
+    assert osm.exit_row["meta"]["broker_submit_key"] == tag
+    assert any("UPDATE positions" in sql for sql, _params in fake_conn.queries)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("option_symbol", "NOW260828P00123000"),
+        ("side", "buy_to_open"),
+        ("account_id", "OTHER"),
+        ("quantity", 2),
+    ],
+)
+def test_restart_holds_on_canonical_tag_identity_conflict(
+    monkeypatch, mock_broker, field, value
+):
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    osm = _RecoveryOSM()
+    contract, tag, _payload_hash = _durable_restart_exit(osm)
+    _configure_strict_recovery_broker(
+        mock_broker,
+        contract=contract,
+        positions=[
+            {"symbol": contract, "quantity": 1, "side": "PUT", "account_id": "ACC123"}
+        ],
+    )
+    remote = _canonical_broker_exit(tag=tag, contract=contract)
+    remote[field] = value
+    mock_broker.list_orders_strict.return_value = [remote]
+
+    result = osm.resume_exit_submit_intent(
+        broker=mock_broker,
+        local_order_id=osm.exit_row["local_order_id"],
+    )
+
+    assert result["ok"] is False
+    assert result["recovery_disposition"] == "HOLD"
+    assert result["error"] == "EXIT_SUBMIT_INTENT_CANONICAL_TAG_IDENTITY_CONFLICT"
+    assert len(osm.adoption_calls) == 0
+    assert mock_broker.session.post.call_count == 0
+    assert mock_broker.cancel_order.call_count == 0
+    assert mock_broker.list_positions_strict.call_count == 0
+
+
+def test_recovery_claim_real_cas_preserves_canonical_owner_and_fences_reentry(
+    monkeypatch,
+):
+    fake_conn = _patch_db(monkeypatch, lambda sql, params: None)
+    fake_conn.rowcount = 1
+    osm = APOrderStateMachine("jason@example.com")
+    local_id = "L-EXIT-CAS"
+    tag = canonical_broker_submit_key(local_id)
+    payload_hash = "a" * 64
+
+    assert osm.claim_exit_submit_intent_recovery(
+        local_id,
+        position_id="position-cas",
+        execution_mode="live",
+        contract="NOW260828P00122000",
+        durable_qty=1,
+        broker_submit_key=tag,
+        payload_hash=payload_hash,
+    ) is True
+
+    sql, params = fake_conn.queries[0]
+    assert "meta->>'submit_intent_at'" in sql
+    assert "meta->>'broker_submit_key'" in sql
+    assert "meta->>'broker_submit_payload_hash'" in sql
+    assert "meta->>'current_owner'" in sql
+    assert "recovery_submit_owner" in sql
+    assert "recovery_submit_lease_until" in sql
+    patch = json.loads(params[0])
+    assert "current_owner" not in patch
+    assert patch["recovery_submit_owner"].startswith(
+        "canonical_exit_recovery:jason@example.com:L-EXIT-CAS:"
+    )
+
+
+def test_canonical_tag_adoption_uses_real_osm_cas(monkeypatch):
+    adopted_row = {
+        "local_order_id": "L-EXIT-ADOPT",
+        "client_id": "jason@example.com",
+        "position_id": "position-adopt",
+        "kind": "EXIT",
+        "status": "EXIT_SUBMITTED",
+        "execution_mode": "live",
+        "qty": 1,
+        "broker_order_id": "BROKER-ADOPT-1",
+        "submitted_ts": None,
+    }
+
+    def resolve(sql, _params):
+        return adopted_row if "SELECT * FROM orders" in sql else None
+
+    fake_conn = _patch_db(monkeypatch, resolve)
+    fake_conn.rowcount = 1
+    osm = APOrderStateMachine("jason@example.com")
+    osm._emit_transition_event = lambda **_kwargs: None
+    osm._handle_exit_engine_hooks = lambda **_kwargs: None
+
+    result = osm.adopt_broker_owned_exit_request(
+        "L-EXIT-ADOPT",
+        broker_order_id="BROKER-ADOPT-1",
+        execution_mode="live",
+        position_id="position-adopt",
+        expected_qty=1,
+        source="canonical_exit_submit_intent_recovery",
+    )
+
+    assert result["disposition"] == "ADOPTED"
+    assert result["broker_order_id"] == "BROKER-ADOPT-1"
+    sql, params = fake_conn.queries[0]
+    assert "status='EXIT_REQUESTED'" in sql
+    assert "position_id::text=%s" in sql
+    assert "qty=%s" in sql
+    assert params[8] == 1
+
+
+def test_reconciler_routes_durable_exit_intent_to_canonical_recovery(
+    monkeypatch,
+):
+    from ap_reconciler import APBrokerReconciler
+
+    recovery = MagicMock(
+        return_value={
+            "ok": True,
+            "broker_order_id": "BROKER-RESTART-1",
+            "status": "EXIT_SUBMITTED",
+        }
+    )
+    osm = MagicMock()
+    osm.resume_exit_submit_intent = recovery
+    reconciler = APBrokerReconciler.__new__(APBrokerReconciler)
+    reconciler.client_id = "jason@example.com"
+    reconciler.osm = osm
+    reconciler.broker = MagicMock()
+    reconciler._alert_fn = lambda _msg: None
+    reconciler._missing_id_exit_tracker = {}
+    legacy_fallback = MagicMock(side_effect=AssertionError("legacy fuzzy recovery used"))
+    reconciler._recover_missing_broker_id_exit = legacy_fallback
+
+    summary = {"orders_alerted": 0, "orders_corrected": 0}
+    reconciler._handle_order_without_broker_id(
+        {
+            "local_order_id": "L-EXIT-RESTART",
+            "kind": "EXIT",
+            "status": "EXIT_REQUESTED",
+            "broker_order_id": None,
+            "contract": "NOW260828P00122000",
+            "meta": {
+                "submit_intent_at": "2026-08-28T14:00:00+00:00",
+                "broker_submit_key": "L-EXIT-RESTART",
+            },
+        },
+        summary,
+    )
+
+    recovery.assert_called_once_with(
+        broker=reconciler.broker,
+        local_order_id="L-EXIT-RESTART",
+    )
+    legacy_fallback.assert_not_called()
+    assert summary["orders_corrected"] == 1
+

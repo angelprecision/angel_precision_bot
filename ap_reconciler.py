@@ -76,6 +76,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1308,6 +1309,87 @@ class APBrokerReconciler:
 
         self._check_ghost_fills(summary)
 
+    def _has_durable_exit_submit_intent(self, order: dict) -> bool:
+        """Identify EXIT rows that must bypass legacy missing-ID matching."""
+        if not isinstance(order, dict):
+            return False
+        if str(order.get("kind") or "").strip().upper() != "EXIT":
+            return False
+        broker_id = str(order.get("broker_order_id") or "").strip().upper()
+        if broker_id and broker_id not in {
+            "N/A", "PENDING", "UNKNOWN", "NULL", "NONE", "?", "0",
+        }:
+            return False
+        meta = order.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                # A row that visibly carries the durable key must not be sent
+                # to permissive fuzzy recovery when its metadata is malformed.
+                return "submit_intent_at" in meta or "broker_submit_key" in meta
+        if not isinstance(meta, dict):
+            return False
+        return bool(
+            str(meta.get("submit_intent_at") or "").strip()
+            or str(meta.get("broker_submit_key") or "").strip()
+            or str(meta.get("broker_submit_payload_hash") or "").strip()
+            or str(meta.get("current_owner") or "").strip().startswith(
+                "broker_submit:"
+            )
+        )
+
+    def _resume_durable_exit_submit_intent(self, order: dict, summary: dict) -> bool:
+        """Run the single canonical-tag-first EXIT recovery seam.
+
+        Returning True means the row was handled or deliberately held.  In
+        either case the caller must not fall through to legacy fuzzy identity
+        recovery or age-based phantom cancellation.
+        """
+        local_id = str(order.get("local_order_id") or order.get("id") or "").strip()
+        contract = self._norm_contract(order.get("contract") or order.get("symbol") or "?")
+        resume = getattr(self.osm, "resume_exit_submit_intent", None)
+        if not callable(resume):
+            self._alert(
+                f"EXIT_SUBMIT_INTENT_RECOVERY_UNAVAILABLE | {contract or '?'} | {local_id or '?'} | "
+                "strict canonical recovery seam is not wired; holding durable submit intent"
+            )
+            summary["orders_alerted"] += 1
+            return True
+        try:
+            outcome = resume(broker=self.broker, local_order_id=local_id) or {}
+        except Exception as exc:
+            log.critical(
+                "[%s] durable EXIT submit-intent recovery raised local=%s: %s",
+                self.client_id,
+                local_id,
+                exc,
+                exc_info=True,
+            )
+            self._alert(
+                f"EXIT_SUBMIT_INTENT_RECOVERY_HELD | {contract or '?'} | {local_id or '?'} | "
+                f"{type(exc).__name__}"
+            )
+            summary["orders_alerted"] += 1
+            return True
+
+        if outcome.get("ok"):
+            summary["orders_corrected"] += 1
+            self._missing_id_exit_tracker.pop(local_id, None)
+            self._alert(
+                f"EXIT_SUBMIT_INTENT_RECOVERED | {contract or '?'} | {local_id} | "
+                f"broker_order_id={outcome.get('broker_order_id') or 'none'} | "
+                f"reason={outcome.get('error') or 'canonical_recovery'}"
+            )
+            return True
+
+        self._alert(
+            f"EXIT_SUBMIT_INTENT_RECOVERY_HELD | {contract or '?'} | {local_id or '?'} | "
+            f"reason={outcome.get('error') or 'reconciliation_required'}"
+        )
+        summary["orders_alerted"] += 1
+        return True
+
     def _resolve_missing_id_exit_truth(self, order: dict, summary: dict, *, reason: str = "") -> bool:
         """Resolve an EXIT order that has no broker_order_id into exactly one safe endpoint.
 
@@ -1317,6 +1399,9 @@ class APBrokerReconciler:
           - no broker order/fill after repeated proof -> mark replacement safe and terminal-cancel local order
           - ambiguous/unknown -> alert and keep quarantine
         """
+        if self._has_durable_exit_submit_intent(order):
+            return self._resume_durable_exit_submit_intent(order, summary)
+
         local_id      = str(order.get("local_order_id") or order.get("id") or "")
         pos_id        = str(order.get("position_id") or order.get("positionId") or "").strip()
         contract      = self._norm_contract(order.get("contract") or order.get("symbol") or "")
@@ -1483,6 +1568,10 @@ class APBrokerReconciler:
             "EXIT_REQUESTED", "EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL",
             "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL",
         }:
+            if self._has_durable_exit_submit_intent(order):
+                self._resume_durable_exit_submit_intent(order, summary)
+                return
+
             if self._recover_missing_broker_id_exit(order, summary):
                 self._missing_id_exit_tracker.pop(str(local_id), None)
                 return

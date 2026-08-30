@@ -73,6 +73,26 @@ def _extract_broker_account_id(broker: Any) -> str:
     )
 
 
+def _declared_broker_capability(broker: Any, name: str):
+    """Return a broker method explicitly supplied by the adapter.
+
+    ``getattr`` alone is unsafe with permissive test doubles and proxy
+    objects that manufacture arbitrary attributes. Strict money-path
+    capabilities must be present on the adapter type or explicitly attached
+    to the instance; otherwise callers must classify the snapshot as
+    unavailable rather than treating a fabricated callable as authority.
+    """
+    method = getattr(type(broker), name, None)
+    if callable(method):
+        return getattr(broker, name, None)
+    instance_attrs = getattr(broker, "__dict__", {})
+    if isinstance(instance_attrs, dict):
+        method = instance_attrs.get(name)
+        if callable(method):
+            return method
+    return None
+
+
 def _extract_position_account_id(raw: dict[str, Any]) -> str:
     nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
     for key in ("account_id", "account", "account_number"):
@@ -184,13 +204,13 @@ def resolve_exit_broker_truth(
     # The production Tradier adapter exposes a strict capability so a request
     # failure cannot be collapsed into its legacy ``list_positions() == []``
     # compatibility result. Test doubles and older adapters retain fallback.
-    strict_method = getattr(type(broker), "list_positions_strict", None)
-    list_positions = (
-        getattr(broker, "list_positions_strict", None)
-        if callable(strict_method)
-        else getattr(broker, "list_positions", None)
-    )
-    audit["source"] = "broker.list_positions_strict" if callable(strict_method) else "broker.list_positions"
+    # Resolve only a capability declared by the concrete adapter (or explicitly
+    # attached to its instance); ``MagicMock`` creates arbitrary callable
+    # attributes on demand, which must not masquerade as strict broker truth.
+    strict_method = _declared_broker_capability(broker, "list_positions_strict")
+    is_strict = callable(strict_method)
+    list_positions = strict_method if is_strict else getattr(broker, "list_positions", None)
+    audit["source"] = "broker.list_positions_strict" if is_strict else "broker.list_positions"
     if not callable(list_positions):
         audit["snapshot_status"] = "broker_positions_unavailable"
         audit["error"] = "broker_list_positions_missing"
@@ -212,10 +232,21 @@ def resolve_exit_broker_truth(
         }
 
     if rows is None:
+        # The strict adapter contract never uses ``None`` for a successful
+        # empty account snapshot.  Treat it as an evidence gap so recovery
+        # cannot mistake a malformed response for broker-flat truth.
+        if is_strict:
+            audit["snapshot_status"] = "broker_positions_malformed"
+            audit["error"] = "strict_snapshot_none"
+            return {
+                "broker_truth_open_qty": None,
+                "is_fresh_exact": False,
+                "audit": audit,
+            }
         rows = []
-    if isinstance(rows, dict):
+    if isinstance(rows, dict) and not is_strict:
         rows = [rows]
-    if not isinstance(rows, list):
+    if not isinstance(rows, list) or (is_strict and any(not isinstance(row, dict) for row in rows)):
         audit["snapshot_status"] = "broker_positions_malformed"
         audit["error"] = f"unexpected_payload:{type(rows).__name__}"
         return {
@@ -979,7 +1010,9 @@ def resolve_protective_exit_takeover(
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="broker_already_flat")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_BROKER_FLAT", "audit": audit}
 
-    list_orders_strict = getattr(broker, "list_orders_strict", None)
+    list_orders_strict = _declared_broker_capability(
+        broker, "list_orders_strict"
+    )
     if not callable(list_orders_strict):
         audit.update(event="EXIT_PROTECTIVE_REPLACEMENT_BLOCKED", reason="list_orders_strict_unavailable")
         return {"allowed": False, "replacement_qty": 0, "reason": "EXIT_PROTECTIVE_ORDERS_UNAVAILABLE", "audit": audit}
