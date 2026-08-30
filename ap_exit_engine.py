@@ -4381,6 +4381,7 @@ class APExitEngine:
                         # replacement durable owner.
                         existing.closed = True
                         existing.quantity_remaining = 0
+                        _clear_adoption_identity_quarantine(pos)
                         continue
                     log.debug(
                         "[%s] Exit engine already tracking %s | pos_id=%s",
