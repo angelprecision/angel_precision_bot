@@ -1314,6 +1314,34 @@ class TestIntegrationOrderMonitor:
         assert result_reason == "canonical_recovery_terminalized"
         assert osm.cancel_calls == [(r["local_order_id"], reason)]
 
+    def test_order_monitor_trigger_ready_retry_stays_owned_read_only(self):
+        """Production order-monitor caller must preserve a canonical retry."""
+        from ap.order_monitor import APOrderMonitor
+
+        row = _canonical_trigger_ready_retry_row()
+        osm = _MockOSM()
+        osm.seed(row)
+        before_meta = dict(osm._rows[row["local_order_id"]]["meta"])
+
+        monitor = APOrderMonitor.__new__(APOrderMonitor)
+        monitor.client_id = "client@test.com"
+        monitor.client_mode = "PAPER"
+        monitor.osm = osm
+        monitor.entry_watcher = None
+        monitor.broker = MagicMock()
+
+        attempted, succeeded, reason = monitor._canonical_pending_trigger_rearm(
+            row,
+            row["local_order_id"],
+            row["contract"],
+            is_past_eod=False,
+        )
+
+        assert (attempted, succeeded) == (True, True)
+        assert reason == "canonical_recovery_retry_owned"
+        assert osm.cancel_calls == []
+        assert osm._rows[row["local_order_id"]]["meta"] == before_meta
+
     def test_canonical_rearm_observes_active_materializer_read_only(self):
         """The order-monitor consumer must preserve MATERIALIZATION_OWNED."""
         from ap.order_monitor import APOrderMonitor
