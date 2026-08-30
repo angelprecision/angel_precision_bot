@@ -447,6 +447,20 @@ class TestTriggerReadyMaterializationRetryFence:
 
         assert classify_pending_trigger_row(row, watcher_owned=False) == PTC.STUCK_TRIGGER_READY
 
+    @pytest.mark.parametrize("attempts", [True, "1", 1.0])
+    def test_durable_reread_rejects_coercible_attempts(self, attempts):
+        """Retry ownership proof must reject non-integer JSONB values."""
+        row = _canonical_trigger_ready_retry_row()
+        rec, osm = _make_recovery(row, watcher=None)
+
+        durable = dict(row)
+        durable["meta"] = dict(row["meta"])
+        durable["meta"]["materialization_attempts"] = attempts
+        osm._rows[row["local_order_id"]] = durable
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.cancel_calls == []
+
     def test_nested_terminal_outcome_wins_over_retry_shape(self):
         from ap.pending_trigger_classifier import classify_pending_trigger_row
 
@@ -516,12 +530,14 @@ class TestTriggerReadyMaterializationRetryFence:
             )
         }
         rec, osm = _make_recovery(row, watcher=None)
+        before_meta = dict(osm._rows[row["local_order_id"]]["meta"])
 
         assert [rec.recover_one_row(row) for _ in range(2)] == [
             _RowOutcome.RETRY_OWNED,
             _RowOutcome.RETRY_OWNED,
         ]
         assert osm.cancel_calls == []
+        assert osm._rows[row["local_order_id"]]["meta"] == before_meta
         assert {
             key: osm._rows[row["local_order_id"]]["meta"][key]
             for key in retry_fields
