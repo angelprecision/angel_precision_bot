@@ -3998,9 +3998,12 @@ class APExitEngine:
                         continue
                     _repairs_to_remove.append(p)
                 for _rp in _repairs_to_remove:
-                    if not _converge_broker_repair_db_identity(
-                        _client, _norm_canonical, _contract,
-                        str(getattr(_rp, "position_id", "") or ""), _canon_id,
+                    if (
+                        bool(getattr(_rp, "broker_repair_provisional", False))
+                        and not _converge_broker_repair_db_identity(
+                            _client, _norm_canonical, _contract,
+                            str(getattr(_rp, "position_id", "") or ""), _canon_id,
+                        )
                     ):
                         return CanonicalAdoptionResult(
                             disposition="RETRY_ADOPTION_ERROR", adopted=False,
@@ -4166,8 +4169,11 @@ class APExitEngine:
 
                 # Found a valid broker-repair position — upgrade in place.
                 old_id = _pid
-                if not _converge_broker_repair_db_identity(
-                    _client, _mode, _contract, old_id, _canon_id,
+                if (
+                    bool(getattr(pos, "broker_repair_provisional", False))
+                    and not _converge_broker_repair_db_identity(
+                        _client, _mode, _contract, old_id, _canon_id,
+                    )
                 ):
                     return CanonicalAdoptionResult(
                         disposition="RETRY_ADOPTION_ERROR", adopted=False,
