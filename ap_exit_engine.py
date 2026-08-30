@@ -3559,6 +3559,28 @@ def _broker_repair_lookup_marker(status: str, reason: str = "") -> dict:
     return {"_lookup_status": status, "_lookup_reason": reason}
 
 
+_BROKER_REPAIR_PROVENANCE_KEY = "broker_repair_provenance"
+_BROKER_REPAIR_PROVENANCE_VALUE = "broker_recovery_uuid"
+
+
+def _broker_repair_provenance_from_row(row: dict) -> str:
+    """Read explicit durable recovery provenance without inferring from identity gaps."""
+    if not isinstance(row, dict):
+        return ""
+    direct = str(row.get(_BROKER_REPAIR_PROVENANCE_KEY) or "").strip().lower()
+    if direct:
+        return direct
+    meta = _broker_repair_order_meta(row.get("meta"))
+    return str(meta.get(_BROKER_REPAIR_PROVENANCE_KEY) or "").strip().lower()
+
+
+def _broker_repair_row_is_provisional(row: dict) -> bool:
+    return (
+        _broker_repair_provenance_from_row(row)
+        == _BROKER_REPAIR_PROVENANCE_VALUE
+    )
+
+
 def _is_broker_repair_provisional(position) -> bool:
     """Identify a provisional broker-recovery owner independent of UUID format."""
     if bool(getattr(position, "broker_repair_provisional", False)):
@@ -3566,6 +3588,16 @@ def _is_broker_repair_provisional(position) -> bool:
     if bool(getattr(position, "brokerrepairprovisional", False)):
         return True
     return str(getattr(position, "position_id", "") or "").startswith("broker-repair-")
+
+
+def _clear_broker_repair_provisional(position) -> None:
+    """Canonical adoption must remove every in-memory repair-provenance spelling."""
+    try:
+        position.broker_repair_provisional = False
+        position.brokerrepairprovisional = False
+        position.broker_repair_provenance = ""
+    except Exception as exc:
+        log.debug("[exit_eng] clear broker-repair provenance failed: %s", exc)
 
 
 def _converge_broker_repair_db_identity(
@@ -3578,7 +3610,7 @@ def _converge_broker_repair_db_identity(
     client_id = str(client_id or "").strip().lower()
     execution_mode = str(execution_mode or "").strip().lower()
     contract = str(contract or "").strip().upper()
-    if not provisional_id or not canonical_id or provisional_id == canonical_id:
+    if not provisional_id or not canonical_id:
         return True
     try:
         from ap.db import conn, run_with_retry
@@ -3589,6 +3621,26 @@ def _converge_broker_repair_db_identity(
                     "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
                     (lock_key,),
                 )
+                if provisional_id == canonical_id:
+                    cur.execute(
+                        """UPDATE positions
+                           SET meta = COALESCE(meta, '{}'::jsonb) - %s,
+                               updated_at = NOW()
+                           WHERE id = %s AND client_id = %s
+                             AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                             AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                             AND UPPER(TRIM(COALESCE(status, ''))) IN
+                                 ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                             AND COALESCE(quantity_remaining, qty, 0) > 0""",
+                        (
+                            _BROKER_REPAIR_PROVENANCE_KEY,
+                            canonical_id,
+                            client_id,
+                            execution_mode,
+                            contract,
+                        ),
+                    )
+                    return cur.rowcount in (0, 1)
                 cur.execute(
                     """SELECT id FROM positions
                        WHERE id = %s AND client_id = %s
@@ -3628,14 +3680,23 @@ def _converge_broker_repair_db_identity(
                     )
                     return cur.rowcount == 1
                 cur.execute(
-                    """UPDATE positions SET id = %s
+                    """UPDATE positions
+                       SET id = %s,
+                           meta = COALESCE(meta, '{}'::jsonb) - %s
                        WHERE id = %s AND client_id = %s
                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                          AND UPPER(TRIM(COALESCE(contract, ''))) = %s
                          AND UPPER(TRIM(COALESCE(status, ''))) IN
                              ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
                          AND COALESCE(quantity_remaining, qty, 0) > 0""",
-                    (canonical_id, provisional_id, client_id, execution_mode, contract),
+                    (
+                        canonical_id,
+                        _BROKER_REPAIR_PROVENANCE_KEY,
+                        provisional_id,
+                        client_id,
+                        execution_mode,
+                        contract,
+                    ),
                 )
                 return cur.rowcount == 1
 
@@ -4003,6 +4064,8 @@ class APExitEngine:
                 _repairs_to_remove = []
                 _identity_unproven_repairs = []
                 for p in self._positions:
+                    if p is _existing_canon:
+                        continue
                     if not _is_broker_repair_provisional(p):
                         continue
                     if str(getattr(p, "option_symbol", "") or "").upper().strip() != _contract:
@@ -4113,6 +4176,22 @@ class APExitEngine:
                     )
 
                 _reclassify_hard_ref_for_entry(_existing_canon)
+
+                # A previously adopted UUID repair may already be indexed under
+                # the canonical id. Positive canonical identity clears both its
+                # durable and in-memory recovery provenance; it must never remove
+                # itself as a repair on a repeated adoption call.
+                if _is_broker_repair_provisional(_existing_canon):
+                    if not _converge_broker_repair_db_identity(
+                        _client, _norm_canonical, _contract,
+                        _canon_id, _canon_id,
+                    ):
+                        return CanonicalAdoptionResult(
+                            disposition="RETRY_ADOPTION_ERROR", adopted=False,
+                            safe_to_seed=False, retryable=True,
+                            reason="canonical_provenance_clear_failed",
+                        )
+                    _clear_broker_repair_provisional(_existing_canon)
 
                 # Assert exactly one nonclosed active object for this contract.
                 _active_for_contract = [
@@ -4237,6 +4316,7 @@ class APExitEngine:
 
                 # ── Canonical identity fields ──────────────────────────────────
                 pos.position_id = _canon_id
+                _clear_broker_repair_provisional(pos)
                 if client_id:
                     pos.client_id = _client
                 if signal_id:
@@ -4379,33 +4459,66 @@ class APExitEngine:
                     _incoming_id = str(getattr(pos, "position_id", "") or "")
                     _incoming_client = str(getattr(pos, "client_id", "") or "").strip().lower()
                     _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                    _incoming_is_provisional = _is_broker_repair_provisional(pos)
+                    _existing_is_provisional = _is_broker_repair_provisional(existing)
+                    _existing_client = str(
+                        getattr(existing, "client_id", "") or ""
+                    ).strip().lower()
+                    _existing_mode = str(
+                        getattr(existing, "execution_mode", "") or ""
+                    ).strip().lower()
+                    _same_durable_identity = (
+                        bool(_incoming_client)
+                        and _incoming_client == _existing_client
+                        and _incoming_mode in {"live", "paper"}
+                        and _incoming_mode == _existing_mode
+                    )
                     _incoming_is_proven_canonical = (
                         _incoming_id
-                        and not _is_broker_repair_provisional(pos)
+                        and not _incoming_is_provisional
                         and _incoming_client
                         and _incoming_mode in {"live", "paper"}
+                    )
+                    _can_replace_quarantined_repair = (
+                        _same_durable_identity
+                        and _existing_is_provisional
+                        and (
+                            _incoming_is_proven_canonical
+                            or _incoming_is_provisional
+                        )
                     )
                     if (
                         same_sym
                         and not same_id
                         and _is_adoption_identity_quarantined(existing)
-                        and (
-                            _incoming_is_proven_canonical
-                            or (
-                                _is_broker_repair_provisional(pos)
-                            )
-                        )
+                        and _can_replace_quarantined_repair
                     ):
-                        log.warning(
-                            "[exit_eng] ADD_POSITION_CANONICAL_BYPASSES_QUARANTINED_REPAIR "
-                            "| canonical=%s repair=%s contract=%s",
-                            _incoming_id,
-                            getattr(existing, "position_id", ""),
-                            getattr(pos, "option_symbol", ""),
-                        )
-                        # Retain the quarantined object for audit visibility, but
+                        if _incoming_is_provisional:
+                            log.critical(
+                                "[exit_eng] "
+                                "ADD_POSITION_PROVISIONAL_BYPASSES_QUARANTINED_REPAIR "
+                                "client=%s mode=%s contract=%s provisional_id=%s "
+                                "quarantined_id=%s",
+                                _incoming_client,
+                                _incoming_mode,
+                                getattr(pos, "option_symbol", ""),
+                                _incoming_id,
+                                getattr(existing, "position_id", ""),
+                            )
+                        else:
+                            log.warning(
+                                "[exit_eng] "
+                                "ADD_POSITION_CANONICAL_BYPASSES_QUARANTINED_REPAIR "
+                                "client=%s mode=%s contract=%s canonical=%s repair=%s",
+                                _incoming_client,
+                                _incoming_mode,
+                                getattr(pos, "option_symbol", ""),
+                                _incoming_id,
+                                getattr(existing, "position_id", ""),
+                            )
+                        # Retain the quarantined repair for audit visibility, but
                         # retire it as an active owner before installing the
-                        # replacement durable owner.
+                        # exact same-domain replacement durable owner.
                         existing.closed = True
                         existing.quantity_remaining = 0
                         _clear_adoption_identity_quarantine(pos)
@@ -7368,7 +7481,7 @@ class APExitEngine:
                                qty, quantity_remaining, avg_fill, entry_price,
                                underlying_entry, stop_underlying, target_underlying,
                                entry_ts, status, signal_id, execution_mode,
-                               local_order_id, broker_order_id
+                               local_order_id, broker_order_id, meta
                         FROM positions
                         WHERE client_id = %s
                           AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
@@ -7515,6 +7628,14 @@ class APExitEngine:
             if order.get("filled_ts") and _broker_repair_timestamp(order.get("filled_ts")):
                 entry_ts = order.get("filled_ts")
 
+            position_meta = (
+                {
+                    _BROKER_REPAIR_PROVENANCE_KEY:
+                        _BROKER_REPAIR_PROVENANCE_VALUE,
+                }
+                if not proven_position_id
+                else {}
+            )
             repair_row = {
                 "id": position_id,
                 "client_id": self._email,
@@ -7537,15 +7658,19 @@ class APExitEngine:
                 "signal_id": signal_id,
                 "local_order_id": local_order_id,
                 "broker_order_id": broker_order_id,
+                "meta": position_meta,
             }
 
             def _remember(row_id, row: Optional[dict] = None):
                 cached = dict(row or repair_row)
                 cached["id"] = str(row_id)
-                # A conflict re-query may return a UUID row without the
-                # in-memory provenance marker.  Reapply the marker from the
-                # exact evidence selected for this broker-repair attempt.
-                cached["broker_repair_provisional"] = not bool(proven_position_id)
+                # A no-id fill is uncertainty, not proof that an independently
+                # written canonical row is provisional. Only the durable marker
+                # written by this recovery INSERT can classify a UUID repair.
+                cached["broker_repair_provisional"] = (
+                    not bool(proven_position_id)
+                    and _broker_repair_row_is_provisional(cached)
+                )
                 return _BrokerRepairIdentity(str(row_id), cached)
 
             def _ins():
@@ -7607,7 +7732,7 @@ class APExitEngine:
                             entry_price, avg_fill,
                             underlying_entry, stop_underlying, target_underlying,
                             status, entry_ts, signal_id,
-                            local_order_id, broker_order_id, updated_at
+                            local_order_id, broker_order_id, meta, updated_at
                         ) VALUES (
                             %s, %s, %s, %s, %s,
                             %s,
@@ -7616,7 +7741,7 @@ class APExitEngine:
                             %s, %s,
                             %s, %s, %s,
                             'OPEN', %s, %s,
-                            %s, %s, NOW()
+                            %s, %s, %s::jsonb, NOW()
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING id
@@ -7629,6 +7754,7 @@ class APExitEngine:
                             underlying_entry, underlying_stop, underlying_target,
                             entry_ts, signal_id,
                             local_order_id, broker_order_id,
+                            _json.dumps(position_meta),
                         ),
                     )
                     row = c.fetchone()
@@ -7801,10 +7927,13 @@ class APExitEngine:
                     "none", "null", "nan", "unknown", "n/a", "unavailable",
                 }:
                     setattr(mp, _identity_attr, _normalized_identity)
-        if bool(row.get("broker_repair_provisional")) or (
-            str(row.get("broker_repair_provenance") or "").strip().lower()
-            == "broker_recovery"
-        ):
+        _explicit_provisional = row.get("broker_repair_provisional")
+        _row_is_provisional = (
+            bool(_explicit_provisional)
+            if _explicit_provisional is not None
+            else _broker_repair_row_is_provisional(row)
+        )
+        if _row_is_provisional:
             mp.broker_repair_provisional = True
             mp.brokerrepairprovisional = True
 
@@ -8018,12 +8147,10 @@ class APExitEngine:
             # ── 3a. Try DB load ───────────────────────────────────────────────
             db_row = self._load_db_position_row(sym)
             if db_row:
-                # Reconstruct repair provenance after a process restart from
-                # the exact filled-ENTRY evidence.  The production positions
-                # schema has no provenance column: a canonical order linked to
-                # this row proves it is canonical; an exact fill with no
-                # position_id (or a different canonical id) proves this row
-                # is a provisional broker-repair owner.
+                # Durable positions.meta provenance survives restart. Filled
+                # ENTRY identity may positively confirm or contradict the row,
+                # but a missing order position_id is uncertainty and must never
+                # classify an otherwise canonical row as provisional.
                 try:
                     _repair_evidence = self._find_exact_filled_entry_order(
                         sym, self._resolved_execution_mode(), bp
@@ -8036,10 +8163,9 @@ class APExitEngine:
                         _evidence_position_id = _broker_repair_position_id(
                             _repair_evidence.get("position_id")
                         )
-                        if _db_position_id:
+                        if _db_position_id and _evidence_position_id:
                             db_row["broker_repair_provisional"] = (
-                                not _evidence_position_id
-                                or _evidence_position_id != _db_position_id
+                                _evidence_position_id != _db_position_id
                             )
                 except Exception as _provenance_err:
                     log.debug(
