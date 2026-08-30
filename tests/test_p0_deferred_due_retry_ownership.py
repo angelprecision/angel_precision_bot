@@ -3326,7 +3326,8 @@ def test_real_postgres_recovery_dispatches_due_retry_to_execution_core(monkeypat
     def db_conn():
         connection = psycopg2.connect(database_url)
         try:
-            yield connection
+            with connection.cursor() as cursor:
+                yield cursor
             connection.commit()
         finally:
             connection.close()
