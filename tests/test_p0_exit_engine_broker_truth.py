@@ -1386,19 +1386,19 @@ def test_load_db_position_row_returns_underlying_entry_stop_target_columns(monke
                     id, client_id, underlying, contract, option_symbol, execution_mode,
                     side, direction, qty, quantity_remaining, avg_fill, entry_price,
                     underlying_entry, stop_underlying, target_underlying,
-                    entry_ts, status, signal_id
+                    entry_ts, status, signal_id, local_order_id, broker_order_id
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s,
                     %s, %s, %s,
-                    NOW(), %s, %s
+                    NOW(), %s, %s, %s, %s
                 )
                 """,
                 (
                     "canonical-position-hydration", client, "NOW", contract, contract, "live",
                     "PUT", "PUT", 1, 1, 1.30, 1.30,
                     127.425, 130.44, 124.78,
-                    "OPEN", "sig-hydration",
+                    "OPEN", "sig-hydration", "local-entry-123", "broker-entry-456",
                 ),
             )
         pg_conn.commit()
@@ -1419,6 +1419,8 @@ def test_load_db_position_row_returns_underlying_entry_stop_target_columns(monke
         assert row.get("underlying_entry") == pytest.approx(127.425)
         assert row.get("stop_underlying") == pytest.approx(130.44)
         assert row.get("target_underlying") == pytest.approx(124.78)
+        assert row.get("local_order_id") == "local-entry-123"
+        assert row.get("broker_order_id") == "broker-entry-456"
 
         # End-to-end: hydration must flow all the way through to the
         # ManagedPosition the exit engine consumes.
@@ -1426,6 +1428,10 @@ def test_load_db_position_row_returns_underlying_entry_stop_target_columns(monke
         assert mp.underlying_entry == pytest.approx(127.425)
         assert mp.underlying_stop == pytest.approx(130.44)
         assert mp.underlying_target == pytest.approx(124.78)
+        assert mp.position_id == "canonical-position-hydration"
+        assert mp.entry_local_order_id == "local-entry-123"
+        assert mp.entry_broker_order_id == "broker-entry-456"
+        assert mp.execution_mode == "live"
 
 
 @_skip_if_no_mod
@@ -1773,3 +1779,66 @@ def test_postgres_fixture_wrapper_returns_dict_rows(monkeypatch):
         assert isinstance(row, dict), f"Expected dict, got {type(row).__name__}"
         assert row["id"] == "wrap-1"
         assert row["execution_mode"] == "live"
+
+
+@_skip_if_no_mod
+def test_postgres_provisional_uuid_converges_to_later_canonical_identity(monkeypatch):
+    """Real PostgreSQL proof: UUID repair A converges to canonical B."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        client = "convergence@example.com"
+        contract = "QQQ260830P00450000"
+        repair_id = "7d2f9f1e-7e31-4cb1-9b7e-2cf5f6a0b001"
+        canonical_id = "canonical-position-b"
+        with pg_conn.cursor() as cur:
+            for pid in (repair_id, canonical_id):
+                cur.execute(
+                    """INSERT INTO positions (
+                           id, client_id, underlying, contract, option_symbol,
+                           execution_mode, side, direction, qty, quantity_remaining,
+                           avg_fill, entry_price, underlying_entry, stop_underlying,
+                           target_underlying, status, signal_id
+                       ) VALUES (
+                           %s, %s, %s, %s, %s, 'live', 'PUT', 'PUT', 1, 1,
+                           1.50, 1.50, 450.0, 455.0, 440.0, 'OPEN', %s)""",
+                    (pid, client, "QQQ", contract, contract, pid),
+                )
+        pg_conn.commit()
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").RLock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="live")
+        repair = eng._managed_position_from_row({
+            "id": repair_id, "client_id": client, "underlying": "QQQ",
+            "contract": contract, "option_symbol": contract, "execution_mode": "live",
+            "side": "PUT", "qty": 1, "quantity_remaining": 1,
+            "entry_price": 1.50, "underlying_entry": 450.0,
+            "stop_underlying": 455.0, "target_underlying": 440.0,
+            "status": "OPEN", "broker_repair_provisional": True,
+        }, qty_override=1, prefer_qty_override=True)
+        eng.add_position(repair)
+        result = eng.adopt_canonical_position_identity(
+            contract=contract, canonical_position_id=canonical_id,
+            local_order_id="", broker_order_id="", signal_id="",
+            canonical_signal_id="", entry_fill=1.50, entry_ts=None,
+            execution_mode="live", client_id=client,
+            underlying_entry=450.0, underlying_stop=455.0,
+            underlying_target=440.0,
+        )
+        assert result.adopted is True
+        assert repair_id != canonical_id
+        assert [p.position_id for p in eng.active_positions()] == [canonical_id]
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status, quantity_remaining FROM positions
+                   WHERE client_id = %s AND execution_mode = 'live' AND contract = %s
+                   ORDER BY id""", (client, contract))
+            rows = cur.fetchall()
+        active = [r for r in rows if r[1] in ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")]
+        assert len(active) == 1
+        assert active[0][0] == canonical_id
+        assert any(r[0] == repair_id and r[1] == "CLOSED" and r[2] == 0 for r in rows)
