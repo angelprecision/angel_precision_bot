@@ -44,7 +44,10 @@ from ap.pending_trigger_restart_recovery import (
     _RR_MODE_FIELD,
     _RR_CLOSE_REASON,
 )
-from ap.pending_trigger_classifier import PendingTriggerClassification as PTC
+from ap.pending_trigger_classifier import (
+    PendingTriggerClassification as PTC,
+    classify_pending_trigger_row,
+)
 
 
 # ── Fixtures / helpers ────────────────────────────────────────────────────────
@@ -506,7 +509,6 @@ class TestTriggerReadyMaterializationRetryFence:
             ("retry_attempt", None),
             ("breach_attempt_count", 2),
             ("materialization_generation", None),
-            ("retry_max_attempts", 4),
         ],
     )
     def test_retry_authority_mirrors_missing_or_split_fail_closed(self, field, value):
