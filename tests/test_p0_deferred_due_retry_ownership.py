@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import threading
+from contextlib import contextmanager
 import time
 
 # PR #389 amendment: ap.order_state_machine imports ap.db which requires a
@@ -3301,3 +3303,129 @@ def test_source_less_quote_still_requires_approved_tradier_transport(base_url):
 
     assert result["valid"] is False
     assert result["reason"] == "MARKET_QUOTE_UNAPPROVED_TRANSPORT"
+
+
+@pytest.mark.integration
+def test_real_postgres_recovery_dispatches_due_retry_to_execution_core(monkeypatch):
+    """Exercise the real APRecovery SQL load and due-executor boundary.
+
+    The database row is production-shaped and loaded through the same orders
+    query used by startup recovery. The executor is a narrow spy: this test
+    proves recovery dispatches exactly once with the durable generation/attempt
+    values, without pretending to prove broker submission.
+    """
+    psycopg2 = pytest.importorskip("psycopg2")
+    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL") or os.getenv("DATABASE_URL")
+    if not database_url or "mock" in database_url:
+        pytest.skip("real PostgreSQL test database is not configured")
+
+    row = _row(next_retry_offset_seconds=-60)
+    local_order_id = row["local_order_id"]
+    meta = json.dumps(row["meta"])
+
+    @contextmanager
+    def db_conn():
+        connection = psycopg2.connect(database_url)
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    connection = psycopg2.connect(database_url)
+    try:
+        with connection:
+            with connection.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS orders (
+                        local_order_id text PRIMARY KEY,
+                        client_id text,
+                        signal_id text,
+                        plan_id text,
+                        symbol text,
+                        contract text,
+                        direction text,
+                        score double precision,
+                        tier text,
+                        trigger_price double precision,
+                        stop_underlying double precision,
+                        target_underlying double precision,
+                        pattern text,
+                        timeframe text,
+                        execution_mode text,
+                        qty integer,
+                        limit_price double precision,
+                        reserved_cost double precision,
+                        status text,
+                        broker_order_id text,
+                        submitted_ts timestamptz,
+                        kind text,
+                        meta jsonb,
+                        created_ts timestamptz
+                    )
+                """)
+                cur.execute("DELETE FROM orders WHERE local_order_id = %s", (local_order_id,))
+                cur.execute("""
+                    INSERT INTO orders (
+                        local_order_id, client_id, signal_id, plan_id, symbol,
+                        contract, direction, score, tier, trigger_price,
+                        stop_underlying, target_underlying, pattern, timeframe,
+                        execution_mode, qty, limit_price, reserved_cost, status,
+                        broker_order_id, submitted_ts, kind, meta, created_ts
+                    ) VALUES (
+                        %(local_order_id)s, %(client_id)s, %(signal_id)s, %(plan_id)s,
+                        %(symbol)s, %(contract)s, %(direction)s, %(score)s, %(tier)s,
+                        %(trigger_price)s, %(stop_underlying)s, %(target_underlying)s,
+                        %(pattern)s, %(timeframe)s, %(execution_mode)s, %(qty)s,
+                        %(limit_price)s, %(reserved_cost)s, %(status)s,
+                        %(broker_order_id)s, %(submitted_ts)s, %(kind)s, %(meta)s::jsonb,
+                        NOW()
+                    )
+                """, {**row, "meta": meta})
+    finally:
+        connection.close()
+
+    class DbOSM:
+        client_id = CLIENT_ID
+
+        def __init__(self):
+            self.broker_calls = []
+
+        def get_order(self, oid):
+            return None
+
+        def update_order_meta(self, oid, patch):
+            return True
+
+    osm = DbOSM()
+    executor = MagicMock(return_value={"disposition": "SUBMITTED", "reason_code": "TEST_SUBMITTED"})
+    core = SimpleNamespace(
+        execution_mode="paper",
+        broker=MagicMock(),
+        order_state_machine=osm,
+        resume_deferred_materialization_retry=executor,
+    )
+    recovery = _recovery(core, watcher=None)
+    import ap.db
+    monkeypatch.setattr(ap.db, "conn", db_conn)
+
+    try:
+        result = {}
+        recovery._recover_deferred_breach_lifecycles(result)
+    finally:
+        cleanup = psycopg2.connect(database_url)
+        try:
+            with cleanup:
+                with cleanup.cursor() as cur:
+                    cur.execute("DELETE FROM orders WHERE local_order_id = %s", (local_order_id,))
+        finally:
+            cleanup.close()
+
+    executor.assert_called_once()
+    kwargs = executor.call_args.kwargs
+    assert kwargs["local_order_id"] == local_order_id
+    assert kwargs["expected_generation"] == 1
+    assert kwargs["expected_retry_attempt"] == 2
+    assert result.get("recovered") == 1
+    core.broker.submit_order.assert_not_called()
+    core.broker.cancel_order.assert_not_called()
