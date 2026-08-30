@@ -4480,11 +4480,11 @@ class APExitEngine:
                         and _incoming_mode in {"live", "paper"}
                     )
                     _can_replace_quarantined_repair = (
-                        _same_durable_identity
-                        and _existing_is_provisional
-                        and (
-                            _incoming_is_proven_canonical
-                            or _incoming_is_provisional
+                        _incoming_is_proven_canonical
+                        or (
+                            _incoming_is_provisional
+                            and _same_durable_identity
+                            and _existing_is_provisional
                         )
                     )
                     if (
