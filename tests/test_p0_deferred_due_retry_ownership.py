@@ -3314,6 +3314,8 @@ def test_real_postgres_recovery_dispatches_due_retry_to_execution_core(monkeypat
     values, without pretending to prove broker submission.
     """
     psycopg2 = pytest.importorskip("psycopg2")
+    from psycopg2.extras import RealDictCursor
+
     database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL") or os.getenv("DATABASE_URL")
     if not database_url or "mock" in database_url:
         pytest.skip("real PostgreSQL test database is not configured")
@@ -3326,7 +3328,7 @@ def test_real_postgres_recovery_dispatches_due_retry_to_execution_core(monkeypat
     def db_conn():
         connection = psycopg2.connect(database_url)
         try:
-            with connection.cursor() as cursor:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 yield cursor
             connection.commit()
         finally:
