@@ -3559,6 +3559,96 @@ def _broker_repair_lookup_marker(status: str, reason: str = "") -> dict:
     return {"_lookup_status": status, "_lookup_reason": reason}
 
 
+def _is_broker_repair_provisional(position) -> bool:
+    """Identify a provisional broker-recovery owner independent of UUID format."""
+    if bool(getattr(position, "broker_repair_provisional", False)):
+        return True
+    if bool(getattr(position, "brokerrepairprovisional", False)):
+        return True
+    return str(getattr(position, "position_id", "") or "").startswith("broker-repair-")
+
+
+def _converge_broker_repair_db_identity(
+    client_id: str, execution_mode: str, contract: str,
+    provisional_id: str, canonical_id: str,
+) -> bool:
+    """Retire or rename a provisional DB owner under the repair lock."""
+    provisional_id = str(provisional_id or "").strip()
+    canonical_id = str(canonical_id or "").strip()
+    client_id = str(client_id or "").strip().lower()
+    execution_mode = str(execution_mode or "").strip().lower()
+    contract = str(contract or "").strip().upper()
+    if not provisional_id or not canonical_id or provisional_id == canonical_id:
+        return True
+    try:
+        from ap.db import conn, run_with_retry
+        def _converge():
+            with conn() as db:
+                with db.cursor() as cur:
+                    lock_key = f"broker-repair:{client_id}:{execution_mode}:{contract}"
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
+                        (lock_key,),
+                    )
+                    cur.execute(
+                        """SELECT id FROM positions
+                           WHERE id = %s AND client_id = %s
+                             AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                             AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                             AND UPPER(TRIM(COALESCE(status, ''))) IN
+                                 ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                             AND COALESCE(quantity_remaining, qty, 0) > 0
+                           LIMIT 1""",
+                        (provisional_id, client_id, execution_mode, contract),
+                    )
+                    if cur.fetchone() is None:
+                        return True
+                    cur.execute(
+                        """SELECT id FROM positions
+                           WHERE id = %s AND client_id = %s
+                             AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                             AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                             AND UPPER(TRIM(COALESCE(status, ''))) IN
+                                 ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                             AND COALESCE(quantity_remaining, qty, 0) > 0
+                           LIMIT 1""",
+                        (canonical_id, client_id, execution_mode, contract),
+                    )
+                    if cur.fetchone() is not None:
+                        cur.execute(
+                            """UPDATE positions
+                               SET status = 'CLOSED', quantity_remaining = 0,
+                                   qty = 0, updated_at = NOW()
+                               WHERE id = %s AND client_id = %s
+                                 AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                                 AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                                 AND UPPER(TRIM(COALESCE(status, ''))) IN
+                                     ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                                 AND COALESCE(quantity_remaining, qty, 0) > 0""",
+                            (provisional_id, client_id, execution_mode, contract),
+                        )
+                        return cur.rowcount == 1
+                    cur.execute(
+                        """UPDATE positions SET id = %s
+                           WHERE id = %s AND client_id = %s
+                             AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                             AND UPPER(TRIM(COALESCE(contract, ''))) = %s
+                             AND UPPER(TRIM(COALESCE(status, ''))) IN
+                                 ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                             AND COALESCE(quantity_remaining, qty, 0) > 0""",
+                        (canonical_id, provisional_id, client_id, execution_mode, contract),
+                    )
+                    return cur.rowcount == 1
+        return bool(run_with_retry(_converge))
+    except Exception as exc:
+        log.critical(
+            "[exit_eng] CANONICAL_DB_IDENTITY_CONVERGENCE_FAILED "
+            "client=%s mode=%s contract=%s provisional=%s canonical=%s: %s",
+            client_id, execution_mode, contract, provisional_id, canonical_id, exc,
+        )
+        return False
+
+
 def _broker_repair_order_matches(order: dict, broker_position: dict) -> bool:
     """Require enough fill evidence before reusing an existing position id."""
     broker_qty = _broker_repair_positive_int(broker_position.get("quantity"))
@@ -3887,7 +3977,7 @@ class APExitEngine:
                 _repairs_to_remove = []
                 _identity_unproven_repairs = []
                 for p in self._positions:
-                    if not str(getattr(p, "position_id", "") or "").startswith("broker-repair-"):
+                    if not _is_broker_repair_provisional(p):
                         continue
                     if str(getattr(p, "option_symbol", "") or "").upper().strip() != _contract:
                         continue
@@ -3909,6 +3999,15 @@ class APExitEngine:
                         continue
                     _repairs_to_remove.append(p)
                 for _rp in _repairs_to_remove:
+                    if not _converge_broker_repair_db_identity(
+                        _client, _norm_canonical, _contract,
+                        str(getattr(_rp, "position_id", "") or ""), _canon_id,
+                    ):
+                        return CanonicalAdoptionResult(
+                            disposition="RETRY_ADOPTION_ERROR", adopted=False,
+                            safe_to_seed=False, retryable=True,
+                            reason="provisional_db_identity_convergence_failed",
+                        )
                     _merge_now = datetime.now(timezone.utc)
                     _accepted_repair_bid = None
                     # Quote values and their timestamps are one snapshot.  Never
@@ -4025,7 +4124,7 @@ class APExitEngine:
             for pos in self._positions:
                 _pid = str(pos.position_id or "")
                 _sym = str(pos.option_symbol or "").upper().strip()
-                _is_repair = _pid.startswith("broker-repair-")
+                _is_repair = _is_broker_repair_provisional(pos)
                 _same_contract = (_sym == _contract)
                 if not (_is_repair and _same_contract and not pos.closed):
                     continue
@@ -4068,6 +4167,14 @@ class APExitEngine:
 
                 # Found a valid broker-repair position — upgrade in place.
                 old_id = _pid
+                if not _converge_broker_repair_db_identity(
+                    _client, _mode, _contract, old_id, _canon_id,
+                ):
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_ADOPTION_ERROR", adopted=False,
+                        safe_to_seed=False, retryable=True,
+                        reason="provisional_db_identity_convergence_failed",
+                    )
 
                 # ── Blocker 3: Remove contaminated midpoint state ────────────
                 _prior_peak_source = str(
@@ -4242,7 +4349,7 @@ class APExitEngine:
                     _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
                     _incoming_is_proven_canonical = (
                         _incoming_id
-                        and not _incoming_id.startswith("broker-repair-")
+                        and not _is_broker_repair_provisional(existing)
                         and _incoming_client
                         and _incoming_mode in {"live", "paper"}
                     )
@@ -7372,6 +7479,7 @@ class APExitEngine:
                 "contract": contract,
                 "option_symbol": contract,
                 "execution_mode": _mode,
+                "broker_repair_provisional": not bool(proven_position_id),
                 "side": side,
                 "direction": side,
                 "qty": qty,
@@ -7962,6 +8070,7 @@ class APExitEngine:
                             )
                         ),
                         "execution_mode":     _recovery_mode,
+                        "broker_repair_provisional": True,
                     }
                     if isinstance(_repair_row, dict):
                         minimal_row.update(_repair_row)
@@ -9243,7 +9352,7 @@ class APExitEngine:
                 execution_mode=_exec_mode,
                 contract=str(option_symbol or ""),
                 broker_truth_open_qty=_broker_truth_qty,
-                allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
+                allow_missing_position_with_broker_truth=_is_broker_repair_provisional(pos),
             )
             if _exit_guard.get("blocked"):
                 _blocked_reason = str(_exit_guard.get("reason") or "exit_submission_blocked")
