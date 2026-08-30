@@ -1861,6 +1861,30 @@ def test_postgres_provisional_uuid_converges_to_later_canonical_identity(monkeyp
         eng.add_position(repair)
         assert [p.position_id for p in eng.active_positions()] == [repair_id]
 
+        # Simulate the next process cycle: reload A from PostgreSQL and
+        # recover its provisional provenance from the still-unlinked fill.
+        restarted = engine_cls.__new__(engine_cls)
+        restarted._email = client
+        restarted._lock = threading.RLock()
+        restarted._positions = []
+        restarted._positions_by_id = {}
+        restarted.broker = types.SimpleNamespace(
+            mode="live",
+            account_id="restart-account",
+            list_positions=lambda: [{
+                "symbol": contract,
+                "quantity": 1,
+                "cost_basis": 150.0,
+            }],
+        )
+        restarted._fetch_broker_quote = lambda _sym: {}
+
+        assert restarted._broker_position_precheck() is True
+        restarted_active = restarted.active_positions()
+        assert [p.position_id for p in restarted_active] == [repair_id]
+        assert getattr(restarted_active[0], "broker_repair_provisional", False) is True
+        eng = restarted
+
         # The later canonical writer exposes position_id B.
         with pg_conn.cursor() as cur:
             cur.execute(
