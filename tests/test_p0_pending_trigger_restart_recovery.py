@@ -947,7 +947,7 @@ class TestBlocker3CanonicalRetryFields:
         r = _row(meta={"trigger_price": 450.0})
         r["contract"] = "DEFERRED:SPY"
         rec, osm = _make_recovery(r)
-        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="test")
+        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="PROVIDER_TIMEOUT")
 
         assert outcome == _RowOutcome.RETRY_OWNED
         all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
@@ -1487,7 +1487,7 @@ class TestAmendment10Required:
         r = _row(meta={"trigger_price": 450.0})
         r["contract"] = "DEFERRED:SPY"
         rec, osm = _make_recovery(r)
-        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="chain_warmup")
+        outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="PROVIDER_TIMEOUT")
 
         assert outcome == _RowOutcome.RETRY_OWNED
         all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
@@ -1497,7 +1497,7 @@ class TestAmendment10Required:
         assert all_meta.get(_MAT_BROKER_READY) is False
         assert isinstance(all_meta.get(_MAT_ATTEMPTS_FIELD), int)
         assert all_meta.get(_MAT_NEXT_RETRY_AT)
-        assert all_meta.get(_MAT_REASON_FIELD) == "chain_warmup"
+        assert all_meta.get(_MAT_REASON_FIELD) == "PROVIDER_TIMEOUT"
         assert all_meta.get(_MAT_LAST_FAILURE_FIELD)
 
         # Invented fields must NOT be present
@@ -1521,7 +1521,7 @@ class TestAmendment10Required:
             _MAT_STATUS_FIELD:       "RETRY_PENDING",
             _MAT_NEXT_RETRY_AT:      (_now + timedelta(minutes=1)).isoformat(),
             _MAT_ATTEMPTS_FIELD:     1,
-            _MAT_REASON_FIELD:       "test",
+            _MAT_REASON_FIELD:       "PROVIDER_TIMEOUT",
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
             _MAT_BROKER_READY:       True,   # wrong — stamp sets False
         })
@@ -1539,7 +1539,7 @@ class TestAmendment10Required:
             _MAT_STATUS_FIELD:   "RETRY_PENDING",
             _MAT_NEXT_RETRY_AT:  (_now + timedelta(minutes=1)).isoformat(),
             # _MAT_ATTEMPTS_FIELD missing
-            _MAT_REASON_FIELD:   "test",
+            _MAT_REASON_FIELD:   "PROVIDER_TIMEOUT",
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
             _MAT_BROKER_READY:   False,
         })
@@ -1555,7 +1555,7 @@ class TestAmendment10Required:
             _MAT_STATUS_FIELD:       "RETRY_PENDING",
             _MAT_NEXT_RETRY_AT:      (_now + timedelta(minutes=1)).isoformat(),
             _MAT_ATTEMPTS_FIELD:     1,
-            _MAT_REASON_FIELD:       "test",
+            _MAT_REASON_FIELD:       "PROVIDER_TIMEOUT",
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
             _MAT_BROKER_READY:       False,
         })
