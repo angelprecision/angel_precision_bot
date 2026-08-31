@@ -4431,6 +4431,191 @@ class APExitEngine:
             safe_to_seed=True, retryable=False,
         )
 
+    # ────────────────────────────────────────────────────────────────────────
+    # PR #557 amendment — degraded broker owner → durable owner convergence.
+    #
+    # A broker_repair_degraded=True in-memory owner is installed when durable
+    # persistence fails but broker still proves the position open.  On later
+    # precheck cycles the same OCC re-enters durable repair (Blocker 1 fix
+    # in the same amendment).  When that later cycle succeeds — either a
+    # durable provisional UUID or an exact canonical position_id — the new
+    # owner cannot simply be add_position()'d: add_position sees the active
+    # degraded owner for the same OCC and rejects the incoming object as a
+    # duplicate, leaving the broker-open position permanently owned by the
+    # temporary degraded identity.
+    #
+    # This helper performs the ownership transition in place under exact
+    # client_id + execution_mode + OCC + broker_repair_degraded=True
+    # fencing.  It preserves live exit state (quotes, peak/high-water,
+    # touched profit, exit-in-flight, scale-out) that the degraded owner
+    # accumulated so the transition does not drop protection state.
+    # ────────────────────────────────────────────────────────────────────────
+    _LIVE_STATE_ATTRS_PRESERVED_ON_CONVERGENCE = (
+        # Quote/price state
+        "current_option_price", "current_bid", "current_ask", "current_underlying",
+        "last_option_bid_update_ts", "last_option_quote_update_ts",
+        "last_underlying_quote_update_ts",
+        # Peak / high-water / touched-profit
+        "peak_pnl_pct", "touched_profit", "max_profit_seen",
+        # Rejection / stuck state
+        "last_rejection_ts", "last_exit_rejected", "_exit_stuck_count",
+        # Scale-out
+        "scale_outs_done", "pending_scale_counted",
+        # Exit-in-flight and pending exit identity
+        "exit_in_flight", "pending_exit_reason", "pending_exit_action",
+        "pending_exit_qty", "pending_exit_filled_qty",
+        "pending_exit_local_order_id", "pending_exit_broker_order_id",
+        "last_applied_exit_local_order_id", "last_applied_exit_broker_order_id",
+        "last_applied_exit_cum_fill", "last_applied_exit_cum_fill_by_order",
+        "last_exit_signal_ts",
+        # Stop-breach confirmation state
+        "_stop_breach_ts", "_underlying_stop_breach_ts",
+        "_underlying_stop_breach_quote_ts",
+        # Execution-core ghost fields
+        "_exit_submit_ts", "_exit_attempts",
+        # Protective monitoring
+        "protective_monitoring_state",
+    )
+
+    def _converge_degraded_owner_to_durable(self, sym: str, incoming_pos) -> bool:
+        """Transition an active broker_repair_degraded owner to a durable owner.
+
+        Returns True when the exact degraded owner was found and swapped for
+        `incoming_pos` under strict client + execution_mode + OCC fencing.
+        Returns False when no matching degraded owner exists — caller must
+        then fall through to normal add_position().
+
+        On success:
+          * The degraded owner is closed and evicted from _positions /
+            _positions_by_id.
+          * `incoming_pos` inherits accumulated live exit state.
+          * `incoming_pos.broker_repair_degraded` is cleared.
+          * `incoming_pos.broker_repair_provisional` is left unchanged
+            (True for durable UUID; False for exact canonical identity).
+          * Exactly one active owner for this OCC remains: `incoming_pos`.
+
+        Never fabricates identity: fencing failures return False without
+        mutating any position.  A durable UUID conversion path may still
+        call this — the durable UUID position is provisional but has a
+        real db-persisted identity, and the degraded owner has neither.
+        """
+        if incoming_pos is None:
+            return False
+        _sym = str(sym or "").upper().strip()
+        if not _sym:
+            return False
+        _incoming_id = str(getattr(incoming_pos, "position_id", "") or "").strip()
+        if not _incoming_id:
+            return False
+        _incoming_client = str(
+            getattr(incoming_pos, "client_id", "") or ""
+        ).strip().lower()
+        _incoming_mode = str(
+            getattr(incoming_pos, "execution_mode", "") or ""
+        ).strip().lower()
+        _runner_client = str(self._email or "").strip().lower()
+        _runner_mode = str(self._resolved_execution_mode() or "").strip().lower()
+        # Runner-fenced identity: incoming must match this engine's exact
+        # client + mode.  Blank/unknown incoming mode cannot converge.
+        if _incoming_mode not in {"live", "paper"}:
+            return False
+        if _incoming_client and _incoming_client != _runner_client:
+            return False
+        if _incoming_mode != _runner_mode:
+            return False
+
+        with self._lock:
+            existing_degraded = None
+            for p in self._positions:
+                if getattr(p, "closed", False):
+                    continue
+                if not bool(getattr(p, "broker_repair_degraded", False)):
+                    continue
+                if str(getattr(p, "option_symbol", "") or "").upper().strip() != _sym:
+                    continue
+                _p_client = str(
+                    getattr(p, "client_id", "") or ""
+                ).strip().lower()
+                _p_mode = str(
+                    getattr(p, "execution_mode", "") or ""
+                ).strip().lower()
+                if _p_client and _p_client != _runner_client:
+                    continue
+                if _p_mode not in {"live", "paper"}:
+                    continue
+                if _p_mode != _runner_mode:
+                    continue
+                existing_degraded = p
+                break
+            if existing_degraded is None:
+                return False
+            _old_id = str(getattr(existing_degraded, "position_id", "") or "")
+            # Same-object no-op: nothing to converge.
+            if _old_id == _incoming_id and incoming_pos is existing_degraded:
+                return False
+
+            # Preserve live exit state.  Only copy attributes that exist on
+            # the source AND are unset/default on the incoming object, so
+            # we never overwrite fresh durable metadata with stale state.
+            for _attr in self._LIVE_STATE_ATTRS_PRESERVED_ON_CONVERGENCE:
+                if not hasattr(existing_degraded, _attr):
+                    continue
+                _old_val = getattr(existing_degraded, _attr, None)
+                if _old_val is None:
+                    continue
+                # Numeric zero / empty containers / empty strings are
+                # "unset" on the fresh incoming object; preserve degraded
+                # values in those slots.
+                _new_val = getattr(incoming_pos, _attr, None)
+                _new_is_unset = (
+                    _new_val is None
+                    or _new_val == 0
+                    or _new_val == 0.0
+                    or _new_val == ""
+                    or _new_val == {}
+                    or _new_val is False
+                )
+                if _new_is_unset:
+                    try:
+                        setattr(incoming_pos, _attr, _old_val)
+                    except Exception:
+                        pass
+
+            # Mark the degraded owner closed so any concurrent reader
+            # ignores it, then evict from indices.
+            try:
+                existing_degraded.closed = True
+                existing_degraded.close_reason = (
+                    "converged_to_durable:" + _incoming_id
+                )
+            except Exception:
+                pass
+            if existing_degraded in self._positions:
+                self._positions.remove(existing_degraded)
+            if _old_id and self._positions_by_id.get(_old_id) is existing_degraded:
+                self._positions_by_id.pop(_old_id, None)
+
+            # Clear degraded flag on incoming; keep provisional as-supplied.
+            try:
+                incoming_pos.broker_repair_degraded = False
+                incoming_pos.brokerrepairdegraded = False
+            except Exception:
+                pass
+
+            # Install incoming as the sole active owner for this OCC.
+            self._positions.append(incoming_pos)
+            self._positions_by_id[_incoming_id] = incoming_pos
+
+        log.info(
+            "[exit_eng] EXIT_BROKER_DEGRADED_OWNER_CONVERGED "
+            "client=%s mode=%s contract=%s "
+            "old_position_id=%s new_position_id=%s "
+            "still_provisional=%s live_state_preserved=true",
+            self._email, _runner_mode, _sym, _old_id, _incoming_id,
+            bool(getattr(incoming_pos, "broker_repair_provisional", False)),
+        )
+        return True
+
     def add_position(self, pos: ManagedPosition):
         """Track a newly broker-confirmed open position for exit protection."""
         if pos is None:
@@ -8256,7 +8441,13 @@ class APExitEngine:
                         qty_override=broker_qty,
                         prefer_qty_override=True,
                     )
-                    self.add_position(pos)
+                    if _has_degraded_owner_for_sym and self._converge_degraded_owner_to_durable(sym, pos):
+                        # Converged in-place; skip normal add_position so
+                        # duplicate-OCC rejection cannot leave the degraded
+                        # owner installed.
+                        pass
+                    else:
+                        self.add_position(pos)
                     # Converge a provisional owner when a later exact filled-ENTRY lookup proves canonical identity.
                     if (isinstance(_repair_evidence, dict) and not _repair_evidence.get("_lookup_status") and _is_broker_repair_provisional(pos)):
                         _canonical_id = _broker_repair_position_id(_repair_evidence.get("position_id"))
@@ -8416,10 +8607,13 @@ class APExitEngine:
                         qty_override=broker_qty,
                         prefer_qty_override=True,
                     )
-                    self.add_position(pos)
-                    _loaded_active = (
-                        pos in self.active_positions()
-                    )
+                    if _has_degraded_owner_for_sym and self._converge_degraded_owner_to_durable(sym, pos):
+                        # In-place transition preserved live exit state and
+                        # removed the degraded owner; treat as active.
+                        _loaded_active = pos in self._positions
+                    else:
+                        self.add_position(pos)
+                        _loaded_active = pos in self.active_positions()
                     if not _loaded_active:
                         raise RuntimeError("add_position did not install behavior-active broker owner")
                     repaired_syms.append(sym)              # confirmed DB row
@@ -8433,6 +8627,25 @@ class APExitEngine:
                     )
                     # Durable identity is unavailable, but broker truth is positive.
                     # Retain a narrowly-scoped provisional owner for exit evaluation.
+                    #
+                    # PR #557 amendment: if this OCC ALREADY has a degraded
+                    # owner (previous cycle's install), do NOT create another
+                    # broker-degraded-<uuid> — that would leave the retry-
+                    # rejection path leaking new identities every cycle.
+                    # The existing degraded owner already provides protective
+                    # exit ownership; keep it and let the next successful
+                    # durable repair converge it via _converge_degraded_
+                    # owner_to_durable.
+                    if _has_degraded_owner_for_sym:
+                        log.warning(
+                            "[exit_eng] EXIT_BROKER_DEGRADED_OWNER_RETAINED "
+                            "client=%s mode=%s contract=%s quantity=%d "
+                            "reason=durable_repair_still_unavailable — "
+                            "existing degraded owner preserved for exit protection",
+                            self._email, self._resolved_execution_mode(),
+                            sym, broker_qty,
+                        )
+                        continue
                     try:
                         _degraded_id = f"broker-degraded-{_uuid.uuid4()}"
                         _degraded_row = {
@@ -8569,7 +8782,33 @@ class APExitEngine:
             repair_failed_syms,
         )
 
-        return len(repair_failed_syms) == 0
+        # PR #557 amendment: precheck return contract.
+        # True  = every broker-open position has safe behavior-visible
+        #         exit ownership.  A repair that fell back to a
+        #         degraded owner still satisfies this: the OCC remains
+        #         exit-visible under fenced identity, and later cycles
+        #         will retry the durable convergence.
+        # False = broker truth itself could not be represented for
+        #         exit ownership (nothing installed at all).
+        _syms_without_owner: list[str] = []
+        with self._lock:
+            _active_syms = {
+                str(getattr(p, "option_symbol", "") or "").upper()
+                for p in self._positions
+                if _is_behavior_active_position(p)
+            }
+        for _sym in repair_failed_syms:
+            if str(_sym or "").upper() not in _active_syms:
+                _syms_without_owner.append(_sym)
+        if _syms_without_owner:
+            log.error(
+                "[exit_eng] EXIT_BROKER_PRECHECK_UNOWNED_POSITIONS "
+                "client=%s contracts=%s — broker proves positions open "
+                "with no in-engine owner (degraded owner install also failed)",
+                self._email, sorted(_syms_without_owner),
+            )
+            return False
+        return True
 
     def _check_all_positions(self, now_et: Optional[datetime] = None):
         today_et = _et_session_date()

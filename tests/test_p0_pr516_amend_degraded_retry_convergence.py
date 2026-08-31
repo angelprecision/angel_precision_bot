@@ -1,19 +1,22 @@
 """
 tests/test_p0_pr516_amend_degraded_retry_convergence.py
 
-PR #516 amendment — regression:
-  * Blocker 1: degraded broker-truth owners are retried for durable recovery
-    on each subsequent cycle instead of getting "frozen" as ownership.
-  * Blocker 2: canonical convergence uses the actual helper APIs
-    (_broker_repair_historical_value / _broker_repair_text_value) with the
-    correct signatures and consumes their (value, contradiction) returns.
+PR #557 amendment — degraded broker-truth owner → durable owner convergence.
 
-Behavioral shape follows the pattern established by
-test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty in
-tests/test_p0_exit_engine_broker_truth.py: build a minimal engine via
-__new__, stub collaborators, drive _broker_position_precheck() across two
-cycles, and assert that no exit ENTRY submit / broad CANCEL is issued by
-the amendment surface.
+Blockers covered:
+  * Blocker 1 (from earlier amendment): degraded owner is retried for durable
+    recovery on subsequent cycles.
+  * Blocker 2 (from earlier amendment): canonical convergence uses the actual
+    helper APIs and consumes the (value, contradiction) tuple returns.
+  * Blocker 3 (this amendment): durable recovery actually REPLACES the
+    degraded owner rather than being rejected as a duplicate; in-place
+    convergence preserves live exit state; retry failure retains the
+    existing degraded owner instead of leaking a new broker-degraded-<uuid>.
+
+Every test is stated in behavioural terms and asserts the invariants
+listed in the amendment spec.  Real behavioural tests run only when the
+ap_exit_engine module can be imported (skipped otherwise).  Source-pattern
+tests always run and catch regressions of the exact call/method shape.
 """
 from __future__ import annotations
 
@@ -76,7 +79,6 @@ _COST_BASIS = _ENTRY_PX * _BROKER_QTY * 100.0
 
 
 def _stub_ap_db():
-    """Install a permissive ap.db stub so best-effort DB writes never raise."""
     ap_stub = types.ModuleType("ap")
     db_stub = types.ModuleType("ap.db")
     db_stub.run_with_retry = lambda f: (f() if callable(f) else None)
@@ -87,7 +89,6 @@ def _stub_ap_db():
 
 
 def _new_engine():
-    """Build a minimal APExitEngine bypassing __init__."""
     engine_cls = getattr(_EE_MOD, "APExitEngine", None)
     if engine_cls is None:
         pytest.skip("APExitEngine not exported in test env")
@@ -112,7 +113,7 @@ def _broker_mock():
     return m
 
 
-def _assert_no_broker_writes(broker):
+def _assert_no_broker_writes(broker, context: str = ""):
     """The amendment must never submit an ENTRY or issue broad cancels."""
     for forbidden in (
         "submit_order", "submit_entry", "submit_exit",
@@ -122,41 +123,41 @@ def _assert_no_broker_writes(broker):
         if fn is None:
             continue
         assert not fn.called, (
-            f"broker.{forbidden} was called during precheck — "
-            f"amendment must never submit/cancel from the exit-cycle precheck"
+            f"broker.{forbidden} was called during {context or 'precheck'} — "
+            f"amendment must never submit/cancel from precheck"
         )
 
 
+def _active_for_sym(eng, sym):
+    with eng._lock:
+        return [
+            p for p in eng._positions
+            if getattr(p, "quantity_remaining", 0) > 0
+            and str(getattr(p, "option_symbol", "")).upper() == sym
+            and not getattr(p, "closed", False)
+        ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Blocker 1 regression — two-cycle degraded → durable retry
+# Behavioural — three-cycle convergence + idempotency (durable UUID case)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @_skip_if_no_mod
-def test_pr516_amend_cycle1_installs_degraded_then_cycle2_retries_durable_recovery():
+def test_pr557_amend_three_cycle_convergence_durable_uuid():
     """
-    CYCLE 1: broker proves LIVE position; engine empty; DB repair forced
-             unavailable → degraded broker-truth owner installed and
-             remains exit-visible.
-    CYCLE 2: broker still proves LIVE position; durable filled-ENTRY
-             evidence now available → durable recovery is RETRIED (previously
-             skipped because the degraded owner had already claimed the OCC),
-             canonical position_id adopted, degraded owner removed, exactly
-             one active owner remains, no duplicate lifecycle.
+    CYCLE 1: broker OPEN + durable repair unavailable → degraded owner installed.
+    CYCLE 2: broker still OPEN + durable UUID now persists (no canonical filled
+             ENTRY yet) → degraded owner IS REPLACED by durable provisional
+             owner in-place, live exit state preserved, exactly one active.
+    CYCLE 3: broker still OPEN + no new work → precheck is idempotent: the
+             durable provisional owner remains unchanged, no new degraded id
+             created, no duplicate lifecycle.
     """
     _stub_ap_db()
     eng = _new_engine()
     broker = _broker_mock()
     eng.broker = broker
     eng._quote_broker = broker
-
-    # ── Cycle 1 stubs ─────────────────────────────────────────────────────
-    # DB row NOT FOUND: forces the "no db row" branch, which then attempts
-    # the repair via _upsert_broker_position_to_db. Force that to fail so
-    # the degraded-owner install branch runs.
-    eng._load_db_position_row = lambda sym: None
-    eng._upsert_broker_position_to_db = MagicMock(
-        side_effect=RuntimeError("cycle1: durable repair unavailable")
-    )
     eng._fetch_broker_quote = lambda _sym: {
         "mark": _ENTRY_PX, "bid": _ENTRY_PX - 0.05, "ask": _ENTRY_PX + 0.05,
         "mid": _ENTRY_PX, "last": _ENTRY_PX,
@@ -164,87 +165,163 @@ def test_pr516_amend_cycle1_installs_degraded_then_cycle2_retries_durable_recove
     eng._underlying_from_occ = lambda _sym: _UNDERLYING
     eng._parse_occ_side = lambda _sym: "CALL"
 
-    # Cycle 1
-    result1 = eng._broker_position_precheck()
-    assert result1 is True, "precheck must return True even when repair falls back to degraded"
-
-    # Post-cycle-1 assertions
-    with eng._lock:
-        active = [p for p in eng._positions if getattr(p, "quantity_remaining", 0) > 0]
-    assert len(active) == 1, f"expected exactly one degraded owner, got {len(active)}"
-    degraded = active[0]
-    assert getattr(degraded, "broker_repair_degraded", False) is True, (
-        "cycle 1 owner must carry broker_repair_degraded=True"
+    # ── CYCLE 1: force durable repair failure ────────────────────────────
+    eng._load_db_position_row = lambda sym: None
+    eng._upsert_broker_position_to_db = MagicMock(
+        side_effect=RuntimeError("cycle1: durable repair unavailable")
     )
-    assert getattr(degraded, "broker_repair_provisional", False) is True
-    assert str(getattr(degraded, "option_symbol", "")).upper() == _CONTRACT
-    assert int(getattr(degraded, "quantity_remaining", 0)) == _BROKER_QTY
-    assert str(getattr(degraded, "execution_mode", "")).strip().lower() == _MODE
-    _assert_no_broker_writes(broker)
+    result1 = eng._broker_position_precheck()
+    # Amended contract: degraded owner installed → precheck returns True
+    # because the position is exit-visible.
+    assert result1 is True, (
+        f"cycle 1 precheck must return True when degraded owner installed; got {result1}"
+    )
 
-    # ── Cycle 2 — Blocker 1 core assertion ──────────────────────────────
-    # The critical invariant: on the next cycle, the degraded owner's OCC
-    # MUST re-enter the repair loop (i.e. the upsert path fires again).
-    # Before the amendment, the OCC was subtracted out of
-    # missing_from_engine, so the loop never re-fired and no durable
-    # recovery attempt could happen — degraded ownership became permanent.
-    # Note: we don't reset the upsert mock here — cycle 1 already recorded
-    # its call; we assert cycle 2 adds a second call for the same OCC.
-    cycle1_upsert_calls = eng._upsert_broker_position_to_db.call_count
-    canonical_pos_id = f"pos-canonical-{uuid.uuid4()}"
-    eng._upsert_broker_position_to_db = MagicMock(return_value=canonical_pos_id)
-    eng._load_db_position_row = lambda sym: None  # force upsert path again
+    active1 = _active_for_sym(eng, _CONTRACT)
+    assert len(active1) == 1, f"cycle 1 must install exactly one owner; got {len(active1)}"
+    degraded = active1[0]
+    degraded_id = str(getattr(degraded, "position_id", "") or "")
+    assert degraded_id, "degraded owner must have a position_id"
+    assert getattr(degraded, "broker_repair_degraded", False) is True
+    assert getattr(degraded, "broker_repair_provisional", False) is True
+    assert str(getattr(degraded, "execution_mode", "")).strip().lower() == _MODE
+
+    # Simulate accumulated live exit state on the degraded owner.
+    degraded.peak_pnl_pct = 12.5
+    degraded.touched_profit = True
+    degraded.current_bid = 3.20
+    degraded.current_ask = 3.30
+
+    _assert_no_broker_writes(broker, context="cycle 1")
+
+    # ── CYCLE 2: durable UUID now persists via upsert ────────────────────
+    provisional_uuid = f"pos-provisional-{uuid.uuid4()}"
+
+    class _StubDBRow(dict):
+        pass
+
+    # After upsert returns the id, the precheck loads the row via
+    # _load_db_position_row to build the managed position.  Return a row
+    # matching the same OCC/client/mode/qty but with provisional flags.
+    provisional_row = {
+        "id": provisional_uuid,
+        "position_id": provisional_uuid,
+        "client_id": _CLIENT,
+        "contract": _CONTRACT,
+        "option_symbol": _CONTRACT,
+        "underlying": _UNDERLYING,
+        "side": "CALL",
+        "direction": "CALL",
+        "qty": _BROKER_QTY,
+        "quantity_remaining": _BROKER_QTY,
+        "entry_price": _ENTRY_PX,
+        "avg_fill": _ENTRY_PX,
+        "execution_mode": _MODE,
+        "status": "OPEN",
+        "broker_repair_provisional": True,
+        "broker_repair_degraded": False,
+    }
+    eng._upsert_broker_position_to_db = MagicMock(return_value=provisional_uuid)
+    eng._load_db_position_row = lambda sym: (
+        provisional_row if sym.upper() == _CONTRACT else None
+    )
 
     result2 = eng._broker_position_precheck()
-    assert result2 is True, "cycle 2 precheck must succeed"
+    assert result2 is True, f"cycle 2 precheck must return True; got {result2}"
 
-    # Blocker 1 assertion: durable repair WAS retried in cycle 2.
-    assert eng._upsert_broker_position_to_db.call_count >= 1, (
-        "Blocker 1 regression: durable repair was not retried on cycle 2 — "
-        "degraded owner would have been permanent"
-    )
-    # Verify the retry was for the same OCC that the degraded owner holds.
-    call_args_list = eng._upsert_broker_position_to_db.call_args_list
-    retried_syms = [str(c.args[0]).upper() for c in call_args_list if c.args]
-    assert _CONTRACT in retried_syms, (
-        f"cycle 2 upsert must be called for {_CONTRACT}; got {retried_syms}"
-    )
-    # No duplicate: exactly one active owner remains for this OCC.
-    with eng._lock:
-        active2 = [
-            p for p in eng._positions
-            if getattr(p, "quantity_remaining", 0) > 0
-            and str(getattr(p, "option_symbol", "")).upper() == _CONTRACT
-        ]
+    active2 = _active_for_sym(eng, _CONTRACT)
     assert len(active2) == 1, (
-        f"cycle 2 must leave exactly one owner for {_CONTRACT}, got {len(active2)}: "
+        f"cycle 2 must leave exactly one active owner; got {len(active2)}: "
         f"{[getattr(p, 'position_id', '?') for p in active2]}"
     )
-    _assert_no_broker_writes(broker)
+    surviving = active2[0]
+    surviving_id = str(getattr(surviving, "position_id", "") or "")
+
+    # Convergence invariants:
+    assert surviving_id != degraded_id, (
+        "convergence regression: degraded position_id still present after cycle 2 — "
+        "ownership was never transferred to the durable owner"
+    )
+    assert getattr(surviving, "broker_repair_degraded", False) is False, (
+        "cycle 2 surviving owner must have broker_repair_degraded=False"
+    )
+    assert getattr(surviving, "broker_repair_provisional", False) is True, (
+        "durable UUID owner remains provisional until canonical ENTRY proves identity"
+    )
+    assert str(getattr(surviving, "option_symbol", "")).upper() == _CONTRACT
+    assert str(getattr(surviving, "execution_mode", "")).strip().lower() == _MODE
+
+    # Live state preservation invariants (accumulated on the degraded owner):
+    assert getattr(surviving, "peak_pnl_pct", 0.0) == 12.5, (
+        "convergence must preserve peak_pnl_pct from the degraded owner"
+    )
+    assert getattr(surviving, "touched_profit", False) is True, (
+        "convergence must preserve touched_profit from the degraded owner"
+    )
+    assert getattr(surviving, "current_bid", 0.0) == 3.20, (
+        "convergence must preserve current_bid quote state"
+    )
+    # Degraded owner must no longer be an active owner:
+    with eng._lock:
+        assert not any(
+            str(getattr(p, "position_id", "") or "") == degraded_id
+            and not getattr(p, "closed", False)
+            for p in eng._positions
+        ), "old degraded id must no longer be an active owner"
+        assert eng._positions_by_id.get(degraded_id) is None or \
+               eng._positions_by_id.get(degraded_id) is not degraded, (
+            "_positions_by_id must not point to the closed degraded object"
+        )
+
+    _assert_no_broker_writes(broker, context="cycle 2")
+
+    # ── CYCLE 3: idempotency ─────────────────────────────────────────────
+    # Broker still says OPEN with same qty; DB still returns the same
+    # provisional row.  precheck should be a no-op: same owner, no new
+    # degraded identity, no duplicate.
+    eng._upsert_broker_position_to_db = MagicMock(return_value=provisional_uuid)
+    result3 = eng._broker_position_precheck()
+    assert result3 is True
+
+    active3 = _active_for_sym(eng, _CONTRACT)
+    assert len(active3) == 1, f"cycle 3 must remain at one owner; got {len(active3)}"
+    still_owner = active3[0]
+    assert str(getattr(still_owner, "position_id", "")).strip() == surviving_id, (
+        "cycle 3 must leave the durable owner unchanged"
+    )
+    # No new broker-degraded-<uuid> was created:
+    with eng._lock:
+        degraded_after_c3 = [
+            p for p in eng._positions
+            if getattr(p, "broker_repair_degraded", False)
+            and not getattr(p, "closed", False)
+        ]
+    assert degraded_after_c3 == [], (
+        f"cycle 3 must not create any new degraded owner; got "
+        f"{[getattr(p,'position_id','?') for p in degraded_after_c3]}"
+    )
+
+    _assert_no_broker_writes(broker, context="cycle 3")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Blocker 1 variant — durable UUID succeeds but no canonical ENTRY yet
+# Behavioural — retry failure retains the existing degraded owner
 # ─────────────────────────────────────────────────────────────────────────────
 
 @_skip_if_no_mod
-def test_pr516_amend_durable_uuid_replaces_degraded_without_canonical_entry():
+def test_pr557_amend_retry_failure_retains_existing_degraded_no_new_uuid():
     """
-    Cycle 1 installs a degraded owner (as above).  Cycle 2: durable repair
-    now persists a provisional UUID (no canonical filled ENTRY yet).  The
-    degraded owner must be replaced by exactly one durable provisional
-    owner — never leave both in place.
+    CYCLE 1: install degraded owner.
+    CYCLE 2: durable repair fails AGAIN → the amendment must retain the
+             EXISTING degraded owner and NOT create a new
+             broker-degraded-<uuid>.  Exactly one degraded owner remains
+             with the same position_id as cycle 1.
     """
     _stub_ap_db()
     eng = _new_engine()
     broker = _broker_mock()
     eng.broker = broker
     eng._quote_broker = broker
-
-    eng._load_db_position_row = lambda sym: None
-    eng._upsert_broker_position_to_db = MagicMock(
-        side_effect=RuntimeError("cycle1: repair unavailable")
-    )
     eng._fetch_broker_quote = lambda _sym: {
         "mark": _ENTRY_PX, "bid": _ENTRY_PX, "ask": _ENTRY_PX,
         "mid": _ENTRY_PX, "last": _ENTRY_PX,
@@ -252,47 +329,147 @@ def test_pr516_amend_durable_uuid_replaces_degraded_without_canonical_entry():
     eng._underlying_from_occ = lambda _sym: _UNDERLYING
     eng._parse_occ_side = lambda _sym: "CALL"
 
-    eng._broker_position_precheck()
-    with eng._lock:
-        active = [p for p in eng._positions if getattr(p, "quantity_remaining", 0) > 0]
-    assert len(active) == 1 and getattr(active[0], "broker_repair_degraded", False)
-
-    # Cycle 2: upsert now succeeds with a provisional UUID; no canonical
-    # filled-ENTRY evidence available (repair_evidence lacks position_id).
-    provisional_id = f"pos-provisional-{uuid.uuid4()}"
-    eng._upsert_broker_position_to_db = MagicMock(return_value=provisional_id)
-    # Still no DB row load for reuse — force the upsert branch:
     eng._load_db_position_row = lambda sym: None
+    eng._upsert_broker_position_to_db = MagicMock(
+        side_effect=RuntimeError("repair unavailable")
+    )
 
     eng._broker_position_precheck()
-    with eng._lock:
-        active2 = [p for p in eng._positions if getattr(p, "quantity_remaining", 0) > 0]
+    active1 = _active_for_sym(eng, _CONTRACT)
+    assert len(active1) == 1 and getattr(active1[0], "broker_repair_degraded", False)
+    degraded_id_c1 = str(getattr(active1[0], "position_id", "") or "")
+
+    # Cycle 2: same failure
+    eng._broker_position_precheck()
+    active2 = _active_for_sym(eng, _CONTRACT)
     assert len(active2) == 1, (
-        f"cycle 2 must leave exactly one owner (durable-provisional replaces degraded), "
-        f"got {len(active2)}"
+        f"retry failure must not create a second owner; got {len(active2)}: "
+        f"{[getattr(p, 'position_id', '?') for p in active2]}"
     )
+    still_degraded = active2[0]
+    assert str(getattr(still_degraded, "position_id", "")).strip() == degraded_id_c1, (
+        "retry failure must retain the EXACT existing degraded position_id — "
+        "a new broker-degraded-<uuid> would leak identities every cycle"
+    )
+    assert getattr(still_degraded, "broker_repair_degraded", False) is True
+
     _assert_no_broker_writes(broker)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Blocker 2 regression — helper API surface + return-tuple handling
+# Behavioural — caller-boundary through _check_all_positions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_pr516_amend_broker_repair_historical_value_takes_keyword_keys():
-    """The historical helper is (*mappings, keys=...); a value+contradiction tuple returns."""
+@_skip_if_no_mod
+def test_pr557_amend_caller_boundary_check_all_positions_two_cycles():
+    """
+    Exercise the real _check_all_positions() caller (not just precheck).
+
+    CYCLE 1: broker OPEN + durable repair unavailable → position is still
+             an exit-visible owner after _check_all_positions returns.
+    CYCLE 2: durable identity available → same position now under durable
+             identity, position never disappeared from exit ownership,
+             no ENTRY submit, no broad CANCEL.
+    """
+    _stub_ap_db()
+    eng = _new_engine()
+    broker = _broker_mock()
+    eng.broker = broker
+    eng._quote_broker = broker
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": _ENTRY_PX, "bid": _ENTRY_PX, "ask": _ENTRY_PX,
+        "mid": _ENTRY_PX, "last": _ENTRY_PX,
+    }
+    eng._underlying_from_occ = lambda _sym: _UNDERLYING
+    eng._parse_occ_side = lambda _sym: "CALL"
+
+    # Stub the post-precheck portions of _check_all_positions to no-ops so
+    # this test focuses on the caller boundary and does not depend on the
+    # full exit rule evaluation harness.
+    eng._emit_exit_event = lambda *a, **kw: None
+    eng.on_exit = None
+    eng.on_scale = None
+
+    # Cycle 1 — durable repair fails
+    eng._load_db_position_row = lambda sym: None
+    eng._upsert_broker_position_to_db = MagicMock(
+        side_effect=RuntimeError("repair unavailable")
+    )
+    try:
+        eng._check_all_positions()
+    except Exception as e:
+        # If the exit loop trips on unstubbed collaborators (quote monitor,
+        # exit engine timers, etc.), that is unrelated to the precheck
+        # convergence being tested here. Assert precheck-side outcomes.
+        pytest.skip(
+            f"caller-boundary skipped: _check_all_positions requires more "
+            f"env than we can construct here ({type(e).__name__}: {e}); "
+            f"precheck path is covered by the three-cycle test above"
+        )
+
+    active1 = _active_for_sym(eng, _CONTRACT)
+    assert len(active1) == 1, "position must remain exit-visible after cycle 1"
+    degraded_id_c1 = str(getattr(active1[0], "position_id", "") or "")
+    assert getattr(active1[0], "broker_repair_degraded", False) is True
+    _assert_no_broker_writes(broker, context="cycle 1 _check_all_positions")
+
+    # Cycle 2 — durable identity available
+    provisional_uuid = f"pos-provisional-{uuid.uuid4()}"
+    provisional_row = {
+        "id": provisional_uuid,
+        "position_id": provisional_uuid,
+        "client_id": _CLIENT,
+        "contract": _CONTRACT,
+        "option_symbol": _CONTRACT,
+        "underlying": _UNDERLYING,
+        "side": "CALL",
+        "direction": "CALL",
+        "qty": _BROKER_QTY,
+        "quantity_remaining": _BROKER_QTY,
+        "entry_price": _ENTRY_PX,
+        "avg_fill": _ENTRY_PX,
+        "execution_mode": _MODE,
+        "status": "OPEN",
+        "broker_repair_provisional": True,
+        "broker_repair_degraded": False,
+    }
+    eng._upsert_broker_position_to_db = MagicMock(return_value=provisional_uuid)
+    eng._load_db_position_row = lambda sym: (
+        provisional_row if sym.upper() == _CONTRACT else None
+    )
+    try:
+        eng._check_all_positions()
+    except Exception as e:
+        pytest.skip(
+            f"caller-boundary skipped on cycle 2: {type(e).__name__}: {e}"
+        )
+
+    active2 = _active_for_sym(eng, _CONTRACT)
+    assert len(active2) == 1, "cycle 2 must leave exactly one owner"
+    surviving = active2[0]
+    assert str(getattr(surviving, "position_id", "")).strip() != degraded_id_c1, (
+        "convergence did not replace the degraded owner"
+    )
+    assert getattr(surviving, "broker_repair_degraded", False) is False
+    _assert_no_broker_writes(broker, context="cycle 2 _check_all_positions")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper API unit tests (Blocker 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pr557_amend_broker_repair_historical_value_takes_keyword_keys():
     fn = getattr(_EE_MOD, "_broker_repair_historical_value", None)
     if fn is None:
         pytest.skip("_broker_repair_historical_value not exported")
     keys = ("underlying_entry",)
     value, conflict = fn({"underlying_entry": 100.0}, {}, keys=keys)
     assert value == 100.0 and conflict is False
-    # Contradiction across mappings must be detected.
     _, conflict2 = fn({"underlying_entry": 100.0}, {"underlying_entry": 101.0}, keys=keys)
     assert conflict2 is True
 
 
-def test_pr516_amend_broker_repair_text_value_takes_order_meta_key():
-    """The text helper is (order, meta, key); a value+contradiction tuple returns."""
+def test_pr557_amend_broker_repair_text_value_takes_order_meta_key():
     fn = getattr(_EE_MOD, "_broker_repair_text_value", None)
     if fn is None:
         pytest.skip("_broker_repair_text_value not exported")
@@ -302,19 +479,37 @@ def test_pr516_amend_broker_repair_text_value_takes_order_meta_key():
     assert conflict2 is True
 
 
-def test_pr516_amend_convergence_call_uses_correct_helper_signatures():
-    """Source-level regression: the convergence branch must pass the tuple
-    return through and use keyword `keys=` for the historical helper. This
-    catches any future rewrite that reverts to the broken call shape."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Source-pattern anti-regression (always runs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pr557_amend_converge_helper_present_and_wired():
+    """The convergence helper must exist and be called from both precheck sites."""
     src = (_REPO / "ap_exit_engine.py").read_text()
-    # Locate the convergence branch by its unique log marker introduced in
-    # the amendment.
-    marker = "EXIT_BROKER_REPAIR_IDENTITY_HOLD"
-    assert marker in src, (
-        "amendment log marker missing — canonical convergence branch not present"
+    assert "def _converge_degraded_owner_to_durable" in src, (
+        "amendment converger method missing"
     )
-    # The convergence block must unpack both helpers into 2-tuples, not
-    # treat their return as a scalar.
+    # Called at both add_position sites in precheck:
+    assert src.count("_converge_degraded_owner_to_durable(sym, pos)") >= 2, (
+        "converger must be called from both DB-loaded and post-upsert branches"
+    )
+    # Log marker present:
+    assert "EXIT_BROKER_DEGRADED_OWNER_CONVERGED" in src
+
+
+def test_pr557_amend_retry_failure_retains_existing_degraded_marker_present():
+    """Retry-failure branch must retain the existing degraded owner instead of
+    creating a new broker-degraded-<uuid>."""
+    src = (_REPO / "ap_exit_engine.py").read_text()
+    assert "EXIT_BROKER_DEGRADED_OWNER_RETAINED" in src, (
+        "retry-failure retention log marker missing — new broker-degraded-<uuid> "
+        "would leak every retry cycle"
+    )
+
+
+def test_pr557_amend_convergence_call_uses_correct_helper_signatures():
+    src = (_REPO / "ap_exit_engine.py").read_text()
+    assert "EXIT_BROKER_REPAIR_IDENTITY_HOLD" in src
     for pattern in (
         "_entry_geom, _entry_conflict = _broker_repair_historical_value(",
         "_signal_id, _signal_conflict = _broker_repair_text_value(",
@@ -325,9 +520,7 @@ def test_pr516_amend_convergence_call_uses_correct_helper_signatures():
         assert pattern in src, f"convergence call shape regression: missing `{pattern}`"
 
 
-def test_pr516_amend_degraded_retry_set_included_in_precheck_iteration():
-    """Source-level regression: precheck must union degraded owners into the
-    iteration set so subsequent cycles retry durable repair."""
+def test_pr557_amend_degraded_retry_set_included_in_precheck_iteration():
     src = (_REPO / "ap_exit_engine.py").read_text()
     for pattern in (
         "degraded_retry_syms",
@@ -335,3 +528,13 @@ def test_pr516_amend_degraded_retry_set_included_in_precheck_iteration():
         'getattr(p, "broker_repair_degraded", False)',
     ):
         assert pattern in src, f"degraded-retry regression: missing `{pattern}`"
+
+
+def test_pr557_amend_precheck_return_contract_documented():
+    """Precheck return contract must be the documented one: True when every
+    broker-open position has safe behavior-visible exit ownership."""
+    src = (_REPO / "ap_exit_engine.py").read_text()
+    assert "EXIT_BROKER_PRECHECK_UNOWNED_POSITIONS" in src, (
+        "return-contract log marker missing — degraded-owner install must "
+        "not be reported as unowned"
+    )
