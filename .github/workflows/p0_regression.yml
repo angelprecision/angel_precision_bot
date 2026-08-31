@@ -46,6 +46,7 @@ jobs:
           git diff --check origin/main...HEAD
 
       - name: Prove PR 528 base failure and corrected head behavior
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 528
         env:
           PR528_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
