@@ -1904,7 +1904,16 @@ def _classify_overnight_reeval_result(result: dict) -> dict:
     # retryable subset as the complete inventory. This must run regardless of
     # the earlier row-deferred branch; otherwise RETRYABLE_PARTIAL_DEFERRED
     # can exhaust into the #559 safe-partial readiness exception.
-    if bool(result.get("source_lookup_partial")):
+    _source_lookup_failed = (
+        result.get("trade_queue_status") == _SOURCE_STATUS_FAILED
+        and result.get("ap_signals_status") == _SOURCE_STATUS_FAILED
+    )
+    if _source_lookup_failed:
+        result_class = "RETRYABLE_SOURCE_LOOKUP_FAILED"
+        completed = False
+        retryable = True
+        retry_reason = "source_lookup_failed"
+    elif bool(result.get("source_lookup_partial")):
         result_class = "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
         completed = False
         retryable = True

@@ -2472,7 +2472,11 @@ class ClientRunner(threading.Thread):
 
             retryable_deferred = int(result.get("retryable_deferred", 0) or 0)
             unresolved = int(result.get("unresolved", 0) or 0)
-            if bool(result.get("source_lookup_partial")):
+            _source_lookup_failed = (
+                result.get("trade_queue_status") == "FAILED"
+                and result.get("ap_signals_status") == "FAILED"
+            )
+            if bool(result.get("source_lookup_partial")) and not _source_lookup_failed:
                 result["result_class"] = "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
                 result["completed"] = False
                 result["retryable"] = True
