@@ -8098,23 +8098,49 @@ class APExitEngine:
 
         missing_from_engine = broker_syms - engine_syms
 
+        # ── PR #516 amendment: degraded broker-truth owners must be retried
+        # for durable recovery on later cycles.  A degraded owner is
+        # behavior-active (OPEN, qty>0), so its OCC lands in `engine_syms`
+        # and is subtracted out of `missing_from_engine`.  Without this
+        # explicit retry set, the repair loop never re-fires and the
+        # broker-open position stays owned by an in-memory degraded
+        # identity forever.  Retry only when the broker still proves
+        # positive quantity for the exact client + execution_mode + OCC.
+        _resolved_mode = str(self._resolved_execution_mode() or "").strip().lower()
+        with self._lock:
+            degraded_retry_syms = {
+                str(getattr(p, "option_symbol", "") or "").upper()
+                for p in self._positions
+                if getattr(p, "broker_repair_degraded", False)
+                and _is_behavior_active_position(p)
+                and str(getattr(p, "execution_mode", "") or "").strip().lower() == _resolved_mode
+                and str(getattr(p, "client_id", self._email) or self._email).strip().lower()
+                    == str(self._email or "").strip().lower()
+                and str(getattr(p, "option_symbol", "") or "").upper() in broker_syms
+                and int(broker_map.get(str(getattr(p, "option_symbol", "") or "").upper(), {}).get("quantity") or 0) > 0
+            }
+        # Union into the iteration set; retain original set for logging.
+        missing_from_engine_syms = set(missing_from_engine) | degraded_retry_syms
+
         log.info(
             "[exit_eng] EXIT_BROKER_PRECHECK_START "
             "client=%s account=%s broker_position_count=%d engine_position_count=%d "
-            "broker_symbols=%s engine_symbols=%s missing_from_engine=%s",
+            "broker_symbols=%s engine_symbols=%s missing_from_engine=%s "
+            "degraded_retry=%s",
             self._email, _account_id,
             len(broker_syms), len(engine_syms),
             sorted(broker_syms), sorted(engine_syms),
             sorted(missing_from_engine),
+            sorted(degraded_retry_syms),
         )
 
-        if not missing_from_engine:
+        if not missing_from_engine_syms:
             # All broker positions already tracked — log summary and return
             log.info(
                 "[exit_eng] EXIT_BROKER_PRECHECK_SUMMARY "
                 "client=%s account=%s broker_position_count=%d "
                 "engine_position_count=%d missing_from_engine=0 "
-                "all_broker_positions_tracked=true",
+                "degraded_retry=0 all_broker_positions_tracked=true",
                 self._email, _account_id, len(broker_syms), len(engine_syms),
             )
             return True
@@ -8124,9 +8150,14 @@ class APExitEngine:
         loaded_db_syms              = []   # existing DB row found and loaded
         repair_failed_syms          = []   # add_position never called
 
-        for sym in sorted(missing_from_engine):
+        for sym in sorted(missing_from_engine_syms):
             bp         = broker_map[sym]
             broker_qty = int(bp.get("quantity") or 0)
+            # Amendment: retry rows that already have a degraded in-memory owner
+            # skip the "install a new engine position" step and route straight
+            # into the durable repair / convergence branches so they can be
+            # replaced or upgraded — never doubled.
+            _has_degraded_owner_for_sym = sym in degraded_retry_syms
             cost_basis = float(bp.get("cost_basis") or 0)
             entry_px   = cost_basis / max(broker_qty, 1) / 100
 
@@ -8234,17 +8265,74 @@ class APExitEngine:
                             _entry_fill = _broker_repair_positive_float(_repair_evidence.get("fill_price"))
                             if _entry_fill is None:
                                 _entry_fill = _broker_repair_positive_float(getattr(pos, "entry_price", 0.0)) or 0.0
-                            _entry_geom = _broker_repair_historical_value(_repair_evidence, "underlying_entry")
-                            _stop_geom = _broker_repair_historical_value(_repair_evidence, "stop_underlying")
-                            _target_geom = _broker_repair_historical_value(_repair_evidence, "target_underlying")
-                            if _entry_geom is not None and _stop_geom is not None and _target_geom is not None:
-                                _signal_id = _broker_repair_text_value(_repair_evidence, "signal_id") or str(_order_meta.get("signal_id") or "")
-                                _canonical_signal_id = _broker_repair_text_value(_repair_evidence, "canonical_signal_id") or str(_order_meta.get("canonical_signal_id") or _signal_id)
-                                _local_order_id = _broker_repair_text_value(_repair_evidence, "local_order_id") or str(_order_meta.get("local_order_id") or "")
-                                _broker_order_id = _broker_repair_text_value(_repair_evidence, "broker_order_id") or str(_order_meta.get("broker_order_id") or "")
-                                _adoption = self.adopt_canonical_position_identity(contract=sym, canonical_position_id=_canonical_id, local_order_id=_local_order_id, broker_order_id=_broker_order_id, signal_id=_signal_id, canonical_signal_id=_canonical_signal_id, entry_fill=_entry_fill, entry_ts=_repair_evidence.get("filled_ts"), execution_mode=self._resolved_execution_mode(), client_id=self._email, order_filled_ts=_repair_evidence.get("filled_ts"), underlying_entry=_entry_geom, underlying_stop=_stop_geom, underlying_target=_target_geom, direction=str(getattr(pos, "side", "") or ""))
+                            # Historical/text helpers return (value, contradiction).
+                            # Both mappings must be scanned; a contradiction blocks
+                            # canonical adoption — ambiguous evidence never fabricates identity.
+                            _entry_geom, _entry_conflict = _broker_repair_historical_value(
+                                _repair_evidence, _order_meta,
+                                keys=_BROKER_REPAIR_ENTRY_GEOMETRY_KEYS,
+                            )
+                            _stop_geom, _stop_conflict = _broker_repair_historical_value(
+                                _repair_evidence, _order_meta,
+                                keys=_BROKER_REPAIR_STOP_GEOMETRY_KEYS,
+                            )
+                            _target_geom, _target_conflict = _broker_repair_historical_value(
+                                _repair_evidence, _order_meta,
+                                keys=_BROKER_REPAIR_TARGET_GEOMETRY_KEYS,
+                            )
+                            _signal_id, _signal_conflict = _broker_repair_text_value(
+                                _repair_evidence, _order_meta, "signal_id",
+                            )
+                            _canonical_signal_id, _canonical_signal_conflict = _broker_repair_text_value(
+                                _repair_evidence, _order_meta, "canonical_signal_id",
+                            )
+                            _local_order_id, _local_order_conflict = _broker_repair_text_value(
+                                _repair_evidence, _order_meta, "local_order_id",
+                            )
+                            _broker_order_id, _broker_order_conflict = _broker_repair_text_value(
+                                _repair_evidence, _order_meta, "broker_order_id",
+                            )
+                            _any_conflict = any((
+                                _entry_conflict, _stop_conflict, _target_conflict,
+                                _signal_conflict, _canonical_signal_conflict,
+                                _local_order_conflict, _broker_order_conflict,
+                            ))
+                            _geom_present = (
+                                _entry_geom > 0.0 and _stop_geom > 0.0 and _target_geom > 0.0
+                            )
+                            if not _any_conflict and _geom_present and _signal_id and _local_order_id:
+                                _canonical_signal_id = _canonical_signal_id or _signal_id
+                                _adoption = self.adopt_canonical_position_identity(
+                                    contract=sym,
+                                    canonical_position_id=_canonical_id,
+                                    local_order_id=_local_order_id,
+                                    broker_order_id=(_broker_order_id or ""),
+                                    signal_id=_signal_id,
+                                    canonical_signal_id=_canonical_signal_id,
+                                    entry_fill=_entry_fill,
+                                    entry_ts=_repair_evidence.get("filled_ts"),
+                                    execution_mode=self._resolved_execution_mode(),
+                                    client_id=self._email,
+                                    order_filled_ts=_repair_evidence.get("filled_ts"),
+                                    underlying_entry=_entry_geom,
+                                    underlying_stop=_stop_geom,
+                                    underlying_target=_target_geom,
+                                    direction=str(getattr(pos, "side", "") or ""),
+                                )
                                 if getattr(_adoption, "adopted", False):
                                     pos = self._positions_by_id.get(_canonical_id, pos)
+                            elif _any_conflict:
+                                log.error(
+                                    "[exit_eng] EXIT_BROKER_REPAIR_IDENTITY_HOLD "
+                                    "client=%s contract=%s canonical_id=%s "
+                                    "conflicts=(entry=%s stop=%s target=%s signal=%s "
+                                    "canonical_signal=%s local_order=%s broker_order=%s) "
+                                    "— refusing canonical adoption; retaining current owner",
+                                    self._email, sym, _canonical_id,
+                                    _entry_conflict, _stop_conflict, _target_conflict,
+                                    _signal_conflict, _canonical_signal_conflict,
+                                    _local_order_conflict, _broker_order_conflict,
+                                )
                     _loaded_active = (
                         pos in self.active_positions()
                     )
