@@ -53,6 +53,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
 
 from ap.logger import get_logger
+from ap.selector_retry_policy import (
+    DeferredMaterializationConfigConflict,
+    is_retryable_selector_reason,
+    resolve_deferred_materialization_max_attempts,
+)
 
 log = get_logger("ap.pending_trigger_classifier")
 
@@ -921,6 +926,143 @@ def has_broker_handoff_evidence(row: dict) -> bool:
     return False
 
 
+_TERMINAL_LIFECYCLE_STATES: frozenset[str] = frozenset({
+    "CANCELED",
+    "EXPIRED",
+    "REJECTED",
+    "ERROR",
+})
+
+
+def _has_canonical_materialization_retry_candidate(row: dict, meta: dict) -> bool:
+    """Recognize a coherent deferred retry shape without claiming ownership.
+
+    This is intentionally weaker than the durable reread verifier in
+    ``PendingTriggerRestartRecovery``.  It only prevents a truthful canonical
+    ``RETRY_PENDING`` state from being hidden behind the watcher's historical
+    ``trigger_ready`` marker.  The recovery engine still proves identity,
+    contract, attempt bounds, and the durable row before returning
+    ``RETRY_OWNED``.
+
+    Active materializer fields are not used as retry proof. The active
+    ``APOrderStateMachine.schedule_deferred_materialization_retry`` handoff
+    clears them atomically and writes the mirrored counters/generation consumed
+    by startup recovery and the retry CAS. The legacy ``stamp_retry_pending``
+    helper has no production call site and is not executable retry authority.
+    ``materialization_status=RETRY_PENDING`` remains distinct from the #521
+    ``RUNNING`` proof.
+    """
+    if not isinstance(row, dict) or not isinstance(meta, dict):
+        return False
+
+    # The active OSM writer persists retry authority at the top level and may
+    # carry an optional nested materialization diagnostics mapping. A malformed
+    # nested container is durable corruption, not an absent legacy surface.
+    nested_materialization = meta.get("materialization")
+    if nested_materialization is not None and not isinstance(
+        nested_materialization, dict
+    ):
+        return False
+
+    if str(meta.get("materialization_status") or "").strip().upper() != "RETRY_PENDING":
+        return False
+
+    # The retry owner is only an ENTRY owner and must carry the signal identity
+    # that the durable recovery verifier will bind on reread.  Do not let this
+    # new trigger_ready preservation branch broaden protection to another row
+    # kind or to an identity-less row.
+    if str(row.get("kind") or "").strip().upper() != "ENTRY":
+        return False
+    if not str(row.get("signal_id") or "").strip():
+        return False
+
+    # A real OCC contract is not a deferred materialization retry.  Blank is
+    # allowed only for the explicit post-#526 blank-deferred ownership shape;
+    # the marker prevents arbitrary blank-contract retry metadata from gaining
+    # protection.  The durable recovery verifier remains the authority for
+    # whether the marked shape can proceed.
+    contract = str(row.get("contract") or "").strip().upper()
+    if contract and not contract.startswith("DEFERRED:"):
+        return False
+    if not contract and meta.get("contract_deferred") is not True:
+        return False
+
+    # Canonical writer contract: broker_ready is the literal JSON boolean
+    # false.  Do not accept string coercions or a missing value as proof.
+    if meta.get("broker_ready") is not False:
+        return False
+    if has_broker_handoff_evidence(row):
+        return False
+
+    # The canonical writer stores a real JSON integer attempt count.  Reject
+    # bools and string/float coercions so malformed retry metadata cannot
+    # outrank a trigger-ready terminal boundary.
+    attempts = meta.get("materialization_attempts")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        return False
+
+    # The due executor and OSM CAS fence use the mirrored retry counters and
+    # generation, not materialization_attempts alone.  Require the complete
+    # durable shape here so a legacy/incomplete row is left on the existing
+    # fail-closed stuck path instead of being advertised as RETRY_OWNED.
+    retry_attempt = meta.get("retry_attempt")
+    breach_attempt_count = meta.get("breach_attempt_count")
+    generation = meta.get("materialization_generation")
+    max_attempts = meta.get("retry_max_attempts")
+    counters = (retry_attempt, breach_attempt_count, generation, max_attempts)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in counters):
+        return False
+    if retry_attempt != attempts or breach_attempt_count != attempts:
+        return False
+    if generation < 1 or max_attempts < attempts:
+        return False
+    # The persisted row ceiling and the current live ceiling are
+    # independent authorities. A config change must not invalidate an
+    # otherwise coherent in-flight row merely because its stored max was
+    # written under the prior value. The effective ceiling is the lower of
+    # the two; the due executor applies the same hard live ceiling.
+    try:
+        live_max_attempts = resolve_deferred_materialization_max_attempts()
+    except (DeferredMaterializationConfigConflict, TypeError, ValueError):
+        return False
+    if attempts > live_max_attempts:
+        return False
+
+    reason = str(meta.get("materialization_reason") or "").strip()
+    if not reason or not is_retryable_selector_reason(reason):
+        return False
+
+    next_retry_at = meta.get("materialization_next_retry_at")
+    if _parse_iso_classifier(next_retry_at) is None:
+        return False
+
+    if not str(meta.get("materialization_reason") or "").strip():
+        return False
+
+    if _parse_iso_classifier(meta.get("materialization_last_failure_at")) is None:
+        return False
+
+    # A terminal lifecycle/outcome contradiction is stronger than retry
+    # looking fields.  The active-owner fields are deliberately not checked:
+    # they are historical/stale fields in the legacy writer shape and are not
+    # retry ownership authority.
+    lifecycle_state = str(meta.get("lifecycle_state") or "").strip().upper()
+    if lifecycle_state in _TERMINAL_LIFECYCLE_STATES:
+        return False
+
+    for outcome_value in (
+        meta.get("materialization_outcome"),
+        _extract(meta, "materialization.outcome"),
+        _extract(meta, "materialization.materialization_outcome"),
+    ):
+        if _persisted_value_is_absent(outcome_value):
+            continue
+        if str(outcome_value).strip().upper() not in _RETRY_MATERIALIZATION_OUTCOMES:
+            return False
+
+    return True
+
+
 def is_active_materialization_in_flight(row: dict) -> bool:
     """Return whether a pending entry row has a current materializer owner.
 
@@ -980,11 +1122,15 @@ def classify_pending_trigger_row(
             return PendingTriggerClassification.NOT_PENDING_TRIGGER
 
         watcher_reason = str(_extract(meta, "watcher_audit.reason_code") or "").strip()
-        materialization_outcome = str(
-            meta.get("materialization_outcome")
-            or _extract(meta, "materialization.outcome")
-            or ""
-        ).strip().upper()
+        materialization_outcome_values = tuple(
+            str(value).strip().upper()
+            for value in (
+                meta.get("materialization_outcome"),
+                _extract(meta, "materialization.outcome"),
+                _extract(meta, "materialization.materialization_outcome"),
+            )
+            if not _persisted_value_is_absent(value)
+        )
         retry_status = str(
             meta.get("materialization_status")
             or meta.get("retry_status")
@@ -997,27 +1143,39 @@ def classify_pending_trigger_row(
         restart_rearm_status = str(meta.get("restart_rearm_status") or "").strip().upper()
         restart_rearm_next_at = meta.get("restart_rearm_next_at")
 
-        # ── Priority 1: trigger_ready ──
-        # When watcher_reason is trigger_ready the watcher fired a callback
-        # but the broker never accepted.  In LIVE this is normally a zombie.
-        # EXCEPTION (PR #521): if a durably proven, current, unexpired
-        # deferred materialization owner holds this row, recovery must not
-        # terminalize it — the materializer alone resolves the attempt.
-        if watcher_reason == "trigger_ready":
-            if is_active_materialization_in_flight(row):
-                return PendingTriggerClassification.MATERIALIZATION_IN_FLIGHT
-            return PendingTriggerClassification.STUCK_TRIGGER_READY
-
-        # ── Priority 2: real invalidation reason ──
+        # ── Priority 1: real watcher invalidation ──
         if watcher_reason == "orphan_no_watcher":
             return PendingTriggerClassification.ORPHAN_NO_WATCHER
 
         if _reason_is_invalidation(watcher_reason):
             return PendingTriggerClassification.STUCK_INVALIDATED
 
-        # ── Priority 3: materialization already terminal ──
-        if materialization_outcome in _TERMINAL_MATERIALIZATION_OUTCOMES:
+        # ── Priority 2: terminal materialization outcome ──
+        # A terminal writer decision outranks both stale watcher diagnostics
+        # and retry-looking fields, including nested legacy outcome surfaces.
+        if any(
+            outcome in _TERMINAL_MATERIALIZATION_OUTCOMES
+            for outcome in materialization_outcome_values
+        ):
             return PendingTriggerClassification.STUCK_TERMINAL_MATERIALIZATION
+
+        # ── Priority 3: active materializer / canonical retry ──
+        # When watcher_reason is trigger_ready the watcher fired a callback
+        # but the broker never accepted.  In LIVE this is normally a zombie.
+        # EXCEPTION (PR #521): if a durably proven, current, unexpired
+        # deferred materialization owner holds this row, recovery must not
+        # terminalize it — the materializer alone resolves the attempt.
+        #
+        # PR #528: a canonical RETRY_PENDING handoff is a second, distinct
+        # owner state.  It must outrank the lower-information trigger_ready
+        # diagnostic, but only after the retry shape is coherent; the durable
+        # recovery reread remains the stronger RETRY_OWNED authority.
+        if watcher_reason == "trigger_ready":
+            if is_active_materialization_in_flight(row):
+                return PendingTriggerClassification.MATERIALIZATION_IN_FLIGHT
+            if _has_canonical_materialization_retry_candidate(row, meta):
+                return PendingTriggerClassification.WAITING_RETRYABLE
+            return PendingTriggerClassification.STUCK_TRIGGER_READY
 
         # ── Priority 4: caller-supplied unsafe live-quote signal ──
         if live_quote_already_through_trigger is True:
