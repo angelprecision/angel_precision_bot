@@ -41,7 +41,7 @@ def test_load_db_row_exact_mode_filter_present():
     load_start = EE_SRC.find("def _load_db_position_row")
     load_end   = EE_SRC.find("\n    def ", load_start + 1)
     load_body  = EE_SRC[load_start:load_end]
-    assert "signal_id, execution_mode" in load_body
+    assert "signal_id," in load_body and "execution_mode," in load_body
     assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in load_body
 
 def test_upsert_persists_execution_mode_column():
@@ -189,7 +189,7 @@ def _postgres_positions_table(monkeypatch):
     cur.execute(
         """
         CREATE TEMP TABLE positions (
-            id TEXT PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+            id TEXT NOT NULL PRIMARY KEY,
             client_id TEXT,
             underlying TEXT,
             contract TEXT,
@@ -201,10 +201,36 @@ def _postgres_positions_table(monkeypatch):
             quantity_remaining INTEGER,
             avg_fill DOUBLE PRECISION,
             entry_price DOUBLE PRECISION,
+            underlying_entry DOUBLE PRECISION,
+            stop_underlying DOUBLE PRECISION,
+            target_underlying DOUBLE PRECISION,
             entry_ts TIMESTAMPTZ,
             status TEXT,
             signal_id TEXT,
+            local_order_id TEXT,
+            broker_order_id TEXT,
             updated_at TIMESTAMPTZ DEFAULT NOW()
+        ) ON COMMIT PRESERVE ROWS
+        """
+    )
+    cur.execute(
+        """
+        CREATE TEMP TABLE orders (
+            local_order_id TEXT PRIMARY KEY,
+            client_id TEXT,
+            position_id TEXT,
+            kind TEXT,
+            status TEXT,
+            contract TEXT,
+            execution_mode TEXT,
+            filled_qty INTEGER,
+            fill_price DOUBLE PRECISION,
+            filled_ts TIMESTAMPTZ,
+            signal_id TEXT,
+            broker_order_id TEXT,
+            meta JSONB,
+            updated_ts TIMESTAMPTZ DEFAULT NOW(),
+            created_ts TIMESTAMPTZ DEFAULT NOW()
         ) ON COMMIT PRESERVE ROWS
         """
     )
@@ -265,6 +291,7 @@ def _postgres_positions_table(monkeypatch):
             pass
         try:
             _teardown_cur = pg_conn.cursor()
+            _teardown_cur.execute("DROP TABLE IF EXISTS orders")
             _teardown_cur.execute("DROP TABLE IF EXISTS positions")
             pg_conn.commit()
             _teardown_cur.close()
@@ -392,6 +419,73 @@ def test_upsert_broker_position_to_db_persists_exact_mode_in_postgres(monkeypatc
 
 
 @_skip_if_no_mod
+def test_upsert_reuses_exact_filled_entry_identity_and_geometry(monkeypatch):
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "BAC260821C00065000"
+        client = "repair-identity@example.com"
+        position_id = "canonical-position-516"
+        filled_ts = "2026-07-22T13:00:00Z"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, position_id, kind, status,
+                    contract, execution_mode, filled_qty, fill_price, filled_ts,
+                    signal_id, broker_order_id, meta
+                ) VALUES (%s, %s, %s, 'ENTRY', 'FILLED', %s, 'live',
+                          %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    "local-entry-516", client, position_id, contract,
+                    2, 0.75, filled_ts, "signal-516", "broker-entry-516",
+                    '{"underlying_entry":127.425,"stop_underlying":130.44,'
+                    '"target_underlying":124.78}',
+                ),
+            )
+        pg_conn.commit()
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="live")
+
+        row_id = eng._upsert_broker_position_to_db(
+            contract,
+            {
+                "quantity": 2,
+                "cost_basis": 150.0,
+                "date_acquired": filled_ts,
+            },
+        )
+
+        assert row_id == position_id
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, client_id, execution_mode, signal_id,
+                       local_order_id, broker_order_id, underlying_entry,
+                       stop_underlying, target_underlying
+                FROM positions
+                WHERE client_id = %s AND contract = %s
+                """,
+                (client, contract),
+            )
+            row = cur.fetchone()
+        assert row is not None
+        assert row[:6] == (
+            position_id, client, "live", "signal-516",
+            "local-entry-516", "broker-entry-516",
+        )
+        assert row[6:] == pytest.approx((127.425, 130.44, 124.78))
+
+
+@_skip_if_no_mod
 def test_normal_load_preserves_zero_qty():
     """
     Test 6: normal DB-only load (prefer_qty_override=False, default).
@@ -483,9 +577,9 @@ def test_upsert_on_conflict_fallback_sqlite():
     """
     # Build the re-query SQL from source
     idx = EE_SRC.find("SELECT id FROM positions")
-    fallback_region = EE_SRC[idx:idx + 400]
+    fallback_region = EE_SRC[idx:idx + 900]
     assert "client_id" in fallback_region
-    assert "UPPER(contract)" in fallback_region
+    assert "UPPER(TRIM(COALESCE(contract" in fallback_region
 
     # Simple structural check — the re-query EXISTS in source
     assert "ORDER BY entry_ts DESC NULLS LAST" in fallback_region
@@ -644,45 +738,27 @@ def test_log_honesty_repair_failed_reason_in_added_log():
     )
 
 def test_repaired_syms_only_for_real_db_rows():
-    """
-    Fix 2/Option A: repaired_syms must only be appended when new_id is truthy.
-    Synthetic-id loads go to engine_loaded_synthetic_syms.
-    """
-    assert "engine_loaded_synthetic_syms" in EE_SRC, (
-        "engine_loaded_synthetic_syms list must exist in precheck"
-    )
-    # repaired_syms.append must be guarded by `if new_id:`
-    idx = EE_SRC.find("repaired_syms.append(sym)")
-    region = EE_SRC[max(0, idx - 150) : idx + 50]
-    assert "if new_id" in region, (
-        "repaired_syms.append must only run when new_id is a real DB id"
-    )
-    # engine_loaded_synthetic_syms.append must be in the else branch
-    idx2 = EE_SRC.find("engine_loaded_synthetic_syms.append(sym)")
-    assert idx2 > 0, "engine_loaded_synthetic_syms.append must be called in the else branch"
+    """Only a confirmed durable row may be counted as repaired."""
+    assert "engine_loaded_synthetic_syms" not in EE_SRC
+    assert "if not new_id:" in EE_SRC
+    assert "repaired_syms.append(sym)" in EE_SRC
+    assert "db_upsert_returned_no_id" in EE_SRC
 
-def test_summary_includes_engine_loaded_synthetic():
-    """Fix 4: summary log must include engine_loaded_synthetic field."""
+def test_summary_excludes_engine_loaded_synthetic():
+    """The summary must distinguish confirmed repairs from failed repairs."""
     idx = EE_SRC.rfind("EXIT_BROKER_PRECHECK_SUMMARY")
     region = EE_SRC[idx:idx + 600]
-    assert "engine_loaded_synthetic" in region, (
-        "EXIT_BROKER_PRECHECK_SUMMARY must include engine_loaded_synthetic field"
-    )
+    assert "engine_loaded_synthetic" not in region
     assert "repaired_from_broker" in region, (
         "EXIT_BROKER_PRECHECK_SUMMARY must still include repaired_from_broker (DB-confirmed only)"
     )
+    assert "repair_failed" in region
 
-def test_synthetic_path_sets_db_repaired_false():
-    """
-    Fix 1 (existing): when upsert returns None, db_repaired must be set False
-    before add_position is called.
-    """
-    idx = EE_SRC.find("db_repaired         = False")
-    assert idx > 0, "db_repaired=False must be set in the synthetic-id path"
-    region = EE_SRC[idx : idx + 300]
-    assert "db_upsert_returned_no_id" in region or "synthetic" in region, (
-        "db_repaired=False path must be near synthetic id logic"
-    )
+def test_failed_upsert_does_not_create_synthetic_owner():
+    """A failed upsert must not create an engine-only synthetic owner."""
+    assert "db_upsert_returned_no_id" in EE_SRC
+    assert "using synthetic position_id" not in EE_SRC
+    assert "engine will still load and evaluate" not in EE_SRC
 
 
 # =============================================================================
