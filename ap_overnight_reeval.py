@@ -1761,59 +1761,19 @@ def _overnight_source_provenance(*, source: str, job_id, signal_id) -> dict | No
     }
 
 
-def _merge_overnight_source_provenance(metadata: dict, provenance: dict) -> bool:
-    """Add source provenance without relabeling an already-identified order."""
+def _overnight_source_provenance_matches(metadata: dict, provenance: dict) -> bool:
+    """Prove an existing order already carries the exact source-row identity."""
     _keys = (
         "overnight_source_table",
         "overnight_source_job_id",
         "overnight_source_signal_id",
     )
-    _existing = {
-        key: str(metadata.get(key) or "").strip()
+    return all(
+        str(metadata.get(key) or "").strip()
+        == str(provenance.get(key) or "").strip()
+        and bool(str(metadata.get(key) or "").strip())
         for key in _keys
-    }
-    _has_existing = any(_existing.values())
-    if _has_existing and any(_existing[key] != str(provenance.get(key) or "").strip() for key in _keys):
-        return False
-    metadata.update(provenance)
-    return True
-
-
-def _persist_overnight_order_provenance(
-    order_state_machine,
-    *,
-    local_order_id: str,
-    client_id: str,
-    execution_mode: str,
-    signal_id: str,
-    provenance: dict,
-) -> bool:
-    """Durably bind a reattached order to its exact overnight source row."""
-    _update_order_meta = getattr(order_state_machine, "update_order_meta", None)
-    if not callable(_update_order_meta):
-        log.critical(
-            "OVERNIGHT_ORDER_PROVENANCE_UPDATE_UNAVAILABLE client=%s mode=%s "
-            "signal=%s local_order_id=%s",
-            client_id, execution_mode, signal_id, local_order_id,
-        )
-        return False
-    try:
-        return bool(
-            _update_order_meta(
-                local_order_id,
-                dict(provenance),
-                expected_status="PENDING_TRIGGER",
-                expected_execution_mode=str(execution_mode or "").strip().lower(),
-                expected_signal_id=str(signal_id or "").strip(),
-            )
-        )
-    except Exception as exc:
-        log.critical(
-            "OVERNIGHT_ORDER_PROVENANCE_UPDATE_FAILED client=%s mode=%s "
-            "signal=%s local_order_id=%s error=%s",
-            client_id, execution_mode, signal_id, local_order_id, exc,
-        )
-        return False
+    )
 
 
 def _classify_overnight_reeval_result(result: dict) -> dict:
@@ -2353,40 +2313,23 @@ def run_overnight_reeval(
                     if not isinstance(_ord_meta, dict):
                         _ord_meta = {}
 
-                    _source_meta_present = all(
-                        str(_ord_meta.get(key) or "").strip()
-                        == str(value).strip()
-                        for key, value in source_provenance.items()
-                    )
-                    if not _merge_overnight_source_provenance(
+                    # A legacy order without the new source-row fields is not
+                    # identifiable enough to reattach.  The current source row
+                    # may share signal/canonical identity with a different
+                    # source's old order, so stamping the current provenance
+                    # here would manufacture the exact proof the readiness
+                    # guard relies on.  Only an already-complete matching
+                    # provenance record may authorize reattachment.
+                    if not _overnight_source_provenance_matches(
                         _ord_meta, source_provenance
                     ):
                         log.critical(
                             "[%s] overnight_reeval: REATTACH_WATCHER source provenance "
-                            "mismatch signal=%s local_order_id=%s expected=%s existing=%s "
-                            "— preserving order and classifying retryable",
+                            "missing_or_mismatched signal=%s local_order_id=%s "
+                            "expected=%s existing=%s — preserving order and "
+                            "classifying retryable",
                             ticker, signal_id, _existing_oid,
                             source_provenance, _ord_meta,
-                        )
-                        result["skipped"] = result.get("skipped", 0) + 1
-                        _record_retryable_row(
-                            result, job_id=job_id, signal_id=signal_id, source=job_source
-                        )
-                        continue
-
-                    if not _source_meta_present and not _persist_overnight_order_provenance(
-                        order_state_machine,
-                        local_order_id=_existing_oid,
-                        client_id=client_id,
-                        execution_mode=_reattach_mode,
-                        signal_id=signal_id,
-                        provenance=source_provenance,
-                    ):
-                        log.critical(
-                            "[%s] overnight_reeval: REATTACH_WATCHER source provenance "
-                            "was not durably persisted signal=%s local_order_id=%s "
-                            "— classifying retryable",
-                            ticker, signal_id, _existing_oid,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
                         _record_retryable_row(

@@ -813,6 +813,7 @@ def _run_one_attempt(
     watcher_already_owns=False,
     legacy_confirmed=False,
     source_provenance=True,
+    legacy_source_metadata=None,
 ):
     """Drive the real run_overnight_reeval loop for a single attempt.
     Uses spies on master_control, contract_selector, OSM create/broker to
@@ -852,6 +853,8 @@ def _run_one_attempt(
             "overnight_source_job_id": "sup:sig-reattach-integration",
             "overnight_source_signal_id": "sig-reattach-integration",
         }
+    if legacy_source_metadata is not None:
+        _active_row["meta"] = dict(legacy_source_metadata)
     monkeypatch.setattr(
         ov, "_query_active_entry_order",
         lambda *_a, **_kw: (ov._LS_FOUND, dict(_active_row)),
@@ -926,27 +929,33 @@ def _run_one_attempt(
     )
 
 
-def test_reattach_missing_source_provenance_is_durably_bound(monkeypatch):
-    """A legacy pending order must be tagged before reattach can prove it."""
+def test_reattach_legacy_cross_source_order_is_not_relabelled(monkeypatch):
+    """A legacy order from another source cannot be claimed by this row."""
     proof_write = MagicMock(return_value=True)
     state = _run_one_attempt(
         monkeypatch,
         mock_ledger=proof_write,
         source_provenance=False,
+        legacy_source_metadata={
+            "source_table": "trade_queue",
+            "source_job_id": "12345",
+            "original_signal_id": "sig-reattach-integration",
+        },
     )
 
-    assert state.result["armed"] == 1
-    state.provenance_update.assert_called_once_with(
-        EXISTING_LOCAL_OID,
-        {
-            "overnight_source_table": "ap_signals",
-            "overnight_source_job_id": "sup:sig-reattach-integration",
-            "overnight_source_signal_id": "sig-reattach-integration",
-        },
-        expected_status="PENDING_TRIGGER",
-        expected_execution_mode="paper",
-        expected_signal_id="sig-reattach-integration",
-    )
+    assert state.result["armed"] == 0
+    assert state.result["retryable_deferred"] == 1
+    assert state.result["completed"] is False
+    state.provenance_update.assert_not_called()
+    state.entry_watcher.watch.assert_not_called()
+    state.pre_watch_fence.assert_not_called()
+    state.mc_evaluate.assert_not_called()
+    state.selector_select.assert_not_called()
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
 
 
 def test_owned_reattach_legacy_evidence_retries_proof_without_rearm(monkeypatch):
