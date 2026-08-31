@@ -231,9 +231,6 @@ def _postgres_positions_table(monkeypatch):
             signal_id TEXT,
             local_order_id TEXT,
             broker_order_id TEXT,
-            underlying_entry DOUBLE PRECISION,
-            stop_underlying DOUBLE PRECISION,
-            target_underlying DOUBLE PRECISION,
             meta JSONB
         ) ON COMMIT PRESERVE ROWS
         """
@@ -360,9 +357,6 @@ def _postgres_shared_positions_table(monkeypatch):
                 signal_id TEXT,
                 local_order_id TEXT,
                 broker_order_id TEXT,
-                underlying_entry DOUBLE PRECISION,
-                stop_underlying DOUBLE PRECISION,
-                target_underlying DOUBLE PRECISION,
                 meta JSONB
             );
             SET search_path TO {schema}, public
@@ -550,15 +544,14 @@ def test_postgres_recovery_reuses_canonical_filled_entry_identity(monkeypatch):
                 INSERT INTO orders (
                     id, client_id, execution_mode, contract, kind, status,
                     filled_qty, fill_price, filled_ts, position_id, signal_id,
-                    local_order_id, broker_order_id,
-                    underlying_entry, stop_underlying, target_underlying
+                    local_order_id, broker_order_id, meta
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     "entry-order-1", client, "live", contract, "ENTRY", "PARTIAL_FILL",
                     1, 1.30, "2026-08-25T13:54:01+00:00", canonical_id,
                     "signal-1", "local-entry-1", "broker-entry-1",
-                    127.425, 130.44, 124.78,
+                    json.dumps({"underlying_entry": 127.425, "stop_underlying": 130.44, "target_underlying": 124.78}),
                 ),
             )
         pg_conn.commit()
