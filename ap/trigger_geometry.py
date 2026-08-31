@@ -15,9 +15,16 @@ def _f(value: Any) -> float | None:
 
 def _levels(signal: dict[str, Any]) -> tuple[float | None, float | None, float | None]:
     trigger = signal.get("trigger") if isinstance(signal.get("trigger"), dict) else {}
-    entry = _f(signal.get("entry_price") or signal.get("trigger_price") or trigger.get("entry"))
-    stop = _f(signal.get("stop_price") or signal.get("stop_underlying") or trigger.get("stop"))
-    target = _f(signal.get("target_price") or signal.get("target_underlying") or trigger.get("pt1") or trigger.get("pt2"))
+    scalar_trigger = signal.get("trigger") if not isinstance(signal.get("trigger"), dict) else None
+    entry = _f(
+        signal.get("trigger_price")
+        or scalar_trigger
+        or trigger.get("entry")
+        or signal.get("underlying_entry_price")
+        or signal.get("entry_price")
+    )
+    stop = _f(signal.get("stop_price") or signal.get("stop_underlying") or signal.get("stop") or trigger.get("stop"))
+    target = _f(signal.get("target_price") or signal.get("target_underlying") or signal.get("target") or trigger.get("pt1") or trigger.get("pt2"))
     return entry, stop, target
 
 
@@ -82,7 +89,9 @@ def score_remaining_opportunity(signal: dict[str, Any], side: Any | None = None)
     sig = dict(signal or {})
     normalized_side = normalize_signal_side(side if side is not None else sig.get("side") or sig.get("direction"))
     trigger = sig.get("trigger") if isinstance(sig.get("trigger"), dict) else {}
-    current = _f(sig.get("current_price") or sig.get("underlying_price") or sig.get("entry_price") or trigger.get("entry"))
+    # Remaining opportunity requires an actual point-in-time underlying quote.
+    # Entry/trigger geometry is not a substitute for current market truth.
+    current = _f(sig.get("current_price") or sig.get("underlying_price"))
     _entry, stop, target = _levels(sig)
     missing = [n for n, v in (("current_price", current), ("target", target), ("stop", stop)) if v is None]
     warnings: list[str] = []

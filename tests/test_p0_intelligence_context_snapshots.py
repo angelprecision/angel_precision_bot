@@ -21,6 +21,8 @@ from ap.intelligence_context_worker import process_due_intelligence_jobs_once  #
 from ap.intelligence_context_handoff import submit_intelligence_enqueue  # noqa: E402
 from ap.intelligence_context_handoff import (  # noqa: E402
     enqueue_pretrigger_context_best_effort,
+    intelligence_context_enabled,
+    INTELLIGENCE_CONTEXT_HANDOFF_CAPACITY,
 )
 from ap.intelligence_snapshot_store import (  # noqa: E402
     _MEMORY_JOBS,
@@ -409,6 +411,19 @@ def test_disabled_feature_does_not_submit_enqueue(monkeypatch):
     assert result == {"ok": True, "accepted": False, "disabled": True}
 
 
+def test_intelligence_capture_defaults_on_and_capacity_covers_scanner_burst(monkeypatch):
+    monkeypatch.delenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", raising=False)
+
+    assert intelligence_context_enabled() is True
+    assert INTELLIGENCE_CONTEXT_HANDOFF_CAPACITY >= 512
+
+
+def test_worker_source_defaults_enabled():
+    source = (REPO_ROOT / "ap" / "intelligence_context_worker.py").read_text()
+
+    assert 'INTELLIGENCE_CONTEXT_WORKER_ENABLED", "1"' in source
+
+
 def test_async_handoff_freezes_nested_signal_state(monkeypatch):
     monkeypatch.setenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "1")
     captured = {}
@@ -629,6 +644,13 @@ def test_recovery_scan_backfills_missing_phase_jobs_from_durable_truth(monkeypat
     assert {job["canonical_signal_id"] for job in jobs} == {
         "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72"
     }
+
+
+def test_recovery_includes_terminal_queue_rows_in_population():
+    source = (REPO_ROOT / "ap" / "intelligence_context_materializer.py").read_text()
+    recovery = source[source.index("def recover_missing_intelligence_jobs"):]
+
+    assert "q.status NOT IN ('REJECTED','ERROR','CANCELED','CANCELLED','EXPIRED')" not in recovery
 
 
 def test_preopen_refreshes_time_sensitive_quote_instead_of_relabeling_pretrigger(monkeypatch):

@@ -2,6 +2,14 @@
 ap_strategy_evolver.py
 Angel Precision — Autonomous Strategy Parameter Optimizer
 
+LEGACY LEAKY RESEARCH ONLY.
+
+This script is retained for reproducibility, but its simplified simulator uses
+historical ``win_rate`` and ``avg_return`` as scoring inputs.  Those fields are
+outcomes, so results from this script are not valid promotion evidence and must
+never be copied into live thresholds.  New policy evaluation belongs in
+``ap.profitability_objective``.
+
 This IS the Auto-Quant pattern, adapted for your system.
 Instead of mutating FreqTrade strategies, this mutates the weights and
 thresholds inside ap_strat_agent.py and backtests them against your
@@ -13,7 +21,8 @@ per symbol per quarter). Target: 80%+ win rate.
 
 Usage:
     # Run overnight with Claude Code or as a standalone script
-    python ap_strategy_evolver.py --source ap_strat_setups.csv --rounds 100
+    python ap_strategy_evolver.py --source ap_strat_setups.csv --rounds 100 \
+        --allow-outcome-leakage
 
     # Or import and drive from Claude Code:
     from ap_strategy_evolver import run_evolution_loop
@@ -147,8 +156,10 @@ def load_historical_setups(csv_path: str) -> list[dict]:
     setups = []
     path = Path(csv_path)
     if not path.exists():
-        logger.warning(f"CSV not found: {csv_path} — using synthetic test data")
-        return _generate_synthetic_setups()
+        raise FileNotFoundError(
+            f"Historical setup CSV not found: {csv_path}. "
+            "Synthetic fallback is forbidden for strategy evaluation."
+        )
 
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
@@ -450,6 +461,8 @@ def run_evolution_loop(
     source_csv: str = "ap_strat_setups.csv",
     rounds: int = 100,
     target_win_rate: float = 0.80,
+    *,
+    allow_outcome_leakage: bool = False,
 ):
     """
     Autonomous parameter evolution loop.
@@ -464,6 +477,17 @@ def run_evolution_loop(
     Per Auto-Quant: DO NOT stop to ask for confirmation.
     Keep iterating until interrupted or rounds exhausted.
     """
+    if not allow_outcome_leakage:
+        raise RuntimeError(
+            "Legacy strategy evolver is blocked because simulate_gate() uses "
+            "historical win_rate and avg_return as inputs. Pass "
+            "allow_outcome_leakage=True only for reproducibility research; use "
+            "ap.profitability_objective for promotion evidence."
+        )
+
+    logger.warning(
+        "LEGACY LEAKY RESEARCH: results are not valid paper/live promotion evidence"
+    )
     logger.info("="*60)
     logger.info("AP STRATEGY EVOLVER — Starting evolution loop")
     logger.info(f"Target: {target_win_rate:.0%} win rate | Rounds: {rounds}")
@@ -590,7 +614,10 @@ def run_evolution_loop(
             "config":            best_config.to_dict(),
         }, f, indent=2)
     logger.info(f"Best config saved to: {best_config_path}")
-    logger.info("Paste 'config' block into ap_strat_agent.py → STRATEGY_WEIGHTS + DEFAULT_GATE_THRESHOLD")
+    logger.warning(
+        "Do not promote this config to paper or live thresholds; the simulator "
+        "contains outcome leakage."
+    )
 
     return best_config, best_result
 
@@ -604,10 +631,16 @@ if __name__ == "__main__":
     parser.add_argument("--source", default="ap_strat_setups.csv", help="Path to ap_strat_setups.csv")
     parser.add_argument("--rounds", type=int, default=100, help="Number of evolution rounds")
     parser.add_argument("--target", type=float, default=0.80, help="Target win rate (e.g. 0.80)")
+    parser.add_argument(
+        "--allow-outcome-leakage",
+        action="store_true",
+        help="Acknowledge this legacy simulator is invalid for policy promotion",
+    )
     args = parser.parse_args()
 
     run_evolution_loop(
         source_csv=args.source,
         rounds=args.rounds,
         target_win_rate=args.target,
+        allow_outcome_leakage=args.allow_outcome_leakage,
     )

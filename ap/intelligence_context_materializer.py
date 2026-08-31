@@ -83,6 +83,7 @@ def build_intelligence_context_payload(
     observation = point_in_time.get("underlying_observation") or {}
     observed_price = observation.get("price")
     evaluation_signal = dict(sig)
+    evaluation_signal["canonical_signal_id"] = canonical_signal_id
     if observed_price is not None:
         evaluation_signal["underlying_price"] = observed_price
         evaluation_signal["current_price"] = observed_price
@@ -102,11 +103,45 @@ def build_intelligence_context_payload(
     from ap.sector_context import score_sector_context
     from ap.volume_confirmation import score_volume_confirmation
     from ap.vwap_context import score_vwap_context
+    from ap.trigger_geometry import score_trigger_geometry
+    from ap.score_profile_side import normalize_signal_side
+    from ap.position_score_profile import build_position_score_profile
+    from ap.intelligence_score import build_intelligence_score
     strat_context = evaluate_higher_timeframe_confluence(evaluation_signal, market_context)
     fvg_context = evaluate_fvg_context(evaluation_signal, market_context)
     sector_context = score_sector_context(evaluation_signal, market_context)
     volume_context = score_volume_confirmation(evaluation_signal, market_context)
     vwap_context = score_vwap_context(evaluation_signal, market_context)
+    trigger_context = score_trigger_geometry(
+        evaluation_signal,
+        normalize_signal_side(evaluation_signal.get("side") or evaluation_signal.get("direction")),
+    )
+    profile_market_context = dict(market_context)
+    profile_market_context["_intelligence_upstream"] = {
+        name: {"provided": True, "raw": raw}
+        for name, raw in {
+            "the_strat_confluence": strat_context,
+            "fair_value_gap": fvg_context,
+            "sector_context": sector_context,
+            "volume_confirmation": volume_context,
+            "vwap_context": vwap_context,
+            "trigger_geometry": trigger_context,
+        }.items()
+    }
+    position_score_profile = build_position_score_profile(
+        evaluation_signal, profile_market_context
+    )
+    computed_at = _now_iso()
+    intelligence_score = build_intelligence_score(
+        position_score_profile,
+        signal=evaluation_signal,
+        client_id=str(client_id or ""),
+        execution_mode=normalize_execution_mode(execution_mode),
+        scored_at=computed_at,
+        data_as_of=point_in_time.get("collected_at") or computed_at,
+        source=f"intelligence_context_{phase.lower()}",
+        git_commit=_git_commit(),
+    )
     geometry = extract_trade_geometry(evaluation_signal)
     timeframe_context = {
         "monthly": summarize_timeframe({"1mo": market_context["candles"].get("monthly")}, "1mo"),
@@ -145,6 +180,7 @@ def build_intelligence_context_payload(
         "sector": _component((sector_context.get("diagnostics") or {}).get("sector_direction") is not None, error_prefix="sector_quote"),
         "volume": _component((volume_context.get("diagnostics") or {}).get("relative_volume") is not None),
         "vwap": _component((vwap_context.get("diagnostics") or {}).get("vwap") is not None),
+        "intelligence_score": _component(bool(intelligence_score.get("score_valid"))),
     }
     required_values = list(component_statuses.values())
     status = "COMPLETE" if required_values and all(value == "AVAILABLE" for value in required_values) else "PARTIAL"
@@ -173,7 +209,7 @@ def build_intelligence_context_payload(
         "timeframe": str(sig.get("timeframe") or ""),
         "data_as_of": point_in_time.get("collected_at") or _now_iso(),
         "signal_data_as_of": sig.get("data_as_of") or sig.get("queued_at"),
-        "computed_at": _now_iso(),
+        "computed_at": computed_at,
         "status": status,
         "component_statuses": component_statuses,
         "hard_safety_blocks": hard_blocks,
@@ -189,6 +225,9 @@ def build_intelligence_context_payload(
         "sector_context": sector_context,
         "volume_context": volume_context,
         "vwap_context": vwap_context,
+        "trigger_context": trigger_context,
+        "position_score_profile": position_score_profile,
+        "intelligence_score": intelligence_score,
         "underlying_observation": observation,
         "data_provenance": point_in_time.get("provenance") or {},
         "parent_snapshot_id": parent_snapshot_id,
@@ -365,7 +404,6 @@ def recover_missing_intelligence_jobs(
                 FROM trade_queue q
                 WHERE q.client_id=%s
                   AND upper(COALESCE(q.payload->>'execution_mode', q.payload->>'mode', %s))=%s
-                  AND q.status NOT IN ('REJECTED','ERROR','CANCELED','CANCELLED','EXPIRED')
                   AND NOT EXISTS (
                     SELECT 1 FROM ap_intelligence_jobs j
                     WHERE j.client_id=q.client_id

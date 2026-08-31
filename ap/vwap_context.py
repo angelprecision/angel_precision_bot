@@ -32,8 +32,10 @@ def score_vwap_context(signal: dict[str, Any], market_context: dict[str, Any] | 
     sig = dict(signal or {}); ctx = market_context or {}; trend_ctx = _trend_payload(ctx)
     side = normalize_signal_side(sig.get("side") or sig.get("direction"))
     trigger = sig.get("trigger") if isinstance(sig.get("trigger"), dict) else {}
-    price = _first_float(sig.get("current_price"), sig.get("underlying_price"), sig.get("entry_price"), sig.get("trigger_price"), trigger.get("entry"), trend_ctx.get("price"), trend_ctx.get("current_price"))
-    entry = _first_float(sig.get("entry_price"), sig.get("trigger_price"), trigger.get("entry"), price)
+    # VWAP alignment is a live-context calculation.  Do not manufacture the
+    # current price from planned entry/trigger geometry.
+    price = _first_float(sig.get("current_price"), sig.get("underlying_price"), trend_ctx.get("price"), trend_ctx.get("current_price"))
+    entry = _first_float(sig.get("trigger_price"), trigger.get("entry"), sig.get("underlying_entry_price"), sig.get("entry_price"))
     vwap = _first_float(sig.get("vwap"), trend_ctx.get("vwap"), trend_ctx.get("session_vwap"))
     chop_zone_pct = _first_float(sig.get("vwap_chop_zone_pct"), trend_ctx.get("chop_zone_pct"), CONFIG.vwap_chop_zone_pct) or CONFIG.vwap_chop_zone_pct
     sr_zone_pct = _first_float(trend_ctx.get("support_resistance_zone_pct"), CONFIG.vwap_support_resistance_zone_pct) or CONFIG.vwap_support_resistance_zone_pct

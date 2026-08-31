@@ -330,20 +330,27 @@ def _run_position_score_profile(
         ):
             mod_res = upstream_results.get(mod_name)
             if mod_res and isinstance(mod_res, dict):
-                # Pass only the canonical fields — not internal _raw
+                # Pass canonical status plus an internal copy of the raw
+                # evidence so downstream scoring does not rerun the module.
                 _upstream_canonical[mod_name] = {
+                    "provided":     True,
                     "available":    mod_res.get("available"),
                     "score":        mod_res.get("score"),     # None = unavailable
                     "missing_reason": mod_res.get("missing_reason"),
                     "error":        mod_res.get("error"),
                     "freshness":    mod_res.get("freshness"),
+                    # Internal-only raw evidence lets the profile consume the
+                    # exact module result rather than recomputing it.
+                    "raw":          copy.deepcopy(mod_res.get("_raw")),
                 }
             else:
                 _upstream_canonical[mod_name] = {
+                    "provided": True,
                     "available": False,
                     "score":     None,
                     "missing_reason": "upstream_result_missing",
                     "error":     None,
+                    "raw":       None,
                 }
         # Attach upstream canonical results to profile_context under a namespaced key.
         # position_score_profile can read these for comparison or override.
@@ -481,9 +488,21 @@ def evaluate_intelligence(
         if mod_name != "market_context":
             module_scores[mod_name] = score
 
-    # overall_score from position_score_profile.total_score
+    # One canonical 0-100 score is derived from the detailed raw profile.
+    # The raw profile remains available for diagnostics and compatibility.
     psp_raw = (module_results.get("position_score_profile") or {}).get("_raw") or {}
-    overall_score: Optional[float] = (
+    from ap.intelligence_score import build_intelligence_score
+    intelligence_score = build_intelligence_score(
+        psp_raw,
+        signal=sig,
+        client_id=str(client_id or ""),
+        execution_mode=str(execution_mode or ""),
+        scored_at=now,
+        data_as_of=ctx.get("data_as_of") or now,
+        source="intelligence_evaluation",
+        git_commit=_CACHED_GIT_COMMIT,
+    )
+    raw_profile_score = (
         psp_raw.get("total_score")
         if isinstance(psp_raw.get("total_score"), (int, float))
         else None
@@ -506,7 +525,11 @@ def evaluate_intelligence(
         "config_hash":         _config_hash({}),
         "git_commit":          _CACHED_GIT_COMMIT,  # cached at module load, not per evaluation
         "available":           len(missing_inputs) < len(module_results),
-        "overall_score":       overall_score,
+        # Backward-compatible diagnostic field (0-120 raw profile scale).
+        "overall_score":       raw_profile_score,
+        # Canonical research-ranking field (strict 0-100, or None if invalid).
+        "policy_score":        intelligence_score.get("policy_score"),
+        "intelligence_score":  intelligence_score,
         "module_scores":       module_scores,
         "module_statuses":     module_statuses,
         "missing_inputs":      sorted(set(missing_inputs)),

@@ -146,6 +146,27 @@ def _parse_payload(raw) -> dict:
     return {}
 
 
+def _resolve_enqueue_execution_mode(explicit_mode: Any, payload: dict[str, Any]) -> str | None:
+    """Resolve a trustworthy intelligence scope without changing queue admission."""
+
+    payload_raw = _payload_execution_mode_value(payload)
+    explicit_raw = str(explicit_mode or "").strip()
+    if explicit_raw:
+        explicit = str(explicit_mode).strip().upper()
+        if explicit not in {"PAPER", "LIVE"}:
+            return None
+        if str(payload_raw or "").strip():
+            payload_mode = str(payload_raw).strip().upper()
+            if payload_mode not in {"PAPER", "LIVE"} or payload_mode != explicit:
+                return None
+        return explicit
+    if str(payload_raw or "").strip():
+        payload_mode = str(payload_raw).strip().upper()
+        return payload_mode if payload_mode in {"PAPER", "LIVE"} else None
+    env_mode = str(os.getenv("BOT_MODE") or os.getenv("MODE") or "").strip().upper()
+    return env_mode if env_mode in {"PAPER", "LIVE"} else None
+
+
 # =============================================================================
 # ENQUEUE -- idempotent insert
 # =============================================================================
@@ -154,6 +175,7 @@ def enqueue_signal(
     sig,
     client_id: str = "default",
     idempotency_key: str | None = None,
+    execution_mode: str | None = None,
 ) -> bool:
     """
     Push a signal into trade_queue.
@@ -215,6 +237,19 @@ def enqueue_signal(
     # enqueues within the same millisecond, producing duplicate
     # idempotency_keys and silently dropping signals as "duplicates".
     signal_id = payload.get("signal_id") or f"signal_{uuid.uuid4().hex[:12]}_{_now_iso()}"
+    signal_id = str(signal_id)
+    payload["signal_id"] = signal_id
+    canonical_signal_id = str(payload.get("canonical_signal_id") or signal_id)
+    try:
+        from ap_canonical_signal import build_canonical_signal_id
+        canonical_signal_id = build_canonical_signal_id(signal_id, payload) or canonical_signal_id
+    except Exception as canonical_exc:
+        log.warning("enqueue_signal: canonical identity fallback signal_id=%s err=%s", signal_id, canonical_exc)
+    payload["canonical_signal_id"] = canonical_signal_id
+
+    intelligence_mode = _resolve_enqueue_execution_mode(execution_mode, payload)
+    if intelligence_mode and not str(_payload_execution_mode_value(payload) or "").strip():
+        payload["execution_mode"] = intelligence_mode.lower()
     if not idempotency_key:
         idempotency_key = f"{client_id}:{signal_id}"
 
@@ -240,6 +275,37 @@ def enqueue_signal(
             log.debug(f"Duplicate ignored: {signal_id}")
             return False
         log.info(f"✅ Enqueued: {signal_id} client={client_id}")
+        if intelligence_mode:
+            try:
+                from ap.intelligence_context_handoff import enqueue_pretrigger_context_best_effort
+
+                intel = enqueue_pretrigger_context_best_effort(
+                    payload,
+                    client_id=client_id,
+                    execution_mode=intelligence_mode,
+                    canonical_signal_id=canonical_signal_id,
+                )
+                if not intel.get("ok"):
+                    log.warning(
+                        "PRETRIGGER intelligence handoff failed signal_id=%s client_id=%s reason=%s",
+                        signal_id,
+                        client_id,
+                        intel.get("error"),
+                    )
+            except Exception as intel_exc:
+                log.warning(
+                    "PRETRIGGER intelligence handoff error signal_id=%s client_id=%s err=%s",
+                    signal_id,
+                    client_id,
+                    intel_exc,
+                )
+        else:
+            log.warning(
+                "PRETRIGGER intelligence deferred: authoritative execution mode unavailable "
+                "signal_id=%s client_id=%s",
+                signal_id,
+                client_id,
+            )
         return True
     except Exception as e:
         msg = str(e).lower()
@@ -2458,33 +2524,6 @@ def _dispatch(
     # legacy-fallback guard; it does not affect _dispatch fail-closed logic.
     _execution_mode = runtime_mode_for_dispatch
     live_mode: bool = _execution_mode == "LIVE"
-
-    # Intelligence context PRETRIGGER enqueue: durable, observe-only, and
-    # non-blocking. This is intentionally before synchronous Master Control
-    # intelligence so slow evidence can materialize ahead of any trigger breach.
-    try:
-        from ap.intelligence_context_handoff import enqueue_pretrigger_context_best_effort
-
-        _intel_enqueue = enqueue_pretrigger_context_best_effort(
-            payload,
-            client_id=client_id,
-            execution_mode=_execution_mode,
-            canonical_signal_id=_canonical_signal_id,
-        )
-        if not _intel_enqueue.get("ok"):
-            log.warning(
-                "[%s] PRETRIGGER intelligence enqueue failed signal_id=%s reason=%s",
-                ticker,
-                signal_id,
-                _intel_enqueue.get("error"),
-            )
-    except Exception as _intel_exc:
-        log.warning(
-            "[%s] PRETRIGGER intelligence enqueue error signal_id=%s: %s",
-            ticker,
-            signal_id,
-            _intel_exc,
-        )
 
     if _paper_overnight_reeval_only_enabled(payload=payload, execution_mode=_execution_mode):
         log.warning(

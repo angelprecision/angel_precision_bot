@@ -53,6 +53,18 @@ def process_due_intelligence_jobs_once(
             result = complete_job_with_snapshot(job, claim_owner=owner, snapshot_kwargs=snapshot_kwargs)
             if result.get("ok") and result.get("completed"):
                 completed += 1
+                if str(job.get("phase") or "").upper() == "PRETRIGGER":
+                    from ap.trade_dossier import reconcile_pretrigger_snapshot_best_effort
+                    snapshot = result.get("snapshot") or {}
+                    reconciliation = reconcile_pretrigger_snapshot_best_effort(
+                        snapshot_kwargs,
+                        snapshot_id=str(snapshot.get("snapshot_id") or ""),
+                    )
+                    if not reconciliation.get("ok"):
+                        log.warning(
+                            "intelligence dossier reconciliation unavailable job_id=%s result=%s",
+                            job.get("id"), reconciliation,
+                        )
                 continue
             errors += 1
             attempts = int(job.get("attempt_count") or 0)
@@ -140,7 +152,7 @@ def start_intelligence_context_worker(
     interval_seconds: Optional[float] = None,
     broker: Any = None,
 ) -> Optional[threading.Thread]:
-    if os.getenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+    if os.getenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
     mode = str(execution_mode or "").strip().upper()
     name = f"intelligence-context-{client_id}-{mode.lower()}"
@@ -159,9 +171,23 @@ def start_intelligence_context_worker(
                 recovery = recover_missing_intelligence_jobs(
                     client_id=client_id, execution_mode=execution_mode,
                 )
+                from ap.trade_dossier import reconcile_trade_dossier_backlog_best_effort
+                dossier_recovery = reconcile_trade_dossier_backlog_best_effort(
+                    client_id=client_id,
+                    execution_mode=execution_mode,
+                )
+                from ap.intelligence_daily_rankings import freeze_due_daily_rankings_best_effort
+                daily_ranking = freeze_due_daily_rankings_best_effort(
+                    client_id=client_id,
+                    execution_mode=execution_mode,
+                )
                 last_recovery = now
                 if not recovery.get("ok"):
                     log.warning("[%s] intelligence recovery scan failed: %s", client_id, recovery)
+                if not dossier_recovery.get("ok"):
+                    log.warning("[%s] intelligence dossier recovery failed: %s", client_id, dossier_recovery)
+                if not daily_ranking.get("ok"):
+                    log.warning("[%s] intelligence daily ranking failed: %s", client_id, daily_ranking)
             result = process_due_intelligence_jobs_once(
                 claim_owner=owner,
                 client_id=client_id,

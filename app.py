@@ -699,6 +699,16 @@ def create_app() -> Flask:
             _tbp_err,
         )
 
+    try:
+        from ap.intelligence_api import intelligence_bp as _intelligence_bp
+        app.register_blueprint(_intelligence_bp)
+        log.info("✅ Intelligence feed endpoints registered at /intelligence/*")
+    except Exception as _ibp_err:
+        log.error(
+            "Intelligence blueprint registration failed (non-fatal): %s",
+            _ibp_err,
+        )
+
     # ✅ Ensure default client exists BEFORE any state write
     with conn() as c:
         row = c.execute("SELECT 1 FROM clients WHERE client_id=%s", (DEFAULT_CLIENT_ID,)).fetchone()
@@ -1177,7 +1187,7 @@ def create_app() -> Flask:
                             "expiry_hint": msg.calls.expiry_hint,
                         },
                     )
-                    enqueue_signal(sig, client_id=client_id)
+                    enqueue_signal(sig, client_id=client_id, execution_mode=cfg.BOT_MODE)
                     queued += 1
 
                 if msg.puts and msg.puts.strike:
@@ -1200,7 +1210,7 @@ def create_app() -> Flask:
                             "expiry_hint": msg.puts.expiry_hint,
                         },
                     )
-                    enqueue_signal(sig, client_id=client_id)
+                    enqueue_signal(sig, client_id=client_id, execution_mode=cfg.BOT_MODE)
                     queued += 1
 
             return jsonify({"ok": True, "parsed": len(parsed), "queued": queued})
@@ -2542,7 +2552,11 @@ def create_app() -> Flask:
 
             # Enqueue directly into the runner's queue (bypasses route_signal_to_all_clients)
             try:
-                job_id = enqueue_signal(signal, client_id=client_id)
+                job_id = enqueue_signal(
+                    signal,
+                    client_id=client_id,
+                    execution_mode=getattr(runner, "mode", None),
+                )
                 return jsonify({
                     "ok": True,
                     "signal_id": signal_id,

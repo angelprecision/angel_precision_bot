@@ -9,12 +9,32 @@ from typing import Any, Callable
 
 log = logging.getLogger("ap.intelligence_context_handoff")
 
-_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="intelligence-handoff")
-_CAPACITY = threading.BoundedSemaphore(128)
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+INTELLIGENCE_CONTEXT_HANDOFF_WORKERS = _bounded_int_env(
+    "INTELLIGENCE_CONTEXT_HANDOFF_WORKERS", 4, 1, 32
+)
+# Scanner bursts average roughly 200 opportunities.  A 512-slot floor keeps
+# capture from becoming a sampling mechanism while remaining bounded.
+INTELLIGENCE_CONTEXT_HANDOFF_CAPACITY = _bounded_int_env(
+    "INTELLIGENCE_CONTEXT_HANDOFF_CAPACITY", 512, 512, 10000
+)
+_EXECUTOR = ThreadPoolExecutor(
+    max_workers=INTELLIGENCE_CONTEXT_HANDOFF_WORKERS,
+    thread_name_prefix="intelligence-handoff",
+)
+_CAPACITY = threading.BoundedSemaphore(INTELLIGENCE_CONTEXT_HANDOFF_CAPACITY)
 
 
 def intelligence_context_enabled() -> bool:
-    return os.getenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "0").strip().lower() in {
+    return os.getenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "1").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
