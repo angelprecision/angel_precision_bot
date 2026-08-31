@@ -8146,6 +8146,7 @@ class APExitEngine:
 
             # ── 3a. Try DB load ───────────────────────────────────────────────
             db_row = self._load_db_position_row(sym)
+            _repair_evidence = None
             if db_row:
                 # Durable positions.meta provenance survives restart. Filled
                 # ENTRY identity may positively confirm or contradict the row,
@@ -8225,6 +8226,25 @@ class APExitEngine:
                         prefer_qty_override=True,
                     )
                     self.add_position(pos)
+                    # Converge a provisional owner when a later exact filled-ENTRY lookup proves canonical identity.
+                    if (isinstance(_repair_evidence, dict) and not _repair_evidence.get("_lookup_status") and _is_broker_repair_provisional(pos)):
+                        _canonical_id = _broker_repair_position_id(_repair_evidence.get("position_id"))
+                        if _canonical_id and _canonical_id != str(getattr(pos, "position_id", "") or ""):
+                            _order_meta = _broker_repair_order_meta(_repair_evidence.get("meta"))
+                            _entry_fill = _broker_repair_positive_float(_repair_evidence.get("fill_price"))
+                            if _entry_fill is None:
+                                _entry_fill = _broker_repair_positive_float(getattr(pos, "entry_price", 0.0)) or 0.0
+                            _entry_geom = _broker_repair_historical_value(_repair_evidence, "underlying_entry")
+                            _stop_geom = _broker_repair_historical_value(_repair_evidence, "stop_underlying")
+                            _target_geom = _broker_repair_historical_value(_repair_evidence, "target_underlying")
+                            if _entry_geom is not None and _stop_geom is not None and _target_geom is not None:
+                                _signal_id = _broker_repair_text_value(_repair_evidence, "signal_id") or str(_order_meta.get("signal_id") or "")
+                                _canonical_signal_id = _broker_repair_text_value(_repair_evidence, "canonical_signal_id") or str(_order_meta.get("canonical_signal_id") or _signal_id)
+                                _local_order_id = _broker_repair_text_value(_repair_evidence, "local_order_id") or str(_order_meta.get("local_order_id") or "")
+                                _broker_order_id = _broker_repair_text_value(_repair_evidence, "broker_order_id") or str(_order_meta.get("broker_order_id") or "")
+                                _adoption = self.adopt_canonical_position_identity(contract=sym, canonical_position_id=_canonical_id, local_order_id=_local_order_id, broker_order_id=_broker_order_id, signal_id=_signal_id, canonical_signal_id=_canonical_signal_id, entry_fill=_entry_fill, entry_ts=_repair_evidence.get("filled_ts"), execution_mode=self._resolved_execution_mode(), client_id=self._email, order_filled_ts=_repair_evidence.get("filled_ts"), underlying_entry=_entry_geom, underlying_stop=_stop_geom, underlying_target=_target_geom, direction=str(getattr(pos, "side", "") or ""))
+                                if getattr(_adoption, "adopted", False):
+                                    pos = self._positions_by_id.get(_canonical_id, pos)
                     _loaded_active = (
                         pos in self.active_positions()
                     )
@@ -8323,17 +8343,34 @@ class APExitEngine:
                         "client=%s account=%s contract_symbol=%s error=%s",
                         self._email, _account_id, sym, repair_failed_reason,
                     )
-                    log.error(
-                        "[exit_eng] EXIT_BROKER_POSITION_ADDED_TO_ENGINE "
-                        "client=%s account=%s contract_symbol=%s "
-                        "db_seen_before=%s db_status_before=%s db_qty_before=%s "
-                        "broker_qty=%d loaded_qty=0 db_repaired=%s "
-                        "repair_failed_reason=%s added_to_engine=false "
-                        "will_evaluate_this_cycle=false quote_status=N/A",
-                        self._email, _account_id, sym,
-                        db_seen, db_status_before, db_qty_before,
-                        broker_qty, db_repaired, repair_failed_reason,
-                    )
+                    # Durable identity is unavailable, but broker truth is positive.
+                    # Retain a narrowly-scoped provisional owner for exit evaluation.
+                    try:
+                        _degraded_id = f"broker-degraded-{_uuid.uuid4()}"
+                        _degraded_row = {
+                            "id": _degraded_id, "client_id": self._email,
+                            "contract": sym, "option_symbol": sym,
+                            "underlying": self._underlying_from_occ(sym),
+                            "side": self._parse_occ_side(sym), "direction": self._parse_occ_side(sym),
+                            "qty": broker_qty, "quantity_remaining": broker_qty,
+                            "entry_price": entry_px, "avg_fill": entry_px,
+                            "execution_mode": self._resolved_execution_mode(),
+                            "status": "OPEN", "broker_repair_provisional": True,
+                            "broker_repair_degraded": True,
+                        }
+                        _degraded_pos = self._managed_position_from_row(_degraded_row, qty_override=broker_qty, prefer_qty_override=True)
+                        _degraded_pos.broker_repair_provisional = True
+                        _degraded_pos.brokerrepairprovisional = True
+                        _degraded_pos.broker_repair_degraded = True
+                        _degraded_pos.brokerrepairdegraded = True
+                        self.add_position(_degraded_pos)
+                        log.error(
+                            "[exit_eng] EXIT_BROKER_DEGRADED_OWNER_INSTALLED "
+                            "client=%s mode=%s contract=%s quantity=%d position_id=%s canonical_identity=false broker_submit=NOT_ATTEMPTED",
+                            self._email, getattr(_degraded_pos, "execution_mode", ""), sym, broker_qty, _degraded_id,
+                        )
+                    except Exception as _degraded_err:
+                        log.critical("[exit_eng] degraded broker-truth owner install failed for %s: %s", sym, _degraded_err)
                     continue
 
             # ── 3c. Verify loaded_qty > 0 (fail-safe broker-truth enforcement) ─
@@ -8453,7 +8490,9 @@ class APExitEngine:
         # Prevents "no positions" assumption when DB/engine missed a fill.
         # EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE is logged if check fails — execution continues.
         try:
-            self._broker_position_precheck()
+            _precheck_ok = self._broker_position_precheck()
+            if not _precheck_ok:
+                log.warning("[exit_eng] _broker_position_precheck returned false; continuing with retained broker-truth/degraded owners")
         except Exception as _pce:
             log.warning("[exit_eng] _broker_position_precheck error (non-blocking): %s", _pce)
 
