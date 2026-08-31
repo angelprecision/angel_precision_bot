@@ -10,6 +10,7 @@ _INSTALLED = False
 _SAFE_RESULT_CLASS = "RETRY_EXHAUSTED"
 _SAFE_LAST_ERROR = "OVERNIGHT_REEVAL_RETRY_EXHAUSTED"
 _SAFE_RETRY_REASON = "retryable_rows_remain"
+_RETRYABLE_SOURCES = {"trade_queue", "ap_signals"}
 
 
 def _normalize_mode(value: Any) -> str:
@@ -27,6 +28,48 @@ def _strict_nonnegative_int(details: dict, key: str) -> int | None:
     return value if value >= 0 else None
 
 
+def _retryable_row_identities(
+    details: dict,
+    expected_count: int,
+) -> tuple[list[tuple[str, str, str]] | None, str | None]:
+    """Load the source-row identities needed for a safe partial proof."""
+    raw_rows = details.get("retryable_rows")
+    if not isinstance(raw_rows, list) or len(raw_rows) != expected_count:
+        return None, "retryable_row_identity_count_mismatch"
+
+    identities: list[tuple[str, str, str]] = []
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            return None, "retryable_row_identity_invalid"
+        source = _normalize_mode(raw_row.get("source"))
+        job_id = str(raw_row.get("job_id") or "").strip()
+        signal_id = str(raw_row.get("signal_id") or "").strip()
+        if source not in _RETRYABLE_SOURCES or not job_id or not signal_id:
+            return None, "retryable_row_identity_invalid"
+        identities.append((source, job_id, signal_id))
+
+    if len(set(identities)) != expected_count:
+        return None, "retryable_row_identity_duplicate"
+    if len({signal_id for _, _, signal_id in identities}) != expected_count:
+        return None, "retryable_row_signal_identity_duplicate"
+    return identities, None
+
+
+def _entry_watcher_is_live(runner) -> bool:
+    """Require the canonical watcher thread, not only retained pending state."""
+    watcher = getattr(getattr(runner, "core", None), "entry_watcher", None)
+    if watcher is None or getattr(watcher, "_running", None) is not True:
+        return False
+    thread = getattr(watcher, "_thread", None)
+    is_alive = getattr(thread, "is_alive", None)
+    if not callable(is_alive):
+        return False
+    try:
+        return bool(is_alive())
+    except Exception:
+        return False
+
+
 def _latest_exact_overnight_row(
     *,
     client_id: str,
@@ -35,7 +78,19 @@ def _latest_exact_overnight_row(
 ) -> dict | None:
     from ap.morning_handoff import _latest_handoff_rows
 
-    for row in _latest_handoff_rows(trading_date) or []:
+    try:
+        rows = _latest_handoff_rows(trading_date) or []
+    except Exception as exc:
+        log.warning(
+            "SAFE_PARTIAL_HANDOFF_LOOKUP_UNAVAILABLE client_id=%s mode=%s date=%s error=%s",
+            client_id,
+            execution_mode,
+            trading_date,
+            exc,
+        )
+        return None
+
+    for row in rows:
         if str(row.get("client_id") or "").strip() != client_id:
             continue
         if _normalize_mode(row.get("execution_mode")) != execution_mode:
@@ -94,6 +149,9 @@ def classify_safe_exhausted_partial(
             "fresh_processed",
             "errors",
             "terminal_errors",
+            "armed",
+            "terminal_rejected",
+            "already_resolved",
             "unresolved",
             "retryable_deferred",
             "attempt_count",
@@ -111,6 +169,19 @@ def classify_safe_exhausted_partial(
         return False, {"reason": "overnight_has_unresolved_or_error_truth"}
     if counts["retryable_deferred"] <= 0 or counts["attempt_count"] <= 0:
         return False, {"reason": "overnight_retryable_partial_shape_missing"}
+    outcome_total = sum(
+        counts[key]
+        for key in (
+            "armed",
+            "terminal_rejected",
+            "terminal_errors",
+            "retryable_deferred",
+            "already_resolved",
+            "unresolved",
+        )
+    )
+    if outcome_total != counts["fetched"]:
+        return False, {"reason": "overnight_outcome_accounting_mismatch"}
 
     if client_state.get("stale_processing_ids"):
         return False, {"reason": "stale_processing_rows_present"}
@@ -120,6 +191,31 @@ def classify_safe_exhausted_partial(
     pending_rows = client_state.get("pending_trigger_rows") or []
     if len(pending_rows) < counts["retryable_deferred"]:
         return False, {"reason": "retryable_rows_not_durably_represented"}
+
+    retryable_rows, identity_error = _retryable_row_identities(
+        details,
+        counts["retryable_deferred"],
+    )
+    if identity_error:
+        return False, {"reason": identity_error}
+
+    pending_by_signal: dict[str, list[dict]] = {}
+    for pending_row in pending_rows:
+        if not isinstance(pending_row, dict):
+            return False, {"reason": "pending_trigger_row_invalid"}
+        signal_id = str(pending_row.get("signal_id") or "").strip()
+        if signal_id:
+            pending_by_signal.setdefault(signal_id, []).append(pending_row)
+    for _, _, signal_id in retryable_rows or []:
+        matches = pending_by_signal.get(signal_id) or []
+        if len(matches) != 1 or not str(matches[0].get("local_order_id") or "").strip():
+            return False, {
+                "reason": "retryable_rows_not_exactly_represented",
+                "signal_id": signal_id,
+            }
+
+    if not _entry_watcher_is_live(runner):
+        return False, {"reason": "entry_watcher_not_live"}
 
     unowned = base_module._pending_trigger_without_watcher(runner, pending_rows)
     if unowned:
@@ -136,6 +232,7 @@ def classify_safe_exhausted_partial(
         "processed": counts["processed"],
         "fetched": counts["fetched"],
         "owned_pending_trigger_count": len(pending_rows),
+        "retryable_rows": retryable_rows,
     }
 
 
