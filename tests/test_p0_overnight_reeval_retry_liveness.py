@@ -664,6 +664,80 @@ def test_residual_counts_override_false_completed_result(monkeypatch):
     assert runner._overnight_reeval_success_date is None
 
 
+def _safe_retryable_result(**overrides):
+    result = _result(
+        processed=100,
+        fetched=100,
+        armed=90,
+        rejected=5,
+        terminal_rejected=5,
+        terminal_errors=0,
+        retryable_deferred=5,
+        already_resolved=0,
+        unresolved=0,
+        stalled=False,
+        completed=False,
+        retryable=True,
+        retry_reason="retryable_rows_remain",
+        result_class="RETRYABLE_PARTIAL_DEFERRED",
+    )
+    result.update(overrides)
+    return result
+
+
+def _safe_retryable_post(*, missing_owner_count=0, status="OK"):
+    return {
+        "handoff_result": {
+            "ok": True,
+            "errors": [],
+            "summary": {"orders_missing_runtime_owner": missing_owner_count},
+        },
+        "readiness_result": {"ok": status == "OK", "status": status, "errors": []},
+    }
+
+
+def test_owned_retryable_rows_recover_readiness_without_global_retry(monkeypatch):
+    monkeypatch.setattr(
+        ov,
+        "run_overnight_reeval",
+        lambda **kwargs: _safe_retryable_result(),
+    )
+    runner = _runner()
+    runner.mode = "LIVE"
+    runner._run_post_overnight_morning_handoff = (
+        lambda result: _safe_retryable_post()
+    )
+
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9, 31), source="scheduler")
+
+    assert result["result_class"] == "COMPLETED_WITH_RETRYABLE_DEFERRED"
+    assert result["completed"] is True
+    assert result["retryable"] is False
+    assert result["retryable_deferred"] == 5
+    assert result["next_retry_at"] is None
+    assert runner._overnight_reeval_success_date == _dt(9).date()
+
+
+def test_missing_retry_owner_keeps_live_readiness_fail_closed(monkeypatch):
+    monkeypatch.setattr(
+        ov,
+        "run_overnight_reeval",
+        lambda **kwargs: _safe_retryable_result(),
+    )
+    runner = _runner()
+    runner.mode = "LIVE"
+    runner._run_post_overnight_morning_handoff = (
+        lambda result: _safe_retryable_post(missing_owner_count=1, status="BLOCKED")
+    )
+
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9, 31), source="scheduler")
+
+    assert result["completed"] is False
+    assert result["retryable"] is True
+    assert result["result_class"] in {"RETRYABLE_PARTIAL_DEFERRED", "RETRY_EXHAUSTED"}
+    assert runner._overnight_reeval_success_date is None
+
+
 def test_retry_scheduler_does_not_create_duplicate_entry_orders():
     body = inspect.getsource(cr.ClientRunner.run_overnight_reeval_attempt)
     assert "create_entry_order" not in body

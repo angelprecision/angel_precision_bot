@@ -1938,6 +1938,100 @@ class ClientRunner(threading.Thread):
             "attempt_performed": False,
         }
 
+    @staticmethod
+    def _safe_retryable_overnight_completion(
+        result: dict,
+        post: dict | None = None,
+    ) -> bool:
+        """Accept retryable rows only after current handoff truth is healthy.
+
+        A complete source inventory plus a successful recovery/readiness pass
+        means an individual deferred retry no longer needs to hold the account
+        gate. Missing ownership, malformed counts, or any readiness error keep
+        the existing LIVE fail-closed behavior.
+        """
+        if not isinstance(result, dict):
+            return False
+
+        def _counter(value):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        fetched = _counter(result.get("fetched"))
+        processed = _counter(result.get("processed"))
+        armed = _counter(result.get("armed", 0))
+        terminal_rejected = _counter(
+            result.get("terminal_rejected", result.get("rejected", 0))
+        )
+        errors = _counter(result.get("errors", 0))
+        terminal_errors = _counter(result.get("terminal_errors", errors))
+        retryable_deferred = _counter(result.get("retryable_deferred"))
+        already_resolved = _counter(result.get("already_resolved", 0))
+        unresolved = _counter(result.get("unresolved", 0))
+        if None in {
+            fetched,
+            processed,
+            armed,
+            terminal_rejected,
+            errors,
+            terminal_errors,
+            retryable_deferred,
+            already_resolved,
+            unresolved,
+        }:
+            return False
+        if (
+            fetched <= 0
+            or processed != fetched
+            or retryable_deferred <= 0
+            or errors != 0
+            or terminal_errors != 0
+            or unresolved != 0
+            or (
+                armed
+                + terminal_rejected
+                + terminal_errors
+                + retryable_deferred
+                + already_resolved
+                != fetched
+            )
+        ):
+            return False
+        for key in (
+            "source_lookup_partial",
+            "source_lookup_failed",
+            "ownership_loss",
+            "malformed_lifecycle",
+            "broker_submit_ambiguity",
+        ):
+            if result.get(key):
+                return False
+
+        if post is None:
+            return True
+        if not isinstance(post, dict):
+            return False
+
+        handoff = post.get("handoff_result")
+        readiness = post.get("readiness_result")
+        summary = handoff.get("summary") if isinstance(handoff, dict) else None
+        missing_owner_count = (
+            _counter(summary.get("orders_missing_runtime_owner"))
+            if isinstance(summary, dict)
+            else None
+        )
+        return bool(
+            isinstance(handoff, dict)
+            and handoff.get("ok") is True
+            and not handoff.get("errors")
+            and missing_owner_count == 0
+            and isinstance(readiness, dict)
+            and readiness.get("ok") is True
+            and str(readiness.get("status") or "").upper() == "OK"
+            and not readiness.get("errors")
+        )
+
     def _overnight_reeval_window_start(self, today):
         return datetime(today.year, today.month, today.day, 9, 0, 0, tzinfo=_ET)
 
@@ -2408,6 +2502,8 @@ class ClientRunner(threading.Thread):
 
         result: dict
         last_error = None
+        _post_candidate = None
+        _safe_post_handoff = None
         try:
             self._overnight_reeval_attempt_count += 1
             self._overnight_reeval_last_attempt_at = now_et
@@ -2458,11 +2554,35 @@ class ClientRunner(threading.Thread):
 
             retryable_deferred = int(result.get("retryable_deferred", 0) or 0)
             unresolved = int(result.get("unresolved", 0) or 0)
+            _engine_marked_retryable = bool(result.get("retryable"))
             if bool(result.get("completed")) and (retryable_deferred > 0 or unresolved > 0):
                 result["result_class"] = "RETRYABLE_PARTIAL_DEFERRED"
                 result["completed"] = False
                 result["retryable"] = True
                 result["retry_reason"] = "retryable_rows_remain"
+
+            # A retryable selector result is not automatically an account-wide
+            # failure. Re-run the existing durable handoff/recovery and let
+            # current readiness prove whether every remaining owner is live.
+            # The recovery result is retained so a safe completion does not
+            # invoke the post-overnight handoff twice.
+            if (
+                retryable_deferred > 0
+                and _engine_marked_retryable
+                and not bool(result.get("completed"))
+                and self._safe_retryable_overnight_completion(result)
+            ):
+                _post_candidate = self._run_post_overnight_morning_handoff(result)
+                if self._safe_retryable_overnight_completion(result, _post_candidate):
+                    result["result_class"] = "COMPLETED_WITH_RETRYABLE_DEFERRED"
+                    result["completed"] = True
+                    result["retryable"] = False
+                    result["retry_reason"] = None
+                    result["stalled"] = False
+                    result.pop("retry_exhausted", None)
+                    result.pop("last_error", None)
+                    result["safe_retryable_deferred_completion"] = True
+                    _safe_post_handoff = _post_candidate
 
             result["attempt_count"] = self._overnight_reeval_attempt_count
             result["attempt_source"] = source
@@ -2504,7 +2624,11 @@ class ClientRunner(threading.Thread):
             )
 
             if bool(result.get("completed")):
-                post = self._run_post_overnight_morning_handoff(result)
+                post = (
+                    _safe_post_handoff
+                    if _safe_post_handoff is not None
+                    else self._run_post_overnight_morning_handoff(result)
+                )
                 result["handoff_result"] = post.get("handoff_result") if isinstance(post, dict) else None
                 result["readiness_result"] = post.get("readiness_result") if isinstance(post, dict) else None
             else:
@@ -2524,9 +2648,18 @@ class ClientRunner(threading.Thread):
                 # preopen_readiness_enforcement_failed:*. Merely logging
                 # the exception here would leave entries_allowed=True
                 # despite unverified pre-open watcher ownership.
-                _readiness = self._enforce_preopen_readiness_at_deadline(
-                    now_et=now_et, today=today, source=source,
-                    result_class=str(result.get("result_class") or "incomplete"),
+                _candidate_readiness = (
+                    _post_candidate.get("readiness_result")
+                    if isinstance(_post_candidate, dict)
+                    else None
+                )
+                _readiness = (
+                    _candidate_readiness
+                    if isinstance(_candidate_readiness, dict)
+                    else self._enforce_preopen_readiness_at_deadline(
+                        now_et=now_et, today=today, source=source,
+                        result_class=str(result.get("result_class") or "incomplete"),
+                    )
                 )
                 if _readiness is None:
                     logger.info(
