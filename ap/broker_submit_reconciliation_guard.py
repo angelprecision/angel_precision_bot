@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from ap.broker_submit_identity import canonical_broker_submit_key
@@ -143,6 +144,7 @@ def _exact_live_submit_identity(subject, row: dict) -> tuple[dict | None, str]:
         "payload_hash": payload_hash,
         "generation": generation,
         "current_owner": expected_owner,
+        "materialization_owner": str(meta.get("materialization_owner") or "").strip(),
         "first_no_match_at": first_no_match_at if first_no_match_matches else "",
     }, "ok"
 
@@ -229,7 +231,12 @@ def _record_first_no_match(local_order_id: str, identity: dict, observed_at: str
                   AND COALESCE(meta->>'broker_submit_payload_hash','') = %s
                   AND COALESCE(meta->>'current_owner','') = %s
                   AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
-                  AND COALESCE(meta->>'broker_reconcile_no_match_observed_at','') = ''
+                  AND (
+                        COALESCE(meta->>'broker_reconcile_no_match_observed_at','') = ''
+                     OR COALESCE(meta->>'broker_reconcile_no_match_submit_key','') <> %s
+                     OR COALESCE(meta->>'broker_reconcile_no_match_payload_hash','') <> %s
+                     OR COALESCE((meta->>'broker_reconcile_no_match_generation')::int, 0) <> %s
+                  )
                 """,
                 (
                     patch,
@@ -242,6 +249,9 @@ def _record_first_no_match(local_order_id: str, identity: dict, observed_at: str
                     identity["broker_submit_key"],
                     identity["payload_hash"],
                     identity["current_owner"],
+                    identity["generation"],
+                    identity["broker_submit_key"],
+                    identity["payload_hash"],
                     identity["generation"],
                 ),
             )
@@ -260,19 +270,24 @@ def _release_after_proven_absence(
     first_no_match_at: str,
     proven_at: str,
 ) -> bool:
-    """Restore BROKER_READY only after two complete broker no-match observations."""
+    """Return one exact ambiguous intent to canonical BROKER_READY authority."""
     from ap.db import conn, run_with_retry
     from ap.order_state_machine import _DURABLE_EXECUTION_MODE_SQL
 
+    resume_owner = identity.get("materialization_owner") or ""
     patch = json.dumps({
         "lifecycle_state": "BROKER_READY",
         "broker_ready": True,
         "submit_intent_at": "",
         "broker_submit_key": "",
         "broker_submit_payload_hash": "",
-        "current_owner": "",
+        "current_owner": resume_owner,
         "recovery_submit_owner": "",
         "recovery_submit_lease_until": "",
+        "broker_reconcile_no_match_observed_at": "",
+        "broker_reconcile_no_match_submit_key": "",
+        "broker_reconcile_no_match_payload_hash": "",
+        "broker_reconcile_no_match_generation": 0,
         "broker_reconcile_absence_proven_at": proven_at,
         "broker_reconcile_absence_first_observed_at": first_no_match_at,
         "broker_reconcile_absence_submit_key": identity["broker_submit_key"],
@@ -335,138 +350,146 @@ def _release_after_proven_absence(
         return False
 
 
-def _patch_reconciler() -> None:
-    import ap_execution_core
-
-    cls = ap_execution_core.APExecutionCore
-    original = cls.reconcile_deferred_broker_intent
-    if getattr(original, "_ap_live_submit_liveness", False):
-        return
-
-    def reconcile_deferred_broker_intent(self, *, local_order_id: str) -> dict:
-        result = original(self, local_order_id=local_order_id) or {}
-        if str(result.get("reason_code") or "") != "RECONCILE_BROKER_NO_MATCH_HELD":
-            return result
-
-        osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
-        if osm is None:
-            return {**result, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_OSM_UNAVAILABLE"}
-        try:
-            row = osm.get_order(local_order_id)
-        except Exception as exc:
-            return {**result, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_ROW_READ_ERROR:{type(exc).__name__}"}
-
-        identity, reason = _exact_live_submit_identity(self, row)
-        if identity is None:
-            return {**result, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_IDENTITY_UNPROVEN:{reason}"}
-
-        now = datetime.now(timezone.utc)
-        intent_age = (now - identity["submit_dt"]).total_seconds()
-        first_raw = identity["first_no_match_at"]
-        first_dt = _parse_ts(first_raw)
-        if not first_raw:
-            observed_at = now.isoformat()
-            if not _record_first_no_match(local_order_id, identity, observed_at):
-                return {**result, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_NO_MATCH_PROOF_CAS_LOST"}
-            return {
-                **result,
-                "disposition": "RECONCILE_PENDING",
-                "reason_code": "RECONCILE_BROKER_NO_MATCH_SETTLING",
-                "next_retry_after_seconds": max(1, int(_SETTLEMENT_SECONDS)),
-            }
-        if first_dt is None:
-            return {**result, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_NO_MATCH_PROOF_MALFORMED"}
-
-        confirm_age = (now - first_dt).total_seconds()
-        if intent_age < _SETTLEMENT_SECONDS or confirm_age < _CONFIRM_SECONDS:
-            return {
-                **result,
-                "disposition": "RECONCILE_PENDING",
-                "reason_code": "RECONCILE_BROKER_NO_MATCH_SETTLING",
-                "next_retry_after_seconds": max(
-                    1,
-                    int(max(_SETTLEMENT_SECONDS - intent_age, _CONFIRM_SECONDS - confirm_age, 1)),
-                ),
-            }
-
-        if not _release_after_proven_absence(
+def _advance_no_match_proof(local_order_id: str, identity: dict) -> str:
+    now = datetime.now(timezone.utc)
+    first_raw = identity.get("first_no_match_at") or ""
+    if not first_raw:
+        return (
+            "SETTLING"
+            if _record_first_no_match(local_order_id, identity, now.isoformat())
+            else "CAS_LOST"
+        )
+    first_dt = _parse_ts(first_raw)
+    if first_dt is None:
+        return "MALFORMED"
+    intent_age = (now - identity["submit_dt"]).total_seconds()
+    confirm_age = (now - first_dt).total_seconds()
+    if intent_age < _SETTLEMENT_SECONDS or confirm_age < _CONFIRM_SECONDS:
+        return "SETTLING"
+    return (
+        "RELEASED"
+        if _release_after_proven_absence(
             local_order_id,
             identity,
             first_no_match_at=first_raw,
             proven_at=now.isoformat(),
-        ):
-            return {**result, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ABSENCE_RELEASE_CAS_LOST"}
-
-        # Do not invoke the restart helper from inside the reconciler. Its caller
-        # owns some terminal dispositions. Restoring the exact row to BROKER_READY
-        # is the durable handoff; the existing watcher/recovery path then re-enters
-        # the canonical LIVE gates and canonical submit implementation.
-        return {
-            **result,
-            "disposition": "RECONCILE_PENDING",
-            "reason_code": "RECONCILE_BROKER_ABSENCE_PROVEN_CANONICAL_RESUME_REQUIRED",
-            "canonical_resume_required": True,
-            "next_retry_after_seconds": 1,
-        }
-
-    reconcile_deferred_broker_intent._ap_live_submit_liveness = True
-    reconcile_deferred_broker_intent._ap_original = original
-    cls.reconcile_deferred_broker_intent = reconcile_deferred_broker_intent
+        )
+        else "CAS_LOST"
+    )
 
 
-def _patch_entry_callback() -> None:
+def _canonical_reconcile(osm, broker, local_order_id: str) -> dict:
+    """Reuse the existing #323 broker-intent reconciler at runtime."""
     import ap_execution_core
 
-    cls = ap_execution_core.APExecutionCore
-    original = cls._on_entry_trigger
-    if getattr(original, "_ap_submit_intent_router", False):
+    core = object.__new__(ap_execution_core.APExecutionCore)
+    core.client_id = str(getattr(osm, "client_id", "") or "")
+    core.email = core.client_id
+    core.execution_mode = str(getattr(osm, "execution_mode", "") or "").lower()
+    core.mode = core.execution_mode.upper()
+    core.order_state_machine = osm
+    core.osm = osm
+    core.broker = broker
+    return (
+        ap_execution_core.APExecutionCore.reconcile_deferred_broker_intent(
+            core, local_order_id=local_order_id
+        )
+        or {}
+    )
+
+
+def _patch_osm_submit() -> None:
+    from ap.order_state_machine import APOrderStateMachine, OrderStatus
+
+    original = APOrderStateMachine.submit_existing_entry
+    if getattr(original, "_ap_broker_intent_reconcile", False):
         return
 
-    def _reconcile_if_owned(self, watched):
-        sig = getattr(watched, "signal", {}) or {}
-        local_order_id = str(sig.get("local_order_id") or "").strip()
-        if not local_order_id:
-            return None
-        osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
-        if osm is None:
-            return None
+    def submit_existing_entry(
+        self,
+        *,
+        local_order_id: str,
+        broker,
+        plan=None,
+        limit_price=None,
+    ) -> dict:
         try:
-            row = osm.get_order(local_order_id)
+            row = self.get_order(local_order_id)
         except Exception:
-            return None
-        identity, _ = _exact_live_submit_identity(self, row)
+            row = None
+        identity, _ = (
+            _exact_live_submit_identity(self, row)
+            if isinstance(row, dict)
+            else (None, "row_missing")
+        )
         if identity is None:
-            return None
-        rec = self.reconcile_deferred_broker_intent(local_order_id=local_order_id) or {}
-        if str(rec.get("disposition") or "").upper() == "ALREADY_RECONCILED":
-            return {**rec, "disposition": "SUBMITTED"}
+            return original(
+                self,
+                local_order_id=local_order_id,
+                broker=broker,
+                plan=plan,
+                limit_price=limit_price,
+            )
+
+        try:
+            rec = _canonical_reconcile(self, broker, local_order_id)
+        except Exception as exc:
+            rec = {
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}",
+            }
+
+        disposition = str(rec.get("disposition") or "").upper()
+        if disposition == "ALREADY_RECONCILED":
+            status = str(rec.get("status") or OrderStatus.SUBMITTED).upper()
+            ok = status in {
+                OrderStatus.SUBMITTED,
+                OrderStatus.ACKNOWLEDGED,
+                OrderStatus.PARTIAL_FILL,
+                OrderStatus.FILLED,
+            }
+            return {
+                "ok": ok,
+                "local_order_id": local_order_id,
+                "broker_order_id": rec.get("broker_order_id"),
+                "status": status,
+                "error": None if ok else str(rec.get("reason_code") or "BROKER_RECONCILED_TERMINAL"),
+                "reconciled_by_tag": True,
+            }
+
+        reason = str(rec.get("reason_code") or "RECONCILE_PENDING")
+        if reason == "RECONCILE_BROKER_NO_MATCH_HELD":
+            advance = _advance_no_match_proof(local_order_id, identity)
+            if advance == "RELEASED" and identity.get("materialization_owner"):
+                plan_meta = getattr(plan, "metadata", None) if plan is not None else None
+                if isinstance(plan_meta, dict):
+                    plan_meta.pop("recovery_submit_fenced", None)
+                    plan_meta.pop("recovery_submit_owner", None)
+                    plan_meta.pop("recovery_submit_generation", None)
+                # The current watcher invocation already passed the authoritative
+                # LIVE gates. The exact CAS restored the pre-intent materialized
+                # owner, so continue through the one existing OSM submit path.
+                return original(
+                    self,
+                    local_order_id=local_order_id,
+                    broker=broker,
+                    plan=plan,
+                    limit_price=limit_price,
+                )
+            reason = f"RECONCILE_BROKER_NO_MATCH_{advance}"
+
         return {
-            "disposition": "KEEP_WATCHER",
-            "reason_code": str(rec.get("reason_code") or "BROKER_INTENT_RECONCILE_PENDING"),
-            "retry_after_seconds": int(rec.get("next_retry_after_seconds") or 5),
+            "ok": False,
             "local_order_id": local_order_id,
-            "canonical_resume_required": bool(rec.get("canonical_resume_required")),
+            "broker_order_id": rec.get("broker_order_id"),
+            "status": str((row or {}).get("status") or OrderStatus.PENDING_TRIGGER),
+            "error": reason,
+            "reconciliation_required": True,
         }
 
-    def _on_entry_trigger(self, watched):
-        # Already-SUBMITTING means broker truth owns the next action. Never rerun
-        # hydration, selector, LIVE gates, or submit-intent creation first.
-        routed = _reconcile_if_owned(self, watched)
-        if routed is not None:
-            return routed
-
-        result = original(self, watched)
-
-        # A normal callback can atomically transfer BROKER_READY ownership to
-        # broker_submit:* and then observe the transfer instead of a broker id.
-        # Re-read immediately so that handoff enters reconciliation now, rather
-        # than restarting ordinary entry work on the next poll.
-        routed = _reconcile_if_owned(self, watched)
-        return routed if routed is not None else result
-
-    _on_entry_trigger._ap_submit_intent_router = True
-    _on_entry_trigger._ap_original = original
-    cls._on_entry_trigger = _on_entry_trigger
+    submit_existing_entry._ap_broker_intent_reconcile = True
+    submit_existing_entry._ap_original = original
+    APOrderStateMachine.submit_existing_entry = submit_existing_entry
 
 
 def _patch_recovery_retention() -> None:
@@ -494,13 +517,17 @@ def _patch_recovery_retention() -> None:
             else (None, "row_missing")
         )
         if identity is not None:
+            advance = "RETAINED"
+            if str(reason or "") == "RECONCILE_BROKER_NO_MATCH_HELD":
+                advance = _advance_no_match_proof(local_order_id, identity)
             log.warning(
                 "BROKER_SUBMIT_OWNER_RETAINED_PENDING_RECONCILIATION "
-                "client_id=%s order=%s submit_key=%s reason=%s",
+                "client_id=%s order=%s submit_key=%s reason=%s advance=%s",
                 self.client_id,
                 local_order_id,
                 identity["broker_submit_key"],
                 reason,
+                advance,
             )
             return True
         return original(
@@ -519,6 +546,5 @@ def _patch_recovery_retention() -> None:
 def install_broker_submit_reconciliation_guard() -> None:
     """Install the P0 LIVE submit-intent liveness repair exactly once."""
     _patch_tradier_list_orders()
-    _patch_reconciler()
-    _patch_entry_callback()
+    _patch_osm_submit()
     _patch_recovery_retention()
