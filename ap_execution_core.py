@@ -4463,72 +4463,21 @@ class APExecutionCore:
                 stage="broker_order_response",
                 exc=ValueError("missing status"),
             )
-        status_map = {
-            "open": "SUBMITTED", "pending": "SUBMITTED", "queued": "SUBMITTED",
-            "ack": "SUBMITTED", "acked": "SUBMITTED", "acknowledged": "SUBMITTED",
-            "received": "SUBMITTED", "working": "SUBMITTED",
-            "filled": "FILLED", "partially_filled": "PARTIAL_FILL",
-            "partial_filled": "PARTIAL_FILL", "rejected": "REJECTED",
-            "canceled": "CANCELED", "cancelled": "CANCELED", "expired": "EXPIRED",
+        recognized_statuses = {
+            "open", "pending", "queued", "ack", "acked", "acknowledged",
+            "received", "working", "filled", "partially_filled",
+            "partial_filled", "rejected", "canceled", "cancelled", "expired",
         }
-        if remote_status not in status_map:
+        if remote_status not in recognized_statuses:
             return _retain_owner(
                 f"RECONCILE_BROKER_STATUS_UNEXPECTED:{remote_status}",
                 stage="broker_order_response",
             )
-        local_status = status_map[remote_status]
-        fill_qty = None
-        fill_price = None
-        if local_status in {"FILLED", "PARTIAL_FILL"}:
-            fill_raw = _remote_optional_text(
-                remote,
-                "exec_quantity",
-                "filled_quantity",
-                "filled_qty",
-                "cumulative_filled_quantity",
-            )
-            if fill_raw is None and local_status == "FILLED":
-                fill_qty = expected_qty
-            elif fill_raw is None and local_status == "PARTIAL_FILL":
-                return _retain_owner(
-                    "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:missing broker fill quantity",
-                    stage="broker_order_response",
-                    exc=ValueError("missing broker fill quantity"),
-                )
-            elif fill_raw is not None:
-                try:
-                    fill_qty = _strict_reconcile_int(fill_raw, field="broker fill quantity")
-                except ValueError as exc:
-                    return _retain_owner(
-                        f"RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:{str(exc)}",
-                        stage="broker_order_response",
-                        exc=exc,
-                    )
-            if fill_qty is None or fill_qty > expected_qty or (
-                local_status == "FILLED" and fill_qty != expected_qty
-            ):
-                return _retain_owner(
-                    "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:broker fill quantity out of range",
-                    stage="broker_order_response",
-                    exc=ValueError("broker fill quantity out of range"),
-                )
-            fill_price_raw = _remote_optional_text(
-                remote, "avg_fill_price", "average_fill_price", "fill_price"
-            )
-            if fill_price_raw is not None:
-                try:
-                    fill_price = _strict_reconcile_float(
-                        fill_price_raw, field="broker fill price"
-                    )
-                except ValueError as exc:
-                    return _retain_owner(
-                        f"RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:{str(exc)}",
-                        stage="broker_order_response",
-                        exc=exc,
-                    )
 
-        # Establish the accepted boundary first so the existing state machine
-        # owns all subsequent fill/terminal transitions.
+        # Adopt only the exact broker identity here.  The canonical fill monitor
+        # owns every later broker-status transition and its required side effects:
+        # cumulative fill accounting, position creation/linking, exit-engine
+        # seeding, and entry guard release for broker-terminal failures.
         try:
             adopted = bool(
                 osm.transition(
@@ -4554,28 +4503,6 @@ class APExecutionCore:
                     "RECONCILE_ADOPTION_TRANSITION_FAILED",
                     stage="adoption_transition",
                 )
-        if local_status != "SUBMITTED":
-            try:
-                osm.transition(
-                    local_order_id,
-                    local_status,
-                    broker_order_id=remote_id,
-                    filled_qty=fill_qty,
-                    fill_price=fill_price,
-                    last_error=(
-                        str(remote.get("reason") or remote.get("message") or "")
-                        or None
-                    ),
-                )
-            except Exception as exc:
-                log.critical(
-                    "[%s] broker adoption fill transition failed local_order_id=%s "
-                    "status=%s exc=%s",
-                    expected_client_id,
-                    local_order_id,
-                    local_status,
-                    exc,
-                )
         meta_update = getattr(osm, "update_order_meta", None)
         if callable(meta_update):
             try:
@@ -4586,7 +4513,7 @@ class APExecutionCore:
                     "broker_reconcile_response": remote,
                     "broker_submit_reconciliation_status": "FOUND",
                     "current_owner": "ORDER_MONITOR",
-                    "lifecycle_state": local_status,
+                    "lifecycle_state": "SUBMITTED",
                 })
             except Exception as exc:
                 log.warning(
@@ -4601,7 +4528,7 @@ class APExecutionCore:
             "disposition": "ALREADY_RECONCILED",
             "reason_code": "BROKER_ORDER_ADOPTED",
             "broker_order_id": remote_id,
-            "status": local_status,
+            "status": "SUBMITTED",
             "broker_truth": "FOUND",
             "reconciliation_stage": "adoption_complete",
         }
