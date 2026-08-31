@@ -116,6 +116,36 @@ def test_partial_source_inventory_forces_retryable_even_when_rows_processed(monk
     assert result["result_class"] == "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
 
 
+def test_partial_source_inventory_overrides_deferred_subset_classification():
+    """An incomplete source cannot remain RETRYABLE_PARTIAL_DEFERRED.
+
+    That classification can later exhaust into the #559 readiness exception;
+    partial source truth must retain the stronger source-inventory reason even
+    when visible rows include both armed and deferred outcomes.
+    """
+    result = ov._classify_overnight_reeval_result(
+        {
+            "fetched": 2,
+            "processed": 2,
+            "armed": 1,
+            "terminal_rejected": 0,
+            "terminal_errors": 0,
+            "errors": 0,
+            "retryable_deferred": 1,
+            "already_resolved": 0,
+            "unresolved": 0,
+            "source_lookup_partial": True,
+            "trade_queue_status": ov._SOURCE_STATUS_FAILED,
+            "ap_signals_status": ov._SOURCE_STATUS_SUCCESS,
+        }
+    )
+
+    assert result["result_class"] == "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
+    assert result["completed"] is False
+    assert result["retryable"] is True
+    assert result["retry_reason"] == "partial_source_inventory"
+
+
 def test_runner_does_not_set_success_date_on_source_lookup_failed(monkeypatch):
     """Wire the failing result through run_overnight_reeval_attempt on a
     ClientRunner (with all other deps stubbed) and prove that the runner

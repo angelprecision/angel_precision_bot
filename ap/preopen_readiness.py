@@ -417,7 +417,11 @@ def _query_client_state(client_id: str) -> dict:
 
             c.execute(
                 """
-                SELECT local_order_id, signal_id
+                SELECT local_order_id,
+                       signal_id,
+                       meta->>'overnight_source_table' AS overnight_source_table,
+                       meta->>'overnight_source_job_id' AS overnight_source_job_id,
+                       meta->>'overnight_source_signal_id' AS overnight_source_signal_id
                 FROM orders
                 WHERE client_id = %s
                   AND kind = 'ENTRY'
@@ -433,9 +437,21 @@ def _query_client_state(client_id: str) -> dict:
             pending_trigger = []
             for row in (c.fetchall() or []):
                 if isinstance(row, dict):
-                    pending_trigger.append({"local_order_id": row.get("local_order_id"), "signal_id": row.get("signal_id")})
+                    pending_trigger.append({
+                        "local_order_id": row.get("local_order_id"),
+                        "signal_id": row.get("signal_id"),
+                        "overnight_source_table": row.get("overnight_source_table"),
+                        "overnight_source_job_id": row.get("overnight_source_job_id"),
+                        "overnight_source_signal_id": row.get("overnight_source_signal_id"),
+                    })
                 else:
-                    pending_trigger.append({"local_order_id": row[0], "signal_id": row[1]})
+                    pending_trigger.append({
+                        "local_order_id": row[0],
+                        "signal_id": row[1],
+                        "overnight_source_table": row[2],
+                        "overnight_source_job_id": row[3],
+                        "overnight_source_signal_id": row[4],
+                    })
 
             c.execute(
                 """

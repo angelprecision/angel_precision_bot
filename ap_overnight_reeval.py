@@ -1740,11 +1740,80 @@ def _record_retryable_row(
         result["retryable_rows"] = retryable_rows
     retryable_rows.append(
         {
-            "job_id": str(job_id or "").strip(),
-            "signal_id": str(signal_id or "").strip(),
+            "job_id": "" if job_id is None else str(job_id).strip(),
+            "signal_id": "" if signal_id is None else str(signal_id).strip(),
             "source": str(source or "").strip().lower(),
         }
     )
+
+
+def _overnight_source_provenance(*, source: str, job_id, signal_id) -> dict | None:
+    """Return the exact source-row identity that must follow an overnight order."""
+    _source = str(source or "").strip().lower()
+    _job_id = "" if job_id is None else str(job_id).strip()
+    _signal_id = "" if signal_id is None else str(signal_id).strip()
+    if _source not in {"trade_queue", "ap_signals"} or not _job_id or not _signal_id:
+        return None
+    return {
+        "overnight_source_table": _source,
+        "overnight_source_job_id": _job_id,
+        "overnight_source_signal_id": _signal_id,
+    }
+
+
+def _merge_overnight_source_provenance(metadata: dict, provenance: dict) -> bool:
+    """Add source provenance without relabeling an already-identified order."""
+    _keys = (
+        "overnight_source_table",
+        "overnight_source_job_id",
+        "overnight_source_signal_id",
+    )
+    _existing = {
+        key: str(metadata.get(key) or "").strip()
+        for key in _keys
+    }
+    _has_existing = any(_existing.values())
+    if _has_existing and any(_existing[key] != str(provenance.get(key) or "").strip() for key in _keys):
+        return False
+    metadata.update(provenance)
+    return True
+
+
+def _persist_overnight_order_provenance(
+    order_state_machine,
+    *,
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    signal_id: str,
+    provenance: dict,
+) -> bool:
+    """Durably bind a reattached order to its exact overnight source row."""
+    _update_order_meta = getattr(order_state_machine, "update_order_meta", None)
+    if not callable(_update_order_meta):
+        log.critical(
+            "OVERNIGHT_ORDER_PROVENANCE_UPDATE_UNAVAILABLE client=%s mode=%s "
+            "signal=%s local_order_id=%s",
+            client_id, execution_mode, signal_id, local_order_id,
+        )
+        return False
+    try:
+        return bool(
+            _update_order_meta(
+                local_order_id,
+                dict(provenance),
+                expected_status="PENDING_TRIGGER",
+                expected_execution_mode=str(execution_mode or "").strip().lower(),
+                expected_signal_id=str(signal_id or "").strip(),
+            )
+        )
+    except Exception as exc:
+        log.critical(
+            "OVERNIGHT_ORDER_PROVENANCE_UPDATE_FAILED client=%s mode=%s "
+            "signal=%s local_order_id=%s error=%s",
+            client_id, execution_mode, signal_id, local_order_id, exc,
+        )
+        return False
 
 
 def _classify_overnight_reeval_result(result: dict) -> dict:
@@ -1831,10 +1900,11 @@ def _classify_overnight_reeval_result(result: dict) -> dict:
         and already_resolved == 0
     )
     # PR #388 P0-2: partial-source inventory override. If either source
-    # lookup failed, we cannot certify the run complete — even when every
-    # observed row was processed. Downgrade to a retryable classification so
-    # the runner never sets success_date on incomplete truth.
-    if bool(result.get("source_lookup_partial")) and completed:
+    # lookup failed, we cannot certify the run complete or treat the visible
+    # retryable subset as the complete inventory. This must run regardless of
+    # the earlier row-deferred branch; otherwise RETRYABLE_PARTIAL_DEFERRED
+    # can exhaust into the #559 safe-partial readiness exception.
+    if bool(result.get("source_lookup_partial")):
         result_class = "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
         completed = False
         retryable = True
@@ -1962,6 +2032,11 @@ def run_overnight_reeval(
         # caller can persist an honest status instead of "success".
         "fetched": 0,
         "stalled": False,
+        "source_lookup_partial": False,
+        "trade_queue_status": None,
+        "ap_signals_status": None,
+        "trade_queue_error": None,
+        "ap_signals_error": None,
     }
 
     # Guard: only run on trading days, 9:00-9:45 AM ET window (unless force=True)
@@ -1994,6 +2069,7 @@ def run_overnight_reeval(
 
     _tq_failed  = _fetch_result.trade_queue_status != _SOURCE_STATUS_SUCCESS
     _sup_failed = _fetch_result.ap_signals_status  != _SOURCE_STATUS_SUCCESS
+    result["source_lookup_partial"] = bool(_tq_failed or _sup_failed)
 
     if _tq_failed and _sup_failed and not watching_signals:
         # Both sources failed and no rows visible → cannot certify empty
@@ -2046,6 +2122,22 @@ def run_overnight_reeval(
             import json; signal = json.loads(signal)
         signal_id = job.get("signal_id") or signal.get("signal_id", "")
         job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
+        source_provenance = _overnight_source_provenance(
+            source=job_source,
+            job_id=job_id,
+            signal_id=signal_id,
+        )
+        if source_provenance is None:
+            log.critical(
+                "[%s] overnight_reeval: source-row identity incomplete source=%r job_id=%r signal_id=%r "
+                "— classifying retryable_deferred",
+                client_id, job_source, job_id, signal_id,
+            )
+            result["skipped"] = result.get("skipped", 0) + 1
+            _record_retryable_row(
+                result, job_id=job_id, signal_id=signal_id, source=job_source
+            )
+            continue
         ticker = signal.get("ticker") or signal.get("symbol", "?")
         side = _normalize_overnight_side(signal.get("side") or signal.get("direction"))
         if side not in {"CALL", "PUT"}:
@@ -2252,6 +2344,47 @@ def run_overnight_reeval(
                     if not isinstance(_ord_meta, dict):
                         _ord_meta = {}
 
+                    if not _merge_overnight_source_provenance(
+                        _ord_meta, source_provenance
+                    ):
+                        log.critical(
+                            "[%s] overnight_reeval: REATTACH_WATCHER source provenance "
+                            "mismatch signal=%s local_order_id=%s expected=%s existing=%s "
+                            "— preserving order and classifying retryable",
+                            ticker, signal_id, _existing_oid,
+                            source_provenance, _ord_meta,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
+                        continue
+
+                    _source_meta_present = all(
+                        str(_ord_meta.get(key) or "").strip()
+                        == str(value).strip()
+                        for key, value in source_provenance.items()
+                    )
+                    if not _source_meta_present and not _persist_overnight_order_provenance(
+                        order_state_machine,
+                        local_order_id=_existing_oid,
+                        client_id=client_id,
+                        execution_mode=_reattach_mode,
+                        signal_id=signal_id,
+                        provenance=source_provenance,
+                    ):
+                        log.critical(
+                            "[%s] overnight_reeval: REATTACH_WATCHER source provenance "
+                            "was not durably persisted signal=%s local_order_id=%s "
+                            "— classifying retryable",
+                            ticker, signal_id, _existing_oid,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
+                        continue
+
                     # Metadata merge: existing FIRST, canonical values LAST
                     # so proven session/mode/client/canonical always win over
                     # any stale or blank stored metadata.
@@ -2266,6 +2399,7 @@ def run_overnight_reeval(
                         "overnight_reeval_session_key":     session_key,
                         "signal_id":                        _reattach_signal_id,
                         "canonical_signal_id":              _reattach_canonical,
+                        **source_provenance,
                         # PR #388 Blocker 1: REATTACH is a proven PR#388
                         # seam and opts in to the late-attachment classifier.
                         "late_attachment_policy_eligible":  True,
@@ -2551,8 +2685,9 @@ def run_overnight_reeval(
                         session_key=session_key,
                         clear_reattach_in_progress=True,
                         extra_meta={
-                            "source_table": "ap_signals",
-                            "source_job_id": str(job_id),
+                            "source_table": source_provenance["overnight_source_table"],
+                            "source_job_id": source_provenance["overnight_source_job_id"],
+                            **source_provenance,
                             "ticker": ticker,
                             "side": side,
                             "contract_deferred": True,
@@ -3077,6 +3212,7 @@ def run_overnight_reeval(
             if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
                 decision.plan.metadata = {}
             decision.plan.metadata.update({
+                **source_provenance,
                 "contract_deferred": True,
                 "deferred_breach_selection": True,
                 "selection_context": "deferred_breach",
@@ -3380,8 +3516,9 @@ def run_overnight_reeval(
                             local_order_id=str(local_order_id),
                             session_key=session_key,
                             extra_meta={
-                                "source_table": "ap_signals",
-                                "source_job_id": str(job_id),
+                                "source_table": source_provenance["overnight_source_table"],
+                                "source_job_id": source_provenance["overnight_source_job_id"],
+                                **source_provenance,
                                 "ticker": ticker,
                                 "side": side,
                                 "contract_deferred": contract_deferred,

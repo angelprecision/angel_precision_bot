@@ -55,6 +55,25 @@ def _retryable_row_identities(
     return identities, None
 
 
+def _pending_trigger_identity(row: dict) -> tuple[str, str, str] | None:
+    """Read the exact overnight source identity persisted on an order."""
+    if not isinstance(row, dict):
+        return None
+    source = _normalize_mode(row.get("overnight_source_table"))
+    job_id = str(row.get("overnight_source_job_id") or "").strip()
+    source_signal_id = str(row.get("overnight_source_signal_id") or "").strip()
+    order_signal_id = str(row.get("signal_id") or "").strip()
+    if (
+        source not in _RETRYABLE_SOURCES
+        or not job_id
+        or not source_signal_id
+        or not order_signal_id
+        or source_signal_id != order_signal_id
+    ):
+        return None
+    return source, job_id, source_signal_id
+
+
 def _entry_watcher_is_live(runner) -> bool:
     """Require the canonical watcher thread, not only retained pending state."""
     watcher = getattr(getattr(runner, "core", None), "entry_watcher", None)
@@ -134,6 +153,16 @@ def classify_safe_exhausted_partial(
     if not isinstance(details, dict):
         return False, {"reason": "overnight_details_invalid"}
 
+    # A safe partial is permitted only after both source inventories are known
+    # complete. Missing or contradictory source truth is indistinguishable from
+    # an incomplete inventory and must remain blocked.
+    if details.get("source_lookup_partial") is not False:
+        return False, {"reason": "overnight_source_lookup_partial"}
+    if details.get("trade_queue_status") != "SUCCESS":
+        return False, {"reason": "overnight_trade_queue_source_not_success"}
+    if details.get("ap_signals_status") != "SUCCESS":
+        return False, {"reason": "overnight_ap_signals_source_not_success"}
+
     if str(details.get("result_class") or "").strip().upper() != _SAFE_RESULT_CLASS:
         return False, {"reason": "overnight_result_class_not_retry_exhausted"}
     if str(details.get("retry_reason") or "").strip() != _SAFE_RETRY_REASON:
@@ -199,18 +228,21 @@ def classify_safe_exhausted_partial(
     if identity_error:
         return False, {"reason": identity_error}
 
-    pending_by_signal: dict[str, list[dict]] = {}
+    pending_by_identity: dict[tuple[str, str, str], list[dict]] = {}
     for pending_row in pending_rows:
         if not isinstance(pending_row, dict):
             return False, {"reason": "pending_trigger_row_invalid"}
-        signal_id = str(pending_row.get("signal_id") or "").strip()
-        if signal_id:
-            pending_by_signal.setdefault(signal_id, []).append(pending_row)
-    for _, _, signal_id in retryable_rows or []:
-        matches = pending_by_signal.get(signal_id) or []
+        identity = _pending_trigger_identity(pending_row)
+        if identity is not None:
+            pending_by_identity.setdefault(identity, []).append(pending_row)
+    for source, job_id, signal_id in retryable_rows or []:
+        identity = (source, job_id, signal_id)
+        matches = pending_by_identity.get(identity) or []
         if len(matches) != 1 or not str(matches[0].get("local_order_id") or "").strip():
             return False, {
                 "reason": "retryable_rows_not_exactly_represented",
+                "source": source,
+                "job_id": job_id,
                 "signal_id": signal_id,
             }
 

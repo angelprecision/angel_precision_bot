@@ -117,7 +117,11 @@ def _pending_trigger_order_row():
         "signal_id":            "sig-reattach-integration",
         "qty":                  2,
         "limit_price":          0.01,
-        "meta":                 {},
+        "meta":                 {
+            "overnight_source_table": "ap_signals",
+            "overnight_source_job_id": "sup:sig-reattach-integration",
+            "overnight_source_signal_id": "sig-reattach-integration",
+        },
         "contract":             "DEFERRED:SPY",
     }
 
@@ -838,6 +842,9 @@ def _run_one_attempt(
     if legacy_confirmed:
         _active_row["meta"] = {
             "trigger_crossed_at": "2026-08-03T16:00:00+00:00",
+            "overnight_source_table": "ap_signals",
+            "overnight_source_job_id": "sup:sig-reattach-integration",
+            "overnight_source_signal_id": "sig-reattach-integration",
         }
     monkeypatch.setattr(
         ov, "_query_active_entry_order",

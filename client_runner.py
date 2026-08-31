@@ -1918,6 +1918,11 @@ class ClientRunner(threading.Thread):
             "retryable_deferred": 0,
             "retryable_rows": [],
             "already_resolved": 0,
+            "source_lookup_partial": False,
+            "trade_queue_status": None,
+            "ap_signals_status": None,
+            "trade_queue_error": None,
+            "ap_signals_error": None,
             "unresolved": 0,
             "stale_skipped": 0,
             "fresh_processed": 0,
@@ -2014,6 +2019,11 @@ class ClientRunner(threading.Thread):
                 "retryable_deferred": result.get("retryable_deferred"),
                 "retryable_rows": result.get("retryable_rows"),
                 "already_resolved": result.get("already_resolved"),
+                "source_lookup_partial": result.get("source_lookup_partial"),
+                "trade_queue_status": result.get("trade_queue_status"),
+                "ap_signals_status": result.get("ap_signals_status"),
+                "trade_queue_error": result.get("trade_queue_error"),
+                "ap_signals_error": result.get("ap_signals_error"),
                 "unresolved": result.get("unresolved"),
                 "stale_skipped": result.get("stale_skipped"),
                 "fresh_processed": result.get("fresh_processed"),
@@ -2462,7 +2472,12 @@ class ClientRunner(threading.Thread):
 
             retryable_deferred = int(result.get("retryable_deferred", 0) or 0)
             unresolved = int(result.get("unresolved", 0) or 0)
-            if bool(result.get("completed")) and (retryable_deferred > 0 or unresolved > 0):
+            if bool(result.get("source_lookup_partial")):
+                result["result_class"] = "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
+                result["completed"] = False
+                result["retryable"] = True
+                result["retry_reason"] = "partial_source_inventory"
+            elif bool(result.get("completed")) and (retryable_deferred > 0 or unresolved > 0):
                 result["result_class"] = "RETRYABLE_PARTIAL_DEFERRED"
                 result["completed"] = False
                 result["retryable"] = True
