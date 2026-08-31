@@ -33,6 +33,12 @@ def install_trade_lifecycle_safety_guards() -> None:
     install_trade_lifecycle_guards()
 
 
+def install_broker_submit_reconciliation_guard() -> None:
+    from .broker_submit_reconciliation_guard import install_broker_submit_reconciliation_guard as install_guard
+
+    install_guard()
+
+
 def install_entry_safety_guards() -> None:
     installers = (
         install_entry_metadata_safety_guards,
@@ -56,3 +62,8 @@ install_entry_safety_guards()
 # silently reverting to the implementation that conflates DB failure with an
 # exact-owner CAS miss.
 install_selector_cursor_safety_guard()
+# P0 LIVE broker-submit reconciliation is also a deployment invariant. A failed
+# install would silently restore the production state that strands durable
+# SUBMITTING intents, so startup must fail instead of pretending the repair is
+# active.
+install_broker_submit_reconciliation_guard()
