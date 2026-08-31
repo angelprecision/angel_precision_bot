@@ -13,6 +13,12 @@ from ap.logger import get_logger
 
 log = get_logger("ap.brokers.tradier")
 
+# The submit-intent reconciler matches the exact Tradier tag.  Always request
+# tags and the largest supported page, but bound pagination so an unusual or
+# adversarial account response cannot make a recovery poll unbounded.
+TRADIER_ORDERS_PAGE_SIZE = 1500
+TRADIER_ORDERS_MAX_PAGES = 10
+
 
 @dataclass(frozen=True)
 class TradierConfig:
@@ -416,18 +422,46 @@ class TradierBroker(BrokerAdapter):
 
         Unlike ``get_order`` this deliberately propagates transport/auth errors:
         callers must distinguish an authoritative empty result from an unavailable
-        broker query before deciding that a new POST is safe.
+        broker query before deciding that a new POST is safe.  Tags are required
+        for the exact submit-intent match, so every page requests them explicitly.
         """
-        j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
-        node = j.get("orders") if isinstance(j, dict) else None
-        orders = node.get("order") if isinstance(node, dict) else node
-        if orders is None:
-            return []
-        if isinstance(orders, dict):
-            return [orders]
-        if isinstance(orders, list):
-            return [order for order in orders if isinstance(order, dict)]
-        raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        endpoint = f"/v1/accounts/{self.cfg.account_id}/orders"
+        all_orders: List[Dict[str, Any]] = []
+
+        for page in range(1, TRADIER_ORDERS_MAX_PAGES + 1):
+            j = self._get(
+                endpoint,
+                params={
+                    "includeTags": "true",
+                    "limit": TRADIER_ORDERS_PAGE_SIZE,
+                    "page": page,
+                },
+            )
+            if not isinstance(j, dict):
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:root")
+            if "orders" not in j:
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:missing_orders")
+
+            node = j.get("orders")
+            if node is not None and not isinstance(node, (dict, list)):
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:orders")
+            orders = node.get("order") if isinstance(node, dict) else node
+            if orders is None:
+                page_orders: List[Dict[str, Any]] = []
+            elif isinstance(orders, dict):
+                page_orders = [orders]
+            elif isinstance(orders, list):
+                if not all(isinstance(order, dict) for order in orders):
+                    raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:order_list")
+                page_orders = orders
+            else:
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+
+            all_orders.extend(page_orders)
+            if len(page_orders) < TRADIER_ORDERS_PAGE_SIZE:
+                return all_orders
+
+        raise ValueError("TRADIER_ORDERS_PAGINATION_CEILING")
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
         # Not used in current architecture

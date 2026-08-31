@@ -1724,7 +1724,7 @@ class APEntryWatcher:
             # diagnostic clarity and is treated as "retain" by the
             # consumer.
             if meta.get("submit_intent_at"):
-                return "RECONCILE_BROKER_INTENT", None
+                return "RECONCILE_BROKER_INTENT", claimed_next_retry
             # Status says submitted but no broker id and no submit intent
             # — inconsistent durable state.  Retain the watcher.
             return "KEEP_WATCHER", None
@@ -1804,7 +1804,7 @@ class APEntryWatcher:
         if claimed_disposition == "RECONCILE_BROKER_INTENT":
             # Trust the claim only if row actually shows a durable intent.
             if meta.get("submit_intent_at"):
-                return "RECONCILE_BROKER_INTENT", None
+                return "RECONCILE_BROKER_INTENT", claimed_next_retry
             return "KEEP_WATCHER", None
 
         # ── No claim (None/malformed) — infer from durable row ────────

@@ -427,6 +427,7 @@ class APOrderMonitor:
         # whether a valid mode was explicitly wired by the caller.
         client_mode: str | None = None,
         data_broker=None,
+        execution_core=None,
     ):
         self.client_id   = client_id
         self.broker      = broker
@@ -437,6 +438,7 @@ class APOrderMonitor:
         self.contract_selector = contract_selector
         self.alert_fn    = alert_fn
         self.data_broker = data_broker or getattr(broker, "data_broker", None)
+        self.execution_core = execution_core
         raw_recovery_mode = str(client_mode or "").strip().lower()
         self._broker_owned_exit_recovery_mode = (
             raw_recovery_mode if raw_recovery_mode in {"live", "paper"} else ""
@@ -822,6 +824,23 @@ class APOrderMonitor:
                         log.debug("[%s] lost-handoff systemic check failed: %s", self.client_id, _e)
 
             elif status == "PENDING_TRIGGER":
+                # A durable broker-submit handoff has already crossed the
+                # watcher/materialization boundary.  Route it before deferred
+                # hydration so a stale or partially projected contract cannot
+                # re-enter selector work or ordinary watcher recovery.
+                if (
+                    not broker_oid
+                    and not submitted_ts
+                    and self._has_pending_trigger_broker_submit_handoff(order)
+                ):
+                    self._reconcile_pending_trigger_broker_handoff(
+                        order=order,
+                        local_order_id=local_id,
+                        contract=contract,
+                        age_secs=age_secs,
+                    )
+                    continue
+
                 if hydration_attempts >= max(1, DEFERRED_HYDRATION_MAX_PER_CYCLE):
                     if str(order.get("contract") or "").strip().upper().startswith("DEFERRED:"):
                         log.info(
@@ -1046,6 +1065,12 @@ class APOrderMonitor:
                           AND (broker_order_id IS NULL OR broker_order_id = '')
                           AND UPPER(contract) LIKE 'DEFERRED:%%'
                           AND kind = 'ENTRY'
+                          AND COALESCE(meta->>'broker_ready', 'false') <> 'true'
+                          AND COALESCE(meta->>'lifecycle_state', '') <> 'SUBMITTING'
+                          AND COALESCE(meta->>'submit_intent_at', '') = ''
+                          AND COALESCE(meta->>'broker_submit_key', '') = ''
+                          AND COALESCE(meta->>'broker_submit_payload_hash', '') = ''
+                          AND COALESCE(meta->>'current_owner', '') NOT LIKE 'broker_submit:%%'
                           AND created_ts < %s
                         RETURNING local_order_id, symbol, reserved_cost, created_ts
                         """,
@@ -1259,6 +1284,25 @@ class APOrderMonitor:
         submitted_ts,
     ) -> None:
         if age_secs <= PENDING_TRIGGER_MAX_AGE_SECONDS:
+            return
+
+        # A stale PENDING_TRIGGER row can be past the watcher stage already.
+        # Once the durable submit intent and broker-submit owner are present,
+        # the order monitor must hand the row to the canonical broker-intent
+        # reconciler before probing or rearming the watcher.  In particular,
+        # do not let the ordinary pending-trigger recovery path reinterpret a
+        # broker handoff as a missing watcher/client identity.
+        if (
+            not broker_oid
+            and not submitted_ts
+            and self._has_pending_trigger_broker_submit_handoff(order)
+        ):
+            self._reconcile_pending_trigger_broker_handoff(
+                order=order,
+                local_order_id=local_id,
+                contract=contract,
+                age_secs=age_secs,
+            )
             return
 
         _submitted_repr = submitted_ts.isoformat() if submitted_ts else "None"
@@ -1668,6 +1712,129 @@ class APOrderMonitor:
             return bool(has_order(local_order_id)), True, None
         except Exception as exc:
             return None, True, f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _has_pending_trigger_broker_submit_handoff(order: dict) -> bool:
+        """Return True for a durable PENDING_TRIGGER broker handoff.
+
+        ``PENDING_TRIGGER`` is normally the watcher's pre-breach state.  A
+        submit-intent crash window is different: durable ownership has already
+        transferred to ``broker_submit:*`` and must be reconciled against the
+        broker.  Require the complete handoff marker here so ordinary watcher
+        rows continue through their existing recovery path; the canonical
+        reconciler then proves the remaining identity fields before any broker
+        adoption or canonical resume.
+        """
+        if not isinstance(order, dict):
+            return False
+        meta = _coerce_meta(order)
+        lifecycle = str(meta.get("lifecycle_state") or "").strip().upper()
+        submit_intent_at = str(meta.get("submit_intent_at") or "").strip()
+        broker_submit_key = str(meta.get("broker_submit_key") or "").strip()
+        current_owner = str(meta.get("current_owner") or "").strip()
+        return bool(
+            lifecycle == "SUBMITTING"
+            and submit_intent_at
+            and broker_submit_key
+            and current_owner == f"broker_submit:{broker_submit_key}"
+        )
+
+    def _reconcile_pending_trigger_broker_handoff(
+        self,
+        *,
+        order: dict,
+        local_order_id: str,
+        contract: str,
+        age_secs: float,
+    ) -> dict:
+        """Route a stale broker-owned PENDING_TRIGGER row to #562.
+
+        This method deliberately has no watcher or cleanup fallback.  The
+        durable ``broker_submit:*`` owner remains on the row if the execution
+        core is unavailable or the broker truth is unknown; only the canonical
+        reconciler may adopt, release, or resume that ownership.
+        """
+        runtime_mode = str(getattr(self, "client_mode", "") or "").strip().lower()
+        try:
+            from ap.order_state_machine import _durable_execution_mode
+
+            durable_mode = _durable_execution_mode(order)
+        except Exception:
+            durable_mode = None
+        if runtime_mode != "live" or durable_mode != "live":
+            log.critical(
+                "[%s] PENDING_TRIGGER_BROKER_HANDOFF_NON_LIVE_MODE "
+                "| local=%s | contract=%s | runtime_mode=%s | durable_mode=%s "
+                "| broker_submit_owner=retained | live_reconciler=NOT_ATTEMPTED "
+                "| watcher_rearm=NOT_ATTEMPTED | cleanup=NOT_ATTEMPTED",
+                self.client_id,
+                local_order_id,
+                contract,
+                runtime_mode or "unknown",
+                durable_mode or "unknown",
+            )
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "PENDING_TRIGGER_BROKER_HANDOFF_NON_LIVE_MODE",
+            }
+        execution_core = getattr(self, "execution_core", None)
+        reconcile = getattr(
+            execution_core, "reconcile_deferred_broker_intent", None
+        )
+        if not callable(reconcile):
+            log.critical(
+                "[%s] PENDING_TRIGGER_BROKER_HANDOFF_RECONCILER_UNAVAILABLE "
+                "| local=%s | contract=%s | age=%.0fs "
+                "| broker_submit_owner=retained | watcher_rearm=NOT_ATTEMPTED "
+                "| cleanup=NOT_ATTEMPTED",
+                self.client_id,
+                local_order_id,
+                contract,
+                age_secs,
+            )
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "PENDING_TRIGGER_BROKER_HANDOFF_RECONCILER_UNAVAILABLE",
+            }
+
+        try:
+            result = reconcile(local_order_id=local_order_id) or {}
+        except Exception as exc:
+            log.error(
+                "[%s] PENDING_TRIGGER_BROKER_HANDOFF_RECONCILE_RAISED "
+                "| local=%s | contract=%s | error=%s "
+                "| watcher_rearm=NOT_ATTEMPTED | cleanup=NOT_ATTEMPTED",
+                self.client_id,
+                local_order_id,
+                contract,
+                exc,
+            )
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": (
+                    "PENDING_TRIGGER_BROKER_HANDOFF_RECONCILE_RAISED:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+
+        if not isinstance(result, dict):
+            result = {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "PENDING_TRIGGER_BROKER_HANDOFF_RECONCILE_MALFORMED",
+            }
+        log.info(
+            "[%s] PENDING_TRIGGER_BROKER_HANDOFF_RECONCILED "
+            "| local=%s | contract=%s | age=%.0fs | disposition=%s "
+            "| reason=%s | broker_truth=%s | watcher_rearm=NOT_ATTEMPTED",
+            self.client_id,
+            local_order_id,
+            contract,
+            age_secs,
+            result.get("disposition"),
+            result.get("reason_code"),
+            result.get("broker_truth"),
+        )
+        return result
 
     def _canonical_pending_trigger_rearm(
         self,

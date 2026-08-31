@@ -13,8 +13,8 @@ Invariants proven here:
   * the reconciler never calls the broker and never mutates the row
   * ALREADY_RECONCILED when a broker_order_id is present
   * NOT_IN_CRASH_WINDOW when there is no submit_intent_at (safe to resume)
-  * RECONCILE_PENDING (reason RECONCILE_BROKER_QUERY_NOT_YET_WIRED) in the
-    crash window until the broker-query adoption gate is wired
+  * RECONCILE_PENDING with exact broker-submit ownership retained for broker
+    query failures or clean no-match observations
   * inspection failures collapse to KEEP_WATCHER (never a resume)
 """
 
@@ -27,6 +27,10 @@ from unittest.mock import MagicMock
 import pytest
 
 import ap_execution_core
+from ap.broker_submit_identity import (
+    build_entry_submit_payload,
+    entry_submit_payload_hash,
+)
 from ap_recovery import APStartupRecovery
 
 
@@ -37,6 +41,8 @@ def _make_core(client_id="jason@example.com"):
     core = types.SimpleNamespace()
     core.client_id = client_id
     core.email = client_id
+    core.execution_mode = "live"
+    core.mode = "LIVE"
     core.order_state_machine = MagicMock()
     core.broker = MagicMock()
     core.broker.list_orders.side_effect = TimeoutError("broker unavailable")
@@ -45,6 +51,7 @@ def _make_core(client_id="jason@example.com"):
             core, type(core)
         )
     )
+    core._is_real_occ_contract = ap_execution_core.APExecutionCore._is_real_occ_contract
     return core
 
 
@@ -52,16 +59,32 @@ def _row(**overrides):
     base = {
         "local_order_id": "oid-1",
         "client_id": "jason@example.com",
+        "execution_mode": "live",
         "kind": "ENTRY",
         "status": "PENDING_TRIGGER",
+        "symbol": "SPY",
+        "contract": "SPY260717C00600000",
+        "qty": 1,
+        "limit_price": 1.25,
         "broker_order_id": None,
         "meta": {
+            "execution_mode": "live",
             "lifecycle_state": "SUBMITTING",
+            "materialization_generation": 1,
             "submit_intent_at": datetime.now(timezone.utc).isoformat(),
             "broker_submit_key": "oid-1",
-            "broker_submit_payload_hash": "abc123",
+            "current_owner": "broker_submit:oid-1",
         },
     }
+    base["meta"]["broker_submit_payload_hash"] = entry_submit_payload_hash(
+        build_entry_submit_payload(
+            symbol=base["symbol"],
+            contract=base["contract"],
+            qty=base["qty"],
+            limit_price=base["limit_price"],
+            broker_submit_key=base["meta"]["broker_submit_key"],
+        )
+    )
     base.update(overrides)
     return base
 
@@ -76,7 +99,9 @@ def test_crash_window_query_failure_returns_reconcile_pending():
     core.order_state_machine.get_order.return_value = _row()
     result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
     assert result["disposition"] == "RECONCILE_PENDING"
-    assert result["reason_code"] == "RECONCILE_BROKER_QUERY_FAILED:TimeoutError"
+    assert result["reason_code"].startswith(
+        "RECONCILE_BROKER_QUERY_FAILED:TimeoutError:broker unavailable"
+    )
     assert result["broker_submit_key"] == "oid-1"
 
 
@@ -111,7 +136,10 @@ def test_old_submit_intent_with_empty_broker_list_stays_fail_closed():
     result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
 
     assert result["disposition"] == "RECONCILE_PENDING"
-    assert result["reason_code"] == "RECONCILE_BROKER_NO_MATCH_HELD"
+    assert result["reason_code"] == "RECONCILE_BROKER_NO_MATCH_OBSERVED"
+    assert result["broker_truth"] == "NO_MATCH_OBSERVED"
+    core.order_state_machine.retain_broker_submit_owner_for_reconciliation.assert_called_once()
+    core.order_state_machine.release_broker_submit_intent_after_no_match.assert_not_called()
     core.order_state_machine.update_order_meta.assert_not_called()
 
 
@@ -135,6 +163,7 @@ def test_reconciler_never_mutates_row():
     core = _make_core()
     core.order_state_machine.get_order.return_value = _row()
     core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+    core.order_state_machine.retain_broker_submit_owner_for_reconciliation.assert_called_once()
     core.order_state_machine.update_order_meta.assert_not_called()
     core.order_state_machine.terminalize_deferred_breach.assert_not_called()
     core.order_state_machine.submit_existing_entry.assert_not_called()

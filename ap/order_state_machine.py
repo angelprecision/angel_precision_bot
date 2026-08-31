@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -53,7 +54,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from ap.broker_submit_identity import canonical_broker_submit_key
+from ap.broker_submit_identity import (
+    build_entry_submit_payload,
+    canonical_broker_submit_key,
+    entry_submit_payload_hash,
+)
 from ap.db import conn, run_with_retry
 from ap.exit_safety import (
     alert_exit_submission_halted,
@@ -2461,6 +2466,305 @@ class APOrderStateMachine:
             log.warning(
                 "[%s] persist_deferred_submit_intent failed order=%s: %s",
                 self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def retain_broker_submit_owner_for_reconciliation(
+        self,
+        local_order_id: str,
+        *,
+        broker_submit_key: str,
+        submit_intent_at: str | None = None,
+        payload_hash: str,
+        generation: int,
+        execution_mode: str,
+        contract: str,
+        qty: int,
+        limit_price: float,
+        reason: str,
+        next_retry_at: str | None = None,
+        reconciliation_stage: str = "broker_order_reconciliation",
+        exception_class: str = "",
+        exception_message: str = "",
+    ) -> bool:
+        """Retain an exact ``broker_submit:*`` owner without replacing it.
+
+        A broker-query failure happens after the irreversible submit-intent CAS.
+        The recovery scheduler must therefore be able to refresh diagnostics
+        while the canonical broker-submit owner remains untouched.  This is a
+        single exact-identity CAS: a stale caller cannot stamp retry metadata on
+        a different client, mode, generation, contract, quantity, price, key,
+        or payload hash.
+        """
+        _local_id = str(local_order_id or "").strip()
+        _raw_submit_key = str(broker_submit_key or "").strip()
+        _submit_key = canonical_broker_submit_key(_raw_submit_key)
+        _payload_hash = str(payload_hash or "").strip()
+        _intent_at = str(submit_intent_at or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        _contract = str(contract or "").strip()
+        _owner = f"broker_submit:{_submit_key}"
+        try:
+            if isinstance(generation, (bool, float)):
+                raise ValueError
+            _generation = int(generation)
+            if _generation < 1:
+                raise ValueError
+            if isinstance(qty, (bool, float)):
+                raise ValueError
+            _qty = int(qty)
+            _limit = round(float(limit_price), 2)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            not _local_id
+            or _raw_submit_key != _submit_key
+            or not _submit_key
+            or not _intent_at
+            or not _payload_hash
+            or _mode not in {"live", "paper"}
+            or not _contract
+            or _qty <= 0
+            or not math.isfinite(_limit)
+            or _limit <= 0
+            or not str(reason or "").strip()
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "broker_submit_owner_retained": True,
+            "broker_submit_reconciliation_status": "PENDING",
+            "broker_submit_reconciliation_reason": str(reason or "").strip(),
+            "broker_submit_reconciliation_stage": (
+                str(reconciliation_stage or "broker_order_reconciliation").strip()
+                or "broker_order_reconciliation"
+            ),
+            "broker_submit_reconciliation_last_at": _now,
+            "broker_submit_reconciliation_next_retry_at": (
+                str(next_retry_at).strip() if next_retry_at else None
+            ),
+        }
+        if exception_class:
+            _patch["broker_submit_reconciliation_exception_class"] = str(exception_class)
+        if exception_message:
+            _patch["broker_submit_reconciliation_exception_message"] = str(exception_message)
+        try:
+            _patch_json = json.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _retain():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'SUBMITTING'
+                      AND NULLIF(meta->>'submit_intent_at','') IS NOT NULL
+                      AND COALESCE(meta->>'broker_submit_key','') = %s
+                      AND COALESCE(meta->>'broker_submit_payload_hash','') = %s
+                      AND COALESCE(meta->>'current_owner','') = %s
+                      AND COALESCE(meta->>'submit_intent_at','') = %s
+                      AND CASE
+                            WHEN COALESCE(meta->>'materialization_generation','')
+                                 ~ '^[1-9][0-9]*$'
+                            THEN (meta->>'materialization_generation')::int
+                            ELSE NULL
+                          END = %s
+                      AND COALESCE(contract,'') = %s
+                      AND COALESCE(qty,0) = %s
+                      AND qty > 0
+                      AND ROUND(COALESCE(limit_price,0)::numeric, 2) = %s
+                      AND limit_price > 0
+                    """,
+                    (
+                        _patch_json,
+                        _local_id,
+                        self.client_id,
+                        _mode,
+                        _submit_key,
+                        _payload_hash,
+                        _owner,
+                        _intent_at,
+                        _generation,
+                        _contract,
+                        _qty,
+                        _limit,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_retain) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] retain_broker_submit_owner_for_reconciliation failed "
+                "order=%s: %s",
+                self.client_id,
+                _local_id,
+                exc,
+            )
+            return False
+
+    def release_broker_submit_intent_after_no_match(
+        self,
+        local_order_id: str,
+        *,
+        broker_submit_key: str,
+        submit_intent_at: str | None = None,
+        payload_hash: str,
+        generation: int,
+        execution_mode: str,
+        contract: str,
+        qty: int,
+        limit_price: float,
+        reason: str,
+        reconciliation_stage: str = "broker_order_reconciliation",
+    ) -> bool:
+        """Atomically return one proven-no-match row to ``BROKER_READY``.
+
+        This is the only operation that may retire a submit-intent fence.  It
+        requires the complete durable identity and a successful broker query
+        that found no exact tag after the settlement window.  The old submit
+        key is recorded under audit-only fields and removed from the active
+        proof surface so the existing canonical continuation can recreate the
+        same tag through its normal submit-intent CAS.
+        """
+        _local_id = str(local_order_id or "").strip()
+        _raw_submit_key = str(broker_submit_key or "").strip()
+        _submit_key = canonical_broker_submit_key(_raw_submit_key)
+        _payload_hash = str(payload_hash or "").strip()
+        _intent_at = str(submit_intent_at or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        _contract = str(contract or "").strip()
+        _owner = f"broker_submit:{_submit_key}"
+        try:
+            if isinstance(generation, (bool, float)):
+                raise ValueError
+            _generation = int(generation)
+            if _generation < 1:
+                raise ValueError
+            if isinstance(qty, (bool, float)):
+                raise ValueError
+            _qty = int(qty)
+            _limit = round(float(limit_price), 2)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            not _local_id
+            or _raw_submit_key != _submit_key
+            or not _submit_key
+            or not _intent_at
+            or not _payload_hash
+            or _mode not in {"live", "paper"}
+            or not _contract
+            or _qty <= 0
+            or not math.isfinite(_limit)
+            or _limit <= 0
+            or not str(reason or "").strip()
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "lifecycle_state": "BROKER_READY",
+            "materialization_status": "SELECTED",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "broker_ready": True,
+            "broker_submit_reconciliation_status": "NO_MATCH_PROVEN",
+            "broker_submit_reconciliation_no_match_at": _now,
+            "broker_submit_reconciliation_release_reason": str(reason or "").strip(),
+            "broker_submit_reconciliation_stage": (
+                str(reconciliation_stage or "broker_order_reconciliation").strip()
+                or "broker_order_reconciliation"
+            ),
+            "broker_submit_reconciliation_key": _submit_key,
+            "broker_submit_reconciliation_payload_hash": _payload_hash,
+            "broker_submit_reconciliation_next_retry_at": None,
+        }
+        try:
+            _patch_json = json.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _release():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = (
+                            COALESCE(meta, '{}'::jsonb)
+                            - 'submit_intent_at'
+                            - 'submit_started_at'
+                            - 'broker_submit_key'
+                            - 'broker_submit_payload_hash'
+                            - 'current_owner'
+                            - 'recovery_submit_owner'
+                            - 'recovery_submit_claimed_at'
+                            - 'recovery_submit_lease_until'
+                        ) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'SUBMITTING'
+                      AND NULLIF(meta->>'submit_intent_at','') IS NOT NULL
+                      AND COALESCE(meta->>'broker_submit_key','') = %s
+                      AND COALESCE(meta->>'broker_submit_payload_hash','') = %s
+                      AND COALESCE(meta->>'current_owner','') = %s
+                      AND COALESCE(meta->>'submit_intent_at','') = %s
+                      AND CASE
+                            WHEN COALESCE(meta->>'materialization_generation','')
+                                 ~ '^[1-9][0-9]*$'
+                            THEN (meta->>'materialization_generation')::int
+                            ELSE NULL
+                          END = %s
+                      AND COALESCE(contract,'') = %s
+                      AND COALESCE(qty,0) = %s
+                      AND qty > 0
+                      AND ROUND(COALESCE(limit_price,0)::numeric, 2) = %s
+                      AND limit_price > 0
+                    """,
+                    (
+                        _patch_json,
+                        _local_id,
+                        self.client_id,
+                        _mode,
+                        _submit_key,
+                        _payload_hash,
+                        _owner,
+                        _intent_at,
+                        _generation,
+                        _contract,
+                        _qty,
+                        _limit,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_release) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] release_broker_submit_intent_after_no_match failed "
+                "order=%s: %s",
+                self.client_id,
+                _local_id,
+                exc,
             )
             return False
 
@@ -5465,18 +5769,17 @@ class APOrderStateMachine:
         # tag MUST be the canonical submit key so _lookup_order_by_tag can recover from
         # ambiguous broker responses (read timeout, JSON parse fail) without
         # double-submitting.
-        _order_data = {
-            "class": "option", "symbol": ticker, "option_symbol": contract,
-            "side": "buy_to_open", "quantity": qty,
-            "type": "limit", "price": round(lp, 2), "duration": "day",
-            "tag": _submit_key,
-        }
+        _order_data = build_entry_submit_payload(
+            symbol=ticker,
+            contract=contract,
+            qty=qty,
+            limit_price=lp,
+            broker_submit_key=_submit_key,
+        )
         # Persist the exact durable submit intent before any broker bytes leave
         # the process.  The Tradier tag is the stable idempotency/reconciliation
         # key for the crash window after POST but before broker_order_id commit.
-        _payload_hash = hashlib.sha256(
-            json.dumps(_order_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        _payload_hash = entry_submit_payload_hash(_order_data)
         _breach_to_submit_ms = None
         try:
             _breach_at = datetime.fromisoformat(str(

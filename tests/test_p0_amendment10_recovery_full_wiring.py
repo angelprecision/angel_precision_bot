@@ -4,6 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import ap_execution_core
+from ap.broker_submit_identity import (
+    build_entry_submit_payload,
+    entry_submit_payload_hash,
+)
 from ap.order_state_machine import APOrderStateMachine
 
 
@@ -18,7 +22,21 @@ def _row(crash=False):
         "selected_qty": 1,
     }
     if crash:
-        meta.update(lifecycle_state="SUBMITTING", submit_intent_at=datetime.now(timezone.utc).isoformat(), broker_submit_key="oid-1")
+        meta.update(
+            lifecycle_state="SUBMITTING",
+            submit_intent_at=datetime.now(timezone.utc).isoformat(),
+            broker_submit_key="oid-1",
+            current_owner="broker_submit:oid-1",
+            broker_submit_payload_hash=entry_submit_payload_hash(
+                build_entry_submit_payload(
+                    symbol="SPY",
+                    contract="SPY260717C00600000",
+                    qty=1,
+                    limit_price=2.10,
+                    broker_submit_key="oid-1",
+                )
+            ),
+        )
     return {
         "local_order_id": "oid-1", "client_id": "jason@example.com",
         "execution_mode": "live", "signal_id": "sig-1", "plan_id": "plan-1",
@@ -135,7 +153,9 @@ def test_query_failure_is_retryable_and_never_posts():
     core.broker.list_orders.side_effect = TimeoutError("timeout")
     result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
     assert result["disposition"] == "RECONCILE_PENDING"
-    assert result["reason_code"] == "RECONCILE_BROKER_QUERY_FAILED:TimeoutError"
+    assert result["reason_code"].startswith(
+        "RECONCILE_BROKER_QUERY_FAILED:TimeoutError:timeout"
+    )
     core.broker.place_order.assert_not_called()
 
 
