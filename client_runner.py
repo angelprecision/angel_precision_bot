@@ -2476,7 +2476,12 @@ class ClientRunner(threading.Thread):
                 result.get("trade_queue_status") == "FAILED"
                 and result.get("ap_signals_status") == "FAILED"
             )
-            if bool(result.get("source_lookup_partial")) and not _source_lookup_failed:
+            if _source_lookup_failed:
+                result["result_class"] = "RETRYABLE_SOURCE_LOOKUP_FAILED"
+                result["completed"] = False
+                result["retryable"] = True
+                result["retry_reason"] = "source_lookup_failed"
+            elif bool(result.get("source_lookup_partial")):
                 result["result_class"] = "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
                 result["completed"] = False
                 result["retryable"] = True

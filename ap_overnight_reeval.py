@@ -2353,6 +2353,11 @@ def run_overnight_reeval(
                     if not isinstance(_ord_meta, dict):
                         _ord_meta = {}
 
+                    _source_meta_present = all(
+                        str(_ord_meta.get(key) or "").strip()
+                        == str(value).strip()
+                        for key, value in source_provenance.items()
+                    )
                     if not _merge_overnight_source_provenance(
                         _ord_meta, source_provenance
                     ):
@@ -2369,11 +2374,6 @@ def run_overnight_reeval(
                         )
                         continue
 
-                    _source_meta_present = all(
-                        str(_ord_meta.get(key) or "").strip()
-                        == str(value).strip()
-                        for key, value in source_provenance.items()
-                    )
                     if not _source_meta_present and not _persist_overnight_order_provenance(
                         order_state_machine,
                         local_order_id=_existing_oid,
