@@ -50,7 +50,7 @@ def _strict_positive_int(value: Any) -> int | None:
 
 
 def _exact_live_submit_identity(subject, row: dict) -> tuple[dict | None, str]:
-    """Prove the exact durable LIVE submit-intent shape before any liveness action."""
+    """Prove the exact durable LIVE submit-intent shape before liveness work."""
     if not isinstance(row, dict):
         return None, "row_missing"
 
@@ -76,7 +76,6 @@ def _exact_live_submit_identity(subject, row: dict) -> tuple[dict | None, str]:
         return None, "runtime_mode_invalid"
     if mode != "live" or runtime_mode != "live":
         return None, "not_live"
-
     if str(row.get("kind") or "").strip().upper() != "ENTRY":
         return None, "kind_mismatch"
     if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
@@ -119,6 +118,19 @@ def _exact_live_submit_identity(subject, row: dict) -> tuple[dict | None, str]:
         if selected_qty != qty:
             return None, "selected_qty_mismatch"
 
+    first_no_match_at = str(
+        meta.get("broker_reconcile_no_match_observed_at") or ""
+    ).strip()
+    first_no_match_matches = bool(
+        first_no_match_at
+        and str(meta.get("broker_reconcile_no_match_submit_key") or "").strip()
+            == submit_key
+        and str(meta.get("broker_reconcile_no_match_payload_hash") or "").strip()
+            == payload_hash
+        and _strict_positive_int(meta.get("broker_reconcile_no_match_generation"))
+            == generation
+    )
+
     return {
         "client_id": row_client,
         "execution_mode": mode,
@@ -131,7 +143,7 @@ def _exact_live_submit_identity(subject, row: dict) -> tuple[dict | None, str]:
         "payload_hash": payload_hash,
         "generation": generation,
         "current_owner": expected_owner,
-        "first_no_match_at": str(meta.get("broker_reconcile_no_match_observed_at") or "").strip(),
+        "first_no_match_at": first_no_match_at if first_no_match_matches else "",
     }, "ok"
 
 
@@ -143,7 +155,7 @@ def _patch_tradier_list_orders() -> None:
         return
 
     def list_orders(self):
-        """Return the complete current-session order set with Tradier tags included."""
+        """Return a complete current-session order set with Tradier tags."""
         all_orders: list[dict] = []
         path = f"/v1/accounts/{self.cfg.account_id}/orders"
         for page in range(1, _TRADIER_MAX_PAGES + 1):
@@ -155,15 +167,13 @@ def _patch_tradier_list_orders() -> None:
                     "page": page,
                 },
             )
-            node = payload.get("orders") if isinstance(payload, dict) else None
+            if not isinstance(payload, dict) or "orders" not in payload:
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:root")
+            node = payload.get("orders")
             orders = node.get("order") if isinstance(node, dict) else node
             if orders is None:
                 batch: list[dict] = []
             elif isinstance(orders, str) and orders.strip().lower() in {"", "null"}:
-                # Tradier has historically used null-like empty sentinels on
-                # otherwise-successful account collection responses. Only these
-                # exact empty sentinels are normalized; every other scalar shape
-                # remains UNKNOWN and raises below.
                 batch = []
             elif isinstance(orders, dict):
                 batch = [orders]
@@ -185,13 +195,14 @@ def _patch_tradier_list_orders() -> None:
     TradierBroker.list_orders = list_orders
 
 
-def _record_first_no_match(osm, local_order_id: str, identity: dict, observed_at: str) -> bool:
+def _record_first_no_match(local_order_id: str, identity: dict, observed_at: str) -> bool:
     from ap.db import conn, run_with_retry
     from ap.order_state_machine import _DURABLE_EXECUTION_MODE_SQL
 
     patch = json.dumps({
         "broker_reconcile_no_match_observed_at": observed_at,
         "broker_reconcile_no_match_submit_key": identity["broker_submit_key"],
+        "broker_reconcile_no_match_payload_hash": identity["payload_hash"],
         "broker_reconcile_no_match_generation": identity["generation"],
     })
 
@@ -243,7 +254,6 @@ def _record_first_no_match(osm, local_order_id: str, identity: dict, observed_at
 
 
 def _release_after_proven_absence(
-    osm,
     local_order_id: str,
     identity: dict,
     *,
@@ -295,6 +305,9 @@ def _release_after_proven_absence(
                   AND COALESCE(meta->>'current_owner','') = %s
                   AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                   AND COALESCE(meta->>'broker_reconcile_no_match_observed_at','') = %s
+                  AND COALESCE(meta->>'broker_reconcile_no_match_submit_key','') = %s
+                  AND COALESCE(meta->>'broker_reconcile_no_match_payload_hash','') = %s
+                  AND COALESCE((meta->>'broker_reconcile_no_match_generation')::int, 0) = %s
                 """,
                 (
                     patch,
@@ -309,6 +322,9 @@ def _release_after_proven_absence(
                     identity["current_owner"],
                     identity["generation"],
                     first_no_match_at,
+                    identity["broker_submit_key"],
+                    identity["payload_hash"],
+                    identity["generation"],
                 ),
             )
             return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
@@ -350,7 +366,8 @@ def _patch_reconciler() -> None:
         first_dt = _parse_ts(first_raw)
         if not first_raw:
             observed_at = now.isoformat()
-            _record_first_no_match(osm, local_order_id, identity, observed_at)
+            if not _record_first_no_match(local_order_id, identity, observed_at):
+                return {**result, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_NO_MATCH_PROOF_CAS_LOST"}
             return {
                 **result,
                 "disposition": "RECONCILE_PENDING",
@@ -372,49 +389,24 @@ def _patch_reconciler() -> None:
                 ),
             }
 
-        # The original reconciler has just completed a second exact-tag broker
-        # query in this invocation and still found no matching order. The first
-        # no-match timestamp is durable and old enough to satisfy the settlement
-        # window. Only this exact CAS may clear the old intent and restore the
-        # existing canonical BROKER_READY continuation.
-        proven_at = now.isoformat()
         if not _release_after_proven_absence(
-            osm,
             local_order_id,
             identity,
             first_no_match_at=first_raw,
-            proven_at=proven_at,
+            proven_at=now.isoformat(),
         ):
             return {**result, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ABSENCE_RELEASE_CAS_LOST"}
 
-        resume = getattr(self, "resume_deferred_broker_ready_order", None)
-        if not callable(resume):
-            return {
-                **result,
-                "disposition": "RECONCILE_PENDING",
-                "reason_code": "RECONCILE_CANONICAL_RESUME_UNAVAILABLE",
-            }
-        resumed = resume(local_order_id=local_order_id) or {}
-        resumed_disp = str(resumed.get("disposition") or "").strip().upper()
-        if resumed_disp == "SUBMITTED" or resumed.get("broker_order_id"):
-            return {
-                **result,
-                **resumed,
-                "disposition": "ALREADY_RECONCILED",
-                "reason_code": "RECONCILE_CANONICAL_RESUME_SUBMITTED",
-            }
-        if resumed_disp in {"TERMINAL_DURABLE", "TERMINAL_ALREADY_DURABLE"}:
-            return {
-                **result,
-                **resumed,
-                "disposition": "ALREADY_RECONCILED",
-                "reason_code": "RECONCILE_CANONICAL_RESUME_TERMINAL",
-            }
+        # Do not invoke the restart helper from inside the reconciler. Its caller
+        # owns some terminal dispositions. Restoring the exact row to BROKER_READY
+        # is the durable handoff; the existing watcher/recovery path then re-enters
+        # the canonical LIVE gates and canonical submit implementation.
         return {
             **result,
-            **resumed,
             "disposition": "RECONCILE_PENDING",
-            "reason_code": str(resumed.get("reason_code") or "RECONCILE_CANONICAL_RESUME_PENDING"),
+            "reason_code": "RECONCILE_BROKER_ABSENCE_PROVEN_CANONICAL_RESUME_REQUIRED",
+            "canonical_resume_required": True,
+            "next_retry_after_seconds": 1,
         }
 
     reconcile_deferred_broker_intent._ap_live_submit_liveness = True
@@ -447,28 +439,28 @@ def _patch_entry_callback() -> None:
             return None
         rec = self.reconcile_deferred_broker_intent(local_order_id=local_order_id) or {}
         if str(rec.get("disposition") or "").upper() == "ALREADY_RECONCILED":
-            return {"disposition": "SUBMITTED", **rec}
+            return {**rec, "disposition": "SUBMITTED"}
         return {
             "disposition": "KEEP_WATCHER",
             "reason_code": str(rec.get("reason_code") or "BROKER_INTENT_RECONCILE_PENDING"),
             "retry_after_seconds": int(rec.get("next_retry_after_seconds") or 5),
             "local_order_id": local_order_id,
+            "canonical_resume_required": bool(rec.get("canonical_resume_required")),
         }
 
     def _on_entry_trigger(self, watched):
-        # Pre-route an already-SUBMITTING row directly to broker truth. Do not
-        # re-run hydration, selector, gates, or submit-intent creation while the
-        # durable broker-submit owner exists.
+        # Already-SUBMITTING means broker truth owns the next action. Never rerun
+        # hydration, selector, LIVE gates, or submit-intent creation first.
         routed = _reconcile_if_owned(self, watched)
         if routed is not None:
             return routed
 
         result = original(self, watched)
 
-        # The normal callback can atomically transfer BROKER_READY ownership to
-        # broker_submit:* and then observe MATERIALIZATION_SUBMIT_OWNERSHIP_TRANSFERRED.
-        # Re-read immediately and route that durable handoff to reconciliation
-        # instead of waiting for another watcher/recovery cycle.
+        # A normal callback can atomically transfer BROKER_READY ownership to
+        # broker_submit:* and then observe the transfer instead of a broker id.
+        # Re-read immediately so that handoff enters reconciliation now, rather
+        # than restarting ordinary entry work on the next poll.
         routed = _reconcile_if_owned(self, watched)
         return routed if routed is not None else result
 
@@ -496,7 +488,11 @@ def _patch_recovery_retention() -> None:
             row = self.get_order(local_order_id)
         except Exception:
             row = None
-        identity, _ = _exact_live_submit_identity(self, row) if isinstance(row, dict) else (None, "row_missing")
+        identity, _ = (
+            _exact_live_submit_identity(self, row)
+            if isinstance(row, dict)
+            else (None, "row_missing")
+        )
         if identity is not None:
             log.warning(
                 "BROKER_SUBMIT_OWNER_RETAINED_PENDING_RECONCILIATION "
@@ -506,9 +502,6 @@ def _patch_recovery_retention() -> None:
                 identity["broker_submit_key"],
                 reason,
             )
-            # The canonical broker_submit:* owner is already stronger authority
-            # than recovery_scheduler. Preserve it untouched and report retention
-            # success so recovery does not emit RECOVERY_RETENTION_WRITE_FAILED.
             return True
         return original(
             self,
