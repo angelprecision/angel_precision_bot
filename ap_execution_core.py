@@ -5256,6 +5256,62 @@ class APExecutionCore:
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
+        try:
+            _strategy_order = {}
+            _get_order_for_strategy = getattr(self.order_state_machine, "get_order", None)
+            if callable(_get_order_for_strategy):
+                _strategy_order = _get_order_for_strategy(queue_local_order_id) or {}
+            if not _strategy_order:
+                _get_order_for_strategy = getattr(self.order_state_machine, "_get_order", None)
+                if callable(_get_order_for_strategy):
+                    _strategy_order = _get_order_for_strategy(queue_local_order_id) or {}
+            from ap.entry_metadata_guard import validate_entry_strategy_truth
+            _strategy_result = validate_entry_strategy_truth(
+                order=_strategy_order,
+                plan=approved_plan,
+                caller_meta=getattr(approved_plan, "metadata", None),
+                client_id=_breach_client_id,
+                execution_mode=(
+                    getattr(approved_plan, "execution_mode", None)
+                    or sig.get("execution_mode")
+                    or getattr(self, "execution_mode", None)
+                ),
+            )
+        except Exception as _strategy_exc:
+            _strategy_result = SimpleNamespace(
+                ok=False,
+                reason=f"ENTRY_STRATEGY_TRUTH_VALIDATOR_ERROR:{_strategy_exc}",
+                details={
+                    "client_id": _breach_client_id,
+                    "signal_id": signal_id,
+                    "order_id": queue_local_order_id,
+                    "ticker": ticker,
+                },
+            )
+        if not _strategy_result.ok:
+            _strategy_reason = str(_strategy_result.reason or "ENTRY_STRATEGY_TRUTH_INVALID")
+            log.critical(
+                "[%s] ENTRY_STRATEGY_TRUTH_BLOCKED before materialization | "
+                "order_id=%s reason=%s details=%s",
+                ticker, queue_local_order_id, _strategy_reason, _strategy_result.details,
+            )
+            _terminalize_breach_failure(
+                _strategy_reason,
+                cleanup_action="expire",
+                meta_patch={
+                    "entry_strategy_truth": {
+                        "ok": False,
+                        "reason_code": _strategy_reason,
+                        **(dict(_strategy_result.details or {})),
+                    },
+                    "metadata_validation_status": "BLOCKED",
+                    "metadata_validation_reason": _strategy_reason,
+                },
+                context_notes=_strategy_reason,
+                funnel_key="entry_strategy_truth_blocked",
+            )
+            return
+
         # ── Intelligence PR 1: dispatch immediately after plan is confirmed ──────
         # Fires before any post-plan terminal return (rejections, expiry, submit).
         # _ensure_intelligence_dispatched is idempotent — retries do not re-dispatch.

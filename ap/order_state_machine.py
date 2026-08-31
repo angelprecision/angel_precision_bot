@@ -5453,6 +5453,63 @@ class APOrderStateMachine:
                 "error": "MATERIALIZATION_DURABLE_STATE_MISMATCH:stale_read",
             }
 
+        try:
+            from ap.entry_metadata_guard import (
+                ENTRY_GEOMETRY_CONFLICT,
+                ENTRY_GEOMETRY_CHANGED_AFTER_ARM,
+                validate_entry_strategy_truth,
+            )
+            _strategy_truth = validate_entry_strategy_truth(
+                order=latest,
+                plan=plan,
+                client_id=self.client_id,
+                execution_mode=latest.get("execution_mode"),
+            )
+        except Exception as _strategy_exc:
+            _strategy_truth = None
+            error_msg = f"ENTRY_STRATEGY_TRUTH_VALIDATOR_ERROR:{_strategy_exc}"
+        if _strategy_truth is not None and not _strategy_truth.ok:
+            error_msg = str(_strategy_truth.reason or "ENTRY_STRATEGY_TRUTH_INVALID")
+            if plan is not None and error_msg == ENTRY_GEOMETRY_CONFLICT:
+                error_msg = ENTRY_GEOMETRY_CHANGED_AFTER_ARM
+            diagnostics = {
+                "entry_strategy_truth": {
+                    "ok": False,
+                    "reason_code": error_msg,
+                    **(_strategy_truth.details or {}),
+                },
+                "metadata_validation_status": "BLOCKED",
+                "metadata_validation_reason": error_msg,
+            }
+            terminalized = self.terminalize_deferred_breach(
+                local_order_id,
+                reason_code=error_msg,
+                terminal_status="ERROR",
+                diagnostics=diagnostics,
+            )
+            if not terminalized:
+                self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": latest.get("broker_order_id"),
+                "status": OrderStatus.ERROR,
+                "error": error_msg,
+                "strategy_truth_blocked": True,
+                "terminalized": bool(terminalized),
+                "details": _strategy_truth.details,
+            }
+        if _strategy_truth is None:
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": latest.get("broker_order_id"),
+                "status": OrderStatus.ERROR,
+                "error": error_msg,
+                "strategy_truth_blocked": True,
+            }
+
         base_url   = (getattr(broker, "base_url", None)
                       or getattr(getattr(broker, "cfg", None), "base_url", None)
                       or "https://sandbox.tradier.com")
