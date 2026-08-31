@@ -545,7 +545,7 @@ def test_postgres_recovery_reuses_canonical_filled_entry_identity(monkeypatch):
                     id, client_id, execution_mode, contract, kind, status,
                     filled_qty, fill_price, filled_ts, position_id, signal_id,
                     local_order_id, broker_order_id, meta
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     "entry-order-1", client, "live", contract, "ENTRY", "PARTIAL_FILL",
@@ -680,12 +680,10 @@ def test_upsert_fails_closed_on_contradictory_historical_aliases(monkeypatch):
                 """
                 INSERT INTO orders (
                     id, client_id, execution_mode, contract, kind, status,
-                    filled_qty, fill_price, filled_ts, position_id,
-                    underlying_entry, meta
+                    filled_qty, fill_price, filled_ts, position_id, meta
                 ) VALUES (
                     %s, %s, %s, %s, 'ENTRY', 'FILLED',
-                    1, 1.30, %s, NULL,
-                    0, %s
+                    1, 1.30, %s, NULL, %s
                 )
                 """,
                 (
