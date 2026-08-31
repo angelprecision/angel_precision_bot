@@ -8,10 +8,8 @@ or retention of the exact owner with no broker POST.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -98,7 +96,6 @@ def _core_for(row: dict, *, mode: str | None = None):
     osm = MagicMock()
     osm.get_order.return_value = row
     osm.retain_broker_submit_owner_for_reconciliation.return_value = True
-    osm.release_broker_submit_intent_after_no_match.return_value = True
 
     broker = MagicMock()
     broker.list_orders.return_value = []
@@ -331,9 +328,7 @@ def test_actual_tradier_complete_pages_without_tag_retain_owner_after_page_two()
     assert result["reason_code"] == "RECONCILE_BROKER_NO_MATCH_OBSERVED"
     assert result["broker_truth"] == "NO_MATCH_OBSERVED"
     assert result["broker_submit_owner_retained"] is True
-    assert result.get("broker_submit_fence_released") is not True
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.session.post.assert_not_called()
     assert [
@@ -357,7 +352,6 @@ def test_actual_tradier_query_error_is_unknown_and_never_not_found():
     assert result["disposition"] == "RECONCILE_PENDING"
     assert result["reason_code"].startswith("RECONCILE_BROKER_QUERY_FAILED")
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.session.post.assert_not_called()
 
@@ -378,7 +372,6 @@ def test_actual_tradier_malformed_page_is_unknown_and_never_not_found():
     assert result["broker_truth"] == "UNKNOWN"
     assert result["reason_code"].startswith("RECONCILE_BROKER_QUERY_FAILED")
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.session.post.assert_not_called()
 
@@ -415,7 +408,6 @@ def test_actual_tradier_pagination_ceiling_is_unknown_and_never_not_found(
     assert result["broker_truth"] == "UNKNOWN"
     assert result["reason_code"].startswith("RECONCILE_BROKER_QUERY_FAILED")
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.session.post.assert_not_called()
     assert [
@@ -429,7 +421,7 @@ def test_actual_tradier_pagination_ceiling_is_unknown_and_never_not_found(
     [timedelta(seconds=31), timedelta(minutes=10)],
     ids=["31_seconds_old", "10_minutes_old"],
 )
-def test_actual_tradier_complete_empty_result_never_releases_or_posts(intent_age):
+def test_actual_tradier_complete_empty_result_retains_and_never_posts(intent_age):
     """Age never turns a clean empty query into permission for another POST."""
     row = _intent_row(
         intent_at=(datetime.now(timezone.utc) - intent_age).isoformat()
@@ -447,9 +439,7 @@ def test_actual_tradier_complete_empty_result_never_releases_or_posts(intent_age
     assert result["reason_code"] == "RECONCILE_BROKER_NO_MATCH_OBSERVED"
     assert result["broker_truth"] == "NO_MATCH_OBSERVED"
     assert result["broker_submit_owner_retained"] is True
-    assert result.get("broker_submit_fence_released") is not True
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.session.post.assert_not_called()
     broker.session.get.assert_called_once()
@@ -497,7 +487,6 @@ def test_repeated_empty_queries_retain_owner_until_late_page_two_tag():
     assert found["broker_truth"] == "FOUND"
     assert found["broker_order_id"] == "TR-LATE-PAGE-2"
     assert osm.retain_broker_submit_owner_for_reconciliation.call_count == 2
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     osm.transition.assert_called_once()
     broker.session.post.assert_not_called()
@@ -567,7 +556,7 @@ def test_exact_tag_found_is_adopted_once_and_never_posted():
     assert broker.list_orders.call_count == 1
 
 
-def test_no_match_observed_retains_owner_without_release_or_post():
+def test_no_match_observed_retains_owner_without_resume_or_post():
     row = _intent_row(intent_at=datetime.now(timezone.utc).isoformat())
     core, osm, broker = _core_for(row)
     broker.list_orders.return_value = []
@@ -580,7 +569,6 @@ def test_no_match_observed_retains_owner_without_release_or_post():
     assert result["broker_submit_owner_retained"] is True
     assert result["next_retry_at"]
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.place_order.assert_not_called()
 
@@ -600,7 +588,6 @@ def test_no_match_observed_after_any_age_remains_fail_closed_without_resume():
     assert result["broker_submit_owner_retained"] is True
     assert result["next_retry_at"]
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     core.submit_existing_entry.assert_not_called()
     broker.place_order.assert_not_called()
@@ -633,7 +620,6 @@ def test_unknown_or_malformed_broker_truth_is_retryable_and_fail_closed(
     assert result["reconciliation_stage"] == "broker_order_query"
     assert result["next_retry_at"]
     assert osm.retain_broker_submit_owner_for_reconciliation.call_count == 1
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     broker.place_order.assert_not_called()
 
 
@@ -664,7 +650,6 @@ def test_malformed_unrelated_tag_is_unknown_not_proven_no_match():
         "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:invalid tag"
     )
     assert result["broker_truth"] == "UNKNOWN"
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.place_order.assert_not_called()
 
@@ -688,7 +673,6 @@ def test_submit_identity_mismatch_fails_closed_before_broker_query(field):
     )
     broker.list_orders.assert_not_called()
     osm.transition.assert_not_called()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
 
 
 def test_paper_row_cannot_be_adopted_from_live_tradier():
@@ -726,7 +710,7 @@ def test_tradier_order_adapter_propagates_malformed_truth(payload):
         TradierBroker.list_orders(adapter)
 
 
-def test_concurrent_reconcilers_never_release_or_duplicate_post():
+def test_concurrent_reconcilers_retain_owner_without_duplicate_post():
     """Concurrent clean misses retain one durable owner and make zero POSTs."""
     row = _intent_row(
         intent_at=(datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
@@ -776,7 +760,6 @@ def test_concurrent_reconcilers_never_release_or_duplicate_post():
         assert result["broker_truth"] == "NO_MATCH_OBSERVED"
         assert result["broker_submit_owner_retained"] is True
     assert osm.retain_broker_submit_owner_for_reconciliation.call_count == 2
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.session.post.assert_not_called()
     assert broker.session.get.call_count == 2
@@ -930,14 +913,12 @@ def test_order_monitor_stale_pending_trigger_routes_broker_handoff_end_to_end(
         datetime.now(timezone.utc) - timedelta(minutes=2)
     ).isoformat()
     broker.list_orders.return_value = []
-    osm.release_broker_submit_intent_after_no_match.reset_mock()
     core.resume_deferred_broker_ready_order.reset_mock()
     osm.retain_broker_submit_owner_for_reconciliation.reset_mock()
     monitor._check_entry_orders()
 
     assert reconcile.call_count == 3
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    osm.release_broker_submit_intent_after_no_match.assert_not_called()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.place_order.assert_not_called()
     core.submit_existing_entry.assert_not_called()
@@ -1189,173 +1170,8 @@ def test_recovery_malformed_meta_does_not_fall_through_to_resume(monkeypatch):
     assert "recovery_submit_meta_unreadable:malformed-meta-1" in result["errors"]
 
 
-def test_real_postgres_release_cas_and_transition_are_single_writer(monkeypatch):
-    """Disposable PostgreSQL fixture proves one release and one transition."""
-    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
-    if not database_url:
-        pytest.skip("disposable PostgreSQL URL not configured")
-    psycopg2 = pytest.importorskip("psycopg2")
-    extras = pytest.importorskip("psycopg2.extras")
-
-    schema = f"p0_submit_{os.urandom(8).hex()}"
-
-    class _Wrapper:
-        def __init__(self, connection, cursor):
-            self.connection = connection
-            self.cursor = cursor
-
-        @property
-        def rowcount(self):
-            return self.cursor.rowcount
-
-        def execute(self, sql, params=None):
-            self.cursor.execute(sql, params)
-            return self
-
-        def fetchone(self):
-            return self.cursor.fetchone()
-
-        def fetchall(self):
-            return self.cursor.fetchall()
-
-    @contextmanager
-    def _pg_conn():
-        connection = psycopg2.connect(database_url)
-        cursor = connection.cursor(cursor_factory=extras.RealDictCursor)
-        try:
-            cursor.execute(f'SET search_path TO "{schema}"')
-            yield _Wrapper(connection, cursor)
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            cursor.close()
-            connection.close()
-
-    admin = psycopg2.connect(database_url)
-    admin.autocommit = True
-    try:
-        with admin.cursor() as cursor:
-            cursor.execute(f'CREATE SCHEMA "{schema}"')
-            cursor.execute(
-                f'''
-                CREATE TABLE "{schema}".orders (
-                    local_order_id TEXT PRIMARY KEY,
-                    client_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    execution_mode TEXT NOT NULL,
-                    broker_order_id TEXT,
-                    submitted_ts TIMESTAMPTZ,
-                    contract TEXT,
-                    symbol TEXT,
-                    qty INTEGER,
-                    limit_price NUMERIC,
-                    meta JSONB,
-                    filled_qty INTEGER,
-                    fill_price NUMERIC,
-                    position_id TEXT,
-                    signal_id TEXT,
-                    canonical_signal_id TEXT,
-                    last_error TEXT,
-                    updated_ts TIMESTAMPTZ DEFAULT NOW()
-                )
-                '''
-            )
-
-        method_globals = APOrderStateMachine.release_broker_submit_intent_after_no_match.__globals__
-        monkeypatch.setitem(method_globals, "conn", _pg_conn)
-        monkeypatch.setitem(method_globals, "run_with_retry", lambda fn, *args, **kwargs: fn())
-
-        local_order_id = _CSCO_ID
-        row = _intent_row(
-            local_order_id=local_order_id,
-            symbol="CSCO",
-            contract="CSCO260904C00075000",
-            intent_at=(datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
-        )
-        key = row["meta"]["broker_submit_key"]
-        payload_hash = row["meta"]["broker_submit_payload_hash"]
-        with _pg_conn() as connection:
-            connection.execute(
-                """
-                INSERT INTO orders (
-                    local_order_id, client_id, kind, status, execution_mode,
-                    contract, symbol, qty, limit_price, meta
-                ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER','live',%s,%s,%s,%s,%s::jsonb)
-                """,
-                (
-                    local_order_id,
-                    _CLIENT,
-                    row["contract"],
-                    row["symbol"],
-                    row["qty"],
-                    row["limit_price"],
-                    json.dumps(row["meta"]),
-                ),
-            )
-
-        osm = APOrderStateMachine(_CLIENT)
-        osm._notify_opportunity_ledger = lambda **_kwargs: None
-        osm._handle_exit_engine_hooks = lambda **_kwargs: None
-        args = {
-            "broker_submit_key": key,
-            "submit_intent_at": row["meta"]["submit_intent_at"],
-            "payload_hash": payload_hash,
-            "generation": row["meta"]["materialization_generation"],
-            "execution_mode": "live",
-            "contract": row["contract"],
-            "qty": row["qty"],
-            "limit_price": row["limit_price"],
-            "reason": "RECONCILE_BROKER_NO_MATCH_SETTLED",
-        }
-        results = []
-
-        def _release():
-            results.append(
-                osm.release_broker_submit_intent_after_no_match(
-                    local_order_id,
-                    **args,
-                )
-            )
-
-        threads = [threading.Thread(target=_release) for _ in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=10)
-
-        assert sorted(results) == [False, True]
-        with _pg_conn() as connection:
-            connection.execute(
-                "SELECT status, broker_order_id, meta FROM orders WHERE local_order_id=%s",
-                (local_order_id,),
-            )
-            released = dict(connection.fetchone())
-        assert released["status"] == "PENDING_TRIGGER"
-        assert released["broker_order_id"] is None
-        assert released["meta"]["lifecycle_state"] == "BROKER_READY"
-        assert released["meta"].get("broker_submit_key") is None
-        assert released["meta"].get("current_owner") is None
-        assert released["meta"]["broker_submit_reconciliation_key"] == key
-
-        assert osm.transition(
-            local_order_id,
-            "SUBMITTED",
-            broker_order_id="TR-CSCO-1",
-            submitted_ts=datetime.now(timezone.utc).isoformat(),
-        )
-        with _pg_conn() as connection:
-            connection.execute(
-                "SELECT status, broker_order_id, submitted_ts FROM orders WHERE local_order_id=%s",
-                (local_order_id,),
-            )
-            submitted = dict(connection.fetchone())
-        assert submitted["status"] == "SUBMITTED"
-        assert submitted["broker_order_id"] == "TR-CSCO-1"
-        assert submitted["submitted_ts"] is not None
-    finally:
-        with admin.cursor() as cursor:
-            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        admin.close()
+def test_no_match_release_mutation_is_not_exposed():
+    assert not hasattr(
+        APOrderStateMachine,
+        "release_broker_submit_intent_after_no_match",
+    )

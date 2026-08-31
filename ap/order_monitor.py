@@ -1751,8 +1751,8 @@ class APOrderMonitor:
 
         This method deliberately has no watcher or cleanup fallback.  The
         durable ``broker_submit:*`` owner remains on the row if the execution
-        core is unavailable or the broker truth is unknown; only the canonical
-        reconciler may adopt, release, or resume that ownership.
+        core is unavailable or the broker truth is unknown; the canonical
+        reconciler may only adopt an exact broker match or retain that ownership.
         """
         runtime_mode = str(getattr(self, "client_mode", "") or "").strip().lower()
         try:

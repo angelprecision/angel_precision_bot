@@ -139,7 +139,6 @@ def test_old_submit_intent_with_empty_broker_list_stays_fail_closed():
     assert result["reason_code"] == "RECONCILE_BROKER_NO_MATCH_OBSERVED"
     assert result["broker_truth"] == "NO_MATCH_OBSERVED"
     core.order_state_machine.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    core.order_state_machine.release_broker_submit_intent_after_no_match.assert_not_called()
     core.order_state_machine.update_order_meta.assert_not_called()
 
 

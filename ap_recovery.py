@@ -2271,38 +2271,6 @@ class APStartupRecovery:
                 )
                 return True
 
-            if _reconciliation.get("broker_submit_fence_released"):
-                # The broker query proved NOT_FOUND and the exact submit-intent
-                # CAS was retired.  It is now safe to assign the ordinary
-                # recovery owner if the canonical continuation could not make
-                # a durable progress decision.  This branch is never reached
-                # for an existing broker_submit:* owner (handled above).
-                _fenced_fn = getattr(
-                    self.osm, "retain_recovery_ownership_if_no_watcher", None
-                )
-                if callable(_fenced_fn):
-                    try:
-                        ok = bool(_fenced_fn(
-                            loid,
-                            recovery_owner=f"recovery_scheduler:{self.client_id}",
-                            reason=reason,
-                            recovery_retention_mode=recovery_mode,
-                        ))
-                    except Exception as exc:
-                        log.critical(
-                            "[%s] RECOVERY_POST_NO_MATCH_RETENTION_RAISED "
-                            "local_order_id=%s reason=%s exc=%s",
-                            self.client_id,
-                            loid,
-                            reason,
-                            exc,
-                        )
-                        return False
-                    if ok:
-                        return True
-                # Fall through to the compatibility path only when the exact
-                # fenced helper is absent; no broker-submit owner exists here.
-
             # PR #421 final amendment (§5): prefer the fenced OSM write —
             # it refuses (returns False, no-op) if committed watcher
             # authority (current_owner/watcher_token/watcher_generation)
@@ -2589,22 +2557,6 @@ class APStartupRecovery:
                     # The canonical reconciler/resume path already committed
                     # the durable outcome.  Do not apply a second recovery
                     # mutation in this pass.
-                    continue
-                if rec_disposition == "RETRY_WAIT":
-                    # A separately proven canonical retry may return a normal
-                    # retry result.  Preserve an explicitly released fence
-                    # through the exact recovery owner without resubmitting
-                    # here.  Ambiguous broker-list absence never returns this
-                    # branch: it remains broker_submit:* owned.
-                    if rec.get("broker_submit_fence_released"):
-                        _retain_recovery_ownership(
-                            local_order_id,
-                            reason=str(
-                                rec.get("reason_code")
-                                or "canonical_resume_retry_wait"
-                            ),
-                            reconciliation=rec,
-                        )
                     continue
                 if rec_disposition == "NOT_IN_CRASH_WINDOW":
                     # This block was entered with durable submit_intent_at.
