@@ -4515,13 +4515,20 @@ class APExitEngine:
         ).strip().lower()
         _runner_client = str(self._email or "").strip().lower()
         _runner_mode = str(self._resolved_execution_mode() or "").strip().lower()
-        # Runner-fenced identity: incoming must match this engine's exact
-        # client + mode.  Blank/unknown incoming mode cannot converge.
+        # PR #557 amendment (identity fence hardening) —
+        # STRICT client + mode equality.  Blank client identity must fail
+        # closed: a degraded owner without a proven client id cannot be
+        # transitioned to durable ownership.  LIVE/PAPER isolation is
+        # exact — both sides must be a KNOWN mode and equal.
         if _incoming_mode not in {"live", "paper"}:
             return False
-        if _incoming_client and _incoming_client != _runner_client:
+        if _runner_mode not in {"live", "paper"}:
             return False
         if _incoming_mode != _runner_mode:
+            return False
+        if not _runner_client:
+            return False
+        if _incoming_client != _runner_client:
             return False
 
         with self._lock:
@@ -4539,7 +4546,9 @@ class APExitEngine:
                 _p_mode = str(
                     getattr(p, "execution_mode", "") or ""
                 ).strip().lower()
-                if _p_client and _p_client != _runner_client:
+                # STRICT client + mode equality on the existing degraded
+                # owner as well: blank client fails closed.
+                if not _p_client or _p_client != _runner_client:
                     continue
                 if _p_mode not in {"live", "paper"}:
                     continue
@@ -4581,6 +4590,42 @@ class APExitEngine:
                     except Exception:
                         pass
 
+            # Clear degraded flag on incoming BEFORE invariant check so
+            # the final combined object matches what will be installed.
+            try:
+                incoming_pos.broker_repair_degraded = False
+                incoming_pos.brokerrepairdegraded = False
+            except Exception:
+                pass
+
+            # PR #557 amendment (Blocker 2) — validate the final combined
+            # incoming object BEFORE swapping ownership.  If the merged
+            # position (durable identity + preserved live state) does not
+            # pass position invariants, retain the existing degraded owner
+            # and abandon this convergence attempt.  Durable recovery will
+            # retry on a later cycle; the position remains exit-visible
+            # under the existing degraded owner.
+            try:
+                self._assert_position_invariants(
+                    incoming_pos, "degraded_to_durable_convergence"
+                )
+            except Exception as _inv_err:
+                # Restore incoming's degraded flag to False (it never took
+                # ownership; leave it in a consistent state for the caller
+                # to discard).  Do NOT touch the existing degraded owner.
+                log.error(
+                    "[exit_eng] EXIT_BROKER_DEGRADED_OWNER_CONVERGENCE_ABORTED "
+                    "client=%s mode=%s contract=%s "
+                    "old_position_id=%s incoming_position_id=%s "
+                    "reason=invariant_failed error=%s — "
+                    "retaining existing degraded owner; durable recovery "
+                    "will retry on a later cycle",
+                    self._email, _runner_mode, _sym,
+                    _old_id, _incoming_id, _inv_err,
+                )
+                return False
+
+            # Invariants pass — perform the ownership swap.
             # Mark the degraded owner closed so any concurrent reader
             # ignores it, then evict from indices.
             try:
@@ -4594,13 +4639,6 @@ class APExitEngine:
                 self._positions.remove(existing_degraded)
             if _old_id and self._positions_by_id.get(_old_id) is existing_degraded:
                 self._positions_by_id.pop(_old_id, None)
-
-            # Clear degraded flag on incoming; keep provisional as-supplied.
-            try:
-                incoming_pos.broker_repair_degraded = False
-                incoming_pos.brokerrepairdegraded = False
-            except Exception:
-                pass
 
             # Install incoming as the sole active owner for this OCC.
             self._positions.append(incoming_pos)

@@ -199,6 +199,7 @@ jobs:
             tests/test_p0_exit_closed_guard_and_circuit_breaker.py \
             tests/test_p0_unknown_execution_mode_fail_closed.py \
             tests/test_p0_exit_engine_broker_truth.py \
+            tests/test_p0_pr516_amend_degraded_retry_convergence.py \
             tests/test_p0_live_executable_bid_pnl.py \
             tests/test_soft_exit_executable_truth.py \
             tests/test_p0_canonical_exit_fill_truth.py \

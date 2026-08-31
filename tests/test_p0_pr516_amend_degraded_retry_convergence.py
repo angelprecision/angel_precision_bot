@@ -360,6 +360,34 @@ def test_pr557_amend_retry_failure_retains_existing_degraded_no_new_uuid():
 # Behavioural — caller-boundary through _check_all_positions
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _stub_check_all_positions_collaborators(eng):
+    """Fully stub the deterministic collaborators that _check_all_positions
+    depends on outside the precheck path we are exercising.  This lets the
+    caller-boundary test fail on REAL lifecycle regressions rather than
+    tripping on unrelated missing wiring."""
+    from datetime import datetime, timezone
+
+    eng._emit_exit_event = lambda *a, **kw: None
+    eng.on_exit = None
+    eng.on_scale = None
+    # Quote monitor / quote-arrived events are optional collaborators used
+    # by the exit-loop timing logic; stub as no-ops if the loop consults them.
+    eng.quote_monitor = None
+    import threading as _t
+    eng._quote_arrived_event = _t.Event()
+    eng._flattening = _t.Event()
+    # Kill switch and master control — precheck+loop consult these.
+    eng._kill_switch_fn = None
+    eng.master_control = None
+    # DB persistence throttle plumbing referenced by the exit loop.
+    if not hasattr(eng, "_last_db_persist_ts"):
+        eng._last_db_persist_ts = {}
+    # Position manager reference (unused when None but read defensively).
+    eng._position_manager = None
+    # Time helper stubs — no clock drift into rule evaluation.
+    eng._now_utc = lambda: datetime.now(timezone.utc)
+
+
 @_skip_if_no_mod
 def test_pr557_amend_caller_boundary_check_all_positions_two_cycles():
     """
@@ -367,9 +395,14 @@ def test_pr557_amend_caller_boundary_check_all_positions_two_cycles():
 
     CYCLE 1: broker OPEN + durable repair unavailable → position is still
              an exit-visible owner after _check_all_positions returns.
-    CYCLE 2: durable identity available → same position now under durable
+    CYCLE 2: durable identity available → same position under durable
              identity, position never disappeared from exit ownership,
-             no ENTRY submit, no broad CANCEL.
+             no ENTRY submit, no broad CANCEL, exactly one active owner.
+
+    PR #557 amendment (Blocker 3): production-path failures inside
+    _check_all_positions() MUST fail the test.  Only setup-time /
+    import-time prerequisites may cause a skip (via @_skip_if_no_mod).
+    Do NOT wrap the caller invocation in try/except-skip.
     """
     _stub_ap_db()
     eng = _new_engine()
@@ -382,38 +415,29 @@ def test_pr557_amend_caller_boundary_check_all_positions_two_cycles():
     }
     eng._underlying_from_occ = lambda _sym: _UNDERLYING
     eng._parse_occ_side = lambda _sym: "CALL"
-
-    # Stub the post-precheck portions of _check_all_positions to no-ops so
-    # this test focuses on the caller boundary and does not depend on the
-    # full exit rule evaluation harness.
-    eng._emit_exit_event = lambda *a, **kw: None
-    eng.on_exit = None
-    eng.on_scale = None
+    _stub_check_all_positions_collaborators(eng)
 
     # Cycle 1 — durable repair fails
     eng._load_db_position_row = lambda sym: None
     eng._upsert_broker_position_to_db = MagicMock(
         side_effect=RuntimeError("repair unavailable")
     )
-    try:
-        eng._check_all_positions()
-    except Exception as e:
-        # If the exit loop trips on unstubbed collaborators (quote monitor,
-        # exit engine timers, etc.), that is unrelated to the precheck
-        # convergence being tested here. Assert precheck-side outcomes.
-        pytest.skip(
-            f"caller-boundary skipped: _check_all_positions requires more "
-            f"env than we can construct here ({type(e).__name__}: {e}); "
-            f"precheck path is covered by the three-cycle test above"
-        )
+    # Real invocation — any unexpected runtime error is a FAILURE, not a skip.
+    eng._check_all_positions()
 
     active1 = _active_for_sym(eng, _CONTRACT)
-    assert len(active1) == 1, "position must remain exit-visible after cycle 1"
+    assert len(active1) == 1, (
+        "position must remain exit-visible after _check_all_positions cycle 1"
+    )
     degraded_id_c1 = str(getattr(active1[0], "position_id", "") or "")
-    assert getattr(active1[0], "broker_repair_degraded", False) is True
+    assert getattr(active1[0], "broker_repair_degraded", False) is True, (
+        "cycle 1 owner must carry broker_repair_degraded=True"
+    )
+    assert str(getattr(active1[0], "option_symbol", "")).upper() == _CONTRACT
+    assert str(getattr(active1[0], "execution_mode", "")).strip().lower() == _MODE
     _assert_no_broker_writes(broker, context="cycle 1 _check_all_positions")
 
-    # Cycle 2 — durable identity available
+    # Cycle 2 — durable identity available via upsert + row load
     provisional_uuid = f"pos-provisional-{uuid.uuid4()}"
     provisional_row = {
         "id": provisional_uuid,
@@ -437,20 +461,22 @@ def test_pr557_amend_caller_boundary_check_all_positions_two_cycles():
     eng._load_db_position_row = lambda sym: (
         provisional_row if sym.upper() == _CONTRACT else None
     )
-    try:
-        eng._check_all_positions()
-    except Exception as e:
-        pytest.skip(
-            f"caller-boundary skipped on cycle 2: {type(e).__name__}: {e}"
-        )
+    # Real invocation — any unexpected runtime error is a FAILURE, not a skip.
+    eng._check_all_positions()
 
     active2 = _active_for_sym(eng, _CONTRACT)
-    assert len(active2) == 1, "cycle 2 must leave exactly one owner"
+    assert len(active2) == 1, (
+        f"cycle 2 must leave exactly one owner; got {len(active2)}"
+    )
     surviving = active2[0]
     assert str(getattr(surviving, "position_id", "")).strip() != degraded_id_c1, (
-        "convergence did not replace the degraded owner"
+        "convergence failed: degraded id still active after cycle 2"
     )
-    assert getattr(surviving, "broker_repair_degraded", False) is False
+    assert getattr(surviving, "broker_repair_degraded", False) is False, (
+        "cycle 2 owner must have broker_repair_degraded=False"
+    )
+    assert str(getattr(surviving, "option_symbol", "")).upper() == _CONTRACT
+    assert str(getattr(surviving, "execution_mode", "")).strip().lower() == _MODE
     _assert_no_broker_writes(broker, context="cycle 2 _check_all_positions")
 
 
@@ -537,4 +563,191 @@ def test_pr557_amend_precheck_return_contract_documented():
     assert "EXIT_BROKER_PRECHECK_UNOWNED_POSITIONS" in src, (
         "return-contract log marker missing — degraded-owner install must "
         "not be reported as unowned"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Failure cases — fencing must fail closed; invariant failure must be safe
+# ─────────────────────────────────────────────────────────────────────────────
+
+@_skip_if_no_mod
+def test_pr557_amend_converger_fails_closed_on_wrong_client():
+    """Wrong client_id on incoming → converger returns False, degraded retained."""
+    _stub_ap_db()
+    eng = _new_engine()
+    broker = _broker_mock()
+    eng.broker = broker
+    eng._quote_broker = broker
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": _ENTRY_PX, "bid": _ENTRY_PX, "ask": _ENTRY_PX,
+        "mid": _ENTRY_PX, "last": _ENTRY_PX,
+    }
+    eng._underlying_from_occ = lambda _sym: _UNDERLYING
+    eng._parse_occ_side = lambda _sym: "CALL"
+    eng._load_db_position_row = lambda sym: None
+    eng._upsert_broker_position_to_db = MagicMock(
+        side_effect=RuntimeError("cycle1: unavailable")
+    )
+    eng._broker_position_precheck()
+    degraded = _active_for_sym(eng, _CONTRACT)[0]
+
+    # Craft an incoming pos with a foreign client_id and try to converge.
+    from types import SimpleNamespace
+    incoming = SimpleNamespace(
+        position_id=f"pos-foreign-{uuid.uuid4()}",
+        option_symbol=_CONTRACT,
+        client_id="not_the_runner@example.com",  # wrong client
+        execution_mode=_MODE,
+        quantity=_BROKER_QTY, quantity_remaining=_BROKER_QTY,
+        pending_exit_qty=0, pending_exit_filled_qty=0,
+        broker_repair_degraded=False, brokerrepairdegraded=False,
+        broker_repair_provisional=True, closed=False,
+    )
+    result = eng._converge_degraded_owner_to_durable(_CONTRACT, incoming)
+    assert result is False, "wrong client_id must fail closed"
+    # Degraded owner must still be active with its original id
+    still_degraded = _active_for_sym(eng, _CONTRACT)
+    assert len(still_degraded) == 1
+    assert str(getattr(still_degraded[0], "position_id", "")).strip() == \
+        str(getattr(degraded, "position_id", "")).strip()
+
+
+@_skip_if_no_mod
+def test_pr557_amend_converger_fails_closed_on_blank_client():
+    """Blank incoming client_id → converger returns False (fail closed)."""
+    _stub_ap_db()
+    eng = _new_engine()
+    broker = _broker_mock()
+    eng.broker = broker
+    eng._quote_broker = broker
+    eng._fetch_broker_quote = lambda _sym: {"mark": _ENTRY_PX, "bid": _ENTRY_PX,
+                                             "ask": _ENTRY_PX, "mid": _ENTRY_PX,
+                                             "last": _ENTRY_PX}
+    eng._underlying_from_occ = lambda _sym: _UNDERLYING
+    eng._parse_occ_side = lambda _sym: "CALL"
+    eng._load_db_position_row = lambda sym: None
+    eng._upsert_broker_position_to_db = MagicMock(side_effect=RuntimeError("unav"))
+    eng._broker_position_precheck()
+
+    from types import SimpleNamespace
+    incoming = SimpleNamespace(
+        position_id=f"pos-blank-{uuid.uuid4()}",
+        option_symbol=_CONTRACT,
+        client_id="",  # blank — MUST fail closed
+        execution_mode=_MODE,
+        quantity=_BROKER_QTY, quantity_remaining=_BROKER_QTY,
+        pending_exit_qty=0, pending_exit_filled_qty=0,
+        broker_repair_degraded=False, brokerrepairdegraded=False,
+        broker_repair_provisional=True, closed=False,
+    )
+    assert eng._converge_degraded_owner_to_durable(_CONTRACT, incoming) is False
+
+
+@_skip_if_no_mod
+def test_pr557_amend_converger_fails_closed_on_mode_mismatch():
+    """LIVE/PAPER mismatch → converger returns False (fail closed)."""
+    _stub_ap_db()
+    eng = _new_engine()
+    broker = _broker_mock()
+    eng.broker = broker
+    eng._quote_broker = broker
+    eng._fetch_broker_quote = lambda _sym: {"mark": _ENTRY_PX, "bid": _ENTRY_PX,
+                                             "ask": _ENTRY_PX, "mid": _ENTRY_PX,
+                                             "last": _ENTRY_PX}
+    eng._underlying_from_occ = lambda _sym: _UNDERLYING
+    eng._parse_occ_side = lambda _sym: "CALL"
+    eng._load_db_position_row = lambda sym: None
+    eng._upsert_broker_position_to_db = MagicMock(side_effect=RuntimeError("unav"))
+    eng._broker_position_precheck()
+
+    from types import SimpleNamespace
+    incoming = SimpleNamespace(
+        position_id=f"pos-modemis-{uuid.uuid4()}",
+        option_symbol=_CONTRACT,
+        client_id=_CLIENT,
+        execution_mode="paper",  # engine is live; must not cross
+        quantity=_BROKER_QTY, quantity_remaining=_BROKER_QTY,
+        pending_exit_qty=0, pending_exit_filled_qty=0,
+        broker_repair_degraded=False, brokerrepairdegraded=False,
+        broker_repair_provisional=True, closed=False,
+    )
+    assert eng._converge_degraded_owner_to_durable(_CONTRACT, incoming) is False
+
+
+@_skip_if_no_mod
+def test_pr557_amend_converger_fails_closed_on_invariant_failure():
+    """Invariant failure on the merged incoming object → converger returns
+    False; existing degraded owner is retained; no ownership swap happened."""
+    _stub_ap_db()
+    eng = _new_engine()
+    broker = _broker_mock()
+    eng.broker = broker
+    eng._quote_broker = broker
+    eng._fetch_broker_quote = lambda _sym: {"mark": _ENTRY_PX, "bid": _ENTRY_PX,
+                                             "ask": _ENTRY_PX, "mid": _ENTRY_PX,
+                                             "last": _ENTRY_PX}
+    eng._underlying_from_occ = lambda _sym: _UNDERLYING
+    eng._parse_occ_side = lambda _sym: "CALL"
+    eng._load_db_position_row = lambda sym: None
+    eng._upsert_broker_position_to_db = MagicMock(side_effect=RuntimeError("unav"))
+    eng._broker_position_precheck()
+    degraded = _active_for_sym(eng, _CONTRACT)[0]
+    degraded_id = str(getattr(degraded, "position_id", "") or "")
+
+    # Craft an incoming that violates the invariant:
+    # quantity_remaining > quantity
+    from types import SimpleNamespace
+    incoming = SimpleNamespace(
+        position_id=f"pos-invalid-{uuid.uuid4()}",
+        option_symbol=_CONTRACT,
+        client_id=_CLIENT,
+        execution_mode=_MODE,
+        quantity=1, quantity_remaining=99,  # invariant violation
+        pending_exit_qty=0, pending_exit_filled_qty=0,
+        broker_repair_degraded=False, brokerrepairdegraded=False,
+        broker_repair_provisional=True, closed=False,
+    )
+    assert eng._converge_degraded_owner_to_durable(_CONTRACT, incoming) is False, (
+        "invariant failure must abort convergence"
+    )
+    # Existing degraded owner must remain active with its original id
+    still_degraded = _active_for_sym(eng, _CONTRACT)
+    assert len(still_degraded) == 1, (
+        "invariant-abort must leave exactly one owner (the existing degraded)"
+    )
+    assert str(getattr(still_degraded[0], "position_id", "")).strip() == degraded_id
+
+
+def test_pr557_amend_converger_enforces_strict_client_fence_source():
+    """Source-pattern anti-regression: converger must NOT use the truthy
+    idiom `if _incoming_client and _incoming_client != _runner_client`
+    which lets blank client bypass the fence."""
+    src = (_REPO / "ap_exit_engine.py").read_text()
+    # The converger block must contain strict equality patterns:
+    assert "if not _runner_client:" in src, (
+        "converger must fail closed when runner client is blank"
+    )
+    assert "if _incoming_client != _runner_client:" in src, (
+        "converger must use strict client equality (not truthy short-circuit)"
+    )
+
+
+def test_pr557_amend_converger_calls_invariant_check_before_swap():
+    """Source-pattern anti-regression: converger must call
+    _assert_position_invariants with the convergence context BEFORE the
+    ownership swap.  If reverted, a merged object could be installed
+    without passing invariants."""
+    src = (_REPO / "ap_exit_engine.py").read_text()
+    marker = '_assert_position_invariants('
+    conv_start = src.find("def _converge_degraded_owner_to_durable")
+    conv_end = src.find("\n    def ", conv_start + 1)
+    conv_body = src[conv_start:conv_end]
+    assert marker in conv_body, (
+        "converger must call _assert_position_invariants on the merged incoming"
+    )
+    assert '"degraded_to_durable_convergence"' in conv_body, (
+        "converger must pass the documented context string"
+    )
+    assert "EXIT_BROKER_DEGRADED_OWNER_CONVERGENCE_ABORTED" in conv_body, (
+        "converger must log the invariant-abort event"
     )
