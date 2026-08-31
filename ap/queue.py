@@ -3770,9 +3770,27 @@ def _dispatch(
                 _mark_job(job_id, "ERROR", error=f"submit_error:{submit_res.get('error')}")
                 return
 
+            _entry_status = str(submit_res.get("status") or "").upper()
             log.info(
-                "[%s] Order submitted immediately after broker acceptance | local=%s broker=%s",
-                ticker, local_order_id, submit_res.get("broker_order_id"),
+                "ENTRY_BROKER_ACCEPTED client_id=%s execution_mode=%s "
+                "signal_id=%s canonical_signal_id=%s local_order_id=%s "
+                "broker_order_id=%s status=%s symbol=%s contract=%s qty=%s "
+                "limit_price=%s source=queue_immediate",
+                client_id,
+                str(_execution_mode or "").lower(),
+                signal_id,
+                _canonical_signal_id,
+                local_order_id,
+                submit_res.get("broker_order_id"),
+                _entry_status,
+                ticker,
+                getattr(plan, "contract_symbol", ""),
+                getattr(plan, "contracts", ""),
+                getattr(plan, "limit_price", ""),
+            )
+            log.info(
+                "[%s] Entry OSM outcome after broker acceptance | local=%s broker=%s status=%s",
+                ticker, local_order_id, submit_res.get("broker_order_id"), _entry_status,
             )
             # Amendment §3: BROKER_SUBMITTED ledger update.
             try:

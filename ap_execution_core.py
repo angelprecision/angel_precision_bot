@@ -36,6 +36,7 @@ from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
+from ap_canonical_signal     import build_canonical_signal_id
 from ap.utils                import now_utc_iso
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
@@ -10156,16 +10157,50 @@ class APExecutionCore:
                     "decision_status": "submitted",
                     "context_notes": f"entry_submitted local={local_order_id} broker={broker_order_id}",
                 })
+            _entry_canonical_signal_id = build_canonical_signal_id(signal_id, sig)
+            _entry_log_client_id = str(
+                locals().get("_gate_client_id")
+                or _proof_client_id
+                or getattr(self, "client_id", None)
+                or getattr(self, "email", None)
+                or ""
+            )
+            _entry_log_execution_mode = str(
+                locals().get("_gate_exec_mode")
+                or _proof_execution_mode
+                or getattr(self, "execution_mode", None)
+                or getattr(self, "mode", None)
+                or ""
+            ).strip().lower()
+            _entry_log_status = str(submit_res.get("status") or "").upper()
+            log.info(
+                "ENTRY_BROKER_ACCEPTED client_id=%s execution_mode=%s "
+                "signal_id=%s canonical_signal_id=%s local_order_id=%s "
+                "broker_order_id=%s status=%s symbol=%s contract=%s qty=%s "
+                "limit_price=%s source=execution_core",
+                _entry_log_client_id,
+                _entry_log_execution_mode,
+                signal_id,
+                _entry_canonical_signal_id,
+                local_order_id,
+                broker_order_id,
+                _entry_log_status,
+                ticker,
+                approved_contract,
+                approved_qty,
+                submit_limit,
+            )
             # P1 ENTRY FIX (2026-05-21): tag the original ask submission as
             # entry_attempt=0 so the dashboard log-parser can bucket attempts.
             # entry_attempt=0 = original ask submit (this line)
             # entry_attempt=1 = ask+0.01 repeg (emitted by retry_engine.apply_repeg)
             # entry_attempt=2 = ask+0.02 repeg
             log.info(
-                "[%s] Entry submitted via OSM | entry_attempt=0 local=%s broker=%s %sx %s @ $%.2f",
+                "[%s] Entry OSM outcome | entry_attempt=0 local=%s broker=%s status=%s %sx %s @ $%.2f",
                 ticker,
                 local_order_id,
                 broker_order_id,
+                _entry_log_status,
                 approved_qty,
                 approved_contract,
                 submit_limit,

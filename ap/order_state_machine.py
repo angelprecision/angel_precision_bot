@@ -1306,6 +1306,28 @@ class APOrderStateMachine:
             f" broker={broker_order_id}" if broker_order_id else "",
             f" fill={filled_qty}@{fill_price}" if fill_price is not None else "",
         )
+        if kind.upper() == "ENTRY" and new_status == OrderStatus.FILLED:
+            _filled_broker_order_id = str(
+                broker_order_id or current.get("broker_order_id") or ""
+            )
+            _filled_qty = filled_qty if filled_qty is not None else current.get("filled_qty")
+            _filled_price = fill_price if fill_price is not None else current.get("fill_price")
+            log.info(
+                "ENTRY_BROKER_FILLED client_id=%s execution_mode=%s "
+                "signal_id=%s canonical_signal_id=%s local_order_id=%s "
+                "broker_order_id=%s status=FILLED symbol=%s contract=%s "
+                "filled_qty=%s fill_price=%s source=osm_transition",
+                self.client_id,
+                str(current.get("execution_mode") or ""),
+                str(current.get("signal_id") or ""),
+                str(current.get("canonical_signal_id") or ""),
+                local_order_id,
+                _filled_broker_order_id,
+                str(current.get("symbol") or ""),
+                str(current.get("contract") or ""),
+                _filled_qty if _filled_qty is not None else "",
+                _filled_price if _filled_price is not None else "",
+            )
         self._emit_transition_event(
             local_order_id=local_order_id, old_status=old_status, new_status=new_status,
             order=current,
