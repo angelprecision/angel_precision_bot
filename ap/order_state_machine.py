@@ -5076,6 +5076,23 @@ class APOrderStateMachine:
                 canonical_broker_submit_key(local_order_id),
             )
             if _recovered_bid:
+                # Every tag recovery means an ambiguous broker response left a
+                # submitted order without a persisted broker_order_id — the
+                # system was one bug away from a double submit. Page it.
+                try:
+                    from ap.critical_alerts import alert_critical
+
+                    alert_critical(
+                        "ENTRY_BROKER_TAG_RECOVERY",
+                        f"local_order_id={local_order_id} recovered "
+                        f"broker_order_id={_recovered_bid} via Tradier tag after "
+                        "an ambiguous broker response. Review the originating "
+                        "submit; this event firing is the double-submit defense "
+                        "doing its job and deserves inspection.",
+                        dedup_key=str(local_order_id),
+                    )
+                except Exception:
+                    pass
                 _attached = self._attach_broker_identity_if_missing(
                     local_order_id,
                     broker_order_id=_recovered_bid,

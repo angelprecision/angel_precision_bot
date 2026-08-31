@@ -428,6 +428,19 @@ def _claim_durable_decision_generation(
                     generation_key,
                     _CLAIM_LEASE_SECONDS,
                 )
+                try:
+                    from ap.critical_alerts import alert_critical
+
+                    alert_critical(
+                        "EXIT_DECISION_STALE_CLAIM_AMBIGUOUS",
+                        f"client={client_id} position={position_id} "
+                        f"generation_key={generation_key} — a stale exit claim was "
+                        "quarantined; this position may hold an ambiguous exit state "
+                        "and requires operator review.",
+                        dedup_key=f"{client_id}|{position_id}",
+                    )
+                except Exception:
+                    pass
                 return stale
 
             row = c.execute(
@@ -1933,6 +1946,20 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         exc,
                     )
                     if _durable_claim_outage_blocks_submit(self, pos):
+                        try:
+                            from ap.critical_alerts import alert_critical
+
+                            alert_critical(
+                                "EXIT_DECISION_GENERATION_READ_UNAVAILABLE",
+                                f"mode={mode} client={resolved_client} position={position_id} "
+                                f"action={getattr(decision, 'action', '')} error={exc} — "
+                                "LIVE exit decision SUPPRESSED because the durable "
+                                "generation could not be read. A live position may have "
+                                "no working exit path until this clears.",
+                                dedup_key=f"{resolved_client}|{position_id}",
+                            )
+                        except Exception:
+                            pass
                         return False
                     durable = None
                 if durable is not None:
@@ -1979,6 +2006,25 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             getattr(decision, "reason_code", ""),
                             exc,
                         )
+                        try:
+                            from ap.critical_alerts import alert_critical
+
+                            _live_blocked = _durable_claim_outage_blocks_submit(self, pos)
+                            alert_critical(
+                                "EXIT_DECISION_GENERATION_CLAIM_FAILED",
+                                f"mode={mode} client={resolved_client} position={position_id} "
+                                f"key={generation_key} error={exc} — "
+                                + (
+                                    "LIVE exit decision SUPPRESSED; a live position may "
+                                    "have no working exit path until this clears."
+                                    if _live_blocked
+                                    else "exit proceeding WITHOUT durable duplicate-exit "
+                                    "fencing (claim infrastructure unavailable)."
+                                ),
+                                dedup_key=f"{resolved_client}|{position_id}",
+                            )
+                        except Exception:
+                            pass
                         if _durable_claim_outage_blocks_submit(self, pos):
                             _retire_local_exit_intent_after_no_submit(
                                 self,
