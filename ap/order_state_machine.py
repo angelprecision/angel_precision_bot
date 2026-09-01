@@ -6215,10 +6215,11 @@ class APOrderStateMachine:
                     _stale_c.execute(
                         """
                         UPDATE positions
-                        SET status = 'CLOSED',
-                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
                         WHERE id = %s
                           AND client_id = %s
+                          AND LOWER(COALESCE(execution_mode, '')) = %s
+                          AND COALESCE(contract, '') = %s
                           AND status NOT IN ('CLOSED', 'EXPIRED')
                         """,
                         (
@@ -6233,10 +6234,18 @@ class APOrderStateMachine:
                             }),
                             str(position_id),
                             self.client_id,
+                            str(execution_mode or "").strip().lower(),
+                            str(contract or ""),
                         ),
                     )
             except Exception as exc:
-                log.warning("[%s] failed to mark flat broker-truth position %s stale: %s", self.client_id, position_id, exc)
+                log.warning(
+                    "[%s] failed to persist flat broker-truth reconciliation marker "
+                    "for position %s: %s",
+                    self.client_id,
+                    position_id,
+                    exc,
+                )
             return {
                 "ok": False,
                 "local_order_id": local_id,
@@ -6380,16 +6389,14 @@ class APOrderStateMachine:
 
             # ── P0 (PR #307): new reason codes from broker-truth override ────
             # SYNTHETIC_POSITION_STALE_BROKER_FLAT: broker says qty=0 but the
-            # local position thinks it's still open. Stop repeated exit firing
-            # by marking the local position stale so the exit engine stops
-            # evaluating it on every tick.
-            # ── Req 5: synthetic-flat block — ALL writes nested under the exact condition ──
-            # The broker-truth metadata update, warning log, and positions CLOSED
-            # mutation must execute ONLY when:
+            # local position thinks it's still open. Preserve diagnostics while
+            # leaving the row eligible for exact external-fill reconciliation.
+            # ── Req 5: synthetic-flat block — diagnostic write only ──
+            # The broker-truth metadata update and warning log execute only when:
             #   1. blocked_reason == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
             #   2. broker_truth.get("is_fresh_exact") is True
             #   3. int(broker_truth.get("broker_truth_open_qty") or 0) == 0
-            # Any other blocked reason must NOT mark the position CLOSED.
+            # Flatness alone must not close the position or zero its quantity.
             if blocked_reason == "SYNTHETIC_POSITION_STALE_BROKER_FLAT":
                 broker_truth_audit.update(
                     {
@@ -6407,12 +6414,12 @@ class APOrderStateMachine:
                 log.warning(
                     "[%s] SYNTHETIC_POSITION_STALE_BROKER_FLAT "
                     "position_id=%s contract=%s — broker is flat; "
-                    "marking local position stale to stop repeated exit firing",
+                    "retaining position for exact external-fill reconciliation",
                     self.client_id, position_id, contract,
                 )
-                # ── Triple-condition guard on the CLOSED write ────────────────
-                # Only mark the position CLOSED when all three are true.
-                # Missing, non-exact, or non-zero broker truth must not close it.
+                # ── Triple-condition guard on the diagnostic write ───────────
+                # Only persist reconciliation diagnostics when all three are true.
+                # Missing, non-exact, or non-zero broker truth must not mutate it.
                 if (
                     broker_truth.get("is_fresh_exact") is True
                     and int(broker_truth.get("broker_truth_open_qty") or 0) == 0
@@ -6422,10 +6429,11 @@ class APOrderStateMachine:
                             _stale_c.execute(
                                 """
                                 UPDATE positions
-                                SET status = 'CLOSED',
-                                    meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                                SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
                                 WHERE id = %s
                                   AND client_id = %s
+                                  AND LOWER(COALESCE(execution_mode, '')) = %s
+                                  AND COALESCE(contract, '') = %s
                                   AND status NOT IN ('CLOSED', 'EXPIRED')
                                 """,
                                 (
@@ -6440,15 +6448,19 @@ class APOrderStateMachine:
                                     }),
                                     str(position_id),
                                     self.client_id,
+                                    str(execution_mode or "").strip().lower(),
+                                    str(contract or ""),
                                 ),
                             )
                         log.info(
-                            "[%s] position %s marked CLOSED (broker flat, fresh exact broker truth, qty=0) | reconciler/manual-close-needed",
+                            "[%s] position %s retained for reconciliation "
+                            "(broker flat, fresh exact broker truth, qty=0) | manual-close-needed",
                             self.client_id, position_id,
                         )
                     except Exception as _stale_exc:
                         log.warning(
-                            "[%s] failed to mark position %s stale: %s",
+                            "[%s] failed to persist position %s broker-flat "
+                            "reconciliation marker: %s",
                             self.client_id, position_id, _stale_exc,
                         )
 

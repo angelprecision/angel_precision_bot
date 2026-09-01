@@ -174,6 +174,19 @@ def _open_position_row(quantity_remaining: int = 1):
     }
 
 
+def _assert_reconciliation_update_is_identity_scoped(position_updates, *, position_id):
+    assert position_updates
+    for sql, params in position_updates:
+        assert "LOWER(COALESCE(execution_mode, '')) = %s" in sql
+        assert "COALESCE(contract, '') = %s" in sql
+        assert params[1:] == (
+            position_id,
+            "jason@example.com",
+            "live",
+            "SMCI260626P00032500",
+        )
+
+
 def test_exit_guard_blocks_closed_position_before_tradier_call(monkeypatch, mock_broker):
     _patch_db(
         monkeypatch,
@@ -752,7 +765,7 @@ def test_broker_truth_exact_occ_allows_protective_close(monkeypatch, mock_broker
     assert any("UPDATE orders " in sql and "SET meta = COALESCE(meta, '{}'::jsonb)" in sql for sql, _ in fake_conn.queries)
 
 
-def test_broker_flat_exact_match_blocks_without_broker_post_and_marks_stale(monkeypatch, mock_broker):
+def test_broker_flat_exact_match_blocks_without_broker_post_and_preserves_reconciliation(monkeypatch, mock_broker):
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
     fake_conn = _patch_db(
         monkeypatch,
@@ -777,10 +790,15 @@ def test_broker_flat_exact_match_blocks_without_broker_post_and_marks_stale(monk
     assert result["ok"] is False
     assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
     assert mock_broker.session.post.call_count == 0
-    assert any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
+    position_updates = [
+        (sql, params) for sql, params in fake_conn.queries if "UPDATE positions" in sql
+    ]
+    _assert_reconciliation_update_is_identity_scoped(position_updates, position_id="pos-flat")
+    assert all("status = 'CLOSED'" not in sql for sql, _ in position_updates)
+    assert any("reconciler_manual_close_needed" in str(params) for _, params in position_updates)
 
 
-def test_broker_flat_exact_match_blocks_even_without_circuit_breaker_trip(monkeypatch, mock_broker):
+def test_broker_flat_exact_match_without_breaker_preserves_reconciliation(monkeypatch, mock_broker):
     fake_conn = _patch_db(
         monkeypatch,
         lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
@@ -804,7 +822,12 @@ def test_broker_flat_exact_match_blocks_even_without_circuit_breaker_trip(monkey
     assert result["ok"] is False
     assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
     assert mock_broker.session.post.call_count == 0
-    assert any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
+    position_updates = [
+        (sql, params) for sql, params in fake_conn.queries if "UPDATE positions" in sql
+    ]
+    _assert_reconciliation_update_is_identity_scoped(position_updates, position_id="pos-flat-no-breaker")
+    assert all("status = 'CLOSED'" not in sql for sql, _ in position_updates)
+    assert any("reconciler_manual_close_needed" in str(params) for _, params in position_updates)
 
 
 def test_broker_wrong_occ_contract_does_not_override_breaker(monkeypatch, mock_broker):
@@ -941,13 +964,15 @@ def test_requested_qty_greater_than_broker_truth_blocks_no_oversell(monkeypatch,
     )
 
 
-def test_empty_positions_marks_stale_position_closed(monkeypatch, mock_broker):
+def test_empty_positions_preserves_position_for_manual_fill_reconciliation(monkeypatch, mock_broker):
     """
     Production-shape fix (formerly 'test_contract_not_matched_does_not_mark_position_closed').
     Empty positions list = broker confirms ALL positions flat = this contract is flat.
-    OSM must fire SYNTHETIC_POSITION_STALE_BROKER_FLAT and mark position CLOSED.
+    OSM must fire SYNTHETIC_POSITION_STALE_BROKER_FLAT without marking the
+    position CLOSED before exact external-fill adoption.
     OLD expected circuit_breaker_tripped + NO position close. That was the VZ/META bug.
-    NEW (correct) behavior: stale position gets marked CLOSED to stop repeat-fire loop.
+    Correct behavior: preserve the active position and write reconciliation
+    diagnostics only, so the exact broker EXIT fill can still be adopted.
     """
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
     fake_conn = _patch_db(
@@ -975,11 +1000,12 @@ def test_empty_positions_marks_stale_position_closed(monkeypatch, mock_broker):
         "That fallthrough was the VZ/META production shape bug."
     )
     assert mock_broker.session.post.call_count == 0
-    # Position row must be marked CLOSED to prevent repeat-fire loop
-    assert any(
-        "UPDATE positions" in sql and "'CLOSED'" in sql
-        for sql, _ in fake_conn.queries
-    ), "Empty broker snapshot must mark position CLOSED to stop the repeat-fire loop"
+    position_updates = [
+        (sql, params) for sql, params in fake_conn.queries if "UPDATE positions" in sql
+    ]
+    _assert_reconciliation_update_is_identity_scoped(position_updates, position_id="pos-no-match")
+    assert all("status = 'CLOSED'" not in sql for sql, _ in position_updates)
+    assert any("reconciler_manual_close_needed" in str(params) for _, params in position_updates)
 
 
 def test_duplicate_exit_guard_still_blocks_before_override(monkeypatch, mock_broker):
@@ -1011,3 +1037,141 @@ def test_duplicate_exit_guard_still_blocks_before_override(monkeypatch, mock_bro
     assert result["ok"] is False
     assert result["error"].startswith("active_exit_already_exists")
     assert mock_broker.session.post.call_count == 0
+
+
+def test_autonomous_recovery_empty_snapshot_preserves_exact_fill_candidate():
+    from types import SimpleNamespace
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    broker = MagicMock()
+    broker.list_open_orders = broker.get_open_orders = None
+    broker.list_orders.return_value = []
+    broker.list_positions.return_value = []
+    exit_engine = MagicMock()
+    position = SimpleNamespace(
+        position_id="pos-recovery-flat-532",
+        option_symbol="BAC260904C00062000",
+        contracts=2,
+    )
+
+    result = recover_exit_position(position, broker=broker, exit_engine=exit_engine)
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_flat_requires_exact_external_fill"
+    exit_engine.mark_position_closed.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+
+
+def test_autonomous_recovery_terminal_pending_order_checks_current_position_truth():
+    from types import SimpleNamespace
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    broker = MagicMock()
+    broker.get_order.return_value = {"status": "canceled", "order_id": "old-exit"}
+    broker.list_open_orders = broker.get_open_orders = None
+    broker.list_orders.return_value = []
+    broker.orders = None
+    broker.list_positions.return_value = []
+    exit_engine = MagicMock()
+    position = SimpleNamespace(
+        position_id="pos-terminal-flat-532",
+        option_symbol="BAC260904C00062000",
+        pending_exit_local_order_id="local-exit",
+        pending_exit_broker_order_id="old-exit",
+        pending_exit_qty=2,
+        contracts=2,
+    )
+
+    result = recover_exit_position(position, broker=broker, exit_engine=exit_engine)
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_flat_requires_exact_external_fill"
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.mark_position_closed.assert_not_called()
+
+
+def test_autonomous_recovery_holds_when_order_truth_is_unavailable():
+    from types import SimpleNamespace
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    broker = MagicMock()
+    broker.get_order.return_value = {"status": "canceled", "order_id": "old-exit"}
+    broker.list_open_orders.side_effect = RuntimeError("orders unavailable")
+    broker.get_open_orders.side_effect = RuntimeError("orders unavailable")
+    broker.list_orders.side_effect = RuntimeError("orders unavailable")
+    broker.orders = None
+    broker.list_positions.return_value = [
+        {"symbol": "BAC260904C00062000", "quantity": 2}
+    ]
+    exit_engine = MagicMock()
+    position = SimpleNamespace(
+        position_id="pos-orders-unavailable-532",
+        option_symbol="BAC260904C00062000",
+        pending_exit_local_order_id="local-exit",
+        pending_exit_broker_order_id="old-exit",
+        pending_exit_qty=2,
+    )
+
+    result = recover_exit_position(position, broker=broker, exit_engine=exit_engine)
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_truth_unavailable"
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "broker_positions",
+    [
+        [{"symbol": "BAC260904C00062000"}],
+        [{"symbol": "BAC260904C00062000", "quantity": True}],
+        [{"symbol": "BAC260904C00062000", "quantity": "1.5"}],
+        [{"symbol": "", "quantity": 2}],
+        ["not-a-position-row"],
+    ],
+)
+def test_autonomous_recovery_holds_when_position_truth_is_malformed(broker_positions):
+    from types import SimpleNamespace
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    broker = MagicMock()
+    broker.list_open_orders = broker.get_open_orders = None
+    broker.list_orders.return_value = []
+    broker.orders = None
+    broker.list_positions.return_value = broker_positions
+    exit_engine = MagicMock()
+    position = SimpleNamespace(
+        position_id="pos-position-malformed-532",
+        option_symbol="BAC260904C00062000",
+        contracts=2,
+    )
+
+    result = recover_exit_position(position, broker=broker, exit_engine=exit_engine)
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_position_truth_malformed"
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.mark_position_closed.assert_not_called()
+
+
+def test_autonomous_recovery_holds_when_position_truth_is_unavailable():
+    from types import SimpleNamespace
+    from ap.exit_autonomous_recovery import recover_exit_position
+
+    broker = MagicMock()
+    broker.list_open_orders = broker.get_open_orders = None
+    broker.list_orders.return_value = []
+    broker.orders = None
+    broker.list_positions = None
+    exit_engine = MagicMock()
+    position = SimpleNamespace(
+        position_id="pos-position-unavailable-532",
+        option_symbol="BAC260904C00062000",
+        contracts=2,
+    )
+
+    result = recover_exit_position(position, broker=broker, exit_engine=exit_engine)
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_position_truth_unavailable"
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.mark_position_closed.assert_not_called()

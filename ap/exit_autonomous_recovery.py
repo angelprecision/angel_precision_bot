@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -90,11 +91,13 @@ def _dt_age_seconds(dt: Any) -> Optional[float]:
         return None
 
 
-def _list_open_orders(broker: Any) -> list[dict]:
+def _list_open_orders_truth(broker: Any) -> tuple[str, list[dict]]:
+    saw_callable = False
     for method_name in ("list_open_orders", "get_open_orders", "list_orders", "orders"):
         method = getattr(broker, method_name, None)
         if not callable(method):
             continue
+        saw_callable = True
         try:
             try:
                 result = method(status="open")
@@ -106,13 +109,24 @@ def _list_open_orders(broker: Any) -> list[dict]:
             if isinstance(result, dict):
                 for key in ("orders", "data", "results", "items"):
                     if isinstance(result.get(key), list):
-                        return [dict(x) for x in result[key] if isinstance(x, dict)]
-                return [result]
+                        rows = result[key]
+                        if not all(isinstance(x, dict) for x in rows):
+                            return "malformed", []
+                        return "available", [dict(x) for x in rows]
+                return "available", [result]
             if isinstance(result, list):
-                return [dict(x) for x in result if isinstance(x, dict)]
+                if not all(isinstance(x, dict) for x in result):
+                    return "malformed", []
+                return "available", [dict(x) for x in result]
+            return "malformed", []
         except Exception as exc:
             log.warning("broker.%s failed during autonomous recovery: %s", method_name, exc)
-    return []
+    return ("unavailable" if saw_callable else "unavailable"), []
+
+
+def _list_open_orders(broker: Any) -> list[dict]:
+    _state, rows = _list_open_orders_truth(broker)
+    return rows
 
 
 def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
@@ -133,9 +147,10 @@ def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
         return None
 
 
-def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> list[tuple[str, dict]]:
+def _matching_open_exit_orders_with_truth(broker: Any, contract: str, *, exclude_broker_id: str = "") -> tuple[str, list[tuple[str, dict]]]:
     matches: list[tuple[str, dict]] = []
-    for raw in _list_open_orders(broker):
+    order_state, rows = _list_open_orders_truth(broker)
+    for raw in rows:
         if contract and _contract(raw) != contract:
             continue
         if not _is_exit_like(raw):
@@ -147,6 +162,11 @@ def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id:
         if not bid or (exclude_broker_id and bid == exclude_broker_id):
             continue
         matches.append((bid, raw))
+    return order_state, matches
+
+
+def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> list[tuple[str, dict]]:
+    _state, matches = _matching_open_exit_orders_with_truth(broker, contract, exclude_broker_id=exclude_broker_id)
     return matches
 
 
@@ -232,6 +252,40 @@ class RecoveryAction:
     details: dict = field(default_factory=dict)
 
 
+def _hold(reason: str, pid: str = "", local_id: str = "", broker_id: str = "", details: Optional[dict] = None) -> RecoveryAction:
+    return RecoveryAction("NOOP", reason, pid, local_id, broker_id, details or {})
+
+
+def _broker_position_state(broker: Any, contract: str) -> str:
+    """Return held/flat only from validated broker position truth."""
+    positions_method = getattr(broker, "list_positions", None)
+    if not callable(positions_method):
+        return "unavailable"
+    try:
+        broker_positions = positions_method()
+    except Exception:
+        return "unavailable"
+    if broker_positions is None or not isinstance(broker_positions, list):
+        return "malformed"
+    contract_held = False
+    for raw_position in broker_positions:
+        if not isinstance(raw_position, dict):
+            return "malformed"
+        raw_contract = _contract(raw_position)
+        raw_qty = raw_position.get("quantity", raw_position.get("qty"))
+        if not raw_contract or raw_qty in (None, "") or isinstance(raw_qty, bool):
+            return "malformed"
+        try:
+            quantity = Decimal(str(raw_qty))
+            if not quantity.is_finite() or quantity != quantity.to_integral_value():
+                raise InvalidOperation
+        except (InvalidOperation, ValueError, TypeError):
+            return "malformed"
+        if raw_contract == contract and quantity != 0:
+            contract_held = True
+    return "held" if contract_held else "flat"
+
+
 def _mark_replacement_safe(exit_engine: Any, pid: str, *, reason: str, local_id: str, broker_id: str, details: dict) -> RecoveryAction:
     if exit_engine and hasattr(exit_engine, "mark_exit_replacement_safe"):
         exit_engine.mark_exit_replacement_safe(
@@ -303,7 +357,9 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
             if st in TERMINAL_BROKER_STATUSES:
                 # CRITICAL safety: terminal status for the old pending id is NOT enough.
                 # Scan broker for a different live exit on the same contract before allowing replacement.
-                other_matches = _matching_open_exit_orders(broker, contract, exclude_broker_id=pending_broker_id)
+                order_state, other_matches = _matching_open_exit_orders_with_truth(broker, contract, exclude_broker_id=pending_broker_id)
+                if order_state != "available":
+                    return _hold(f"broker_order_truth_{order_state}", pid, local_id, pending_broker_id, {"old_status": st, "contract": contract, "quote_health": qh})
                 if len(other_matches) == 1:
                     other_bid, other_raw = other_matches[0]
                     if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
@@ -317,6 +373,11 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                     return RecoveryAction("CONFIRMED_OPEN", "different_broker_exit_still_open", pid, local_id, other_bid, {"old_status": st, "contract": contract, "quote_health": qh})
                 if len(other_matches) > 1:
                     return RecoveryAction("NOOP", "multiple_different_open_exits_block_replacement", pid, local_id, pending_broker_id, {"old_status": st, "matches": [m[0] for m in other_matches], "quote_health": qh})
+                position_state = _broker_position_state(broker, contract)
+                if position_state == "flat":
+                    return _hold("broker_flat_requires_exact_external_fill", pid, local_id, pending_broker_id, {"status": st, "contract": contract, "quote_health": qh})
+                if position_state != "held":
+                    return _hold(f"broker_position_truth_{position_state}", pid, local_id, pending_broker_id, {"status": st, "contract": contract, "quote_health": qh})
                 return _mark_replacement_safe(
                     exit_engine,
                     pid,
@@ -328,7 +389,9 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
             return RecoveryAction("NOOP", "broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
 
     # Missing broker id: scan open orders for matching exit order.
-    matches = _matching_open_exit_orders(broker, contract)
+    order_state, matches = _matching_open_exit_orders_with_truth(broker, contract)
+    if order_state != "available":
+        return _hold(f"broker_order_truth_{order_state}", pid, local_id, "", {"contract": contract, "quote_health": qh})
 
     if len(matches) == 1:
         recovered_broker_id, raw = matches[0]
@@ -362,29 +425,15 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
         return RecoveryAction("NOOP", "multiple_live_exit_orders_cancel_not_proven", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
 
     # Negative proof: no matching open sell-to-close order currently at broker.
-    # Before marking replacement safe, verify the contract is still held.
-    # If position is flat at the broker (exit filled, callback dropped), close it
-    # instead of spawning a duplicate sell-to-close that Tradier will reject.
-    try:
-        _broker_positions = broker.list_positions() if hasattr(broker, "list_positions") else []
-        _contract_held = any(
-            str(p.get("symbol") or "").upper() == str(contract or "").upper()
-            for p in (_broker_positions or [])
-            if int(p.get("quantity") or 0) != 0
-        )
-        if not _contract_held and contract:
-            # Position is flat at broker — exit filled but callback was dropped.
-            # Mark position closed rather than allowing a duplicate exit submission.
-            if exit_engine and hasattr(exit_engine, "mark_position_closed"):
-                exit_engine.mark_position_closed(pid, exit_price=None, filled_qty=getattr(pos, "contracts", 0))
-            return RecoveryAction(
-                "MARKED_CLOSED",
-                "autonomous_recovery_contract_flat_at_broker",
-                pid, local_id, "",
-                {"contract": contract, "quote_health": qh, "source": "negative_proof_position_check"},
-            )
-    except Exception as _bp_exc:
-        log.debug("exit_autonomous_recovery: broker position check failed (non-fatal): %s", _bp_exc)
+    # Unknown or malformed broker position truth must not unlock replacement.
+    position_state = _broker_position_state(broker, contract)
+    if position_state == "flat":
+        # Broker-flat truth proves exposure is gone, but does not identify
+        # the exact external EXIT fill or its economics. Leave terminal
+        # adoption to manual_close_reconciliation.
+        return _hold("broker_flat_requires_exact_external_fill", pid, local_id, "", {"contract": contract, "quote_health": qh})
+    if position_state != "held":
+        return _hold(f"broker_position_truth_{position_state}", pid, local_id, "", {"contract": contract, "quote_health": qh})
 
     return _mark_replacement_safe(
         exit_engine,
