@@ -1725,28 +1725,6 @@ def _record_watch_arm_failure_proof(
         )
 
 
-def _record_retryable_row(
-    result: dict,
-    *,
-    job_id,
-    signal_id,
-    source: str,
-) -> None:
-    """Keep the durable retry count bound to the exact source rows."""
-    result["retryable_deferred"] = int(result.get("retryable_deferred", 0) or 0) + 1
-    retryable_rows = result.setdefault("retryable_rows", [])
-    if not isinstance(retryable_rows, list):
-        retryable_rows = []
-        result["retryable_rows"] = retryable_rows
-    retryable_rows.append(
-        {
-            "job_id": str(job_id or "").strip(),
-            "signal_id": str(signal_id or "").strip(),
-            "source": str(source or "").strip().lower(),
-        }
-    )
-
-
 def _classify_overnight_reeval_result(result: dict) -> dict:
     """Attach the operational completion/retry contract to a result dict."""
     if not isinstance(result, dict):
@@ -1762,9 +1740,6 @@ def _classify_overnight_reeval_result(result: dict) -> dict:
         result.get("retryable_deferred", fetched if stalled and fetched > 0 else 0) or 0
     )
     already_resolved = int(result.get("already_resolved", 0) or 0)
-    retryable_rows = result.get("retryable_rows")
-    if not isinstance(retryable_rows, list):
-        retryable_rows = []
     unresolved = int(
         result.get(
             "unresolved",
@@ -1821,7 +1796,6 @@ def _classify_overnight_reeval_result(result: dict) -> dict:
     result["terminal_errors"] = terminal_errors
     result["retryable_deferred"] = retryable_deferred
     result["already_resolved"] = already_resolved
-    result["retryable_rows"] = retryable_rows
     result["unresolved"] = unresolved
     result["stalled"] = bool(
         retryable_deferred > 0
@@ -1946,7 +1920,6 @@ def run_overnight_reeval(
         "errors": 0,
         "terminal_errors": 0,
         "retryable_deferred": 0,
-        "retryable_rows": [],
         "already_resolved": 0,
         "unresolved": 0,
         "stale_skipped": 0,
@@ -2160,9 +2133,7 @@ def run_overnight_reeval(
                         ticker, _disp, signal_id,
                     )
                     result["skipped"] = result.get("skipped", 0) + 1
-                    _record_retryable_row(
-                        result, job_id=job_id, signal_id=signal_id, source=job_source
-                    )
+                    result["retryable_deferred"] += 1
                     continue
 
                 if _disp == _DISPOSITION_REATTACH_WATCHER:
@@ -2189,9 +2160,7 @@ def run_overnight_reeval(
                             ticker, signal_id,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
-                        _record_retryable_row(
-                            result, job_id=job_id, signal_id=signal_id, source=job_source
-                        )
+                        result["retryable_deferred"] += 1
                         continue
 
                     # Explicit per-row locals — never fall back to outer-loop
@@ -2216,9 +2185,7 @@ def run_overnight_reeval(
                             ticker, signal_id, _existing_oid,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
-                        _record_retryable_row(
-                            result, job_id=job_id, signal_id=signal_id, source=job_source
-                        )
+                        result["retryable_deferred"] += 1
                         continue
 
                     def _reattach_price(order_key, signal_key):
@@ -2369,9 +2336,7 @@ def run_overnight_reeval(
                                 ticker, signal_id, _existing_oid,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
-                            _record_retryable_row(
-                                result, job_id=job_id, signal_id=signal_id, source=job_source
-                            )
+                            result["retryable_deferred"] += 1
                             continue
                         try:
                             _reattach_armed = entry_watcher.watch(
@@ -2389,9 +2354,7 @@ def run_overnight_reeval(
                             # PENDING_TRIGGER order is untouched and the
                             # next retry can attempt reattach again.
                             result["skipped"] = result.get("skipped", 0) + 1
-                            _record_retryable_row(
-                                result, job_id=job_id, signal_id=signal_id, source=job_source
-                            )
+                            result["retryable_deferred"] += 1
                             continue
 
                     if not _reattach_armed:
@@ -2420,9 +2383,7 @@ def run_overnight_reeval(
                                 ticker, signal_id, _existing_oid, _post_active_status,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
-                            _record_retryable_row(
-                                result, job_id=job_id, signal_id=signal_id, source=job_source
-                            )
+                            result["retryable_deferred"] += 1
                             continue
 
                         # Case 2: row found in active-ownership family
@@ -2464,9 +2425,7 @@ def run_overnight_reeval(
                                     ticker, signal_id, _existing_oid, _post_active_status,
                                 )
                                 result["skipped"] = result.get("skipped", 0) + 1
-                                _record_retryable_row(
-                                    result, job_id=job_id, signal_id=signal_id, source=job_source
-                                )
+                                result["retryable_deferred"] += 1
                                 continue
 
                             log.warning(
@@ -2534,9 +2493,7 @@ def run_overnight_reeval(
                             signal_id, _existing_oid,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
-                        _record_retryable_row(
-                            result, job_id=job_id, signal_id=signal_id, source=job_source
-                        )
+                        result["retryable_deferred"] += 1
                         continue
 
                     # Persist durable WATCHER_ARMED proof after successful reattachment.
@@ -2572,9 +2529,7 @@ def run_overnight_reeval(
                             _existing_oid, session_key,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
-                        _record_retryable_row(
-                            result, job_id=job_id, signal_id=signal_id, source=job_source
-                        )
+                        result["retryable_deferred"] += 1
                         continue
 
                     log.info(
@@ -2604,9 +2559,7 @@ def run_overnight_reeval(
                         ticker, signal_id, _created_oid,
                     )
                     result["skipped"] = result.get("skipped", 0) + 1
-                    _record_retryable_row(
-                        result, job_id=job_id, signal_id=signal_id, source=job_source
-                    )
+                    result["retryable_deferred"] += 1
                     continue
 
                 # RETRYABLE or NEW — fall through to normal processing.
@@ -2646,9 +2599,7 @@ def run_overnight_reeval(
                                 "after_hours_deferred:overnight_prior_levels_fetch_failed",
                             )
                         result["skipped"] += 1
-                        _record_retryable_row(
-                            result, job_id=job_id, signal_id=signal_id, source=job_source
-                        )
+                        result["retryable_deferred"] += 1
                         continue
                 else:
                     log.warning(
@@ -2776,9 +2727,7 @@ def run_overnight_reeval(
                         ),
                     )
                 result["skipped"] = result.get("skipped", 0) + 1
-                _record_retryable_row(
-                    result, job_id=job_id, signal_id=signal_id, source=job_source
-                )
+                result["retryable_deferred"] += 1
                 continue  # leave job WATCHING for next reeval run
 
             # Step 2: Derive entry_trigger if not provided by scanner
@@ -2816,9 +2765,7 @@ def run_overnight_reeval(
                             "after_hours_deferred:overnight_snapshot_fetch_failed",
                         )
                     result["skipped"] += 1
-                    _record_retryable_row(
-                        result, job_id=job_id, signal_id=signal_id, source=job_source
-                    )
+                    result["retryable_deferred"] += 1
                     continue
                 if snapshot:
                     snapshot_by_ticker[_ticker_key] = snapshot
@@ -2850,9 +2797,7 @@ def run_overnight_reeval(
                             "after_hours_deferred:overnight_snapshot_unavailable",
                         )
                     result["skipped"] = result.get("skipped", 0) + 1
-                    _record_retryable_row(
-                        result, job_id=job_id, signal_id=signal_id, source=job_source
-                    )
+                    result["retryable_deferred"] += 1
                     continue  # leave job WATCHING for next reeval run
                 # True invalidation — reject
                 log.info("[%s] overnight_reeval: OVERNIGHT_TRUE_INVALIDATION %s — %s",
@@ -3401,9 +3346,7 @@ def run_overnight_reeval(
                                 local_order_id, session_key,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
-                            _record_retryable_row(
-                                result, job_id=job_id, signal_id=signal_id, source=job_source
-                            )
+                            result["retryable_deferred"] += 1
                             continue
 
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
