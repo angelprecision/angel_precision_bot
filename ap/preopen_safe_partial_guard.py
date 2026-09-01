@@ -212,6 +212,21 @@ def classify_safe_exhausted_partial(
     if outcome_total != counts["fetched"]:
         return False, {"reason": "overnight_outcome_accounting_mismatch"}
 
+    current_attempt_count = getattr(runner, "_overnight_reeval_attempt_count", None)
+    current_attempt_at = getattr(runner, "_overnight_reeval_last_attempt_at", None)
+    try:
+        current_attempted_at = current_attempt_at.isoformat()
+    except Exception:
+        current_attempted_at = ""
+    if (
+        isinstance(current_attempt_count, bool)
+        or not isinstance(current_attempt_count, int)
+        or current_attempt_count != counts["attempt_count"]
+        or not current_attempted_at
+        or str(details.get("attempted_at") or "").strip() != current_attempted_at
+    ):
+        return False, {"reason": "overnight_lock_not_current_attempt"}
+
     if client_state.get("stale_processing_ids"):
         return False, {"reason": "stale_processing_rows_present"}
     if client_state.get("watching_orphans"):

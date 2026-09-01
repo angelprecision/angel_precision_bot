@@ -2423,6 +2423,10 @@ class ClientRunner(threading.Thread):
         result: dict
         last_error = None
         try:
+            if force:
+                # A forced retry is a new authority attempt. Do not let a
+                # previous same-day success survive a failed re-evaluation.
+                self._overnight_reeval_success_date = None
             self._overnight_reeval_attempt_count += 1
             self._overnight_reeval_last_attempt_at = now_et
             logger.info(

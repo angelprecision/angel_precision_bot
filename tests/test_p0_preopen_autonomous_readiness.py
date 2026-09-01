@@ -285,6 +285,37 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
     assert details["source"] == "handoff_run_locks.post_overnight_reeval"
 
 
+def test_overnight_status_rejects_persisted_success_after_current_attempt_fails(monkeypatch):
+    _stub_common(monkeypatch, handoff=True, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="live")
+    runner._overnight_reeval_state_date = "2026-06-22"
+    runner._overnight_reeval_success_date = None
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
+
+    status, details = pr._overnight_status(
+        runner,
+        {
+            "stale_processing_ids": [],
+            "watching_orphans": [],
+            "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+            "watching_count": 1,
+        },
+        "2026-06-22",
+        client_id="jason@example.com",
+        execution_mode="live",
+        stage="manual",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+
+    assert status == "missing"
+    assert details["source"] == "runner_overnight_reeval_not_successful_today"
+
+
 def test_overnight_status_ignores_legacy_last_reeval_date(monkeypatch):
     _stub_common(monkeypatch, handoff=True, client_state={
         "stale_processing_ids": [],

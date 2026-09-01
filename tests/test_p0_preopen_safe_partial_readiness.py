@@ -45,6 +45,7 @@ def _jason_row(**detail_overrides):
         "source_lookup_partial": False,
         "trade_queue_status": "SUCCESS",
         "ap_signals_status": "SUCCESS",
+        "attempted_at": "2026-08-31T16:00:00+00:00",
         "trade_queue_error": None,
         "ap_signals_error": None,
     }
@@ -92,6 +93,8 @@ def _live_runner(*, watcher_running=True, watcher_alive=True):
     return SimpleNamespace(
         mode="LIVE",
         _overnight_reeval_success_date=None,
+        _overnight_reeval_attempt_count=7,
+        _overnight_reeval_last_attempt_at=datetime(2026, 8, 31, 16, 0, tzinfo=timezone.utc),
         initialized=SimpleNamespace(is_set=lambda: True),
         worker_thread=SimpleNamespace(is_alive=lambda: True),
         is_alive=lambda: True,
@@ -254,6 +257,26 @@ def test_failed_source_status_is_blocked_even_if_partial_flag_is_false(monkeypat
 
     assert safe is False
     assert proof["reason"] == "overnight_trade_queue_source_not_success"
+
+
+def test_safe_partial_proof_must_match_current_runner_attempt(monkeypatch):
+    monkeypatch.setattr(guard, "_latest_exact_overnight_row", lambda **_: _jason_row())
+    runner = _live_runner()
+    runner._overnight_reeval_last_attempt_at = datetime(
+        2026, 8, 31, 16, 1, tzinfo=timezone.utc
+    )
+
+    safe, proof = guard.classify_safe_exhausted_partial(
+        SimpleNamespace(_pending_trigger_without_watcher=lambda runner, rows: []),
+        runner=runner,
+        client_state=_client_state(),
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+        trading_date="2026-08-31",
+    )
+
+    assert safe is False
+    assert proof["reason"] == "overnight_lock_not_current_attempt"
 
 
 def test_missing_source_completeness_fields_fail_closed(monkeypatch):

@@ -2038,7 +2038,9 @@ def run_overnight_reeval(
 
     _tq_failed  = _fetch_result.trade_queue_status != _SOURCE_STATUS_SUCCESS
     _sup_failed = _fetch_result.ap_signals_status  != _SOURCE_STATUS_SUCCESS
-    result["source_lookup_partial"] = bool(_tq_failed or _sup_failed)
+    result["source_lookup_partial"] = bool(
+        _tq_failed or _sup_failed or _fetch_result.source_lookup_partial
+    )
 
     if _tq_failed and _sup_failed and not watching_signals:
         # Both sources failed and no rows visible → cannot certify empty
@@ -3738,6 +3740,7 @@ class _FetchWatchingSignalsResult(NamedTuple):
     .ap_signals_status   — SUCCESS / FAILED
     .trade_queue_error   — short error string if FAILED
     .ap_signals_error    — short error string if FAILED
+    .source_lookup_partial — True when a successful source query was truncated
 
     A FAILED status must never be interpreted as "zero rows / completed no
     work". The caller must classify the run retryable when any source is
@@ -3749,6 +3752,7 @@ class _FetchWatchingSignalsResult(NamedTuple):
     ap_signals_status:  str
     trade_queue_error:  Optional[str]
     ap_signals_error:   Optional[str]
+    source_lookup_partial: bool = False
 
 
 def _fetch_watching_signals(client_id: str) -> list:
@@ -3847,6 +3851,7 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
     trade_queue_error:  Optional[str] = None
     ap_signals_status:  str = _SOURCE_STATUS_SUCCESS
     ap_signals_error:   Optional[str] = None
+    source_lookup_partial: bool = False
 
     # PR #388 P0-8: SINGLE fetch limit for BOTH sources. Previously the
     # shared ap_signals query was hardcoded at .limit(300) while trade_queue
@@ -3873,10 +3878,18 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
                       AND status = 'WATCHING'
                     ORDER BY created_ts DESC
                     LIMIT %s
-                """, (client_id, _fetch_limit))
+                """, (client_id, _fetch_limit + 1))
                 return c.fetchall()
 
         rows = run_with_retry(_fn) or []
+        if len(rows) > _fetch_limit:
+            source_lookup_partial = True
+            log.error(
+                "[%s] _fetch_watching_signals[trade_queue] inventory exceeds fetch limit=%d "
+                "— refusing to certify complete source truth",
+                client_id, _fetch_limit,
+            )
+            rows = rows[:_fetch_limit]
         for row in rows:
             d = dict(row) if not isinstance(row, dict) else row
             if isinstance(d.get("payload"), str):
@@ -3946,11 +3959,21 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
                 .eq("decision_status", "WATCHING")
                 .gte("created_at", cutoff)
                 .order("created_at", desc=True)
-                .limit(_fetch_limit)  # P0-8: unified with trade_queue limit
+                .limit(_fetch_limit + 1)  # probe one extra row for completeness
                 .execute()
             )
 
-            for row in (res.data or []):
+            source_rows = list(res.data or [])
+            if len(source_rows) > _fetch_limit:
+                source_lookup_partial = True
+                log.error(
+                    "[%s] _fetch_watching_signals[ap_signals] inventory exceeds fetch limit=%d "
+                    "— refusing to certify complete source truth",
+                    client_id, _fetch_limit,
+                )
+                source_rows = source_rows[:_fetch_limit]
+
+            for row in source_rows:
                 sid = str(row.get("signal_id") or "")
                 if not sid or sid in seen_signal_ids:
                     continue
@@ -4047,6 +4070,7 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
         ap_signals_status=ap_signals_status,
         trade_queue_error=trade_queue_error,
         ap_signals_error=ap_signals_error,
+        source_lookup_partial=source_lookup_partial,
     )
 
 

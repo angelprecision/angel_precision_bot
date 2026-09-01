@@ -723,6 +723,23 @@ def test_force_true_bypasses_success_suppression_but_respects_lock(monkeypatch):
     assert len(calls) == 1
 
 
+def test_force_true_clears_prior_success_before_failed_attempt(monkeypatch):
+    monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: _result())
+    runner = _runner()
+    today = _dt(9).date()
+    runner._overnight_reeval_state_date = today
+    runner._overnight_reeval_success_date = today
+
+    result = runner.run_overnight_reeval_attempt(
+        force=True,
+        now_et=_dt(9, 33),
+        source="admin_sync",
+    )
+
+    assert result["completed"] is False
+    assert runner._overnight_reeval_success_date is None
+
+
 def test_force_true_bypasses_exhausted_suppression(monkeypatch):
     calls = []
     monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: calls.append(kwargs) or _result())

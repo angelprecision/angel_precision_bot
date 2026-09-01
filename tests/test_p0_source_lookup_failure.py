@@ -146,6 +146,26 @@ def test_partial_source_inventory_overrides_deferred_subset_classification():
     assert result["retry_reason"] == "partial_source_inventory"
 
 
+def test_truncated_successful_source_is_still_retryable(monkeypatch):
+    row = {
+        "id": "sup:visible",
+        "signal_id": "visible",
+        "payload": {"signal_id": "visible", "ticker": "VISIBLE", "side": "invalid"},
+        "created_ts": None,
+        "_source": "ap_signals",
+    }
+    fetch = _empty_fetch_result(tq_ok=True, sup_ok=True, rows=[row])._replace(
+        source_lookup_partial=True
+    )
+
+    result = _run_reeval(monkeypatch, fetch)
+
+    assert result["source_lookup_partial"] is True
+    assert result["completed"] is False
+    assert result["retryable"] is True
+    assert result["retry_reason"] == "partial_source_inventory"
+
+
 def test_runner_does_not_set_success_date_on_source_lookup_failed(monkeypatch):
     """Wire the failing result through run_overnight_reeval_attempt on a
     ClientRunner (with all other deps stubbed) and prove that the runner
