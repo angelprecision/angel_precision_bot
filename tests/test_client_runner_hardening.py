@@ -628,8 +628,9 @@ class TestFix8OrderMonitorWatcherWiring:
                 self.wire = MagicMock()
 
         class _FakeOrderStateMachine:
-            def __init__(self, client_id: str):
+            def __init__(self, client_id: str, execution_mode=None):
                 self.client_id = client_id
+                self.execution_mode = execution_mode
                 self.expire_calls: list[tuple[str, str]] = []
                 self.transition_calls: list[tuple[str, str, dict]] = []
 
@@ -707,6 +708,10 @@ class TestFix8OrderMonitorWatcherWiring:
         assert runner.order_monitor.entry_watcher is watcher, (
             "Normal startup-built APOrderMonitor must receive the same "
             "entry_watcher instance from runner.core."
+        )
+        assert runner.order_state_machine.execution_mode == "paper", (
+            "Normal startup must construct the OSM with the runner's "
+            "canonical execution mode."
         )
 
         monkeypatch.setattr(order_monitor_mod, "PENDING_TRIGGER_CLEANUP_ENABLED", True)

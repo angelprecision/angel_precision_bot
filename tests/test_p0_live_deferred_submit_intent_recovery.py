@@ -19,6 +19,7 @@ import pytest
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:1/test")
 
 import ap_execution_core
+import ap.fill_monitor as fill_monitor
 from ap.broker_submit_identity import (
     build_entry_submit_payload,
     canonical_broker_submit_key,
@@ -115,6 +116,111 @@ def _core_for(row: dict, *, mode: str | None = None):
             core, type(core)
         )
     )
+    return core, osm, broker
+
+
+def test_osm_runtime_mode_is_explicit_and_never_defaults_from_malformed_input():
+    live_osm = APOrderStateMachine(
+        client_id=_CLIENT,
+        execution_mode=" LIVE ",
+    )
+    assert live_osm.execution_mode == "live"
+    assert APOrderStateMachine(client_id=_CLIENT).execution_mode is None
+
+    with pytest.raises(ValueError, match="execution_mode"):
+        APOrderStateMachine(client_id=_CLIENT, execution_mode="staging")
+
+
+def test_client_runner_wires_canonical_mode_into_production_osm_constructor():
+    import inspect
+    import client_runner
+
+    captured = {}
+
+    class _CaptureOSM:
+        def __init__(self, *, client_id, execution_mode):
+            captured.update(
+                client_id=client_id,
+                execution_mode=execution_mode,
+            )
+
+    runner = object.__new__(client_runner.ClientRunner)
+    runner.email = _CLIENT
+    runner.mode = "LIVE"
+
+    result = runner._build_order_state_machine(_CaptureOSM)
+
+    assert isinstance(result, _CaptureOSM)
+    assert captured == {"client_id": _CLIENT, "execution_mode": "live"}
+    run_inner_source = inspect.getsource(client_runner.ClientRunner._run_inner)
+    assert "self._build_order_state_machine(" in run_inner_source
+    assert "APOrderStateMachine" in run_inner_source
+
+    runner.mode = "UNKNOWN"
+    with pytest.raises(RuntimeError, match="unproven execution mode"):
+        runner._build_order_state_machine(_CaptureOSM)
+
+
+class _StatefulAdoptionOSM:
+    """Small durable-state double that honors the production metadata CAS."""
+
+    def __init__(self, row: dict):
+        self.row = dict(row)
+        self.row["meta"] = dict(row.get("meta") or {})
+        self.client_id = row["client_id"]
+        self.transition_calls = []
+        self.meta_calls = []
+        self.advance_to_filled_before_meta = False
+
+    def get_order(self, local_order_id: str):
+        if local_order_id != self.row["local_order_id"]:
+            return None
+        current = dict(self.row)
+        current["meta"] = dict(self.row.get("meta") or {})
+        return current
+
+    def transition(self, local_order_id: str, new_status: str, **kwargs):
+        self.transition_calls.append((local_order_id, new_status, dict(kwargs)))
+        if local_order_id != self.row["local_order_id"]:
+            return False
+        self.row["status"] = new_status
+        if kwargs.get("broker_order_id"):
+            self.row["broker_order_id"] = kwargs["broker_order_id"]
+        if kwargs.get("submitted_ts"):
+            self.row["submitted_ts"] = kwargs["submitted_ts"]
+        if kwargs.get("filled_qty") is not None:
+            self.row["filled_qty"] = kwargs["filled_qty"]
+        if kwargs.get("fill_price") is not None:
+            self.row["fill_price"] = kwargs["fill_price"]
+        return True
+
+    def update_order_meta(self, local_order_id: str, meta_patch: dict, **kwargs):
+        self.meta_calls.append((local_order_id, dict(meta_patch), dict(kwargs)))
+        if local_order_id != self.row["local_order_id"]:
+            return False
+        if self.advance_to_filled_before_meta:
+            self.row["status"] = "FILLED"
+            self.advance_to_filled_before_meta = False
+        expected_status = kwargs.get("expected_status")
+        if expected_status and self.row.get("status") != expected_status:
+            return False
+        expected_mode = kwargs.get("expected_execution_mode")
+        if expected_mode and self.row.get("execution_mode") != expected_mode:
+            return False
+        expected_signal_id = kwargs.get("expected_signal_id")
+        if expected_signal_id and self.row.get("signal_id") != expected_signal_id:
+            return False
+        self.row["meta"].update(meta_patch)
+        return True
+
+
+def _stateful_adoption_core(row: dict, *, broker_status: str = "filled"):
+    osm = _StatefulAdoptionOSM(row)
+    broker = MagicMock()
+    broker.list_orders.return_value = [_remote(row, status=broker_status)]
+    core, _, _ = _core_for(row)
+    core.order_state_machine = osm
+    core.broker = broker
     return core, osm, broker
 
 
@@ -215,6 +321,156 @@ def _remote(row: dict, *, broker_id: str = "TR-ACTIVE", status: str = "open", **
     }
     value.update(extra)
     return value
+
+
+def test_adoption_transition_failure_retains_owner_and_never_posts():
+    row = _intent_row()
+    core, osm, broker = _core_for(row)
+    osm.get_order.side_effect = [row, row]
+    osm.transition.return_value = False
+    broker.list_orders.return_value = [_remote(row, status="filled")]
+
+    result = core.reconcile_deferred_broker_intent(local_order_id=_AAPL_ID)
+
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["reason_code"] == "RECONCILE_ADOPTION_TRANSITION_FAILED"
+    assert result["broker_submit_owner_retained"] is True
+    osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
+    osm.update_order_meta.assert_not_called()
+    broker.place_order.assert_not_called()
+
+
+def test_adoption_metadata_cas_cannot_rewrite_a_concurrent_filled_row():
+    row = _intent_row()
+    core, osm, broker = _stateful_adoption_core(row)
+    osm.advance_to_filled_before_meta = True
+
+    result = core.reconcile_deferred_broker_intent(local_order_id=_AAPL_ID)
+
+    assert result["disposition"] == "ALREADY_RECONCILED"
+    assert osm.row["status"] == "FILLED"
+    assert osm.row["meta"]["current_owner"] == (
+        f"broker_submit:{row['meta']['broker_submit_key']}"
+    )
+    assert osm.meta_calls[0][2]["expected_status"] == "SUBMITTED"
+    assert osm.meta_calls[0][2]["expected_execution_mode"] == "live"
+    assert osm.meta_calls[0][2]["expected_signal_id"] == row["signal_id"]
+    broker.place_order.assert_not_called()
+
+
+def test_found_filled_flows_through_real_fill_monitor_side_effects(monkeypatch):
+    row = _intent_row()
+    core, osm, broker = _stateful_adoption_core(row, broker_status="filled")
+    result = core.reconcile_deferred_broker_intent(local_order_id=_AAPL_ID)
+
+    assert result["status"] == "SUBMITTED"
+    broker.get_order.return_value = {
+        "status": "FILLED",
+        "exec_quantity": 1,
+        "avg_fill_price": 2.40,
+    }
+
+    open_position = MagicMock(return_value="position-1")
+    bind_identity = MagicMock(return_value=(True, "bound"))
+    seed_exit = MagicMock(return_value=(True, "seeded"))
+    release_guards = MagicMock()
+    monkeypatch.setattr(fill_monitor, "emit_fill_event", MagicMock())
+    monkeypatch.setattr(fill_monitor, "audit", MagicMock())
+    monkeypatch.setattr(fill_monitor, "trace_gate", MagicMock())
+    monkeypatch.setattr(fill_monitor, "_cancel_pair_opposite", MagicMock())
+    monkeypatch.setattr(fill_monitor, "_open_position_safe", open_position)
+    monkeypatch.setattr(
+        fill_monitor,
+        "_bind_filled_entry_durable_identity",
+        bind_identity,
+    )
+    monkeypatch.setattr(fill_monitor, "_seed_exit_engine", seed_exit)
+    monkeypatch.setattr(fill_monitor, "_release_entry_guards", release_guards)
+
+    fill_monitor.process_pending_order(
+        broker,
+        osm.get_order(_AAPL_ID),
+        osm=osm,
+        pm=object(),
+        exit_engine=object(),
+        runtime_execution_mode="live",
+    )
+
+    assert [call[1] for call in osm.transition_calls] == ["SUBMITTED", "FILLED"]
+    open_position.assert_called_once()
+    bind_identity.assert_called_once()
+    seed_exit.assert_called_once()
+    release_guards.assert_called_once()
+    broker.place_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("broker_status", "expected_status", "filled_qty"),
+    [
+        ("partially_filled", "PARTIAL_FILL", 1),
+        ("rejected", "REJECTED", 0),
+        ("canceled", "CANCELED", 0),
+        ("expired", "EXPIRED", 0),
+    ],
+)
+def test_found_nonfilled_statuses_wait_for_fill_monitor_transition(
+    monkeypatch,
+    broker_status,
+    expected_status,
+    filled_qty,
+):
+    row = _intent_row()
+    core, osm, broker = _stateful_adoption_core(
+        row,
+        broker_status=broker_status,
+    )
+    result = core.reconcile_deferred_broker_intent(local_order_id=_AAPL_ID)
+
+    assert result["status"] == "SUBMITTED"
+    broker.get_order.return_value = {
+        "status": broker_status.upper(),
+        "exec_quantity": filled_qty,
+        "avg_fill_price": 2.40,
+        "reason": broker_status,
+    }
+    open_position = MagicMock(return_value="position-should-not-exist")
+    release_guards = MagicMock()
+    monkeypatch.setattr(fill_monitor, "emit_fill_event", MagicMock())
+    monkeypatch.setattr(fill_monitor, "audit", MagicMock())
+    monkeypatch.setattr(fill_monitor, "trace_gate", MagicMock())
+    monkeypatch.setattr(fill_monitor, "_cancel_pair_opposite", MagicMock())
+    monkeypatch.setattr(fill_monitor, "_open_position_safe", open_position)
+    monkeypatch.setattr(
+        fill_monitor,
+        "_bind_filled_entry_durable_identity",
+        MagicMock(return_value=(True, "bound")),
+    )
+    monkeypatch.setattr(
+        fill_monitor,
+        "_seed_exit_engine",
+        MagicMock(return_value=(True, "seeded")),
+    )
+    monkeypatch.setattr(fill_monitor, "_release_entry_guards", release_guards)
+
+    fill_monitor.process_pending_order(
+        broker,
+        osm.get_order(_AAPL_ID),
+        osm=osm,
+        pm=object(),
+        exit_engine=object(),
+        runtime_execution_mode="live",
+    )
+
+    assert [call[1] for call in osm.transition_calls] == [
+        "SUBMITTED",
+        expected_status,
+    ]
+    open_position.assert_not_called()
+    if expected_status in {"REJECTED", "CANCELED", "EXPIRED"}:
+        release_guards.assert_called_once()
+    else:
+        release_guards.assert_not_called()
+    broker.place_order.assert_not_called()
 
 
 class _TradierResponse:

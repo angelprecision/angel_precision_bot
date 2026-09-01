@@ -720,6 +720,24 @@ class ClientRunner(threading.Thread):
         self._overnight_reeval_last_result_class = None
         self._overnight_reeval_last_retry_reason = None
 
+    def _build_order_state_machine(self, order_state_machine_cls):
+        """Construct the OSM with the runner's canonical execution mode.
+
+        Deferred LIVE submit-intent recovery must never depend on a mode-less
+        OSM instance and then fall through to a legacy broker lookup path.
+        Unknown runner modes fail closed before any lifecycle subsystem starts.
+        """
+        mode = str(self.mode or "").strip().lower()
+        if mode not in {"live", "paper"}:
+            raise RuntimeError(
+                f"[{self.email}] cannot construct order state machine with "
+                f"unproven execution mode={self.mode!r}"
+            )
+        return order_state_machine_cls(
+            client_id=self.email,
+            execution_mode=mode,
+        )
+
     def trip_kill_switch(self, reason: str = "manual_trip") -> None:
         """PR D / FIX-2 (BUG-CR-4): public setter to trip the kill switch.
 
@@ -3187,7 +3205,9 @@ class ClientRunner(threading.Thread):
             supabase_client=sb,
         )
 
-        self.order_state_machine = APOrderStateMachine(client_id=self.email)
+        self.order_state_machine = self._build_order_state_machine(
+            APOrderStateMachine
+        )
 
         # WIRE-2: split-brain startup audit ───────────────────────────────────
         # Orders from a prior session where the broker accepted a submission but

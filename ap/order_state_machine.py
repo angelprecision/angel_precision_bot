@@ -397,12 +397,23 @@ PENDING_EXIT_STATUSES = (
 
 class APOrderStateMachine:
 
-    def __init__(self, client_id: str):
+    def __init__(self, client_id: str, execution_mode: str | None = None):
         # AUDIT-4: strip client_id — DB whitespace artifacts caused log noise and
         # potential registry mismatches when self.client_id was passed forward as a
         # lookup key. _normalize_client_key normalizes for registry lookups but
         # self.client_id itself was never cleaned.
         self.client_id        = str(client_id or "").strip().lower()   # normalise: matches _normalize_client_key()
+        # Runtime mode is an authority input for production wiring.  Keep
+        # legacy/offline construction possible when the caller has no mode, but
+        # never turn an explicit malformed value into a PAPER/LIVE default.
+        self.execution_mode: str | None = None
+        if execution_mode is not None:
+            _mode = str(execution_mode).strip().lower()
+            if _mode not in {"live", "paper"}:
+                raise ValueError(
+                    "APOrderStateMachine execution_mode must be exactly 'live' or 'paper'"
+                )
+            self.execution_mode = _mode
         self.run_id           = os.getenv("AP_RUN_ID", "unknown")
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit       = get_git_commit()

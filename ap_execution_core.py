@@ -4506,7 +4506,18 @@ class APExecutionCore:
         meta_update = getattr(osm, "update_order_meta", None)
         if callable(meta_update):
             try:
-                meta_update(local_order_id, {
+                # The broker identity transition is the authority boundary;
+                # metadata is only a best-effort annotation.  Fence this
+                # annotation to SUBMITTED so a concurrent fill-monitor pass
+                # cannot be silently overwritten back to ORDER_MONITOR after
+                # it has already advanced the row to FILLED/PARTIAL/terminal.
+                _row_execution_mode = str(
+                    row.get("execution_mode") or ""
+                ).strip().lower()
+                _expected_signal_id = str(
+                    row.get("signal_id") or ""
+                ).strip() or None
+                _meta_updated = meta_update(local_order_id, {
                     "reconciled_at": now_utc_iso(),
                     "recovery_classification": "BROKER_ORDER_ADOPTED",
                     "broker_reconcile_status": remote_status,
@@ -4514,7 +4525,18 @@ class APExecutionCore:
                     "broker_submit_reconciliation_status": "FOUND",
                     "current_owner": "ORDER_MONITOR",
                     "lifecycle_state": "SUBMITTED",
-                })
+                }, expected_status="SUBMITTED",
+                   expected_execution_mode=(
+                       row_mode if _row_execution_mode == row_mode else None
+                   ),
+                   expected_signal_id=_expected_signal_id)
+                if not _meta_updated:
+                    log.warning(
+                        "[%s] broker adoption metadata CAS not applied local_order_id=%s; "
+                        "durable lifecycle/identity remains authoritative",
+                        expected_client_id,
+                        local_order_id,
+                    )
             except Exception as exc:
                 log.warning(
                     "[%s] broker adoption metadata write failed local_order_id=%s "
