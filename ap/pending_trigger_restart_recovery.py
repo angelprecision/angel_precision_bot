@@ -42,7 +42,6 @@ from ap.pending_trigger_classifier import (
 )
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
-    is_retryable_selector_reason,
     resolve_deferred_materialization_max_attempts,
 )
 
@@ -65,31 +64,14 @@ class _RowOutcome:
 
 _TERMINAL_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED", "ERROR"})
 
-# Keep terminal materialization cleanup aligned with the classifier's three
-# persisted outcome surfaces. Classification can see a nested legacy outcome,
-# so cleanup must preserve that exact decision rather than writing a blank
-# trailing-colon reason.
-_TERMINAL_MATERIALIZATION_OUTCOMES = frozenset({
-    "TERMINAL_NO_TRADEABLE_CONTRACT",
-    "TERMINAL_QUALITY_REJECT",
-    "TERMINAL_MATERIALIZATION_FAILED",
-    "FAILED_TERMINAL",
-})
-
-# Active production materialization-retry authority is written atomically by
-# APOrderStateMachine.schedule_deferred_materialization_retry(). Repository-wide
-# production search found no caller of the legacy stamp_retry_pending() helper.
-# These mirrors are consumed by APRecovery and the OSM generation/attempt CAS.
+# #323 canonical materialization retry fields — exact shape from ap/deferred_materializer.stamp_retry_pending()
+# DO NOT invent fields not present in that function.
 _MAT_STATUS_FIELD        = "materialization_status"      # "RETRY_PENDING"
 _MAT_NEXT_RETRY_AT       = "materialization_next_retry_at"
 _MAT_ATTEMPTS_FIELD      = "materialization_attempts"    # int — canonical attempt counter
 _MAT_REASON_FIELD        = "materialization_reason"      # reason_code str
 _MAT_LAST_FAILURE_FIELD  = "materialization_last_failure_at"
 _MAT_BROKER_READY        = "broker_ready"               # must be False on RETRY_PENDING rows
-_MAT_GENERATION_FIELD      = "materialization_generation"
-_MAT_RETRY_ATTEMPT_FIELD    = "retry_attempt"
-_MAT_BREACH_ATTEMPT_FIELD  = "breach_attempt_count"
-_MAT_MAX_ATTEMPTS_FIELD    = "retry_max_attempts"
 # Max attempts from the same env var the deferred materializer reads
 _MAT_MAX_ATTEMPTS_ENV    = "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS"
 
@@ -537,7 +519,7 @@ class PendingTriggerRestartRecovery:
             )
 
         elif cls == PTC.STUCK_TERMINAL_MATERIALIZATION:
-            _outcome = _terminal_materialization_outcome(row)
+            _outcome = (row.get("meta") or {}).get("materialization_outcome", "")
             return self._terminalize_with_reason(
                 local_oid, row,
                 f"restart_stuck_terminal_materialization:{_outcome}",
@@ -903,12 +885,21 @@ class PendingTriggerRestartRecovery:
     # ── Canonical retry ownership (#323 fields) ────────────────────────────────
 
     def _enter_canonical_retry(self, local_oid: str, row: dict, *, reason: str) -> str:
-        """Persist the active OSM-compatible retry authority shape.
+        """
+        Fix 1: write the exact fields that ap/deferred_materializer.stamp_retry_pending()
+        writes so the deployed #323 consumer can see and process the row.
 
-        This legacy recovery writer currently has no production caller, but if
-        reactivated it must emit the same typed attempt mirrors, generation, and
-        maximum-attempt authority consumed by APRecovery and the OSM CAS. It
-        deliberately does not create a second owner or retry scheduler.
+        Real canonical schema (from stamp_retry_pending):
+          materialization_status          = "RETRY_PENDING"
+          broker_ready                    = False
+          materialization_attempts        = int
+          materialization_next_retry_at   = isoformat
+          materialization_reason          = str
+          materialization_last_failure_at = isoformat
+
+        Removed: materialization_owner, materialization_retry_deadline,
+                 materialization_attempt_count, materialization_retry_reason
+                 (none of these exist in stamp_retry_pending).
         """
         _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
         try:
@@ -936,25 +927,10 @@ class PendingTriggerRestartRecovery:
             )
 
         _next = (_now + timedelta(seconds=_delay)).isoformat()
-        # Keep the recovery-owned write congruent with the due executor's
-        # canonical retry shape.  APRecovery and the OSM CAS fence consume
-        # these mirrors; writing materialization_attempts alone would create
-        # a retry that this verifier correctly could not later own.
-        _generation_raw = _meta.get(_MAT_GENERATION_FIELD, 1)
-        if (
-            isinstance(_generation_raw, bool)
-            or not isinstance(_generation_raw, int)
-            or _generation_raw < 1
-        ):
-            return _RowOutcome.UNRESOLVED
         _ok = self._safe_meta_update(local_oid, {
             _MAT_STATUS_FIELD:       "RETRY_PENDING",
             _MAT_BROKER_READY:       False,
             _MAT_ATTEMPTS_FIELD:     _attempts,
-            _MAT_RETRY_ATTEMPT_FIELD: _attempts,
-            _MAT_BREACH_ATTEMPT_FIELD: _attempts,
-            _MAT_GENERATION_FIELD:   _generation_raw,
-            _MAT_MAX_ATTEMPTS_FIELD: _max,
             _MAT_NEXT_RETRY_AT:      _next,
             _MAT_REASON_FIELD:       reason,
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
@@ -1106,13 +1082,15 @@ class PendingTriggerRestartRecovery:
         expected_next_at: str = "",
         expected_attempts: int = 0,
     ) -> "dict | None":
-        """Prove active OSM retry ownership from an exact durable reread.
+        """
+        Fix 1: prove canonical #323 retry ownership using the real stamp_retry_pending fields.
 
-        The production handoff writes RETRY_PENDING, literal broker_ready=False,
-        coherent typed attempt mirrors, generation, configured maximum, schedule,
-        retry reason, last-failure timestamp, and retry-later outcome. Partial,
-        legacy-only, or malformed shapes are not executable retry authority and
-        fail closed without terminalization from this verifier.
+        Required fields: materialization_status=RETRY_PENDING, broker_ready=False,
+          materialization_attempts (int >= 1), materialization_next_retry_at,
+          materialization_reason, materialization_last_failure_at.
+
+        Removed: materialization_owner, materialization_retry_deadline,
+                 materialization_attempt_count, materialization_retry_reason.
         """
         get_fn = getattr(self.osm, "get_order", None)
         if not callable(get_fn):
@@ -1128,52 +1106,21 @@ class PendingTriggerRestartRecovery:
         rr_oid    = str(reread.get("local_order_id") or "").strip()
         rr_client = str(reread.get("client_id") or reread.get("client_email") or "").strip().lower()
         rr_mode   = str(reread.get("execution_mode") or "").strip().lower()
-        rr_signal = str(reread.get("signal_id") or "").strip()
-        rr_kind   = str(reread.get("kind") or "").strip().upper()
-        expected_signal = str((row or {}).get("signal_id") or "").strip()
-        expected_kind   = str((row or {}).get("kind") or "").strip().upper()
         contract  = str(reread.get("contract") or "").strip()
         if status != "PENDING_TRIGGER":
             return None
         if not rr_oid or rr_oid != local_oid:
             return None
-        if expected_kind != "ENTRY" or rr_kind != "ENTRY":
-            return None
-        if not expected_signal or not rr_signal or rr_signal != expected_signal:
-            return None
         if not rr_client or rr_client != self.client_id.lower():
             return None
         if not rr_mode or rr_mode != self.execution_mode:
+            return None
+        if not contract or not contract.upper().startswith("DEFERRED:"):
             return None
         if reread.get("broker_order_id") or reread.get("submitted_ts"):
             return None
 
         meta = _extract_meta(reread)
-        nested_materialization = meta.get("materialization")
-        if nested_materialization is not None and not isinstance(
-            nested_materialization, dict
-        ):
-            return None
-        # The classifier inspects every persisted outcome surface; the durable
-        # reread must apply the same authority rule, including nested legacy
-        # materialization payloads.
-        for _surface in (meta, nested_materialization or {}):
-            for _key in ("materialization_outcome", "outcome"):
-                _outcome = str(_surface.get(_key) or "").strip().upper()
-                if _outcome and _outcome not in {
-                    "RETRY_LATER_SELECTOR_BUDGET",
-                    "RETRY_LATER_DATA_UNAVAILABLE",
-                }:
-                    return None
-        _lifecycle = str(meta.get("lifecycle_state") or "").strip().upper()
-        if _lifecycle in {"CANCELED", "EXPIRED", "REJECTED", "ERROR"}:
-            return None
-        _is_deferred_contract = contract.upper().startswith("DEFERRED:")
-        _is_marked_blank_deferred = (
-            not contract and meta.get("contract_deferred") is True
-        )
-        if not (_is_deferred_contract or _is_marked_blank_deferred):
-            return None
         materialization_outcome = str(
             meta.get("materialization_outcome") or ""
         ).strip().upper()
@@ -1187,21 +1134,9 @@ class PendingTriggerRestartRecovery:
         next_at      = str(meta.get(_MAT_NEXT_RETRY_AT) or "").strip()
         reason       = str(meta.get(_MAT_REASON_FIELD) or "").strip()
         last_fail    = str(meta.get(_MAT_LAST_FAILURE_FIELD) or "").strip()
-        attempts = meta.get(_MAT_ATTEMPTS_FIELD)
-        retry_attempt = meta.get(_MAT_RETRY_ATTEMPT_FIELD)
-        breach_attempt_count = meta.get(_MAT_BREACH_ATTEMPT_FIELD)
-        generation = meta.get(_MAT_GENERATION_FIELD)
-        durable_max = meta.get(_MAT_MAX_ATTEMPTS_FIELD)
-        # Durable JSONB proof must be typed, not merely int-coercible.  These
-        # are the same mirrors consumed by APRecovery and the OSM CAS fence.
-        counters = (attempts, retry_attempt, breach_attempt_count, generation, durable_max)
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in counters):
-            return None
-        if retry_attempt != attempts or breach_attempt_count != attempts:
-            return None
-        if generation < 1 or durable_max < attempts:
-            return None
-        if not is_retryable_selector_reason(reason):
+        try:
+            attempts = int(meta.get(_MAT_ATTEMPTS_FIELD))
+        except (TypeError, ValueError):
             return None
 
         try:
@@ -1217,13 +1152,9 @@ class PendingTriggerRestartRecovery:
             return None
         if broker_ready is not False:
             return None
-        # The row's persisted max is its own ceiling; the current
-        # resolver is the live hard ceiling. Use the effective minimum so a
-        # mid-session config change does not silently invalidate every
-        # in-flight retry, while neither authority can be exceeded.
         if attempts < 1 or attempts > _max:
             return None
-        if not next_at or not reason or _parse_iso(last_fail) is None:
+        if not next_at or not reason:
             return None
         next_dt = _parse_iso(next_at)
         if next_dt is None:
@@ -1727,23 +1658,6 @@ def _extract_meta(row: dict) -> dict:
         except Exception:
             meta = {}
     return meta if isinstance(meta, dict) else {}
-
-
-def _terminal_materialization_outcome(row: dict) -> str:
-    """Return the recognized terminal outcome from any persisted surface."""
-    meta = _extract_meta(row)
-    nested = meta.get("materialization")
-    nested = nested if isinstance(nested, dict) else {}
-    values = (
-        meta.get("materialization_outcome"),
-        nested.get("outcome"),
-        nested.get("materialization_outcome"),
-    )
-    for value in values:
-        outcome = str(value or "").strip()
-        if outcome and outcome.upper() in _TERMINAL_MATERIALIZATION_OUTCOMES:
-            return outcome
-    return ""
 
 
 def _canonical_underlying_trigger(row: dict) -> Optional[float]:
