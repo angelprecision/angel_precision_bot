@@ -1756,6 +1756,34 @@ class APExecutionCore:
             return SCORE_FLOOR_LIVE, CONTEXT_FLOOR_LIVE
         return SCORE_FLOOR_PAPER, CONTEXT_FLOOR_PAPER
 
+    def _position_snapshot_mode(self) -> str:
+        """Resolve the canonical mode required by APPositionManager.snapshot().
+
+        Position truth must remain scoped to the runner's exact LIVE/PAPER
+        identity. Never call snapshot without an explicit mode and never
+        invent a default when runtime identity is malformed.
+        """
+        resolved = []
+        for attr in ("mode", "execution_mode"):
+            if not hasattr(self, attr):
+                continue
+            raw = getattr(self, attr)
+            if raw is None or not str(raw).strip():
+                continue
+            normalized = _normalize_execution_mode(raw)
+            if normalized is None:
+                raise RuntimeError(
+                    f"position_snapshot_execution_mode_invalid:{attr}={raw!r}"
+                )
+            resolved.append((attr, normalized))
+        if not resolved:
+            raise RuntimeError("position_snapshot_execution_mode_invalid:missing")
+        values = {value for _, value in resolved}
+        if len(values) != 1:
+            detail = ",".join(f"{attr}={value}" for attr, value in resolved)
+            raise RuntimeError(f"position_snapshot_execution_mode_conflict:{detail}")
+        return resolved[0][1]
+
     def _current_open_position_count(self) -> int:
         """
         Return the most reliable open-position count available.
@@ -1765,7 +1793,19 @@ class APExecutionCore:
         """
         if self.position_manager is not None:
             try:
-                snap = self.position_manager.snapshot()
+                snapshot_mode = self._position_snapshot_mode()
+            except Exception as exc:
+                log.critical(
+                    "[%s] position_manager.snapshot blocked — invalid execution mode; "
+                    "failing closed at max positions: %s",
+                    getattr(self, "email", "?"), exc,
+                )
+                try:
+                    return max(0, int(self._max_positions))
+                except (AttributeError, TypeError, ValueError):
+                    return max(0, int(MAX_POSITIONS))
+            try:
+                snap = self.position_manager.snapshot(mode=snapshot_mode)
                 return int(snap.get("open_count") or 0)
             except Exception as exc:
                 log.warning(
@@ -1779,7 +1819,15 @@ class APExecutionCore:
         """Return pending entry count from position-manager snapshot when available."""
         if self.position_manager is not None:
             try:
-                snap = self.position_manager.snapshot()
+                snapshot_mode = self._position_snapshot_mode()
+            except Exception as exc:
+                log.critical(
+                    "[%s] pending-entry snapshot blocked — invalid execution mode: %s",
+                    getattr(self, "email", "?"), exc,
+                )
+                return 0
+            try:
+                snap = self.position_manager.snapshot(mode=snapshot_mode)
                 return int(snap.get("pending_entries") or 0)
             except Exception:
                 return 0
