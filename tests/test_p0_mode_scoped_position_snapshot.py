@@ -229,3 +229,265 @@ def test_position_manager_snapshot_scopes_position_rows_and_capital_by_mode(monk
     )
     assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in summary_sql
     assert summary_params == ("start", "end", "client@example.com", "live")
+
+
+# ---------------------------------------------------------------------------
+# Driver-faithful PostgreSQL behavioral cases (audit requirement)
+# Each test uses the same fake-cursor harness as the existing DB test above
+# and verifies the SQL + params that would be sent to PostgreSQL.
+# ---------------------------------------------------------------------------
+
+def _make_fake_conn_factory(rows_by_query: dict, executed: list):
+    """
+    Build a context-manager conn() factory that:
+    - accepts SET TRANSACTION … silently
+    - routes SELECT queries to rows_by_query keyed on a substring of the SQL
+    - records every (sql, params) pair in `executed`
+    """
+    import contextlib
+
+    class _FakeCursor:
+        def __init__(self):
+            self._rows = []
+
+        def execute(self, sql, params=()):
+            executed.append((sql.strip(), params))
+            self._rows = []
+            for key, rows in rows_by_query.items():
+                if key in sql:
+                    self._rows = rows
+                    break
+
+        def fetchall(self):
+            return list(self._rows)
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+    @contextlib.contextmanager
+    def _conn_ctx():
+        yield _FakeCursor()
+
+    return _conn_ctx
+
+
+def _standard_broker_trades_stub():
+    return {
+        "trades_today": 0,
+        "trades_today_source": "test",
+        "synthetic_position_rows_ignored": 0,
+        "null_mode_fills_ignored": 0,
+        "wrong_mode_fills_ignored": 0,
+        "missing_identity_fills_ignored": 0,
+        "trade_count_query_status": "ok",
+    }
+
+
+def test_live_snapshot_sees_only_live_open_positions(monkeypatch):
+    """LIVE runner snapshot: only LIVE open positions are returned; PAPER ignored."""
+    executed = []
+    rows_by_query = {
+        # active positions — return one LIVE row, one PAPER row for the DB
+        # but the SQL itself must filter by mode so only LIVE comes back
+        "SELECT *": [
+            {
+                "id": "live-pos-1",
+                "status": "OPEN",
+                "execution_mode": "live",
+                "entry_price": 1.00,
+                "quantity": 1,
+                "quantity_remaining": 1,
+                "capital_allocated": 100.0,
+                "symbol": "SPY260919C00560000",
+                "underlying": "SPY",
+                "direction": "CALL",
+                "meta": {},
+            }
+        ],
+        # terminal-order counts
+        "SELECT id, status, quantity_remaining": [],
+        # realized P&L
+        "COALESCE(SUM(realized_pnl)": [{"total": 0.0}],
+    }
+
+    import ap.position_manager as position_manager
+
+    monkeypatch.setattr(position_manager, "conn", _make_fake_conn_factory(rows_by_query, executed))
+    monkeypatch.setattr(position_manager, "run_with_retry", lambda fn, **_: fn())
+    monkeypatch.setattr(
+        position_manager,
+        "_broker_confirmed_entry_trades_today",
+        lambda *a, **kw: _standard_broker_trades_stub(),
+    )
+
+    manager = position_manager.APPositionManager("client@example.com")
+    manager._market_day_bounds_utc = lambda: ("start", "end", "2026-09-02")
+
+    snapshot = manager.snapshot(mode="live")
+
+    # Snapshot returns the one LIVE position
+    assert snapshot["open_count"] == 1
+    assert snapshot["open_position_ids"] == ["live-pos-1"]
+
+    # Every positions SELECT must carry the mode predicate and param
+    positions_queries = [
+        (sql, params)
+        for sql, params in executed
+        if "LOWER(TRIM(COALESCE(execution_mode" in sql
+    ]
+    assert positions_queries, "Expected at least one mode-scoped positions query"
+    for sql, params in positions_queries:
+        assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in sql, (
+            f"Mode predicate missing from positions query:\n{sql}"
+        )
+        assert "live" in params, (
+            f"Mode param 'live' missing from params: {params}"
+        )
+
+
+def test_paper_snapshot_sees_only_paper_open_positions(monkeypatch):
+    """PAPER runner snapshot: only PAPER open positions returned; LIVE ignored."""
+    executed = []
+    rows_by_query = {
+        "SELECT *": [
+            {
+                "id": "paper-pos-1",
+                "status": "OPEN",
+                "execution_mode": "paper",
+                "entry_price": 2.00,
+                "quantity": 2,
+                "quantity_remaining": 2,
+                "capital_allocated": 200.0,
+                "symbol": "QQQ260919C00480000",
+                "underlying": "QQQ",
+                "direction": "CALL",
+                "meta": {},
+            }
+        ],
+        "SELECT id, status, quantity_remaining": [],
+        "COALESCE(SUM(realized_pnl)": [{"total": 5.0}],
+    }
+
+    import ap.position_manager as position_manager
+
+    monkeypatch.setattr(position_manager, "conn", _make_fake_conn_factory(rows_by_query, executed))
+    monkeypatch.setattr(position_manager, "run_with_retry", lambda fn, **_: fn())
+    monkeypatch.setattr(
+        position_manager,
+        "_broker_confirmed_entry_trades_today",
+        lambda *a, **kw: _standard_broker_trades_stub(),
+    )
+
+    manager = position_manager.APPositionManager("client@example.com")
+    manager._market_day_bounds_utc = lambda: ("start", "end", "2026-09-02")
+
+    snapshot = manager.snapshot(mode="paper")
+
+    assert snapshot["open_count"] == 1
+    assert snapshot["open_position_ids"] == ["paper-pos-1"]
+
+    for sql, params in executed:
+        if "FROM positions" in sql or "COALESCE(SUM(realized_pnl)" in sql:
+            assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in sql, (
+                f"Mode predicate missing:\n{sql}"
+            )
+            assert "paper" in params, f"Mode param 'paper' missing: {params}"
+
+
+def test_capital_and_pnl_stay_mode_scoped(monkeypatch):
+    """capital_deployed and realized_pnl_today are derived from mode-scoped queries only."""
+    executed = []
+    rows_by_query = {
+        "SELECT *": [
+            {
+                "id": "live-pos-A",
+                "status": "OPEN",
+                "execution_mode": "live",
+                "entry_price": 3.50,
+                "quantity": 4,
+                "quantity_remaining": 4,
+                "capital_allocated": 350.0,
+                "symbol": "SPY260919C00570000",
+                "underlying": "SPY",
+                "direction": "CALL",
+                "meta": {},
+            }
+        ],
+        "SELECT id, status, quantity_remaining": [],
+        "COALESCE(SUM(realized_pnl)": [{"realized_pnl_today": 42.0, "capital_deployed": 350.0}],
+    }
+
+    import ap.position_manager as position_manager
+
+    monkeypatch.setattr(position_manager, "conn", _make_fake_conn_factory(rows_by_query, executed))
+    monkeypatch.setattr(position_manager, "run_with_retry", lambda fn, **_: fn())
+    monkeypatch.setattr(
+        position_manager,
+        "_broker_confirmed_entry_trades_today",
+        lambda *a, **kw: _standard_broker_trades_stub(),
+    )
+
+    manager = position_manager.APPositionManager("client@example.com")
+    manager._market_day_bounds_utc = lambda: ("start", "end", "2026-09-02")
+
+    snapshot = manager.snapshot(mode="live")
+
+    assert snapshot["capital_deployed"] == 350.0
+    assert snapshot["realized_pnl_today"] == 42.0
+
+    # Confirm P&L query is also mode-scoped
+    pnl_queries = [(s, p) for s, p in executed if "COALESCE(SUM(realized_pnl)" in s]
+    assert pnl_queries, "Expected at least one realized_pnl query"
+    for sql, params in pnl_queries:
+        assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in sql
+        assert "live" in params
+
+
+def test_invalid_mode_raises_before_any_snapshot_read(monkeypatch):
+    """snapshot(mode=None/invalid) must raise before touching any DB query."""
+    executed = []
+
+    import ap.position_manager as position_manager
+    import contextlib
+
+    class _SentinelCursor:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+    @contextlib.contextmanager
+    def _sentinel_conn():
+        yield _SentinelCursor()
+
+    monkeypatch.setattr(position_manager, "conn", _sentinel_conn)
+    monkeypatch.setattr(position_manager, "run_with_retry", lambda fn, **_: fn())
+
+    manager = position_manager.APPositionManager("client@example.com")
+    manager._market_day_bounds_utc = lambda: ("start", "end", "2026-09-02")
+
+    import pytest as _pytest
+
+    # None mode — must raise, zero DB reads
+    executed.clear()
+    with _pytest.raises((ValueError, RuntimeError)):
+        manager.snapshot(mode=None)
+
+    data_reads = [(s, p) for s, p in executed if "FROM positions" in s or "COALESCE" in s]
+    assert not data_reads, (
+        f"snapshot(mode=None) made {len(data_reads)} data read(s) before raising: {data_reads}"
+    )
+
+    # Invalid string mode
+    executed.clear()
+    with _pytest.raises((ValueError, RuntimeError)):
+        manager.snapshot(mode="staging")
+
+    data_reads = [(s, p) for s, p in executed if "FROM positions" in s or "COALESCE" in s]
+    assert not data_reads, (
+        f"snapshot(mode='staging') made {len(data_reads)} data read(s) before raising: {data_reads}"
+    )
