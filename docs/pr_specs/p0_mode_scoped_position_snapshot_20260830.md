@@ -24,17 +24,17 @@ Scope invariant: no selector, score, sizing, threshold, scanner, broker submit/c
 
 ## Proof — test coverage (14 structural/mock cases; exact-head P0 required)
 
-**ExecutionCore layer (mocked `_RecordingPositionManager`):**
-- LIVE/PAPER canonical mode resolution (including whitespace normalization)
-- Successful scoped snapshot wins over local process fallback
-- Real snapshot failure preserves existing fallback
-- Invalid or conflicting identity (`""`, `"staging"`, `LIVE`+`staging`, `LIVE`+`paper`) never reaches `snapshot()`
+**ExecutionCore layer (9 collected cases; mocked `_RecordingPositionManager`):**
+- LIVE/PAPER canonical mode resolution (3 parametrized cases, including whitespace normalization)
+- Successful scoped snapshot wins over local process fallback (1 case)
+- Real snapshot failure preserves existing fallback (1 case)
+- Invalid or conflicting identity (4 parametrized cases: `""`, `"staging"`, `LIVE`+`staging`, `LIVE`+`paper`) never reaches `snapshot()`
 
-**PositionManager SQL layer (structural/mock coverage; not PostgreSQL-backed):**
-- Existing: `snapshot(mode="live")` returns only live-tagged position and scopes all three SQL queries with the mode predicate and `"live"` param
-- NEW: LIVE runner sees only LIVE open positions; PAPER runner sees only PAPER open positions
-- NEW: `capital_deployed` and `realized_pnl_today` sourced from mode-scoped summary query only
-- NEW: `snapshot(mode=None)` and `snapshot(mode="staging")` raise before any data read reaches the DB
+**PositionManager SQL layer (5 structural/mock cases; not PostgreSQL-backed):**
+- Existing: `snapshot(mode="live")` returns only live-tagged position and scopes all three SQL queries with the mode predicate and `"live"` param (1 case)
+- NEW: LIVE runner sees only LIVE open positions; PAPER runner sees only PAPER open positions (2 cases)
+- NEW: `capital_deployed` and `realized_pnl_today` sourced from mode-scoped summary query only (1 case)
+- NEW: `snapshot(mode=None)` and `snapshot(mode="staging")` raise before any data read reaches the DB (1 case)
 
 These tests do not prove psycopg2/PostgreSQL driver execution; exact-head P0 CI is the required integration evidence.
 
@@ -44,4 +44,5 @@ These tests do not prove psycopg2/PostgreSQL driver execution; exact-head P0 CI 
 - Merge base confirmed: `16564d7e9df6fd1b4320c76173446c33891a994f`
 - No #528 files resurrected (`ap/pending_trigger_classifier.py`, `ap/pending_trigger_restart_recovery.py` — zero diff)
 - Final production diff: `ap_execution_core.py` (+48 lines), `ap/position_manager.py` (+24 lines)
-- 14/14 tests green on new exact head
+- No PostgreSQL-backed case is present in this PR; exact-head P0 remains the required integration evidence
+- Current exact-head Actions attempts terminate before job creation as `startup_failure` with zero jobs
