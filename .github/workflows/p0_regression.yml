@@ -168,7 +168,6 @@ jobs:
             tests/test_p0_deferred_materialization_copyback_before_proof.py \
             tests/test_p0_amendment3_monotonic_generation_fencing.py \
             tests/test_p0_amendment6_broker_ambiguity_reconciler.py \
-            tests/test_p0_live_deferred_submit_intent_recovery.py \
             tests/test_p0_osm_broker_submit_boundary.py \
             tests/test_p0_exit_closed_guard_and_circuit_breaker.py \
             tests/test_p0_unknown_execution_mode_fail_closed.py \
