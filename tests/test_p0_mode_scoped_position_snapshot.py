@@ -95,7 +95,7 @@ def test_invalid_or_conflicting_identity_never_calls_unscoped_snapshot(
     assert manager.calls == []
 
 
-def test_position_manager_snapshot_scopes_position_rows_and_capital_by_mode(monkeypatch):
+def test_position_manager_snapshot_scopes_position_rows_and_capital_by_mode_structural_mock(monkeypatch):
     import ap.position_manager as position_manager
 
     executed = []
@@ -232,12 +232,12 @@ def test_position_manager_snapshot_scopes_position_rows_and_capital_by_mode(monk
 
 
 # ---------------------------------------------------------------------------
-# Driver-faithful PostgreSQL behavioral cases (audit requirement)
-# Each test uses the same fake-cursor harness as the existing DB test above
-# and verifies the SQL + params that would be sent to PostgreSQL.
+# Structural/mock SQL coverage (not PostgreSQL-backed)
+# These tests use fake cursors and verify the SQL shape/parameters passed by
+# this code path. They do not establish PostgreSQL driver behavior.
 # ---------------------------------------------------------------------------
 
-def _make_fake_conn_factory(rows_by_query: dict, executed: list):
+def _make_structural_mock_conn_factory(rows_by_query: dict, executed: list):
     """
     Build a context-manager conn() factory that:
     - accepts SET TRANSACTION … silently
@@ -283,7 +283,7 @@ def _standard_broker_trades_stub():
     }
 
 
-def test_live_snapshot_sees_only_live_open_positions(monkeypatch):
+def test_live_snapshot_sees_only_live_open_positions_structural_mock(monkeypatch):
     """LIVE runner snapshot: only LIVE open positions are returned; PAPER ignored."""
     executed = []
     rows_by_query = {
@@ -312,7 +312,7 @@ def test_live_snapshot_sees_only_live_open_positions(monkeypatch):
 
     import ap.position_manager as position_manager
 
-    monkeypatch.setattr(position_manager, "conn", _make_fake_conn_factory(rows_by_query, executed))
+    monkeypatch.setattr(position_manager, "conn", _make_structural_mock_conn_factory(rows_by_query, executed))
     monkeypatch.setattr(position_manager, "run_with_retry", lambda fn, **_: fn())
     monkeypatch.setattr(
         position_manager,
@@ -345,7 +345,7 @@ def test_live_snapshot_sees_only_live_open_positions(monkeypatch):
         )
 
 
-def test_paper_snapshot_sees_only_paper_open_positions(monkeypatch):
+def test_paper_snapshot_sees_only_paper_open_positions_structural_mock(monkeypatch):
     """PAPER runner snapshot: only PAPER open positions returned; LIVE ignored."""
     executed = []
     rows_by_query = {
@@ -370,7 +370,7 @@ def test_paper_snapshot_sees_only_paper_open_positions(monkeypatch):
 
     import ap.position_manager as position_manager
 
-    monkeypatch.setattr(position_manager, "conn", _make_fake_conn_factory(rows_by_query, executed))
+    monkeypatch.setattr(position_manager, "conn", _make_structural_mock_conn_factory(rows_by_query, executed))
     monkeypatch.setattr(position_manager, "run_with_retry", lambda fn, **_: fn())
     monkeypatch.setattr(
         position_manager,
@@ -394,7 +394,7 @@ def test_paper_snapshot_sees_only_paper_open_positions(monkeypatch):
             assert "paper" in params, f"Mode param 'paper' missing: {params}"
 
 
-def test_capital_and_pnl_stay_mode_scoped(monkeypatch):
+def test_capital_and_pnl_stay_mode_scoped_structural_mock(monkeypatch):
     """capital_deployed and realized_pnl_today are derived from mode-scoped queries only."""
     executed = []
     rows_by_query = {
@@ -419,7 +419,7 @@ def test_capital_and_pnl_stay_mode_scoped(monkeypatch):
 
     import ap.position_manager as position_manager
 
-    monkeypatch.setattr(position_manager, "conn", _make_fake_conn_factory(rows_by_query, executed))
+    monkeypatch.setattr(position_manager, "conn", _make_structural_mock_conn_factory(rows_by_query, executed))
     monkeypatch.setattr(position_manager, "run_with_retry", lambda fn, **_: fn())
     monkeypatch.setattr(
         position_manager,
@@ -443,7 +443,7 @@ def test_capital_and_pnl_stay_mode_scoped(monkeypatch):
         assert "live" in params
 
 
-def test_invalid_mode_raises_before_any_snapshot_read(monkeypatch):
+def test_invalid_mode_raises_before_any_snapshot_read_structural_mock(monkeypatch):
     """snapshot(mode=None/invalid) must raise before touching any DB query."""
     executed = []
 
