@@ -22,7 +22,7 @@ Scope invariant: no selector, score, sizing, threshold, scanner, broker submit/c
 4. Missing/malformed/conflicting mode must never invent a default — raises immediately, fails closed.
 5. Preserve current fallback only when an authoritative scoped snapshot itself fails.
 
-## Proof — test coverage (14 cases, all green on rebased head)
+## Proof — test coverage (14 structural/mock cases; exact-head P0 required)
 
 **ExecutionCore layer (mocked `_RecordingPositionManager`):**
 - LIVE/PAPER canonical mode resolution (including whitespace normalization)
@@ -30,11 +30,13 @@ Scope invariant: no selector, score, sizing, threshold, scanner, broker submit/c
 - Real snapshot failure preserves existing fallback
 - Invalid or conflicting identity (`""`, `"staging"`, `LIVE`+`staging`, `LIVE`+`paper`) never reaches `snapshot()`
 
-**PositionManager SQL layer (fake cursor, driver-faithful):**
+**PositionManager SQL layer (structural/mock coverage; not PostgreSQL-backed):**
 - Existing: `snapshot(mode="live")` returns only live-tagged position and scopes all three SQL queries with the mode predicate and `"live"` param
 - NEW: LIVE runner sees only LIVE open positions; PAPER runner sees only PAPER open positions
 - NEW: `capital_deployed` and `realized_pnl_today` sourced from mode-scoped summary query only
 - NEW: `snapshot(mode=None)` and `snapshot(mode="staging")` raise before any data read reaches the DB
+
+These tests do not prove psycopg2/PostgreSQL driver execution; exact-head P0 CI is the required integration evidence.
 
 ## Rebase audit (performed 2026-09-02)
 
