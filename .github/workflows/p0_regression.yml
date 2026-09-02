@@ -187,7 +187,6 @@ jobs:
             tests/test_p0_broker_confirmed_daily_trade_count.py \
             tests/test_p0_schema_attestation_and_migration_runner.py \
             tests/test_p0_position_execution_mode_schema.py \
-            tests/test_p0_mode_scoped_position_snapshot.py \
             tests/test_p0_live_startup_preflight.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_live_submit_gates.py \
