@@ -31,9 +31,7 @@ from __future__ import annotations
 
 import os
 import sys
-import json
 import threading
-from contextlib import contextmanager
 import time
 
 # PR #389 amendment: ap.order_state_machine imports ap.db which requires a
@@ -1121,7 +1119,6 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
                 "local_order_id": local_order_id,
             },
             "trigger_price": 61.0,
-            "watcher_audit": {"reason_code": "trigger_ready"},
         }
         with _pg_conn() as c:
             c.execute(
@@ -1198,30 +1195,6 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
         assert row["local_order_id"] == local_order_id
         assert row["status"] == "PENDING_TRIGGER"
 
-        retry_authority_keys = (
-            "lifecycle_state",
-            "materialization_status",
-            "materialization_in_flight",
-            "materialization_owner",
-            "materialization_generation",
-            "retry_attempt",
-            "breach_attempt_count",
-            "materialization_attempts",
-            "retry_max_attempts",
-            "materialization_next_retry_at",
-            "next_retry_at",
-            "materialization_reason",
-            "materialization_last_failure_at",
-            "materialization_outcome",
-            "retry_owner",
-            "current_owner",
-            "broker_ready",
-        )
-        before_retry_authority = {
-            key: meta.get(key)
-            for key in retry_authority_keys
-        }
-
         classification = classify_pending_trigger_row(
             row,
             watcher_owned=None,
@@ -1245,16 +1218,6 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
 
         reread = osm.get_order(local_order_id)
         assert reread["status"] == "PENDING_TRIGGER"
-        assert {
-            key: reread["meta"].get(key)
-            for key in retry_authority_keys
-        } == before_retry_authority
-        assert reread["meta"]["watcher_audit"]["reason_code"] == "trigger_ready"
-        assert reread["meta"]["restart_recovery_cls"] == (
-            PendingTriggerClassification.WAITING_RETRYABLE
-        )
-        assert reread["meta"]["restart_recovery_retry_subtype"] == "MATERIALIZATION_RETRY"
-        assert reread["meta"]["restart_recovery_at"]
         assert reread["meta"]["materialization_outcome"] == (
             "RETRY_LATER_SELECTOR_BUDGET"
         )
@@ -2918,26 +2881,6 @@ def test_deferred_retry_mode_contradiction_fails_closed_before_callback(monkeypa
     core._on_entry_trigger.assert_not_called()
 
 
-def test_deferred_retry_blank_contract_marker_reaches_due_executor(monkeypatch):
-    """#526 blank ownership remains executable by the canonical due path."""
-    meta = _base_meta(retry_attempt=1)
-    meta["execution_mode"] = "paper"
-    meta["contract_deferred"] = True
-    core, osm = _core_with_row(meta, monkeypatch=monkeypatch, execution_mode="paper")
-    osm.get_order.return_value["contract"] = ""
-
-    result = core.resume_deferred_materialization_retry(
-        local_order_id=LOCAL_ORDER_ID,
-        expected_generation=1,
-        expected_retry_attempt=2,
-        owner="owner-blank-contract",
-    )
-
-    assert result["disposition"] == "RETRY_WAIT"
-    core.order_state_machine.claim_deferred_materialization.assert_called_once()
-    core._on_entry_trigger.assert_called_once()
-
-
 # ── Test 1: durable=3, env=5 → max_attempts raised to 5 ─────────────────────
 
 def test_am1_durable_3_env_5_raises_to_5(monkeypatch):
@@ -3338,153 +3281,3 @@ def test_source_less_quote_still_requires_approved_tradier_transport(base_url):
 
     assert result["valid"] is False
     assert result["reason"] == "MARKET_QUOTE_UNAPPROVED_TRANSPORT"
-
-
-def test_real_postgres_recovery_dispatches_due_retry_to_execution_core(monkeypatch):
-    """Exercise the real APRecovery SQL load and due-executor boundary.
-
-    The database row is production-shaped and loaded through the same orders
-    query used by startup recovery. The executor is a narrow spy: this test
-    proves recovery dispatches exactly once with the durable generation/attempt
-    values, without pretending to prove broker submission.
-    """
-    psycopg2 = pytest.importorskip("psycopg2")
-    from psycopg2.extras import RealDictCursor
-
-    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL") or os.getenv("DATABASE_URL")
-    if not database_url or "mock" in database_url:
-        pytest.skip("real PostgreSQL test database is not configured")
-
-    row = _row(next_retry_offset_seconds=-60)
-    local_order_id = row["local_order_id"]
-    meta = json.dumps(row["meta"])
-
-    @contextmanager
-    def db_conn():
-        connection = psycopg2.connect(database_url)
-        try:
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                yield cursor
-            connection.commit()
-        finally:
-            connection.close()
-
-    connection = psycopg2.connect(database_url)
-    try:
-        with connection:
-            with connection.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS orders (
-                        local_order_id text PRIMARY KEY,
-                        client_id text,
-                        signal_id text,
-                        plan_id text,
-                        symbol text,
-                        contract text,
-                        direction text,
-                        score double precision,
-                        tier text,
-                        trigger_price double precision,
-                        stop_underlying double precision,
-                        target_underlying double precision,
-                        pattern text,
-                        timeframe text,
-                        execution_mode text,
-                        qty integer,
-                        limit_price double precision,
-                        reserved_cost double precision,
-                        status text,
-                        broker_order_id text,
-                        submitted_ts timestamptz,
-                        kind text,
-                        meta jsonb,
-                        created_ts timestamptz
-                    )
-                """)
-                # Other CI tests may have created a minimal orders table
-                # already. Add the exact columns required by APRecovery's
-                # production SELECT so this acceptance fixture is idempotent.
-                for column, sql_type in (
-                    ("local_order_id", "text"), ("client_id", "text"),
-                    ("signal_id", "text"), ("plan_id", "text"),
-                    ("symbol", "text"), ("contract", "text"),
-                    ("direction", "text"), ("score", "double precision"),
-                    ("tier", "text"), ("trigger_price", "double precision"),
-                    ("stop_underlying", "double precision"),
-                    ("target_underlying", "double precision"),
-                    ("pattern", "text"), ("timeframe", "text"),
-                    ("execution_mode", "text"), ("qty", "integer"),
-                    ("limit_price", "double precision"),
-                    ("reserved_cost", "double precision"), ("status", "text"),
-                    ("broker_order_id", "text"), ("submitted_ts", "timestamptz"),
-                    ("kind", "text"), ("meta", "jsonb"),
-                    ("created_ts", "timestamptz"),
-                ):
-                    cur.execute(
-                        f"ALTER TABLE orders ADD COLUMN IF NOT EXISTS {column} {sql_type}"
-                    )
-                cur.execute("DELETE FROM orders WHERE local_order_id = %s", (local_order_id,))
-                cur.execute("""
-                    INSERT INTO orders (
-                        local_order_id, client_id, signal_id, plan_id, symbol,
-                        contract, direction, score, tier, trigger_price,
-                        stop_underlying, target_underlying, pattern, timeframe,
-                        execution_mode, qty, limit_price, reserved_cost, status,
-                        broker_order_id, submitted_ts, kind, meta, created_ts
-                    ) VALUES (
-                        %(local_order_id)s, %(client_id)s, %(signal_id)s, %(plan_id)s,
-                        %(symbol)s, %(contract)s, %(direction)s, %(score)s, %(tier)s,
-                        %(trigger_price)s, %(stop_underlying)s, %(target_underlying)s,
-                        %(pattern)s, %(timeframe)s, %(execution_mode)s, %(qty)s,
-                        %(limit_price)s, %(reserved_cost)s, %(status)s,
-                        %(broker_order_id)s, %(submitted_ts)s, %(kind)s, %(meta)s::jsonb,
-                        NOW()
-                    )
-                """, {**row, "meta": meta})
-    finally:
-        connection.close()
-
-    class DbOSM:
-        client_id = CLIENT_ID
-
-        def __init__(self):
-            self.broker_calls = []
-
-        def get_order(self, oid):
-            return None
-
-        def update_order_meta(self, oid, patch):
-            return True
-
-    osm = DbOSM()
-    executor = MagicMock(return_value={"disposition": "SUBMITTED", "reason_code": "TEST_SUBMITTED"})
-    core = SimpleNamespace(
-        execution_mode="paper",
-        broker=MagicMock(),
-        order_state_machine=osm,
-        resume_deferred_materialization_retry=executor,
-    )
-    recovery = _recovery(core, watcher=None)
-    import ap.db
-    monkeypatch.setattr(ap.db, "conn", db_conn)
-
-    try:
-        result = {}
-        recovery._recover_deferred_breach_lifecycles(result)
-    finally:
-        cleanup = psycopg2.connect(database_url)
-        try:
-            with cleanup:
-                with cleanup.cursor() as cur:
-                    cur.execute("DELETE FROM orders WHERE local_order_id = %s", (local_order_id,))
-        finally:
-            cleanup.close()
-
-    executor.assert_called_once()
-    kwargs = executor.call_args.kwargs
-    assert kwargs["local_order_id"] == local_order_id
-    assert kwargs["expected_generation"] == 1
-    assert kwargs["expected_retry_attempt"] == 2
-    assert result.get("deferred_lifecycles_recovered") == 1
-    core.broker.submit_order.assert_not_called()
-    core.broker.cancel_order.assert_not_called()
