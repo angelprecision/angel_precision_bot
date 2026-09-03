@@ -35,7 +35,12 @@ from ap_tier_engine          import APShadowTracker
 from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
-from ap.broker_submit_identity import canonical_broker_submit_key
+from ap.broker_submit_identity import (
+    build_entry_submit_payload,
+    canonical_broker_submit_key,
+    entry_submit_payload_hash,
+)
+from ap.brokers.tradier import TradierOrderQueryDeadlineExceeded
 from ap.utils                import now_utc_iso
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
@@ -47,6 +52,124 @@ except ImportError:
 log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+
+# Retained for compatibility with callers/configuration that still reference
+# the historical settlement setting.  A clean empty Tradier listing is not
+# proof that an ambiguous LIVE submit never reached the broker, so the
+# reconciler below never uses age to release its submit fence.
+DEFERRED_SUBMIT_SETTLEMENT_SECONDS = 30.0
+DEFERRED_SUBMIT_RECONCILIATION_RETRY_SECONDS = 15.0
+
+
+def _bounded_submit_reconcile_seconds(
+    env_name: str,
+    default: float,
+    *,
+    minimum: float = 1.0,
+    maximum: float = 300.0,
+) -> float:
+    try:
+        value = float(os.getenv(env_name, str(default)))
+    except (TypeError, ValueError, OverflowError):
+        value = float(default)
+    if not math.isfinite(value):
+        value = float(default)
+    return max(float(minimum), min(float(maximum), value))
+
+
+def _strict_reconcile_int(value, *, field: str) -> int:
+    """Parse a positive integer, including integral broker JSON floats."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{field} must be a positive integer")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{field} must be a positive integer")
+        number = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value.strip()):
+        number = int(value.strip())
+    else:
+        raise ValueError(f"{field} must be a positive integer")
+    if number <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return number
+
+
+def _strict_reconcile_float(value, *, field: str) -> float:
+    if isinstance(value, bool) or value is None or value == "":
+        raise ValueError(f"{field} must be a positive finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a positive finite number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{field} must be a positive finite number")
+    return number
+
+
+def _strict_reconcile_generation(value) -> int:
+    if isinstance(value, bool) or value is None or value == "":
+        raise ValueError("materialization_generation must be a positive integer")
+    if isinstance(value, int):
+        generation = value
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value.strip()):
+        generation = int(value.strip())
+    else:
+        raise ValueError("materialization_generation must be a positive integer")
+    if generation < 1:
+        raise ValueError("materialization_generation must be a positive integer")
+    return generation
+
+
+def _parse_reconcile_timestamp(value, *, field: str) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError(f"{field} is required")
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _remote_optional_text(remote: dict, *keys: str) -> str | None:
+    for key in keys:
+        if key not in remote:
+            continue
+        value = remote.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        if not isinstance(value, (str, int, float)):
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        if str(value).strip() == "":
+            continue
+        return str(value).strip()
+    return None
+
+
+def _remote_optional_text_shape_is_valid(remote: dict, *keys: str) -> bool:
+    """Reject present-but-structured identity fields as malformed truth."""
+    for key in keys:
+        if key not in remote:
+            continue
+        value = remote.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            return False
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (str, int, float))
+        )
+    return True
 
 
 def _normalize_execution_mode(value) -> str | None:
@@ -3908,37 +4031,20 @@ class APExecutionCore:
         self,
         *,
         local_order_id: str,
+        recovery_deadline_monotonic: float | None = None,
     ) -> dict:
-        """Reconcile a submit-intent crash window against broker truth.
+        """Resolve one durable ENTRY submit intent without a duplicate POST.
 
-        The submit path persists ``submit_intent_at`` and the Tradier
-        idempotency tag (``broker_submit_key`` = local_order_id) BEFORE
-        any broker bytes leave the process.  If the process crashes after
-        the broker accepted the order but before ``broker_order_id`` was
-        committed to the row, the durable row shows:
-
-            submit_intent_at present, broker_order_id absent
-
-        while a LIVE order may exist at the broker.  This is the
-        double-submit hazard: naively "resuming" such a row (the §2 path)
-        could place a second live order for Jason.
-
-        The broker account order list is queried by the durable tag and the
-        result is strongly checked against contract, side and quantity before
-        an existing order is adopted. Ambiguity remains fail-closed.
-
-          * ALREADY_RECONCILED — broker_order_id already present; the
-            order monitor owns the row.  (Defensive; the recovery load
-            filter normally excludes these.)
-          * NOT_IN_CRASH_WINDOW — no submit_intent_at; the row never
-            reached the broker-submit boundary and is safe for the normal
-            resume path.
-          * RECONCILE_PENDING — broker truth is unavailable or ambiguous.
-          * KEEP_WATCHER — inspection could not complete (OSM unavailable,
-            row read raised, row missing).
-
-        This method never POSTs. It only reads broker truth and adopts an exact
-        match through the existing order state machine.
+        The durable submit-intent CAS is the authority.  This function first
+        proves the complete identity, then classifies the broker response as
+        FOUND, NO_MATCH_OBSERVED, or UNKNOWN.  A clean empty query is only an
+        observation: it never proves that an ambiguous LIVE submit did not
+        reach the broker, so it retains the exact broker-submit fence and
+        schedules another bounded reconciliation poll.  Only the existing
+        canonical submit path may create submission authority, and this
+        ambiguous-POST recovery path never releases its fence.  A startup
+        recovery deadline is passed through to broker order enumeration; its
+        exhaustion is UNKNOWN and retains the exact broker-submit owner.
         """
         _owner_label = f"broker_reconciler:{self.client_id or self.email or ''}"
         _base = {
@@ -3946,10 +4052,16 @@ class APExecutionCore:
             "owner": _owner_label,
             "submit_intent_at": None,
             "broker_submit_key": None,
+            "broker_submit_payload_hash": None,
+            "generation": None,
+            "execution_mode": None,
+            "broker_truth": None,
+            "reconciliation_stage": "durable_submit_intent_proof",
+            "next_retry_at": None,
         }
 
-        def _keep(reason: str) -> dict:
-            return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
+        def _keep(reason: str, **extra) -> dict:
+            return {**_base, **extra, "disposition": "KEEP_WATCHER", "reason_code": reason}
 
         osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
         if osm is None:
@@ -3962,112 +4074,550 @@ class APExecutionCore:
                 "local_order_id=%s exc=%s",
                 self.client_id, local_order_id, exc,
             )
-            return _keep(f"RECONCILE_ROW_READ_ERROR:{type(exc).__name__}")
+            return _keep(
+                f"RECONCILE_ROW_READ_ERROR:{type(exc).__name__}:{str(exc)}",
+                exception_class=type(exc).__name__,
+                exception_message=str(exc),
+                reconciliation_stage="durable_submit_intent_read",
+            )
         if not isinstance(row, dict):
             return _keep("RECONCILE_ROW_MISSING")
 
-        # Identity: client_id (never touch another client's row)
+        # Identity and lifecycle are exact.  A missing field is not equivalent
+        # to a match: it is an unprovable row and must never reach Tradier.
         row_client_id = str(row.get("client_id") or "").strip().lower()
         expected_client_id = str(self.client_id or self.email or "").strip().lower()
-        if row_client_id and expected_client_id and row_client_id != expected_client_id:
-            return _keep("RECONCILE_CLIENT_ID_MISMATCH")
-        row_mode = str(row.get("execution_mode") or "").strip().lower()
-        expected_mode = str(getattr(self, "execution_mode", None) or getattr(self, "mode", None) or "").strip().lower()
-        if row_mode and expected_mode and row_mode != expected_mode:
-            return _keep("RECONCILE_EXECUTION_MODE_MISMATCH")
+        if not expected_client_id or row_client_id != expected_client_id:
+            return _keep(
+                "RECONCILE_CLIENT_ID_MISMATCH"
+                if row_client_id and row_client_id != expected_client_id
+                else "RECONCILE_CLIENT_ID_UNPROVEN"
+            )
+
+        from ap.order_state_machine import _durable_execution_mode
+
+        meta_raw = row.get("meta")
+        if meta_raw is None:
+            meta = {}
+        elif isinstance(meta_raw, str):
+            try:
+                meta = json.loads(meta_raw)
+            except Exception as exc:
+                return _keep(
+                    f"RECONCILE_SUBMIT_META_UNREADABLE:{type(exc).__name__}:{str(exc)}",
+                    exception_class=type(exc).__name__,
+                    exception_message=str(exc),
+                    reconciliation_stage="durable_submit_intent_proof",
+                )
+        else:
+            meta = meta_raw
+        if not isinstance(meta, dict):
+            return _keep(
+                "RECONCILE_SUBMIT_META_UNREADABLE:ValueError:expected object",
+                exception_class="ValueError",
+                exception_message="expected object",
+                reconciliation_stage="durable_submit_intent_proof",
+            )
+
+        row_mode = _durable_execution_mode(row, meta)
+        expected_mode = _normalize_execution_mode(
+            getattr(self, "execution_mode", None)
+            or getattr(self, "mode", None)
+        )
+        if row_mode is None or expected_mode is None or row_mode != expected_mode:
+            return _keep(
+                "RECONCILE_EXECUTION_MODE_MISMATCH"
+                if row_mode and expected_mode and row_mode != expected_mode
+                else "RECONCILE_EXECUTION_MODE_UNPROVEN"
+            )
 
         broker_order_id = str(row.get("broker_order_id") or "").strip()
-        meta = row.get("meta") or {}
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except Exception:
-                meta = {}
-        meta = meta or {}
         submit_intent_at = meta.get("submit_intent_at")
-        broker_submit_key = meta.get("broker_submit_key")
-        _base["submit_intent_at"] = submit_intent_at
-        _base["broker_submit_key"] = broker_submit_key
+        broker_submit_key_raw = meta.get("broker_submit_key")
+        payload_hash = str(meta.get("broker_submit_payload_hash") or "").strip()
+        _base.update(
+            submit_intent_at=submit_intent_at,
+            broker_submit_key=broker_submit_key_raw,
+            broker_submit_payload_hash=payload_hash or None,
+            execution_mode=row_mode,
+        )
 
-        # ── Already has a broker order → adopted, not our concern ────
+        # This reconciler is the LIVE broker-submit authority.  A PAPER row
+        # must never adopt an order from a live Tradier account, even if a
+        # stale or misrouted tag happens to match.
+        if row_mode != "live":
+            return _keep(
+                "RECONCILE_LIVE_ONLY_EXECUTION_MODE_REQUIRED",
+                broker_truth="UNKNOWN",
+            )
+
         if broker_order_id:
             return {
                 **_base,
                 "disposition": "ALREADY_RECONCILED",
                 "reason_code": "RECONCILE_BROKER_ORDER_PRESENT",
                 "broker_order_id": broker_order_id,
+                "broker_truth": "FOUND",
+                "reconciliation_stage": "durable_submit_intent_proof",
             }
-
-        # ── No submit intent → not a crash-window row ────────────────
         if not submit_intent_at:
             return {
                 **_base,
                 "disposition": "NOT_IN_CRASH_WINDOW",
                 "reason_code": "RECONCILE_NO_SUBMIT_INTENT",
+                "reconciliation_stage": "durable_submit_intent_proof",
             }
+        if row.get("submitted_ts"):
+            return _keep(
+                "RECONCILE_SUBMITTED_TIMESTAMP_WITHOUT_BROKER_ID",
+                broker_truth="UNKNOWN",
+            )
+        if str(row.get("kind") or "").strip().upper() != "ENTRY":
+            return _keep("RECONCILE_KIND_MISMATCH")
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return _keep(
+                f"RECONCILE_STATUS_NOT_ELIGIBLE:{str(row.get('status') or '').strip().upper()}"
+            )
+
+        def _identity_unproven(field: str) -> dict:
+            return _keep(
+                f"RECONCILE_SUBMIT_INTENT_IDENTITY_UNPROVEN:{field}",
+                broker_truth="UNKNOWN",
+            )
+
+        try:
+            expected_contract = str(row.get("contract") or "").strip()
+            expected_symbol = str(row.get("symbol") or "").strip()
+            expected_qty = _strict_reconcile_int(row.get("qty"), field="qty")
+            expected_limit = _strict_reconcile_float(
+                row.get("limit_price"), field="limit_price"
+            )
+            expected_generation = _strict_reconcile_generation(
+                meta.get("materialization_generation")
+            )
+        except ValueError as exc:
+            return _identity_unproven(str(exc).split(" ", 1)[0])
+        if not expected_symbol:
+            return _identity_unproven("symbol")
+        _is_real_occ = getattr(
+            self, "_is_real_occ_contract", APExecutionCore._is_real_occ_contract
+        )
+        if not expected_contract or not _is_real_occ(
+            expected_contract, expected_symbol
+        ):
+            return _identity_unproven("contract")
+
+        broker_submit_key = str(broker_submit_key_raw or "").strip()
+        canonical_key = canonical_broker_submit_key(local_order_id)
+        if not broker_submit_key:
+            return _identity_unproven("broker_submit_key")
+        if broker_submit_key != canonical_key:
+            return _identity_unproven("broker_submit_key_canonical")
+        if not payload_hash:
+            return _identity_unproven("broker_submit_payload_hash")
+        expected_payload = build_entry_submit_payload(
+            symbol=expected_symbol,
+            contract=expected_contract,
+            qty=expected_qty,
+            limit_price=expected_limit,
+            broker_submit_key=canonical_key,
+        )
+        expected_payload_hash = entry_submit_payload_hash(expected_payload)
+        if payload_hash != expected_payload_hash:
+            return _identity_unproven("broker_submit_payload_hash_mismatch")
+        expected_owner = f"broker_submit:{canonical_key}"
+        if str(meta.get("current_owner") or "").strip() != expected_owner:
+            return _identity_unproven("current_owner")
+        if str(meta.get("lifecycle_state") or "").strip().upper() != "SUBMITTING":
+            return _identity_unproven("lifecycle_state")
+
+        _base.update(
+            owner=expected_owner,
+            broker_submit_key=canonical_key,
+            broker_submit_payload_hash=payload_hash,
+            generation=expected_generation,
+        )
+        _proof = {
+            "broker_submit_key": canonical_key,
+            "submit_intent_at": str(submit_intent_at).strip(),
+            "payload_hash": payload_hash,
+            "generation": expected_generation,
+            "execution_mode": row_mode,
+            "contract": expected_contract,
+            "qty": expected_qty,
+            "limit_price": expected_limit,
+        }
+
+        def _retry_at(seconds: float | None = None) -> str:
+            delay = (
+                _bounded_submit_reconcile_seconds(
+                    "DEFERRED_SUBMIT_RECONCILIATION_RETRY_SECONDS",
+                    DEFERRED_SUBMIT_RECONCILIATION_RETRY_SECONDS,
+                )
+                if seconds is None
+                else max(1.0, float(seconds))
+            )
+            return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+
+        def _retain_owner(
+            reason: str,
+            *,
+            stage: str,
+            next_retry_at: str | None = None,
+            exc: Exception | None = None,
+        ) -> dict:
+            retry_at = next_retry_at or _retry_at()
+            result = {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": reason,
+                "broker_truth": "UNKNOWN",
+                "reconciliation_stage": stage,
+                "next_retry_at": retry_at,
+                "broker_submit_owner_retained": True,
+                "broker_submit_owner_retention_persisted": None,
+            }
+            if exc is not None:
+                result.update(
+                    exception_class=type(exc).__name__,
+                    exception_message=str(exc),
+                )
+            retain = getattr(
+                osm, "retain_broker_submit_owner_for_reconciliation", None
+            )
+            if not callable(retain):
+                # The exact owner already remains on the row.  Do not fall back
+                # to retain_recovery_ownership_if_no_watcher(), which would try
+                # to replace canonical broker ownership with a scheduler owner.
+                log.critical(
+                    "[%s] BROKER_SUBMIT_OWNER_RETAINED_PENDING_RECONCILIATION "
+                    "local_order_id=%s reason=%s — exact retention CAS unavailable",
+                    expected_client_id,
+                    local_order_id,
+                    reason,
+                )
+                result["broker_submit_owner_retention_persisted"] = False
+                return result
+            try:
+                retained = bool(
+                    retain(
+                        local_order_id,
+                        **_proof,
+                        reason=reason,
+                        next_retry_at=retry_at,
+                        reconciliation_stage=stage,
+                        exception_class=(type(exc).__name__ if exc is not None else ""),
+                        exception_message=(str(exc) if exc is not None else ""),
+                    )
+                )
+            except Exception as retention_exc:
+                log.critical(
+                    "[%s] BROKER_SUBMIT_OWNER_RETENTION_RAISED local_order_id=%s "
+                    "reason=%s exc=%s",
+                    expected_client_id,
+                    local_order_id,
+                    reason,
+                    retention_exc,
+                )
+                result["broker_submit_owner_retention_persisted"] = False
+                result["retention_exception_class"] = type(retention_exc).__name__
+                result["retention_exception_message"] = str(retention_exc)
+                return result
+            result["broker_submit_owner_retention_persisted"] = retained
+            log.warning(
+                "[%s] BROKER_SUBMIT_OWNER_RETAINED_PENDING_RECONCILIATION "
+                "local_order_id=%s owner=%s reason=%s next_retry_at=%s persisted=%s",
+                expected_client_id,
+                local_order_id,
+                expected_owner,
+                reason,
+                retry_at,
+                retained,
+            )
+            return result
+
+        try:
+            _parse_reconcile_timestamp(submit_intent_at, field="submit_intent_at")
+        except ValueError as exc:
+            return _retain_owner(
+                f"RECONCILE_SUBMIT_INTENT_TIMESTAMP_INVALID:{str(exc)}",
+                stage="submit_intent_timestamp",
+                exc=exc,
+            )
 
         broker = getattr(self, "broker", None)
         list_orders = getattr(broker, "list_orders", None)
         if not callable(list_orders):
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_BROKER_QUERY_UNAVAILABLE"}
-        try:
-            broker_orders = list_orders()
-        except Exception as exc:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}"}
-
-        tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
-        exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
-        expected_contract = str(row.get("contract") or "")
-        expected_qty = int(row.get("qty") or 0)
-        strong = [
-            o for o in exact_tag
-            if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
-            and str(o.get("side") or "").lower() == "buy_to_open"
-            and int(float(o.get("quantity") or 0)) == expected_qty
-        ]
-        if len(exact_tag) > 1 or len(strong) > 1:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
-        if exact_tag and not strong:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH"}
-        if not strong:
-            # A broker order listing can be delayed, paginated, or incomplete.
-            # Once submit intent is durable, one empty listing can never prove
-            # that the POST did not land.  Retain the identity fence until exact
-            # broker truth or an explicit operator reconciliation resolves it.
-            return {
-                **_base,
-                "disposition": "RECONCILE_PENDING",
-                "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD",
-            }
-
-        remote = strong[0]
-        remote_id = str(remote.get("id") or remote.get("order_id") or "")
-        remote_status = str(remote.get("status") or "").lower().replace("-", "_")
-        if not remote_id:
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MATCH_MISSING_ORDER_ID"}
-        status_map = {
-            "filled": "FILLED", "partially_filled": "PARTIAL_FILL",
-            "partial_filled": "PARTIAL_FILL", "rejected": "REJECTED",
-            "canceled": "CANCELED", "cancelled": "CANCELED", "expired": "EXPIRED",
-        }
-        local_status = status_map.get(remote_status, "SUBMITTED")
-        # Establish the accepted boundary first so the existing state machine
-        # owns all subsequent fill/terminal transitions.
-        if not osm.transition(local_order_id, "SUBMITTED", broker_order_id=remote_id, submitted_ts=now_utc_iso()):
-            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
-        if local_status != "SUBMITTED":
-            osm.transition(
-                local_order_id, local_status, broker_order_id=remote_id,
-                filled_qty=remote.get("exec_quantity") or remote.get("filled_quantity"),
-                fill_price=remote.get("avg_fill_price"),
-                last_error=(str(remote.get("reason") or remote.get("message") or "") or None),
+            return _retain_owner(
+                "RECONCILE_BROKER_QUERY_UNAVAILABLE",
+                stage="broker_order_query",
             )
-        osm.update_order_meta(local_order_id, {
-            "reconciled_at": now_utc_iso(), "recovery_classification": "BROKER_ORDER_ADOPTED",
-            "broker_reconcile_status": remote_status, "broker_reconcile_response": remote,
-            "current_owner": "ORDER_MONITOR", "lifecycle_state": local_status,
-        })
-        return {**_base, "disposition": "ALREADY_RECONCILED", "reason_code": "BROKER_ORDER_ADOPTED", "broker_order_id": remote_id, "status": local_status}
+        try:
+            if recovery_deadline_monotonic is None:
+                broker_orders = list_orders()
+            else:
+                broker_orders = list_orders(
+                    deadline_monotonic=recovery_deadline_monotonic
+                )
+            if not isinstance(broker_orders, list):
+                raise ValueError("broker order response must be a list")
+            if not all(isinstance(order, dict) for order in broker_orders):
+                raise ValueError("broker order response contains a non-object")
+        except TradierOrderQueryDeadlineExceeded as exc:
+            return _retain_owner(
+                "RECONCILE_BROKER_QUERY_DEADLINE_EXCEEDED",
+                stage="broker_order_query",
+                exc=exc,
+            )
+        except Exception as exc:
+            return _retain_owner(
+                f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}:{str(exc)}",
+                stage="broker_order_query",
+                exc=exc,
+            )
+
+        for broker_order in broker_orders:
+            if not _remote_optional_text_shape_is_valid(broker_order, "tag"):
+                return _retain_owner(
+                    "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:invalid tag",
+                    stage="broker_order_response",
+                    exc=ValueError("invalid tag"),
+                )
+
+        exact_tag = [
+            order
+            for order in broker_orders
+            if str(order.get("tag") or "").strip() == canonical_key
+        ]
+
+        if len(exact_tag) > 1:
+            return _retain_owner(
+                "RECONCILE_MULTIPLE_MATCHES",
+                stage="broker_order_response",
+            ) | {"match_count": len(exact_tag), "broker_truth": "UNKNOWN"}
+
+        if not exact_tag:
+            # A complete, tagged, paginated negative is still only an
+            # observation.  The original POST may have reached Tradier while
+            # its response was lost, and an empty list supplies no broker-side
+            # idempotency proof that makes a second LIVE POST safe.  Retain
+            # the exact owner through the existing CAS and poll again; do not
+            # release broker_submit:* or enter canonical resume from here.
+            return _retain_owner(
+                "RECONCILE_BROKER_NO_MATCH_OBSERVED",
+                stage="broker_order_query",
+            ) | {"broker_truth": "NO_MATCH_OBSERVED"}
+
+        remote = exact_tag[0]
+        remote_contract = _remote_optional_text(
+            remote, "option_symbol", "contract", "symbol"
+        )
+        if not remote_contract:
+            return _retain_owner(
+                "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:missing contract",
+                stage="broker_order_response",
+                exc=ValueError("missing contract"),
+            )
+        if remote_contract.upper() != expected_contract.upper():
+            return _retain_owner(
+                "RECONCILE_TAG_IDENTITY_MISMATCH",
+                stage="broker_order_response",
+            ) | {"broker_truth": "UNKNOWN"}
+        remote_side = _remote_optional_text(remote, "side")
+        if not remote_side:
+            return _retain_owner(
+                "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:missing side",
+                stage="broker_order_response",
+                exc=ValueError("missing side"),
+            )
+        if remote_side.lower() != "buy_to_open":
+            return _retain_owner(
+                "RECONCILE_TAG_IDENTITY_MISMATCH",
+                stage="broker_order_response",
+            ) | {"broker_truth": "UNKNOWN"}
+        try:
+            remote_qty = _strict_reconcile_int(
+                remote.get("quantity"), field="broker quantity"
+            )
+        except ValueError as exc:
+            return _retain_owner(
+                f"RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:{str(exc)}",
+                stage="broker_order_response",
+                exc=exc,
+            )
+        if remote_qty != expected_qty:
+            return _retain_owner(
+                "RECONCILE_TAG_IDENTITY_MISMATCH",
+                stage="broker_order_response",
+            ) | {"broker_truth": "UNKNOWN"}
+
+        _account_candidates = (
+            getattr(broker, "account_id", None),
+            getattr(getattr(broker, "cfg", None), "account_id", None),
+        )
+        expected_account = next(
+            (
+                str(value).strip()
+                for value in _account_candidates
+                if isinstance(value, (str, int, float))
+                and not isinstance(value, bool)
+                and str(value).strip()
+            ),
+            None,
+        )
+        remote_account = _remote_optional_text(
+            remote, "account_id", "account", "account_number"
+        )
+        if not _remote_optional_text_shape_is_valid(
+            remote, "account_id", "account", "account_number"
+        ):
+            return _retain_owner(
+                "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:invalid account identity",
+                stage="broker_order_response",
+                exc=ValueError("invalid account identity"),
+            )
+        if expected_account and remote_account and remote_account != expected_account:
+            return _retain_owner(
+                "RECONCILE_TAG_IDENTITY_MISMATCH",
+                stage="broker_order_response",
+            ) | {"broker_truth": "UNKNOWN"}
+        remote_client = _remote_optional_text(
+            remote, "client_id", "client_email", "client", "email"
+        )
+        if not _remote_optional_text_shape_is_valid(
+            remote, "client_id", "client_email", "client", "email"
+        ):
+            return _retain_owner(
+                "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:invalid client identity",
+                stage="broker_order_response",
+                exc=ValueError("invalid client identity"),
+            )
+        if remote_client and remote_client.strip().lower() != expected_client_id:
+            return _retain_owner(
+                "RECONCILE_TAG_IDENTITY_MISMATCH",
+                stage="broker_order_response",
+            ) | {"broker_truth": "UNKNOWN"}
+        remote_mode = _remote_optional_text(remote, "execution_mode", "mode")
+        if not _remote_optional_text_shape_is_valid(
+            remote, "execution_mode", "mode"
+        ):
+            return _retain_owner(
+                "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:invalid execution mode",
+                stage="broker_order_response",
+                exc=ValueError("invalid execution mode"),
+            )
+        if remote_mode:
+            normalized_remote_mode = _normalize_execution_mode(remote_mode)
+            if normalized_remote_mode is None or normalized_remote_mode != row_mode:
+                return _retain_owner(
+                    "RECONCILE_TAG_IDENTITY_MISMATCH",
+                    stage="broker_order_response",
+                ) | {"broker_truth": "UNKNOWN"}
+
+        remote_id = _remote_optional_text(remote, "id", "order_id")
+        if not remote_id:
+            return _retain_owner(
+                "RECONCILE_MATCH_MISSING_ORDER_ID",
+                stage="broker_order_response",
+            ) | {"broker_truth": "UNKNOWN"}
+        remote_status = str(remote.get("status") or "").strip().lower().replace("-", "_")
+        if not remote_status:
+            return _retain_owner(
+                "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:missing status",
+                stage="broker_order_response",
+                exc=ValueError("missing status"),
+            )
+        recognized_statuses = {
+            "open", "pending", "queued", "ack", "acked", "acknowledged",
+            "received", "working", "filled", "partially_filled",
+            "partial_filled", "rejected", "canceled", "cancelled", "expired",
+        }
+        if remote_status not in recognized_statuses:
+            return _retain_owner(
+                f"RECONCILE_BROKER_STATUS_UNEXPECTED:{remote_status}",
+                stage="broker_order_response",
+            )
+
+        # Adopt only the exact broker identity here.  The canonical fill monitor
+        # owns every later broker-status transition and its required side effects:
+        # cumulative fill accounting, position creation/linking, exit-engine
+        # seeding, and entry guard release for broker-terminal failures.
+        try:
+            adopted = bool(
+                osm.transition(
+                    local_order_id,
+                    "SUBMITTED",
+                    broker_order_id=remote_id,
+                    submitted_ts=now_utc_iso(),
+                )
+            )
+        except Exception as exc:
+            return _retain_owner(
+                f"RECONCILE_ADOPTION_TRANSITION_FAILED:{type(exc).__name__}:{str(exc)}",
+                stage="adoption_transition",
+                exc=exc,
+            )
+        if not adopted:
+            try:
+                latest = osm.get_order(local_order_id) or {}
+            except Exception:
+                latest = {}
+            if str(latest.get("broker_order_id") or "").strip() != remote_id:
+                return _retain_owner(
+                    "RECONCILE_ADOPTION_TRANSITION_FAILED",
+                    stage="adoption_transition",
+                )
+        meta_update = getattr(osm, "update_order_meta", None)
+        if callable(meta_update):
+            try:
+                # The broker identity transition is the authority boundary;
+                # metadata is only a best-effort annotation.  Fence this
+                # annotation to SUBMITTED so a concurrent fill-monitor pass
+                # cannot be silently overwritten back to ORDER_MONITOR after
+                # it has already advanced the row to FILLED/PARTIAL/terminal.
+                _row_execution_mode = str(
+                    row.get("execution_mode") or ""
+                ).strip().lower()
+                _expected_signal_id = str(
+                    row.get("signal_id") or ""
+                ).strip() or None
+                _meta_updated = meta_update(local_order_id, {
+                    "reconciled_at": now_utc_iso(),
+                    "recovery_classification": "BROKER_ORDER_ADOPTED",
+                    "broker_reconcile_status": remote_status,
+                    "broker_reconcile_response": remote,
+                    "broker_submit_reconciliation_status": "FOUND",
+                    "current_owner": "ORDER_MONITOR",
+                    "lifecycle_state": "SUBMITTED",
+                }, expected_status="SUBMITTED",
+                   expected_execution_mode=(
+                       row_mode if _row_execution_mode == row_mode else None
+                   ),
+                   expected_signal_id=_expected_signal_id)
+                if not _meta_updated:
+                    log.warning(
+                        "[%s] broker adoption metadata CAS not applied local_order_id=%s; "
+                        "durable lifecycle/identity remains authoritative",
+                        expected_client_id,
+                        local_order_id,
+                    )
+            except Exception as exc:
+                log.warning(
+                    "[%s] broker adoption metadata write failed local_order_id=%s "
+                    "exc=%s",
+                    expected_client_id,
+                    local_order_id,
+                    exc,
+                )
+        return {
+            **_base,
+            "disposition": "ALREADY_RECONCILED",
+            "reason_code": "BROKER_ORDER_ADOPTED",
+            "broker_order_id": remote_id,
+            "status": "SUBMITTED",
+            "broker_truth": "FOUND",
+            "reconciliation_stage": "adoption_complete",
+        }
 
     def reconcile_exit_broker_intent(
         self,
@@ -4468,6 +5018,206 @@ class APExecutionCore:
                     "context_notes": "local_order_id_missing_at_breach",
                 })
             return
+
+        # P0: once the durable submit-intent boundary exists, the watcher is
+        # no longer allowed to re-enter hydration, materialization, ordinary
+        # submit-intent creation, or submit_existing_entry().  Read the row
+        # before any breach-time policy work and route the exact crash window
+        # through the one canonical broker-intent reconciler.  The signal
+        # metadata is copied from the durable plan by APEntryWatcher.watch();
+        # using it as the probe hint preserves the existing ordinary and
+        # materialization-retry ownership ordering when no submit evidence is
+        # present, while still making a durable deferred-submit callback
+        # reconciliation-only before any policy work.
+        _submit_probe_sources = (sig, _signal_meta, _initial_meta)
+        _submit_probe_hint = bool(
+            any(
+                str(source.get("submit_intent_at") or "").strip()
+                or str(source.get("broker_submit_key") or "").strip()
+                or str(source.get("current_owner") or "").strip().startswith(
+                    "broker_submit:"
+                )
+                or str(source.get("lifecycle_state") or "").strip().upper()
+                == "SUBMITTING"
+                for source in _submit_probe_sources
+            )
+            or (
+                not _is_recovered
+                and any(
+                    source.get("materialization_generation") is not None
+                    for source in _submit_probe_sources
+                )
+            )
+            or (_is_recovered and _ownership_kind == "broker_ready_recovery")
+        )
+        _submit_probe_row = None
+        _submit_probe_read_failed = False
+        if _submit_probe_hint and self.order_state_machine is not None:
+            _submit_probe_get = getattr(self.order_state_machine, "get_order", None)
+            if callable(_submit_probe_get):
+                try:
+                    _submit_probe_row = _submit_probe_get(queue_local_order_id)
+                except Exception as _submit_probe_exc:
+                    _submit_probe_read_failed = True
+                    log.critical(
+                        "[%s] BROKER_SUBMIT_RECONCILIATION_ROW_READ_FAILED "
+                        "local_order_id=%s exception_class=%s exception_message=%s",
+                        ticker,
+                        queue_local_order_id,
+                        type(_submit_probe_exc).__name__,
+                        str(_submit_probe_exc),
+                    )
+        if _submit_probe_read_failed:
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "BROKER_SUBMIT_RECONCILIATION_ROW_READ_FAILED",
+                "retry_after_seconds": 5,
+            }
+        if isinstance(_submit_probe_row, dict):
+            _submit_probe_status = str(
+                _submit_probe_row.get("status") or ""
+            ).strip().upper()
+            _submit_probe_broker_id = str(
+                _submit_probe_row.get("broker_order_id") or ""
+            ).strip()
+            _submit_probe_meta_raw = _submit_probe_row.get("meta")
+            _submit_probe_meta = {}
+            _submit_probe_meta_ok = True
+            if _submit_probe_meta_raw is None:
+                _submit_probe_meta = {}
+            elif isinstance(_submit_probe_meta_raw, str):
+                try:
+                    _submit_probe_meta = json.loads(_submit_probe_meta_raw)
+                except Exception:
+                    _submit_probe_meta_ok = False
+            elif isinstance(_submit_probe_meta_raw, dict):
+                _submit_probe_meta = _submit_probe_meta_raw
+            else:
+                _submit_probe_meta_ok = False
+            if (
+                not _submit_probe_broker_id
+                and _submit_probe_status == "PENDING_TRIGGER"
+                and not _submit_probe_meta_ok
+            ):
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "BROKER_SUBMIT_RECONCILIATION_META_UNREADABLE",
+                    "retry_after_seconds": 5,
+                }
+            if not isinstance(_submit_probe_meta, dict):
+                _submit_probe_meta = {}
+            _submit_probe_intent_present = bool(
+                str(_submit_probe_meta.get("submit_intent_at") or "").strip()
+            )
+            _submit_probe_lifecycle = str(
+                _submit_probe_meta.get("lifecycle_state") or ""
+            ).strip().upper()
+            _submit_probe_key_present = bool(
+                str(_submit_probe_meta.get("broker_submit_key") or "").strip()
+            )
+            _submit_probe_owner = str(
+                _submit_probe_meta.get("current_owner") or ""
+            ).strip()
+            _submit_probe_recovery_owner = str(
+                _submit_probe_meta.get("recovery_submit_owner") or ""
+            ).strip()
+            # A recovery-submit owner is a bounded takeover lease, not
+            # permanent watcher ownership.  Only an aware, parseable lease
+            # that is still in the future may block the watcher; an expired
+            # lease must fall through to the existing canonical recovery/CAS
+            # path so the row cannot be stranded until restart.
+            _submit_probe_recovery_lease_active = (
+                APExecutionCore._live_materialization_lease(
+                    _submit_probe_meta.get("recovery_submit_lease_until")
+                )
+                is not None
+            )
+            _submit_probe_recovery_owner_active = bool(
+                not _is_recovered
+                and (
+                    _submit_probe_recovery_owner
+                    or _submit_probe_owner.startswith("recovery_submit:")
+                )
+                and not _submit_probe_broker_id
+                and not _submit_probe_row.get("submitted_ts")
+                and _submit_probe_lifecycle != "SUBMITTING"
+                and _submit_probe_recovery_lease_active
+            )
+            if _submit_probe_recovery_owner_active:
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "RECOVERY_SUBMIT_OWNER_ACTIVE",
+                    "retry_after_seconds": 5,
+                }
+            _submit_probe_requires_reconcile = (
+                not _submit_probe_broker_id
+                and not _submit_probe_row.get("submitted_ts")
+                and (
+                    _submit_probe_intent_present
+                    or _submit_probe_key_present
+                    or _submit_probe_lifecycle == "SUBMITTING"
+                    or _submit_probe_owner.startswith("broker_submit:")
+                )
+            )
+            if _submit_probe_requires_reconcile:
+                _reconcile_fn = getattr(
+                    self, "reconcile_deferred_broker_intent", None
+                )
+                if not callable(_reconcile_fn):
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "BROKER_SUBMIT_RECONCILER_UNAVAILABLE",
+                        "retry_after_seconds": 5,
+                    }
+                try:
+                    _reconcile_result = _reconcile_fn(
+                        local_order_id=queue_local_order_id
+                    ) or {}
+                except Exception as _reconcile_exc:
+                    log.critical(
+                        "[%s] BROKER_SUBMIT_RECONCILIATION_RAISED "
+                        "local_order_id=%s exception_class=%s exception_message=%s",
+                        ticker,
+                        queue_local_order_id,
+                        type(_reconcile_exc).__name__,
+                        str(_reconcile_exc),
+                    )
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "BROKER_SUBMIT_RECONCILIATION_RAISED",
+                        "retry_after_seconds": 5,
+                    }
+                _reconcile_disposition = str(
+                    _reconcile_result.get("disposition") or ""
+                ).strip().upper()
+                if _reconcile_disposition in {"SUBMITTED", "ALREADY_RECONCILED"}:
+                    return {
+                        **_reconcile_result,
+                        "disposition": "SUBMITTED",
+                    }
+                if _reconcile_disposition == "TERMINAL_DURABLE":
+                    return _reconcile_result
+                if _reconcile_disposition == "RETRY_WAIT":
+                    return {
+                        **_reconcile_result,
+                        "disposition": "RECONCILE_BROKER_INTENT",
+                    }
+                if _reconcile_disposition in {
+                    "RECONCILE_PENDING",
+                    "NOT_IN_CRASH_WINDOW",
+                }:
+                    return {
+                        **_reconcile_result,
+                        "disposition": "RECONCILE_BROKER_INTENT",
+                    }
+                return {
+                    **_reconcile_result,
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": str(
+                        _reconcile_result.get("reason_code")
+                        or "BROKER_SUBMIT_RECONCILIATION_UNPROVEN"
+                    ),
+                }
         _deferred_claim_context = {"owner": "", "generation": None}
         _deferred_materialization_owned = False
         _recovery_pre_claimed = bool(sig.get("_recovery_pre_claimed"))

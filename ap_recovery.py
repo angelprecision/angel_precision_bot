@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import logging
 import os
 import re
@@ -42,6 +43,11 @@ from ap_entry_watcher import (
 )
 from ap.pending_trigger_classifier import is_active_materialization_in_flight
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
+from ap.broker_submit_identity import (
+    build_entry_submit_payload,
+    canonical_broker_submit_key,
+    entry_submit_payload_hash,
+)
 
 log = logging.getLogger("ap.recovery")
 
@@ -78,6 +84,35 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _strict_recovery_int(value, *, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or isinstance(value, float)
+        or value is None
+        or value == ""
+    ):
+        raise ValueError(f"{field} must be a positive integer")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value.strip()):
+        number = int(value.strip())
+    else:
+        raise ValueError(f"{field} must be a positive integer")
+    return number
+
+
+def _strict_recovery_float(value, *, field: str) -> float:
+    if isinstance(value, bool) or value is None or value == "":
+        raise ValueError(f"{field} must be a positive finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a positive finite number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{field} must be a positive finite number")
+    return number
 
 
 def _extract_explicit_fill_qty(raw: dict) -> Optional[int]:
@@ -413,6 +448,7 @@ class APStartupRecovery:
         exit_engine=None, # APExitEngine (optional — needed for exit re-attachment)
         entry_watcher=None,  # APEntryWatcher (optional — needed for watcher reseed)
         execution_core=None, # APExecutionCore (optional — required for §2 safe BROKER_READY recovery)
+        recovery_deadline_monotonic: float | None = None,
     ):
         self.client_id     = str(client_id or "").strip().lower()
         self.broker        = broker
@@ -422,6 +458,7 @@ class APStartupRecovery:
         self.exit_engine   = exit_engine
         self.entry_watcher = entry_watcher
         self.execution_core = execution_core
+        self.recovery_deadline_monotonic = recovery_deadline_monotonic
 
     # ──────────────────────────────────────────────────────────────────────────
     # Entry point
@@ -454,12 +491,16 @@ class APStartupRecovery:
             result["errors"].append("recovery_unknown_execution_mode")
             return result
 
+        if self._stop_for_expired_deadline(result, "deferred_breach_lifecycle"):
+            return result
         try:
             self._recover_deferred_breach_lifecycles(result)
         except Exception as e:
             log.error("[%s] Deferred breach lifecycle recovery error: %s", self.client_id, e)
             result["errors"].append(f"deferred_lifecycle: {e}")
 
+        if self._stop_for_expired_deadline(result, "canonical_exit_fill_reconciliation"):
+            return result
         try:
             self._retry_canonical_exit_fill_reconciliations(result)
         except Exception as e:
@@ -472,6 +513,8 @@ class APStartupRecovery:
             result["errors"].append(f"exit_fill_reconciliation: {e}")
             result["exit_fill_reconciliations_failed"] += 1
 
+        if self._stop_for_expired_deadline(result, "stale_exit_generation_claims"):
+            return result
         try:
             self._reconcile_stale_exit_generation_claims(result)
         except Exception as e:
@@ -483,6 +526,8 @@ class APStartupRecovery:
             )
             result["errors"].append(f"stale_exit_claims: {e}")
 
+        if self._stop_for_expired_deadline(result, "downtime_exit_fill_recovery"):
+            return result
         try:
             live_exit_orders = self._recover_exit_fills_that_occurred_during_downtime(result)
         except Exception as e:
@@ -490,30 +535,40 @@ class APStartupRecovery:
             result["errors"].append(f"exit_fill_downtime: {e}")
             live_exit_orders = []
 
+        if self._stop_for_expired_deadline(result, "position_recovery"):
+            return result
         try:
             self._recover_positions(result)
         except Exception as e:
             log.error("[%s] Position recovery error: %s", self.client_id, e)
             result["errors"].append(f"positions: {e}")
 
+        if self._stop_for_expired_deadline(result, "pending_entry_verification"):
+            return result
         try:
             self._verify_pending_entries(result)
         except Exception as e:
             log.error("[%s] Entry verification error: %s", self.client_id, e)
             result["errors"].append(f"entries: {e}")
 
+        if self._stop_for_expired_deadline(result, "live_exit_protection_reattachment"):
+            return result
         try:
             self._reattach_live_exit_protections(result, live_exit_orders)
         except Exception as e:
             log.error("[%s] Exit reattachment error: %s", self.client_id, e)
             result["errors"].append(f"exits: {e}")
 
+        if self._stop_for_expired_deadline(result, "buying_power_recompute"):
+            return result
         try:
             self._recompute_buying_power(result)
         except Exception as e:
             log.error("[%s] Buying power recompute error: %s", self.client_id, e)
             result["errors"].append(f"buying_power: {e}")
 
+        if self._stop_for_expired_deadline(result, "dedup_reseed"):
+            return result
         try:
             self._reseed_dedup(result)
         except Exception as e:
@@ -521,11 +576,16 @@ class APStartupRecovery:
             result["errors"].append(f"dedup: {e}")
 
         if include_watcher_reseed:
+            if self._stop_for_expired_deadline(result, "watcher_reseed"):
+                return result
             try:
                 self._reseed_watchers(result)
             except Exception as e:
                 log.error("[%s] Watcher reseed error: %s", self.client_id, e)
                 result["errors"].append(f"watchers: {e}")
+
+        if self._stop_for_expired_deadline(result, "completion"):
+            return result
 
         log.info(
             "[%s] Recovery complete | positions=%d entries_verified=%d "
@@ -548,6 +608,35 @@ class APStartupRecovery:
             len(result["errors"]),
         )
         return result
+
+    def _recovery_deadline_expired(self) -> bool:
+        deadline = getattr(self, "recovery_deadline_monotonic", None)
+        if deadline is None:
+            return False
+        try:
+            return time.monotonic() >= float(deadline)
+        except (TypeError, ValueError, OverflowError):
+            return True
+
+    def _stop_for_expired_deadline(self, result: dict, phase: str) -> bool:
+        if not self._recovery_deadline_expired():
+            return False
+        result.update(
+            status="DEGRADED",
+            broker_truth="UNKNOWN",
+            recovery_status="DEGRADED",
+            recovery_truth="UNKNOWN",
+            recovery_deadline_exceeded=True,
+        )
+        reason = f"recovery_deadline_exceeded:{phase}"
+        if reason not in result.setdefault("errors", []):
+            result["errors"].append(reason)
+        log.warning(
+            "[%s] RECOVERY_DEADLINE_EXCEEDED phase=%s — stopping before further recovery mutations",
+            self.client_id,
+            phase,
+        )
+        return True
 
     def _retry_canonical_exit_fill_reconciliations(self, result: dict) -> None:
         """Run the bounded, client-scoped accounting retry pass once at startup.
@@ -1729,6 +1818,18 @@ class APStartupRecovery:
         now = datetime.now(timezone.utc)
         recovered = 0
 
+        def _broker_submit_retry_at() -> str:
+            try:
+                delay = float(
+                    os.getenv("DEFERRED_SUBMIT_RECONCILIATION_RETRY_SECONDS", "15")
+                )
+            except (TypeError, ValueError, OverflowError):
+                delay = 15.0
+            if not math.isfinite(delay):
+                delay = 15.0
+            delay = max(1.0, min(300.0, delay))
+            return (now + timedelta(seconds=delay)).isoformat()
+
         def _strict_durable_counter(
             meta_dict: dict,
             key: str,
@@ -1999,6 +2100,130 @@ class APStartupRecovery:
             result.setdefault("errors", []).append(f"fenced_term_write_failed:{loid}")
             return {"result": "WRITE_FAILED"}
 
+        def _read_broker_submit_retention_proof(loid):
+            """Reread and classify an existing broker-submit owner.
+
+            A recovery pass must never replace a canonical submit owner merely
+            because its own reconciliation call failed.  This helper is
+            intentionally read-only; an incomplete or contradictory identity
+            is returned as unproven so the caller can fail closed without any
+            recovery-owner write.
+            """
+            get_order = getattr(self.osm, "get_order", None)
+            if not callable(get_order):
+                return None
+            try:
+                reread = get_order(loid)
+            except Exception:
+                return None
+            if not isinstance(reread, dict):
+                return None
+            raw_meta = reread.get("meta")
+            _meta_parse_ok = raw_meta is None or isinstance(raw_meta, dict)
+            if isinstance(raw_meta, str) and raw_meta.strip():
+                try:
+                    parsed_meta = json.loads(raw_meta)
+                    _meta_parse_ok = isinstance(parsed_meta, dict)
+                    reread_meta = parsed_meta if _meta_parse_ok else {}
+                except Exception:
+                    _meta_parse_ok = False
+                    reread_meta = {}
+            else:
+                reread_meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+            if not _meta_parse_ok:
+                return {"exact": False, "submit_evidence": True, "meta_unreadable": True}
+            recovery_claim_evidence = bool(
+                str(reread_meta.get("recovery_submit_owner") or "").strip()
+                or str(reread_meta.get("current_owner") or "").strip().startswith("recovery_submit:")
+            )
+            submit_evidence = bool(
+                str(reread_meta.get("submit_intent_at") or "").strip()
+                or str(reread_meta.get("broker_submit_key") or "").strip()
+                or str(reread_meta.get("broker_submit_payload_hash") or "").strip()
+                or str(reread_meta.get("current_owner") or "").strip().startswith("broker_submit:")
+                or str(reread_meta.get("lifecycle_state") or "").upper() == "SUBMITTING"
+            )
+            if not submit_evidence and not recovery_claim_evidence:
+                return None
+
+            if (
+                recovery_claim_evidence
+                and str(reread_meta.get("lifecycle_state") or "").upper()
+                in {"BROKER_READY", "RETRY_WAIT"}
+            ):
+                return {"recovery_claim": True, "submit_evidence": False}
+
+            try:
+                from ap.order_state_machine import _durable_execution_mode
+
+                durable_mode = _durable_execution_mode(reread, reread_meta)
+            except Exception:
+                durable_mode = None
+            row_client = str(reread.get("client_id") or "").strip().lower()
+            row_mode = str(durable_mode or "").strip().lower()
+            key = str(reread_meta.get("broker_submit_key") or "").strip()
+            expected_key = canonical_broker_submit_key(loid)
+            owner = str(reread_meta.get("current_owner") or "").strip()
+            try:
+                generation = _strict_recovery_int(
+                    reread_meta.get("materialization_generation"),
+                    field="materialization_generation",
+                )
+                qty = _strict_recovery_int(reread.get("qty"), field="qty")
+                limit_price = _strict_recovery_float(
+                    reread.get("limit_price"), field="limit_price"
+                )
+            except ValueError:
+                return {"exact": False, "submit_evidence": True}
+
+            contract = str(reread.get("contract") or "").strip()
+            symbol = str(reread.get("symbol") or "").strip()
+            payload_hash = str(
+                reread_meta.get("broker_submit_payload_hash") or ""
+            ).strip()
+            exact = bool(
+                row_client
+                and row_client == self.client_id
+                and row_mode == recovery_mode.lower()
+                and str(reread.get("kind") or "").strip().upper() == "ENTRY"
+                and str(reread.get("status") or "").strip().upper() == "PENDING_TRIGGER"
+                and not str(reread.get("broker_order_id") or "").strip()
+                and not reread.get("submitted_ts")
+                and str(reread_meta.get("lifecycle_state") or "").upper() == "SUBMITTING"
+                and bool(str(reread_meta.get("submit_intent_at") or "").strip())
+                and key == expected_key
+                and owner == f"broker_submit:{expected_key}"
+                and bool(payload_hash)
+                and bool(contract)
+                and bool(symbol)
+                and bool(re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract.upper()))
+            )
+            if exact:
+                expected_payload = build_entry_submit_payload(
+                    symbol=symbol,
+                    contract=contract,
+                    qty=qty,
+                    limit_price=limit_price,
+                    broker_submit_key=expected_key,
+                )
+                exact = payload_hash == entry_submit_payload_hash(expected_payload)
+            if not exact:
+                return {"exact": False, "submit_evidence": True}
+            return {
+                "exact": True,
+                "submit_evidence": True,
+                "broker_submit_key": expected_key,
+                "submit_intent_at": str(
+                    reread_meta.get("submit_intent_at") or ""
+                ).strip(),
+                "payload_hash": payload_hash,
+                "generation": generation,
+                "execution_mode": row_mode,
+                "contract": contract,
+                "qty": qty,
+                "limit_price": limit_price,
+            }
+
         # ── AMENDMENT §5: durable ownership on failed/impossible rearm ──
         # A resumable row must never be left ownerless. When a rearm cannot
         # happen (no entry_watcher wired) or the rearm returns False, we do
@@ -2008,7 +2233,98 @@ class APStartupRecovery:
         # resume it. Only recovery_* keys are written — contract, qty,
         # limit, selector evidence, tp/sl, direction and every trade-policy
         # field are preserved untouched.
-        def _retain_recovery_ownership(loid, *, reason):
+        def _retain_recovery_ownership(loid, *, reason, reconciliation=None):
+            # A durable broker-submit owner is already the correct owner for an
+            # ambiguous broker result.  Re-read it and retain only that exact
+            # identity.  In particular, never call the generic recovery-owner
+            # writer on a row whose submit intent may have reached Tradier.
+            _broker_proof = _read_broker_submit_retention_proof(loid)
+            _reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+            if _broker_proof and _broker_proof.get("recovery_claim"):
+                log.info(
+                    "[%s] RECOVERY_SUBMIT_OWNER_RETAINED_PENDING_RETRY "
+                    "local_order_id=%s reason=%s",
+                    self.client_id,
+                    loid,
+                    reason,
+                )
+                return True
+            if isinstance(_broker_proof, dict) and _broker_proof.get("submit_evidence"):
+                if not _broker_proof.get("exact"):
+                    log.critical(
+                        "[%s] BROKER_SUBMIT_OWNER_RETENTION_IDENTITY_UNPROVEN "
+                        "local_order_id=%s reason=%s — preserving row unchanged",
+                        self.client_id,
+                        loid,
+                        reason,
+                    )
+                    result.setdefault("errors", []).append(
+                        f"broker_submit_owner_identity_unproven:{loid}"
+                    )
+                    return False
+                _retain_broker = getattr(
+                    self.osm, "retain_broker_submit_owner_for_reconciliation", None
+                )
+                if callable(_retain_broker):
+                    try:
+                        _retained = bool(
+                            _retain_broker(
+                                loid,
+                                **{
+                                    key: _broker_proof[key]
+                                    for key in (
+                                        "broker_submit_key", "submit_intent_at", "payload_hash", "generation",
+                                        "execution_mode", "contract", "qty", "limit_price",
+                                    )
+                                },
+                                reason=reason,
+                                next_retry_at=(
+                                    _reconciliation.get("next_retry_at")
+                                    or _broker_submit_retry_at()
+                                ),
+                                reconciliation_stage=(
+                                    _reconciliation.get("reconciliation_stage")
+                                    or "broker_order_reconciliation"
+                                ),
+                                exception_class=str(
+                                    _reconciliation.get("exception_class") or ""
+                                ),
+                                exception_message=str(
+                                    _reconciliation.get("exception_message") or ""
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        _retained = False
+                        result.setdefault("errors", []).append(
+                            f"broker_submit_retention_raised:{loid}"
+                        )
+                        log.critical(
+                            "[%s] BROKER_SUBMIT_OWNER_RETENTION_RAISED "
+                            "local_order_id=%s reason=%s exc=%s",
+                            self.client_id,
+                            loid,
+                            reason,
+                            exc,
+                        )
+                    if not _retained:
+                        # The owner proven by the reread remains in place even
+                        # when the diagnostic refresh misses its CAS.  Do not
+                        # replace it and do not emit the old generic retention
+                        # failure, which incorrectly described this state.
+                        result.setdefault("errors", []).append(
+                            f"broker_submit_retention_not_refreshed:{loid}"
+                        )
+                log.warning(
+                    "[%s] BROKER_SUBMIT_OWNER_RETAINED_PENDING_RECONCILIATION "
+                    "local_order_id=%s owner=broker_submit:%s reason=%s",
+                    self.client_id,
+                    loid,
+                    _broker_proof["broker_submit_key"],
+                    reason,
+                )
+                return True
+
             # PR #421 final amendment (§5): prefer the fenced OSM write —
             # it refuses (returns False, no-op) if committed watcher
             # authority (current_owner/watcher_token/watcher_generation)
@@ -2126,7 +2442,29 @@ class APStartupRecovery:
                 )
                 continue
 
-            meta = self._coerce_order_meta(order.get("meta"))
+            raw_meta = order.get("meta")
+            _meta_parse_ok = raw_meta is None or isinstance(raw_meta, dict)
+            if isinstance(raw_meta, str) and raw_meta.strip():
+                try:
+                    _parsed_meta = json.loads(raw_meta)
+                    _meta_parse_ok = isinstance(_parsed_meta, dict)
+                    meta = _parsed_meta if _meta_parse_ok else {}
+                except Exception:
+                    _meta_parse_ok = False
+                    meta = {}
+            else:
+                meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+            if not _meta_parse_ok:
+                log.critical(
+                    "[%s] RECOVERY_SUBMIT_META_UNREADABLE local_order_id=%s "
+                    "— preserving row unchanged",
+                    self.client_id,
+                    local_order_id,
+                )
+                result.setdefault("errors", []).append(
+                    f"recovery_submit_meta_unreadable:{local_order_id}"
+                )
+                continue
             lifecycle = str(meta.get("lifecycle_state") or "").upper()
             materialization_status = str(meta.get("materialization_status") or "").upper()
 
@@ -2189,7 +2527,13 @@ class APStartupRecovery:
                 stale_pending = (now - created_at).total_seconds() > 72 * 3600
             except Exception:
                 stale_pending = False
-            if stale_pending:
+            # A persisted submit intent is an ambiguous broker handoff.  Its
+            # age must not let generic stale cleanup preempt reconciliation.
+            broker_submit_intent_pending = bool(
+                meta.get("submit_intent_at")
+                and not str(order.get("broker_order_id") or "").strip()
+            )
+            if stale_pending and not broker_submit_intent_pending:
                 _terminalize_verified(
                     local_order_id,
                     reason_code="RECOVERY_STALE_PENDING_TRIGGER",
@@ -2221,7 +2565,7 @@ class APStartupRecovery:
             # and never terminalizes until the broker-query adoption gate is
             # wired. On RECONCILE_PENDING we retain durable ownership so the
             # row is never lost while it waits for reconciliation.
-            if meta.get("submit_intent_at") and not str(order.get("broker_order_id") or "").strip():
+            if broker_submit_intent_pending:
                 reconcile_fn = None
                 if self.execution_core is not None:
                     reconcile_fn = getattr(
@@ -2241,7 +2585,12 @@ class APStartupRecovery:
                     )
                     continue
                 try:
-                    rec = reconcile_fn(local_order_id=local_order_id) or {}
+                    reconcile_kwargs = {"local_order_id": local_order_id}
+                    if self.recovery_deadline_monotonic is not None:
+                        reconcile_kwargs[
+                            "recovery_deadline_monotonic"
+                        ] = self.recovery_deadline_monotonic
+                    rec = reconcile_fn(**reconcile_kwargs) or {}
                 except Exception as exc:
                     log.error(
                         "[%s] reconcile_deferred_broker_intent raised "
@@ -2262,7 +2611,17 @@ class APStartupRecovery:
                     _retain_recovery_ownership(
                         local_order_id,
                         reason=str(rec.get("reason_code") or "crash_window_reconcile_pending"),
+                        reconciliation=rec,
                     )
+                    continue
+                if rec_disposition in {
+                    "SUBMITTED",
+                    "TERMINAL_DURABLE",
+                    "TERMINAL_ALREADY_DURABLE",
+                }:
+                    # The canonical reconciler/resume path already committed
+                    # the durable outcome.  Do not apply a second recovery
+                    # mutation in this pass.
                     continue
                 if rec_disposition == "NOT_IN_CRASH_WINDOW":
                     # This block was entered with durable submit_intent_at.
@@ -2274,6 +2633,7 @@ class APStartupRecovery:
                             rec.get("reason_code")
                             or "crash_window_classifier_contradiction"
                         ),
+                        reconciliation=rec,
                     )
                     continue
                 else:
@@ -2281,6 +2641,7 @@ class APStartupRecovery:
                     _retain_recovery_ownership(
                         local_order_id,
                         reason=str(rec.get("reason_code") or "crash_window_keep"),
+                        reconciliation=rec,
                     )
                     continue
 

@@ -720,6 +720,24 @@ class ClientRunner(threading.Thread):
         self._overnight_reeval_last_result_class = None
         self._overnight_reeval_last_retry_reason = None
 
+    def _build_order_state_machine(self, order_state_machine_cls):
+        """Construct the OSM with the runner's canonical execution mode.
+
+        Deferred LIVE submit-intent recovery must never depend on a mode-less
+        OSM instance and then fall through to a legacy broker lookup path.
+        Unknown runner modes fail closed before any lifecycle subsystem starts.
+        """
+        mode = str(self.mode or "").strip().lower()
+        if mode not in {"live", "paper"}:
+            raise RuntimeError(
+                f"[{self.email}] cannot construct order state machine with "
+                f"unproven execution mode={self.mode!r}"
+            )
+        return order_state_machine_cls(
+            client_id=self.email,
+            execution_mode=mode,
+        )
+
     def trip_kill_switch(self, reason: str = "manual_trip") -> None:
         """PR D / FIX-2 (BUG-CR-4): public setter to trip the kill switch.
 
@@ -3183,7 +3201,9 @@ class ClientRunner(threading.Thread):
             supabase_client=sb,
         )
 
-        self.order_state_machine = APOrderStateMachine(client_id=self.email)
+        self.order_state_machine = self._build_order_state_machine(
+            APOrderStateMachine
+        )
 
         # WIRE-2: split-brain startup audit ───────────────────────────────────
         # Orders from a prior session where the broker accepted a submission but
@@ -3413,6 +3433,7 @@ class ClientRunner(threading.Thread):
             contract_selector=getattr(self.core, "contract_selector", None),
             client_mode=self.mode,   # PR66: pass PAPER/LIVE so max-age splits correctly
             data_broker=data_broker,
+            execution_core=self.core,
         )
         self.order_monitor.start()
 
@@ -4080,13 +4101,17 @@ class ClientRunner(threading.Thread):
 
 
     def _run_startup_recovery(self, broker, exit_eng):
-        """Run startup recovery with a hard timeout to prevent blocking initialization.
-        Recovery is best-effort — a timeout logs a warning but never blocks entries.
+        """Run startup recovery with a cooperative deadline.
+
+        Recovery is best-effort, but a timed-out worker must be fully drained
+        before startup returns so it cannot overlap the normal runtime
+        lifecycle authorities.
         """
         import concurrent.futures as _cf
         _RECOVERY_TIMEOUT = float(os.getenv("STARTUP_RECOVERY_TIMEOUT_SEC", "25"))
         _recovery_attempt_id = uuid.uuid4().hex
         _recovery_started_at = time.time()
+        _recovery_deadline_monotonic = time.monotonic() + max(0.0, _RECOVERY_TIMEOUT)
         _completion_logged = False
 
         def _do_recovery():
@@ -4099,52 +4124,75 @@ class ClientRunner(threading.Thread):
                 exit_engine=exit_eng,
                 entry_watcher=getattr(getattr(self, "core", None), "entry_watcher", None),
                 execution_core=getattr(self, "core", None),  # §2: required for safe BROKER_READY recovery
+                recovery_deadline_monotonic=_recovery_deadline_monotonic,
             )
             return recovery.run(include_watcher_reseed=False)
 
+        _ex = None
         try:
-            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                _fut = _ex.submit(_do_recovery)
+            _ex = _cf.ThreadPoolExecutor(max_workers=1)
+            _fut = _ex.submit(_do_recovery)
+            try:
+                _remaining = max(
+                    0.0,
+                    _recovery_deadline_monotonic - time.monotonic(),
+                )
+                rec_result = _fut.result(timeout=_remaining)
+                logger.info(
+                    "[%s] Startup recovery complete: positions=%s entries_corrected=%s exits=%s dedup=%s",
+                    self.email,
+                    rec_result.get("positions_recovered"),
+                    rec_result.get("entries_corrected"),
+                    rec_result.get("exits_reattached"),
+                    rec_result.get("dedup_seeded"),
+                )
+                _recovery_status = str(
+                    rec_result.get("recovery_status") or rec_result.get("status") or ""
+                ).strip().upper()
+                self._log_startup_recovery_complete(
+                    status="degraded" if _recovery_status == "DEGRADED" else "success",
+                    started_at=_recovery_started_at,
+                    recovery_attempt_id=_recovery_attempt_id,
+                    result=rec_result,
+                )
+                _completion_logged = True
+            except _cf.TimeoutError:
+                logger.warning(
+                    "[%s] Startup recovery timed out after %.0fs — continuing without full recovery. "
+                    "Open positions may not be reseeded until next restart.",
+                    self.email, _RECOVERY_TIMEOUT,
+                )
+                _fut.cancel()
+                # Future.cancel() cannot stop a running recovery.  Drain it
+                # before returning; APStartupRecovery.run() checks the same
+                # deadline at every phase boundary and must stop cooperatively
+                # before normal runtime authorities are started.
                 try:
-                    rec_result = _fut.result(timeout=_RECOVERY_TIMEOUT)
-                    logger.info(
-                        "[%s] Startup recovery complete: positions=%s entries_corrected=%s exits=%s dedup=%s",
-                        self.email,
-                        rec_result.get("positions_recovered"),
-                        rec_result.get("entries_corrected"),
-                        rec_result.get("exits_reattached"),
-                        rec_result.get("dedup_seeded"),
-                    )
-                    self._log_startup_recovery_complete(
-                        status="success",
-                        started_at=_recovery_started_at,
-                        recovery_attempt_id=_recovery_attempt_id,
-                        result=rec_result,
-                    )
-                    _completion_logged = True
-                except _cf.TimeoutError:
+                    _fut.result()
+                except Exception as _drain_exc:
                     logger.warning(
-                        "[%s] Startup recovery timed out after %.0fs — continuing without full recovery. "
-                        "Open positions may not be reseeded until next restart.",
-                        self.email, _RECOVERY_TIMEOUT,
+                        "[%s] Startup recovery worker failed while draining after timeout: %s",
+                        self.email,
+                        _drain_exc,
                     )
-                    _fut.cancel()
-                    self._log_startup_recovery_complete(
-                        status="timeout",
-                        started_at=_recovery_started_at,
-                        recovery_attempt_id=_recovery_attempt_id,
-                        errors=[f"startup_recovery_timeout:{_RECOVERY_TIMEOUT:g}s"],
-                    )
-                    _completion_logged = True
-                except Exception as exc:
-                    self._log_startup_recovery_complete(
-                        status="failed",
-                        started_at=_recovery_started_at,
-                        recovery_attempt_id=_recovery_attempt_id,
-                        errors=[str(exc)],
-                    )
-                    _completion_logged = True
-                    raise
+                _ex.shutdown(wait=True, cancel_futures=True)
+                _ex = None
+                self._log_startup_recovery_complete(
+                    status="timeout",
+                    started_at=_recovery_started_at,
+                    recovery_attempt_id=_recovery_attempt_id,
+                    errors=[f"startup_recovery_timeout:{_RECOVERY_TIMEOUT:g}s"],
+                )
+                _completion_logged = True
+            except Exception as exc:
+                self._log_startup_recovery_complete(
+                    status="failed",
+                    started_at=_recovery_started_at,
+                    recovery_attempt_id=_recovery_attempt_id,
+                    errors=[str(exc)],
+                )
+                _completion_logged = True
+                raise
         except Exception as exc:
             if not _completion_logged:
                 self._log_startup_recovery_complete(
@@ -4163,6 +4211,9 @@ class ClientRunner(threading.Thread):
                 self._enter_degraded_mode(
                     f"startup_recovery_failed:{exc}", stop_runner=False
                 )
+        finally:
+            if _ex is not None:
+                _ex.shutdown(wait=True, cancel_futures=True)
 
     def _register_exit_engine(self, exit_eng):
         try:
