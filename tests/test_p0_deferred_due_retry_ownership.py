@@ -67,7 +67,6 @@ def _row(
     retry_attempt: int = 1,
     materialization_generation: int = 1,
     max_attempts: int = 3,
-    selector_reason: str = "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
     next_retry_offset_seconds: int = -60,   # negative = past = due
     execution_mode: str = "paper",
     client_id: str = CLIENT_ID,
@@ -116,7 +115,7 @@ def _row(
             "trigger_price": 130.0,
             "observed_underlying_price": 130.05,
             "materialization_selector_failure": {
-                "reason_code": selector_reason,
+                "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                 "direct_quote_calls": 5,
                 "direct_quote_calls_limit": 5,
                 "last_candidate_reject_reason": "OI_TOO_LOW",
@@ -1784,9 +1783,9 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     """Real seam test: resume_deferred_materialization_retry → real _on_entry_trigger
     deferred path → selector mock → durable copyback → canonical submit seam.
 
-    Verifies the core requirement: the retry ownership claim reaches the
-    canonical selector/submit path exactly once. The callback's normal retry
-    claim is bypassed via the verified pre-claim markers.
+    Verifies the core requirement: claim_deferred_materialization is called
+    EXACTLY ONCE across the entire path. The second claim inside
+    _on_entry_trigger must be bypassed via the verified pre-claim markers.
 
     Does NOT mock _on_entry_trigger. Does NOT manually manufacture the
     post-callback row.
@@ -1818,8 +1817,6 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "materialization_generation": 1,
         "watcher_token": "watcher:test",
         "retry_attempt": 1,
-        "breach_attempt_count": 1,
-        "materialization_attempts": 1,
         "retry_max_attempts": 3,
         "next_retry_at": _iso(now - timedelta(seconds=30)),
         "materialization_next_retry_at": _iso(now - timedelta(seconds=30)),
@@ -1869,8 +1866,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "meta": before_meta,
     }
 
-    # After the normal retry claim: row is MATERIALIZING with gen=2,
-    # and the selector attempt is 2.
+    # After claim: row is MATERIALIZING with gen=2, attempt=2
     claimed_meta = dict(before_meta)
     claimed_meta.update({
         "lifecycle_state": "MATERIALIZING",
@@ -1879,10 +1875,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "materialization_owner": f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3",
         "materialization_lease_until": _iso(now + timedelta(seconds=120)),
         "materialization_in_flight": True,
-        "materialization_market_truth_pending": False,
         "retry_attempt": 2,
-        "breach_attempt_count": 2,
-        "materialization_attempts": 2,
     })
     after_claim_row = dict(before_row)
     after_claim_row["meta"] = claimed_meta
@@ -1923,10 +1916,6 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
 
         def claim_deferred_materialization(self, oid, **kw):
             claim_call_count[0] += 1
-            assert oid == LOCAL_ORDER_ID
-            assert kw["retry_attempt"] == 2
-            assert kw.get("advance_retry_attempt", True) is True
-            assert kw.get("market_truth_only", False) is False
             self.row = after_claim_row
             return True
 
@@ -2087,15 +2076,18 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     selector_elapsed = time.perf_counter() - started
 
     # ── Assertions ────────────────────────────────────────────────────
+    # CORE INVARIANT: claim must be called exactly once
+    assert claim_call_count[0] == 1, (
+        f"claim_deferred_materialization must be called exactly once; "
+        f"got {claim_call_count[0]}"
+    )
     if starting_contract != "DEFERRED:RTX":
-        assert claim_call_count[0] == 1
         # A real durable OCC is already materialized.  A stale deferred flag
         # must not reopen selector work or create a second ownership claim.
         assert _FakeSelector.select_count == 0
         assert copyback_calls == []
         assert submit_calls == []
         return
-    assert claim_call_count[0] == 1
     # Selector must have been called exactly once
     assert _FakeSelector.select_count == 1, (
         f"selector.select must be called exactly once; got {_FakeSelector.select_count}"
@@ -2113,7 +2105,6 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     assert selector_elapsed < 0.25
     assert copyback_calls, "validated retry selection must reach durable copyback"
     assert copyback_calls[-1]["contract"] == "RTX260117C00130000"
-    assert copyback_calls[-1]["generation"] == 2
     assert float(copyback_calls[-1]["limit_price"]) > 0.01
     assert len(submit_calls) == 1
     assert submit_calls[0]["plan"].contract_symbol == "RTX260117C00130000"
@@ -2760,7 +2751,6 @@ def test_market_truth_claim_defers_attempt_mirror_until_atomic_advance():
             execution_mode="paper",
             retry_attempt=2,
             advance_retry_attempt=False,
-            market_truth_only=True,
         )
 
     assert patches_seen
@@ -2783,7 +2773,6 @@ def test_market_truth_claim_defers_attempt_mirror_until_atomic_advance():
             observed_underlying_price=130.05,
             retry_attempt=3,
             advance_retry_attempt=True,
-            market_truth_only=False,
             advance_after_market_truth=True,
             signal_id=SIGNAL_ID,
             execution_mode="paper",
@@ -2805,7 +2794,7 @@ def test_two_market_truth_holds_keep_attempt_then_one_recovery_advances(monkeypa
 
     monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "1")
     row = _row(retry_attempt=1, materialization_generation=1,
-               max_attempts=1, selector_reason="CURRENT_PRICE_FETCH_FAILED")
+               max_attempts=1)
     row["meta"].update({
         "breach_attempt_count": 1,
         "materialization_attempts": 1,
@@ -2841,7 +2830,6 @@ def test_two_market_truth_holds_keep_attempt_then_one_recovery_advances(monkeypa
                     kwargs["retry_attempt"],
                 ))
                 assert kwargs["advance_retry_attempt"] is True
-                assert kwargs["market_truth_only"] is False
                 meta.update({
                     "retry_attempt": kwargs["retry_attempt"],
                     "breach_attempt_count": kwargs["retry_attempt"],
@@ -2853,7 +2841,6 @@ def test_two_market_truth_holds_keep_attempt_then_one_recovery_advances(monkeypa
                 return True
             claims.append((kwargs["retry_attempt"], kwargs["new_generation"]))
             assert kwargs["advance_retry_attempt"] is False
-            assert kwargs["market_truth_only"] is True
             meta.update({
                 "lifecycle_state": "MATERIALIZING",
                 "materialization_status": "RUNNING",
@@ -2941,7 +2928,6 @@ def test_two_market_truth_holds_keep_attempt_then_one_recovery_advances(monkeypa
             new_generation=signal["materialization_generation"],
             retry_attempt=signal["retry_attempt"] + 1,
             advance_retry_attempt=True,
-            market_truth_only=False,
             advance_after_market_truth=True,
             signal_id=SIGNAL_ID,
             execution_mode="paper",

@@ -2728,7 +2728,6 @@ class APOrderStateMachine:
         # fresh market truth passes.
         retry_attempt: int | None = None,
         advance_retry_attempt: bool = True,
-        market_truth_only: bool = False,
         advance_after_market_truth: bool = False,
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
@@ -2803,7 +2802,7 @@ class APOrderStateMachine:
             "materialization_started_at": _now,
             # A market-truth-only ownership lease has not started selector
             # work; leave this marker empty until the post-truth claim.
-            "selector_started_at": "" if market_truth_only else _now,
+            "selector_started_at": _now if advance_retry_attempt else "",
             "trigger_crossed_at": str(trigger_crossed_at or _now),
             "breach_received_at": _now,
             "trigger_price": float(trigger_price or 0),
@@ -2815,16 +2814,18 @@ class APOrderStateMachine:
             "broker_ready": False,
             # A true value means this ownership claim has not yet earned a
             # selector-attempt identity. Only the post-truth CAS clears it.
-            "materialization_market_truth_pending": bool(market_truth_only),
+            "materialization_market_truth_pending": not advance_retry_attempt,
         }
         if not isinstance(advance_retry_attempt, bool) or not isinstance(
-            market_truth_only, bool
-        ) or not isinstance(advance_after_market_truth, bool):
+            advance_after_market_truth, bool
+        ):
             return False
         if (
-            market_truth_only and advance_retry_attempt
-            or advance_after_market_truth
-            and (market_truth_only or not advance_retry_attempt or retry_attempt is None)
+            (not advance_retry_attempt and retry_attempt is None)
+            or (
+                advance_after_market_truth
+                and (not advance_retry_attempt or retry_attempt is None)
+            )
         ):
             return False
         if advance_after_market_truth:

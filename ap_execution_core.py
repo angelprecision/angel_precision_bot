@@ -3557,7 +3557,6 @@ class APExecutionCore:
                 **(
                     {
                         "advance_retry_attempt": False,
-                        "market_truth_only": True,
                     }
                     if _market_truth_only_retry
                     else {}
@@ -6319,7 +6318,6 @@ class APExecutionCore:
                                 execution_mode=_mat_exec_mode,
                                 retry_attempt=_next_attempt,
                                 advance_retry_attempt=True,
-                                market_truth_only=False,
                                 advance_after_market_truth=True,
                                 lease_until=(
                                     datetime.now(timezone.utc)
