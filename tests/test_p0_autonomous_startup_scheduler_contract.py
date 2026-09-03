@@ -195,9 +195,11 @@ def _startup_recovery_messages(caplog):
 def test_startup_recovery_timeout_still_emits_completion_marker(monkeypatch, caplog):
     import client_runner
 
+    captured = {}
+
     class _Recovery:
         def __init__(self, **kwargs):
-            pass
+            captured.update(kwargs)
 
         def run(self, include_watcher_reseed=False):
             time.sleep(0.02)
@@ -208,12 +210,16 @@ def test_startup_recovery_timeout_still_emits_completion_marker(monkeypatch, cap
     caplog.set_level(logging.INFO, logger="client_runner")
 
     runner = _runner_for_startup_recovery(client_runner)
+    started = time.monotonic()
     runner._run_startup_recovery(broker=object(), exit_eng=object())
+    elapsed = time.monotonic() - started
 
     messages = _startup_recovery_messages(caplog)
     assert len(messages) == 1
     assert "status=timeout" in messages[0]
     assert "recovery_attempt_id=" in messages[0]
+    assert elapsed < 0.018
+    assert 0 < captured["recovery_deadline_monotonic"] - started < 0.1
 
 
 def test_startup_recovery_exception_emits_failed_marker(monkeypatch, caplog):

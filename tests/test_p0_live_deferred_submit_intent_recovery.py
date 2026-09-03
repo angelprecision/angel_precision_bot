@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:1/test")
 
@@ -663,6 +665,51 @@ def test_actual_tradier_pagination_ceiling_is_unknown_and_never_not_found(
 
     assert result["broker_truth"] == "UNKNOWN"
     assert result["reason_code"].startswith("RECONCILE_BROKER_QUERY_FAILED")
+    osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
+    core.resume_deferred_broker_ready_order.assert_not_called()
+    broker.session.post.assert_not_called()
+    assert [
+        call.kwargs["params"]["page"]
+        for call in broker.session.get.call_args_list
+    ] == [1, 2]
+
+
+def test_actual_tradier_slow_subsequent_page_hits_recovery_deadline_and_retains_owner():
+    """A slow page after a full page cannot outlive the recovery budget."""
+    import ap.brokers.tradier as tradier_module
+
+    row = _intent_row()
+    full_page = [
+        {"id": f"TR-OTHER-{index}", "tag": f"other-{index}"}
+        for index in range(tradier_module.TRADIER_ORDERS_PAGE_SIZE)
+    ]
+    recovery_budget = 0.10
+
+    def _slow_page(url, *, params, timeout):
+        assert url == "https://api.tradier.com/v1/accounts/acct/orders"
+        assert timeout[0] > 0
+        assert timeout[1] <= recovery_budget
+        if params["page"] == 1:
+            return _TradierResponse({"orders": {"order": full_page}})
+        time.sleep(timeout[1])
+        raise requests.exceptions.Timeout("slow subsequent page")
+
+    broker = _transport_broker(_slow_page)
+    core, osm, _unused_mock_broker = _core_for(row)
+    core.broker = broker
+
+    started = time.monotonic()
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=row["local_order_id"],
+        recovery_deadline_monotonic=started + recovery_budget,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < recovery_budget + 0.25
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["reason_code"] == "RECONCILE_BROKER_QUERY_DEADLINE_EXCEEDED"
+    assert result["broker_truth"] == "UNKNOWN"
+    assert result["broker_submit_owner_retained"] is True
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
     core.resume_deferred_broker_ready_order.assert_not_called()
     broker.session.post.assert_not_called()
@@ -1375,6 +1422,7 @@ def test_recovery_retains_exact_broker_owner_without_generic_recovery_write(monk
         )
     )
     watcher = SimpleNamespace(has_order=lambda _loid: False, watch=MagicMock())
+    recovery_deadline = time.monotonic() + 30.0
     recovery = APStartupRecovery(
         client_id=_CLIENT,
         broker=object(),
@@ -1383,11 +1431,17 @@ def test_recovery_retains_exact_broker_owner_without_generic_recovery_write(monk
         master_control=SimpleNamespace(mode="LIVE"),
         entry_watcher=watcher,
         execution_core=ec,
+        recovery_deadline_monotonic=recovery_deadline,
     )
     result = {"deferred_lifecycles_recovered": 0}
 
     recovery._recover_deferred_breach_lifecycles(result)
 
+    ec.reconcile_deferred_broker_intent.assert_called_once()
+    assert ec.reconcile_deferred_broker_intent.call_args.kwargs == {
+        "local_order_id": "recovery-live-1",
+        "recovery_deadline_monotonic": recovery_deadline,
+    }
     osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
     osm.retain_recovery_ownership_if_no_watcher.assert_not_called()
     osm.update_order_meta.assert_not_called()

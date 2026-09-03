@@ -40,6 +40,7 @@ from ap.broker_submit_identity import (
     canonical_broker_submit_key,
     entry_submit_payload_hash,
 )
+from ap.brokers.tradier import TradierOrderQueryDeadlineExceeded
 from ap.utils                import now_utc_iso
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
@@ -4029,6 +4030,7 @@ class APExecutionCore:
         self,
         *,
         local_order_id: str,
+        recovery_deadline_monotonic: float | None = None,
     ) -> dict:
         """Resolve one durable ENTRY submit intent without a duplicate POST.
 
@@ -4039,7 +4041,9 @@ class APExecutionCore:
         reach the broker, so it retains the exact broker-submit fence and
         schedules another bounded reconciliation poll.  Only the existing
         canonical submit path may create submission authority, and this
-        ambiguous-POST recovery path never releases its fence.
+        ambiguous-POST recovery path never releases its fence.  A startup
+        recovery deadline is passed through to broker order enumeration; its
+        exhaustion is UNKNOWN and retains the exact broker-submit owner.
         """
         _owner_label = f"broker_reconciler:{self.client_id or self.email or ''}"
         _base = {
@@ -4348,11 +4352,22 @@ class APExecutionCore:
                 stage="broker_order_query",
             )
         try:
-            broker_orders = list_orders()
+            if recovery_deadline_monotonic is None:
+                broker_orders = list_orders()
+            else:
+                broker_orders = list_orders(
+                    deadline_monotonic=recovery_deadline_monotonic
+                )
             if not isinstance(broker_orders, list):
                 raise ValueError("broker order response must be a list")
             if not all(isinstance(order, dict) for order in broker_orders):
                 raise ValueError("broker order response contains a non-object")
+        except TradierOrderQueryDeadlineExceeded as exc:
+            return _retain_owner(
+                "RECONCILE_BROKER_QUERY_DEADLINE_EXCEEDED",
+                stage="broker_order_query",
+                exc=exc,
+            )
         except Exception as exc:
             return _retain_owner(
                 f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}:{str(exc)}",

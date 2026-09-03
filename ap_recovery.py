@@ -448,6 +448,7 @@ class APStartupRecovery:
         exit_engine=None, # APExitEngine (optional — needed for exit re-attachment)
         entry_watcher=None,  # APEntryWatcher (optional — needed for watcher reseed)
         execution_core=None, # APExecutionCore (optional — required for §2 safe BROKER_READY recovery)
+        recovery_deadline_monotonic: float | None = None,
     ):
         self.client_id     = str(client_id or "").strip().lower()
         self.broker        = broker
@@ -457,6 +458,7 @@ class APStartupRecovery:
         self.exit_engine   = exit_engine
         self.entry_watcher = entry_watcher
         self.execution_core = execution_core
+        self.recovery_deadline_monotonic = recovery_deadline_monotonic
 
     # ──────────────────────────────────────────────────────────────────────────
     # Entry point
@@ -2525,7 +2527,12 @@ class APStartupRecovery:
                     )
                     continue
                 try:
-                    rec = reconcile_fn(local_order_id=local_order_id) or {}
+                    reconcile_kwargs = {"local_order_id": local_order_id}
+                    if self.recovery_deadline_monotonic is not None:
+                        reconcile_kwargs[
+                            "recovery_deadline_monotonic"
+                        ] = self.recovery_deadline_monotonic
+                    rec = reconcile_fn(**reconcile_kwargs) or {}
                 except Exception as exc:
                     log.error(
                         "[%s] reconcile_deferred_broker_intent raised "
