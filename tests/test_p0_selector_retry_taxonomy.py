@@ -21,6 +21,7 @@ from ap.selector_retry_policy import (
     get_policy,
     classify_selector_reason,
     is_retryable_selector_reason,
+    deferred_retry_count_exhaustion_applies,
     resolve_selector_recovery_final_reason,
     RETRYABLE_BREACH_SELECTOR_REASONS,
     RETRYABLE_MATERIALIZATION_REASONS,
@@ -251,7 +252,7 @@ def test_duplicate_conflict_reason_has_runtime_restart_materializer_parity():
     assert policy.classification == RETRYABLE_DATA
     assert policy.selector_rerun_allowed is True
     assert policy.retry_delay_applies is True
-    assert policy.max_attempts_applies is True
+    assert policy.max_attempts_applies is False
     assert runtime == {
         "action": "retry_schedule",
         "reason_code": reason,
@@ -605,11 +606,8 @@ def test_duplicate_conflict_attempt_two_remains_retryable():
     assert result["reason_code"] not in _GENERIC_RELABEL_REASONS
 
 
-def test_duplicate_conflict_max_attempts_reached_is_retry_exhausted():
-    """attempt == max_attempts terminalizes as retry_exhausted, not a
-    generic quality rejection, and the canonical reason stays embedded in
-    the terminal_reason string per the real production contract.
-    """
+def test_duplicate_conflict_at_max_attempts_remains_retryable():
+    """A proven transient data miss is not terminalized by the count ceiling."""
     from ap_execution_core import _classify_deferred_breach_retry_decision
 
     result = _classify_deferred_breach_retry_decision(
@@ -621,16 +619,10 @@ def test_duplicate_conflict_max_attempts_reached_is_retry_exhausted():
         retry_enabled=True,
     )
 
-    assert result["action"] == "retry_exhausted"
+    assert result["action"] == "retry_schedule"
     assert result["reason_code"] == _DUPLICATE_QUOTE_CONFLICT_REASON
     assert result["retryable_reason"] is True
-    assert result["terminal_reason"] == (
-        f"BREACH_RETRY_EXHAUSTED:{_DUPLICATE_QUOTE_CONFLICT_REASON}"
-    )
     assert result["reason_code"] not in _GENERIC_RELABEL_REASONS
-    # The canonical reason must be traceable inside the terminal string,
-    # not collapsed into an opaque generic exhaustion marker.
-    assert _DUPLICATE_QUOTE_CONFLICT_REASON in result["terminal_reason"]
 
 
 def test_duplicate_conflict_past_cutoff_does_not_schedule_retry():
@@ -753,12 +745,20 @@ def test_retryable_data_codes_apply_retry_delay():
             )
 
 
-def test_retryable_data_codes_have_max_attempts():
+def test_retryable_data_codes_are_validity_bound():
     for code, pol in _POLICY_TABLE.items():
         if pol.classification == RETRYABLE_DATA:
-            assert pol.max_attempts_applies, (
-                f"{code!r} is RETRYABLE_DATA but max_attempts_applies=False"
+            assert not pol.max_attempts_applies, (
+                f"{code!r} is RETRYABLE_DATA but max_attempts_applies=True"
             )
+
+
+def test_count_helper_keeps_unknowns_fail_closed():
+    assert deferred_retry_count_exhaustion_applies("UNKNOWN_REASON", selector_failure={})
+    assert not deferred_retry_count_exhaustion_applies(
+        "CURRENT_PRICE_FETCH_FAILED",
+        selector_failure={"market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE"},
+    )
 
 
 def test_all_policies_have_non_empty_final_reason_and_queue_reason():

@@ -153,6 +153,7 @@ from ap.selector_retry_policy import (
     classify_selector_reason as _classify_selector_reason,
     is_retryable_selector_reason as _is_retryable_selector_reason,  # noqa: F401 – re-exported
     is_operational_request_budget_reason as _is_operational_request_budget_reason,
+    deferred_retry_count_exhaustion_applies as _deferred_retry_count_exhaustion_applies,
 )
 # NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is NOT in RETRYABLE_BREACH_SELECTOR_REASONS.
 # It is the DTE-ladder aggregation reason and may reflect structural quality
@@ -485,10 +486,10 @@ def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
 #
 # New default: 1530 (3:30 PM ET) — the system's own last-entry boundary
 # (matches ap_entry_watcher EOD disarm and ap/order_monitor
-# _PT_ORPHAN_EOD_CUTOFF). Total retry span per order remains bounded by
-# MAX_BREACH_SELECTOR_RETRIES × BREACH_SELECTOR_RETRY_DELAY_SECONDS
-# (default 5 × 8s = ~40s), so this cannot cause open-ended retry loops;
-# the cutoff only stops NEW retries from being scheduled into the close.
+# _PT_ORPHAN_EOD_CUTOFF). Validity-bound data retries are bounded by this
+# entry cutoff and their backoff; terminal quality/policy/invariant outcomes
+# remain fail-closed. The cutoff stops NEW retries from being scheduled into
+# the close.
 # Env var name is unchanged so the operational kill-switch muscle memory
 # ("set BREACH_SELECTOR_RETRY_CUTOFF_ET=0 to stop all retries") still works.
 _BREACH_RETRY_CUTOFF_DEFAULT_HHMM = 1530
@@ -952,11 +953,15 @@ def _classify_deferred_breach_retry_decision(
     _retryable_reason = (
         _reason_code in RETRYABLE_BREACH_SELECTOR_REASONS or bool(ladder_retryable)
     )
+    _count_cap_applies = _deferred_retry_count_exhaustion_applies(
+        _reason_code,
+        ladder_retryable=bool(ladder_retryable),
+    )
     if (
         _retryable_reason
         and retry_enabled
         and bool(queue_local_order_id)
-        and attempt < max_attempts
+        and (not _count_cap_applies or attempt < max_attempts)
         and not past_cutoff
     ):
         return {
@@ -971,7 +976,7 @@ def _classify_deferred_breach_retry_decision(
             "retryable_reason": True,
             "terminal_reason": f"breach_retry_cutoff:{_reason_code}",
         }
-    if _retryable_reason and attempt >= max_attempts:
+    if _retryable_reason and _count_cap_applies and attempt >= max_attempts:
         return {
             "action": "retry_exhausted",
             "reason_code": _reason_code,
@@ -3285,6 +3290,17 @@ class APExecutionCore:
             meta = {}
             _meta_parse_ok = False
 
+        _selector_failure_meta = meta.get("materialization_selector_failure")
+        if not isinstance(_selector_failure_meta, dict):
+            _selector_failure_meta = {}
+        _durable_retry_reason = str(
+            meta.get("retry_reason")
+            or meta.get("materialization_reason")
+            or meta.get("deferred_retry_reason_code")
+            or _selector_failure_meta.get("reason_code")
+            or ""
+        ).strip()
+
         # execution_mode: resolve the durable column/meta authority and then
         # require it to match this deferred-retry worker's explicit mode.
         from ap.order_state_machine import _durable_execution_mode as _resolve_durable_execution_mode
@@ -3413,9 +3429,19 @@ class APExecutionCore:
         # The resolved maximum is always the configured env value.
         # _durable_max is clamped but does not raise above configured_max.
         max_attempts = _configured_max
-        if _expected_attempt > max_attempts:
-            return _term("RETRY_MAX_ATTEMPTS_EXCEEDED", status="EXPIRED",
-                         attempt=_expected_attempt, max_attempts=max_attempts)
+        if (
+            _expected_attempt > max_attempts
+            and _deferred_retry_count_exhaustion_applies(
+                _durable_retry_reason,
+                selector_failure=_selector_failure_meta,
+            )
+        ):
+            return _term(
+                "RETRY_MAX_ATTEMPTS_EXCEEDED",
+                status="EXPIRED",
+                attempt=_expected_attempt,
+                max_attempts=max_attempts,
+            )
 
         durable_due_at_raw = (
             meta.get("materialization_next_retry_at")
@@ -6154,15 +6180,6 @@ class APExecutionCore:
                                 "disposition": "KEEP_WATCHER",
                                 "reason_code": "MATERIALIZATION_CONFIG_CONFLICT",
                             }
-                        if _selector_attempt_number >= _max_attempts_truth:
-                            return _terminalize_deferred_breach_failure(
-                                f"BREACH_RETRY_EXHAUSTED:{_truth_result.reason_code}",
-                                extra_meta={
-                                    "final_market_truth": _truth_result.audit,
-                                    "selector_calls": 0,
-                                    "broker_post_count": 0,
-                                },
-                            )
                         _truth_delay = _positive_int_env_config(
                             "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
                         )
@@ -6822,12 +6839,12 @@ class APExecutionCore:
                     # AMENDMENT (PR #219, Jason LIVE recovery): default is now
                     # "1" (ON). Retry only applies to deferred breach selection
                     # AND is further gated by RETRYABLE_BREACH_SELECTOR_REASONS,
-                    # queue_local_order_id presence, attempt count, and the
-                    # BREACH_SELECTOR_RETRY_CUTOFF_ET wall-clock cap — so this
-                    # cannot cause runaway retries for non-deferred flows or
-                    # for structural rejections. The env var is preserved as
-                    # an emergency kill switch (set to "0" to disable without
-                    # a code deploy).
+                    # queue_local_order_id presence, the canonical retry policy,
+                    # and the BREACH_SELECTOR_RETRY_CUTOFF_ET wall-clock cap —
+                    # so this cannot cause runaway retries for non-deferred
+                    # flows or structural rejections. The env var is preserved
+                    # as an emergency kill switch (set to "0" to disable
+                    # without a code deploy).
                     _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
                     from ap.selector_retry_policy import (
                         DeferredMaterializationConfigConflict,

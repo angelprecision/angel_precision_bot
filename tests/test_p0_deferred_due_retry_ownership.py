@@ -560,6 +560,9 @@ def test_8_exhausted_retry_returns_terminal_and_does_not_call_broker(monkeypatch
     core = _core()
     # attempt 4 requested but max_attempts=3 (env also 3 → resolved max=3)
     row = _row(retry_attempt=3, max_attempts=3)
+    row["meta"]["materialization_selector_failure"] = {
+        "reason_code": "UNKNOWN_RETRY_REASON",
+    }
     core.order_state_machine.get_order.return_value = row
 
     result = core.resume_deferred_materialization_retry(
@@ -2937,8 +2940,8 @@ def test_am1_durable_3_env_5_attempt_5_allowed(monkeypatch):
         f"Attempt 5 should be allowed when env=5: {result}"
 
 
-def test_am1_durable_3_env_5_attempt_6_exhausted(monkeypatch):
-    """Attempt 6 must be BLOCKED when resolved max is 5."""
+def test_am1_durable_3_env_5_attempt_6_remains_retryable(monkeypatch):
+    """A known transient data failure remains retryable past the telemetry max."""
     monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
 
     core, osm = _core_with_row(_base_meta(retry_max_attempts=3, retry_attempt=5), monkeypatch=monkeypatch)
@@ -2948,9 +2951,9 @@ def test_am1_durable_3_env_5_attempt_6_exhausted(monkeypatch):
         expected_retry_attempt=6,
         owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:6",
     )
-    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" in result.get("reason_code", ""), \
-        f"Attempt 6 must be exhausted at max=5: {result}"
-    assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""), \
+        f"Attempt 6 must remain retryable: {result}"
+    assert result.get("disposition") == "RETRY_WAIT"
 
 
 # ── Test 2: durable=7/500, env=5 → hard capped at 5 (blocker correction) ────
@@ -2985,8 +2988,8 @@ def test_am1_durable_7_env_5_clamped_to_5(monkeypatch):
         assert kwargs.get("max_attempts") == 5,             f"Durable max=7 must be clamped to env=5: got {kwargs.get('max_attempts')}"
 
 
-def test_am1_durable_7_env_5_attempt_6_clamped_exhausted(monkeypatch):
-    """Attempt 6 must be BLOCKED when durable=7, env=5 (clamped to 5)."""
+def test_am1_durable_7_env_5_attempt_6_remains_retryable(monkeypatch):
+    """A bounded durable max is telemetry, not a cap for known data failures."""
     monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
 
     core, osm = _core_with_row(_base_meta(retry_max_attempts=7, retry_attempt=5), monkeypatch=monkeypatch)
@@ -2996,12 +2999,12 @@ def test_am1_durable_7_env_5_attempt_6_clamped_exhausted(monkeypatch):
         expected_retry_attempt=6,
         owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:6",
     )
-    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" in result.get("reason_code", ""),         f"Attempt 6 must be exhausted when durable=7 is clamped to env=5: {result}"
-    assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""),         f"Attempt 6 must remain retryable: {result}"
+    assert result.get("disposition") == "RETRY_WAIT"
 
 
-def test_am1_durable_500_env_5_clamped(monkeypatch):
-    """Corrupted or stale durable max=500 must be clamped to env=5."""
+def test_am1_durable_500_env_5_remains_retryable(monkeypatch):
+    """A stale durable max cannot terminalize a known data failure by count."""
     monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
 
     core, osm = _core_with_row(_base_meta(retry_max_attempts=500, retry_attempt=5), monkeypatch=monkeypatch)
@@ -3011,8 +3014,8 @@ def test_am1_durable_500_env_5_clamped(monkeypatch):
         expected_retry_attempt=6,
         owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:6",
     )
-    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" in result.get("reason_code", ""),         f"Attempt 6 must be exhausted when durable=500 is clamped to env=5: {result}"
-    assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""),         f"Attempt 6 must remain retryable: {result}"
+    assert result.get("disposition") == "RETRY_WAIT"
 
 
 # ── Test 2b: durable=5, env=5 → 5 (exact match) ──────────────────────────────

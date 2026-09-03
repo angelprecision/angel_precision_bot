@@ -42,6 +42,7 @@ from ap.pending_trigger_classifier import (
 )
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
+    deferred_retry_count_exhaustion_applies,
     resolve_deferred_materialization_max_attempts,
 )
 
@@ -915,7 +916,16 @@ class PendingTriggerRestartRecovery:
 
         _meta     = _extract_meta(row)
         _attempts = int(_meta.get(_MAT_ATTEMPTS_FIELD) or 0) + 1
-        if _attempts > _max:
+        _selector_failure = _meta.get("materialization_selector_failure")
+        if not isinstance(_selector_failure, dict):
+            _selector_failure = {}
+        if (
+            _attempts > _max
+            and deferred_retry_count_exhaustion_applies(
+                reason,
+                selector_failure=_selector_failure,
+            )
+        ):
             log.warning(
                 "RESTART_RECOVERY_CANONICAL_RETRY_EXHAUSTED local=%s attempts=%d max=%d — terminalizing",
                 local_oid, _attempts, _max,
@@ -1132,7 +1142,16 @@ class PendingTriggerRestartRecovery:
         mat_status   = str(meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
         broker_ready = meta.get(_MAT_BROKER_READY)
         next_at      = str(meta.get(_MAT_NEXT_RETRY_AT) or "").strip()
-        reason       = str(meta.get(_MAT_REASON_FIELD) or "").strip()
+        _selector_failure = meta.get("materialization_selector_failure")
+        if not isinstance(_selector_failure, dict):
+            _selector_failure = {}
+        reason       = str(
+            meta.get(_MAT_REASON_FIELD)
+            or meta.get("retry_reason")
+            or meta.get("deferred_retry_reason_code")
+            or _selector_failure.get("reason_code")
+            or ""
+        ).strip()
         last_fail    = str(meta.get(_MAT_LAST_FAILURE_FIELD) or "").strip()
         try:
             attempts = int(meta.get(_MAT_ATTEMPTS_FIELD))
@@ -1152,7 +1171,15 @@ class PendingTriggerRestartRecovery:
             return None
         if broker_ready is not False:
             return None
-        if attempts < 1 or attempts > _max:
+        if attempts < 1:
+            return None
+        if (
+            attempts > _max
+            and deferred_retry_count_exhaustion_applies(
+                reason,
+                selector_failure=_selector_failure,
+            )
+        ):
             return None
         if not next_at or not reason:
             return None

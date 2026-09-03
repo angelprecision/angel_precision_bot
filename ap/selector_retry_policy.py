@@ -99,133 +99,140 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "NO_CHAIN_DATA": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="NO_CHAIN_DATA",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_PROVIDER_ERROR": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_PROVIDER_ERROR",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_PROVIDER_EMPTY_EXPIRATIONS": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_PROVIDER_EMPTY_OPTIONS": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_PROVIDER_EMPTY_OPTIONS",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_PARSE_EMPTY": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_PARSE_EMPTY",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_EMPTY": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_EMPTY",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_FETCH_FAILED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_FETCH_FAILED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "NO_EXPIRATION_IN_DTE_WINDOW": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="NO_EXPIRATION_IN_DTE_WINDOW",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "DIRECT_QUOTE_UNAVAILABLE": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="DIRECT_QUOTE_UNAVAILABLE",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_ROW_ZERO_BID_ASK": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_ROW_ZERO_BID_ASK",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "DIRECT_QUOTE_ZERO_BID_ASK": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="DIRECT_QUOTE_ZERO_BID_ASK",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "QUOTE_FETCH_FAILED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="QUOTE_FETCH_FAILED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "QUOTE_ZERO_BID_ASK": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="QUOTE_ZERO_BID_ASK",
+        queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
+    ),
+    "CURRENT_PRICE_FETCH_FAILED": SelectorRetryPolicy(
+        classification=RETRYABLE_DATA,
+        selector_rerun_allowed=True, retain_existing_contract=False,
+        retry_delay_applies=True, max_attempts_applies=False,
+        final_reason_code="CURRENT_PRICE_FETCH_FAILED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "SELECTOR_REQUEST_BUDGET_EXHAUSTED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "MARKET_DATA_THROTTLE_UNAVAILABLE": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="MARKET_DATA_THROTTLE_UNAVAILABLE",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "PROVIDER_RATE_LIMITED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="PROVIDER_RATE_LIMITED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "PROVIDER_TIMEOUT": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="PROVIDER_TIMEOUT",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "REJECT_UNAVAILABLE": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="REJECT_UNAVAILABLE",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
@@ -593,6 +600,78 @@ def is_retryable_selector_reason(reason_code: "str | None") -> bool:
     addition of a new reason code in the table is the only required change.
     """
     return get_policy(reason_code).classification == RETRYABLE_DATA
+
+
+def deferred_retry_count_exhaustion_applies(
+    reason_code: "str | None",
+    *,
+    selector_failure: dict | None = None,
+    ladder_retryable: bool = False,
+) -> bool:
+    """Return whether the retry count may be a terminal authority.
+
+    Known transient data failures are bounded by the existing validity, cutoff,
+    ownership, and broker fences. Unknown or terminal outcomes remain
+    fail-closed. A DTE aggregation reason is retryable only with an explicit
+    all-data-miss ladder proof.
+    """
+    if ladder_retryable:
+        return False
+
+    failure = selector_failure if isinstance(selector_failure, dict) else {}
+    market_truth = str(
+        failure.get("market_truth_outcome") or ""
+    ).strip().upper()
+    if not market_truth:
+        nested = failure.get("last_breach_selector_audit")
+        if isinstance(nested, dict):
+            market_truth = str(
+                nested.get("market_truth_outcome") or ""
+            ).strip().upper()
+    if market_truth == "HOLD_MARKET_TRUTH_UNAVAILABLE":
+        return False
+
+    if str(reason_code or "").strip().upper() == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
+        audits = [
+            failure.get("last_dte_ladder_audit"),
+            failure.get("dte_ladder_audit"),
+            failure.get("last_breach_selector_audit"),
+        ]
+        for audit in audits:
+            if not isinstance(audit, dict):
+                continue
+            nested = audit.get("last_dte_ladder_audit")
+            if isinstance(nested, dict):
+                audit = nested
+            buckets = audit.get("buckets_attempted")
+            if not isinstance(buckets, list) or not buckets:
+                continue
+            proven = True
+            saw_failure = False
+            for bucket in buckets:
+                expirations = bucket.get("expirations_probed") if isinstance(bucket, dict) else None
+                if not isinstance(expirations, list) or not expirations:
+                    proven = False
+                    break
+                for expiration in expirations:
+                    sub_failure = expiration.get("failure") if isinstance(expiration, dict) else None
+                    sub_reason = str(
+                        sub_failure.get("reason_code") or ""
+                    ).strip().upper() if isinstance(sub_failure, dict) else ""
+                    if sub_reason not in RETRYABLE_BREACH_SELECTOR_REASONS:
+                        proven = False
+                        break
+                    saw_failure = True
+                if not proven:
+                    break
+            if proven and saw_failure:
+                return False
+
+    policy = get_policy(reason_code)
+    return not (
+        policy.classification == RETRYABLE_DATA
+        and not policy.max_attempts_applies
+    )
 
 
 # ── Sub-classification: OPERATIONAL_REQUEST_BUDGET vs candidate-quality ───────
