@@ -2527,7 +2527,13 @@ class APStartupRecovery:
                 stale_pending = (now - created_at).total_seconds() > 72 * 3600
             except Exception:
                 stale_pending = False
-            if stale_pending:
+            # A persisted submit intent is an ambiguous broker handoff.  Its
+            # age must not let generic stale cleanup preempt reconciliation.
+            broker_submit_intent_pending = bool(
+                meta.get("submit_intent_at")
+                and not str(order.get("broker_order_id") or "").strip()
+            )
+            if stale_pending and not broker_submit_intent_pending:
                 _terminalize_verified(
                     local_order_id,
                     reason_code="RECOVERY_STALE_PENDING_TRIGGER",
@@ -2559,7 +2565,7 @@ class APStartupRecovery:
             # and never terminalizes until the broker-query adoption gate is
             # wired. On RECONCILE_PENDING we retain durable ownership so the
             # row is never lost while it waits for reconciliation.
-            if meta.get("submit_intent_at") and not str(order.get("broker_order_id") or "").strip():
+            if broker_submit_intent_pending:
                 reconcile_fn = None
                 if self.execution_core is not None:
                     reconcile_fn = getattr(

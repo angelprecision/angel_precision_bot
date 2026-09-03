@@ -4602,7 +4602,13 @@ class APOrderStateMachine:
                     "WHERE local_order_id=%s AND client_id=%s AND kind='ENTRY' "
                     "AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
                     "AND (broker_order_id IS NULL OR broker_order_id='') "
-                    "AND submitted_ts IS NULL" + _where_owner,
+                    "AND submitted_ts IS NULL "
+                    "AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at','')), '') IS NULL "
+                    "AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key','')), '') IS NULL "
+                    "AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash','')), '') IS NULL "
+                    "AND LOWER(BTRIM(COALESCE(meta->>'current_owner',''))) NOT LIKE 'broker_submit:%' "
+                    "AND UPPER(BTRIM(COALESCE(meta->>'lifecycle_state',''))) <> 'SUBMITTING'"
+                    + _where_owner,
                     tuple(_params),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)

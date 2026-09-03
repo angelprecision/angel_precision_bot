@@ -329,6 +329,39 @@ def test_recovery_routes_crash_window_to_reconciler_never_resumes(monkeypatch):
     assert patch["recovery_retention_reason"] == "RECONCILE_BROKER_QUERY_NOT_YET_WIRED"
 
 
+def test_stale_crash_window_reaches_reconciler_before_stale_cleanup(monkeypatch):
+    """Age-based cleanup must not mutate a durable broker-submit handoff."""
+    osm = _osm()
+    sentinel = {"status": "PENDING_TRIGGER", "owner": "broker_submit:oid-crash"}
+
+    def _would_terminalize(*_args, **_kwargs):
+        sentinel["status"] = "EXPIRED"
+        sentinel["owner"] = ""
+        return True
+
+    osm.terminalize_deferred_breach.side_effect = _would_terminalize
+    ec = types.SimpleNamespace(
+        reconcile_deferred_broker_intent=MagicMock(return_value={
+            "disposition": "RECONCILE_PENDING",
+            "reason_code": "RECONCILE_BROKER_QUERY_NOT_YET_WIRED",
+        }),
+        resume_deferred_broker_ready_order=MagicMock(),
+    )
+    watcher = types.SimpleNamespace(
+        has_order=lambda _oid: False, watch=MagicMock(return_value=True),
+    )
+    row = _crash_window_recovery_row()
+    row["created_ts"] = datetime.now(timezone.utc) - timedelta(hours=73)
+    row["meta"]["current_owner"] = "broker_submit:oid-crash"
+
+    _run(monkeypatch, [row], osm=osm, entry_watcher=watcher, execution_core=ec)
+
+    ec.reconcile_deferred_broker_intent.assert_called_once()
+    osm.terminalize_deferred_breach.assert_not_called()
+    osm.submit_existing_entry.assert_not_called()
+    assert sentinel == {"status": "PENDING_TRIGGER", "owner": "broker_submit:oid-crash"}
+
+
 def test_recovery_crash_window_without_execution_core_retains(monkeypatch):
     """Without a reconciler wired, a crash-window row is retained, never
     resumed, never terminalized."""
