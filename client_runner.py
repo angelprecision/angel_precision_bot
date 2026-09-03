@@ -3739,6 +3739,20 @@ class ClientRunner(threading.Thread):
                                     OR  TRIM(COALESCE(o.broker_order_id, '')) = ''
                                     OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL')
                                     )
+                              -- Durable broker-submit handoffs must reach the
+                              -- reconciler before generic startup cleanup can
+                              -- classify the row.  In particular, the cleanup
+                              -- call runs before startup recovery constructs
+                              -- the OSM/core, so this SQL guard is the first
+                              -- protection against local terminalization.
+                              AND NOT (
+                                    NULLIF(TRIM(o.meta->>'submit_intent_at'), '') IS NOT NULL
+                                OR  NULLIF(TRIM(o.meta->>'broker_submit_key'), '') IS NOT NULL
+                                OR  NULLIF(TRIM(o.meta->>'broker_submit_payload_hash'), '') IS NOT NULL
+                                OR  NULLIF(TRIM(o.meta->>'current_owner'), '') LIKE 'broker_submit:%'
+                                OR  UPPER(TRIM(COALESCE(o.meta->>'lifecycle_state', ''))) = 'SUBMITTING'
+                                OR  NULLIF(TRIM(o.meta->>'broker_submit_resolution_state'), '') IS NOT NULL
+                              )
                               AND   (
                                         o.meta->'watcher_audit' IS NULL
                                     OR  o.meta->'watcher_audit'->>'reason_code' IN (

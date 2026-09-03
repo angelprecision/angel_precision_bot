@@ -351,6 +351,63 @@ def test_quarantine_marker_survives_restart_and_revalidates_position_truth():
     _assert_no_money_path_mutations(core, broker, osm)
 
 
+def test_existing_quarantine_marker_is_not_reused_after_position_truth_failure():
+    row = _historical_row()
+    broker = MagicMock()
+    broker.list_positions_authoritative.return_value = []
+    core, osm, broker = _core_for(row, broker)
+
+    first = core.reconcile_deferred_broker_intent(
+        local_order_id=AAPL_ID,
+        now_utc=NOW,
+    )
+    assert first["historical_nonblocking"] is True
+    row["meta"].update(osm.update_order_meta.call_args.args[1])
+    assert AAPL_ID in core._historical_quarantine_verified_ids
+    osm.update_order_meta.reset_mock()
+
+    broker.list_positions_authoritative.side_effect = RuntimeError("position read failed")
+    second = core.reconcile_deferred_broker_intent(
+        local_order_id=AAPL_ID,
+        now_utc=NOW + timedelta(minutes=1),
+    )
+
+    assert second["broker_truth"] == "UNKNOWN"
+    assert second["historical_nonblocking"] is False
+    assert AAPL_ID not in core._historical_quarantine_verified_ids
+    _assert_no_money_path_mutations(core, broker, osm)
+
+
+def test_position_present_with_marker_invalidation_cas_failure_stays_blocking():
+    row = _historical_row()
+    broker = MagicMock()
+    broker.list_positions_authoritative.return_value = []
+    core, osm, broker = _core_for(row, broker)
+
+    first = core.reconcile_deferred_broker_intent(
+        local_order_id=AAPL_ID,
+        now_utc=NOW,
+    )
+    assert first["historical_nonblocking"] is True
+    row["meta"].update(osm.update_order_meta.call_args.args[1])
+    osm.update_order_meta.reset_mock()
+    osm.update_order_meta.return_value = False
+    broker.list_positions_authoritative.return_value = [
+        {"symbol": row["contract"], "quantity": 1}
+    ]
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=AAPL_ID,
+        now_utc=NOW + timedelta(minutes=1),
+    )
+
+    assert result["broker_truth"] == "POSITION_PRESENT"
+    assert result["historical_nonblocking"] is False
+    assert result["historical_quarantine_invalidated"] is False
+    assert AAPL_ID not in core._historical_quarantine_verified_ids
+    _assert_no_money_path_mutations(core, broker, osm)
+
+
 def test_readiness_excludes_only_currently_fenced_historical_quarantine_rows():
     source = Path(__file__).resolve().parents[1] / "ap" / "preopen_readiness.py"
     text = source.read_text(encoding="utf-8")
@@ -358,8 +415,87 @@ def test_readiness_excludes_only_currently_fenced_historical_quarantine_rows():
     assert "broker_submit_resolution_trading_date" in text
     assert "broker_submit:" in text
     assert "AND NOT (" in text
+    assert "_historical_quarantine_verified_ids" in text
+    assert "ANY(%s::text[])" in text
     assert "broker_submit_resolution_contract" in text
     assert "broker_submit_resolution_client_id" in text
+
+
+def test_startup_cleanup_excludes_durable_broker_submit_handoffs():
+    source = (Path(__file__).resolve().parents[1] / "client_runner.py").read_text(
+        encoding="utf-8"
+    )
+    candidates = source[source.index("WITH candidates AS") : source.index("active_proof AS")]
+    assert "AND NOT (" in candidates
+    for field in (
+        "submit_intent_at",
+        "broker_submit_key",
+        "broker_submit_payload_hash",
+        "current_owner",
+        "lifecycle_state",
+        "broker_submit_resolution_state",
+    ):
+        assert f"o.meta->>'{field}'" in candidates
+
+
+def test_readiness_query_uses_current_process_quarantine_fence(monkeypatch):
+    from ap import db as ap_db
+    from ap import preopen_readiness
+
+    pending_row = {"local_order_id": AAPL_ID, "signal_id": "sig-aapl"}
+
+    class Cursor:
+        def __init__(self):
+            self.rows = []
+            self.calls = []
+
+        def execute(self, sql, params=()):
+            self.calls.append((sql, params))
+            if "status = 'PROCESSING'" in sql:
+                self.rows = []
+            elif "SELECT q.id, q.signal_id" in sql:
+                self.rows = []
+            elif "SELECT local_order_id, signal_id" in sql:
+                self.rows = [pending_row]
+            elif "SELECT COUNT(*)" in sql:
+                self.rows = [{"n": 0}]
+            else:
+                raise AssertionError(f"unexpected readiness SQL: {sql}")
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    cursor = Cursor()
+
+    class Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(ap_db, "conn", lambda: Connection())
+    monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *args, **kwargs: fn())
+
+    runner = SimpleNamespace(
+        mode="LIVE",
+        core=SimpleNamespace(_historical_quarantine_verified_ids={AAPL_ID}),
+    )
+    preopen_readiness._query_client_state(CLIENT, runner=runner)
+
+    pending_call = next(sql_call for sql_call in cursor.calls if "SELECT local_order_id" in sql_call[0])
+    assert "ANY(%s::text[])" in pending_call[0]
+    assert pending_call[1][2] == [AAPL_ID]
+
+    runner.core._historical_quarantine_verified_ids.clear()
+    preopen_readiness._query_client_state(CLIENT, runner=runner)
+    pending_call = [
+        sql_call for sql_call in cursor.calls if "SELECT local_order_id" in sql_call[0]
+    ][-1]
+    assert pending_call[1][2] == []
 
 
 def test_tradier_authoritative_positions_propagates_failure_and_accepts_empty_shape():

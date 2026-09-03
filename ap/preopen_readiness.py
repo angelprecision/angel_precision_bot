@@ -367,13 +367,30 @@ def _post_overnight_reeval_success_exists(client_id: str, execution_mode: str, t
     return False
 
 
-def _query_client_state(client_id: str) -> dict:
+def _query_client_state(client_id: str, runner=None) -> dict:
     from ap.db import conn, run_with_retry
 
     now_utc = datetime.now(timezone.utc)
     processing_cutoff = now_utc - timedelta(minutes=PROCESSING_STALE_MINUTES)
     watching_cutoff = now_utc - timedelta(minutes=WATCHING_ORPHAN_GRACE_MINUTES)
     pending_cutoff = now_utc - timedelta(hours=PENDING_TRIGGER_LOOKBACK_HOURS)
+    verified_ids = getattr(
+        getattr(runner, "core", None),
+        "_historical_quarantine_verified_ids",
+        None,
+    )
+    if not isinstance(verified_ids, (set, list, tuple)):
+        verified_ids = []
+    try:
+        verified_ids = [
+            str(order_id).strip()
+            for order_id in verified_ids
+            if str(order_id).strip()
+        ]
+    except Exception:
+        # A concurrent reconciler update is uncertainty, not proof that any
+        # historical marker may be hidden.
+        verified_ids = []
 
     def _load():
         with conn() as c:
@@ -463,10 +480,11 @@ def _query_client_state(client_id: str) -> dict:
                       AND COALESCE(meta->>'filled_ts', '') = ''
                       AND COALESCE(meta->>'broker_submitted_ts', '') = ''
                       AND COALESCE(meta->>'broker_submitted_at', '') = ''
+                      AND local_order_id = ANY(%s::text[])
                   )
                 ORDER BY created_ts
                 """,
-                (client_id, pending_cutoff),
+                (client_id, pending_cutoff, verified_ids),
             )
             pending_trigger = []
             for row in (c.fetchall() or []):
@@ -661,7 +679,7 @@ def run_preopen_autonomous_readiness(
     if selector_identity["quote_source"] == "unknown" or not selector_identity["tradier_base_url"]:
         errors.append("selector_quote_identity_unresolved")
 
-    client_state = _query_client_state(client_id)
+    client_state = _query_client_state(client_id, runner=runner)
     details["client_state"] = client_state
 
     if client_state.get("stale_processing_ids"):

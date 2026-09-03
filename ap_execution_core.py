@@ -4103,6 +4103,31 @@ class APExecutionCore:
         production callers use the current UTC instant.
         """
         _owner_label = f"broker_reconciler:{self.client_id or self.email or ''}"
+        # Readiness may only trust a historical quarantine marker after this
+        # process has successfully revalidated the exact row and strict
+        # position truth.  The durable marker survives restart, but this
+        # in-memory fence deliberately does not.
+        _quarantine_verified_ids = getattr(
+            self, "_historical_quarantine_verified_ids", None
+        )
+        if not isinstance(_quarantine_verified_ids, set):
+            _quarantine_verified_ids = set()
+            setattr(self, "_historical_quarantine_verified_ids", _quarantine_verified_ids)
+        _quarantine_lock = getattr(self, "_historical_quarantine_lock", None)
+        if _quarantine_lock is None or not hasattr(_quarantine_lock, "acquire"):
+            _quarantine_lock = threading.Lock()
+            setattr(self, "_historical_quarantine_lock", _quarantine_lock)
+        _local_order_key = str(local_order_id or "").strip()
+        with _quarantine_lock:
+            _quarantine_epochs = getattr(
+                self, "_historical_quarantine_epochs", None
+            )
+            if not isinstance(_quarantine_epochs, dict):
+                _quarantine_epochs = {}
+                setattr(self, "_historical_quarantine_epochs", _quarantine_epochs)
+            _quarantine_epoch = int(_quarantine_epochs.get(_local_order_key, 0)) + 1
+            _quarantine_epochs[_local_order_key] = _quarantine_epoch
+            _quarantine_verified_ids.discard(_local_order_key)
         _base = {
             "local_order_id": local_order_id,
             "owner": _owner_label,
@@ -4541,6 +4566,9 @@ class APExecutionCore:
             if not _update_resolution_meta(marker_patch):
                 retained["reason_code"] = "RECONCILE_HISTORICAL_RESOLUTION_WRITE_FAILED"
                 return retained
+            with _quarantine_lock:
+                if _quarantine_epochs.get(_local_order_key) == _quarantine_epoch:
+                    _quarantine_verified_ids.add(_local_order_key)
             retained.update(historical_nonblocking=True, historical_quarantine_persisted=True, historical_resolution_state=_PRIOR_SESSION_DAY_NO_CURRENT_POSITION)
             return retained
 

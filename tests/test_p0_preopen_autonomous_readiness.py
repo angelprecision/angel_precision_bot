@@ -71,7 +71,7 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     monkeypatch.setattr(
         pr,
         "_query_client_state",
-        lambda client_id: client_state or {
+        lambda client_id, runner=None: client_state or {
             "stale_processing_ids": [],
             "watching_orphans": [],
             "pending_trigger_rows": [],
