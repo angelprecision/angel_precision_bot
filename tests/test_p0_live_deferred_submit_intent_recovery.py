@@ -318,7 +318,7 @@ def _remote(row: dict, *, broker_id: str = "TR-ACTIVE", status: str = "open", **
         "tag": row["meta"]["broker_submit_key"],
         "option_symbol": row["contract"],
         "side": "buy_to_open",
-        "quantity": "1",
+        "quantity": 1.0,
         "status": status,
     }
     value.update(extra)
@@ -857,6 +857,68 @@ def test_exact_tag_found_is_adopted_once_and_never_posted():
     assert osm.update_order_meta.call_args.args[1]["current_owner"] == "ORDER_MONITOR"
     broker.place_order.assert_not_called()
     assert broker.list_orders.call_count == 1
+
+
+@pytest.mark.parametrize("quantity", [1, "1", 1.0, 1.00000000])
+def test_tradier_integral_quantity_shapes_are_adopted_once_without_post_or_cancel(
+    quantity,
+):
+    row = _intent_row()
+    core, osm, broker = _core_for(row)
+    broker.list_orders.return_value = [
+        _remote(
+            row,
+            broker_id="TR-AAPL-REAL-SHAPE",
+            quantity=quantity,
+        )
+    ]
+    osm.transition.return_value = True
+
+    result = core.reconcile_deferred_broker_intent(local_order_id=_AAPL_ID)
+
+    assert result["disposition"] == "ALREADY_RECONCILED"
+    assert result["status"] == "SUBMITTED"
+    assert result["broker_truth"] == "FOUND"
+    assert result["broker_order_id"] == "TR-AAPL-REAL-SHAPE"
+    osm.transition.assert_called_once()
+    assert osm.transition.call_args.args[:2] == (_AAPL_ID, "SUBMITTED")
+    broker.place_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    [
+        1.5,
+        0,
+        -1,
+        0.0,
+        -1.0,
+        True,
+        float("nan"),
+        float("inf"),
+        "1.5",
+        "not-a-number",
+        {"value": 1},
+        [1],
+    ],
+)
+def test_non_integral_or_malformed_broker_quantity_stays_fail_closed(quantity):
+    row = _intent_row()
+    core, osm, broker = _core_for(row)
+    broker.list_orders.return_value = [_remote(row, quantity=quantity)]
+
+    result = core.reconcile_deferred_broker_intent(local_order_id=_AAPL_ID)
+
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["broker_truth"] == "UNKNOWN"
+    assert result["broker_submit_owner_retained"] is True
+    assert result["reason_code"].startswith(
+        "RECONCILE_BROKER_RESPONSE_MALFORMED:ValueError:"
+    )
+    osm.transition.assert_not_called()
+    broker.place_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
 
 
 def test_no_match_observed_retains_owner_without_resume_or_post():

@@ -78,19 +78,20 @@ def _bounded_submit_reconcile_seconds(
 
 
 def _strict_reconcile_int(value, *, field: str) -> int:
-    """Parse a positive broker/durable quantity without bool/decimal coercion."""
-    if (
-        isinstance(value, bool)
-        or isinstance(value, float)
-        or value is None
-        or value == ""
-    ):
+    """Parse a positive integer, including integral broker JSON floats."""
+    if isinstance(value, bool) or value is None:
         raise ValueError(f"{field} must be a positive integer")
     if isinstance(value, int):
         number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{field} must be a positive integer")
+        number = int(value)
     elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value.strip()):
         number = int(value.strip())
     else:
+        raise ValueError(f"{field} must be a positive integer")
+    if number <= 0:
         raise ValueError(f"{field} must be a positive integer")
     return number
 
