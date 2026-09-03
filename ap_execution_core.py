@@ -2191,13 +2191,8 @@ class APExecutionCore:
                 "lease_until": lease_value,
             }
 
-        def _owned(proof, row, *, market_truth_required=False):
-            return {
-                "disposition": "OWNED",
-                **proof,
-                "row": row,
-                "market_truth_required": bool(market_truth_required),
-            }
+        def _owned(proof, row):
+            return {"disposition": "OWNED", **proof, "row": row}
 
         if signal.get("_recovery_pre_claimed"):
             expected_owner = str(
@@ -2236,13 +2231,7 @@ class APExecutionCore:
                 else None
             )
             return (
-                _owned(
-                    proof,
-                    row,
-                    market_truth_required=bool(
-                        signal.get("_recovery_pre_claimed_market_truth_required")
-                    ),
-                )
+                _owned(proof, row)
                 if proof is not None
                 else _keep("MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED")
             )
@@ -2298,52 +2287,18 @@ class APExecutionCore:
         claim = getattr(_osm, "claim_deferred_materialization", None)
         if not callable(claim):
             return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
-        _retry_lifecycle = (
-            str(row_meta.get("lifecycle_state") or "").strip().upper()
-            == "RETRY_WAIT"
-            or str(row_meta.get("materialization_status") or "").strip().upper()
-            == "RETRY_PENDING"
-        )
-        _current_retry_attempt = self._strict_materialization_int(
-            row_meta.get("retry_attempt"), minimum=1,
-        )
-        if _retry_lifecycle and _current_retry_attempt is None:
-            return _keep("MATERIALIZATION_ATTEMPT_INVALID")
-        _row_selector_failure = row_meta.get("materialization_selector_failure")
-        if not isinstance(_row_selector_failure, dict):
-            _row_selector_failure = row_meta.get("selector_failure")
-        if not isinstance(_row_selector_failure, dict):
-            _row_selector_failure = {}
-        _market_truth_only_retry = _retry_lifecycle and (
-            row_meta.get("materialization_market_truth_pending") is True
-            or str(
-                _row_selector_failure.get("market_truth_outcome")
-                or row_meta.get("market_truth_outcome")
-                or ""
-            ).strip().upper() == "HOLD_MARKET_TRUTH_UNAVAILABLE"
-        )
-        _claim_kwargs = {
-            "owner": owner,
-            "generation": next_generation,
-            "lease_until": (
-                datetime.now(timezone.utc) + timedelta(seconds=120)
-            ).isoformat(),
-            "trigger_crossed_at": crossed,
-            "trigger_price": float(getattr(watched, "trigger_price", 0) or 0),
-            "observed_underlying_price": observed,
-            "signal_id": _signal,
-            "execution_mode": _mode,
-        }
-        if _market_truth_only_retry:
-            # Fence ownership and require fresh market truth without claiming
-            # a selector attempt that has not started yet.
-            _claim_kwargs.update({
-                "retry_attempt": _current_retry_attempt,
-                "advance_retry_attempt": False,
-                "market_truth_only": True,
-            })
         try:
-            claimed = bool(claim(local_order_id, **_claim_kwargs))
+            claimed = bool(claim(
+                local_order_id,
+                owner=owner,
+                generation=next_generation,
+                lease_until=(datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+                trigger_crossed_at=crossed,
+                trigger_price=float(getattr(watched, "trigger_price", 0) or 0),
+                observed_underlying_price=observed,
+                signal_id=_signal,
+                execution_mode=_mode,
+            ))
         except Exception as exc:
             log.critical(
                 "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s error=%s",
@@ -2351,18 +2306,14 @@ class APExecutionCore:
             )
             claimed = False
         if claimed:
-            return _owned(
-                {
-                    "owner": owner,
-                    "generation": next_generation,
-                    "attempt": self._strict_materialization_int(
-                        row_meta.get("retry_attempt"), minimum=1,
-                    ) or 0,
-                    "lease_until": None,
-                },
-                row,
-                market_truth_required=_market_truth_only_retry,
-            )
+            return _owned({
+                "owner": owner,
+                "generation": next_generation,
+                "attempt": self._strict_materialization_int(
+                    row_meta.get("retry_attempt"), minimum=1,
+                ) or 0,
+                "lease_until": None,
+            }, row)
 
         row, read_ok = _read()
         if read_ok and isinstance(row, dict):
@@ -4901,8 +4852,6 @@ class APExecutionCore:
             _mat_owner = str(_claim_result.get("owner") or "")
             _mat_generation = _claim_result.get("generation")
             _prior_mat_attempt = int(_claim_result.get("attempt") or 0)
-            if _claim_result.get("market_truth_required"):
-                sig["_deferred_retry_market_truth_required"] = True
             _pv_row = _claim_result.get("row")
             _deferred_materialization_owned = True
             sig["_deferred_materialization_owned"] = True
@@ -6019,13 +5968,10 @@ class APExecutionCore:
                     recovery_cursor_persist=_persist_selector_cursor_progress,
                 )
 
-                # Deferred retries must prove current market truth before
-                # spending selector or direct-quote capacity. The pre-claim
-                # marker keeps this gate active even when the current attempt
-                # is 1 because the claim itself did not start a selector run.
+                # Deferred recovery retries must also prove current market
+                # truth when the pre-claim did not start selector work.
                 _market_truth_required = bool(
-                    sig.get("_deferred_retry_market_truth_required")
-                    or sig.get("_recovery_pre_claimed_market_truth_required")
+                    sig.get("_recovery_pre_claimed_market_truth_required")
                 )
                 if _selector_attempt_number > 1 or _market_truth_required:
                     from ap.live_submit_gates import (
