@@ -604,7 +604,10 @@ class TradierBroker(BrokerAdapter):
         if not isinstance(response, dict) or "positions" not in response:
             raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:root")
         positions = response.get("positions")
-        if positions is None or positions == "null" or positions == {} or positions == []:
+        # Tradier's documented JSON shape is positions.position.  Preserve
+        # the observed explicit null forms, but do not turn an empty/incomplete
+        # positions root into authoritative broker-flat truth.
+        if positions is None or positions == "null":
             return []
         if not isinstance(positions, dict) or "position" not in positions:
             raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:positions")

@@ -104,6 +104,9 @@ def _core_for(row: dict, broker: MagicMock | None = None):
 def _assert_no_money_path_mutations(core, broker, osm):
     broker.place_order.assert_not_called()
     broker.cancel_order.assert_not_called()
+    broker.list_positions.assert_not_called()
+    broker.session.post.assert_not_called()
+    broker.session.delete.assert_not_called()
     core.entry_watcher.watch.assert_not_called()
     for method in (
         "transition",
@@ -112,6 +115,23 @@ def _assert_no_money_path_mutations(core, broker, osm):
         "submit_existing_entry",
     ):
         getattr(osm, method).assert_not_called()
+
+
+def _assert_fail_closed_historical_ambiguity(
+    result, local_order_id, row, core, broker, osm
+):
+    assert result["historical_nonblocking"] is False
+    assert result.get("historical_quarantine_persisted") is not True
+    assert result.get("broker_submit_owner_retention_persisted") is True
+    assert local_order_id not in getattr(
+        core, "_historical_quarantine_verified_ids", set()
+    )
+    osm.retain_broker_submit_owner_for_reconciliation.assert_called_once()
+    retain_kwargs = osm.retain_broker_submit_owner_for_reconciliation.call_args.kwargs
+    assert retain_kwargs["broker_submit_key"] == row["meta"]["broker_submit_key"]
+    assert retain_kwargs["payload_hash"] == row["meta"]["broker_submit_payload_hash"]
+    osm.update_order_meta.assert_not_called()
+    _assert_no_money_path_mutations(core, broker, osm)
 
 
 @pytest.mark.parametrize(
@@ -181,6 +201,48 @@ def test_prior_session_exact_position_remains_blocking_and_never_terminalizes():
     broker.list_orders.assert_not_called()
     osm.update_order_meta.assert_not_called()
     _assert_no_money_path_mutations(core, broker, osm)
+
+
+def test_prior_session_exact_zero_quantity_is_unknown_and_remains_blocking():
+    row = _historical_row()
+    broker = MagicMock()
+    broker.list_positions_authoritative.return_value = [
+        {"symbol": row["contract"], "quantity": 0}
+    ]
+    core, osm, broker = _core_for(row, broker)
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=AAPL_ID,
+        now_utc=NOW,
+    )
+
+    assert result["broker_truth"] == "UNKNOWN"
+    assert "RECONCILE_BROKER_POSITION_QUERY_FAILED" in result["reason_code"]
+    broker.list_positions_authoritative.assert_called_once_with()
+    broker.list_orders.assert_not_called()
+    _assert_fail_closed_historical_ambiguity(
+        result, AAPL_ID, row, core, broker, osm
+    )
+
+
+def test_prior_session_after_hours_timestamp_is_not_a_completed_session():
+    # 19:00 ET on Tuesday is outside the regular session even though Tuesday
+    # and Wednesday are both NYSE trading dates.
+    row = _historical_row(intent_at="2026-09-01T23:00:00+00:00")
+    broker = MagicMock()
+    core, osm, broker = _core_for(row, broker)
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=AAPL_ID,
+        now_utc=NOW,
+    )
+
+    assert result["reason_code"] == "RECONCILE_PRIOR_SESSION_CALENDAR_UNPROVEN"
+    broker.list_positions_authoritative.assert_not_called()
+    broker.list_orders.assert_not_called()
+    _assert_fail_closed_historical_ambiguity(
+        result, AAPL_ID, row, core, broker, osm
+    )
 
 
 def test_historical_quarantine_write_failure_remains_blocking_and_unmarked():
@@ -524,3 +586,64 @@ def test_tradier_authoritative_positions_propagates_failure_and_accepts_empty_sh
     broker._get.side_effect = TimeoutError("broker unavailable")
     with pytest.raises(TimeoutError):
         broker.list_positions_authoritative()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"positions": {}},
+        {"positions": []},
+    ],
+)
+def test_tradier_authoritative_positions_rejects_ambiguous_empty_roots(payload):
+    cfg = TradierConfig(
+        base_url="https://api.tradier.com",
+        account_id="acct",
+        access_token="token",
+    )
+    broker = TradierBroker(cfg)
+    broker._get = MagicMock(return_value=payload)
+
+    with pytest.raises(ValueError, match="TRADIER_POSITIONS_PAYLOAD_MALFORMED"):
+        broker.list_positions_authoritative()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"positions": {}},
+        {"positions": []},
+    ],
+)
+def test_prior_session_ambiguous_empty_position_roots_stay_blocking(
+    payload,
+):
+    row = _historical_row()
+    strict_broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            account_id="acct",
+            access_token="token",
+        )
+    )
+    strict_broker._get = MagicMock(return_value=payload)
+
+    broker = MagicMock()
+    broker.list_positions_authoritative.side_effect = (
+        strict_broker.list_positions_authoritative
+    )
+    core, osm, broker = _core_for(row, broker)
+
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id=AAPL_ID,
+        now_utc=NOW,
+    )
+
+    assert result["broker_truth"] == "UNKNOWN"
+    assert "RECONCILE_BROKER_POSITION_QUERY_FAILED" in result["reason_code"]
+    broker.list_positions_authoritative.assert_called_once_with()
+    strict_broker._get.assert_called_once()
+    broker.list_orders.assert_not_called()
+    _assert_fail_closed_historical_ambiguity(
+        result, AAPL_ID, row, core, broker, osm
+    )

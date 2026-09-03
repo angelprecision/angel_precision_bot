@@ -197,7 +197,16 @@ def _prior_session_classification(
         return "future"
     try:
         from ap.flatline_alarm import is_trading_day
-        if is_trading_day(intent_date) and is_trading_day(now_date):
+        # A prior calendar date is not enough: the durable submit timestamp
+        # must also fall inside the existing regular-session authority.  This
+        # keeps an after-hours timestamp from being treated as a completed DAY
+        # session merely because its date was an NYSE trading day.
+        from ap.queue import _is_regular_session_et
+        if (
+            is_trading_day(intent_date)
+            and is_trading_day(now_date)
+            and _is_regular_session_et(submit_intent_at.astimezone(ET))
+        ):
             return "prior_completed_session"
     except Exception:
         pass
@@ -4465,7 +4474,7 @@ class APExecutionCore:
             positions = list_positions()
             if not isinstance(positions, list):
                 raise ValueError("authoritative position response must be a list")
-            exact_quantity = None
+            exact_position_seen = False
             for position in positions:
                 if not isinstance(position, dict):
                     raise ValueError("authoritative position response contains non-object")
@@ -4480,10 +4489,14 @@ class APExecutionCore:
                 if not math.isfinite(quantity_value):
                     raise ValueError("authoritative position quantity is malformed")
                 if symbol.strip().upper() == expected_contract.upper():
-                    if exact_quantity is not None:
+                    if exact_position_seen:
                         raise ValueError("authoritative position contains duplicate OCC")
-                    exact_quantity = quantity_value
-            return "POSITION_PRESENT" if exact_quantity not in (None, 0) else "NO_CURRENT_POSITION"
+                    exact_position_seen = True
+                    if quantity_value == 0:
+                        raise ValueError(
+                            "authoritative position exact OCC has zero quantity"
+                        )
+            return "POSITION_PRESENT" if exact_position_seen else "NO_CURRENT_POSITION"
 
         def _update_resolution_meta(meta_patch: dict) -> bool:
             update_meta = getattr(osm, "update_order_meta", None)
