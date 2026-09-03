@@ -4101,8 +4101,11 @@ class ClientRunner(threading.Thread):
 
 
     def _run_startup_recovery(self, broker, exit_eng):
-        """Run startup recovery with a hard timeout to prevent blocking initialization.
-        Recovery is best-effort — a timeout logs a warning but never blocks entries.
+        """Run startup recovery with a cooperative deadline.
+
+        Recovery is best-effort, but a timed-out worker must be fully drained
+        before startup returns so it cannot overlap the normal runtime
+        lifecycle authorities.
         """
         import concurrent.futures as _cf
         _RECOVERY_TIMEOUT = float(os.getenv("STARTUP_RECOVERY_TIMEOUT_SEC", "25"))
@@ -4143,8 +4146,11 @@ class ClientRunner(threading.Thread):
                     rec_result.get("exits_reattached"),
                     rec_result.get("dedup_seeded"),
                 )
+                _recovery_status = str(
+                    rec_result.get("recovery_status") or rec_result.get("status") or ""
+                ).strip().upper()
                 self._log_startup_recovery_complete(
-                    status="success",
+                    status="degraded" if _recovery_status == "DEGRADED" else "success",
                     started_at=_recovery_started_at,
                     recovery_attempt_id=_recovery_attempt_id,
                     result=rec_result,
@@ -4157,10 +4163,19 @@ class ClientRunner(threading.Thread):
                     self.email, _RECOVERY_TIMEOUT,
                 )
                 _fut.cancel()
-                # A running recovery may be inside an HTTP request.  Do not
-                # let executor context-manager shutdown wait for it after the
-                # advertised startup deadline has elapsed.
-                _ex.shutdown(wait=False, cancel_futures=True)
+                # Future.cancel() cannot stop a running recovery.  Drain it
+                # before returning; APStartupRecovery.run() checks the same
+                # deadline at every phase boundary and must stop cooperatively
+                # before normal runtime authorities are started.
+                try:
+                    _fut.result()
+                except Exception as _drain_exc:
+                    logger.warning(
+                        "[%s] Startup recovery worker failed while draining after timeout: %s",
+                        self.email,
+                        _drain_exc,
+                    )
+                _ex.shutdown(wait=True, cancel_futures=True)
                 _ex = None
                 self._log_startup_recovery_complete(
                     status="timeout",

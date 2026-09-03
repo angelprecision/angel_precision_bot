@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -196,14 +197,18 @@ def test_startup_recovery_timeout_still_emits_completion_marker(monkeypatch, cap
     import client_runner
 
     captured = {}
+    worker_finished = threading.Event()
 
     class _Recovery:
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
         def run(self, include_watcher_reseed=False):
-            time.sleep(0.02)
-            return {}
+            try:
+                time.sleep(0.02)
+                return {}
+            finally:
+                worker_finished.set()
 
     monkeypatch.setattr(client_runner, "APStartupRecovery", _Recovery)
     monkeypatch.setenv("STARTUP_RECOVERY_TIMEOUT_SEC", "0.001")
@@ -212,14 +217,57 @@ def test_startup_recovery_timeout_still_emits_completion_marker(monkeypatch, cap
     runner = _runner_for_startup_recovery(client_runner)
     started = time.monotonic()
     runner._run_startup_recovery(broker=object(), exit_eng=object())
-    elapsed = time.monotonic() - started
 
     messages = _startup_recovery_messages(caplog)
     assert len(messages) == 1
     assert "status=timeout" in messages[0]
     assert "recovery_attempt_id=" in messages[0]
-    assert elapsed < 0.018
+    assert worker_finished.is_set()
     assert 0 < captured["recovery_deadline_monotonic"] - started < 0.1
+
+
+def test_startup_recovery_deadline_stops_late_mutation_and_drains_worker(monkeypatch):
+    import client_runner
+    from ap_recovery import APStartupRecovery as _RealStartupRecovery
+
+    sentinel = {"value": "unchanged"}
+    worker_finished = threading.Event()
+    captured_result = {}
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            self._recovery = _RealStartupRecovery(**kwargs)
+
+            def _reach_deadline(result):
+                self._recovery.recovery_deadline_monotonic = time.monotonic() - 1.0
+
+            def _would_mutate(result):
+                sentinel["value"] = "mutated"
+
+            self._recovery._recover_deferred_breach_lifecycles = _reach_deadline
+            self._recovery._retry_canonical_exit_fill_reconciliations = _would_mutate
+
+        def run(self, include_watcher_reseed=False):
+            try:
+                result = self._recovery.run(include_watcher_reseed=include_watcher_reseed)
+                captured_result.update(result)
+                return result
+            finally:
+                worker_finished.set()
+
+    monkeypatch.setattr(client_runner, "APStartupRecovery", _Recovery)
+    monkeypatch.setenv("STARTUP_RECOVERY_TIMEOUT_SEC", "0.2")
+
+    runner = _runner_for_startup_recovery(client_runner)
+    runner.master_control = SimpleNamespace(mode="LIVE")
+    runner._run_startup_recovery(broker=object(), exit_eng=object())
+
+    assert worker_finished.is_set()
+    assert sentinel["value"] == "unchanged"
+    assert captured_result["status"] == "DEGRADED"
+    assert captured_result["broker_truth"] == "UNKNOWN"
+    assert captured_result["recovery_status"] == "DEGRADED"
+    assert captured_result["recovery_truth"] == "UNKNOWN"
 
 
 def test_startup_recovery_exception_emits_failed_marker(monkeypatch, caplog):

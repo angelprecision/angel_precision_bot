@@ -491,12 +491,16 @@ class APStartupRecovery:
             result["errors"].append("recovery_unknown_execution_mode")
             return result
 
+        if self._stop_for_expired_deadline(result, "deferred_breach_lifecycle"):
+            return result
         try:
             self._recover_deferred_breach_lifecycles(result)
         except Exception as e:
             log.error("[%s] Deferred breach lifecycle recovery error: %s", self.client_id, e)
             result["errors"].append(f"deferred_lifecycle: {e}")
 
+        if self._stop_for_expired_deadline(result, "canonical_exit_fill_reconciliation"):
+            return result
         try:
             self._retry_canonical_exit_fill_reconciliations(result)
         except Exception as e:
@@ -509,6 +513,8 @@ class APStartupRecovery:
             result["errors"].append(f"exit_fill_reconciliation: {e}")
             result["exit_fill_reconciliations_failed"] += 1
 
+        if self._stop_for_expired_deadline(result, "stale_exit_generation_claims"):
+            return result
         try:
             self._reconcile_stale_exit_generation_claims(result)
         except Exception as e:
@@ -520,6 +526,8 @@ class APStartupRecovery:
             )
             result["errors"].append(f"stale_exit_claims: {e}")
 
+        if self._stop_for_expired_deadline(result, "downtime_exit_fill_recovery"):
+            return result
         try:
             live_exit_orders = self._recover_exit_fills_that_occurred_during_downtime(result)
         except Exception as e:
@@ -527,30 +535,40 @@ class APStartupRecovery:
             result["errors"].append(f"exit_fill_downtime: {e}")
             live_exit_orders = []
 
+        if self._stop_for_expired_deadline(result, "position_recovery"):
+            return result
         try:
             self._recover_positions(result)
         except Exception as e:
             log.error("[%s] Position recovery error: %s", self.client_id, e)
             result["errors"].append(f"positions: {e}")
 
+        if self._stop_for_expired_deadline(result, "pending_entry_verification"):
+            return result
         try:
             self._verify_pending_entries(result)
         except Exception as e:
             log.error("[%s] Entry verification error: %s", self.client_id, e)
             result["errors"].append(f"entries: {e}")
 
+        if self._stop_for_expired_deadline(result, "live_exit_protection_reattachment"):
+            return result
         try:
             self._reattach_live_exit_protections(result, live_exit_orders)
         except Exception as e:
             log.error("[%s] Exit reattachment error: %s", self.client_id, e)
             result["errors"].append(f"exits: {e}")
 
+        if self._stop_for_expired_deadline(result, "buying_power_recompute"):
+            return result
         try:
             self._recompute_buying_power(result)
         except Exception as e:
             log.error("[%s] Buying power recompute error: %s", self.client_id, e)
             result["errors"].append(f"buying_power: {e}")
 
+        if self._stop_for_expired_deadline(result, "dedup_reseed"):
+            return result
         try:
             self._reseed_dedup(result)
         except Exception as e:
@@ -558,11 +576,16 @@ class APStartupRecovery:
             result["errors"].append(f"dedup: {e}")
 
         if include_watcher_reseed:
+            if self._stop_for_expired_deadline(result, "watcher_reseed"):
+                return result
             try:
                 self._reseed_watchers(result)
             except Exception as e:
                 log.error("[%s] Watcher reseed error: %s", self.client_id, e)
                 result["errors"].append(f"watchers: {e}")
+
+        if self._stop_for_expired_deadline(result, "completion"):
+            return result
 
         log.info(
             "[%s] Recovery complete | positions=%d entries_verified=%d "
@@ -585,6 +608,35 @@ class APStartupRecovery:
             len(result["errors"]),
         )
         return result
+
+    def _recovery_deadline_expired(self) -> bool:
+        deadline = getattr(self, "recovery_deadline_monotonic", None)
+        if deadline is None:
+            return False
+        try:
+            return time.monotonic() >= float(deadline)
+        except (TypeError, ValueError, OverflowError):
+            return True
+
+    def _stop_for_expired_deadline(self, result: dict, phase: str) -> bool:
+        if not self._recovery_deadline_expired():
+            return False
+        result.update(
+            status="DEGRADED",
+            broker_truth="UNKNOWN",
+            recovery_status="DEGRADED",
+            recovery_truth="UNKNOWN",
+            recovery_deadline_exceeded=True,
+        )
+        reason = f"recovery_deadline_exceeded:{phase}"
+        if reason not in result.setdefault("errors", []):
+            result["errors"].append(reason)
+        log.warning(
+            "[%s] RECOVERY_DEADLINE_EXCEEDED phase=%s — stopping before further recovery mutations",
+            self.client_id,
+            phase,
+        )
+        return True
 
     def _retry_canonical_exit_fill_reconciliations(self, result: dict) -> None:
         """Run the bounded, client-scoped accounting retry pass once at startup.
