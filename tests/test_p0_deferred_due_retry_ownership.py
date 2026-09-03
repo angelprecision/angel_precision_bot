@@ -67,6 +67,7 @@ def _row(
     retry_attempt: int = 1,
     materialization_generation: int = 1,
     max_attempts: int = 3,
+    selector_reason: str = "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
     next_retry_offset_seconds: int = -60,   # negative = past = due
     execution_mode: str = "paper",
     client_id: str = CLIENT_ID,
@@ -115,7 +116,7 @@ def _row(
             "trigger_price": 130.0,
             "observed_underlying_price": 130.05,
             "materialization_selector_failure": {
-                "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                "reason_code": selector_reason,
                 "direct_quote_calls": 5,
                 "direct_quote_calls_limit": 5,
                 "last_candidate_reject_reason": "OI_TOO_LOW",
@@ -1783,9 +1784,9 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     """Real seam test: resume_deferred_materialization_retry → real _on_entry_trigger
     deferred path → selector mock → durable copyback → canonical submit seam.
 
-    Verifies the core requirement: claim_deferred_materialization is called
-    EXACTLY ONCE across the entire path. The second claim inside
-    _on_entry_trigger must be bypassed via the verified pre-claim markers.
+    Verifies the core requirement: the retry ownership claim reaches the
+    canonical selector/submit path exactly once. The callback's normal retry
+    claim is bypassed via the verified pre-claim markers.
 
     Does NOT mock _on_entry_trigger. Does NOT manually manufacture the
     post-callback row.
@@ -1817,6 +1818,8 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "materialization_generation": 1,
         "watcher_token": "watcher:test",
         "retry_attempt": 1,
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
         "retry_max_attempts": 3,
         "next_retry_at": _iso(now - timedelta(seconds=30)),
         "materialization_next_retry_at": _iso(now - timedelta(seconds=30)),
@@ -1866,7 +1869,8 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "meta": before_meta,
     }
 
-    # After claim: row is MATERIALIZING with gen=2, attempt=2
+    # After the normal retry claim: row is MATERIALIZING with gen=2,
+    # and the selector attempt is 2.
     claimed_meta = dict(before_meta)
     claimed_meta.update({
         "lifecycle_state": "MATERIALIZING",
@@ -1875,7 +1879,10 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "materialization_owner": f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3",
         "materialization_lease_until": _iso(now + timedelta(seconds=120)),
         "materialization_in_flight": True,
+        "materialization_market_truth_pending": False,
         "retry_attempt": 2,
+        "breach_attempt_count": 2,
+        "materialization_attempts": 2,
     })
     after_claim_row = dict(before_row)
     after_claim_row["meta"] = claimed_meta
@@ -1916,6 +1923,10 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
 
         def claim_deferred_materialization(self, oid, **kw):
             claim_call_count[0] += 1
+            assert oid == LOCAL_ORDER_ID
+            assert kw["retry_attempt"] == 2
+            assert kw.get("advance_retry_attempt", True) is True
+            assert kw.get("market_truth_only", False) is False
             self.row = after_claim_row
             return True
 
@@ -2076,18 +2087,15 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     selector_elapsed = time.perf_counter() - started
 
     # ── Assertions ────────────────────────────────────────────────────
-    # CORE INVARIANT: claim must be called exactly once
-    assert claim_call_count[0] == 1, (
-        f"claim_deferred_materialization must be called exactly once; "
-        f"got {claim_call_count[0]}"
-    )
     if starting_contract != "DEFERRED:RTX":
+        assert claim_call_count[0] == 1
         # A real durable OCC is already materialized.  A stale deferred flag
         # must not reopen selector work or create a second ownership claim.
         assert _FakeSelector.select_count == 0
         assert copyback_calls == []
         assert submit_calls == []
         return
+    assert claim_call_count[0] == 1
     # Selector must have been called exactly once
     assert _FakeSelector.select_count == 1, (
         f"selector.select must be called exactly once; got {_FakeSelector.select_count}"
@@ -2105,6 +2113,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     assert selector_elapsed < 0.25
     assert copyback_calls, "validated retry selection must reach durable copyback"
     assert copyback_calls[-1]["contract"] == "RTX260117C00130000"
+    assert copyback_calls[-1]["generation"] == 2
     assert float(copyback_calls[-1]["limit_price"]) > 0.01
     assert len(submit_calls) == 1
     assert submit_calls[0]["plan"].contract_symbol == "RTX260117C00130000"
@@ -2710,6 +2719,282 @@ def test_blocker4_claim_writes_canonical_retry_attempt():
     assert "retry_attempt" in patch_written, "canonical retry_attempt must be in patch"
     assert patch_written["retry_attempt"] == 2
     assert patch_written.get("retry_attempt_in_flight") == 2
+
+
+def test_market_truth_claim_defers_attempt_mirror_until_atomic_advance():
+    """A retry claim fences ownership without spending selector-attempt identity."""
+    import json
+    from unittest.mock import patch
+    from ap.order_state_machine import APOrderStateMachine
+
+    patches_seen = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def execute(self, _sql, params=()):
+            if params and isinstance(params[0], str):
+                patches_seen.append(json.loads(params[0]))
+            return self
+
+    class _FakeConn:
+        def __enter__(self):
+            return _FakeCursor()
+
+        def __exit__(self, *args):
+            return False
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+    with patch("ap.order_state_machine.conn", return_value=_FakeConn()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        assert osm.claim_deferred_materialization(
+            LOCAL_ORDER_ID,
+            owner="owner-market-truth",
+            new_generation=2,
+            lease_until="2026-12-31T00:00:00+00:00",
+            trigger_crossed_at="2026-07-13T10:00:00+00:00",
+            trigger_price=130.0,
+            observed_underlying_price=130.05,
+            signal_id=SIGNAL_ID,
+            execution_mode="paper",
+            retry_attempt=2,
+            advance_retry_attempt=False,
+            market_truth_only=True,
+        )
+
+    assert patches_seen
+    claim_patch = patches_seen[0]
+    assert claim_patch["materialization_market_truth_pending"] is True
+    assert "retry_attempt" not in claim_patch
+    assert "breach_attempt_count" not in claim_patch
+    assert "materialization_attempts" not in claim_patch
+
+    with patch("ap.order_state_machine.conn", return_value=_FakeConn()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        assert osm.claim_deferred_materialization(
+            LOCAL_ORDER_ID,
+            owner="owner-market-truth",
+            generation=2,
+            new_generation=2,
+            lease_until="2026-12-31T00:00:00+00:00",
+            trigger_crossed_at="2026-07-13T10:00:00+00:00",
+            trigger_price=130.0,
+            observed_underlying_price=130.05,
+            retry_attempt=3,
+            advance_retry_attempt=True,
+            market_truth_only=False,
+            advance_after_market_truth=True,
+            signal_id=SIGNAL_ID,
+            execution_mode="paper",
+        )
+
+    advanced_patch = patches_seen[1]
+    assert advanced_patch["materialization_market_truth_pending"] is False
+    assert advanced_patch["materialization_generation"] == 2
+    assert advanced_patch["retry_attempt"] == 3
+    assert advanced_patch["retry_attempt_in_flight"] == 3
+    assert advanced_patch["breach_attempt_count"] == 3
+    assert advanced_patch["materialization_attempts"] == 3
+
+
+def test_two_market_truth_holds_keep_attempt_then_one_recovery_advances(monkeypatch):
+    """Two due HOLD passes keep N; the first real selector pass earns N+1."""
+    import copy
+    import ap_execution_core as core_mod
+
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "1")
+    row = _row(retry_attempt=1, materialization_generation=1,
+               max_attempts=1, selector_reason="CURRENT_PRICE_FETCH_FAILED")
+    row["meta"].update({
+        "breach_attempt_count": 1,
+        "materialization_attempts": 1,
+        "materialization_selector_failure": {
+            "reason_code": "CURRENT_PRICE_FETCH_FAILED",
+            "market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE",
+        },
+    })
+
+    claims = []
+    scheduled = []
+    advances = []
+    selector_calls = []
+
+    class _OSM:
+        client_id = CLIENT_ID
+
+        def __init__(self):
+            self.row = copy.deepcopy(row)
+
+        def get_order(self, _oid):
+            return copy.deepcopy(self.row)
+
+        def update_order_meta(self, _oid, patch):
+            self.row["meta"].update(copy.deepcopy(patch))
+            return True
+
+        def claim_deferred_materialization(self, _oid, **kwargs):
+            meta = self.row["meta"]
+            if kwargs.get("advance_after_market_truth"):
+                advances.append((
+                    kwargs["generation"], kwargs["new_generation"],
+                    kwargs["retry_attempt"],
+                ))
+                assert kwargs["advance_retry_attempt"] is True
+                assert kwargs["market_truth_only"] is False
+                meta.update({
+                    "retry_attempt": kwargs["retry_attempt"],
+                    "breach_attempt_count": kwargs["retry_attempt"],
+                    "materialization_attempts": kwargs["retry_attempt"],
+                    "materialization_market_truth_pending": False,
+                    "materialization_generation": kwargs["new_generation"],
+                    "broker_ready": True,
+                })
+                return True
+            claims.append((kwargs["retry_attempt"], kwargs["new_generation"]))
+            assert kwargs["advance_retry_attempt"] is False
+            assert kwargs["market_truth_only"] is True
+            meta.update({
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_generation": kwargs["new_generation"],
+                "materialization_owner": kwargs["owner"],
+                "current_owner": kwargs["owner"],
+                "watcher_token": kwargs["owner"],
+                "materialization_in_flight": True,
+                "materialization_market_truth_pending": True,
+                "broker_ready": False,
+            })
+            return True
+
+        def schedule_deferred_materialization_retry(self, _oid, **kwargs):
+            scheduled.append(kwargs["next_retry_at"])
+            meta = self.row["meta"]
+            meta.update({
+                "lifecycle_state": "RETRY_WAIT",
+                "materialization_status": "RETRY_PENDING",
+                "materialization_in_flight": False,
+                "materialization_owner": "",
+                "materialization_lease_until": "",
+                "watcher_token": "",
+                "materialization_generation": kwargs["generation"],
+                "retry_attempt": kwargs["attempt"],
+                "breach_attempt_count": kwargs["attempt"],
+                "materialization_attempts": kwargs["attempt"],
+                "retry_reason": kwargs["reason_code"],
+                "materialization_reason": kwargs["reason_code"],
+                "next_retry_at": kwargs["next_retry_at"],
+                "materialization_next_retry_at": kwargs["next_retry_at"],
+                "materialization_selector_failure": kwargs["selector_failure"],
+                "materialization_market_truth_pending": True,
+                "broker_ready": False,
+            })
+            return True
+
+    osm = _OSM()
+    core = SimpleNamespace(
+        client_id=CLIENT_ID,
+        email=CLIENT_ID,
+        execution_mode="paper",
+        mode="PAPER",
+        paper=True,
+        order_state_machine=osm,
+        broker=MagicMock(),
+    )
+
+    market_truth_available = [False]
+
+    def _canonical_callback(watched):
+        signal = watched.signal
+        if not market_truth_available[0]:
+            next_retry = (datetime.now(timezone.utc) + timedelta(
+                seconds=8 + len(scheduled)
+            )).isoformat()
+            assert osm.schedule_deferred_materialization_retry(
+                LOCAL_ORDER_ID,
+                owner=signal["owner"],
+                generation=signal["materialization_generation"],
+                reason_code="HOLD_MARKET_TRUTH_UNAVAILABLE",
+                attempt=signal["retry_attempt"],
+                max_attempts=1,
+                next_retry_at=next_retry,
+                selector_failure={
+                    "reason_code": "CURRENT_PRICE_FETCH_FAILED",
+                    "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+                    "materialization_detail": "HOLD_MARKET_TRUTH_UNAVAILABLE",
+                    "market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE",
+                    "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+                },
+                signal_id=SIGNAL_ID,
+                execution_mode="paper",
+            )
+            return {
+                "disposition": "RETRY_WAIT",
+                "reason_code": "HOLD_MARKET_TRUTH_UNAVAILABLE",
+            }
+
+        selector_calls.append(1)
+        assert osm.claim_deferred_materialization(
+            LOCAL_ORDER_ID,
+            owner=signal["owner"],
+            generation=signal["materialization_generation"],
+            new_generation=signal["materialization_generation"],
+            retry_attempt=signal["retry_attempt"] + 1,
+            advance_retry_attempt=True,
+            market_truth_only=False,
+            advance_after_market_truth=True,
+            signal_id=SIGNAL_ID,
+            execution_mode="paper",
+            lease_until=(datetime.now(timezone.utc) + timedelta(
+                seconds=120
+            )).isoformat(),
+        )
+
+    core._on_entry_trigger = _canonical_callback
+    core.resume_deferred_materialization_retry = (
+        core_mod.APExecutionCore
+        .resume_deferred_materialization_retry.__get__(core, type(core))
+    )
+
+    def _run(generation, owner):
+        osm.row["meta"]["materialization_next_retry_at"] = _iso(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        )
+        osm.row["meta"]["next_retry_at"] = osm.row["meta"][
+            "materialization_next_retry_at"
+        ]
+        return core.resume_deferred_materialization_retry(
+            local_order_id=LOCAL_ORDER_ID,
+            expected_generation=generation,
+            expected_retry_attempt=2,
+            owner=owner,
+        )
+
+    first = _run(1, "owner-hold-1")
+    second = _run(2, "owner-hold-2")
+    assert [first["disposition"], second["disposition"]] == [
+        "RETRY_WAIT", "RETRY_WAIT"
+    ]
+    assert [osm.row["meta"][key] for key in (
+        "retry_attempt", "breach_attempt_count", "materialization_attempts"
+    )] == [1, 1, 1]
+    assert osm.row["meta"]["lifecycle_state"] == "RETRY_WAIT"
+
+    market_truth_available[0] = True
+    third = _run(3, "owner-recovered")
+
+    assert third["disposition"] == "BROKER_READY"
+    assert claims == [(1, 2), (1, 3), (1, 4)]
+    assert advances == [(4, 4, 2)]
+    assert len(selector_calls) == 1
+    assert len(scheduled) == 2
+    assert scheduled[1] > scheduled[0]
+    assert [osm.row["meta"][key] for key in (
+        "retry_attempt", "breach_attempt_count", "materialization_attempts"
+    )] == [2, 2, 2]
+    assert osm.row["meta"]["materialization_generation"] == 4
+    assert core.broker.submit_order.called is False
+    assert core.broker.cancel_order.called is False
 
 
 def test_blocker5_expired_deadline_terminalizes_before_claim():

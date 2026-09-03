@@ -2722,10 +2722,14 @@ class APOrderStateMachine:
         signal_id: str,
         execution_mode: str,
         # P0 AMENDMENT (fix/deferred-retry-due-execution-p0 blocker §5):
-        # Advance retry_attempt atomically with generation so the durable row
-        # always shows the correct attempt count for the in-flight claim, even
-        # if the process crashes between claim and schedule_deferred_materialization_retry.
+        # Normal materialization claims advance retry_attempt atomically with
+        # generation. A market-truth-only retry claim deliberately preserves
+        # the current attempt; the selector attempt is advanced only after
+        # fresh market truth passes.
         retry_attempt: int | None = None,
+        advance_retry_attempt: bool = True,
+        market_truth_only: bool = False,
+        advance_after_market_truth: bool = False,
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
 
@@ -2797,7 +2801,9 @@ class APOrderStateMachine:
             "materialization_claimed_at": _now,
             "materialization_lease_until": str(lease_until or ""),
             "materialization_started_at": _now,
-            "selector_started_at": _now,
+            # A market-truth-only ownership lease has not started selector
+            # work; leave this marker empty until the post-truth claim.
+            "selector_started_at": "" if market_truth_only else _now,
             "trigger_crossed_at": str(trigger_crossed_at or _now),
             "breach_received_at": _now,
             "trigger_price": float(trigger_price or 0),
@@ -2807,7 +2813,24 @@ class APOrderStateMachine:
             "client_id": self.client_id,
             "execution_mode": _mode,
             "broker_ready": False,
+            # A true value means this ownership claim has not yet earned a
+            # selector-attempt identity. Only the post-truth CAS clears it.
+            "materialization_market_truth_pending": bool(market_truth_only),
         }
+        if not isinstance(advance_retry_attempt, bool) or not isinstance(
+            market_truth_only, bool
+        ) or not isinstance(advance_after_market_truth, bool):
+            return False
+        if (
+            market_truth_only and advance_retry_attempt
+            or advance_after_market_truth
+            and (market_truth_only or not advance_retry_attempt or retry_attempt is None)
+        ):
+            return False
+        if advance_after_market_truth:
+            # This is not a new ownership claim: keep the already-fenced
+            # generation and advance only the selector-attempt identity.
+            _expected_previous_generation = _new_generation
         # P0 AMENDMENT (fix/p0-attempt-mirror-atomic-advance-20260827,
         # post-audit blocker §3-§5): ``retry_attempt``, ``breach_attempt_count``,
         # and ``materialization_attempts`` are one durable selector-attempt
@@ -2848,17 +2871,23 @@ class APOrderStateMachine:
             _ra = retry_attempt
             if _ra < 1:
                 return False
-            _patch["retry_attempt"] = _ra
-            # DIAGNOSTIC ONLY (issue #536). retry_attempt_in_flight is written
-            # for operator observability. ``retry_attempt``,
-            # ``breach_attempt_count``, and ``materialization_attempts`` are the
-            # canonical authority — do NOT treat retry_attempt_in_flight as a
-            # fourth authority field or CAS-fence it. Direction reversal also
-            # resets it to zero.
-            _patch["retry_attempt_in_flight"] = _ra
-            _patch["breach_attempt_count"] = _ra
-            _patch["materialization_attempts"] = _ra
-            _prev_attempt = _ra - 1
+            if advance_retry_attempt:
+                _patch["retry_attempt"] = _ra
+                # DIAGNOSTIC ONLY (issue #536). retry_attempt_in_flight is written
+                # for operator observability. ``retry_attempt``,
+                # ``breach_attempt_count``, and ``materialization_attempts`` are the
+                # canonical authority — do NOT treat retry_attempt_in_flight as a
+                # fourth authority field or CAS-fence it. Direction reversal also
+                # resets it to zero.
+                _patch["retry_attempt_in_flight"] = _ra
+                _patch["breach_attempt_count"] = _ra
+                _patch["materialization_attempts"] = _ra
+                _prev_attempt = _ra - 1
+            else:
+                # Ownership-only retry claim: prove the existing N/N/N mirrors
+                # without writing them. The next selector identity is committed
+                # by the post-truth fenced claim after truth.
+                _prev_attempt = _ra
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
         except Exception:
@@ -2890,6 +2919,29 @@ class APOrderStateMachine:
             with conn() as c:
                 _attempt_predicate = ""
                 _attempt_params: list = []
+                if advance_after_market_truth:
+                    # The second phase is still one fenced claim seam, but it
+                    # may run only for the exact owner holding a live,
+                    # market-truth-pending MATERIALIZING lease.
+                    _lifecycle_predicate = """
+                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                      AND COALESCE(meta->>'materialization_status','') = 'RUNNING'
+                      AND COALESCE(meta->>'materialization_in_flight','') = 'true'
+                      AND COALESCE(meta->>'materialization_market_truth_pending','') = 'true'
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE(meta->>'current_owner','') = %s
+                      AND COALESCE(meta->>'watcher_token','') = %s
+                      AND NULLIF(COALESCE(meta->>'materialization_lease_until',''), '')::timestamptz >= %s
+                    """
+                    _lifecycle_params = [_owner, _owner, _owner, _now]
+                else:
+                    _lifecycle_predicate = """
+                      AND (
+                            COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
+                         OR COALESCE(meta->>'materialization_lease_until','') < %s
+                      )
+                    """
+                    _lifecycle_params = [_now]
                 if _prev_attempt is None:
                     # Caller did not pass ``retry_attempt``. This is the
                     # initial-materialization path (first-time claim for a
@@ -2932,15 +2984,13 @@ class APOrderStateMachine:
                       AND signal_id = %s
                       AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND COALESCE((meta->>'broker_ready')::boolean, false) = false
-                      AND (
-                            COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
-                         OR COALESCE(meta->>'materialization_lease_until','') < %s
-                      )
+                    """ + _lifecycle_predicate + """
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                     """ + _attempt_predicate,
                     (
                         _patch_json, local_order_id, self.client_id,
-                        _signal_id, _mode, _now, _expected_previous_generation,
+                        _signal_id, _mode, *_lifecycle_params,
+                        _expected_previous_generation,
                         *_attempt_params,
                     ),
                 )
@@ -3913,6 +3963,12 @@ class APOrderStateMachine:
             "entry_path": _entry_path,
             "materialization_selector_failure": _selector_failure,
             "broker_ready": False,
+            "materialization_market_truth_pending": (
+                str(_selector_failure.get("market_truth_outcome") or "")
+                .strip()
+                .upper()
+                == "HOLD_MARKET_TRUTH_UNAVAILABLE"
+            ),
         }
         if isinstance(selector_recovery_cursor, dict):
             _patch["selector_recovery_cursor_v1"] = selector_recovery_cursor

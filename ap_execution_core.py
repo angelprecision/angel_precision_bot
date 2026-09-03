@@ -2191,8 +2191,13 @@ class APExecutionCore:
                 "lease_until": lease_value,
             }
 
-        def _owned(proof, row):
-            return {"disposition": "OWNED", **proof, "row": row}
+        def _owned(proof, row, *, market_truth_required=False):
+            return {
+                "disposition": "OWNED",
+                **proof,
+                "row": row,
+                "market_truth_required": bool(market_truth_required),
+            }
 
         if signal.get("_recovery_pre_claimed"):
             expected_owner = str(
@@ -2231,7 +2236,13 @@ class APExecutionCore:
                 else None
             )
             return (
-                _owned(proof, row)
+                _owned(
+                    proof,
+                    row,
+                    market_truth_required=bool(
+                        signal.get("_recovery_pre_claimed_market_truth_required")
+                    ),
+                )
                 if proof is not None
                 else _keep("MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED")
             )
@@ -2287,18 +2298,52 @@ class APExecutionCore:
         claim = getattr(_osm, "claim_deferred_materialization", None)
         if not callable(claim):
             return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+        _retry_lifecycle = (
+            str(row_meta.get("lifecycle_state") or "").strip().upper()
+            == "RETRY_WAIT"
+            or str(row_meta.get("materialization_status") or "").strip().upper()
+            == "RETRY_PENDING"
+        )
+        _current_retry_attempt = self._strict_materialization_int(
+            row_meta.get("retry_attempt"), minimum=1,
+        )
+        if _retry_lifecycle and _current_retry_attempt is None:
+            return _keep("MATERIALIZATION_ATTEMPT_INVALID")
+        _row_selector_failure = row_meta.get("materialization_selector_failure")
+        if not isinstance(_row_selector_failure, dict):
+            _row_selector_failure = row_meta.get("selector_failure")
+        if not isinstance(_row_selector_failure, dict):
+            _row_selector_failure = {}
+        _market_truth_only_retry = _retry_lifecycle and (
+            row_meta.get("materialization_market_truth_pending") is True
+            or str(
+                _row_selector_failure.get("market_truth_outcome")
+                or row_meta.get("market_truth_outcome")
+                or ""
+            ).strip().upper() == "HOLD_MARKET_TRUTH_UNAVAILABLE"
+        )
+        _claim_kwargs = {
+            "owner": owner,
+            "generation": next_generation,
+            "lease_until": (
+                datetime.now(timezone.utc) + timedelta(seconds=120)
+            ).isoformat(),
+            "trigger_crossed_at": crossed,
+            "trigger_price": float(getattr(watched, "trigger_price", 0) or 0),
+            "observed_underlying_price": observed,
+            "signal_id": _signal,
+            "execution_mode": _mode,
+        }
+        if _market_truth_only_retry:
+            # Fence ownership and require fresh market truth without claiming
+            # a selector attempt that has not started yet.
+            _claim_kwargs.update({
+                "retry_attempt": _current_retry_attempt,
+                "advance_retry_attempt": False,
+                "market_truth_only": True,
+            })
         try:
-            claimed = bool(claim(
-                local_order_id,
-                owner=owner,
-                generation=next_generation,
-                lease_until=(datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
-                trigger_crossed_at=crossed,
-                trigger_price=float(getattr(watched, "trigger_price", 0) or 0),
-                observed_underlying_price=observed,
-                signal_id=_signal,
-                execution_mode=_mode,
-            ))
+            claimed = bool(claim(local_order_id, **_claim_kwargs))
         except Exception as exc:
             log.critical(
                 "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s error=%s",
@@ -2306,14 +2351,18 @@ class APExecutionCore:
             )
             claimed = False
         if claimed:
-            return _owned({
-                "owner": owner,
-                "generation": next_generation,
-                "attempt": self._strict_materialization_int(
-                    row_meta.get("retry_attempt"), minimum=1,
-                ) or 0,
-                "lease_until": None,
-            }, row)
+            return _owned(
+                {
+                    "owner": owner,
+                    "generation": next_generation,
+                    "attempt": self._strict_materialization_int(
+                        row_meta.get("retry_attempt"), minimum=1,
+                    ) or 0,
+                    "lease_until": None,
+                },
+                row,
+                market_truth_required=_market_truth_only_retry,
+            )
 
         row, read_ok = _read()
         if read_ok and isinstance(row, dict):
@@ -3181,8 +3230,8 @@ class APExecutionCore:
         Blocker §2: Exact identity proof on every field.
           - A missing row field when the expected field is provided FAILS, not passes.
         Blocker §5: Atomic attempt advancement.
-          - claim_deferred_materialization receives retry_attempt so the durable
-            row always shows the in-flight attempt, even on mid-execution crash.
+          - the due-retry claim fences ownership without changing the selector
+            attempt; a separate CAS advances it only after market truth passes.
           - Every RETRY_WAIT return calls schedule_deferred_materialization_retry
             before returning so the durable row is in a verifiable RETRY_WAIT state,
             not MATERIALIZING until lease expires.
@@ -3247,6 +3296,7 @@ class APExecutionCore:
             return _keep("RETRY_INVALID_EXPECTATIONS")
         if not owner or _expected_generation < 1 or _expected_attempt < 1:
             return _term("RETRY_INVALID_EXPECTATIONS", status="ERROR")
+        _materialization_attempt = _expected_attempt - 1
 
         # ── Row read ─────────────────────────────────────────────────
         try:
@@ -3292,7 +3342,22 @@ class APExecutionCore:
 
         _selector_failure_meta = meta.get("materialization_selector_failure")
         if not isinstance(_selector_failure_meta, dict):
+            _selector_failure_meta = meta.get("selector_failure")
+        if not isinstance(_selector_failure_meta, dict):
             _selector_failure_meta = {}
+        _market_truth_only_retry = (
+            meta.get("materialization_market_truth_pending") is True
+            or str(
+                _selector_failure_meta.get("market_truth_outcome")
+                or meta.get("market_truth_outcome")
+                or ""
+            ).strip().upper() == "HOLD_MARKET_TRUTH_UNAVAILABLE"
+        )
+        _callback_attempt = (
+            _materialization_attempt
+            if _market_truth_only_retry
+            else _expected_attempt
+        )
         _durable_retry_reason = str(
             meta.get("retry_reason")
             or meta.get("materialization_reason")
@@ -3512,7 +3577,7 @@ class APExecutionCore:
         if not _timeframe:
             return _term("RETRY_MISSING_TIMEFRAME", status="ERROR")
 
-        # ── Fenced CAS (blocker §5: also stamps retry_attempt atomically) ─
+        # ── Fenced ownership CAS; selector attempt advances after truth ──
         _new_generation = _expected_generation + 1
         try:
             _retry_lock_ttl = int(os.getenv("DEFERRED_MATERIALIZATION_LOCK_TTL_SECONDS", "120"))
@@ -3537,7 +3602,15 @@ class APExecutionCore:
                 ),
                 signal_id=signal_id,
                 execution_mode=row_mode,
-                retry_attempt=_expected_attempt,
+                retry_attempt=_callback_attempt,
+                **(
+                    {
+                        "advance_retry_attempt": False,
+                        "market_truth_only": True,
+                    }
+                    if _market_truth_only_retry
+                    else {}
+                ),
             ))
         except Exception as exc:
             log.error("[%s] resume_deferred_materialization_retry claim_failed "
@@ -3546,7 +3619,11 @@ class APExecutionCore:
         if not claimed:
             return _claim_lost("RETRY_CLAIM_NOT_ACQUIRED")
 
-        _base.update(attempt=_expected_attempt, max_attempts=max_attempts, generation=_new_generation)
+        _base.update(
+            attempt=_callback_attempt,
+            max_attempts=max_attempts,
+            generation=_new_generation,
+        )
 
         # ── Helper: durable RETRY_WAIT schedule (blocker §5) ────────
         # Every RETRY_WAIT return MUST call this so the durable row
@@ -3575,7 +3652,7 @@ class APExecutionCore:
                     _schedule_meta = _build_deferred_retry_schedule_meta(
                         reason_code=reason_code,
                         selector_audit=selector_failure or {},
-                        attempt=_expected_attempt,
+                        attempt=_callback_attempt,
                         max_attempts=max_attempts,
                         delay_seconds=_retry_delay,
                         client_id=self.client_id,
@@ -3589,7 +3666,7 @@ class APExecutionCore:
                         owner=owner,
                         generation=_new_generation,
                         reason_code=reason_code,
-                        attempt=_expected_attempt,
+                        attempt=_callback_attempt,
                         max_attempts=max_attempts,
                         next_retry_at=_next_retry_at,
                         selector_failure={
@@ -3652,7 +3729,7 @@ class APExecutionCore:
                 update_meta(local_order_id, {
                     "materialization_attempt_history": new_history,
                     "selector_request_counters_reset_at": _now.isoformat(),
-                    "materialization_current_attempt": _expected_attempt,
+                    "materialization_current_attempt": _callback_attempt,
                     "materialization_current_generation": _new_generation,
                 })
         except Exception as _hist_exc:
@@ -3695,9 +3772,9 @@ class APExecutionCore:
                 "materialization_generation": _new_generation,
                 "materialization_owner": owner,
                 "materialization_retry_owner": owner,
-                "materialization_retry_attempt": _expected_attempt,
+                "materialization_retry_attempt": _callback_attempt,
                 "materialization_retry_max_attempts": max_attempts,
-                "breach_attempt_count": _expected_attempt - 1,
+                "breach_attempt_count": _callback_attempt,
                 "deferred_breach_selection": True,
                 "selection_context": "deferred_breach_retry",
                 "selector_request_counters_reset_at": _now.isoformat(),
@@ -3720,11 +3797,11 @@ class APExecutionCore:
             "contract_deferred": True,
             "_approved_plan": recovered_plan,
             "materialization_retry_owner": owner,
-            "materialization_retry_attempt": _expected_attempt,
+            "materialization_retry_attempt": _callback_attempt,
             "ownership_kind": "materialization_retry",
             "owner": owner,
             "materialization_generation": _new_generation,
-            "retry_attempt": _expected_attempt,
+            "retry_attempt": _callback_attempt,
             "fenced": True,
             "recovery_submit_fenced": True,
             "recovery_submit_owner": owner,
@@ -3755,7 +3832,8 @@ class APExecutionCore:
                 "_recovery_pre_claimed":             True,
                 "_recovery_pre_claimed_owner":       owner,
                 "_recovery_pre_claimed_generation":  _new_generation,
-                "_recovery_pre_claimed_attempt":     _expected_attempt,
+                "_recovery_pre_claimed_attempt":     _callback_attempt,
+                "_recovery_pre_claimed_market_truth_required": _market_truth_only_retry,
                 "_recovery_pre_claimed_client_id":   row_client,
                 "_recovery_pre_claimed_mode":        row_mode,
             })
@@ -3804,14 +3882,14 @@ class APExecutionCore:
                     "disposition": "KEEP_WATCHER",
                     "reason_code": "REARM_DIRECTION_REVERSAL",
                     "generation": _new_generation,
-                    "attempt": _expected_attempt,
+                    "attempt": _callback_attempt,
                 }
             return {
                 **_base,
                 "disposition": "REARM_WATCHER_REQUIRED",
                 "reason_code": "REARM_DIRECTION_REVERSAL",
                 "generation": _new_generation,
-                "attempt": _expected_attempt,
+                "attempt": _callback_attempt,
                 # Exact-generation handoff (constraint A) — pass through
                 # unmodified from the production callback. The receiving
                 # ap_recovery.py handler is the sole consumer and must
@@ -3845,6 +3923,15 @@ class APExecutionCore:
                 after_meta = json.loads(after_meta)
             except Exception:
                 after_meta = {}
+        try:
+            after_attempt = int(after_meta.get("retry_attempt"))
+            after_generation = int(after_meta.get("materialization_generation"))
+            if after_attempt >= int(_base.get("attempt") or 0):
+                _base["attempt"] = after_attempt
+            if after_generation >= int(_base.get("generation") or 0):
+                _base["generation"] = after_generation
+        except (AttributeError, TypeError, ValueError):
+            pass
 
         if after.get("broker_order_id") and after_status in {
             "SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"
@@ -3877,8 +3964,8 @@ class APExecutionCore:
                 "reason_code": str(after.get("last_error") or after_meta.get("final_reason")
                                    or "RETRY_CANONICAL_TERMINALIZED"),
                 "terminal_status": after_status,
-                "generation": _new_generation,
-                "attempt": _expected_attempt,
+                "generation": _base.get("generation") or _new_generation,
+                "attempt": _base.get("attempt") or _callback_attempt,
             }
         # No durable outcome — schedule retry before returning (blocker §5).
         return _schedule_retry_wait("RETRY_CANONICAL_NO_DURABLE_OUTCOME")
@@ -4814,6 +4901,8 @@ class APExecutionCore:
             _mat_owner = str(_claim_result.get("owner") or "")
             _mat_generation = _claim_result.get("generation")
             _prior_mat_attempt = int(_claim_result.get("attempt") or 0)
+            if _claim_result.get("market_truth_required"):
+                sig["_deferred_retry_market_truth_required"] = True
             _pv_row = _claim_result.get("row")
             _deferred_materialization_owned = True
             sig["_deferred_materialization_owned"] = True
@@ -5930,9 +6019,15 @@ class APExecutionCore:
                     recovery_cursor_persist=_persist_selector_cursor_progress,
                 )
 
-                # Attempts 2..5 must prove the chart is still valid before
-                # spending any option-selector or direct-quote capacity.
-                if _selector_attempt_number > 1:
+                # Deferred retries must prove current market truth before
+                # spending selector or direct-quote capacity. The pre-claim
+                # marker keeps this gate active even when the current attempt
+                # is 1 because the claim itself did not start a selector run.
+                _market_truth_required = bool(
+                    sig.get("_deferred_retry_market_truth_required")
+                    or sig.get("_recovery_pre_claimed_market_truth_required")
+                )
+                if _selector_attempt_number > 1 or _market_truth_required:
                     from ap.live_submit_gates import (
                         MarketTruthAuthority,
                         check_market_validity_gate,
@@ -6240,6 +6335,106 @@ class APExecutionCore:
                             "reason_code": _truth_result.reason_code,
                             "next_retry_at": _truth_next,
                         }
+
+                if _market_truth_required:
+                    _advance = getattr(
+                        self.order_state_machine,
+                        "claim_deferred_materialization",
+                        None,
+                    )
+                    try:
+                        _current_attempt = int(_selector_attempt_number)
+                        _next_attempt = _current_attempt + 1
+                        _current_generation = int(_mat_generation)
+                        _next_generation = _current_generation
+                    except (TypeError, ValueError):
+                        return {
+                            "disposition": "KEEP_WATCHER",
+                            "reason_code": "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED",
+                            "retry_after_seconds": 5,
+                        }
+                    try:
+                        _advance_ttl = int(os.getenv(
+                            "DEFERRED_MATERIALIZATION_LOCK_TTL_SECONDS", "120"
+                        ))
+                    except (TypeError, ValueError):
+                        _advance_ttl = 120
+                    try:
+                        _advance_ok = bool(
+                            callable(_advance)
+                            and _advance(
+                                str(queue_local_order_id or ""),
+                                owner=_mat_owner,
+                                generation=_current_generation,
+                                new_generation=_next_generation,
+                                signal_id=str(
+                                    getattr(approved_plan, "signal_id", "") or ""
+                                ),
+                                execution_mode=_mat_exec_mode,
+                                retry_attempt=_next_attempt,
+                                advance_retry_attempt=True,
+                                market_truth_only=False,
+                                advance_after_market_truth=True,
+                                lease_until=(
+                                    datetime.now(timezone.utc)
+                                    + timedelta(seconds=max(1, _advance_ttl))
+                                ).isoformat(),
+                            )
+                        )
+                    except Exception as _advance_exc:
+                        log.critical(
+                            "[%s] MATERIALIZATION_ATTEMPT_ADVANCE_FAILED "
+                            "order=%s error=%s",
+                            ticker,
+                            queue_local_order_id,
+                            _advance_exc,
+                        )
+                        _advance_ok = False
+                    if not _advance_ok:
+                        # Keep the ownership lease and stop before selector or
+                        # broker work; the next recovery pass can reconcile it.
+                        return {
+                            "disposition": "KEEP_WATCHER",
+                            "reason_code": "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED",
+                            "retry_after_seconds": 5,
+                        }
+                    _selector_attempt_number = _next_attempt
+                    _mat_generation = _next_generation
+                    _prior_mat_attempt = _next_attempt
+                    _deferred_claim_context.update({
+                        "owner": _mat_owner,
+                        "generation": _next_generation,
+                    })
+                    try:
+                        _selector_request_context.recovery_attempt_number = (
+                            _next_attempt
+                        )
+                    except Exception:
+                        pass
+                    sig.update({
+                        "retry_attempt": _next_attempt,
+                        "materialization_retry_attempt": _next_attempt,
+                        "materialization_generation": _next_generation,
+                    })
+                    _advance_plan_meta = getattr(approved_plan, "metadata", None)
+                    if isinstance(_advance_plan_meta, dict):
+                        _advance_plan_meta.update({
+                            "materialization_generation": _next_generation,
+                            "materialization_retry_attempt": _next_attempt,
+                            "breach_attempt_count": _next_attempt,
+                        })
+                    if _cursor_enabled:
+                        _cursor_attempt_meta = {
+                            "materialization_generation": _next_generation,
+                            "selector_attempt_count": _next_attempt,
+                            "updated_at": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                        }
+                        _selector_recovery_cursor.update(_cursor_attempt_meta)
+                        _selector_request_context.recovery_cursor.update(
+                            _cursor_attempt_meta
+                        )
 
                 log.info(
                     "[%s] Overnight deferred signal — selecting contract at breach "
