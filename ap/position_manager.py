@@ -2960,10 +2960,6 @@ class APPositionManager:
         Uses one DB connection and attempts to set REPEATABLE READ before any
         SELECT. No manual BEGIN/COMMIT is issued here; conn() owns transaction
         lifecycle, which avoids brittle nested transaction behavior.
-
-        The required execution mode scopes every position-derived field in the
-        returned snapshot to the runner's exact PAPER/LIVE identity. Order
-        lifecycle counts are scoped independently below using the same mode.
         """
         start_utc, end_utc, session_day = self._market_day_bounds_utc()
 
@@ -2978,21 +2974,14 @@ class APPositionManager:
                 if _snap_mode not in {"paper", "live"}:
                     raise ValueError(f"snapshot_execution_mode_required:{mode}")
 
-                _position_mode_predicate = (
-                    "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s"
-                )
-                _position_mode_params = (_snap_mode,)
-
                 c.execute(
-                    f"""
+                    """
                     SELECT *
                     FROM positions
-                    WHERE client_id=%s
-                      AND {_position_mode_predicate}
-                      AND status IN ('OPEN','CLOSING')
+                    WHERE client_id=%s AND status IN ('OPEN','CLOSING')
                     ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
                     """,
-                    (self.client_id, *_position_mode_params),
+                    (self.client_id,),
                 )
                 active = c.fetchall()
 
@@ -3014,11 +3003,10 @@ class APPositionManager:
                 # excluded at the DB level by the WHERE clause, keeping the
                 # result set minimal.
                 c.execute(
-                    f"""
+                    """
                     SELECT id, status, quantity_remaining, exit_ts
                     FROM positions
                     WHERE client_id=%s
-                      AND {_position_mode_predicate}
                       AND (
                         UPPER(COALESCE(status,'')) IN (
                           'CLOSED','CLOSED_REPAIR','EXPIRED','STOPPED',
@@ -3030,12 +3018,12 @@ class APPositionManager:
                         )
                       )
                     """,
-                    (self.client_id, *_position_mode_params),
+                    (self.client_id,),
                 )
                 terminal_positions = c.fetchall() or []
 
                 c.execute(
-                    f"""
+                    """
                     SELECT
                         COALESCE(SUM(realized_pnl) FILTER (
                             WHERE entry_ts >= %s AND entry_ts < %s
@@ -3046,9 +3034,8 @@ class APPositionManager:
                         ), 0) AS capital_deployed
                     FROM positions
                     WHERE client_id=%s
-                      AND {_position_mode_predicate}
                     """,
-                    (start_utc, end_utc, self.client_id, *_position_mode_params),
+                    (start_utc, end_utc, self.client_id),
                 )
                 summary = c.fetchone() or {}
                 position_capital_deployed = float(summary.get("capital_deployed") or 0.0)
