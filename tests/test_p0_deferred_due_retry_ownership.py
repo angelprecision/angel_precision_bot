@@ -551,7 +551,31 @@ def test_7_successful_retry_reports_broker_ready_or_submitted():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_8_exhausted_retry_returns_terminal_and_does_not_call_broker(monkeypatch):
+@pytest.mark.parametrize(
+    ("reason_code", "selector_failure"),
+    [
+        ("UNKNOWN_RETRY_REASON", {}),
+        (
+            "UNKNOWN_RETRY_REASON",
+            {"market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE"},
+        ),
+        (
+            "OI_TOO_LOW",
+            {
+                "last_breach_selector_audit": {
+                    "market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE",
+                },
+            },
+        ),
+        (
+            "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+            {"market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE"},
+        ),
+    ],
+)
+def test_8_exhausted_retry_returns_terminal_and_does_not_call_broker(
+    monkeypatch, reason_code, selector_failure,
+):
     # Pin MAX_BREACH_SELECTOR_RETRIES=3 to match the durable row's max_attempts=3.
     # Amendment 1 resolves max = max(configured_env, durable); without pinning the
     # env, the default of 5 would raise the max and attempt 4 would no longer be
@@ -561,7 +585,8 @@ def test_8_exhausted_retry_returns_terminal_and_does_not_call_broker(monkeypatch
     # attempt 4 requested but max_attempts=3 (env also 3 → resolved max=3)
     row = _row(retry_attempt=3, max_attempts=3)
     row["meta"]["materialization_selector_failure"] = {
-        "reason_code": "UNKNOWN_RETRY_REASON",
+        "reason_code": reason_code,
+        **selector_failure,
     }
     core.order_state_machine.get_order.return_value = row
 
@@ -2857,6 +2882,17 @@ def test_two_market_truth_holds_keep_attempt_then_one_recovery_advances(monkeypa
         def schedule_deferred_materialization_retry(self, _oid, **kwargs):
             scheduled.append(kwargs["next_retry_at"])
             meta = self.row["meta"]
+            market_truth_outcome = str(
+                kwargs["selector_failure"].get("market_truth_outcome") or ""
+            ).strip().upper()
+            if not market_truth_outcome:
+                nested_audit = kwargs["selector_failure"].get(
+                    "last_breach_selector_audit"
+                )
+                if isinstance(nested_audit, dict):
+                    market_truth_outcome = str(
+                        nested_audit.get("market_truth_outcome") or ""
+                    ).strip().upper()
             meta.update({
                 "lifecycle_state": "RETRY_WAIT",
                 "materialization_status": "RETRY_PENDING",
@@ -2873,7 +2909,9 @@ def test_two_market_truth_holds_keep_attempt_then_one_recovery_advances(monkeypa
                 "next_retry_at": kwargs["next_retry_at"],
                 "materialization_next_retry_at": kwargs["next_retry_at"],
                 "materialization_selector_failure": kwargs["selector_failure"],
-                "materialization_market_truth_pending": True,
+                "materialization_market_truth_pending": (
+                    market_truth_outcome == "HOLD_MARKET_TRUTH_UNAVAILABLE"
+                ),
                 "broker_ready": False,
             })
             return True
@@ -2897,21 +2935,31 @@ def test_two_market_truth_holds_keep_attempt_then_one_recovery_advances(monkeypa
             next_retry = (datetime.now(timezone.utc) + timedelta(
                 seconds=8 + len(scheduled)
             )).isoformat()
+            selector_failure = core_mod._build_deferred_retry_schedule_meta(
+                reason_code="CURRENT_PRICE_FETCH_FAILED",
+                selector_audit={
+                    "market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE",
+                },
+                attempt=signal["retry_attempt"],
+                max_attempts=1,
+                delay_seconds=8,
+                client_id=CLIENT_ID,
+                execution_mode="paper",
+                local_order_id=LOCAL_ORDER_ID,
+                signal_id=SIGNAL_ID,
+            )
+            assert selector_failure["last_breach_selector_audit"][
+                "market_truth_outcome"
+            ] == "HOLD_MARKET_TRUTH_UNAVAILABLE"
             assert osm.schedule_deferred_materialization_retry(
                 LOCAL_ORDER_ID,
                 owner=signal["owner"],
                 generation=signal["materialization_generation"],
-                reason_code="HOLD_MARKET_TRUTH_UNAVAILABLE",
+                reason_code="CURRENT_PRICE_FETCH_FAILED",
                 attempt=signal["retry_attempt"],
                 max_attempts=1,
                 next_retry_at=next_retry,
-                selector_failure={
-                    "reason_code": "CURRENT_PRICE_FETCH_FAILED",
-                    "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
-                    "materialization_detail": "HOLD_MARKET_TRUTH_UNAVAILABLE",
-                    "market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE",
-                    "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
-                },
+                selector_failure=selector_failure,
                 signal_id=SIGNAL_ID,
                 execution_mode="paper",
             )

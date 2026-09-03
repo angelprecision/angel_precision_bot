@@ -3296,19 +3296,6 @@ class APExecutionCore:
             _selector_failure_meta = meta.get("selector_failure")
         if not isinstance(_selector_failure_meta, dict):
             _selector_failure_meta = {}
-        _market_truth_only_retry = (
-            meta.get("materialization_market_truth_pending") is True
-            or str(
-                _selector_failure_meta.get("market_truth_outcome")
-                or meta.get("market_truth_outcome")
-                or ""
-            ).strip().upper() == "HOLD_MARKET_TRUTH_UNAVAILABLE"
-        )
-        _callback_attempt = (
-            _materialization_attempt
-            if _market_truth_only_retry
-            else _expected_attempt
-        )
         _durable_retry_reason = str(
             meta.get("retry_reason")
             or meta.get("materialization_reason")
@@ -3316,6 +3303,40 @@ class APExecutionCore:
             or _selector_failure_meta.get("reason_code")
             or ""
         ).strip()
+        # A synthetic HOLD callback may surface the sentinel as the durable
+        # reason while the selector failure carries the canonical transient
+        # reason. An explicit UNKNOWN/terminal durable reason is never replaced
+        # by nested metadata.
+        _market_truth_retry_reason = _durable_retry_reason
+        if _durable_retry_reason.upper() == "HOLD_MARKET_TRUTH_UNAVAILABLE":
+            _market_truth_retry_reason = str(
+                _selector_failure_meta.get("reason_code") or ""
+            ).strip()
+        _market_truth_outcome = str(
+            _selector_failure_meta.get("market_truth_outcome")
+            or meta.get("market_truth_outcome")
+            or ""
+        ).strip().upper()
+        if not _market_truth_outcome:
+            _nested_market_truth_audit = _selector_failure_meta.get(
+                "last_breach_selector_audit"
+            )
+            if isinstance(_nested_market_truth_audit, dict):
+                _market_truth_outcome = str(
+                    _nested_market_truth_audit.get("market_truth_outcome") or ""
+                ).strip().upper()
+        _market_truth_only_retry = (
+            _is_retryable_selector_reason(_market_truth_retry_reason.upper())
+            and (
+                meta.get("materialization_market_truth_pending") is True
+                or _market_truth_outcome == "HOLD_MARKET_TRUTH_UNAVAILABLE"
+            )
+        )
+        _callback_attempt = (
+            _materialization_attempt
+            if _market_truth_only_retry
+            else _expected_attempt
+        )
 
         # execution_mode: resolve the durable column/meta authority and then
         # require it to match this deferred-retry worker's explicit mode.

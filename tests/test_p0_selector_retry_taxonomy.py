@@ -755,6 +755,22 @@ def test_retryable_data_codes_are_validity_bound():
 
 def test_count_helper_keeps_unknowns_fail_closed():
     assert deferred_retry_count_exhaustion_applies("UNKNOWN_REASON", selector_failure={})
+    assert deferred_retry_count_exhaustion_applies(
+        "UNKNOWN_RETRY_REASON",
+        selector_failure={"market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE"},
+    )
+    assert deferred_retry_count_exhaustion_applies(
+        "OI_TOO_LOW",
+        selector_failure={
+            "last_breach_selector_audit": {
+                "market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE",
+            },
+        },
+    )
+    assert deferred_retry_count_exhaustion_applies(
+        "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+        selector_failure={"market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE"},
+    )
     assert not deferred_retry_count_exhaustion_applies(
         "CURRENT_PRICE_FETCH_FAILED",
         selector_failure={"market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE"},

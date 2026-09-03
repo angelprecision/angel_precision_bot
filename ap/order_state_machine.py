@@ -3936,6 +3936,17 @@ class APOrderStateMachine:
             "materialization_detail": _detail,
             "entry_path": _entry_path,
         })
+        _market_truth_outcome = str(
+            _selector_failure.get("market_truth_outcome") or ""
+        ).strip().upper()
+        if not _market_truth_outcome:
+            _nested_market_truth_audit = _selector_failure.get(
+                "last_breach_selector_audit"
+            )
+            if isinstance(_nested_market_truth_audit, dict):
+                _market_truth_outcome = str(
+                    _nested_market_truth_audit.get("market_truth_outcome") or ""
+                ).strip().upper()
 
         _now = now_utc_iso()
         _patch = {
@@ -3965,10 +3976,7 @@ class APOrderStateMachine:
             "materialization_selector_failure": _selector_failure,
             "broker_ready": False,
             "materialization_market_truth_pending": (
-                str(_selector_failure.get("market_truth_outcome") or "")
-                .strip()
-                .upper()
-                == "HOLD_MARKET_TRUTH_UNAVAILABLE"
+                _market_truth_outcome == "HOLD_MARKET_TRUTH_UNAVAILABLE"
             ),
         }
         if isinstance(selector_recovery_cursor, dict):

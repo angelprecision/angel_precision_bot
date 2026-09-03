@@ -615,8 +615,20 @@ def deferred_retry_count_exhaustion_applies(
     fail-closed. A DTE aggregation reason is retryable only with an explicit
     all-data-miss ladder proof.
     """
-    if ladder_retryable:
+    _reason = str(reason_code or "").strip().upper()
+    _policy = get_policy(_reason)
+
+    # A ladder proof is authority only for its canonical aggregation reason.
+    # Do not let an unrelated caller-supplied flag, or HOLD metadata below,
+    # override an unknown/terminal reason.
+    if ladder_retryable and _reason == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
         return False
+
+    # Canonical reason classification comes before any diagnostic metadata.
+    # Unknown and terminal reasons remain count-terminal even when stale or
+    # nested market-truth evidence says HOLD.
+    if _policy.classification != RETRYABLE_DATA and _reason != "NO_VALID_PLAYBOOK_DTE_CONTRACT":
+        return True
 
     failure = selector_failure if isinstance(selector_failure, dict) else {}
     market_truth = str(
@@ -628,10 +640,7 @@ def deferred_retry_count_exhaustion_applies(
             market_truth = str(
                 nested.get("market_truth_outcome") or ""
             ).strip().upper()
-    if market_truth == "HOLD_MARKET_TRUTH_UNAVAILABLE":
-        return False
-
-    if str(reason_code or "").strip().upper() == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
+    if _reason == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
         audits = [
             failure.get("last_dte_ladder_audit"),
             failure.get("dte_ladder_audit"),
@@ -667,10 +676,16 @@ def deferred_retry_count_exhaustion_applies(
             if proven and saw_failure:
                 return False
 
-    policy = get_policy(reason_code)
+    # NO_VALID_PLAYBOOK_DTE_CONTRACT is terminal unless its ladder proof above
+    # established an all-data-miss retry. Other non-retryable classifications
+    # were returned before inspecting HOLD metadata.
+    if _policy.classification != RETRYABLE_DATA:
+        return True
+    if market_truth == "HOLD_MARKET_TRUTH_UNAVAILABLE":
+        return False
     return not (
-        policy.classification == RETRYABLE_DATA
-        and not policy.max_attempts_applies
+        _policy.classification == RETRYABLE_DATA
+        and not _policy.max_attempts_applies
     )
 
 
