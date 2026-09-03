@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-import math
 import requests
-import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -15,45 +13,12 @@ from ap.logger import get_logger
 
 log = get_logger("ap.brokers.tradier")
 
-# The submit-intent reconciler matches the exact Tradier tag.  Always request
-# tags and the largest supported page, but bound pagination so an unusual or
-# adversarial account response cannot make a recovery poll unbounded.
-TRADIER_ORDERS_PAGE_SIZE = 1500
-TRADIER_ORDERS_MAX_PAGES = 10
-
 
 @dataclass(frozen=True)
 class TradierConfig:
     base_url: str
     access_token: str
     account_id: str
-
-
-class TradierOrderQueryDeadlineExceeded(TimeoutError):
-    """The bounded startup order-enumeration deadline was exhausted."""
-
-
-def _remaining_order_query_seconds(
-    deadline_monotonic: float | None,
-) -> float | None:
-    if deadline_monotonic is None:
-        return None
-    try:
-        deadline = float(deadline_monotonic)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise TradierOrderQueryDeadlineExceeded(
-            "TRADIER_ORDERS_DEADLINE_INVALID"
-        ) from exc
-    if not math.isfinite(deadline):
-        raise TradierOrderQueryDeadlineExceeded(
-            "TRADIER_ORDERS_DEADLINE_INVALID"
-        )
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TradierOrderQueryDeadlineExceeded(
-            "TRADIER_ORDERS_DEADLINE_EXCEEDED"
-        )
-    return remaining
 
 
 class TradierMarketDataError(RuntimeError):
@@ -152,16 +117,9 @@ class TradierBroker(BrokerAdapter):
     # -------------------------
     # HTTP helpers
     # -------------------------
-    def _get(
-        self,
-        path: str,
-        params: Optional[dict] = None,
-        *,
-        timeout=None,
-    ) -> dict:
+    def _get(self, path: str, params: Optional[dict] = None) -> dict:
         url = f"{self.cfg.base_url}{path}"
-        request_timeout = (3.05, 15) if timeout is None else timeout
-        r = self.session.get(url, params=params, timeout=request_timeout)
+        r = self.session.get(url, params=params, timeout=(3.05, 15))
         r.raise_for_status()
         return r.json() if r.content else {}
 
@@ -453,80 +411,23 @@ class TradierBroker(BrokerAdapter):
         except Exception as e:
             return {"status": "ERROR", "reason": str(e)}
 
-    def list_orders(
-        self,
-        *,
-        deadline_monotonic: float | None = None,
-    ) -> List[Dict[str, Any]]:
+    def list_orders(self) -> List[Dict[str, Any]]:
         """Return account orders for exact-tag crash-window reconciliation.
 
         Unlike ``get_order`` this deliberately propagates transport/auth errors:
         callers must distinguish an authoritative empty result from an unavailable
-        broker query before deciding that a new POST is safe.  Tags are required
-        for the exact submit-intent match, so every page requests them explicitly.
-        When supplied, ``deadline_monotonic`` bounds the complete paginated
-        enumeration and raises ``TradierOrderQueryDeadlineExceeded`` on expiry.
+        broker query before deciding that a new POST is safe.
         """
-        endpoint = f"/v1/accounts/{self.cfg.account_id}/orders"
-        all_orders: List[Dict[str, Any]] = []
-
-        for page in range(1, TRADIER_ORDERS_MAX_PAGES + 1):
-            remaining = _remaining_order_query_seconds(deadline_monotonic)
-            request_timeout = (
-                (min(3.05, remaining), min(15.0, remaining))
-                if remaining is not None
-                else None
-            )
-            request_params = {
-                "includeTags": "true",
-                "limit": TRADIER_ORDERS_PAGE_SIZE,
-                "page": page,
-            }
-            request_kwargs = {"params": request_params}
-            if request_timeout is not None:
-                request_kwargs["timeout"] = request_timeout
-            try:
-                j = self._get(endpoint, **request_kwargs)
-            except TradierOrderQueryDeadlineExceeded:
-                raise
-            except Exception as exc:
-                if deadline_monotonic is not None:
-                    try:
-                        _remaining_order_query_seconds(deadline_monotonic)
-                    except TradierOrderQueryDeadlineExceeded as deadline_exc:
-                        raise deadline_exc from exc
-                raise
-
-            # A response that arrives after the deadline is unavailable for
-            # reconciliation, even if its payload looks complete.
-            _remaining_order_query_seconds(deadline_monotonic)
-            if not isinstance(j, dict):
-                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:root")
-            if "orders" not in j:
-                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:missing_orders")
-
-            node = j.get("orders")
-            if node is not None and not isinstance(node, (dict, list)):
-                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:orders")
-            orders = node.get("order") if isinstance(node, dict) else node
-            if orders is None:
-                page_orders: List[Dict[str, Any]] = []
-            elif isinstance(orders, dict):
-                page_orders = [orders]
-            elif isinstance(orders, list):
-                if not all(isinstance(order, dict) for order in orders):
-                    raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED:order_list")
-                page_orders = orders
-            else:
-                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
-
-            all_orders.extend(page_orders)
-            if len(page_orders) < TRADIER_ORDERS_PAGE_SIZE:
-                _remaining_order_query_seconds(deadline_monotonic)
-                return all_orders
-
-        _remaining_order_query_seconds(deadline_monotonic)
-        raise ValueError("TRADIER_ORDERS_PAGINATION_CEILING")
+        j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
+        node = j.get("orders") if isinstance(j, dict) else None
+        orders = node.get("order") if isinstance(node, dict) else node
+        if orders is None:
+            return []
+        if isinstance(orders, dict):
+            return [orders]
+        if isinstance(orders, list):
+            return [order for order in orders if isinstance(order, dict)]
+        raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
         # Not used in current architecture

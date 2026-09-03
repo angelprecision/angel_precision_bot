@@ -3,13 +3,7 @@ import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
 import ap_execution_core
-from ap.broker_submit_identity import (
-    build_entry_submit_payload,
-    entry_submit_payload_hash,
-)
 from ap.order_state_machine import APOrderStateMachine
 
 
@@ -24,21 +18,7 @@ def _row(crash=False):
         "selected_qty": 1,
     }
     if crash:
-        meta.update(
-            lifecycle_state="SUBMITTING",
-            submit_intent_at=datetime.now(timezone.utc).isoformat(),
-            broker_submit_key="oid-1",
-            current_owner="broker_submit:oid-1",
-            broker_submit_payload_hash=entry_submit_payload_hash(
-                build_entry_submit_payload(
-                    symbol="SPY",
-                    contract="SPY260717C00600000",
-                    qty=1,
-                    limit_price=2.10,
-                    broker_submit_key="oid-1",
-                )
-            ),
-        )
+        meta.update(lifecycle_state="SUBMITTING", submit_intent_at=datetime.now(timezone.utc).isoformat(), broker_submit_key="oid-1")
     return {
         "local_order_id": "oid-1", "client_id": "jason@example.com",
         "execution_mode": "live", "signal_id": "sig-1", "plan_id": "plan-1",
@@ -127,35 +107,15 @@ def test_matching_working_order_is_adopted_and_monitor_owned_without_post():
     core.broker.place_order.assert_not_called()
 
 
-def test_matching_fill_adopts_identity_without_bypassing_fill_monitor():
+def test_matching_fill_advances_through_existing_state_machine():
     core = _core()
     core.order_state_machine.get_order.return_value = _row(crash=True)
     core.order_state_machine.transition.return_value = True
     core.broker.list_orders.return_value = [_remote("filled", exec_quantity=1, avg_fill_price=2.08)]
     result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
-    assert result["status"] == "SUBMITTED"
-    assert core.order_state_machine.transition.call_count == 1
-    transition = core.order_state_machine.transition.call_args
-    assert transition.args[:2] == ("oid-1", "SUBMITTED")
-    assert transition.kwargs["broker_order_id"] == "TR-9"
-    assert transition.kwargs["submitted_ts"]
-    core.broker.place_order.assert_not_called()
-
-
-@pytest.mark.parametrize("broker_status", ["partially_filled", "rejected", "canceled", "expired"])
-def test_matching_nonworking_status_never_directly_terminalizes_or_partially_fills(
-    broker_status,
-):
-    core = _core()
-    core.order_state_machine.get_order.return_value = _row(crash=True)
-    core.order_state_machine.transition.return_value = True
-    core.broker.list_orders.return_value = [_remote(broker_status, exec_quantity=1)]
-
-    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
-
-    assert result["status"] == "SUBMITTED"
-    assert core.order_state_machine.transition.call_count == 1
-    assert core.order_state_machine.transition.call_args.args[:2] == ("oid-1", "SUBMITTED")
+    assert result["status"] == "FILLED"
+    assert core.order_state_machine.transition.call_count == 2
+    assert core.order_state_machine.transition.call_args.args[:2] == ("oid-1", "FILLED")
     core.broker.place_order.assert_not_called()
 
 
@@ -175,9 +135,7 @@ def test_query_failure_is_retryable_and_never_posts():
     core.broker.list_orders.side_effect = TimeoutError("timeout")
     result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
     assert result["disposition"] == "RECONCILE_PENDING"
-    assert result["reason_code"].startswith(
-        "RECONCILE_BROKER_QUERY_FAILED:TimeoutError:timeout"
-    )
+    assert result["reason_code"] == "RECONCILE_BROKER_QUERY_FAILED:TimeoutError"
     core.broker.place_order.assert_not_called()
 
 

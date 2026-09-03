@@ -172,7 +172,6 @@ class APSelfHealingSystem:
                     position_manager=runner.position_manager,
                     exit_engine=getattr(getattr(runner, "core", None), "exit_eng", None),
                     entry_watcher=getattr(getattr(runner, "core", None), "entry_watcher", None),
-                    execution_core=getattr(runner, "core", None),
                     contract_selector=getattr(getattr(runner, "core", None), "contract_selector", None),
                     # Propagate only an actually wired mode.  APOrderMonitor keeps
                     # its historical LIVE fallback for unrelated timeout policy,
