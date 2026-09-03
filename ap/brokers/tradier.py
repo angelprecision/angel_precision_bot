@@ -597,3 +597,61 @@ class TradierBroker(BrokerAdapter):
         except Exception as e:
             log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
             return []
+
+    def list_positions_authoritative(self) -> list:
+        """Return strict read-only position truth; propagate broker failures."""
+        response = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
+        if not isinstance(response, dict) or "positions" not in response:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:root")
+        positions = response.get("positions")
+        if positions is None or positions == "null" or positions == {} or positions == []:
+            return []
+        if not isinstance(positions, dict) or "position" not in positions:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:positions")
+        raw_positions = positions.get("position")
+        if raw_positions is None or raw_positions == "null" or raw_positions == []:
+            return []
+        if isinstance(raw_positions, dict):
+            raw_positions = [raw_positions]
+        if not isinstance(raw_positions, list) or not all(isinstance(p, dict) for p in raw_positions):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:position_list")
+
+        normalized = []
+        for position in raw_positions:
+            symbol = position.get("symbol")
+            quantity_raw = position.get("quantity")
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:position_symbol")
+            if quantity_raw is None or isinstance(quantity_raw, bool):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:position_quantity")
+            try:
+                quantity = float(quantity_raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:position_quantity") from exc
+            if not math.isfinite(quantity):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:position_quantity")
+            cost_basis_raw = position.get("cost_basis", 0)
+            if cost_basis_raw is None:
+                cost_basis = 0.0
+            elif isinstance(cost_basis_raw, bool):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:cost_basis")
+            else:
+                try:
+                    cost_basis = float(cost_basis_raw)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:cost_basis") from exc
+                if not math.isfinite(cost_basis):
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED:cost_basis")
+
+            symbol_text = symbol.strip()
+            if len(symbol_text) >= 15 and symbol_text[-9:-8] == "C":
+                side = "CALL"
+            elif len(symbol_text) >= 15 and symbol_text[-9:-8] == "P":
+                side = "PUT"
+            elif "C" in symbol_text:
+                side = "CALL"
+            else:
+                side = "PUT"
+            normalized.append({"symbol": symbol_text, "quantity": quantity,
+                               "cost_basis": cost_basis, "side": side, "raw": position})
+        return normalized

@@ -426,6 +426,44 @@ def _query_client_state(client_id: str) -> dict:
                   AND broker_order_id IS NULL
                   AND submitted_ts IS NULL
                   AND filled_ts IS NULL
+                  AND NOT (
+                      COALESCE(meta->>'broker_submit_resolution_state', '') =
+                          'PRIOR_SESSION_DAY_NO_CURRENT_POSITION'
+                      AND LOWER(TRIM(COALESCE(NULLIF(TRIM(execution_mode), ''),
+                          NULLIF(TRIM(meta->>'execution_mode'), ''), ''))) = 'live'
+                      AND (NULLIF(TRIM(execution_mode), '') IS NULL
+                           OR LOWER(TRIM(execution_mode)) IN ('live', 'paper'))
+                      AND (NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL
+                           OR LOWER(TRIM(meta->>'execution_mode')) IN ('live', 'paper'))
+                      AND (NULLIF(TRIM(execution_mode), '') IS NULL
+                           OR NULLIF(TRIM(meta->>'execution_mode'), '') IS NULL
+                           OR LOWER(TRIM(execution_mode)) = LOWER(TRIM(meta->>'execution_mode')))
+                      AND UPPER(COALESCE(status, '')) = 'PENDING_TRIGGER'
+                      AND COALESCE(meta->>'lifecycle_state', '') = 'SUBMITTING'
+                      AND COALESCE(meta->>'broker_submit_key', '') =
+                          LEFT(BTRIM(local_order_id), 32)
+                      AND COALESCE(meta->>'current_owner', '') =
+                          'broker_submit:' || LEFT(BTRIM(local_order_id), 32)
+                      AND COALESCE(meta->>'broker_submit_resolution_contract', '') =
+                          COALESCE(contract, '')
+                      AND COALESCE(meta->>'broker_submit_resolution_key', '') =
+                          LEFT(BTRIM(local_order_id), 32)
+                      AND COALESCE(meta->>'broker_submit_resolution_client_id', '') =
+                          client_id
+                      AND COALESCE(meta->>'broker_submit_resolution_execution_mode', '') =
+                          'live'
+                      AND COALESCE(meta->>'broker_submit_resolution_at', '') ~
+                          '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+                      AND COALESCE(meta->>'broker_submit_resolution_trading_date', '') =
+                          timezone('America/New_York', NOW())::date::text
+                      AND position_id IS NULL
+                      AND COALESCE(filled_qty, 0) = 0
+                      AND COALESCE(meta->>'broker_order_id', '') = ''
+                      AND COALESCE(meta->>'position_id', '') = ''
+                      AND COALESCE(meta->>'filled_ts', '') = ''
+                      AND COALESCE(meta->>'broker_submitted_ts', '') = ''
+                      AND COALESCE(meta->>'broker_submitted_at', '') = ''
+                  )
                 ORDER BY created_ts
                 """,
                 (client_id, pending_cutoff),

@@ -53,6 +53,14 @@ log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 
+# A historical DAY submit is still durable evidence, but it is no longer a
+# current-session order-list lookup candidate once current broker position
+# truth proves the exact OCC is absent.  Keep this value shared with the
+# readiness SQL as a deliberately narrow, exact marker.
+_PRIOR_SESSION_DAY_NO_CURRENT_POSITION = (
+    "PRIOR_SESSION_DAY_NO_CURRENT_POSITION"
+)
+
 # Retained for compatibility with callers/configuration that still reference
 # the historical settlement setting.  A clean empty Tradier listing is not
 # proof that an ambiguous LIVE submit never reached the broker, so the
@@ -175,6 +183,51 @@ def _remote_optional_text_shape_is_valid(remote: dict, *keys: str) -> bool:
 def _normalize_execution_mode(value) -> str | None:
     mode = str(value or "").strip().lower()
     return mode if mode in _VALID_EXECUTION_MODES else None
+
+
+def _prior_session_classification(
+    submit_intent_at: datetime,
+    now_utc: datetime,
+) -> str:
+    intent_date = submit_intent_at.astimezone(ET).date()
+    now_date = now_utc.astimezone(ET).date()
+    if intent_date == now_date:
+        return "same_session"
+    if intent_date > now_date:
+        return "future"
+    try:
+        from ap.flatline_alarm import is_trading_day
+        if is_trading_day(intent_date) and is_trading_day(now_date):
+            return "prior_completed_session"
+    except Exception:
+        pass
+    return "calendar_unproven"
+
+
+def _reconcile_local_evidence_conflict(row: dict, meta: dict) -> str | None:
+    def _present(value) -> bool:
+        if value is None:
+            return False
+        return bool(value.strip()) if isinstance(value, str) else True
+    for source, values, fields in (
+        ("row", row, ("broker_order_id", "submitted_ts", "filled_ts", "position_id")),
+        ("meta", meta, ("broker_order_id", "submitted_ts", "filled_ts", "position_id", "broker_submitted_ts", "broker_submitted_at")),
+    ):
+        for field in fields:
+            if _present(values.get(field)):
+                return f"{source}.{field}"
+    for source, values in (("row", row), ("meta", meta)):
+        for field in ("filled_qty", "broker_filled_qty", "cumulative_filled_qty"):
+            if field not in values or values.get(field) in (None, ""):
+                continue
+            value = values.get(field)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return f"{source}.{field}"
+            if isinstance(value, bool) or not math.isfinite(numeric) or numeric != 0:
+                return f"{source}.{field}"
+    return None
 
 
 def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_flag) -> str | None:
@@ -4032,6 +4085,7 @@ class APExecutionCore:
         *,
         local_order_id: str,
         recovery_deadline_monotonic: float | None = None,
+        now_utc: datetime | None = None,
     ) -> dict:
         """Resolve one durable ENTRY submit intent without a duplicate POST.
 
@@ -4044,7 +4098,9 @@ class APExecutionCore:
         canonical submit path may create submission authority, and this
         ambiguous-POST recovery path never releases its fence.  A startup
         recovery deadline is passed through to broker order enumeration; its
-        exhaustion is UNKNOWN and retains the exact broker-submit owner.
+        exhaustion is UNKNOWN and retains the exact broker-submit owner.  A
+        deterministic ``now_utc`` may be supplied by recovery tests;
+        production callers use the current UTC instant.
         """
         _owner_label = f"broker_reconciler:{self.client_id or self.email or ''}"
         _base = {
@@ -4222,6 +4278,8 @@ class APExecutionCore:
             limit_price=expected_limit,
             broker_submit_key=canonical_key,
         )
+        if expected_payload.get("duration") != "day":
+            return _identity_unproven("duration_day")
         expected_payload_hash = entry_submit_payload_hash(expected_payload)
         if payload_hash != expected_payload_hash:
             return _identity_unproven("broker_submit_payload_hash_mismatch")
@@ -4276,6 +4334,7 @@ class APExecutionCore:
                 "next_retry_at": retry_at,
                 "broker_submit_owner_retained": True,
                 "broker_submit_owner_retention_persisted": None,
+                "historical_nonblocking": False,
             }
             if exc is not None:
                 result.update(
@@ -4337,15 +4396,154 @@ class APExecutionCore:
             return result
 
         try:
-            _parse_reconcile_timestamp(submit_intent_at, field="submit_intent_at")
+            _submit_intent_dt = _parse_reconcile_timestamp(
+                submit_intent_at, field="submit_intent_at"
+            )
         except ValueError as exc:
             return _retain_owner(
                 f"RECONCILE_SUBMIT_INTENT_TIMESTAMP_INVALID:{str(exc)}",
                 stage="submit_intent_timestamp",
                 exc=exc,
             )
+        try:
+            _reconcile_now = (
+                _parse_reconcile_timestamp(now_utc, field="reconciliation_now")
+                if now_utc is not None else datetime.now(timezone.utc)
+            )
+        except ValueError as exc:
+            return _retain_owner(
+                f"RECONCILE_RECONCILIATION_NOW_INVALID:{str(exc)}",
+                stage="reconciliation_now",
+                exc=exc,
+            )
+        if _submit_intent_dt > _reconcile_now:
+            return _retain_owner(
+                "RECONCILE_SUBMIT_INTENT_TIMESTAMP_FUTURE",
+                stage="submit_intent_timestamp",
+                exc=ValueError("submit_intent_at is in the future"),
+            )
+
+        local_conflict = _reconcile_local_evidence_conflict(row, meta)
+        if local_conflict:
+            return _retain_owner(
+                f"RECONCILE_LOCAL_EVIDENCE_CONTRADICTORY:{local_conflict}",
+                stage="local_identity_proof",
+            )
 
         broker = getattr(self, "broker", None)
+        marker_state = str(meta.get("broker_submit_resolution_state") or "").strip()
+
+        def _authoritative_position_truth() -> str:
+            list_positions = getattr(broker, "list_positions_authoritative", None)
+            if not callable(list_positions):
+                raise ValueError("authoritative position query unavailable")
+            positions = list_positions()
+            if not isinstance(positions, list):
+                raise ValueError("authoritative position response must be a list")
+            exact_quantity = None
+            for position in positions:
+                if not isinstance(position, dict):
+                    raise ValueError("authoritative position response contains non-object")
+                symbol = position.get("symbol")
+                quantity = position.get("quantity")
+                if not isinstance(symbol, str) or not symbol.strip() or quantity is None or isinstance(quantity, bool):
+                    raise ValueError("authoritative position identity is incomplete")
+                try:
+                    quantity_value = float(quantity)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("authoritative position quantity is malformed") from exc
+                if not math.isfinite(quantity_value):
+                    raise ValueError("authoritative position quantity is malformed")
+                if symbol.strip().upper() == expected_contract.upper():
+                    if exact_quantity is not None:
+                        raise ValueError("authoritative position contains duplicate OCC")
+                    exact_quantity = quantity_value
+            return "POSITION_PRESENT" if exact_quantity not in (None, 0) else "NO_CURRENT_POSITION"
+
+        def _update_resolution_meta(meta_patch: dict) -> bool:
+            update_meta = getattr(osm, "update_order_meta", None)
+            if not callable(update_meta):
+                return False
+            cas_kwargs = {
+                "expected_status": "PENDING_TRIGGER",
+            }
+            if str(row.get("execution_mode") or "").strip():
+                cas_kwargs["expected_execution_mode"] = row_mode
+            signal_id = row.get("signal_id")
+            if signal_id is not None and str(signal_id).strip():
+                cas_kwargs["expected_signal_id"] = str(signal_id).strip()
+            try:
+                return bool(update_meta(local_order_id, meta_patch, **cas_kwargs))
+            except Exception as exc:
+                log.critical(
+                    "[%s] HISTORICAL_BROKER_SUBMIT_RESOLUTION_WRITE_RAISED local_order_id=%s exc=%s",
+                    expected_client_id, local_order_id, exc,
+                )
+                return False
+
+        session_class = _prior_session_classification(
+            _submit_intent_dt,
+            _reconcile_now,
+        )
+        if session_class == "future":
+            return _retain_owner(
+                "RECONCILE_SUBMIT_INTENT_TIMESTAMP_FUTURE",
+                stage="submit_intent_timestamp",
+            )
+        if session_class == "calendar_unproven":
+            return _retain_owner(
+                "RECONCILE_PRIOR_SESSION_CALENDAR_UNPROVEN",
+                stage="prior_session_calendar",
+            )
+        if session_class == "prior_completed_session":
+            try:
+                position_truth = _authoritative_position_truth()
+            except Exception as exc:
+                return _retain_owner(
+                    f"RECONCILE_BROKER_POSITION_QUERY_FAILED:{type(exc).__name__}:{str(exc)}",
+                    stage="broker_position_query",
+                    exc=exc,
+                ) | {"current_session_order_query": "NOT_REQUIRED"}
+
+            if position_truth == "POSITION_PRESENT":
+                retained = _retain_owner(
+                    "RECONCILE_PRIOR_SESSION_POSITION_PRESENT",
+                    stage="broker_position_query",
+                )
+                retained.update(broker_truth="POSITION_PRESENT", current_session_order_query="NOT_REQUIRED", historical_nonblocking=False)
+                if marker_state:
+                    invalidated = _update_resolution_meta({
+                        "broker_submit_resolution_state": None,
+                        "broker_submit_resolution_invalidated_at": _reconcile_now.isoformat(),
+                        "broker_submit_resolution_invalidated_reason": "CURRENT_POSITION_PRESENT",
+                    })
+                    retained["historical_quarantine_invalidated"] = invalidated
+                    if not invalidated:
+                        retained["reason_code"] = "RECONCILE_HISTORICAL_RESOLUTION_WRITE_FAILED"
+                return retained
+
+            retained = _retain_owner(
+                "RECONCILE_PRIOR_SESSION_DAY_NO_CURRENT_POSITION",
+                stage="broker_position_query",
+            )
+            retained.update(broker_truth="NO_CURRENT_POSITION", current_session_order_query="NOT_REQUIRED", historical_nonblocking=False, historical_quarantine_persisted=False)
+            if not retained.get("broker_submit_owner_retention_persisted"):
+                return retained
+            marker_patch = {
+                "broker_submit_resolution_state": _PRIOR_SESSION_DAY_NO_CURRENT_POSITION,
+                "broker_submit_resolution_at": _reconcile_now.isoformat(),
+                "broker_submit_resolution_contract": expected_contract,
+                "broker_submit_resolution_key": canonical_key,
+                "broker_submit_resolution_client_id": expected_client_id,
+                "broker_submit_resolution_execution_mode": row_mode,
+                "broker_submit_resolution_trading_date": _reconcile_now.astimezone(ET).date().isoformat(),
+            }
+            if not _update_resolution_meta(marker_patch):
+                retained["reason_code"] = "RECONCILE_HISTORICAL_RESOLUTION_WRITE_FAILED"
+                return retained
+            retained.update(historical_nonblocking=True, historical_quarantine_persisted=True, historical_resolution_state=_PRIOR_SESSION_DAY_NO_CURRENT_POSITION)
+            return retained
+
         list_orders = getattr(broker, "list_orders", None)
         if not callable(list_orders):
             return _retain_owner(

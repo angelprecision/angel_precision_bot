@@ -127,19 +127,23 @@ def test_old_submit_intent_with_empty_broker_list_stays_fail_closed():
     core = _make_core()
     core.broker.list_orders.side_effect = None
     core.broker.list_orders.return_value = []
+    core.broker.list_positions_authoritative.return_value = []
     old = _row()
-    old["meta"]["submit_intent_at"] = (
-        datetime.now(timezone.utc) - timedelta(days=2)
-    ).isoformat()
+    old["meta"]["submit_intent_at"] = "2026-09-01T16:00:00+00:00"
     core.order_state_machine.get_order.return_value = old
 
-    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+    result = core.reconcile_deferred_broker_intent(
+        local_order_id="oid-1",
+        now_utc=datetime(2026, 9, 2, 16, 0, tzinfo=timezone.utc),
+    )
 
     assert result["disposition"] == "RECONCILE_PENDING"
-    assert result["reason_code"] == "RECONCILE_BROKER_NO_MATCH_OBSERVED"
-    assert result["broker_truth"] == "NO_MATCH_OBSERVED"
+    assert result["reason_code"] == "RECONCILE_PRIOR_SESSION_DAY_NO_CURRENT_POSITION"
+    assert result["broker_truth"] == "NO_CURRENT_POSITION"
+    assert result["current_session_order_query"] == "NOT_REQUIRED"
+    assert result["historical_nonblocking"] is True
     core.order_state_machine.retain_broker_submit_owner_for_reconciliation.assert_called_once()
-    core.order_state_machine.update_order_meta.assert_not_called()
+    core.order_state_machine.update_order_meta.assert_called_once()
 
 
 # ═══════════════════════════════════════════════════════════════════════
