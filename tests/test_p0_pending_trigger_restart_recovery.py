@@ -44,8 +44,11 @@ from ap.pending_trigger_restart_recovery import (
     _RR_CLIENT_FIELD,
     _RR_MODE_FIELD,
     _RR_CLOSE_REASON,
+    _build_plan,
+    _late_attachment_policy_eligible,
 )
 from ap.pending_trigger_classifier import PendingTriggerClassification as PTC
+from ap.order_monitor import APOrderMonitor
 
 
 # ── Fixtures / helpers ────────────────────────────────────────────────────────
@@ -3356,6 +3359,485 @@ class TestLateMarketValidityRecovery:
         assert final_meta[_RR_ATTEMPT_FIELD] == 1
         assert datetime.fromisoformat(final_meta[_RR_DEADLINE_FIELD]) > datetime.now(timezone.utc)
         assert osm.cancel_calls == []
+
+
+class _MonitorWatcher(_MockWatcher):
+    def __init__(self, *, watch_returns=True, ownership_raises=False):
+        super().__init__(watch_returns=watch_returns)
+        self.watch_calls = 0
+        self.ownership_raises = ownership_raises
+
+    def has_order(self, local_order_id: str) -> bool:
+        if self.ownership_raises:
+            raise RuntimeError("ownership unavailable")
+        return any(
+            str((getattr(item, "signal", {}) or {}).get("local_order_id") or "")
+            == local_order_id
+            for item in self._pending
+        )
+
+    def watch(self, *args, **kwargs):
+        self.watch_calls += 1
+        return super().watch(*args, **kwargs)
+
+
+def _canonical_late_retry_row(
+    *,
+    local_order_id="late-monitor-1",
+    signal_id="late-signal-1",
+    client_id="client@test.com",
+    mode="paper",
+    next_at=None,
+    deadline=None,
+    attempt=1,
+    late_policy=True,
+):
+    now = datetime.now(timezone.utc)
+    return _row(
+        local_order_id=local_order_id,
+        signal_id=signal_id,
+        client_id=client_id,
+        execution_mode=mode,
+        meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": late_policy,
+            _RR_STATUS_FIELD: "RETRY_PENDING",
+            _RR_OWNER_FIELD: (
+                f"restart_rearm:{client_id.lower()}:{mode.lower()}:{local_order_id}"
+            ),
+            _RR_REASON_FIELD: "late_attachment_market_truth_unavailable_or_unresolved",
+            _RR_ATTEMPT_FIELD: attempt,
+            _RR_NEXT_AT_FIELD: next_at or (now - timedelta(seconds=1)).isoformat(),
+            _RR_DEADLINE_FIELD: deadline or (now + timedelta(minutes=3)).isoformat(),
+            "restart_rearm_first_failed_at": (now - timedelta(seconds=31)).isoformat(),
+            _RR_CLIENT_FIELD: client_id.lower(),
+            _RR_MODE_FIELD: mode.lower(),
+        },
+    )
+
+
+def _monitor_for_retry(row, watcher, *, monitor_client=None, monitor_mode=None):
+    osm = _MockOSM()
+    osm.seed(row)
+    broker = MagicMock()
+    broker.submit_order = MagicMock()
+    broker.place_order = MagicMock()
+    broker.post_order = MagicMock()
+    broker.cancel_order = MagicMock()
+    broker.replace_order = MagicMock()
+    monitor = APOrderMonitor(
+        client_id=monitor_client or row.get("client_id"),
+        broker=broker,
+        order_state_machine=osm,
+        position_manager=MagicMock(),
+        entry_watcher=watcher,
+        client_mode=monitor_mode or row.get("execution_mode"),
+    )
+    return monitor, osm, broker
+
+
+def _run_young_pending_monitor(monitor, order, *, local_id=None):
+    oid = local_id or order["local_order_id"]
+    monitor._check_pending_trigger_order(
+        order=order,
+        local_id=oid,
+        contract=order.get("contract") or f"DEFERRED:{order.get('ticker', 'SPY')}",
+        age_secs=35.0,
+        broker_oid=order.get("broker_order_id"),
+        submitted_ts=order.get("submitted_ts"),
+    )
+
+
+def _assert_no_broker_mutation(broker):
+    broker.submit_order.assert_not_called()
+    broker.place_order.assert_not_called()
+    broker.post_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+    broker.replace_order.assert_not_called()
+
+
+class TestPR569OrderMonitorRetryLiveness:
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_due_young_retry_installs_same_watcher_in_paper_and_live(self, mode):
+        row = _canonical_late_retry_row(mode=mode)
+        watcher = _MonitorWatcher(watch_returns=True)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 1
+        assert len(watcher._pending) == 1
+        assert watcher._pending[0].signal["local_order_id"] == row["local_order_id"]
+        assert watcher._pending[0].signal["signal_id"] == row["signal_id"]
+        assert watcher._pending[0].signal["execution_mode"] == mode
+        final_meta = osm.get_order(row["local_order_id"])["meta"]
+        assert final_meta[_RR_STATUS_FIELD] == "CLOSED"
+        assert final_meta[_RR_CLOSE_REASON] == "watcher_owned"
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_due_retry_truth_unavailable_renews_without_watcher_or_broker_mutation(self):
+        row = _canonical_late_retry_row(attempt=2)
+        watcher = _MonitorWatcher(watch_returns=False)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        final_meta = osm.get_order(row["local_order_id"])["meta"]
+        assert watcher.watch_calls == 1
+        assert watcher._pending == []
+        assert final_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert final_meta[_RR_ATTEMPT_FIELD] == 3
+        assert datetime.fromisoformat(final_meta[_RR_NEXT_AT_FIELD]) > datetime.now(timezone.utc)
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_not_due_retry_is_observed_without_watch_increment_or_broker_call(self):
+        future = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+        row = _canonical_late_retry_row(next_at=future, attempt=2)
+        watcher = _MonitorWatcher(watch_returns=True)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert watcher._pending == []
+        assert osm.get_order(row["local_order_id"])["meta"][_RR_ATTEMPT_FIELD] == 2
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "target_already_complete_terminal",
+            "stop_already_broken_terminal",
+            "late_attachment_move_missed_terminal",
+        ],
+    )
+    def test_due_market_terminal_reason_is_preserved_without_second_cancel(self, reason):
+        row = _canonical_late_retry_row()
+        osm = _MockOSM()
+        osm.seed(row)
+
+        class _TerminalWatcher(_MonitorWatcher):
+            def watch(self, _plan, local_order_id, **_kwargs):
+                self.watch_calls += 1
+                osm._rows[local_order_id]["status"] = "EXPIRED"
+                osm._rows[local_order_id]["last_error"] = reason
+                return False
+
+        watcher = _TerminalWatcher()
+        monitor, _unused, broker = _monitor_for_retry(row, watcher)
+        monitor.osm = osm
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 1
+        assert watcher._pending == []
+        assert osm.get_order(row["local_order_id"])["last_error"] == reason
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_exact_existing_watcher_is_observed_without_second_watch(self):
+        row = _canonical_late_retry_row()
+        watcher = _MonitorWatcher(watch_returns=True)
+        plan = _build_plan(row)
+        assert watcher.watch(plan, row["local_order_id"], recovery_rearm=True)
+        watcher.watch_calls = 0
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert len(watcher._pending) == 1
+        assert osm.get_order(row["local_order_id"])["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_runtime_ownership_lookup_failure_holds_without_watch_or_broker_mutation(self):
+        row = _canonical_late_retry_row()
+        watcher = _MonitorWatcher(watch_returns=True, ownership_raises=True)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert watcher._pending == []
+        assert osm.get_order(row["local_order_id"])["meta"][_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_existing_registry_identity_mismatch_never_calls_watch(self):
+        row = _canonical_late_retry_row()
+        watcher = _MonitorWatcher(watch_returns=True)
+        wrong_plan = _build_plan({**row, "signal_id": "wrong-signal"})
+        assert watcher.watch(wrong_plan, row["local_order_id"], recovery_rearm=True)
+        watcher.watch_calls = 0
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert len(watcher._pending) == 1
+        assert osm.get_order(row["local_order_id"])["meta"][_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    @pytest.mark.parametrize("handoff", ["broker_order_id", "submitted_ts", "broker_ready", "active_materializer"])
+    def test_broker_or_materializer_handoff_never_rearms(self, handoff):
+        row = _canonical_late_retry_row()
+        if handoff == "broker_order_id":
+            row["broker_order_id"] = "broker-1"
+        elif handoff == "submitted_ts":
+            row["submitted_ts"] = datetime.now(timezone.utc).isoformat()
+        elif handoff == "broker_ready":
+            row["meta"]["broker_ready"] = True
+        else:
+            row["meta"].update({
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "materializer:test",
+                "materialization_generation": 1,
+                "materialization_lease_until": (
+                    datetime.now(timezone.utc) + timedelta(minutes=2)
+                ).isoformat(),
+                "broker_ready": False,
+            })
+        watcher = _MonitorWatcher(watch_returns=True)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert watcher._pending == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            "client",
+            "missing_client",
+            "mode",
+            "malformed_mode",
+            "signal",
+            "missing_signal",
+            "local_order",
+        ],
+    )
+    def test_identity_mismatch_never_rearms(self, failure):
+        row = _canonical_late_retry_row()
+        observed = dict(row)
+        monitor_client = None
+        monitor_mode = None
+        local_id = None
+        if failure == "client":
+            monitor_client = "other@test.com"
+        elif failure == "missing_client":
+            monitor_client = " "
+        elif failure == "mode":
+            monitor_mode = "live"
+        elif failure == "malformed_mode":
+            monitor_mode = "production"
+        elif failure == "signal":
+            observed["signal_id"] = "different-signal"
+        elif failure == "missing_signal":
+            observed["signal_id"] = ""
+        else:
+            observed["local_order_id"] = "different-local"
+            local_id = "different-local"
+        watcher = _MonitorWatcher(watch_returns=True)
+        monitor, osm, broker = _monitor_for_retry(
+            row,
+            watcher,
+            monitor_client=monitor_client,
+            monitor_mode=monitor_mode,
+        )
+
+        _run_young_pending_monitor(monitor, observed, local_id=local_id)
+
+        assert watcher.watch_calls == 0
+        assert watcher._pending == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_retry_shape_changed_after_proof_holds_without_watch(self):
+        row = _canonical_late_retry_row()
+
+        class _ChangingOSM(_MockOSM):
+            def __init__(self):
+                super().__init__()
+                self.reads = 0
+
+            def get_order(self, oid):
+                self.reads += 1
+                result = super().get_order(oid)
+                if self.reads >= 2 and result:
+                    result["meta"][_RR_STATUS_FIELD] = "CLOSED"
+                return result
+
+        osm = _ChangingOSM()
+        osm.seed(row)
+        watcher = _MonitorWatcher(watch_returns=True)
+        broker = MagicMock()
+        broker.submit_order = MagicMock()
+        broker.place_order = MagicMock()
+        broker.post_order = MagicMock()
+        broker.cancel_order = MagicMock()
+        broker.replace_order = MagicMock()
+        monitor = APOrderMonitor(
+            client_id=row["client_id"],
+            broker=broker,
+            order_state_machine=osm,
+            position_manager=MagicMock(),
+            entry_watcher=watcher,
+            client_mode="paper",
+        )
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            (_RR_STATUS_FIELD, "CLOSED"),
+            (_RR_OWNER_FIELD, "restart_rearm:wrong"),
+            (_RR_ATTEMPT_FIELD, "1"),
+            (_RR_ATTEMPT_FIELD, True),
+            (_RR_ATTEMPT_FIELD, 0),
+            (_RR_NEXT_AT_FIELD, "not-a-time"),
+            (_RR_DEADLINE_FIELD, "2026-01-01"),
+        ],
+    )
+    def test_malformed_retry_shape_never_bypasses_to_watch(self, field, value):
+        row = _canonical_late_retry_row()
+        row["meta"][field] = value
+        watcher = _MonitorWatcher(watch_returns=True)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert watcher._pending == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_contradictory_attempt_mirror_never_rearms(self):
+        row = _canonical_late_retry_row(attempt=2)
+        row[_RR_ATTEMPT_FIELD] = 1
+        watcher = _MonitorWatcher(watch_returns=True)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_expired_exact_late_lease_renews_one_bounded_generation(self):
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        row = _canonical_late_retry_row(
+            next_at=expired,
+            deadline=expired,
+            attempt=6,
+        )
+        watcher = _MonitorWatcher(watch_returns=False)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        final_meta = osm.get_order(row["local_order_id"])["meta"]
+        assert watcher.watch_calls == 0
+        assert final_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert final_meta[_RR_ATTEMPT_FIELD] == 1
+        assert datetime.fromisoformat(final_meta[_RR_DEADLINE_FIELD]) > datetime.now(timezone.utc)
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    def test_same_process_and_restart_consumers_converge_to_exact_identity(self):
+        row_same_process = _canonical_late_retry_row(local_order_id="same-oid")
+        row_restart = _canonical_late_retry_row(local_order_id="same-oid")
+        watcher_same = _MonitorWatcher(watch_returns=True)
+        watcher_restart = _MonitorWatcher(watch_returns=True)
+        monitor, osm_same, broker = _monitor_for_retry(row_same_process, watcher_same)
+
+        _run_young_pending_monitor(monitor, row_same_process)
+
+        recovery_restart, osm_restart = _make_recovery(
+            row_restart,
+            watcher=watcher_restart,
+            mode="paper",
+            client_id="client@test.com",
+        )
+        restart_outcome = recovery_restart.consume_canonical_restart_rearm_retry(
+            "same-oid",
+            expected_signal_id=row_restart["signal_id"],
+        )
+
+        assert restart_outcome == _RowOutcome.WATCHER_OWNED
+        for watcher in (watcher_same, watcher_restart):
+            assert watcher.watch_calls == 1
+            assert len(watcher._pending) == 1
+            assert watcher._pending[0].signal == {
+                "local_order_id": "same-oid",
+                "signal_id": row_restart["signal_id"],
+                "client_id": "client@test.com",
+                "execution_mode": "paper",
+            }
+        assert osm_same.get_order("same-oid")["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert osm_restart.get_order("same-oid")["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        _assert_no_broker_mutation(broker)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["false", "true", "0", "1", 0, 1, [], {}, " ", None, False],
+)
+def test_late_policy_requires_exact_boolean_true(value):
+    row = {"meta": {"late_attachment_policy_eligible": value}}
+    assert _late_attachment_policy_eligible(row) is False
+    plan = _build_plan(_row(meta={
+        "trigger_price": 450.0,
+        "late_attachment_policy_eligible": value,
+    }))
+    assert plan.late_attachment_policy_eligible is False
+    assert plan.metadata["late_attachment_policy_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    ("top_value", "meta_value", "expected"),
+    [(True, True, True), (False, False, False), (True, False, False), (False, True, False)],
+)
+def test_late_policy_conflicting_authorities_fail_closed(top_value, meta_value, expected):
+    row = {
+        "late_attachment_policy_eligible": top_value,
+        "meta": {"late_attachment_policy_eligible": meta_value},
+    }
+    assert _late_attachment_policy_eligible(row) is expected
+
+
+@pytest.mark.parametrize("malformed", ["true", "false", "1", "0", 1, 0, [], {}, " ", None])
+def test_malformed_top_level_cannot_override_exact_metadata_true(malformed):
+    row = {
+        "late_attachment_policy_eligible": malformed,
+        "meta": {"late_attachment_policy_eligible": True},
+    }
+    assert _late_attachment_policy_eligible(row) is False
+
+
+def test_single_exact_boolean_true_authority_is_eligible():
+    assert _late_attachment_policy_eligible({
+        "meta": {"late_attachment_policy_eligible": True}
+    }) is True
+    assert _late_attachment_policy_eligible({
+        "late_attachment_policy_eligible": True,
+        "meta": {},
+    }) is True
 
 
 def test_pr569_no_clock_terminal_authority_survives():

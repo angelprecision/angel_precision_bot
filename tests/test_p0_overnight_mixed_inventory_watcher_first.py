@@ -394,6 +394,62 @@ def test_post_open_missing_quote_gets_durable_retry_owner(monkeypatch):
     state.broker.cancel_order.assert_not_called()
 
 
+def test_completed_owned_retry_is_consumed_same_process_before_5400_seconds(monkeypatch):
+    from datetime import timedelta, timezone
+
+    from ap.order_monitor import APOrderMonitor
+
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-same-process", _signal("late-same-process", "NFLX"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 30, 5, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+    )
+
+    assert state.result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
+    assert state.result["completed"] is True
+    assert state.result["retryable"] is False
+    assert state.watcher._pending == []
+
+    row = state.osm.rows["local-1"]
+    row["meta"]["restart_rearm_next_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    row["meta"]["restart_rearm_deadline"] = (
+        datetime.now(timezone.utc) + timedelta(minutes=3)
+    ).isoformat()
+    row["created_ts"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=35)
+    ).isoformat()
+    row["contract"] = "DEFERRED:NFLX"
+    state.watcher._watch_returns = True
+    calls_before_due_cycle = len(state.watcher.calls)
+
+    monitor = APOrderMonitor(
+        client_id="jose@example.com",
+        broker=state.broker,
+        order_state_machine=state.osm,
+        position_manager=MagicMock(),
+        entry_watcher=state.watcher,
+        client_mode="LIVE",
+    )
+    monitor._get_active_entry_orders = lambda: [dict(row)]
+    monitor._check_entry_orders()
+
+    assert len(state.watcher.calls) == calls_before_due_cycle + 1
+    assert len(state.watcher._pending) == 1
+    assert state.watcher._pending[0].signal["local_order_id"] == "local-1"
+    assert state.watcher._pending[0].signal["signal_id"] == "late-same-process"
+    assert row["meta"]["restart_rearm_status"] == "CLOSED"
+    assert row["meta"]["restart_rearm_close_reason"] == "watcher_owned"
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
 def test_mixed_terminal_and_56_deferred_rows_remain_retryable(monkeypatch):
     jobs = [_job("duplicate", _signal("duplicate", "DUP"))]
     jobs.extend(_job(index, _signal(f"deferred-{index}", f"T{index:02d}")) for index in range(56))

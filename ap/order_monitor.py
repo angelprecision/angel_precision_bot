@@ -441,6 +441,9 @@ class APOrderMonitor:
         self._broker_owned_exit_recovery_mode = (
             raw_recovery_mode if raw_recovery_mode in {"live", "paper"} else ""
         )
+        self._pending_trigger_recovery_mode = (
+            raw_recovery_mode if raw_recovery_mode in {"live", "paper"} else ""
+        )
         # PR66: store mode for per-mode max-age selection.
         # "or LIVE" guards against explicit None/empty being passed — preserve
         # the legacy monitor policy without granting recovery authority.
@@ -822,6 +825,13 @@ class APOrderMonitor:
                         log.debug("[%s] lost-handoff systemic check failed: %s", self.client_id, _e)
 
             elif status == "PENDING_TRIGGER":
+                # #569 late-market-truth retry leases run on the normal entry
+                # monitor cadence, before hydration and long-age cleanup.  The
+                # canonical recovery engine alone validates and consumes the
+                # exact durable lease; malformed/non-late rows receive no age
+                # bypass and retain all pre-existing monitor behavior.
+                if self._consume_canonical_restart_rearm_retry(order, local_id):
+                    continue
                 if hydration_attempts >= max(1, DEFERRED_HYDRATION_MAX_PER_CYCLE):
                     if str(order.get("contract") or "").strip().upper().startswith("DEFERRED:"):
                         log.info(
@@ -1248,6 +1258,92 @@ class APOrderMonitor:
 
         return False, "no_watcher_evidence_found"
 
+    def _consume_canonical_restart_rearm_retry(
+        self,
+        order: dict,
+        local_order_id: str,
+    ) -> bool:
+        """Consume an exact #569 late retry on the normal monitor cadence.
+
+        Returns True only when ``PendingTriggerRestartRecovery`` recognizes
+        the durable row as its canonical late-policy retry shape.  True means
+        the engine handled the row (including not-due, retry renewal,
+        terminal market truth, exact existing ownership, or fail-closed
+        unresolved).  False grants no new authority and leaves the ordinary
+        age/hydration/watchdog behavior unchanged.
+        """
+        if not isinstance(order, dict):
+            return False
+        retry_meta = _coerce_meta(order)
+        retry_status = retry_meta.get("restart_rearm_status")
+        if (
+            not isinstance(retry_status, str)
+            or retry_status.strip().upper() != "RETRY_PENDING"
+        ):
+            return False
+        local_order_id = str(local_order_id or "").strip()
+        row_local_id = order.get("local_order_id")
+        signal_id = order.get("signal_id")
+        if (
+            not local_order_id
+            or not isinstance(row_local_id, str)
+            or row_local_id.strip() != local_order_id
+            or not isinstance(signal_id, str)
+            or not signal_id.strip()
+        ):
+            return False
+
+        # Only an explicitly wired LIVE/PAPER monitor receives retry-consumer
+        # authority.  The monitor's historical display/policy fallback to LIVE
+        # is not durable execution-mode proof.
+        execution_mode = str(
+            getattr(self, "_pending_trigger_recovery_mode", "") or ""
+        ).strip().lower()
+        if execution_mode not in {"live", "paper"}:
+            return False
+
+        try:
+            from ap.pending_trigger_restart_recovery import (
+                PendingTriggerRestartRecovery as _PTR,
+            )
+
+            recovery = _PTR(
+                client_id=self.client_id,
+                execution_mode=execution_mode,
+                osm=getattr(self, "osm", None),
+                entry_watcher=getattr(self, "entry_watcher", None),
+                broker=getattr(self, "broker", None),
+                caller_source=(
+                    "ap.order_monitor._consume_canonical_restart_rearm_retry"
+                ),
+            )
+            outcome = recovery.consume_canonical_restart_rearm_retry(
+                local_order_id,
+                expected_signal_id=signal_id.strip(),
+            )
+        except Exception as exc:
+            log.error(
+                "[%s] RESTART_REARM_MONITOR_CONSUMER_ERROR local=%s error=%s "
+                "— failed closed",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
+        if outcome is None:
+            return False
+        log.info(
+            "[%s] RESTART_REARM_MONITOR_CONSUMED local=%s signal_id=%s "
+            "mode=%s outcome=%s",
+            self.client_id,
+            local_order_id,
+            signal_id.strip(),
+            execution_mode,
+            outcome,
+        )
+        return True
+
     def _check_pending_trigger_order(
         self,
         *,
@@ -1258,6 +1354,8 @@ class APOrderMonitor:
         broker_oid,
         submitted_ts,
     ) -> None:
+        if self._consume_canonical_restart_rearm_retry(order, local_id):
+            return
         if age_secs <= PENDING_TRIGGER_MAX_AGE_SECONDS:
             return
 

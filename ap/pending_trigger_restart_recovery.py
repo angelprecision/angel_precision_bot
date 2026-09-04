@@ -227,7 +227,54 @@ class PendingTriggerRestartRecovery:
             str(local_oid or "").strip(),
             {},
             expected_signal_id=str(expected_signal_id or "").strip(),
+            require_late_policy=True,
         )
+
+    def consume_canonical_restart_rearm_retry(
+        self,
+        local_oid: str,
+        *,
+        expected_signal_id: str,
+    ) -> Optional[str]:
+        """Consume one exact late-policy restart-rearm lease.
+
+        ``None`` means the durable row is not the canonical retry shape and
+        grants the caller no bypass authority.  Otherwise the returned value
+        is the normal ``_RowOutcome`` from this recovery engine.  Due/not-due,
+        watcher ownership, market truth, renewal, and terminalization remain
+        inside the canonical engine rather than being duplicated by callers.
+        """
+        local_oid = str(local_oid or "").strip()
+        expected_signal_id = str(expected_signal_id or "").strip()
+        if not local_oid or not expected_signal_id:
+            return None
+
+        proof = self._verify_restart_rearm_retry_ownership(
+            local_oid,
+            {},
+            expected_signal_id=expected_signal_id,
+            allow_expired=True,
+            require_late_policy=True,
+        )
+        if proof is None:
+            return None
+
+        get_fn = getattr(self.osm, "get_order", None)
+        if not callable(get_fn):
+            return _RowOutcome.UNRESOLVED
+        try:
+            reread = get_fn(local_oid)
+        except Exception:
+            return _RowOutcome.UNRESOLVED
+        if not isinstance(reread, dict):
+            return _RowOutcome.UNRESOLVED
+        if (
+            _retry_subtype(reread) != _RETRY_RESTART_REARM
+            or not _late_attachment_policy_eligible(reread)
+            or str(reread.get("signal_id") or "").strip() != expected_signal_id
+        ):
+            return _RowOutcome.UNRESOLVED
+        return self._recover_one(reread)
 
     # ── Per-row dispatch ──────────────────────────────────────────────────────
 
@@ -708,7 +755,12 @@ class PendingTriggerRestartRecovery:
         return _RowOutcome.UNRESOLVED
 
     def _handle_restart_rearm_retry(self, row, local_oid, live_quote_abt, plan_builder_fn) -> str:
-        proof = self._verify_restart_rearm_retry_ownership(local_oid, row, allow_expired=True)
+        proof = self._verify_restart_rearm_retry_ownership(
+            local_oid,
+            row,
+            expected_signal_id=str(row.get("signal_id") or "").strip(),
+            allow_expired=True,
+        )
         if proof is None:
             self._mark_failure(local_oid, "retry_verification:restart_rearm")
             log.critical("RESTART_RECOVERY_RESTART_REARM_RETRY_UNPROVEN local=%s", local_oid)
@@ -734,6 +786,19 @@ class PendingTriggerRestartRecovery:
                     "restart_recovery_retry_subtype": _RETRY_RESTART_REARM,
                     "restart_rearm_exhausted_attempt": attempt,
                 },
+            )
+
+        # An expired/exhausted lease is not watcher authority.  The exact
+        # late-policy path may create one fresh bounded generation, but this
+        # cycle performs no watcher mutation; the renewed next_at is consumed
+        # by a later normal monitor tick.
+        if _late_policy and (now > deadline or attempt >= max_attempts):
+            return self._enter_restart_rearm_retry(
+                local_oid,
+                row,
+                reason="late_attachment_market_truth_unavailable_or_unresolved",
+                prior_attempt=0,
+                first_failed_at=None,
             )
 
         # Due late retries return to the same canonical watcher path.  Its
@@ -1038,6 +1103,7 @@ class PendingTriggerRestartRecovery:
             expected_owner=_owner,
             expected_next_at=_next,
             expected_deadline=_deadline,
+            expected_signal_id=str(row.get("signal_id") or "").strip(),
         )
         if proof is None:
             self._mark_failure(local_oid, "retry_verification:restart_rearm_after_write")
@@ -1684,6 +1750,7 @@ class PendingTriggerRestartRecovery:
         expected_deadline: Optional[str] = None,
         expected_signal_id: str = "",
         allow_expired: bool = False,
+        require_late_policy: bool = False,
     ) -> Optional[dict]:
         """Prove bounded pre-breach restart-rearm retry ownership."""
         get_fn = getattr(self.osm, "get_order", None)
@@ -1707,9 +1774,24 @@ class PendingTriggerRestartRecovery:
             return None
         if rr_client != self.client_id.lower():
             return None
-        if rr_mode != self.execution_mode:
+        if self.execution_mode not in {"live", "paper"}:
             return None
-        if expected_signal_id and rr_signal_id != expected_signal_id:
+        if rr_mode not in {"live", "paper"} or rr_mode != self.execution_mode:
+            return None
+        if not rr_signal_id or not expected_signal_id or rr_signal_id != expected_signal_id:
+            return None
+        if require_late_policy and not _late_attachment_policy_eligible(reread):
+            return None
+        if any(
+            value is not None
+            and not (isinstance(value, str) and not value.strip())
+            for value in (
+                reread.get("broker_order_id"),
+                reread.get("submitted_ts"),
+            )
+        ):
+            return None
+        if is_active_materialization_in_flight(reread):
             return None
         # A late-attachment candidate may already have exact trigger-crossing
         # evidence: that is why it needs fresh market truth before a watcher can
@@ -1723,21 +1805,50 @@ class PendingTriggerRestartRecovery:
             return None
 
         meta = _extract_meta(reread)
-        restart_status = str(meta.get(_RR_STATUS_FIELD) or "").strip().upper()
-        owner = str(meta.get(_RR_OWNER_FIELD) or "").strip()
-        reason = str(meta.get(_RR_REASON_FIELD) or "").strip()
-        next_at = str(meta.get(_RR_NEXT_AT_FIELD) or "").strip()
-        deadline = str(meta.get(_RR_DEADLINE_FIELD) or "").strip()
-        first_failed_at = str(meta.get(_RR_FIRST_FAILED_AT) or "").strip()
-        rr_client_meta = str(meta.get(_RR_CLIENT_FIELD) or "").strip().lower()
-        rr_mode_meta = str(meta.get(_RR_MODE_FIELD) or "").strip().lower()
-        try:
-            attempt = int(meta.get(_RR_ATTEMPT_FIELD))
-        except (TypeError, ValueError):
+        restart_status_raw = meta.get(_RR_STATUS_FIELD)
+        owner_raw = meta.get(_RR_OWNER_FIELD)
+        reason_raw = meta.get(_RR_REASON_FIELD)
+        next_at_raw = meta.get(_RR_NEXT_AT_FIELD)
+        deadline_raw = meta.get(_RR_DEADLINE_FIELD)
+        first_failed_at_raw = meta.get(_RR_FIRST_FAILED_AT)
+        rr_client_meta_raw = meta.get(_RR_CLIENT_FIELD)
+        rr_mode_meta_raw = meta.get(_RR_MODE_FIELD)
+        if not all(
+            isinstance(value, str)
+            for value in (
+                restart_status_raw,
+                owner_raw,
+                reason_raw,
+                next_at_raw,
+                deadline_raw,
+                rr_client_meta_raw,
+                rr_mode_meta_raw,
+            )
+        ):
             return None
+        restart_status = restart_status_raw.strip().upper()
+        owner = owner_raw.strip()
+        reason = reason_raw.strip()
+        next_at = next_at_raw.strip()
+        deadline = deadline_raw.strip()
+        first_failed_at = (
+            first_failed_at_raw.strip()
+            if isinstance(first_failed_at_raw, str)
+            else ""
+        )
+        rr_client_meta = rr_client_meta_raw.strip().lower()
+        rr_mode_meta = rr_mode_meta_raw.strip().lower()
+        attempt_raw = meta.get(_RR_ATTEMPT_FIELD)
+        if type(attempt_raw) is not int:
+            return None
+        attempt = attempt_raw
+        if _RR_ATTEMPT_FIELD in reread:
+            top_attempt = reread.get(_RR_ATTEMPT_FIELD)
+            if type(top_attempt) is not int or top_attempt != attempt:
+                return None
         max_attempts = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
-        next_dt = _parse_iso(next_at)
-        deadline_dt = _parse_iso(deadline)
+        next_dt = _parse_retry_iso(next_at)
+        deadline_dt = _parse_retry_iso(deadline)
         if restart_status != "RETRY_PENDING":
             return None
         if not owner or not reason:
@@ -2074,6 +2185,11 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
             return None
     try:
         meta = _extract_meta(row)
+        late_policy_eligible = _late_attachment_policy_eligible(row)
+        plan_metadata = dict(meta)
+        # Never forward a truthy string/number/container into APEntryWatcher.
+        # The reconstructed plan carries one normalized boolean authority.
+        plan_metadata["late_attachment_policy_eligible"] = late_policy_eligible
         signal_id = str(row.get("signal_id") or meta.get("signal_id") or "")
         canonical_signal_id = str(
             row.get("canonical_signal_id")
@@ -2143,7 +2259,8 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
                 row.get("trigger_crossed_at")
                 or meta.get("trigger_crossed_at")
             ),
-            metadata=dict(meta),
+            late_attachment_policy_eligible=late_policy_eligible,
+            metadata=plan_metadata,
             score=float(row.get("score") or meta.get("score") or 0),
             tier=row.get("tier") or meta.get("tier") or "",
             timeframe=row.get("timeframe") or meta.get("timeframe") or "",
@@ -2212,11 +2329,32 @@ def _retry_subtype(row: dict) -> str:
 
 
 def _late_attachment_policy_eligible(row: dict) -> bool:
+    """Return True only for an exact, non-conflicting durable boolean grant.
+
+    Metadata is the normal persisted authority.  A top-level mirror is
+    tolerated for legacy/test row shapes only when it is also an exact bool;
+    if both surfaces exist they must agree.  Generic truthiness never grants
+    the late market-truth lifecycle.
+    """
+    if not isinstance(row, dict):
+        return False
     meta = _extract_meta(row)
-    return bool(
-        (row or {}).get("late_attachment_policy_eligible")
-        or meta.get("late_attachment_policy_eligible")
-    )
+    top_present = "late_attachment_policy_eligible" in row
+    meta_present = "late_attachment_policy_eligible" in meta
+    top_value = row.get("late_attachment_policy_eligible")
+    meta_value = meta.get("late_attachment_policy_eligible")
+
+    if top_present and type(top_value) is not bool:
+        return False
+    if meta_present and type(meta_value) is not bool:
+        return False
+    if top_present and meta_present and top_value is not meta_value:
+        return False
+    if meta_present:
+        return meta_value is True
+    if top_present:
+        return top_value is True
+    return False
 
 
 def _has_trigger_or_submit_evidence(row: dict) -> bool:
@@ -2252,6 +2390,22 @@ def _parse_iso(raw) -> Optional[datetime]:
         dt = datetime.fromisoformat(text)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _parse_retry_iso(raw) -> Optional[datetime]:
+    """Parse a durable retry timestamp only when it is timezone-aware."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        text = raw.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            return None
         return dt
     except Exception:
         return None
