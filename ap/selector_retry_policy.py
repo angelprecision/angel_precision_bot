@@ -148,7 +148,7 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "NO_EXPIRATION_IN_DTE_WINDOW": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=False,
+        retry_delay_applies=True, max_attempts_applies=True,
         final_reason_code="NO_EXPIRATION_IN_DTE_WINDOW",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
@@ -162,7 +162,7 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=False,
+        retry_delay_applies=True, max_attempts_applies=True,
         final_reason_code="DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
@@ -204,7 +204,7 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "SELECTOR_REQUEST_BUDGET_EXHAUSTED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=False,
+        retry_delay_applies=True, max_attempts_applies=True,
         final_reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
@@ -232,7 +232,7 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "REJECT_UNAVAILABLE": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=False,
+        retry_delay_applies=True, max_attempts_applies=True,
         final_reason_code="REJECT_UNAVAILABLE",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
@@ -602,6 +602,17 @@ def is_retryable_selector_reason(reason_code: "str | None") -> bool:
     return get_policy(reason_code).classification == RETRYABLE_DATA
 
 
+def is_validity_bound_deferred_retry_reason(reason_code: "str | None") -> bool:
+    """True only for proven transient-data reasons that retry until cutoff."""
+    policy = get_policy(str(reason_code or "").strip().upper())
+    return (
+        policy.classification == RETRYABLE_DATA
+        and policy.selector_rerun_allowed
+        and policy.retry_delay_applies
+        and not policy.max_attempts_applies
+    )
+
+
 def deferred_retry_count_exhaustion_applies(
     reason_code: "str | None",
     *,
@@ -618,11 +629,9 @@ def deferred_retry_count_exhaustion_applies(
     _reason = str(reason_code or "").strip().upper()
     _policy = get_policy(_reason)
 
-    # A ladder proof is authority only for its canonical aggregation reason.
-    # Do not let an unrelated caller-supplied flag, or HOLD metadata below,
-    # override an unknown/terminal reason.
-    if ladder_retryable and _reason == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
-        return False
+    # ``ladder_retryable`` allows another selector pass, but the aggregate DTE
+    # label alone is not enough to remove the attempt ceiling. Only the full
+    # per-expiration proof below can grant validity-bound authority.
 
     # Canonical reason classification comes before any diagnostic metadata.
     # Unknown and terminal reasons remain count-terminal even when stale or
@@ -631,15 +640,27 @@ def deferred_retry_count_exhaustion_applies(
         return True
 
     failure = selector_failure if isinstance(selector_failure, dict) else {}
-    market_truth = str(
-        failure.get("market_truth_outcome") or ""
-    ).strip().upper()
-    if not market_truth:
-        nested = failure.get("last_breach_selector_audit")
-        if isinstance(nested, dict):
-            market_truth = str(
-                nested.get("market_truth_outcome") or ""
-            ).strip().upper()
+    if _reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED":
+        # The request-budget label is bounded by default. It becomes
+        # validity-bound only when the selector's canonical reduction proves
+        # the budget was consumed by a concrete transient data miss. A lone
+        # budget label (or stale HOLD metadata) is not enough authority.
+        canonical_reason = str(
+            failure.get("canonical_selector_reason") or ""
+        ).strip().upper()
+        operational_reason = str(
+            failure.get("operational_reason") or ""
+        ).strip().upper()
+        observed_reason = str(
+            failure.get("last_observed_selector_reason") or ""
+        ).strip().upper()
+        if (
+            canonical_reason == _reason
+            and operational_reason == _reason
+            and observed_reason != _reason
+            and is_validity_bound_deferred_retry_reason(observed_reason)
+        ):
+            return False
     if _reason == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
         audits = [
             failure.get("last_dte_ladder_audit"),
@@ -667,7 +688,7 @@ def deferred_retry_count_exhaustion_applies(
                     sub_reason = str(
                         sub_failure.get("reason_code") or ""
                     ).strip().upper() if isinstance(sub_failure, dict) else ""
-                    if sub_reason not in RETRYABLE_BREACH_SELECTOR_REASONS:
+                    if not is_validity_bound_deferred_retry_reason(sub_reason):
                         proven = False
                         break
                     saw_failure = True
@@ -681,12 +702,7 @@ def deferred_retry_count_exhaustion_applies(
     # were returned before inspecting HOLD metadata.
     if _policy.classification != RETRYABLE_DATA:
         return True
-    if market_truth == "HOLD_MARKET_TRUTH_UNAVAILABLE":
-        return False
-    return not (
-        _policy.classification == RETRYABLE_DATA
-        and not _policy.max_attempts_applies
-    )
+    return not is_validity_bound_deferred_retry_reason(_reason)
 
 
 # ── Sub-classification: OPERATIONAL_REQUEST_BUDGET vs candidate-quality ───────

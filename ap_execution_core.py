@@ -947,6 +947,7 @@ def _classify_deferred_breach_retry_decision(
     past_cutoff: bool,
     retry_enabled: bool,
     ladder_retryable: bool = False,
+    selector_failure: Optional[dict] = None,
 ) -> dict:
     _reason_code = str(reason_code or "").strip() or "BREACH_SELECTOR_RETURNED_NONE"
     _reason_classification = _classify_selector_reason(_reason_code)
@@ -955,6 +956,7 @@ def _classify_deferred_breach_retry_decision(
     )
     _count_cap_applies = _deferred_retry_count_exhaustion_applies(
         _reason_code,
+        selector_failure=selector_failure,
         ladder_retryable=bool(ladder_retryable),
     )
     if (
@@ -3248,6 +3250,8 @@ class APExecutionCore:
         if not owner or _expected_generation < 1 or _expected_attempt < 1:
             return _term("RETRY_INVALID_EXPECTATIONS", status="ERROR")
         _materialization_attempt = _expected_attempt - 1
+        if _materialization_attempt < 0:
+            return _term("RETRY_INVALID_EXPECTATIONS", status="ERROR")
 
         # ── Row read ─────────────────────────────────────────────────
         try:
@@ -3303,40 +3307,11 @@ class APExecutionCore:
             or _selector_failure_meta.get("reason_code")
             or ""
         ).strip()
-        # A synthetic HOLD callback may surface the sentinel as the durable
-        # reason while the selector failure carries the canonical transient
-        # reason. An explicit UNKNOWN/terminal durable reason is never replaced
-        # by nested metadata.
-        _market_truth_retry_reason = _durable_retry_reason
-        if _durable_retry_reason.upper() == "HOLD_MARKET_TRUTH_UNAVAILABLE":
-            _market_truth_retry_reason = str(
-                _selector_failure_meta.get("reason_code") or ""
-            ).strip()
-        _market_truth_outcome = str(
-            _selector_failure_meta.get("market_truth_outcome")
-            or meta.get("market_truth_outcome")
-            or ""
-        ).strip().upper()
-        if not _market_truth_outcome:
-            _nested_market_truth_audit = _selector_failure_meta.get(
-                "last_breach_selector_audit"
-            )
-            if isinstance(_nested_market_truth_audit, dict):
-                _market_truth_outcome = str(
-                    _nested_market_truth_audit.get("market_truth_outcome") or ""
-                ).strip().upper()
-        _market_truth_only_retry = (
-            _is_retryable_selector_reason(_market_truth_retry_reason.upper())
-            and (
-                meta.get("materialization_market_truth_pending") is True
-                or _market_truth_outcome == "HOLD_MARKET_TRUTH_UNAVAILABLE"
-            )
-        )
-        _callback_attempt = (
-            _materialization_attempt
-            if _market_truth_only_retry
-            else _expected_attempt
-        )
+        # A due retry owns the row before doing work, but it has not earned the
+        # next selector-attempt identity. Fresh market truth must pass first.
+        # This is unconditional for due retries: selector_calls=0 means the
+        # durable N/N/N attempt mirrors cannot advance.
+        _callback_attempt = _materialization_attempt
 
         # execution_mode: resolve the durable column/meta authority and then
         # require it to match this deferred-retry worker's explicit mode.
@@ -3575,13 +3550,7 @@ class APExecutionCore:
                 signal_id=signal_id,
                 execution_mode=row_mode,
                 retry_attempt=_callback_attempt,
-                **(
-                    {
-                        "advance_retry_attempt": False,
-                    }
-                    if _market_truth_only_retry
-                    else {}
-                ),
+                advance_retry_attempt=False,
             ))
         except Exception as exc:
             log.error("[%s] resume_deferred_materialization_retry claim_failed "
@@ -3804,7 +3773,7 @@ class APExecutionCore:
                 "_recovery_pre_claimed_owner":       owner,
                 "_recovery_pre_claimed_generation":  _new_generation,
                 "_recovery_pre_claimed_attempt":     _callback_attempt,
-                "_recovery_pre_claimed_market_truth_required": _market_truth_only_retry,
+                "_recovery_pre_claimed_market_truth_required": True,
                 "_recovery_pre_claimed_client_id":   row_client,
                 "_recovery_pre_claimed_mode":        row_mode,
             })
@@ -6340,6 +6309,20 @@ class APExecutionCore:
                                 retry_attempt=_next_attempt,
                                 advance_retry_attempt=True,
                                 advance_after_market_truth=True,
+                                trigger_crossed_at=str(
+                                    getattr(watched, "trigger_crossed_at", "")
+                                    or getattr(watched, "triggered_at", "")
+                                    or ""
+                                ),
+                                trigger_price=float(
+                                    getattr(approved_plan, "trigger_price", 0)
+                                    or 0
+                                ),
+                                observed_underlying_price=float(
+                                    getattr(watched, "breach_price", 0)
+                                    or getattr(approved_plan, "trigger_price", 0)
+                                    or 0
+                                ),
                                 lease_until=(
                                     datetime.now(timezone.utc)
                                     + timedelta(seconds=max(1, _advance_ttl))
@@ -6356,12 +6339,125 @@ class APExecutionCore:
                         )
                         _advance_ok = False
                     if not _advance_ok:
-                        # Keep the ownership lease and stop before selector or
-                        # broker work; the next recovery pass can reconcile it.
+                        # A lost second CAS still ran zero selector calls. Put
+                        # the exact phase-one owner back into RETRY_WAIT at N;
+                        # never strand it for generic STUCK terminalization.
+                        _advance_plan_meta = getattr(
+                            approved_plan, "metadata", None
+                        )
+                        if not isinstance(_advance_plan_meta, dict):
+                            _advance_plan_meta = {}
+                        _advance_failure = _advance_plan_meta.get(
+                            "materialization_selector_failure"
+                        )
+                        if not isinstance(_advance_failure, dict):
+                            _advance_failure = {}
+                        _advance_reason = str(
+                            _advance_plan_meta.get("retry_reason")
+                            or _advance_plan_meta.get("materialization_reason")
+                            or _advance_plan_meta.get(
+                                "deferred_retry_reason_code"
+                            )
+                            or _advance_failure.get("reason_code")
+                            or ""
+                        ).strip().upper()
+                        if not _advance_reason or not (
+                            _is_retryable_selector_reason(_advance_reason)
+                            or not _deferred_retry_count_exhaustion_applies(
+                                _advance_reason,
+                                selector_failure=_advance_failure,
+                            )
+                        ):
+                            return {
+                                "disposition": "RETRY_SCHEDULE_FAILED",
+                                "reason_code": (
+                                    "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
+                                    "RETRY_REASON_UNPROVEN"
+                                ),
+                            }
+                        _advance_delay = _positive_int_env_config(
+                            "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
+                        )
+                        try:
+                            _advance_max_attempts = max(
+                                _current_attempt,
+                                int(
+                                    _advance_plan_meta.get(
+                                        "retry_max_attempts", _current_attempt
+                                    )
+                                    or _current_attempt
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            _advance_max_attempts = _current_attempt
+                        _advance_next = (
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=_advance_delay)
+                        ).isoformat()
+                        _advance_schedule = getattr(
+                            self.order_state_machine,
+                            "schedule_deferred_materialization_retry",
+                            None,
+                        )
+                        _advance_schedule_meta = _build_deferred_retry_schedule_meta(
+                            reason_code=_advance_reason,
+                            selector_audit=_advance_failure,
+                            attempt=_current_attempt,
+                            max_attempts=_advance_max_attempts,
+                            delay_seconds=_advance_delay,
+                            client_id=str(_breach_client_id or ""),
+                            execution_mode=_mat_exec_mode,
+                            local_order_id=str(queue_local_order_id or ""),
+                            signal_id=str(
+                                getattr(approved_plan, "signal_id", "") or ""
+                            ),
+                        )
+                        try:
+                            _advance_scheduled = bool(
+                                callable(_advance_schedule)
+                                and _advance_schedule(
+                                    str(queue_local_order_id or ""),
+                                    owner=_mat_owner,
+                                    generation=_current_generation,
+                                    reason_code=_advance_reason,
+                                    attempt=_current_attempt,
+                                    max_attempts=_advance_max_attempts,
+                                    next_retry_at=_advance_next,
+                                    selector_failure={
+                                        **_advance_failure,
+                                        **_advance_schedule_meta,
+                                        "materialization_market_truth_pending": True,
+                                        "selector_calls": 0,
+                                        "broker_post_count": 0,
+                                    },
+                                    signal_id=str(
+                                        getattr(approved_plan, "signal_id", "") or ""
+                                    ),
+                                    execution_mode=_mat_exec_mode,
+                                    selector_recovery_cursor=(
+                                        _selector_recovery_cursor
+                                        if _cursor_enabled
+                                        else None
+                                    ),
+                                )
+                            )
+                        except Exception as _schedule_exc:
+                            log.critical(
+                                "[%s] MATERIALIZATION_ATTEMPT_ADVANCE_RETRY_WRITE_FAILED "
+                                "order=%s error=%s",
+                                ticker,
+                                queue_local_order_id,
+                                _schedule_exc,
+                            )
+                            _advance_scheduled = False
                         return {
-                            "disposition": "KEEP_WATCHER",
+                            "disposition": (
+                                "RETRY_WAIT"
+                                if _advance_scheduled
+                                else "RETRY_SCHEDULE_FAILED"
+                            ),
                             "reason_code": "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED",
-                            "retry_after_seconds": 5,
+                            "next_retry_at": _advance_next,
                         }
                     _selector_attempt_number = _next_attempt
                     _mat_generation = _next_generation
@@ -7040,6 +7136,7 @@ class APExecutionCore:
                         past_cutoff=_past_cutoff_a,
                         retry_enabled=_retry_enabled_a,
                         ladder_retryable=_ladder_exhaustion_is_retryable,
+                        selector_failure=_deferred_selector_audit,
                     )
 
                     if _decision_a["action"] == "retry_schedule":

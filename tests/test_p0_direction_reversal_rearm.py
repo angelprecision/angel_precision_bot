@@ -459,7 +459,7 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
     EXEC_MODE      = "paper"
     GENERATION     = 3          # durable generation before this retry
     PRIOR_ATTEMPT  = 1          # durable attempt before this retry fires
-    EXPECTED_ATT   = 2          # the attempt resume_deferred claims
+    EXPECTED_ATT   = 2          # next attempt, earned only after market truth
     NEW_GEN        = GENERATION + 1   # generation after claim = 4
     TRIGGER_PRICE  = 100.0
     TRIGGER_TS     = "2026-08-06T14:00:00+00:00"
@@ -514,9 +514,10 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
     # (ownership verify, pre-claim verify, cursor read — calls #2-4) ────────
     materializing_row = _make_materializing_row(
         LOCAL_ORDER_ID, SIGNAL_ID, PLAN_ID, CLIENT_ID,
-        EXEC_MODE, NEW_GEN, EXPECTED_ATT, OWNER,
+        EXEC_MODE, NEW_GEN, PRIOR_ATTEMPT, OWNER,
         TRIGGER_PRICE, TRIGGER_TS, provenance,
     )
+    materializing_row["meta"]["materialization_market_truth_pending"] = True
 
     # ── Fake row: post-rearm truly blank pre-breach state, returned by PTR
     # re-read. current_owner and materialization_status stay blank until a

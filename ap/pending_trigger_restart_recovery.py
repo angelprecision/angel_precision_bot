@@ -28,7 +28,9 @@ import os
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.logger import get_logger
 from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
@@ -43,6 +45,7 @@ from ap.pending_trigger_classifier import (
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
     deferred_retry_count_exhaustion_applies,
+    is_validity_bound_deferred_retry_reason,
     resolve_deferred_materialization_max_attempts,
 )
 
@@ -160,6 +163,7 @@ class PendingTriggerRestartRecovery:
         self.caller_source  = str(caller_source or "unknown").strip() or "unknown"
         self._row_retry_subtypes: dict[str, str] = {}
         self._row_failure_reasons: dict[str, str] = {}
+        self._broker_order_tags_snapshot: Optional[tuple[str, set[str]]] = None
 
         # PR #421 final amendment — watcher provenance. Set fresh at the
         # start of every _recover_one() call and read by the caller
@@ -375,6 +379,16 @@ class PendingTriggerRestartRecovery:
             # classifier priority changes later.
             if is_active_materialization_in_flight(row):
                 return _observe_materialization_owner()
+
+        if cls == PTC.STUCK_TRIGGER_READY:
+            # A crashed phase-one retry is not an abandoned trigger. It has a
+            # distinct exact-owner, same-attempt recovery contract and must be
+            # resolved before ordinary quote/terminal handling.
+            _phase_one_recovery = self._recover_stale_market_truth_pending(
+                row, local_oid
+            )
+            if _phase_one_recovery is not None:
+                return _phase_one_recovery
 
         # Live quote check.
         live_quote_abt: Optional[bool] = None
@@ -883,6 +897,252 @@ class PendingTriggerRestartRecovery:
         log.info("RESTART_RECOVERY_RESTART_REARM_RETRY_OWNED local=%s proof=%s", local_oid, proof)
         return _RowOutcome.RETRY_OWNED
 
+    def _load_authoritative_broker_order_tags(self) -> tuple[str, set[str]]:
+        """Return a complete current-session Tradier tag snapshot or UNKNOWN.
+
+        Absence is authority only through the raw paginated endpoint. The
+        broker's capped list_orders fallback is deliberately not used here.
+        """
+        if self._broker_order_tags_snapshot is not None:
+            return self._broker_order_tags_snapshot
+
+        raw_get = getattr(self.broker, "_get", None)
+        cfg = getattr(self.broker, "cfg", None)
+        account_id = str(getattr(cfg, "account_id", "") or "").strip()
+        if not callable(raw_get) or not account_id:
+            self._broker_order_tags_snapshot = ("UNKNOWN", set())
+            return self._broker_order_tags_snapshot
+
+        tags: set[str] = set()
+        seen_full_pages: set[tuple[tuple[str, str], ...]] = set()
+        limit = 500
+        try:
+            for page in range(1, 51):
+                payload = raw_get(
+                    f"/v1/accounts/{account_id}/orders?includeTags=true"
+                    f"&page={page}&limit={limit}"
+                )
+                if not isinstance(payload, dict) or "orders" not in payload:
+                    raise ValueError("BROKER_ORDERS_PAGE_MALFORMED")
+                node = payload.get("orders")
+                if node is None or node == "null":
+                    rows: list[dict] = []
+                elif isinstance(node, list):
+                    rows = node
+                elif isinstance(node, dict):
+                    raw_rows = node.get("order")
+                    if raw_rows is None or raw_rows == "null":
+                        rows = []
+                    elif isinstance(raw_rows, dict):
+                        rows = [raw_rows]
+                    elif isinstance(raw_rows, list):
+                        rows = raw_rows
+                    else:
+                        raise ValueError("BROKER_ORDERS_ROWS_MALFORMED")
+                else:
+                    raise ValueError("BROKER_ORDERS_NODE_MALFORMED")
+                if any(not isinstance(order, dict) for order in rows):
+                    raise ValueError("BROKER_ORDER_ROW_MALFORMED")
+                for order in rows:
+                    tag = str(order.get("tag") or "").strip()
+                    if tag:
+                        tags.add(tag)
+                if len(rows) < limit:
+                    self._broker_order_tags_snapshot = ("AVAILABLE", tags)
+                    return self._broker_order_tags_snapshot
+
+                signature = tuple(
+                    (
+                        str(order.get("id") or order.get("order_id") or ""),
+                        str(order.get("tag") or ""),
+                    )
+                    for order in rows
+                )
+                if signature in seen_full_pages:
+                    raise ValueError("BROKER_ORDERS_PAGINATION_STALLED")
+                seen_full_pages.add(signature)
+            raise ValueError("BROKER_ORDERS_PAGINATION_INCOMPLETE")
+        except Exception as exc:
+            log.critical(
+                "RESTART_PHASE_ONE_BROKER_TAG_LOOKUP_UNKNOWN client=%s mode=%s "
+                "error=%s",
+                self.client_id,
+                self.execution_mode,
+                exc,
+            )
+            self._broker_order_tags_snapshot = ("UNKNOWN", set())
+            return self._broker_order_tags_snapshot
+
+    def _inside_retry_entry_window(self, row: dict) -> bool:
+        meta = _extract_meta(row)
+        trigger_dt = _parse_iso(
+            meta.get("trigger_crossed_at") or meta.get("triggered_at")
+        )
+        if trigger_dt is None:
+            return False
+        eastern = ZoneInfo("America/New_York")
+        now_et = datetime.now(eastern)
+        if trigger_dt.astimezone(eastern).date() != now_et.date():
+            return False
+
+        deadline_raw = (
+            meta.get("absolute_entry_deadline")
+            or meta.get("retry_deadline")
+            or meta.get("deferred_retry_deadline")
+        )
+        if deadline_raw:
+            deadline = _parse_iso(deadline_raw)
+            if deadline is None or datetime.now(timezone.utc) >= deadline:
+                return False
+        try:
+            cutoff = int(
+                str(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "1530")).strip()
+            )
+        except (TypeError, ValueError):
+            return False
+        if cutoff < 0 or cutoff > 2359 or cutoff % 100 >= 60:
+            return False
+        return now_et.hour * 100 + now_et.minute < cutoff
+
+    def _recover_stale_market_truth_pending(
+        self, row: dict, local_oid: str
+    ) -> Optional[str]:
+        """Recover an expired phase-one claim at the same selector attempt."""
+        if self.execution_mode != "live" or self.is_past_eod:
+            return None
+        meta = _extract_meta(row)
+        if not (
+            meta.get("materialization_market_truth_pending") is True
+            and str(meta.get("lifecycle_state") or "").strip().upper()
+            == "MATERIALIZING"
+            and str(meta.get("materialization_status") or "").strip().upper()
+            == "RUNNING"
+            and meta.get("materialization_in_flight") is True
+        ):
+            return None
+
+        signal_id = str(row.get("signal_id") or "").strip()
+        owner = str(meta.get("materialization_owner") or "").strip()
+        if (
+            not signal_id
+            or not owner
+            or str(meta.get("current_owner") or "").strip() != owner
+            or str(meta.get("watcher_token") or "").strip() != owner
+        ):
+            return _RowOutcome.UNRESOLVED
+        lease = _parse_iso(meta.get("materialization_lease_until"))
+        if lease is None or lease >= datetime.now(timezone.utc):
+            return _RowOutcome.UNRESOLVED
+
+        raw_counts = (
+            meta.get("retry_attempt"),
+            meta.get("breach_attempt_count"),
+            meta.get("materialization_attempts"),
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in raw_counts):
+            return _RowOutcome.UNRESOLVED
+        attempt = raw_counts[0]
+        if attempt < 1 or raw_counts != (attempt, attempt, attempt):
+            return _RowOutcome.UNRESOLVED
+        generation = meta.get("materialization_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            return _RowOutcome.UNRESOLVED
+
+        selector_failure = meta.get("materialization_selector_failure")
+        if not isinstance(selector_failure, dict):
+            return _RowOutcome.UNRESOLVED
+        reason = str(
+            meta.get("retry_reason")
+            or meta.get("materialization_reason")
+            or meta.get("deferred_retry_reason_code")
+            or selector_failure.get("reason_code")
+            or ""
+        ).strip().upper()
+        if not reason or not (
+            is_validity_bound_deferred_retry_reason(reason)
+            or not deferred_retry_count_exhaustion_applies(
+                reason, selector_failure=selector_failure
+            )
+        ):
+            return None
+
+        if any(str(meta.get(field) or "").strip() for field in (
+            "submit_intent_at",
+            "broker_submit_key",
+            "broker_submit_payload_hash",
+            "recovery_submit_owner",
+            "recovery_submit_lease_until",
+        )) or meta.get("recovery_submit_fenced") is True:
+            return _RowOutcome.UNRESOLVED
+        if not self._inside_retry_entry_window(row):
+            return None
+
+        broker_status, broker_tags = self._load_authoritative_broker_order_tags()
+        exact_tag = canonical_broker_submit_key(local_oid)
+        if broker_status != "AVAILABLE" or exact_tag in broker_tags:
+            self._mark_failure(
+                local_oid,
+                "phase_one_broker_order_found"
+                if exact_tag in broker_tags
+                else "phase_one_broker_truth_unknown",
+            )
+            return _RowOutcome.UNRESOLVED
+
+        try:
+            max_attempts = resolve_deferred_materialization_max_attempts()
+        except DeferredMaterializationConfigConflict:
+            return _RowOutcome.UNRESOLVED
+        max_attempts = max(max_attempts, attempt)
+        delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
+        next_retry_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=delay)
+        ).isoformat()
+        recover = getattr(
+            self.osm, "recover_stale_market_truth_pending_retry", None
+        )
+        if not callable(recover):
+            return _RowOutcome.UNRESOLVED
+        try:
+            recovered = bool(recover(
+                local_oid,
+                expected_owner=owner,
+                generation=generation,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                signal_id=signal_id,
+                execution_mode="live",
+                reason_code=reason,
+                next_retry_at=next_retry_at,
+                selector_failure=selector_failure,
+            ))
+        except Exception:
+            recovered = False
+        if not recovered:
+            return _RowOutcome.UNRESOLVED
+
+        proof = self._verify_materialization_retry_ownership(
+            local_oid,
+            row,
+            expected_next_at=next_retry_at,
+            expected_attempts=attempt,
+            expected_generation=generation,
+            expected_reason=reason,
+            expected_market_truth_pending=True,
+            expected_ownerless=True,
+        )
+        if proof is None:
+            return _RowOutcome.UNRESOLVED
+        self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
+        log.warning(
+            "RESTART_PHASE_ONE_RETRY_RECOVERED local=%s generation=%s "
+            "attempt=%s reason=%s broker_submission=ABSENT selector_calls=0",
+            local_oid,
+            generation,
+            attempt,
+            reason,
+        )
+        return _RowOutcome.RETRY_OWNED
+
     # ── Canonical retry ownership (#323 fields) ────────────────────────────────
 
     def _enter_canonical_retry(self, local_oid: str, row: dict, *, reason: str) -> str:
@@ -1091,6 +1351,10 @@ class PendingTriggerRestartRecovery:
         *,
         expected_next_at: str = "",
         expected_attempts: int = 0,
+        expected_generation: int = 0,
+        expected_reason: str = "",
+        expected_market_truth_pending: Optional[bool] = None,
+        expected_ownerless: bool = False,
     ) -> "dict | None":
         """
         Fix 1: prove canonical #323 retry ownership using the real stamp_retry_pending fields.
@@ -1189,6 +1453,34 @@ class PendingTriggerRestartRecovery:
         if expected_next_at and next_at != expected_next_at:
             return None
         if expected_attempts and attempts != expected_attempts:
+            return None
+        if expected_generation:
+            generation = meta.get("materialization_generation")
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation != expected_generation
+            ):
+                return None
+        if expected_reason and reason != expected_reason:
+            return None
+        if (
+            expected_market_truth_pending is not None
+            and meta.get("materialization_market_truth_pending")
+            is not expected_market_truth_pending
+        ):
+            return None
+        if expected_ownerless and any(
+            str(meta.get(field) or "").strip()
+            for field in (
+                "materialization_owner",
+                "materialization_lease_until",
+                "current_owner",
+                "watcher_token",
+                "retry_owner",
+                "recovery_owner",
+            )
+        ):
             return None
         return {
             "local_order_id":                local_oid,

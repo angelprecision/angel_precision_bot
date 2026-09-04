@@ -21,6 +21,7 @@ from ap.selector_retry_policy import (
     get_policy,
     classify_selector_reason,
     is_retryable_selector_reason,
+    is_validity_bound_deferred_retry_reason,
     deferred_retry_count_exhaustion_applies,
     resolve_selector_recovery_final_reason,
     RETRYABLE_BREACH_SELECTOR_REASONS,
@@ -252,7 +253,7 @@ def test_duplicate_conflict_reason_has_runtime_restart_materializer_parity():
     assert policy.classification == RETRYABLE_DATA
     assert policy.selector_rerun_allowed is True
     assert policy.retry_delay_applies is True
-    assert policy.max_attempts_applies is False
+    assert policy.max_attempts_applies is True
     assert runtime == {
         "action": "retry_schedule",
         "reason_code": reason,
@@ -606,8 +607,8 @@ def test_duplicate_conflict_attempt_two_remains_retryable():
     assert result["reason_code"] not in _GENERIC_RELABEL_REASONS
 
 
-def test_duplicate_conflict_at_max_attempts_remains_retryable():
-    """A proven transient data miss is not terminalized by the count ceiling."""
+def test_duplicate_conflict_at_max_attempts_remains_bounded():
+    """Ambiguous duplicate truth retries, but does not bypass the count ceiling."""
     from ap_execution_core import _classify_deferred_breach_retry_decision
 
     result = _classify_deferred_breach_retry_decision(
@@ -619,7 +620,7 @@ def test_duplicate_conflict_at_max_attempts_remains_retryable():
         retry_enabled=True,
     )
 
-    assert result["action"] == "retry_schedule"
+    assert result["action"] == "retry_exhausted"
     assert result["reason_code"] == _DUPLICATE_QUOTE_CONFLICT_REASON
     assert result["retryable_reason"] is True
     assert result["reason_code"] not in _GENERIC_RELABEL_REASONS
@@ -745,12 +746,42 @@ def test_retryable_data_codes_apply_retry_delay():
             )
 
 
-def test_retryable_data_codes_are_validity_bound():
-    for code, pol in _POLICY_TABLE.items():
-        if pol.classification == RETRYABLE_DATA:
-            assert not pol.max_attempts_applies, (
-                f"{code!r} is RETRYABLE_DATA but max_attempts_applies=True"
-            )
+def test_validity_bound_authority_is_narrower_than_retryable_data():
+    proven_transient = {
+        "NO_CHAIN_DATA",
+        "CHAIN_PROVIDER_ERROR",
+        "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+        "CHAIN_PROVIDER_EMPTY_OPTIONS",
+        "CHAIN_PARSE_EMPTY",
+        "CHAIN_EMPTY",
+        "CHAIN_FETCH_FAILED",
+        "DIRECT_QUOTE_UNAVAILABLE",
+        "CHAIN_ROW_ZERO_BID_ASK",
+        "DIRECT_QUOTE_ZERO_BID_ASK",
+        "QUOTE_FETCH_FAILED",
+        "QUOTE_ZERO_BID_ASK",
+        "CURRENT_PRICE_FETCH_FAILED",
+        "MARKET_DATA_THROTTLE_UNAVAILABLE",
+        "PROVIDER_RATE_LIMITED",
+        "PROVIDER_TIMEOUT",
+    }
+    assert {
+        code
+        for code in RETRYABLE_BREACH_SELECTOR_REASONS
+        if is_validity_bound_deferred_retry_reason(code)
+    } == proven_transient
+    for code in proven_transient:
+        assert get_policy(code).max_attempts_applies is False
+
+    for code in {
+        "NO_EXPIRATION_IN_DTE_WINDOW",
+        "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        "REJECT_UNAVAILABLE",
+    }:
+        assert is_retryable_selector_reason(code)
+        assert not is_validity_bound_deferred_retry_reason(code)
+        assert get_policy(code).max_attempts_applies is True
 
 
 def test_count_helper_keeps_unknowns_fail_closed():
@@ -774,6 +805,56 @@ def test_count_helper_keeps_unknowns_fail_closed():
     assert not deferred_retry_count_exhaustion_applies(
         "CURRENT_PRICE_FETCH_FAILED",
         selector_failure={"market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE"},
+    )
+    assert not deferred_retry_count_exhaustion_applies(
+        "DIRECT_QUOTE_ZERO_BID_ASK", selector_failure={}
+    )
+    assert deferred_retry_count_exhaustion_applies(
+        "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+        selector_failure={"market_truth_outcome": "HOLD_MARKET_TRUTH_UNAVAILABLE"},
+    )
+    assert deferred_retry_count_exhaustion_applies(
+        "SELECTOR_REQUEST_BUDGET_EXHAUSTED", selector_failure={}
+    )
+    assert not deferred_retry_count_exhaustion_applies(
+        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        selector_failure={
+            "canonical_selector_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            "operational_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            "last_observed_selector_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
+        },
+    )
+    assert deferred_retry_count_exhaustion_applies(
+        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        selector_failure={
+            "canonical_selector_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            "operational_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            "last_observed_selector_reason": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+        },
+    )
+
+
+def test_dte_aggregate_needs_all_validity_bound_subreasons():
+    def failure(reason):
+        return {
+            "last_dte_ladder_audit": {
+                "buckets_attempted": [{
+                    "expirations_probed": [{
+                        "failure": {"reason_code": reason}
+                    }]
+                }]
+            }
+        }
+
+    assert not deferred_retry_count_exhaustion_applies(
+        "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+        selector_failure=failure("CHAIN_FETCH_FAILED"),
+        ladder_retryable=True,
+    )
+    assert deferred_retry_count_exhaustion_applies(
+        "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+        selector_failure=failure("NO_EXPIRATION_IN_DTE_WINDOW"),
+        ladder_retryable=True,
     )
 
 
