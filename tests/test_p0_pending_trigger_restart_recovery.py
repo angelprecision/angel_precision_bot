@@ -950,7 +950,7 @@ class TestFinalIdentityAndRestartRearmRetry:
     def test_restart_rearm_retry_before_next_at_does_not_fetch_or_increment(self):
         future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
         deadline = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-        r = _row(meta={**_restart_rearm_meta(next_at=future, deadline=deadline),
+        r = _row(local_order_id="test-oid", meta={**_restart_rearm_meta(next_at=future, deadline=deadline),
                        "trigger_price": 450.0})
         broker = MagicMock()
         rec = PendingTriggerRestartRecovery(
@@ -971,7 +971,7 @@ class TestFinalIdentityAndRestartRearmRetry:
     def test_due_restart_rearm_retry_quote_clear_rearms_once(self):
         past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-        r = _row(meta={**_restart_rearm_meta(next_at=past, deadline=deadline),
+        r = _row(local_order_id="test-oid", meta={**_restart_rearm_meta(next_at=past, deadline=deadline),
                        "trigger_price": 450.0})
         watcher = _MockWatcher(watch_returns=True)
         rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
@@ -985,7 +985,7 @@ class TestFinalIdentityAndRestartRearmRetry:
     def test_due_restart_rearm_retry_quote_unavailable_increments_attempt(self):
         past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-        r = _row(meta={**_restart_rearm_meta(next_at=past, deadline=deadline, attempts=2),
+        r = _row(local_order_id="test-oid", meta={**_restart_rearm_meta(next_at=past, deadline=deadline, attempts=2),
                        "trigger_price": 450.0})
         rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
         summary = rec.recover_all([r])
@@ -999,7 +999,7 @@ class TestFinalIdentityAndRestartRearmRetry:
     def test_due_restart_rearm_retry_already_through_terminalizes_no_watch(self):
         past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-        r = _row(meta={**_restart_rearm_meta(next_at=past, deadline=deadline),
+        r = _row(local_order_id="test-oid", meta={**_restart_rearm_meta(next_at=past, deadline=deadline),
                        "trigger_price": 450.0})
         watcher = _MockWatcher(watch_returns=True)
         rec, osm = _make_recovery(r, watcher=watcher, quote_result=True)
@@ -1021,7 +1021,7 @@ class TestFinalIdentityAndRestartRearmRetry:
 
     def test_restart_rearm_retry_deadline_exhausted_terminalizes_exact_reason(self):
         past = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        r = _row(meta={**_restart_rearm_meta(next_at=past, deadline=past),
+        r = _row(local_order_id="test-oid", meta={**_restart_rearm_meta(next_at=past, deadline=past),
                        "trigger_price": 450.0})
         rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
         summary = rec.recover_all([r])
@@ -3117,3 +3117,248 @@ class TestWatcherOwnedWithInflight:
         assert len(osm.cancel_calls) == 0, (
             "No cancel when trigger evidence identity is unproven even for watcher-owned row"
         )
+
+
+class TestLateMarketValidityRecovery:
+    def test_post_open_through_trigger_routes_to_canonical_watcher_policy(self, monkeypatch):
+        import ap.pending_trigger_restart_recovery as ptr
+        from zoneinfo import ZoneInfo
+
+        monkeypatch.setattr(
+            ptr,
+            "_et_now_ptr",
+            lambda: datetime(2026, 9, 2, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+        )
+        r = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+
+        class _CountingWatcher(_MockWatcher):
+            def __init__(self):
+                super().__init__(watch_returns=True)
+                self.watch_calls = 0
+
+            def watch(self, *args, **kwargs):
+                self.watch_calls += 1
+                return super().watch(*args, **kwargs)
+
+        watcher = _CountingWatcher()
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=True)
+        summary = rec.recover_all([r])
+
+        assert watcher.watch_calls == 1
+        assert summary["watchers_rearmed"] == 1
+        assert summary["terminalized"] == 0
+        assert summary["ownerless_rows_remaining"] == 0
+        assert osm.cancel_calls == []
+
+    def test_non_late_policy_through_trigger_keeps_strict_terminal_rule(self):
+        r = _row(meta={"trigger_price": 450.0})
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=True)
+        summary = rec.recover_all([r])
+
+        assert summary["watchers_rearmed"] == 0
+        assert summary["terminalized"] == 1
+        assert "restart_recovery_already_through_trigger" in osm.cancel_calls[0][1]
+
+    def test_final_preopen_seconds_become_owned_retry_not_terminal(self, monkeypatch):
+        import ap.pending_trigger_restart_recovery as ptr
+        from zoneinfo import ZoneInfo
+
+        monkeypatch.setattr(
+            ptr,
+            "_et_now_ptr",
+            lambda: datetime(2026, 9, 2, 9, 29, 45, tzinfo=ZoneInfo("America/New_York")),
+        )
+        r = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+
+        class _CountingWatcher(_MockWatcher):
+            def __init__(self):
+                super().__init__(watch_returns=True)
+                self.watch_calls = 0
+
+            def watch(self, *args, **kwargs):
+                self.watch_calls += 1
+                return super().watch(*args, **kwargs)
+
+        watcher = _CountingWatcher()
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
+        summary = rec.recover_all([r])
+        all_meta = {k: v for _oid, item in osm.meta_writes for k, v in item.items()}
+
+        assert watcher.watch_calls == 0
+        assert summary["retry_rows_owned"] == 1
+        assert summary["restart_rearm_retry_owned_count"] == 1
+        assert summary["ownerless_rows_remaining"] == 0
+        assert all_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert all_meta[_RR_REASON_FIELD] == "regular_session_market_truth_not_yet_available"
+        assert osm.cancel_calls == []
+
+    def test_exact_runtime_owner_is_preserved_without_second_watch(self):
+        r = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+
+        class _RacingOwner(_MockWatcher):
+            def __init__(self):
+                super().__init__(watch_returns=True)
+                self.watch_calls = 0
+                self.has_order_calls = 0
+
+            def has_order(self, local_order_id):
+                self.has_order_calls += 1
+                if not self._pending:
+                    super().watch(r, local_order_id, recovery_rearm=True)
+                return True
+
+            def watch(self, *args, **kwargs):
+                self.watch_calls += 1
+                return super().watch(*args, **kwargs)
+
+        watcher = _RacingOwner()
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
+        summary = rec.recover_all([r])
+
+        assert watcher.has_order_calls == 1
+        assert watcher.watch_calls == 0
+        assert summary["watchers_rearmed"] == 1
+        assert rec.last_watcher_registered_by_this_attempt is False
+        assert osm.cancel_calls == []
+
+    def test_runtime_ownership_lookup_error_holds_without_mutation(self):
+        r = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+
+        class _UnknownOwner(_MockWatcher):
+            def __init__(self):
+                super().__init__(watch_returns=True)
+                self.watch_calls = 0
+
+            def has_order(self, _local_order_id):
+                raise RuntimeError("registry unavailable")
+
+            def watch(self, *args, **kwargs):
+                self.watch_calls += 1
+                return super().watch(*args, **kwargs)
+
+        watcher = _UnknownOwner()
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
+        summary = rec.recover_all([r])
+
+        assert watcher.watch_calls == 0
+        assert summary["ownerless_rows_remaining"] == 1
+        assert summary["failure_reasons"][r["local_order_id"]] == "runtime_ownership_lookup_failed"
+        assert osm.cancel_calls == []
+
+    def test_market_terminal_reason_is_preserved_without_second_cancel(self):
+        r = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+        osm = _MockOSM()
+
+        class _MarketTerminalWatcher(_MockWatcher):
+            def watch(self, _plan, local_order_id, **_kwargs):
+                osm._rows[local_order_id]["status"] = "EXPIRED"
+                osm._rows[local_order_id]["last_error"] = "target_already_complete_terminal"
+                return False
+
+        rec, osm = _make_recovery(
+            r,
+            osm=osm,
+            watcher=_MarketTerminalWatcher(),
+            quote_result=True,
+        )
+        summary = rec.recover_all([r])
+
+        assert summary["terminalized"] == 1
+        assert summary["ownerless_rows_remaining"] == 0
+        assert osm.get_order(r["local_order_id"])["last_error"] == "target_already_complete_terminal"
+        assert osm.cancel_calls == []
+
+    def test_confirmed_trigger_missing_truth_remains_retry_owned(self):
+        crossed_at = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        local_order_id = str(uuid.uuid4())
+        signal_id = str(uuid.uuid4())
+        r = _row(
+            local_order_id=local_order_id,
+            signal_id=signal_id,
+            meta={
+                "trigger_price": 450.0,
+                "trigger_crossed_at": crossed_at,
+                "trigger_crossed_at_provenance": {
+                    "canonical_signal_id": signal_id,
+                    "client_id": "client@test.com",
+                    "execution_mode": "paper",
+                    "local_order_id": local_order_id,
+                },
+                "canonical_signal_id": signal_id,
+                "late_attachment_policy_eligible": True,
+            },
+        )
+        rec, osm = _make_recovery(
+            r,
+            watcher=_MockWatcher(watch_returns=True),
+            quote_result=None,
+        )
+        summary = rec.recover_all([r])
+        all_meta = {k: v for _oid, item in osm.meta_writes for k, v in item.items()}
+
+        assert summary["retry_rows_owned"] == 1
+        assert summary["restart_rearm_retry_owned_count"] == 1
+        assert summary["ownerless_rows_remaining"] == 0
+        assert all_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert osm.cancel_calls == []
+
+    def test_late_market_truth_retry_exhaustion_renews_instead_of_terminalizing(self):
+        local_order_id = "late-expired-owner"
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        r = _row(
+            local_order_id=local_order_id,
+            meta={
+                **_restart_rearm_meta(
+                    next_at=expired,
+                    deadline=expired,
+                    attempts=6,
+                    owner=(
+                        "restart_rearm:client@test.com:paper:"
+                        f"{local_order_id}"
+                    ),
+                ),
+                "trigger_price": 450.0,
+                "late_attachment_policy_eligible": True,
+            },
+        )
+        rec, osm = _make_recovery(
+            r,
+            watcher=_MockWatcher(watch_returns=True),
+            quote_result=None,
+        )
+
+        summary = rec.recover_all([r])
+        final_meta = osm.get_order(local_order_id)["meta"]
+
+        assert summary["retry_rows_owned"] == 1
+        assert summary["terminalized"] == 0
+        assert summary["ownerless_rows_remaining"] == 0
+        assert final_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert final_meta[_RR_ATTEMPT_FIELD] == 1
+        assert datetime.fromisoformat(final_meta[_RR_DEADLINE_FIELD]) > datetime.now(timezone.utc)
+        assert osm.cancel_calls == []
+
+
+def test_pr569_no_clock_terminal_authority_survives():
+    import inspect
+    import ap.pending_trigger_restart_recovery as ptr
+    import ap_overnight_reeval as ov
+
+    source = inspect.getsource(ov) + inspect.getsource(ptr)
+    assert "PREOPEN_OWNERSHIP_DEADLINE_MISSED" not in source

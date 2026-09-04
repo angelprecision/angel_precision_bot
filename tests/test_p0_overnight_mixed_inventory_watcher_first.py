@@ -84,19 +84,38 @@ class _MasterControl:
 
 
 class _OSM:
-    def __init__(self, *, fail: bool = False):
+    def __init__(self, *, fail: bool = False, fail_meta_update: bool = False):
         self.fail = fail
+        self.fail_meta_update = fail_meta_update
         self.create_calls: list[dict] = []
+        self.rows: dict[str, dict] = {}
 
     def create_entry_order(self, plan, **kwargs):
         if self.fail:
             raise RuntimeError("insert failed")
         local_order_id = f"local-{len(self.create_calls) + 1}"
         self.create_calls.append({"plan": plan, "local_order_id": local_order_id, **kwargs})
+        self.rows[local_order_id] = {
+            "local_order_id": local_order_id,
+            "signal_id": str(getattr(plan, "signal_id", "") or ""),
+            "client_id": str(getattr(plan, "client_id", "") or ""),
+            "execution_mode": str(kwargs.get("execution_mode") or "").lower(),
+            "status": str(kwargs.get("initial_status") or "PENDING_TRIGGER"),
+            "symbol": str(getattr(plan, "ticker", "") or ""),
+            "direction": str(getattr(plan, "direction", "") or ""),
+            "trigger_price": getattr(plan, "trigger_price", None),
+            "meta": dict(kwargs.get("meta") or {}),
+        }
         return local_order_id
 
     def get_order(self, local_order_id: str) -> dict:
-        return {"local_order_id": local_order_id, "status": "PENDING_TRIGGER"}
+        return dict(self.rows.get(local_order_id) or {})
+
+    def update_order_meta(self, local_order_id: str, patch: dict) -> bool:
+        if self.fail_meta_update or local_order_id not in self.rows:
+            return False
+        self.rows[local_order_id]["meta"].update(dict(patch or {}))
+        return True
 
 
 class _Watcher:
@@ -117,7 +136,9 @@ def _run_harness(
     osm: _OSM | None = None,
     client_id: str = "jose@example.com",
     execution_mode: str = "PAPER",
+    now_et: datetime | None = None,
 ):
+    run_now = now_et or FIXED_ET
     counters = {"prior": [], "snapshot": []}
 
     class _Broker:
@@ -134,7 +155,7 @@ def _run_harness(
                 "prior_day_low": 95.0,
                 "prior_day_close": 98.0,
                 "source": "test",
-                "observed_at": FIXED_ET.isoformat(),
+                "observed_at": run_now.isoformat(),
             }
 
     broker = _Broker()
@@ -148,7 +169,7 @@ def _run_harness(
         return {
             "last": 100.0,
             "source": "test",
-            "observed_at": FIXED_ET.isoformat(),
+            "observed_at": run_now.isoformat(),
         }
 
     validator.fetch_market_snapshot = _fetch_snapshot
@@ -178,7 +199,7 @@ def _run_harness(
     waiting: list[tuple[object, str, str]] = []
     armed_rows: list[tuple[object, str, str]] = []
     duplicate_signal_ids = duplicate_signal_ids or set()
-    monkeypatch.setattr(ov, "_et_now", lambda: FIXED_ET)
+    monkeypatch.setattr(ov, "_et_now", lambda: run_now)
     monkeypatch.setattr(ov, "_OVERNIGHT_SNAPSHOT_FAIL_CLOSED", False)
     monkeypatch.setattr(ov, "_fetch_watching_signals", lambda _client_id: list(jobs))
     monkeypatch.setattr(
@@ -232,6 +253,68 @@ def _run_harness(
         waiting=waiting,
         armed_rows=armed_rows,
     )
+
+
+def test_final_preopen_seconds_hold_for_regular_session_truth(monkeypatch):
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-proof", _signal("late-proof", "NFLX"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 29, 30, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert state.result["market_truth_deferred"] == 1
+    assert state.result["retryable_deferred"] == 0
+    assert state.result["retry_owned"] == 1
+    assert state.result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
+    assert state.result["completed"] is True
+    assert state.result["retryable"] is False
+    assert len(state.osm.create_calls) == 1
+    assert state.osm.rows["local-1"]["meta"]["restart_rearm_status"] == "RETRY_PENDING"
+    assert state.osm.rows["local-1"]["meta"]["restart_rearm_owner"] == (
+        "restart_rearm:jose@example.com:live:local-1"
+    )
+    assert state.watcher.calls == []
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_final_preopen_seconds_fail_closed_when_retry_owner_is_unproven(monkeypatch):
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-unowned", _signal("late-unowned", "BMY"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 29, 30, tzinfo=ZoneInfo("America/New_York")),
+        osm=_OSM(fail_meta_update=True),
+    )
+
+    assert state.result["market_truth_deferred"] == 0
+    assert state.result["retryable_deferred"] == 1
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
+    assert state.watcher.calls == []
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+
+
+def test_post_open_new_arm_routes_to_watcher_market_validity(monkeypatch):
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-valid", _signal("late-valid", "C"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert state.result["market_truth_deferred"] == 0
+    assert state.result["armed"] == 1
+    assert state.result["completed"] is True
+    assert len(state.watcher.calls) == 1
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
 
 
 def test_mixed_terminal_and_56_deferred_rows_remain_retryable(monkeypatch):

@@ -464,10 +464,38 @@ def _query_client_state(client_id: str) -> dict:
     }
 
 
-def _pending_trigger_without_watcher(runner, pending_rows: list[dict]) -> list[dict]:
+def _pending_trigger_without_watcher(
+    runner,
+    pending_rows: list[dict],
+    *,
+    client_id: str = "",
+    execution_mode: str = "",
+) -> list[dict]:
     entry_watcher = getattr(getattr(runner, "core", None), "entry_watcher", None)
     if entry_watcher is None or not hasattr(entry_watcher, "has_order"):
         return list(pending_rows or [])
+
+    # A bounded restart-rearm retry is active ownership, not an ownerless
+    # lifecycle.  Reuse the canonical verifier so readiness accepts it only
+    # when the durable client/mode/order identity, owner token, attempt,
+    # next-at, and unexpired deadline all reread exactly.  Any unavailable or
+    # malformed proof remains fail-closed.
+    retry_owner = None
+    osm = getattr(runner, "order_state_machine", None)
+    if osm is not None and client_id and execution_mode:
+        try:
+            from ap.pending_trigger_restart_recovery import PendingTriggerRestartRecovery
+
+            retry_owner = PendingTriggerRestartRecovery(
+                client_id=client_id,
+                execution_mode=execution_mode,
+                osm=osm,
+                entry_watcher=entry_watcher,
+                broker=None,
+                caller_source="ap.preopen_readiness",
+            )
+        except Exception:
+            retry_owner = None
     out = []
     for row in pending_rows or []:
         local_order_id = str(row.get("local_order_id") or "").strip()
@@ -475,10 +503,21 @@ def _pending_trigger_without_watcher(runner, pending_rows: list[dict]) -> list[d
             out.append(row)
             continue
         try:
-            if not entry_watcher.has_order(local_order_id):
-                out.append(row)
+            if entry_watcher.has_order(local_order_id):
+                continue
         except Exception:
             out.append(row)
+            continue
+        try:
+            if (
+                retry_owner is not None
+                and retry_owner.prove_restart_rearm_retry_owner(local_order_id)
+                is not None
+            ):
+                continue
+        except Exception:
+            pass
+        out.append(row)
     return out
 
 
@@ -632,7 +671,12 @@ def run_preopen_autonomous_readiness(
     if client_state.get("watching_orphans"):
         errors.append("watching_rows_missing_orders_recommend_new_rescue")
 
-    unowned_pending = _pending_trigger_without_watcher(runner, client_state.get("pending_trigger_rows") or [])
+    unowned_pending = _pending_trigger_without_watcher(
+        runner,
+        client_state.get("pending_trigger_rows") or [],
+        client_id=client_id,
+        execution_mode=mode,
+    )
     details["pending_trigger_without_watcher"] = unowned_pending
     if unowned_pending:
         errors.append("pending_trigger_without_watcher_ownership")

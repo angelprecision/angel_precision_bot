@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -245,6 +245,79 @@ def test_pending_trigger_without_watcher_is_degraded(monkeypatch):
     result = pr.run_preopen_autonomous_readiness("paper@example.com", "paper", dry_run=True, runner=runner)
     assert "pending_trigger_without_watcher_ownership" in result["errors"]
     assert result["details"]["pending_trigger_without_watcher"][0]["local_order_id"] == "L-1"
+
+
+def test_exact_restart_rearm_retry_owner_does_not_block_unrelated_live_entries(monkeypatch):
+    _stub_common(monkeypatch, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 0,
+    })
+    runner = _Runner(mode="live", watcher=_Watcher(set()))
+    now_utc = datetime.now(timezone.utc)
+    row = {
+        "local_order_id": "L-1",
+        "signal_id": "sig-1",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {
+            "restart_rearm_status": "RETRY_PENDING",
+            "restart_rearm_owner": "restart_rearm:jason@example.com:live:L-1",
+            "restart_rearm_reason": "regular_session_market_truth_not_yet_available",
+            "restart_rearm_attempt": 1,
+            "restart_rearm_next_at": (now_utc + timedelta(seconds=30)).isoformat(),
+            "restart_rearm_deadline": (now_utc + timedelta(minutes=3)).isoformat(),
+            "restart_rearm_first_failed_at": now_utc.isoformat(),
+            "restart_rearm_client_id": "jason@example.com",
+            "restart_rearm_execution_mode": "live",
+            "late_attachment_policy_eligible": True,
+        },
+    }
+    runner.order_state_machine = SimpleNamespace(get_order=lambda oid: dict(row) if oid == "L-1" else None)
+    runner._overnight_reeval_success_date = "2026-06-22"
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner
+    )
+
+    assert result["status"] == "OK"
+    assert "pending_trigger_without_watcher_ownership" not in result["errors"]
+    assert result["details"]["pending_trigger_without_watcher"] == []
+
+
+def test_wrong_restart_rearm_owner_still_blocks_live_entries(monkeypatch):
+    runner = _Runner(mode="live", watcher=_Watcher(set()))
+    now_utc = datetime.now(timezone.utc)
+    row = {
+        "local_order_id": "L-1",
+        "signal_id": "sig-1",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {
+            "restart_rearm_status": "RETRY_PENDING",
+            "restart_rearm_owner": "restart_rearm:other@example.com:live:L-1",
+            "restart_rearm_reason": "regular_session_market_truth_not_yet_available",
+            "restart_rearm_attempt": 1,
+            "restart_rearm_next_at": (now_utc + timedelta(seconds=30)).isoformat(),
+            "restart_rearm_deadline": (now_utc + timedelta(minutes=3)).isoformat(),
+            "restart_rearm_first_failed_at": now_utc.isoformat(),
+            "restart_rearm_client_id": "jason@example.com",
+            "restart_rearm_execution_mode": "live",
+        },
+    }
+    runner.order_state_machine = SimpleNamespace(get_order=lambda oid: dict(row) if oid == "L-1" else None)
+
+    unowned = pr._pending_trigger_without_watcher(
+        runner,
+        [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+
+    assert unowned == [{"local_order_id": "L-1", "signal_id": "sig-1"}]
 
 
 def test_mode_mismatch_is_critical(monkeypatch):

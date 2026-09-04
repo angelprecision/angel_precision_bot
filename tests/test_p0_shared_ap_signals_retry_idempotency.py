@@ -741,6 +741,39 @@ def test_13_no_selector_or_broker_calls_for_terminal_dispositions(monkeypatch, d
     assert len(broker_replace_calls) == 0, f"broker.replace called for {disposition!r}"
 
 
+def test_final_preopen_reattach_gets_verified_retry_owner_without_broker_mutation(monkeypatch):
+    broker_submit_calls = []
+    broker_cancel_calls = []
+    broker_replace_calls = []
+    existing = _order_row(
+        "local-reattach-1",
+        "PENDING_TRIGGER",
+        execution_mode="paper",
+        canonical_signal_id="sig-A",
+    )
+
+    result = _run_shared_ap_signals_harness(
+        monkeypatch,
+        signal_id="sig-A",
+        disposition=ov._DISPOSITION_REATTACH_WATCHER,
+        existing_order=existing,
+        now_et=datetime(
+            2026, 7, 22, 9, 29, 30,
+            tzinfo=ZoneInfo("America/New_York"),
+        ),
+        broker_submit_calls=broker_submit_calls,
+        broker_cancel_calls=broker_cancel_calls,
+        broker_replace_calls=broker_replace_calls,
+    )
+
+    assert result["retry_owned"] == 1
+    assert result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
+    assert result["completed"] is True
+    assert broker_submit_calls == []
+    assert broker_cancel_calls == []
+    assert broker_replace_calls == []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST 14: Row accounting — no row in two buckets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -811,6 +844,8 @@ def _run_shared_ap_signals_harness(
     broker_submit_calls: list | None = None,
     broker_cancel_calls: list | None = None,
     broker_replace_calls: list | None = None,
+    now_et: datetime | None = None,
+    existing_order: dict | None = None,
 ) -> dict:
     """
     Run run_overnight_reeval with a single shared ap_signals row, hooking the
@@ -825,7 +860,7 @@ def _run_shared_ap_signals_harness(
     if broker_replace_calls is None:
         broker_replace_calls = []
 
-    monkeypatch.setattr(ov, "_et_now", lambda: FIXED_ET)
+    monkeypatch.setattr(ov, "_et_now", lambda: now_et or FIXED_ET)
     monkeypatch.setattr(ov, "_OVERNIGHT_SNAPSHOT_FAIL_CLOSED", False)
 
     # Shared ap_signals job (sup: prefix → job_source == "ap_signals")
@@ -843,7 +878,11 @@ def _run_shared_ap_signals_harness(
     # Resolver
     monkeypatch.setattr(
         ov, "_resolve_shared_setup_disposition",
-        lambda *a, **k: ov._DispositionResult(disposition),
+        lambda *a, **k: ov._DispositionResult(
+            disposition,
+            str((existing_order or {}).get("local_order_id") or "") or None,
+            dict(existing_order) if existing_order else None,
+        ),
     )
 
     # Validator
@@ -926,16 +965,39 @@ def _run_shared_ap_signals_harness(
 
     # OSM
     class _OSM:
+        def __init__(self):
+            self.rows = {}
+            if existing_order:
+                self.rows[str(existing_order["local_order_id"])] = dict(existing_order)
+
         def create_entry_order(self, plan, **kwargs):
             if osm_create:
                 return osm_create(plan, **kwargs)
             return "local-1"
 
         def get_order(self, local_order_id):
-            return {"local_order_id": local_order_id, "status": "PENDING_TRIGGER"}
+            return dict(self.rows.get(local_order_id) or {
+                "local_order_id": local_order_id,
+                "status": "PENDING_TRIGGER",
+            })
+
+        def update_order_meta(self, local_order_id, patch):
+            if local_order_id not in self.rows:
+                return False
+            meta = self.rows[local_order_id].get("meta") or {}
+            meta.update(dict(patch or {}))
+            self.rows[local_order_id]["meta"] = meta
+            return True
 
     # Watcher
     class _Watcher:
+        def __init__(self):
+            self._pending = []
+            self._dedup_set = set()
+
+        def has_order(self, _local_order_id):
+            return False
+
         def watch(self, plan, local_order_id):
             if watch_fn:
                 return watch_fn(plan, local_order_id)
