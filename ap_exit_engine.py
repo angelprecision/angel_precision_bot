@@ -7047,7 +7047,7 @@ class APExitEngine:
                           AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                           AND UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
                           AND UPPER(TRIM(COALESCE(kind, ''))) = 'ENTRY'
-                          AND UPPER(TRIM(COALESCE(status, ''))) IN ('FILLED', 'PARTIAL_FILL')
+                          AND UPPER(TRIM(COALESCE(status, ''))) IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')
                           AND COALESCE(filled_qty, 0) > 0
                         ORDER BY filled_ts DESC NULLS LAST,
                                  updated_ts DESC NULLS LAST,
@@ -7064,7 +7064,7 @@ class APExitEngine:
                 and str(row.get("client_id") or "").strip() == str(self._email).strip()
                 and str(row.get("contract") or "").strip().upper() == contract
                 and str(row.get("kind") or "").strip().upper() == "ENTRY"
-                and str(row.get("status") or "").strip().upper() in {"FILLED", "PARTIAL_FILL"}
+                and str(row.get("status") or "").strip().upper() in {"FILLED", "PARTIAL_FILL", "PARTIALLY_FILLED"}
                 and str(row.get("execution_mode") or "").strip().lower() == normalized_mode
                 and _broker_repair_positive_int(row.get("filled_qty")) is not None
             ]
@@ -7111,36 +7111,88 @@ class APExitEngine:
             return None
         try:
             from ap.db import conn, run_with_retry
+            try:
+                from psycopg2.errors import UndefinedColumn as _PgUndefinedColumn
+            except Exception:
+                _PgUndefinedColumn = None
+            # Fix 2 (PR #558 amendment): OR-branch on option_symbol restored.
+            # Legacy positions rows carry the OCC in option_symbol with
+            # contract NULL or set to the short symbol.  Matching only on
+            # contract would miss the existing active row and let the
+            # broker-repair path insert a duplicate ownership row for the
+            # same broker-open contract.
+            _WHERE = (
+                "WHERE client_id = %s "
+                "  AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+                "  AND ( "
+                "    UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE') "
+                "    OR COALESCE(quantity_remaining, 0) > 0 "
+                "  ) "
+                "  AND ( "
+                "    UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s)) "
+                "    OR UPPER(TRIM(COALESCE(option_symbol, ''))) = UPPER(TRIM(%s)) "
+                "  ) "
+                "ORDER BY entry_ts DESC NULLS LAST "
+                "LIMIT 1"
+            )
+            _FULL_COLS = (
+                "id, client_id, underlying, contract, option_symbol, "
+                "side, direction, qty, quantity_remaining, avg_fill, "
+                "entry_price, underlying_entry, stop_underlying, "
+                "target_underlying, entry_ts, status, signal_id, "
+                "execution_mode, local_order_id, broker_order_id"
+            )
+            # Fix 1 (PR #558 amendment): pre-#558 minimal projection used
+            # only when the extended-schema columns are absent.  Existing
+            # position-manager behavior already treats these as optional;
+            # missing keys are backfilled with None so downstream repair
+            # code (which tolerates None for these fields) behaves the
+            # same as it did before the extended projection was added.
+            _MIN_COLS = (
+                "id, client_id, underlying, contract, option_symbol, "
+                "side, direction, qty, quantity_remaining, avg_fill, "
+                "entry_price, entry_ts, status, signal_id, execution_mode"
+            )
+            _OPTIONAL_KEYS = (
+                "underlying_entry", "stop_underlying", "target_underlying",
+                "local_order_id", "broker_order_id",
+            )
             def _q():
                 with conn() as c:
-                    c.execute(
-                        """
-                        SELECT id, client_id, underlying, contract, option_symbol,
-                               side, direction, qty, quantity_remaining, avg_fill,
-                               entry_price, underlying_entry, stop_underlying,
-                               target_underlying, entry_ts, status, signal_id,
-                               execution_mode, local_order_id, broker_order_id
-                        FROM positions
-                        WHERE client_id = %s
-                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                          AND (
-                            UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
-                            OR COALESCE(quantity_remaining, 0) > 0
-                          )
-                          AND UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
-                        ORDER BY entry_ts DESC NULLS LAST
-                        LIMIT 1
-                        """,
-                        (self._email, _mode, sym),
-                    )
-                    # Production ap.db wraps psycopg2 RealDictCursor and returns
-                    # rows as plain dicts (see ap/db.py::_ConnWrapper.fetchone).
-                    # Rebuilding from c.description iterated the dict's KEYS as
-                    # if they were values, so every field became its own column
-                    # name string. Trust the production contract: fetchone()
-                    # already returns a dict of {column: value}.
+                    try:
+                        c.execute(
+                            f"SELECT {_FULL_COLS} FROM positions {_WHERE}",
+                            (self._email, _mode, sym, sym),
+                        )
+                    except Exception as _exc:
+                        _is_undef = (
+                            _PgUndefinedColumn is not None
+                            and isinstance(_exc, _PgUndefinedColumn)
+                        ) or (
+                            "column" in str(_exc).lower()
+                            and "does not exist" in str(_exc).lower()
+                        )
+                        if not _is_undef:
+                            raise
+                        log.critical(
+                            "[exit_eng] _load_db_position_row extended-schema "
+                            "columns not deployed — falling back to pre-#558 "
+                            "minimal projection sym=%s err=%s",
+                            sym, _exc,
+                        )
+                        c.execute(
+                            f"SELECT {_MIN_COLS} FROM positions {_WHERE}",
+                            (self._email, _mode, sym, sym),
+                        )
+                    # Production ap.db wraps psycopg2 RealDictCursor and
+                    # returns rows as plain dicts; trust that contract.
                     row = c.fetchone()
-                    return dict(row) if row else None
+                    if row is None:
+                        return None
+                    result = dict(row)
+                    for _k in _OPTIONAL_KEYS:
+                        result.setdefault(_k, None)
+                    return result
             return run_with_retry(_q)
         except Exception as _de:
             log.warning("[exit_eng] _load_db_position_row %s failed: %s", sym, _de)
@@ -7316,13 +7368,21 @@ class APExitEngine:
                         "SELECT pg_advisory_xact_lock(hashtext(%s))",
                         (f"broker-repair:{self._email}:{_mode}:{contract}",),
                     )
+                    # Fix 2 (PR #558 amendment): OR-branch on option_symbol.
+                    # A legacy row with OCC in option_symbol and contract
+                    # NULL would otherwise not be seen here and the insert
+                    # below would create a duplicate ownership row for the
+                    # same broker-open contract.
                     c.execute(
                         """
                         SELECT *
                         FROM positions
                         WHERE client_id = %s
                           AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                          AND UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                          AND (
+                            UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                            OR UPPER(TRIM(COALESCE(option_symbol, ''))) = UPPER(TRIM(%s))
+                          )
                           AND UPPER(TRIM(COALESCE(status, ''))) IN
                               ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
                           AND COALESCE(quantity_remaining, qty, 0) > 0
@@ -7330,7 +7390,7 @@ class APExitEngine:
                                  updated_at DESC NULLS LAST
                         LIMIT 2
                         """,
-                        (self._email, _mode, contract),
+                        (self._email, _mode, contract, contract),
                     )
                     existing_rows = [dict(row) for row in (c.fetchall() or [])]
                     if len(existing_rows) > 1:
@@ -7368,59 +7428,122 @@ class APExitEngine:
                                 return None
                         return _remember(existing_id, existing)
 
-                    c.execute(
-                        """
-                        INSERT INTO positions (
-                            id, client_id, underlying, contract, option_symbol,
-                            execution_mode,
-                            side, direction,
-                            qty, quantity_remaining,
-                            entry_price, avg_fill,
-                            underlying_entry, stop_underlying, target_underlying,
-                            status, entry_ts, signal_id,
-                            local_order_id, broker_order_id, updated_at
-                        ) VALUES (
-                            %s, %s, %s, %s, %s,
-                            %s,
-                            %s, %s,
-                            %s, %s,
-                            %s, %s,
-                            %s, %s, %s,
-                            'OPEN', %s, %s,
-                            %s, %s, NOW()
+                    # Fix 1 (PR #558 amendment): try extended-schema INSERT
+                    # first.  If any extended column is not deployed, fall
+                    # back to the pre-#558 minimal INSERT (still with the
+                    # explicit durable id required by #558's invariant).
+                    # The dropped fields are the same set the SELECT
+                    # fallback treats as optional; existing position-manager
+                    # code tolerates them being absent from the row.
+                    try:
+                        from psycopg2.errors import UndefinedColumn as _PgUndefinedColumn
+                    except Exception:
+                        _PgUndefinedColumn = None
+                    try:
+                        c.execute(
+                            """
+                            INSERT INTO positions (
+                                id, client_id, underlying, contract, option_symbol,
+                                execution_mode,
+                                side, direction,
+                                qty, quantity_remaining,
+                                entry_price, avg_fill,
+                                underlying_entry, stop_underlying, target_underlying,
+                                status, entry_ts, signal_id,
+                                local_order_id, broker_order_id, updated_at
+                            ) VALUES (
+                                %s, %s, %s, %s, %s,
+                                %s,
+                                %s, %s,
+                                %s, %s,
+                                %s, %s,
+                                %s, %s, %s,
+                                'OPEN', %s, %s,
+                                %s, %s, NOW()
+                            )
+                            ON CONFLICT DO NOTHING
+                            RETURNING id
+                            """,
+                            (
+                                position_id, self._email, repair_row["underlying"],
+                                contract, contract, _mode,
+                                side, side, qty, qty,
+                                entry_px, entry_px,
+                                underlying_entry, underlying_stop, underlying_target,
+                                entry_ts, signal_id,
+                                local_order_id, broker_order_id,
+                            ),
                         )
-                        ON CONFLICT DO NOTHING
-                        RETURNING id
-                        """,
-                        (
-                            position_id, self._email, repair_row["underlying"],
-                            contract, contract, _mode,
-                            side, side, qty, qty,
-                            entry_px, entry_px,
-                            underlying_entry, underlying_stop, underlying_target,
-                            entry_ts, signal_id,
-                            local_order_id, broker_order_id,
-                        ),
-                    )
+                    except Exception as _insert_exc:
+                        _is_undef = (
+                            _PgUndefinedColumn is not None
+                            and isinstance(_insert_exc, _PgUndefinedColumn)
+                        ) or (
+                            "column" in str(_insert_exc).lower()
+                            and "does not exist" in str(_insert_exc).lower()
+                        )
+                        if not _is_undef:
+                            raise
+                        log.critical(
+                            "[exit_eng] BROKER_REPAIR_INSERT extended-schema "
+                            "columns not deployed — falling back to minimal "
+                            "INSERT client=%s mode=%s contract=%s err=%s",
+                            self._email, _mode, contract, _insert_exc,
+                        )
+                        c.execute(
+                            """
+                            INSERT INTO positions (
+                                id, client_id, underlying, contract, option_symbol,
+                                execution_mode,
+                                side, direction,
+                                qty, quantity_remaining,
+                                entry_price, avg_fill,
+                                status, entry_ts, updated_at
+                            ) VALUES (
+                                %s, %s, %s, %s, %s,
+                                %s,
+                                %s, %s,
+                                %s, %s,
+                                %s, %s,
+                                'OPEN', %s, NOW()
+                            )
+                            ON CONFLICT DO NOTHING
+                            RETURNING id
+                            """,
+                            (
+                                position_id, self._email, repair_row["underlying"],
+                                contract, contract, _mode,
+                                side, side, qty, qty,
+                                entry_px, entry_px,
+                                entry_ts,
+                            ),
+                        )
                     row = c.fetchone()
                     if row:
                         row_id = row.get("id")
                         if row_id:
                             return _remember(row_id)
 
+                    # Fix 2 (PR #558 amendment): same OR-branch on
+                    # option_symbol so the ON CONFLICT re-query resolves
+                    # to the legacy row's id when OCC lives in
+                    # option_symbol rather than contract.
                     c.execute(
                         """
                         SELECT id FROM positions
                         WHERE client_id = %s
                           AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                          AND UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                          AND (
+                            UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                            OR UPPER(TRIM(COALESCE(option_symbol, ''))) = UPPER(TRIM(%s))
+                          )
                           AND UPPER(TRIM(COALESCE(status, ''))) IN
                               ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
                           AND COALESCE(quantity_remaining, qty, 0) > 0
                         ORDER BY entry_ts DESC NULLS LAST, updated_at DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self._email, _mode, contract),
+                        (self._email, _mode, contract, contract),
                     )
                     existing = c.fetchone()
                     if existing:

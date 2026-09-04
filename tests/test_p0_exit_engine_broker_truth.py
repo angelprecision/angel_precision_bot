@@ -57,6 +57,74 @@ def test_managed_position_from_row_has_prefer_qty_override():
     sig = EE_SRC[idx:idx + 300]
     assert "prefer_qty_override" in sig
 
+# ── PR #558 amendment: three surgical review-blocker fixes ────────────────────
+
+def test_pr558_amendment_fix1_undefined_column_fallback():
+    """Fix 1: broker-repair SELECT and INSERT must degrade to a pre-#558
+    minimal projection/column-list when the extended-schema columns are not
+    deployed.  Without this, one missing optional column makes every repair
+    attempt fail instead of only the affected field."""
+    # SELECT fallback lives inside _load_db_position_row.
+    load_start = EE_SRC.find("def _load_db_position_row")
+    load_end   = EE_SRC.find("\n    def ", load_start + 1)
+    load_body  = EE_SRC[load_start:load_end]
+    assert "UndefinedColumn" in load_body, (
+        "SELECT must catch psycopg2.errors.UndefinedColumn and fall back"
+    )
+    assert "extended-schema" in load_body, (
+        "Fallback path must log that extended-schema columns are missing"
+    )
+    # Minimal projection must include the pre-#558 base columns only.
+    assert "entry_price, entry_ts, status, signal_id, execution_mode" in load_body
+
+    # INSERT fallback lives inside _upsert_broker_position_to_db.
+    upsert_start = EE_SRC.find("def _upsert_broker_position_to_db")
+    upsert_end   = EE_SRC.find("\n    def ", upsert_start + 1)
+    upsert_body  = EE_SRC[upsert_start:upsert_end]
+    assert "UndefinedColumn" in upsert_body, (
+        "INSERT must catch UndefinedColumn and fall back to minimal INSERT"
+    )
+    # Fallback INSERT must still carry the explicit durable id (#558 invariant).
+    assert upsert_body.count("INSERT INTO positions") >= 2, (
+        "Both extended and fallback INSERT must be present"
+    )
+
+
+def test_pr558_amendment_fix2_option_symbol_or_branch_restored():
+    """Fix 2: every positions-table lookup used by the broker-repair path
+    must match on contract OR option_symbol.  Legacy rows carry the OCC in
+    option_symbol; matching only on contract would miss the existing active
+    row and create a duplicate ownership row for the same broker-open
+    contract — exactly the class of defect #558 is meant to prevent."""
+    # Three lookup sites in ap_exit_engine.py:
+    #   1) _load_db_position_row (pre-repair state read)
+    #   2) pre-INSERT existence check inside the advisory lock
+    #   3) post-INSERT ON CONFLICT DO NOTHING re-query
+    or_hits = EE_SRC.count(
+        "OR UPPER(TRIM(COALESCE(option_symbol, ''))) = UPPER(TRIM(%s))"
+    )
+    assert or_hits >= 3, (
+        f"Expected option_symbol OR-branch at all 3 positions-table lookup "
+        f"sites (SELECT, pre-INSERT, post-INSERT re-query); found {or_hits}"
+    )
+
+
+def test_pr558_amendment_fix3_partially_filled_alternate_spelling():
+    """Fix 3: ENTRY-order canonical lookup must recognize the alternate
+    PARTIALLY_FILLED status form.  The codebase persists both PARTIAL_FILL
+    and PARTIALLY_FILLED; accepting only PARTIAL_FILL loses the exact
+    filled-entry identity/geometry the PR is designed to preserve and
+    forces the repair path into the no-candidates branch."""
+    # Both the SQL IN-list and the Python filter set must accept all three
+    # canonical spellings.
+    assert (
+        "IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')" in EE_SRC
+    ), "ENTRY-orders SQL must accept FILLED, PARTIAL_FILL, and PARTIALLY_FILLED"
+    assert (
+        '{"FILLED", "PARTIAL_FILL", "PARTIALLY_FILLED"}' in EE_SRC
+    ), "Python filter set must mirror the SQL IN-list exactly"
+
+
 def test_precheck_structured_log_events():
     """Fix 7: all required structured log events present."""
     for event in [
