@@ -7142,7 +7142,7 @@ class APExitEngine:
                 "target_underlying, entry_ts, status, signal_id, "
                 "execution_mode, local_order_id, broker_order_id"
             )
-            # Fix 1 (PR #558 amendment): pre-#558 minimal projection used
+            # Fix 1 (PR #558 amendment, v2): pre-#558 minimal projection used
             # only when the extended-schema columns are absent.  Existing
             # position-manager behavior already treats these as optional;
             # missing keys are backfilled with None so downstream repair
@@ -7157,43 +7157,53 @@ class APExitEngine:
                 "underlying_entry", "stop_underlying", "target_underlying",
                 "local_order_id", "broker_order_id",
             )
-            def _q():
+            _params = (self._email, _mode, sym, sym)
+
+            def _q_extended():
+                # Own transaction.  If UndefinedColumn fires here, this
+                # `with conn()` block exits via exception, ap.db rolls
+                # the aborted transaction back, and the connection is
+                # returned to the pool clean.
                 with conn() as c:
-                    try:
-                        c.execute(
-                            f"SELECT {_FULL_COLS} FROM positions {_WHERE}",
-                            (self._email, _mode, sym, sym),
-                        )
-                    except Exception as _exc:
-                        _is_undef = (
-                            _PgUndefinedColumn is not None
-                            and isinstance(_exc, _PgUndefinedColumn)
-                        ) or (
-                            "column" in str(_exc).lower()
-                            and "does not exist" in str(_exc).lower()
-                        )
-                        if not _is_undef:
-                            raise
-                        log.critical(
-                            "[exit_eng] _load_db_position_row extended-schema "
-                            "columns not deployed — falling back to pre-#558 "
-                            "minimal projection sym=%s err=%s",
-                            sym, _exc,
-                        )
-                        c.execute(
-                            f"SELECT {_MIN_COLS} FROM positions {_WHERE}",
-                            (self._email, _mode, sym, sym),
-                        )
-                    # Production ap.db wraps psycopg2 RealDictCursor and
-                    # returns rows as plain dicts; trust that contract.
+                    c.execute(f"SELECT {_FULL_COLS} FROM positions {_WHERE}", _params)
                     row = c.fetchone()
-                    if row is None:
-                        return None
-                    result = dict(row)
-                    for _k in _OPTIONAL_KEYS:
-                        result.setdefault(_k, None)
-                    return result
-            return run_with_retry(_q)
+                    return None if row is None else dict(row)
+
+            def _q_minimal():
+                # Runs in a FRESH `with conn()` (fresh transaction) —
+                # required on real PostgreSQL because an UndefinedColumn
+                # in the extended attempt would have aborted the prior
+                # transaction and made any further execute on that
+                # connection raise InFailedSqlTransaction.
+                with conn() as c:
+                    c.execute(f"SELECT {_MIN_COLS} FROM positions {_WHERE}", _params)
+                    row = c.fetchone()
+                    return None if row is None else dict(row)
+
+            try:
+                row_dict = run_with_retry(_q_extended)
+            except Exception as _exc:
+                _is_undef = (
+                    _PgUndefinedColumn is not None
+                    and isinstance(_exc, _PgUndefinedColumn)
+                ) or (
+                    "column" in str(_exc).lower()
+                    and "does not exist" in str(_exc).lower()
+                )
+                if not _is_undef:
+                    raise
+                log.critical(
+                    "[exit_eng] _load_db_position_row extended-schema "
+                    "columns not deployed — falling back to pre-#558 "
+                    "minimal projection in FRESH transaction sym=%s err=%s",
+                    sym, _exc,
+                )
+                row_dict = run_with_retry(_q_minimal)
+            if row_dict is None:
+                return None
+            for _k in _OPTIONAL_KEYS:
+                row_dict.setdefault(_k, None)
+            return row_dict
         except Exception as _de:
             log.warning("[exit_eng] _load_db_position_row %s failed: %s", sym, _de)
             return None
@@ -7428,17 +7438,28 @@ class APExitEngine:
                                 return None
                         return _remember(existing_id, existing)
 
-                    # Fix 1 (PR #558 amendment): try extended-schema INSERT
-                    # first.  If any extended column is not deployed, fall
-                    # back to the pre-#558 minimal INSERT (still with the
-                    # explicit durable id required by #558's invariant).
-                    # The dropped fields are the same set the SELECT
-                    # fallback treats as optional; existing position-manager
-                    # code tolerates them being absent from the row.
+                    # Fix 1 (PR #558 amendment, v2): try extended-schema
+                    # INSERT first.  If any extended column is not deployed,
+                    # fall back to the pre-#558 minimal INSERT.
+                    #
+                    # PostgreSQL aborts the outer transaction on any error
+                    # inside it — including UndefinedColumn.  We use a
+                    # SAVEPOINT (not a fresh `with conn()`) here because
+                    # the advisory lock, pre-INSERT existence check, this
+                    # INSERT, and the post-INSERT ON CONFLICT re-query
+                    # must remain co-transactional: exiting to a fresh
+                    # transaction would drop the advisory lock and let a
+                    # racing repair worker slip a duplicate row in between
+                    # our existence check and our fallback INSERT.
+                    # ROLLBACK TO SAVEPOINT clears only the aborted portion,
+                    # leaving the surrounding transaction (and lock) alive.
                     try:
                         from psycopg2.errors import UndefinedColumn as _PgUndefinedColumn
                     except Exception:
                         _PgUndefinedColumn = None
+                    _sp = "broker_repair_extended_insert"
+                    c.execute(f"SAVEPOINT {_sp}")
+                    _extended_ok = False
                     try:
                         c.execute(
                             """
@@ -7474,6 +7495,7 @@ class APExitEngine:
                                 local_order_id, broker_order_id,
                             ),
                         )
+                        _extended_ok = True
                     except Exception as _insert_exc:
                         _is_undef = (
                             _PgUndefinedColumn is not None
@@ -7482,12 +7504,18 @@ class APExitEngine:
                             "column" in str(_insert_exc).lower()
                             and "does not exist" in str(_insert_exc).lower()
                         )
+                        # Roll back savepoint whether or not we intend to
+                        # fall back — the outer transaction can't proceed
+                        # past an aborted statement otherwise.
+                        c.execute(f"ROLLBACK TO SAVEPOINT {_sp}")
+                        c.execute(f"RELEASE SAVEPOINT {_sp}")
                         if not _is_undef:
                             raise
                         log.critical(
                             "[exit_eng] BROKER_REPAIR_INSERT extended-schema "
                             "columns not deployed — falling back to minimal "
-                            "INSERT client=%s mode=%s contract=%s err=%s",
+                            "INSERT in SAME transaction after SAVEPOINT "
+                            "rollback client=%s mode=%s contract=%s err=%s",
                             self._email, _mode, contract, _insert_exc,
                         )
                         c.execute(
@@ -7518,6 +7546,8 @@ class APExitEngine:
                                 entry_ts,
                             ),
                         )
+                    if _extended_ok:
+                        c.execute(f"RELEASE SAVEPOINT {_sp}")
                     row = c.fetchone()
                     if row:
                         row_id = row.get("id")

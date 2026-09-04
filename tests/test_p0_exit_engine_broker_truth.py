@@ -60,33 +60,197 @@ def test_managed_position_from_row_has_prefer_qty_override():
 # ── PR #558 amendment: three surgical review-blocker fixes ────────────────────
 
 def test_pr558_amendment_fix1_undefined_column_fallback():
-    """Fix 1: broker-repair SELECT and INSERT must degrade to a pre-#558
-    minimal projection/column-list when the extended-schema columns are not
-    deployed.  Without this, one missing optional column makes every repair
-    attempt fail instead of only the affected field."""
-    # SELECT fallback lives inside _load_db_position_row.
+    """Fix 1 (v2): broker-repair SELECT and INSERT must degrade to a
+    pre-#558 minimal projection/column-list when the extended-schema
+    columns are not deployed — AND must survive PostgreSQL's aborted-
+    transaction semantics.  On real PostgreSQL, catching UndefinedColumn
+    inside a `with conn()` block does not clear the abort: the next
+    execute on the same connection raises InFailedSqlTransaction.
+
+    SELECT fallback must open a FRESH `with conn()` for the minimal
+    projection.  INSERT fallback must use a SAVEPOINT (fresh conn()
+    would drop the advisory lock and let a racing worker slip a
+    duplicate row between our existence check and our fallback INSERT)
+    with ROLLBACK TO SAVEPOINT + RELEASE SAVEPOINT to clear the abort."""
+    # ── SELECT: two separate `with conn()` entries ────────────────────
     load_start = EE_SRC.find("def _load_db_position_row")
     load_end   = EE_SRC.find("\n    def ", load_start + 1)
     load_body  = EE_SRC[load_start:load_end]
     assert "UndefinedColumn" in load_body, (
-        "SELECT must catch psycopg2.errors.UndefinedColumn and fall back"
+        "SELECT must catch psycopg2.errors.UndefinedColumn"
     )
-    assert "extended-schema" in load_body, (
-        "Fallback path must log that extended-schema columns are missing"
+    # There must be at least two `with conn()` blocks in the load path
+    # (one per SQL variant).  The v1 amendment used a single with-conn
+    # with a same-transaction fallback — broken on real PostgreSQL.
+    assert load_body.count("with conn() as c:") >= 2, (
+        "SELECT fallback must run in a FRESH `with conn()` — real "
+        "PostgreSQL leaves the extended attempt's transaction aborted"
     )
-    # Minimal projection must include the pre-#558 base columns only.
-    assert "entry_price, entry_ts, status, signal_id, execution_mode" in load_body
+    assert "FRESH transaction" in load_body, (
+        "Fallback log line must state that a fresh transaction is used"
+    )
 
-    # INSERT fallback lives inside _upsert_broker_position_to_db.
+    # ── INSERT: SAVEPOINT / ROLLBACK TO / RELEASE ─────────────────────
     upsert_start = EE_SRC.find("def _upsert_broker_position_to_db")
     upsert_end   = EE_SRC.find("\n    def ", upsert_start + 1)
     upsert_body  = EE_SRC[upsert_start:upsert_end]
-    assert "UndefinedColumn" in upsert_body, (
-        "INSERT must catch UndefinedColumn and fall back to minimal INSERT"
-    )
-    # Fallback INSERT must still carry the explicit durable id (#558 invariant).
+    assert "UndefinedColumn" in upsert_body
     assert upsert_body.count("INSERT INTO positions") >= 2, (
         "Both extended and fallback INSERT must be present"
+    )
+    assert "_sp = \"broker_repair_extended_insert\"" in upsert_body, (
+        "SAVEPOINT name must be the canonical broker_repair_extended_insert"
+    )
+    assert 'c.execute(f"SAVEPOINT {_sp}")' in upsert_body, (
+        "INSERT must open a SAVEPOINT before the extended attempt"
+    )
+    assert 'c.execute(f"ROLLBACK TO SAVEPOINT {_sp}")' in upsert_body, (
+        "On UndefinedColumn (or any other error) the extended INSERT must "
+        "roll back to the savepoint so the outer transaction can proceed"
+    )
+    assert 'c.execute(f"RELEASE SAVEPOINT {_sp}")' in upsert_body, (
+        "The savepoint must be released whether the extended attempt "
+        "succeeded or was rolled back"
+    )
+
+
+def test_pr558_amendment_fix1_select_survives_aborted_transaction():
+    """Behavioral regression: model PostgreSQL's aborted-transaction
+    semantics and prove _load_db_position_row's fresh-transaction
+    fallback works.  Extended SELECT raises UndefinedColumn.  Any
+    further execute on the SAME connection raises InFailedSqlTransaction
+    (real PostgreSQL contract).  A fresh `with conn()` gives a clean
+    connection and the minimal fallback SELECT succeeds."""
+    # Simulated psycopg2 error classes — real ones if importable,
+    # otherwise ad-hoc.  The fake DB raises these by name; the source
+    # code catches by isinstance OR by message substring.
+    try:
+        from psycopg2.errors import (
+            UndefinedColumn as _RealUndefinedColumn,
+            InFailedSqlTransaction as _RealInFailed,
+        )
+        _UndefErr = _RealUndefinedColumn
+        _AbortedErr = _RealInFailed
+    except Exception:
+        class _UndefErr(Exception):
+            def __str__(self):
+                return "column \"underlying_entry\" does not exist"
+        class _AbortedErr(Exception):
+            def __str__(self):
+                return "current transaction is aborted"
+
+    state = {"conn_num": 0, "in_aborted_txn": False}
+
+    class _Cur:
+        def __init__(self, conn_num):
+            self._conn_num = conn_num
+            self._last_sql = ""
+
+        def execute(self, sql, params=()):
+            # Model real PG: any execute on an aborted transaction fails
+            # with InFailedSqlTransaction until the transaction is rolled
+            # back (which happens at `with conn()` exit).
+            if state["in_aborted_txn"]:
+                raise _AbortedErr(
+                    "current transaction is aborted, commands ignored "
+                    "until end of transaction block"
+                )
+            self._last_sql = sql
+            # Extended SELECT contains the schema-only columns.  Raise
+            # UndefinedColumn and mark the transaction aborted.
+            if "underlying_entry" in sql and "SELECT" in sql.upper():
+                state["in_aborted_txn"] = True
+                raise _UndefErr('column "underlying_entry" does not exist')
+            return self
+
+        def fetchone(self):
+            # Minimal SELECT succeeds and returns a row without the
+            # extended-schema keys.  Downstream backfill fills them
+            # with None.
+            if "SELECT" in self._last_sql.upper():
+                return {
+                    "id": "row-abc",
+                    "client_id": "aborted-txn@example.com",
+                    "underlying": "BAC",
+                    "contract": "BAC260724P00062000",
+                    "option_symbol": "BAC260724P00062000",
+                    "side": "PUT",
+                    "direction": "PUT",
+                    "qty": 1,
+                    "quantity_remaining": 1,
+                    "avg_fill": 0.97,
+                    "entry_price": 0.97,
+                    "entry_ts": "2026-07-24T13:00:00Z",
+                    "status": "OPEN",
+                    "signal_id": "sig-1",
+                    "execution_mode": "live",
+                }
+            return None
+
+        def fetchall(self):
+            return []
+
+        @property
+        def rowcount(self):
+            return 1
+
+    @contextmanager
+    def fake_conn():
+        # Each new `with conn()` clears the aborted flag (real ap.db
+        # rolls back on exception when the block exits, then returns a
+        # clean conn from the pool for the next acquisition).
+        state["conn_num"] += 1
+        state["in_aborted_txn"] = False
+        yield _Cur(state["conn_num"])
+
+    fake_db = types.SimpleNamespace(
+        conn=fake_conn, run_with_retry=lambda fn, **_: fn()
+    )
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_db
+
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+        pytest.skip("APExitEngine not found")
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "aborted-txn@example.com"
+    eng._lock = __import__("threading").Lock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng.broker = types.SimpleNamespace(mode="live")
+    try:
+        loaded = eng._load_db_position_row("BAC260724P00062000")
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    # Under the v1 broken pattern (single `with conn()`, fallback in
+    # same transaction), this call would raise InFailedSqlTransaction
+    # and _load_db_position_row would return None via its outer except.
+    # The v2 fix opens a FRESH `with conn()` for the minimal fallback,
+    # so the returned row proves the fresh-transaction path fired.
+    assert loaded is not None, (
+        "Fresh-transaction fallback must succeed after extended "
+        "UndefinedColumn aborts the first transaction"
+    )
+    assert loaded["id"] == "row-abc"
+    assert loaded["execution_mode"] == "live"
+    # Extended-schema keys absent from the minimal projection must be
+    # backfilled with None so downstream repair code (which tolerates
+    # None here) behaves identically.
+    assert loaded["underlying_entry"] is None
+    assert loaded["local_order_id"] is None
+    assert loaded["broker_order_id"] is None
+    # We must have opened TWO `with conn()` blocks — one for the
+    # aborted extended attempt, one fresh for the minimal fallback.
+    assert state["conn_num"] == 2, (
+        f"Expected 2 conn() entries (extended + fresh fallback), got {state['conn_num']}"
     )
 
 
