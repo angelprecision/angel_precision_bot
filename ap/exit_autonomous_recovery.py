@@ -33,7 +33,7 @@ from ap.exit_safety import (
     is_valid_exact_occ_contract,
     resolve_exit_broker_truth,
 )
-from ap.manual_close_reconciliation import fetch_all_current_session_orders
+from ap.manual_close_reconciliation import fetch_all_current_session_orders, order_filled_at
 
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
@@ -371,6 +371,22 @@ def _extract_fill_price(raw: dict) -> Optional[float]:
     return None
 
 
+def _recovery_fill_timestamp(raw: dict) -> Optional[str]:
+    """Return only an explicit, timezone-aware broker execution timestamp."""
+    try:
+        filled_at = order_filled_at(raw)
+    except Exception:
+        return None
+    if not isinstance(filled_at, datetime):
+        return None
+    try:
+        if filled_at.tzinfo is None or filled_at.utcoffset() is None:
+            return None
+        return filled_at.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
 def _get_order_truth(broker: Any, broker_order_id: str) -> tuple[str, Optional[dict]]:
     """Fetch one order while preserving unavailable/malformed truth as HOLD."""
     requested_id = _norm(broker_order_id)
@@ -433,6 +449,7 @@ def _matching_open_exit_orders_with_truth(
     contract: str,
     *,
     exclude_broker_id: str = "",
+    include_filled: bool = False,
 ) -> tuple[str, list[tuple[str, dict]]]:
     if not is_valid_exact_occ_contract(contract):
         return "identity_unproven", []
@@ -451,13 +468,40 @@ def _matching_open_exit_orders_with_truth(
         status = _status(row)
         if not status:
             return "malformed", []
-        if status not in OPEN_BROKER_STATUSES:
+        if status not in OPEN_BROKER_STATUSES and not (include_filled and status == "filled"):
             continue
         broker_id = _broker_order_id(row)
         if not broker_id:
             return "identity_unproven", []
         if exclude_broker_id and broker_id == exclude_broker_id:
             continue
+        if status == "filled":
+            filled_qty = _filled_order_quantity(row)
+            fill_price = _extract_fill_price(row)
+            order_alias_present, declared_order_qty = _validated_quantity_aliases(
+                row, ("qty", "quantity", "order_qty")
+            )
+            filled_alias_present, declared_filled_qty = _validated_quantity_aliases(
+                row,
+                (
+                    "filled_qty",
+                    "filled_quantity",
+                    "exec_quantity",
+                    "exec_qty",
+                    "quantity_filled",
+                ),
+            )
+            if (
+                filled_qty is None
+                or filled_qty <= 0
+                or fill_price is None
+                or (order_alias_present and declared_order_qty is None)
+                or (filled_alias_present and declared_filled_qty is None)
+                or filled_qty != _qty(row)
+            ):
+                return "malformed", []
+            row["_recovery_fill_qty"] = filled_qty
+            row["_recovery_fill_price"] = fill_price
         matches.append((broker_id, row))
     return "available", matches
 
@@ -1127,6 +1171,7 @@ def recover_exit_position(
         if status == "filled":
             filled_qty = raw.get("_recovery_fill_qty")
             fill_price = raw.get("_recovery_fill_price")
+            filled_ts = _recovery_fill_timestamp(raw)
             remaining = _position_remaining(pos)
             previous_filled = _previous_exit_cumulative_fill(
                 pos,
@@ -1136,11 +1181,20 @@ def recover_exit_position(
             details = {
                 "status": status,
                 "filled_qty": filled_qty,
+                "filled_ts": filled_ts,
                 "previous_cumulative_filled": previous_filled,
                 "local_remaining": remaining,
                 "contract": contract,
                 "quote_health": qh,
             }
+            if filled_ts is None:
+                return _hold(
+                    "broker_order_fill_timestamp_unproven",
+                    pid,
+                    local_id,
+                    pending_broker_id,
+                    {**details, "fill_price": fill_price},
+                )
             if (
                 not isinstance(filled_qty, int)
                 or isinstance(filled_qty, bool)
@@ -1193,6 +1247,7 @@ def recover_exit_position(
                         broker_order_id=pending_broker_id,
                         filled_qty=filled_qty,
                         fill_price=fill_price,
+                        filled_ts=filled_ts,
                     )
                 except Exception as exc:
                     log.warning(
@@ -1221,7 +1276,7 @@ def recover_exit_position(
                     pid,
                     local_id,
                     pending_broker_id,
-                    {**details, "fill_price": fill_price},
+                    {**details, "fill_price": fill_price, "filled_ts": filled_ts},
                 )
 
             if delta_qty > remaining:
@@ -1238,6 +1293,7 @@ def recover_exit_position(
                         local_order_id=local_id,
                         broker_order_id=pending_broker_id,
                         cumulative_filled=filled_qty,
+                        filled_ts=filled_ts,
                         reconciled=True,
                     )
                 except Exception as exc:
@@ -1251,7 +1307,7 @@ def recover_exit_position(
                 )
                 return RecoveryAction(
                     "MARKED_CLOSED", "broker_order_filled", pid, local_id, pending_broker_id,
-                    {**details, "fill_price": fill_price},
+                    {**details, "fill_price": fill_price, "filled_ts": filled_ts},
                 )
 
             if not (exit_engine and hasattr(exit_engine, "note_partial_exit_fill")):
@@ -1270,6 +1326,7 @@ def recover_exit_position(
                     local_order_id=local_id,
                     broker_order_id=pending_broker_id,
                     cumulative_filled=filled_qty,
+                    filled_ts=filled_ts,
                 )
             except Exception as exc:
                 log.warning("autonomous recovery partial-fill hook failed: %s", exc)
@@ -1282,7 +1339,7 @@ def recover_exit_position(
             )
             return RecoveryAction(
                 "PARTIAL_FILL_APPLIED", "broker_order_partial_fill", pid, local_id, pending_broker_id,
-                {**details, "fill_price": fill_price},
+                {**details, "fill_price": fill_price, "filled_ts": filled_ts},
             )
 
         if status in TERMINAL_BROKER_STATUSES:
@@ -1410,7 +1467,11 @@ def recover_exit_position(
             "",
             {"contract": contract, "quote_health": qh, **authority_details},
         )
-    order_state, matches = _matching_open_exit_orders_with_truth(broker, contract)
+    order_state, matches = _matching_open_exit_orders_with_truth(
+        broker,
+        contract,
+        include_filled=True,
+    )
     if order_state != "available":
         return _hold(f"broker_order_truth_{order_state}", pid, local_id, "", {"contract": contract, "quote_health": qh})
     tagged_matches: list[tuple[str, dict]] = []
@@ -1471,6 +1532,35 @@ def recover_exit_position(
                     "quote_health": qh,
                 },
             )
+        if _status(raw) == "filled":
+            filled_qty = raw.get("_recovery_fill_qty")
+            fill_price = raw.get("_recovery_fill_price")
+            filled_ts = _recovery_fill_timestamp(raw)
+            fill_details = {
+                "status": "filled",
+                "filled_qty": filled_qty,
+                "fill_price": fill_price,
+                "filled_ts": filled_ts,
+                "contract": contract,
+                "quote_health": qh,
+            }
+            if filled_ts is None:
+                return _hold(
+                    "broker_order_fill_timestamp_unproven",
+                    pid,
+                    local_id,
+                    recovered_id,
+                    fill_details,
+                )
+            transition = getattr(recovery_osm, "transition", None)
+            if not callable(transition):
+                return _hold(
+                    "canonical_exit_fill_transition_unavailable",
+                    pid,
+                    local_id,
+                    recovered_id,
+                    fill_details,
+                )
         adopted, _refreshed, adoption_result, adoption_reason = _adopt_tagged_exit_order(
             recovery_osm,
             pos,
@@ -1489,6 +1579,55 @@ def recover_exit_position(
                     "contract": contract,
                     "quote_health": qh,
                     "adoption": adoption_result,
+                },
+            )
+        if _status(raw) == "filled":
+            try:
+                transitioned = transition(
+                    local_id,
+                    "EXIT_FILLED",
+                    broker_order_id=recovered_id,
+                    filled_qty=filled_qty,
+                    fill_price=fill_price,
+                    filled_ts=filled_ts,
+                )
+            except Exception as exc:
+                log.warning(
+                    "canonical adopted exit fill transition failed during recovery: %s",
+                    exc,
+                )
+                return _hold(
+                    "canonical_exit_fill_transition_failed",
+                    pid,
+                    local_id,
+                    recovered_id,
+                    fill_details,
+                )
+            if transitioned is not True:
+                return _hold(
+                    "canonical_exit_fill_transition_failed",
+                    pid,
+                    local_id,
+                    recovered_id,
+                    fill_details,
+                )
+            _record_exit_fill_watermark(
+                pos,
+                local_id=local_id,
+                broker_id=recovered_id,
+                cumulative_filled=filled_qty,
+            )
+            return RecoveryAction(
+                "MARKED_CLOSED",
+                "broker_order_filled_via_canonical_osm",
+                pid,
+                local_id,
+                recovered_id,
+                {
+                    **fill_details,
+                    "ownership_evidence": "account_scoped_order_list+exact_occ+canonical_tag",
+                    "adoption_disposition": adoption_result.get("disposition"),
+                    "durable_reread_proof": True,
                 },
             )
         # OSM is the durable authority.  This call only hydrates the runtime

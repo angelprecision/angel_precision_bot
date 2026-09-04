@@ -1106,6 +1106,7 @@ def test_duplicate_exit_guard_still_blocks_before_override(monkeypatch, mock_bro
 
 _RECOVERY_OCC = "IWM260901P00293000"
 _RECOVERY_OTHER_OCC = "IWM260901P00294000"
+_RECOVERY_FILL_TS = "2026-09-04T17:07:14Z"
 
 
 class _RecoveryBroker:
@@ -1172,7 +1173,14 @@ class _RawRecoveryBroker(_RecoveryBroker):
 
 
 class _RecoveryDurableOSM:
-    def __init__(self, *, status="EXIT_REQUESTED", adoption_disposition="ADOPTED", update_on_adopt=True):
+    def __init__(
+        self,
+        *,
+        status="EXIT_REQUESTED",
+        adoption_disposition="ADOPTED",
+        update_on_adopt=True,
+        support_transition=False,
+    ):
         tag = canonical_broker_submit_key("local-exit-566")
         self.row = {
             "local_order_id": "local-exit-566",
@@ -1193,11 +1201,17 @@ class _RecoveryDurableOSM:
                 "split_brain_quarantine": False,
                 "reconciliation_required": False,
             },
+            "filled_qty": 0,
+            "fill_price": None,
+            "filled_ts": None,
         }
         self.adoption_disposition = adoption_disposition
         self.update_on_adopt = update_on_adopt
         self.adopt_calls = []
+        self.transition_calls = []
         self.get_order_calls = []
+        if not support_transition:
+            self.transition = None
 
     def get_order(self, local_order_id):
         self.get_order_calls.append(local_order_id)
@@ -1216,6 +1230,18 @@ class _RecoveryDurableOSM:
             "adopted": disposition == "ADOPTED",
             "status": "EXIT_SUBMITTED" if disposition == "ADOPTED" else self.row["status"],
         }
+
+    def transition(self, local_order_id, new_status, **kwargs):
+        self.transition_calls.append((local_order_id, new_status, dict(kwargs)))
+        if local_order_id != self.row["local_order_id"]:
+            return False
+        self.row["status"] = new_status
+        if kwargs.get("broker_order_id"):
+            self.row["broker_order_id"] = str(kwargs["broker_order_id"])
+        for key in ("filled_qty", "fill_price", "filled_ts"):
+            if key in kwargs:
+                self.row[key] = kwargs[key]
+        return True
 
 
 class _RecoveryHooks:
@@ -1393,6 +1419,243 @@ def test_pr566_paginated_include_tags_finds_exact_order_beyond_first_page():
     assert "page=1" in order_paths[0]
     assert "page=2" in order_paths[1]
     assert len(hooks.order_state_machine.adopt_calls) == 1
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_restart_adopts_exact_tagged_filled_order_into_original_exit_once():
+    broker = _RecoveryBroker(
+        orders=[
+            _recovery_open_order(
+                broker_id="crash-filled-exit",
+                status="filled",
+                exec_quantity=2,
+                avg_fill_price=1.25,
+                transaction_date=_RECOVERY_FILL_TS,
+                tag=canonical_broker_submit_key("local-exit-566"),
+            )
+        ],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+    hooks.order_state_machine = _RecoveryDurableOSM(support_transition=True)
+    position = _recovery_position()
+
+    first = recover_exit_position(position, broker=broker, exit_engine=hooks)
+
+    assert first.action == "MARKED_CLOSED"
+    assert first.reason == "broker_order_filled_via_canonical_osm"
+    assert first.broker_order_id == "crash-filled-exit"
+    assert first.details["filled_qty"] == 2
+    assert first.details["fill_price"] == 1.25
+    assert first.details["filled_ts"] == "2026-09-04T17:07:14+00:00"
+    assert hooks.open_calls == []
+    assert len(hooks.order_state_machine.adopt_calls) == 1
+    assert len(hooks.order_state_machine.transition_calls) == 1
+    assert hooks.order_state_machine.transition_calls[0] == (
+        "local-exit-566",
+        "EXIT_FILLED",
+        {
+            "broker_order_id": "crash-filled-exit",
+            "filled_qty": 2,
+            "fill_price": 1.25,
+            "filled_ts": "2026-09-04T17:07:14+00:00",
+        },
+    )
+    assert hooks.order_state_machine.row["local_order_id"] == "local-exit-566"
+    assert hooks.order_state_machine.row["broker_order_id"] == "crash-filled-exit"
+    assert hooks.order_state_machine.row["status"] == "EXIT_FILLED"
+    assert hooks.order_state_machine.row["filled_ts"] == "2026-09-04T17:07:14+00:00"
+
+    second = recover_exit_position(position, broker=broker, exit_engine=hooks)
+
+    assert second.action == "NOOP"
+    assert second.reason == "broker_submit_authority_unproven"
+    assert len(hooks.order_state_machine.adopt_calls) == 1
+    assert len(hooks.order_state_machine.transition_calls) == 1
+    assert hooks.closed_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+@pytest.mark.parametrize(
+    "fill_timestamp",
+    [None, "not-a-timestamp", "2026-09-04T17:07:14"],
+)
+def test_pr566_tagged_filled_order_without_valid_broker_timestamp_stays_hold_before_adoption(
+    fill_timestamp,
+):
+    order = _recovery_open_order(
+        broker_id="crash-filled-without-ts",
+        status="filled",
+        exec_quantity=2,
+        avg_fill_price=1.25,
+        tag=canonical_broker_submit_key("local-exit-566"),
+    )
+    if fill_timestamp is not None:
+        order["transaction_date"] = fill_timestamp
+    broker = _RecoveryBroker(
+        orders=[order],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_fill_timestamp_unproven"
+    assert hooks.order_state_machine.adopt_calls == []
+    assert hooks.order_state_machine.transition_calls == []
+    assert hooks.open_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_known_filled_order_without_broker_timestamp_stays_hold():
+    broker = _RecoveryBroker(
+        positions=[_recovery_held_position()],
+        get_order_payload={
+            "id": "known-filled-without-ts",
+            "symbol": "IWM",
+            "option_symbol": _RECOVERY_OCC,
+            "side": "sell_to_close",
+            "status": "filled",
+            "quantity": 2,
+            "exec_quantity": 2,
+            "avg_fill_price": 1.25,
+        },
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(pending_broker_id="known-filled-without-ts"),
+        broker=broker,
+        exit_engine=hooks,
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_fill_timestamp_unproven"
+    assert hooks.order_state_machine.transition_calls == []
+    assert hooks.closed_calls == []
+    assert hooks.partial_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_filled_order_wrong_tag_is_not_adopted():
+    broker = _RecoveryBroker(
+        orders=[
+            _recovery_open_order(
+                broker_id="filled-wrong-tag",
+                status="filled",
+                exec_quantity=2,
+                avg_fill_price=1.25,
+                transaction_date=_RECOVERY_FILL_TS,
+                tag=canonical_broker_submit_key("other-exit-566"),
+            )
+        ],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_owner_unproven"
+    assert hooks.order_state_machine.adopt_calls == []
+    assert hooks.order_state_machine.transition_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_filled_order_wrong_account_is_not_adopted():
+    broker = _RecoveryBroker(
+        orders=[
+            _recovery_open_order(
+                broker_id="filled-wrong-account",
+                status="filled",
+                exec_quantity=2,
+                avg_fill_price=1.25,
+                transaction_date=_RECOVERY_FILL_TS,
+                account_id="other-account",
+                tag=canonical_broker_submit_key("local-exit-566"),
+            )
+        ],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_account"
+    assert hooks.order_state_machine.adopt_calls == []
+    assert hooks.order_state_machine.transition_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_filled_order_wrong_occ_is_not_adopted():
+    broker = _RecoveryBroker(
+        orders=[
+            _recovery_open_order(
+                contract=_RECOVERY_OTHER_OCC,
+                broker_id="filled-wrong-occ",
+                status="filled",
+                exec_quantity=2,
+                avg_fill_price=1.25,
+                transaction_date=_RECOVERY_FILL_TS,
+                tag=canonical_broker_submit_key("local-exit-566"),
+            )
+        ],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "replacement_authorization_deferred"
+    assert hooks.order_state_machine.adopt_calls == []
+    assert hooks.order_state_machine.transition_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_multiple_tagged_filled_orders_stay_ambiguous():
+    tag = canonical_broker_submit_key("local-exit-566")
+    broker = _RecoveryBroker(
+        orders=[
+            _recovery_open_order(
+                broker_id="filled-match-one",
+                status="filled",
+                exec_quantity=2,
+                avg_fill_price=1.25,
+                transaction_date=_RECOVERY_FILL_TS,
+                tag=tag,
+            ),
+            _recovery_open_order(
+                broker_id="filled-match-two",
+                status="filled",
+                exec_quantity=2,
+                avg_fill_price=1.26,
+                transaction_date=_RECOVERY_FILL_TS,
+                tag=tag,
+            ),
+        ],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "multiple_tagged_live_exit_orders"
+    assert hooks.order_state_machine.adopt_calls == []
+    assert hooks.order_state_machine.transition_calls == []
     _assert_no_recovery_mutation(broker, hooks)
 
 
@@ -1577,6 +1840,7 @@ def test_pr566_filled_partial_requires_exact_fill_fields_and_preserves_remaining
             "filled_qty": 1,
             "avg_fill_price": 1.25,
             "quantity": 1,
+            "transaction_date": _RECOVERY_FILL_TS,
         },
     )
     hooks = _RecoveryHooks()
@@ -1592,6 +1856,7 @@ def test_pr566_filled_partial_requires_exact_fill_fields_and_preserves_remaining
     assert hooks.partial_calls[0][1]["qty_filled"] == 1
     assert hooks.partial_calls[0][1]["fill_price"] == 1.25
     assert hooks.partial_calls[0][1]["cumulative_filled"] == 1
+    assert hooks.partial_calls[0][1]["filled_ts"] == "2026-09-04T17:07:14+00:00"
     assert hooks.closed_calls == []
     assert hooks.replacement_calls == []
     assert broker.cancel_calls == []
@@ -1609,6 +1874,7 @@ def test_pr566_cumulative_fill_restart_applies_only_delta_once():
             "quantity": 2,
             "exec_quantity": 2,
             "avg_fill_price": 1.25,
+            "transaction_date": _RECOVERY_FILL_TS,
         },
     )
     hooks = _RecoveryHooks()
@@ -1627,6 +1893,7 @@ def test_pr566_cumulative_fill_restart_applies_only_delta_once():
     assert len(hooks.closed_calls) == 1
     assert hooks.closed_calls[0][1]["qty_filled"] == 1
     assert hooks.closed_calls[0][1]["cumulative_filled"] == 2
+    assert hooks.closed_calls[0][1]["filled_ts"] == "2026-09-04T17:07:14+00:00"
     assert hooks.partial_calls == []
     assert second.action == "NOOP"
     assert second.reason == "duplicate_exit_fill_ignored"
@@ -1647,6 +1914,7 @@ def test_pr566_filled_recovery_delegates_to_canonical_osm_and_dedupes():
             "quantity": 2,
             "exec_quantity": 2,
             "avg_fill_price": 1.25,
+            "transaction_date": _RECOVERY_FILL_TS,
         },
     )
     hooks = _RecoveryHooks()
@@ -1678,6 +1946,7 @@ def test_pr566_filled_recovery_delegates_to_canonical_osm_and_dedupes():
         "broker_order_id": "filled-order-osm",
         "filled_qty": 2,
         "fill_price": 1.25,
+        "filled_ts": "2026-09-04T17:07:14+00:00",
     }
     assert hooks.closed_calls == []
     assert hooks.partial_calls == []
