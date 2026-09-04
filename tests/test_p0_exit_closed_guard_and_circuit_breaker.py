@@ -14,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from ap import exit_safety as exit_safety_mod  # noqa: E402
 from ap import order_state_machine as osm_mod  # noqa: E402
+from ap.broker_submit_identity import canonical_broker_submit_key  # noqa: E402
 from ap.exit_autonomous_recovery import recover_exit_engine, recover_exit_position  # noqa: E402
 from ap.order_state_machine import APOrderStateMachine  # noqa: E402
 
@@ -1115,6 +1116,7 @@ class _RecoveryBroker:
         self._get_order_payload = get_order_payload
         self._order_exc = order_exc
         self._position_exc = position_exc
+        self.account_id = "acct-566"
         self.list_orders_calls = 0
         self.list_positions_calls = 0
         self.get_order_calls = []
@@ -1181,7 +1183,16 @@ class _RecoveryHooks:
         self.replacement_calls.append((position_id, kwargs))
 
 
-def _recovery_position(*, contract=_RECOVERY_OCC, pending_broker_id="", remaining=2):
+def _recovery_position(
+    *,
+    contract=_RECOVERY_OCC,
+    pending_broker_id="",
+    remaining=2,
+    pending_qty=None,
+    pending_filled=0,
+):
+    if pending_qty is None:
+        pending_qty = remaining
     return SimpleNamespace(
         position_id="pos-recovery-566",
         closed=False,
@@ -1190,7 +1201,8 @@ def _recovery_position(*, contract=_RECOVERY_OCC, pending_broker_id="", remainin
         symbol="IWM",
         pending_exit_local_order_id="local-exit-566",
         pending_exit_broker_order_id=pending_broker_id,
-        pending_exit_qty=remaining,
+        pending_exit_qty=pending_qty,
+        pending_exit_filled_qty=pending_filled,
         quantity_remaining=remaining,
         contracts=remaining,
         client_id="jason@example.com",
@@ -1265,6 +1277,21 @@ def test_pr566_raw_tradier_position_path_bypasses_laundered_legacy_adapter():
     _assert_no_recovery_mutation(broker, hooks)
 
 
+def test_pr566_incomplete_empty_positions_container_is_unknown_not_flat():
+    broker = _RawRecoveryBroker(positions_payload={"positions": {}})
+
+    truth = exit_safety_mod.resolve_exit_broker_truth(
+        broker=broker,
+        client_id="jason@example.com",
+        contract=_RECOVERY_OCC,
+    )
+
+    assert truth["broker_truth_open_qty"] is None
+    assert truth["is_fresh_exact"] is False
+    assert truth["audit"]["snapshot_status"] == "broker_positions_malformed"
+    assert broker.list_positions_calls == 0
+
+
 def test_pr566_authoritative_list_orders_wins_over_raw_endpoint_fallback():
     broker = _RawRecoveryBroker(
         positions_payload={
@@ -1277,8 +1304,7 @@ def test_pr566_authoritative_list_orders_wins_over_raw_endpoint_fallback():
     broker._orders = [
         _recovery_open_order(
             broker_id="authoritative-open",
-            client_id="jason@example.com",
-            execution_mode="live",
+            tag=canonical_broker_submit_key("local-exit-566"),
         )
     ]
     hooks = _RecoveryHooks()
@@ -1306,8 +1332,7 @@ def test_pr566_unrelated_equity_order_does_not_poison_option_recovery():
             },
             _recovery_open_order(
                 broker_id="option-exit-order",
-                client_id="jason@example.com",
-                execution_mode="live",
+                tag=canonical_broker_submit_key("local-exit-566"),
             ),
         ],
         positions=[_recovery_held_position()],
@@ -1406,9 +1431,113 @@ def test_pr566_filled_partial_requires_exact_fill_fields_and_preserves_remaining
     assert len(hooks.partial_calls) == 1
     assert hooks.partial_calls[0][1]["qty_filled"] == 1
     assert hooks.partial_calls[0][1]["fill_price"] == 1.25
+    assert hooks.partial_calls[0][1]["cumulative_filled"] == 1
     assert hooks.closed_calls == []
     assert hooks.replacement_calls == []
     assert broker.cancel_calls == []
+
+
+def test_pr566_cumulative_fill_restart_applies_only_delta_once():
+    broker = _RecoveryBroker(
+        positions=[_recovery_held_position()],
+        get_order_payload={
+            "id": "filled-order-restart",
+            "symbol": "IWM",
+            "option_symbol": _RECOVERY_OCC,
+            "side": "sell_to_close",
+            "status": "filled",
+            "quantity": 2,
+            "exec_quantity": 2,
+            "avg_fill_price": 1.25,
+        },
+    )
+    hooks = _RecoveryHooks()
+    position = _recovery_position(
+        pending_broker_id="filled-order-restart",
+        remaining=1,
+        pending_qty=2,
+        pending_filled=1,
+    )
+
+    first = recover_exit_position(position, broker=broker, exit_engine=hooks)
+    second = recover_exit_position(position, broker=broker, exit_engine=hooks)
+
+    assert first.action == "MARKED_CLOSED"
+    assert first.details["delta_qty"] == 1
+    assert len(hooks.closed_calls) == 1
+    assert hooks.closed_calls[0][1]["qty_filled"] == 1
+    assert hooks.closed_calls[0][1]["cumulative_filled"] == 2
+    assert hooks.partial_calls == []
+    assert second.action == "NOOP"
+    assert second.reason == "duplicate_exit_fill_ignored"
+    assert len(hooks.closed_calls) == 1
+    assert hooks.replacement_calls == []
+    assert broker.cancel_calls == []
+
+
+def test_pr566_filled_recovery_delegates_to_canonical_osm_and_dedupes():
+    broker = _RecoveryBroker(
+        positions=[_recovery_held_position()],
+        get_order_payload={
+            "id": "filled-order-osm",
+            "symbol": "IWM",
+            "option_symbol": _RECOVERY_OCC,
+            "side": "sell_to_close",
+            "status": "filled",
+            "quantity": 2,
+            "exec_quantity": 2,
+            "avg_fill_price": 1.25,
+        },
+    )
+    hooks = _RecoveryHooks()
+    position = _recovery_position(
+        pending_broker_id="filled-order-osm",
+        remaining=1,
+        pending_qty=2,
+        pending_filled=1,
+    )
+
+    class _CanonicalOSM:
+        def __init__(self):
+            self.calls = []
+
+        def transition(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return True
+
+    osm = _CanonicalOSM()
+
+    first = recover_exit_position(position, broker=broker, exit_engine=hooks, osm=osm)
+    second = recover_exit_position(position, broker=broker, exit_engine=hooks, osm=osm)
+
+    assert first.action == "MARKED_CLOSED"
+    assert first.reason == "broker_order_filled_via_canonical_osm"
+    assert len(osm.calls) == 1
+    assert osm.calls[0][0] == ("local-exit-566", "EXIT_FILLED")
+    assert osm.calls[0][1] == {
+        "broker_order_id": "filled-order-osm",
+        "filled_qty": 2,
+        "fill_price": 1.25,
+    }
+    assert hooks.closed_calls == []
+    assert hooks.partial_calls == []
+    assert second.reason == "duplicate_exit_fill_ignored"
+    assert len(osm.calls) == 1
+
+
+def test_pr566_same_contract_wrong_tag_is_not_adopted():
+    broker = _RecoveryBroker(
+        orders=[_recovery_open_order(tag=canonical_broker_submit_key("other-exit-566"))],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(_recovery_position(), broker=broker, exit_engine=hooks)
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_owner_unproven"
+    assert hooks.open_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
 
 
 def test_pr566_conflicting_filled_order_quantity_requires_hold():
@@ -1541,12 +1670,11 @@ def test_pr566_malformed_order_container_cannot_be_negative_proof():
     _assert_no_recovery_mutation(broker, hooks)
 
 
-def test_pr566_explicit_owner_allows_single_open_order_adoption():
+def test_pr566_real_tradier_tag_allows_single_open_order_adoption():
     broker = _RecoveryBroker(
         orders=[_recovery_open_order(
             broker_id="owned-order",
-            client_id="jason@example.com",
-            execution_mode="live",
+            tag=canonical_broker_submit_key("local-exit-566"),
         )],
         positions=[_recovery_held_position()],
     )

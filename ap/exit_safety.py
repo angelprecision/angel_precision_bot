@@ -264,8 +264,11 @@ def _parse_authoritative_position_payload(payload: Any) -> tuple[str, list[dict[
         positions = payload.get("positions")
         if positions is None or positions == "null":
             return "available", []
+        # A bare empty object is an incomplete provider envelope, not the
+        # documented empty-position shape.  Treating it as an authoritative
+        # empty account could suppress a real EXIT during a malformed read.
         if isinstance(positions, dict) and not positions:
-            return "available", []
+            return "malformed", []
         if not isinstance(positions, dict) or "position" not in positions:
             return "malformed", []
         rows = positions.get("position")

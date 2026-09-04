@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.exit_safety import (
     _normalize_contract,
     is_valid_exact_occ_contract,
@@ -568,6 +569,90 @@ def _position_remaining(pos: Any) -> Optional[int]:
     return None
 
 
+def _exit_fill_order_keys(pos: Any, *, local_id: str, broker_id: str) -> tuple[str, ...]:
+    """Return the durable identities that can own this fill watermark."""
+    values = (
+        broker_id,
+        local_id,
+        _norm(getattr(pos, "pending_exit_broker_order_id", "")),
+        _norm(getattr(pos, "pending_exit_local_order_id", "")),
+    )
+    return tuple(dict.fromkeys(value for value in values if value))
+
+
+def _previous_exit_cumulative_fill(
+    pos: Any,
+    *,
+    local_id: str,
+    broker_id: str,
+) -> Optional[int]:
+    """Read the current order's applied cumulative-fill watermark."""
+    values: list[int] = []
+    pending_value = getattr(pos, "pending_exit_filled_qty", None)
+    if pending_value not in (None, ""):
+        parsed = _strict_qty(pending_value)
+        if parsed is None:
+            return None
+        values.append(parsed)
+
+    watermarks = getattr(pos, "last_applied_exit_cum_fill_by_order", None)
+    if watermarks not in (None, "") and not isinstance(watermarks, dict):
+        return None
+    for key in _exit_fill_order_keys(pos, local_id=local_id, broker_id=broker_id):
+        if not isinstance(watermarks, dict) or key not in watermarks:
+            continue
+        raw_value = watermarks.get(key)
+        if raw_value in (None, ""):
+            continue
+        parsed = _strict_qty(raw_value)
+        if parsed is None:
+            return None
+        values.append(parsed)
+    return max(values) if values else 0
+
+
+def _record_exit_fill_watermark(
+    pos: Any,
+    *,
+    local_id: str,
+    broker_id: str,
+    cumulative_filled: int,
+) -> None:
+    """Persist an in-memory watermark after a successful fill handoff."""
+    keys = _exit_fill_order_keys(pos, local_id=local_id, broker_id=broker_id)
+    watermarks = getattr(pos, "last_applied_exit_cum_fill_by_order", None)
+    if not isinstance(watermarks, dict):
+        watermarks = {}
+        setattr(pos, "last_applied_exit_cum_fill_by_order", watermarks)
+    for key in keys:
+        prior = _strict_qty(watermarks.get(key))
+        watermarks[key] = max(prior or 0, cumulative_filled)
+    prior_scalar = _strict_qty(getattr(pos, "last_applied_exit_cum_fill", 0)) or 0
+    setattr(pos, "last_applied_exit_cum_fill", max(prior_scalar, cumulative_filled))
+    if local_id:
+        setattr(pos, "last_applied_exit_local_order_id", local_id)
+    if broker_id:
+        setattr(pos, "last_applied_exit_broker_order_id", broker_id)
+
+
+def _seed_exit_fill_watermark(
+    pos: Any,
+    *,
+    local_id: str,
+    broker_id: str,
+    cumulative_filled: int,
+) -> None:
+    """Align the legacy hook with the cumulative value already applied."""
+    watermarks = getattr(pos, "last_applied_exit_cum_fill_by_order", None)
+    if not isinstance(watermarks, dict):
+        watermarks = {}
+        setattr(pos, "last_applied_exit_cum_fill_by_order", watermarks)
+    for key in _exit_fill_order_keys(pos, local_id=local_id, broker_id=broker_id):
+        prior = _strict_qty(watermarks.get(key))
+        if prior is None or prior < cumulative_filled:
+            watermarks[key] = cumulative_filled
+
+
 def _order_identity_mismatch(raw: dict, pos: Any) -> str:
     expected_client = _norm(getattr(pos, "client_id", "")).lower()
     expected_mode = _norm(getattr(pos, "execution_mode", "")).lower()
@@ -587,22 +672,51 @@ def _order_identity_mismatch(raw: dict, pos: Any) -> str:
     return ""
 
 
-def _order_has_explicit_owner(raw: dict) -> bool:
+def _order_records(raw: dict) -> list[dict]:
     records = [raw]
     nested = raw.get("raw") if isinstance(raw, dict) else None
     if isinstance(nested, dict):
         records.append(nested)
-    has_client = any(
+    return records
+
+
+def _broker_account_id(broker: Any) -> str:
+    """Resolve the account whose account-scoped order list was queried."""
+    return _norm(
+        getattr(broker, "account_id", None)
+        or getattr(getattr(broker, "cfg", None), "account_id", None)
+        or getattr(broker, "_account_id", None)
+    ).lower()
+
+
+def _order_account_identity_mismatch(raw: dict, broker: Any) -> str:
+    """Reject an order row that explicitly names a different account."""
+    expected = _broker_account_id(broker)
+    values = [
+        _norm(record.get(key)).lower()
+        for record in _order_records(raw)
+        for key in ("account_id", "account", "account_number")
+        if _norm(record.get(key))
+    ]
+    if values and not expected:
+        return "account_unproven"
+    if expected and any(value != expected for value in values):
+        return "account"
+    return ""
+
+
+def _order_matches_local_exit_tag(raw: dict, local_order_id: str) -> bool:
+    """Match only the exact durable tag sent by the canonical submit path."""
+    expected = canonical_broker_submit_key(local_order_id)
+    if not expected:
+        return False
+    tags = [
         _norm(record.get(key))
-        for record in records
-        for key in ("client_id", "clientId", "email")
-    )
-    has_mode = any(
-        _norm(record.get(key)).lower() in {"live", "paper"}
-        for record in records
-        for key in ("execution_mode", "executionMode", "mode")
-    )
-    return bool(has_client and has_mode)
+        for record in _order_records(raw)
+        for key in ("tag", "order_tag", "client_tag")
+        if _norm(record.get(key))
+    ]
+    return bool(tags) and all(tag == expected for tag in tags)
 
 
 def quote_health(pos: Any, *, stale_sec: int = QUOTE_STALE_WARN_SEC) -> dict:
@@ -814,6 +928,19 @@ def recover_exit_position(
             filled_qty = raw.get("_recovery_fill_qty")
             fill_price = raw.get("_recovery_fill_price")
             remaining = _position_remaining(pos)
+            previous_filled = _previous_exit_cumulative_fill(
+                pos,
+                local_id=local_id,
+                broker_id=pending_broker_id,
+            )
+            details = {
+                "status": status,
+                "filled_qty": filled_qty,
+                "previous_cumulative_filled": previous_filled,
+                "local_remaining": remaining,
+                "contract": contract,
+                "quote_health": qh,
+            }
             if (
                 not isinstance(filled_qty, int)
                 or isinstance(filled_qty, bool)
@@ -821,59 +948,141 @@ def recover_exit_position(
                 or fill_price is None
                 or remaining is None
                 or remaining <= 0
-                or filled_qty > remaining
+                or previous_filled is None
             ):
                 return _hold(
                     "broker_order_fill_quantity_unproven",
                     pid,
                     local_id,
                     pending_broker_id,
-                    {
-                        "status": status,
-                        "filled_qty": filled_qty,
-                        "local_remaining": remaining,
-                        "contract": contract,
-                        "quote_health": qh,
-                    },
+                    details,
                 )
-            if filled_qty == remaining:
-                if not (exit_engine and hasattr(exit_engine, "mark_position_closed")):
-                    return _hold("broker_order_fill_close_hook_missing", pid, local_id, pending_broker_id, {"quote_health": qh})
-                exit_engine.mark_position_closed(
+            if filled_qty < previous_filled:
+                details["reason"] = "cumulative_regression"
+                return _hold(
+                    "broker_order_fill_cumulative_regression",
                     pid,
-                    reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
-                    qty_filled=filled_qty,
+                    local_id,
+                    pending_broker_id,
+                    details,
+                )
+
+            # Broker fill quantities are cumulative.  A restart can leave the
+            # local position with only the unfilled remainder, so never compare
+            # the cumulative broker value directly with that remainder.
+            delta_qty = filled_qty - previous_filled
+            details["delta_qty"] = delta_qty
+            if delta_qty <= 0:
+                return _hold("duplicate_exit_fill_ignored", pid, local_id, pending_broker_id, details)
+
+            recovery_osm = osm or getattr(exit_engine, "order_state_machine", None)
+            transition = getattr(recovery_osm, "transition", None)
+            if callable(transition):
+                if not local_id:
+                    return _hold(
+                        "canonical_exit_fill_identity_missing",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        details,
+                    )
+                try:
+                    transitioned = transition(
+                        local_id,
+                        "EXIT_FILLED",
+                        broker_order_id=pending_broker_id,
+                        filled_qty=filled_qty,
+                        fill_price=fill_price,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "canonical exit fill transition failed during recovery: %s",
+                        exc,
+                    )
+                    return _hold(
+                        "canonical_exit_fill_transition_failed",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        details,
+                    )
+                if transitioned is not True:
+                    return _hold("canonical_exit_fill_transition_failed", pid, local_id, pending_broker_id, details)
+                _record_exit_fill_watermark(
+                    pos,
+                    local_id=local_id,
+                    broker_id=pending_broker_id,
+                    cumulative_filled=filled_qty,
+                )
+                action = "MARKED_CLOSED" if delta_qty >= remaining else "PARTIAL_FILL_APPLIED"
+                return RecoveryAction(
+                    action,
+                    "broker_order_filled_via_canonical_osm",
+                    pid,
+                    local_id,
+                    pending_broker_id,
+                    {**details, "fill_price": fill_price},
+                )
+
+            if delta_qty > remaining:
+                return _hold("broker_order_fill_quantity_unproven", pid, local_id, pending_broker_id, details)
+            if delta_qty == remaining:
+                if not (exit_engine and hasattr(exit_engine, "mark_position_closed")):
+                    return _hold("broker_order_fill_close_hook_missing", pid, local_id, pending_broker_id, details)
+                try:
+                    exit_engine.mark_position_closed(
+                        pid,
+                        reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
+                        qty_filled=delta_qty,
+                        fill_price=fill_price,
+                        local_order_id=local_id,
+                        broker_order_id=pending_broker_id,
+                        cumulative_filled=filled_qty,
+                        reconciled=True,
+                    )
+                except Exception as exc:
+                    log.warning("autonomous recovery close hook failed: %s", exc)
+                    return _hold("broker_order_fill_close_hook_failed", pid, local_id, pending_broker_id, details)
+                _record_exit_fill_watermark(
+                    pos,
+                    local_id=local_id,
+                    broker_id=pending_broker_id,
+                    cumulative_filled=filled_qty,
+                )
+                return RecoveryAction(
+                    "MARKED_CLOSED", "broker_order_filled", pid, local_id, pending_broker_id,
+                    {**details, "fill_price": fill_price},
+                )
+
+            if not (exit_engine and hasattr(exit_engine, "note_partial_exit_fill")):
+                return _hold("broker_order_partial_fill_hook_missing", pid, local_id, pending_broker_id, details)
+            _seed_exit_fill_watermark(
+                pos,
+                local_id=local_id,
+                broker_id=pending_broker_id,
+                cumulative_filled=previous_filled,
+            )
+            try:
+                exit_engine.note_partial_exit_fill(
+                    pid,
+                    qty_filled=delta_qty,
                     fill_price=fill_price,
                     local_order_id=local_id,
                     broker_order_id=pending_broker_id,
                     cumulative_filled=filled_qty,
-                    reconciled=True,
                 )
-                return RecoveryAction(
-                    "MARKED_CLOSED",
-                    "broker_order_filled",
-                    pid,
-                    local_id,
-                    pending_broker_id,
-                    {"status": status, "filled_qty": filled_qty, "fill_price": fill_price, "quote_health": qh},
-                )
-            if not (exit_engine and hasattr(exit_engine, "note_partial_exit_fill")):
-                return _hold("broker_order_partial_fill_hook_missing", pid, local_id, pending_broker_id, {"quote_health": qh})
-            exit_engine.note_partial_exit_fill(
-                pid,
-                qty_filled=filled_qty,
-                fill_price=fill_price,
-                local_order_id=local_id,
-                broker_order_id=pending_broker_id,
+            except Exception as exc:
+                log.warning("autonomous recovery partial-fill hook failed: %s", exc)
+                return _hold("broker_order_partial_fill_hook_failed", pid, local_id, pending_broker_id, details)
+            _record_exit_fill_watermark(
+                pos,
+                local_id=local_id,
+                broker_id=pending_broker_id,
                 cumulative_filled=filled_qty,
             )
             return RecoveryAction(
-                "PARTIAL_FILL_APPLIED",
-                "broker_order_partial_fill",
-                pid,
-                local_id,
-                pending_broker_id,
-                {"status": status, "filled_qty": filled_qty, "fill_price": fill_price, "quote_health": qh},
+                "PARTIAL_FILL_APPLIED", "broker_order_partial_fill", pid, local_id, pending_broker_id,
+                {**details, "fill_price": fill_price},
             )
 
         if status in TERMINAL_BROKER_STATUSES:
@@ -891,6 +1100,7 @@ def recover_exit_position(
                     pending_broker_id,
                     {"old_status": status, "contract": contract, "quote_health": qh},
                 )
+            tagged_other_matches: list[tuple[str, dict]] = []
             for other_id, other_raw in other_matches:
                 mismatch = _order_identity_mismatch(other_raw, pos)
                 if mismatch:
@@ -901,8 +1111,35 @@ def recover_exit_position(
                         pending_broker_id,
                         {"broker_order_id": other_id, "identity_field": mismatch, "quote_health": qh},
                     )
-            if len(other_matches) == 1:
-                other_id, other_raw = other_matches[0]
+                account_mismatch = _order_account_identity_mismatch(other_raw, broker)
+                if account_mismatch:
+                    return _hold(
+                        f"broker_order_{account_mismatch}",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {"broker_order_id": other_id, "identity_field": "account", "quote_health": qh},
+                    )
+                if _order_matches_local_exit_tag(other_raw, local_id):
+                    if not _broker_account_id(broker):
+                        return _hold(
+                            "broker_order_account_identity_unproven",
+                            pid,
+                            local_id,
+                            pending_broker_id,
+                            {"broker_order_id": other_id, "quote_health": qh},
+                        )
+                    tagged_other_matches.append((other_id, other_raw))
+                else:
+                    return _hold(
+                        "broker_order_owner_unproven",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {"broker_order_id": other_id, "quote_health": qh},
+                    )
+            if len(tagged_other_matches) == 1:
+                other_id, other_raw = tagged_other_matches[0]
                 pending_qty = _pending_order_quantity(pos, other_raw)
                 if pending_qty is None:
                     return _hold("broker_order_quantity_unproven", pid, local_id, pending_broker_id, {"quote_health": qh})
@@ -915,13 +1152,13 @@ def recover_exit_position(
                         reason="autonomous_recovery_found_different_open_exit",
                     )
                 return RecoveryAction("CONFIRMED_OPEN", "different_broker_exit_still_open", pid, local_id, other_id, {"old_status": status, "contract": contract, "quote_health": qh})
-            if len(other_matches) > 1:
+            if len(tagged_other_matches) > 1:
                 return _hold(
                     "multiple_different_open_exits_block_replacement",
                     pid,
                     local_id,
                     pending_broker_id,
-                    {"old_status": status, "matches": [item[0] for item in other_matches], "quote_health": qh},
+                    {"old_status": status, "matches": [item[0] for item in tagged_other_matches], "quote_health": qh},
                 )
             position_state = _broker_position_state(
                 broker, client_id=position_client, contract=contract
@@ -951,13 +1188,16 @@ def recover_exit_position(
             )
         return _hold("broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": status, "quote_health": qh})
 
-    # Missing broker id: exact order-list ownership is not complete enough for
-    # autonomous adoption in this containment change.  We can still recognize
-    # a single explicitly fenced order, but never cancel or unlock on a
-    # non-paginated negative result.
+    # Missing broker id: only an account-scoped exact-OCC row carrying the
+    # durable canonical submit tag can be adopted.  Tradier rows do not carry
+    # Angel Precision's client/mode fields; those synthetic fields are not
+    # ownership proof.  This path still never cancels or authorizes a
+    # replacement.
     order_state, matches = _matching_open_exit_orders_with_truth(broker, contract)
     if order_state != "available":
         return _hold(f"broker_order_truth_{order_state}", pid, local_id, "", {"contract": contract, "quote_health": qh})
+    tagged_matches: list[tuple[str, dict]] = []
+    untagged_matches: list[tuple[str, dict]] = []
     for broker_id, raw in matches:
         mismatch = _order_identity_mismatch(raw, pos)
         if mismatch:
@@ -968,19 +1208,37 @@ def recover_exit_position(
                 "",
                 {"broker_order_id": broker_id, "identity_field": mismatch, "quote_health": qh},
             )
-        # Without explicit broker-side client/mode ownership, a same-contract
-        # row could belong to another worker/account.  Leave it for canonical
-        # reconciliation rather than adopting it here.
-        if not _order_has_explicit_owner(raw):
+        account_mismatch = _order_account_identity_mismatch(raw, broker)
+        if account_mismatch:
             return _hold(
-                "broker_order_owner_unproven",
+                f"broker_order_{account_mismatch}",
                 pid,
                 local_id,
                 broker_id,
-                {"contract": contract, "quote_health": qh},
+                {"contract": contract, "identity_field": "account", "quote_health": qh},
             )
-    if len(matches) == 1:
-        recovered_id, raw = matches[0]
+        if _order_matches_local_exit_tag(raw, local_id):
+            if not _broker_account_id(broker):
+                return _hold(
+                    "broker_order_account_identity_unproven",
+                    pid,
+                    local_id,
+                    broker_id,
+                    {"contract": contract, "quote_health": qh},
+                )
+            tagged_matches.append((broker_id, raw))
+        else:
+            untagged_matches.append((broker_id, raw))
+    if untagged_matches:
+        return _hold(
+            "broker_order_owner_unproven",
+            pid,
+            local_id,
+            "",
+            {"match_count": len(matches), "contract": contract, "quote_health": qh},
+        )
+    if len(tagged_matches) == 1:
+        recovered_id, raw = tagged_matches[0]
         pending_qty = _pending_order_quantity(pos, raw)
         if pending_qty is None:
             return _hold("broker_order_quantity_unproven", pid, local_id, recovered_id, {"quote_health": qh})
@@ -992,14 +1250,35 @@ def recover_exit_position(
                 qty=pending_qty,
                 reason="autonomous_recovery_matched_live_exit_order",
             )
-        return RecoveryAction("RECOVERED_BROKER_ID", "matched_single_live_exit_order", pid, local_id, recovered_id, {"contract": contract, "quote_health": qh})
-    if len(matches) > 1:
+        return RecoveryAction(
+            "RECOVERED_BROKER_ID",
+            "matched_single_live_exit_order",
+            pid,
+            local_id,
+            recovered_id,
+            {
+                "contract": contract,
+                "ownership_evidence": "account_scoped_order_list+exact_occ+canonical_tag",
+                "quote_health": qh,
+            },
+        )
+    if len(tagged_matches) > 1:
         return _hold(
-            "multiple_live_exit_orders_replacement_deferred",
+            "multiple_tagged_live_exit_orders",
             pid,
             local_id,
             "",
-            {"match_count": len(matches), "quote_health": qh},
+            {"match_count": len(tagged_matches), "quote_health": qh},
+        )
+    if matches:
+        # Same-contract rows without the exact durable tag remain ambiguous;
+        # do not let a unique-looking Tradier row gain new authority.
+        return _hold(
+            "broker_order_owner_unproven",
+            pid,
+            local_id,
+            "",
+            {"match_count": len(matches), "contract": contract, "quote_health": qh},
         )
 
     position_state = _broker_position_state(
