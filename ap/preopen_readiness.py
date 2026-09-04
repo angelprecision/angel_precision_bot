@@ -23,24 +23,6 @@ READINESS_ENFORCEMENT_END_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_END_MINUT
 OVERNIGHT_REEVAL_DUE_HOUR_ET = int(os.getenv("OVERNIGHT_REEVAL_DUE_HOUR_ET", "9"))
 OVERNIGHT_REEVAL_DUE_MINUTE_ET = int(os.getenv("OVERNIGHT_REEVAL_DUE_MINUTE_ET", "18"))
 
-# ── PR #573 P0: after-hours WATCHING readiness boundary ──────────────────────
-# Exact durable marker written by ap/queue.py::_persist_watching_deferral
-# (constant `_PAPER_OVERNIGHT_REEVAL_ONLY_ERROR`) when a signal is intentionally
-# parked for the next overnight/pre-open reevaluation. This is the ONLY
-# `last_error` string that qualifies a WATCHING row for the expected-deferred
-# exemption below. Substring / case / alias matches are not permitted.
-AFTER_HOURS_DEFERRED_MARKER = "after_hours_deferred:awaiting_overnight_reeval"
-
-# Upper bound on how far back a legitimate after-hours defer window can begin.
-# A row older than this in calendar days is stale by construction: it survived
-# at least one required morning consumer boundary without honest downstream
-# disposition, so it cannot still qualify as fresh expected-deferred inventory.
-# The deadline comparison is the primary authority; this is a defense-in-depth
-# bound.
-AFTER_HOURS_DEFERRED_MAX_LOOKBACK_DAYS = int(
-    os.getenv("PREOPEN_AFTER_HOURS_DEFERRED_MAX_LOOKBACK_DAYS", "10")
-)
-
 
 def _now_et(now: datetime | None = None) -> datetime:
     return (now or datetime.now(ET)).astimezone(ET)
@@ -74,290 +56,6 @@ def _after_929_et(now: datetime | None = None) -> bool:
     if not _nyse_is_trading_day(dt):
         return False
     return dt.hour > 9 or (dt.hour == 9 and dt.minute >= 29)
-
-
-# ── PR #573: authoritative next-trading-day resolution ───────────────────────
-# The expected-after-hours-deferred exemption ends at the configured overnight
-# reeval due time (OVERNIGHT_REEVAL_DUE_HOUR_ET:MINUTE, default 09:18 ET) of
-# the NEXT NYSE trading session after the row was created. This helper
-# resolves that deadline authoritatively and returns None on calendar
-# ambiguity (per binding spec: calendar ambiguity => fail closed).
-def _next_trading_session_deadline_et(
-    created_ts_utc: datetime,
-) -> datetime | None:
-    """Return the authoritative next-trading-session overnight-reeval deadline
-    in ET, or None if the NYSE calendar cannot resolve it authoritatively.
-
-    Fail-closed semantics:
-      - naive/malformed inputs return None (caller must fail closed);
-      - the flatline_alarm NYSE calendar must have an authoritative year map
-        for both the source date and every candidate next day scanned;
-      - Friday → Monday and holiday-eve → next trading day are handled by
-        iterating with the canonical `is_trading_day`.
-    """
-    try:
-        from ap.flatline_alarm import is_trading_day as _is_trading_day
-        from ap.flatline_alarm import NYSE_HOLIDAYS as _NYSE_HOLIDAYS
-    except Exception:
-        # Calendar authority unavailable — never manufacture a deadline.
-        return None
-
-    if not isinstance(created_ts_utc, datetime) or created_ts_utc.tzinfo is None:
-        return None
-
-    created_et = created_ts_utc.astimezone(ET)
-
-    # Walk forward from the day AFTER the source date until we find a trading
-    # day. If any calendar-year lookup falls into the "unknown year" branch
-    # (which fail-opens to weekday-only), refuse to guess — return None.
-    candidate = (created_et + timedelta(days=1)).date()
-    # Bound the walk so a broken calendar cannot loop indefinitely.
-    for _ in range(14):
-        if _NYSE_HOLIDAYS.get(candidate.year) is None:
-            # Unknown year in the authoritative map — fail closed.
-            return None
-        if _is_trading_day(candidate):
-            return datetime(
-                candidate.year, candidate.month, candidate.day,
-                OVERNIGHT_REEVAL_DUE_HOUR_ET,
-                OVERNIGHT_REEVAL_DUE_MINUTE_ET,
-                tzinfo=ET,
-            )
-        candidate = candidate + timedelta(days=1)
-    return None
-
-
-def _parse_created_ts_to_utc(raw: Any) -> datetime | None:
-    """Parse a trade_queue.created_ts value to a UTC-aware datetime, or
-    return None on any parse failure. Naive datetimes are rejected: the
-    binding spec forbids machine-local timezone assumptions.
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, datetime):
-        if raw.tzinfo is None:
-            return None
-        return raw.astimezone(timezone.utc)
-    s = str(raw).strip()
-    if not s:
-        return None
-    # psycopg2 typically returns tz-aware datetimes; string arrival happens
-    # only in test fixtures or when payloads are re-serialized.
-    try:
-        # datetime.fromisoformat accepts trailing "Z" only on 3.11+.
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-    except (TypeError, ValueError):
-        return None
-    if dt.tzinfo is None:
-        return None
-    return dt.astimezone(timezone.utc)
-
-
-# ── PR #573 audit follow-up (2026-09-03): source-session classification ──
-# The queue producer at ap/queue.py::_persist_watching_deferral legitimately
-# writes AFTER_HOURS_DEFERRED_MARKER in TWO windows relative to the ET market
-# clock (matching `ap/queue.py::_is_regular_session_et`, which is exactly
-# 09:30–16:00 ET Mon-Fri):
-#
-#   post_close       - after 16:00 ET on a trading day (Sep 2 incident shape),
-#                      OR any time on a non-trading day (Sat/Sun/holiday);
-#   pre_market       - before 09:30 ET on a trading day;
-#   regular_session  - 09:30–16:00 ET on a trading day; the producer does not
-#                      legitimately mint this marker inside regular session,
-#                      so seeing it here means the row lifecycle is
-#                      contradictory and MUST fail closed.
-#
-# The applicable overnight-reeval deadline differs per window:
-#
-#   post_close (trading-day close)  → next trading session 09:18 ET
-#   post_close (non-trading day)    → next trading session 09:18 ET
-#   pre_market                       → SAME trading day 09:18 ET
-#   regular_session                  → NO deadline; fail closed
-#
-# Returns (session_kind, deadline_et) or (session_kind, None) on calendar
-# ambiguity / regular-session shape. Callers treat None deadline the same as
-# a regular-session shape: no exemption, fall back to ordinary orphan.
-_REGULAR_SESSION_OPEN_MIN = 9 * 60 + 30   # 09:30 ET
-_REGULAR_SESSION_CLOSE_MIN = 16 * 60      # 16:00 ET
-
-
-def _resolve_source_session_and_deadline_et(
-    created_ts_utc: datetime,
-) -> tuple[str, datetime | None]:
-    try:
-        from ap.flatline_alarm import is_trading_day as _is_trading_day
-        from ap.flatline_alarm import NYSE_HOLIDAYS as _NYSE_HOLIDAYS
-    except Exception:
-        return "unknown", None
-
-    if not isinstance(created_ts_utc, datetime) or created_ts_utc.tzinfo is None:
-        return "unknown", None
-
-    created_et = created_ts_utc.astimezone(ET)
-    src_date = created_et.date()
-
-    # If the source date's year isn't in the authoritative NYSE map, we
-    # cannot reason about session windows safely. Fail closed.
-    if _NYSE_HOLIDAYS.get(src_date.year) is None:
-        return "unknown", None
-
-    src_is_trading_day = _is_trading_day(src_date)
-    created_minute_of_day = created_et.hour * 60 + created_et.minute
-
-    if not src_is_trading_day:
-        # Weekend / holiday origin — deadline is the next trading session.
-        deadline = _next_trading_session_deadline_et(created_ts_utc)
-        return "non_trading_day", deadline
-
-    if created_minute_of_day < _REGULAR_SESSION_OPEN_MIN:
-        # Pre-market on a trading day. Deadline is SAME day at 09:18 ET.
-        deadline = datetime(
-            src_date.year, src_date.month, src_date.day,
-            OVERNIGHT_REEVAL_DUE_HOUR_ET,
-            OVERNIGHT_REEVAL_DUE_MINUTE_ET,
-            tzinfo=ET,
-        )
-        return "pre_market", deadline
-
-    if created_minute_of_day >= _REGULAR_SESSION_CLOSE_MIN:
-        # Post-close on a trading day — deadline is the next trading session.
-        deadline = _next_trading_session_deadline_et(created_ts_utc)
-        return "post_close", deadline
-
-    # 09:30 ≤ minute < 16:00 on a trading day — contradictory shape.
-    # The queue producer does not legitimately mint the after-hours marker
-    # here, so treat it as ambiguous / fail closed. No deadline is returned.
-    return "regular_session", None
-
-
-def _classify_watching_row(
-    row: dict,
-    *,
-    client_id: str,
-    execution_mode: str,  # noqa: ARG001 — retained for signature stability; see (4) note below
-    now_utc: datetime,
-) -> tuple[str, dict]:
-    """Classify one trade_queue WATCHING row (that already has no matching
-    ENTRY order) into one of:
-
-      - "expected_after_hours_deferred": legitimate parked inventory before
-        its next authoritative processing deadline. Non-blocking.
-      - "after_hours_deferred_overdue": parked with the exact marker but at
-        or past its next authoritative processing deadline. Blocking.
-      - "ordinary_orphan": lacks the exact marker or fails any evidence gate
-        below. Blocking under the existing orphan rule.
-
-    ALL of the following must be true to reach a deferred classification.
-    Any ambiguity returns "ordinary_orphan" (existing fail-closed behavior).
-
-      1. client_id on the row equals the readiness client_id;
-      2. status is exactly "WATCHING";
-      3. last_error is exactly AFTER_HOURS_DEFERRED_MARKER;
-      4. created_ts parseable, tz-aware, non-future, within lookback window;
-      5. source-session window is post_close on a trading day (created_ts
-         in ET is >= 16:00 on an authoritative NYSE trading day). All
-         other origins — pre-market, regular session, non-trading day,
-         unknown-year calendar — return "ordinary_orphan".
-      6. next-trading-session deadline resolvable via NYSE calendar
-         authority (walks forward to the next actual trading session,
-         honoring weekends and holidays: e.g. a Friday post-close row
-         with Monday-holiday resolves to Tuesday 09:18 ET).
-
-    NOTE (PR #573 amendment 2026-09-03): payload.execution_mode is NOT
-    a gate. The 244 real production rows from the September 2 incident
-    do not carry that field; requiring it silently rejected legitimate
-    inventory. Mode safety is provided by client_id scoping in the SQL
-    and by the fact that trade_queue.client_id is unique per runtime
-    client. Same-client mixed-mode ambiguity (one client_id running
-    both PAPER and LIVE simultaneously) is not currently produced and
-    will be handled in a separate PR if it becomes a real shape.
-
-    The returned dict carries diagnostic fields (row_id, signal_id,
-    source session, resolved deadline) suitable for readiness
-    diagnostics — never for lifecycle mutation.
-    """
-    diag: dict = {
-        "id": row.get("id") if isinstance(row, dict) else None,
-        "signal_id": row.get("signal_id") if isinstance(row, dict) else None,
-    }
-    if not isinstance(row, dict):
-        return "ordinary_orphan", diag
-
-    # (1) client identity — must match exactly. A blank/mismatched client
-    # never earns the exemption on someone else's readiness call.
-    row_client = str(row.get("client_id") or "").strip()
-    if not row_client or row_client != str(client_id or "").strip():
-        return "ordinary_orphan", diag
-
-    # (2) status — exact WATCHING only.
-    if str(row.get("status") or "").strip() != "WATCHING":
-        return "ordinary_orphan", diag
-
-    # (3) exact marker equality — never substring, never case-fold. Any other
-    # last_error (including None) falls to ordinary_orphan.
-    if row.get("last_error") != AFTER_HOURS_DEFERRED_MARKER:
-        return "ordinary_orphan", diag
-
-    # (4) [removed] payload.execution_mode gate.
-    # PR #573 amendment (2026-09-03): the durable trade_queue.payload for
-    # the real 244 after-hours WATCHING rows produced by the September 2
-    # incident does NOT contain an execution_mode field. Requiring it here
-    # would silently reject legitimate production inventory.
-    #
-    # Mode safety is provided by the SQL scoping on trade_queue.client_id
-    # (the readiness client identity gate above) combined with the
-    # post-close-on-trading-day source-session gate below. If same-client
-    # mixed-mode (PAPER runner + LIVE runner sharing one client_id)
-    # becomes a proven production shape, it will be addressed in a
-    # separate PR against evidence — not by fabricating producer mode
-    # provenance the queue never persisted.
-
-    # (5) created_ts — must be tz-aware, non-future, within lookback bound.
-    created_utc = _parse_created_ts_to_utc(row.get("created_ts"))
-    if created_utc is None:
-        return "ordinary_orphan", diag
-    if created_utc > now_utc:
-        # Clock skew or malformed payload — never trust a future creation.
-        return "ordinary_orphan", diag
-    if (now_utc - created_utc).days > AFTER_HOURS_DEFERRED_MAX_LOOKBACK_DAYS:
-        return "ordinary_orphan", diag
-    diag["created_ts"] = created_utc.isoformat()
-
-    # (6) source-session classification + deadline resolution.
-    #
-    # PR #573 amendment (2026-09-03): only rows created POST-CLOSE on an
-    # authoritative NYSE trading day (created_ts_ET >= 16:00 on a trading
-    # day) may earn the deferred exemption. Every other source-session
-    # shape falls through to ordinary_orphan and follows the existing
-    # 5-minute grace + orphan block behavior.
-    #
-    #   post_close_trading_day   → eligible; deadline = next trading
-    #                              session at OVERNIGHT_REEVAL_DUE ET
-    #   pre_market_trading_day   → ordinary_orphan (contradictory shape;
-    #                              producer legitimately mints marker
-    #                              here but the amendment does not
-    #                              extend the exemption to pre-market)
-    #   regular_session          → ordinary_orphan (contradictory)
-    #   non_trading_day          → ordinary_orphan (amendment does not
-    #                              extend exemption to weekend/holiday-
-    #                              created rows; only Friday->Monday
-    #                              deadline resolution is honored for
-    #                              a post-close Friday row)
-    #   unknown / ambiguous      → ordinary_orphan (calendar fail-closed)
-    session_kind, deadline_et = _resolve_source_session_and_deadline_et(created_utc)
-    if session_kind != "post_close" or deadline_et is None:
-        diag["source_session"] = session_kind
-        return "ordinary_orphan", diag
-    diag["source_session"] = session_kind
-    deadline_utc = deadline_et.astimezone(timezone.utc)
-    diag["next_deadline_utc"] = deadline_utc.isoformat()
-    diag["next_deadline_et"] = deadline_et.isoformat()
-
-    if now_utc < deadline_utc:
-        return "expected_after_hours_deferred", diag
-    return "after_hours_deferred_overdue", diag
 
 
 def _overnight_reeval_due(now: datetime | None = None) -> bool:
@@ -669,44 +367,13 @@ def _post_overnight_reeval_success_exists(client_id: str, execution_mode: str, t
     return False
 
 
-def _query_client_state(
-    client_id: str,
-    *,
-    execution_mode: str | None = None,
-    now: datetime | None = None,
-) -> dict:
-    """Read the WATCHING/PROCESSING/PENDING_TRIGGER lifecycle facts for one
-    client and bucket the WATCHING rows-without-entry-orders into three
-    disjoint categories.
-
-    PR #573 additions to the returned dict:
-      - `expected_after_hours_deferred` (list): rows carrying the exact
-        canonical defer marker whose next-trading-session processing deadline
-        has NOT yet elapsed. These are diagnostic-only and MUST NOT be
-        counted as orphan blockers.
-      - `after_hours_deferred_overdue` (list): rows carrying the exact defer
-        marker whose next-trading-session deadline HAS elapsed while still
-        parked. These are blocking.
-
-    Backward-compat: `watching_orphans` (list) remains and now contains ONLY
-    ordinary orphans — rows older than WATCHING_ORPHAN_GRACE_MINUTES that
-    did not qualify for either deferred bucket (e.g. no marker, missing mode,
-    calendar ambiguity, marker mismatch, etc). This preserves the existing
-    downstream error "watching_rows_missing_orders_recommend_new_rescue"
-    without weakening any prior orphan protection.
-
-    The `execution_mode` and `now` parameters are keyword-only with defaults
-    so pre-#573 monkeypatches in tests continue to receive the correct
-    single-positional call shape while production code passes both.
-    """
+def _query_client_state(client_id: str) -> dict:
     from ap.db import conn, run_with_retry
 
-    now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc) \
-        if now is not None else datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
     processing_cutoff = now_utc - timedelta(minutes=PROCESSING_STALE_MINUTES)
     watching_cutoff = now_utc - timedelta(minutes=WATCHING_ORPHAN_GRACE_MINUTES)
     pending_cutoff = now_utc - timedelta(hours=PENDING_TRIGGER_LOOKBACK_HOURS)
-    readiness_mode = _normalize_mode(execution_mode)
 
     def _load():
         with conn() as c:
@@ -723,17 +390,13 @@ def _query_client_state(
             )
             stale_processing = [r[0] if not isinstance(r, dict) else r.get("id") for r in (c.fetchall() or [])]
 
-            # PR #573: project the fields the classifier needs — last_error,
-            # created_ts, payload — and drop the age-only filter so the
-            # classifier can bucket every candidate. The age filter still
-            # applies to the ordinary_orphan bucket below.
             c.execute(
                 """
-                SELECT q.id, q.signal_id, q.client_id, q.status,
-                       q.last_error, q.created_ts, q.payload
+                SELECT q.id, q.signal_id
                 FROM trade_queue q
                 WHERE q.client_id = %s
                   AND q.status = 'WATCHING'
+                  AND q.created_ts < %s
                   AND NOT EXISTS (
                       SELECT 1
                       FROM orders o
@@ -743,53 +406,14 @@ def _query_client_state(
                   )
                 ORDER BY q.id
                 """,
-                (client_id,),
+                (client_id, watching_cutoff),
             )
-            watching_orphans: list[dict] = []
-            expected_deferred: list[dict] = []
-            overdue_deferred: list[dict] = []
+            watching_orphans = []
             for row in (c.fetchall() or []):
-                if not isinstance(row, dict):
-                    # psycopg2 tuple cursor — hydrate a dict in the same
-                    # projected column order.
-                    row = {
-                        "id": row[0], "signal_id": row[1], "client_id": row[2],
-                        "status": row[3], "last_error": row[4],
-                        "created_ts": row[5], "payload": row[6],
-                    }
-                kind, diag = _classify_watching_row(
-                    row,
-                    client_id=client_id,
-                    execution_mode=readiness_mode,
-                    now_utc=now_utc,
-                )
-                if kind == "expected_after_hours_deferred":
-                    expected_deferred.append(diag)
-                elif kind == "after_hours_deferred_overdue":
-                    overdue_deferred.append(diag)
+                if isinstance(row, dict):
+                    watching_orphans.append({"id": row.get("id"), "signal_id": row.get("signal_id")})
                 else:
-                    # Ordinary orphan bucket — preserve the pre-#573 age
-                    # threshold so we do not create new blocking noise for
-                    # rows still inside the legacy 5-minute grace.
-                    #
-                    # PR #573 amendment (2026-09-03 review 5101059272):
-                    # `created_utc > now_utc` (future timestamp) must NOT
-                    # earn the grace-window skip. Without the upper bound
-                    # a corrupt future ts satisfies `>= watching_cutoff`
-                    # trivially, causing the row to silently vanish from
-                    # readiness — neither deferred nor orphan-reported.
-                    # Only a proven non-future fresh row receives grace.
-                    created_utc = _parse_created_ts_to_utc(row.get("created_ts"))
-                    if (
-                        created_utc is not None
-                        and created_utc <= now_utc
-                        and created_utc >= watching_cutoff
-                    ):
-                        continue
-                    watching_orphans.append({
-                        "id": row.get("id"),
-                        "signal_id": row.get("signal_id"),
-                    })
+                    watching_orphans.append({"id": row[0], "signal_id": row[1]})
 
             c.execute(
                 """
@@ -828,8 +452,6 @@ def _query_client_state(
             return {
                 "stale_processing_ids": stale_processing,
                 "watching_orphans": watching_orphans,
-                "expected_after_hours_deferred": expected_deferred,
-                "after_hours_deferred_overdue": overdue_deferred,
                 "pending_trigger_rows": pending_trigger,
                 "watching_count": int(watching_count or 0),
             }
@@ -837,8 +459,6 @@ def _query_client_state(
     return run_with_retry(_load) or {
         "stale_processing_ids": [],
         "watching_orphans": [],
-        "expected_after_hours_deferred": [],
-        "after_hours_deferred_overdue": [],
         "pending_trigger_rows": [],
         "watching_count": 0,
     }
@@ -1003,7 +623,7 @@ def run_preopen_autonomous_readiness(
     if selector_identity["quote_source"] == "unknown" or not selector_identity["tradier_base_url"]:
         errors.append("selector_quote_identity_unresolved")
 
-    client_state = _query_client_state(client_id, execution_mode=mode, now=now)
+    client_state = _query_client_state(client_id)
     details["client_state"] = client_state
 
     if client_state.get("stale_processing_ids"):
@@ -1011,21 +631,6 @@ def run_preopen_autonomous_readiness(
 
     if client_state.get("watching_orphans"):
         errors.append("watching_rows_missing_orders_recommend_new_rescue")
-
-    # PR #573: after-hours defer classification.
-    # `expected_after_hours_deferred` rows are legitimate parked inventory
-    # awaiting the next authoritative overnight/pre-open consumer; they are
-    # visible in diagnostics but MUST NOT block LIVE entries by themselves
-    # before their next-trading-session deadline. `after_hours_deferred_overdue`
-    # rows carry the exact marker but have passed that deadline still parked —
-    # they are blocking with a distinct reason so operators can tell the two
-    # apart in incident review.
-    expected_after_hours = client_state.get("expected_after_hours_deferred") or []
-    overdue_after_hours = client_state.get("after_hours_deferred_overdue") or []
-    details["expected_after_hours_deferred_count"] = len(expected_after_hours)
-    details["after_hours_deferred_overdue_count"] = len(overdue_after_hours)
-    if overdue_after_hours:
-        errors.append("after_hours_deferred_overdue")
 
     unowned_pending = _pending_trigger_without_watcher(runner, client_state.get("pending_trigger_rows") or [])
     details["pending_trigger_without_watcher"] = unowned_pending
@@ -1082,11 +687,6 @@ def run_preopen_autonomous_readiness(
         "runner_not_alive",
         "overnight_reeval_missing",
         "pending_trigger_without_watcher_ownership",
-        # PR #573: an overdue after-hours defer row is a row still parked past
-        # its authoritative next-trading-session processing deadline. Global
-        # overnight_reeval success does not erase this — the row itself is the
-        # unresolved-lifecycle evidence. LIVE must fail closed on this.
-        "after_hours_deferred_overdue",
     }
     if mode == "live" and any(err in blocked_keys for err in errors):
         status = "BLOCKED"

@@ -187,7 +187,6 @@ jobs:
             tests/test_p0_broker_confirmed_daily_trade_count.py \
             tests/test_p0_schema_attestation_and_migration_runner.py \
             tests/test_p0_position_execution_mode_schema.py \
-            tests/test_p0_mode_scoped_position_snapshot.py \
             tests/test_p0_live_startup_preflight.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_live_submit_gates.py \
@@ -202,7 +201,6 @@ jobs:
             tests/test_p0_reconciler_exit_filled_query_parameterization.py \
             tests/test_p0_reconciler_historical_entry_truth.py \
             tests/test_p0_live_readiness_blocked_keys.py \
-            tests/test_p0_after_hours_watching_readiness.py \
             tests/test_p0_readiness_deadline_enforcement.py \
             tests/test_p0_startup_readiness_fail_closed.py \
             tests/test_p0_manual_client_close_proof.py \
