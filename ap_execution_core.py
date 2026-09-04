@@ -6318,6 +6318,22 @@ class APExecutionCore:
                 # copyback to DEFERRED:* plans discards a successful retry and
                 # leaves the stale contract/penny limit in place.
                 if _sel_is_real:
+                    # INTELLIGENCE CAPTURE (docs/pr_specs/intelligence_outcome_capture_20260903.md):
+                    # persist feature-at-signal for the winning contract. Fail-soft
+                    # and side-effect only — it cannot alter selection because it
+                    # runs after _sel_is_real is already decided and swallows all
+                    # errors internally.
+                    try:
+                        from ap.selector_feature_capture import (
+                            capture_selected_contract_features,
+                        )
+                        capture_selected_contract_features(
+                            getattr(self, "store", None),
+                            str(getattr(approved_plan, "signal_id", "") or ""),
+                            _sel,
+                        )
+                    except Exception:
+                        pass
                     try:
                         approved_plan.contract_symbol = _sel_contract
                         _sel_price = _sel_price_candidate
@@ -10693,8 +10709,30 @@ class APExecutionCore:
             "position_id":        str(getattr(pos, "position_id", "") or ""),
             "local_order_id":     str(getattr(pos, "local_order_id", "") or ""),
             "signal":             sig,
+            # INTELLIGENCE CAPTURE (docs/pr_specs/intelligence_outcome_capture_20260903.md):
+            # snapshot scoring metadata NOW, while it is still present on sig, so
+            # record_outcome() can label signal_outcomes even if the exit-time
+            # signal dict later loses these fields. Values are carried, never
+            # recomputed or guessed; absent fields are simply omitted.
+            "signal_meta":        {
+                k: v for k, v in {
+                    "pattern":   sig.get("pattern"),
+                    "side":      pos.side,
+                    "timeframe": sig.get("timeframe"),
+                    "score":     (float(sig.get("score")) if sig.get("score") not in (None, "") else None),
+                    "regime":    sig.get("regime"),
+                    "confluence": sig.get("confluence"),
+                }.items() if v not in (None, "")
+            },
             "paper":              self.paper,
         }
+        # Also make the carried metadata visible on the signal dict itself so the
+        # single record_outcome() call site (which reads staged["signal"]) sees it.
+        try:
+            if isinstance(sig, dict):
+                sig.setdefault("signal_meta", pos._proof_staged["signal_meta"])  # type: ignore[index]
+        except Exception:
+            pass
         pos.proof_logged = True  # type: ignore[attr-defined]
         log.info(
             "[EXIT_SUBMITTED_PROOF_STAGED] %s | est_exit=$%.2f pnl=%.1f%% | "
