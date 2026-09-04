@@ -4056,7 +4056,7 @@ class APOrderStateMachine:
         """Return an expired phase-one claim to RETRY_WAIT without a new attempt.
 
         This CAS is intentionally narrower than ordinary stale-trigger recovery.
-        It can only release the exact LIVE owner of a market-truth-pending claim
+        It can only release the exact LIVE/PAPER owner of a market-truth-pending claim
         with coherent N/N/N attempt mirrors and zero broker/submit evidence.
         Generation and attempt are preserved; no replacement owner is installed.
         """
@@ -4070,7 +4070,7 @@ class APOrderStateMachine:
         if (
             not _owner
             or not _signal
-            or _mode != "live"
+            or _mode not in {"live", "paper"}
             or not _reason
             or not _next
             or not isinstance(selector_failure, dict)
