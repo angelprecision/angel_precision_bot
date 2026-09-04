@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
@@ -317,29 +318,26 @@ def test_cross_mode_isolation_uses_strict_execution_mode_equality(monkeypatch):
     assert "LOWER(COALESCE(execution_mode, '')) = %s" in paper_sql
 
 
-def test_exact_numeric_zero_closes_only_after_durable_identity_verification(monkeypatch):
+def test_exact_numeric_zero_persists_marker_without_terminalizing_candidate(monkeypatch):
     engine = _engine(monkeypatch, broker_qty=0)
     pos = _pos()
     engine._positions = [pos]
     engine._positions_by_id = {pos.position_id: pos}
-    events = []
-
-    class OrderedCloseConn(_DbConn):
-        def fetchone(self):
-            events.append(("reread", pos.closed, pos.quantity_remaining, pos.position_id in engine._positions_by_id))
-            return self.row
-
-    fake = OrderedCloseConn(rowcount=1)
-    monkeypatch.setattr(ap_db, "conn", lambda: fake)
-    monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *a, **k: fn())
+    fake = _patch_db(monkeypatch, rowcount=1)
 
     result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
 
-    assert result == BrokerFlatCloseResult(True, 1, True, "closed", None)
-    assert events == [("reread", False, 1, True)]
-    assert pos.closed is True
-    assert pos.quantity_remaining == 0
-    assert engine.active_positions() == []
+    assert result == BrokerFlatCloseResult(False, 1, False, "reconciliation_pending", None)
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert engine.active_positions() == [pos]
+    sql, params = fake.queries[0]
+    assert "UPDATE positions" in sql
+    assert "status = 'CLOSED'" not in sql
+    assert "quantity_remaining = 0" not in sql
+    marker = json.loads(params[0])
+    assert marker["synthetic_position_stale_broker_flat"] is True
+    assert marker["reconciler_manual_close_needed"] is True
 
 
 def test_broker_flat_reread_wrong_mode_fails_verification(monkeypatch):
@@ -575,26 +573,32 @@ def test_degraded_ownership_persist_exception_is_critical_state(monkeypatch):
     assert alerts and alerts[0][0] == "PROTECTIVE_MONITORING_UNPERSISTED"
 
 
-def test_broker_flat_close_removes_memory_only_after_verified_durable_close(monkeypatch):
+def test_submit_exit_decision_broker_flat_retains_manual_reconciliation_candidate(monkeypatch):
     engine = _engine(monkeypatch, broker_qty=0)
     pos = _pos()
     engine._positions = [pos]
     engine._positions_by_id = {pos.position_id: pos}
-    _patch_db(monkeypatch, rowcount=1, row={
-        "id": pos.position_id,
-        "client_id": pos.client_id,
-        "execution_mode": pos.execution_mode,
-        "contract": pos.option_symbol,
-        "status": "CLOSED",
-        "quantity_remaining": 0,
-    })
+    fake = _patch_db(monkeypatch, rowcount=1)
+    callbacks = []
+    engine.on_exit = lambda position, decision: callbacks.append((position, decision))
 
-    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+    result = engine._submit_exit_decision(pos, _decision())
 
-    assert result == BrokerFlatCloseResult(True, 1, True, "closed", None)
-    assert pos.closed is True
-    assert pos.quantity_remaining == 0
-    assert engine.active_positions() == []
+    assert result is False
+    assert callbacks == []
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert engine.active_positions() == [pos]
+    assert engine._positions_by_id[pos.position_id] is pos
+    assert engine.broker.session.post.call_count == 0
+    assert engine.broker.session.delete.call_count == 0
+    position_updates = [(sql, params) for sql, params in fake.queries if "UPDATE positions" in sql]
+    assert position_updates
+    assert all("status = 'CLOSED'" not in sql for sql, _ in position_updates)
+    assert all("quantity_remaining = 0" not in sql for sql, _ in position_updates)
+    marker = json.loads(position_updates[-1][1][0])
+    assert marker["synthetic_position_stale_broker_flat"] is True
+    assert marker["reconciler_manual_close_needed"] is True
 
 
 def test_broker_flat_zero_rowcount_keeps_position_monitored(monkeypatch):

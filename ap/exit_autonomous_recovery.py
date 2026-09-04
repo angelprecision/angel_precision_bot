@@ -8,8 +8,8 @@ Safety rules
 1. Never clear an exit quarantine by time alone.
 2. Never authorize replacement if ANY matching live broker exit order is found.
 3. Prefer fill/close truth when broker/DB evidence exists.
-4. On ambiguous matching live exits, try broker cancel first and only unlock after
-   cancel proof or terminal broker confirmation.
+4. This containment path never cancels or authorizes a replacement from a
+   partial or negative lookup; canonical reconciliation owns that decision.
 5. If broker truth is ambiguous, alert/no-op.
 6. Quote staleness is reported as a kill-switch signal for new entries, not a
    reason to guess exit truth.
@@ -19,16 +19,25 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
+
+from ap.exit_safety import (
+    _normalize_contract,
+    is_valid_exact_occ_contract,
+    resolve_exit_broker_truth,
+)
 
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
 OPEN_BROKER_STATUSES = {"open", "pending", "accepted", "submitted", "queued", "working", "acknowledged", "partially_filled"}
 TERMINAL_BROKER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired"}
 CANCEL_CONFIRMED_STATUSES = {"canceled", "cancelled", "rejected", "expired"}
+BROKER_FLAT_RECONCILIATION_PENDING = "BROKER_FLAT_CLOSE_PENDING"
 QUOTE_STALE_WARN_SEC = int(os.getenv("EXIT_RECOVERY_QUOTE_STALE_SEC", "30"))
 CANCEL_PROOF_RETRIES = int(os.getenv("EXIT_RECOVERY_CANCEL_RETRIES", "3"))
 CANCEL_PROOF_DELAY_SEC = float(os.getenv("EXIT_RECOVERY_CANCEL_DELAY_SEC", "1.0"))
@@ -43,7 +52,7 @@ def _norm(value: Any) -> str:
 
 
 def _norm_contract(value: Any) -> str:
-    return _norm(value).upper().replace(" ", "")
+    return _normalize_contract(value)
 
 
 def _status(raw: dict) -> str:
@@ -55,26 +64,139 @@ def _broker_order_id(raw: dict) -> str:
 
 
 def _contract(raw: dict) -> str:
-    return _norm_contract(raw.get("contract") or raw.get("symbol") or raw.get("option_symbol") or raw.get("instrument"))
+    records = [raw]
+    nested = raw.get("raw") if isinstance(raw, dict) else None
+    if isinstance(nested, dict):
+        records.append(nested)
+    exact_values: set[str] = set()
+    underlying_values: set[str] = set()
+    invalid = False
+    for record in records:
+        for key in (
+            "option_symbol",
+            "optionSymbol",
+            "contract",
+            "instrument",
+            "option_contract",
+            "optionContract",
+            "symbol",
+        ):
+            if key not in record or record.get(key) in (None, ""):
+                continue
+            value = record.get(key)
+            normalized = _norm_contract(value)
+            if is_valid_exact_occ_contract(value):
+                exact_values.add(normalized)
+            elif key in {"symbol", "instrument"} and re.fullmatch(r"[A-Z0-9.]{1,6}", normalized):
+                underlying_values.add(normalized)
+            else:
+                invalid = True
+    if len(exact_values) != 1 or invalid:
+        return ""
+    exact = next(iter(exact_values))
+    root = exact[:-15]
+    if any(value != root for value in underlying_values):
+        return ""
+    return exact
 
 
-def _qty(raw: dict) -> int:
+def _strict_qty(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        quantity = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        not quantity.is_finite()
+        or quantity != quantity.to_integral_value()
+        or quantity < 0
+    ):
+        return None
+    return int(quantity)
+
+
+def _qty(raw: dict) -> Optional[int]:
     for key in ("qty", "quantity", "order_qty", "remaining_qty", "remaining_quantity", "filled_qty", "filled_quantity", "exec_quantity"):
-        try:
-            val = raw.get(key)
-            if val not in (None, ""):
-                return abs(int(float(val)))
-        except Exception:
-            pass
-    return 0
+        if key not in raw or raw.get(key) in (None, ""):
+            continue
+        return _strict_qty(raw.get(key))
+    return None
 
 
 def _is_exit_like(raw: dict) -> bool:
-    text = " ".join(str(raw.get(k) or "") for k in (
-        "side", "action", "instruction", "order_action", "transaction_type", "trade_action", "type", "description", "memo", "notes"
-    )).lower()
-    compact = text.replace("_", "").replace("-", "").replace(" ", "")
-    return "selltoclose" in compact or compact == "stc" or "sell to close" in text
+    values: list[str] = []
+    records = [raw]
+    nested = raw.get("raw") if isinstance(raw, dict) else None
+    if isinstance(nested, dict):
+        records.append(nested)
+    for record in records:
+        values.extend(
+            str(record.get(key) or "").strip().lower()
+            for key in (
+                "side",
+                "action",
+                "instruction",
+                "order_action",
+                "transaction_type",
+                "trade_action",
+                "position_effect",
+            )
+        )
+    compact = {re.sub(r"[\s_-]+", "", value) for value in values if value}
+    if compact.intersection({"selltoclose", "stc"}):
+        return True
+    return "sell" in compact and bool(compact.intersection({"close", "closing"}))
+
+
+def _has_structured_order_direction(raw: dict) -> bool:
+    records = [raw]
+    nested = raw.get("raw") if isinstance(raw, dict) else None
+    if isinstance(nested, dict):
+        records.append(nested)
+    return any(
+        str(record.get(key) or "").strip()
+        for record in records
+        for key in (
+            "side",
+            "action",
+            "instruction",
+            "order_action",
+            "transaction_type",
+            "trade_action",
+            "position_effect",
+        )
+    )
+
+
+def _has_order_instrument_identity(raw: dict) -> bool:
+    """Accept valid option or underlying identities in account-wide order pages."""
+    records = [raw]
+    nested = raw.get("raw") if isinstance(raw, dict) else None
+    if isinstance(nested, dict):
+        records.append(nested)
+    saw_identity = False
+    for record in records:
+        for key in (
+            "option_symbol",
+            "optionSymbol",
+            "contract",
+            "instrument",
+            "option_contract",
+            "optionContract",
+            "symbol",
+        ):
+            if key not in record or record.get(key) in (None, ""):
+                continue
+            value = record.get(key)
+            if is_valid_exact_occ_contract(value):
+                saw_identity = True
+                continue
+            if key in {"symbol", "instrument"} and re.fullmatch(r"[A-Z0-9.]{1,6}", _norm_contract(value)):
+                saw_identity = True
+                continue
+            return False
+    return saw_identity
 
 
 def _dt_age_seconds(dt: Any) -> Optional[float]:
@@ -90,8 +212,84 @@ def _dt_age_seconds(dt: Any) -> Optional[float]:
         return None
 
 
-def _list_open_orders(broker: Any) -> list[dict]:
-    for method_name in ("list_open_orders", "get_open_orders", "list_orders", "orders"):
+def _coerce_order_row(raw: Any) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    if isinstance(raw.get("order"), dict):
+        row = dict(raw["order"])
+        for key in ("status", "state", "order_status"):
+            if key not in row and raw.get(key) not in (None, ""):
+                row[key] = raw[key]
+        return row
+    return dict(raw)
+
+
+def _explicit_order_error(raw: Any) -> bool:
+    row = _coerce_order_row(raw)
+    if row is None:
+        return True
+    if _status(row) in {"error", "failed", "failure", "unavailable"}:
+        return True
+    return any(
+        key in row and row.get(key) not in (None, "")
+        for key in ("error", "errors", "message", "reason")
+    )
+
+
+def _looks_like_order_row(row: dict) -> bool:
+    """Require a recognizable broker order before accepting a row."""
+    if not isinstance(row, dict) or not _broker_order_id(row):
+        return False
+    if _status(row) not in OPEN_BROKER_STATUSES | TERMINAL_BROKER_STATUSES:
+        return False
+    if not _has_structured_order_direction(row) or not _has_order_instrument_identity(row):
+        return False
+    quantity = _qty(row)
+    return quantity is not None and quantity > 0
+
+
+def _parse_order_payload(payload: Any) -> tuple[str, list[dict]]:
+    if payload is None:
+        return "unavailable", []
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        if _explicit_order_error(payload):
+            return "malformed", []
+        node = payload.get("orders")
+        if node is None:
+            for key in ("data", "results", "items"):
+                if key in payload:
+                    node = payload[key]
+                    break
+        if node is None:
+            # A single normalized order row is also accepted.
+            row = _coerce_order_row(payload)
+            return ("available", [row]) if row is not None and _looks_like_order_row(row) else ("malformed", [])
+        if isinstance(node, dict):
+            if not node:
+                return "malformed", []
+            node = node.get("order")
+        if node is None or node == "null":
+            return "malformed", []
+        rows = node if isinstance(node, list) else [node]
+    else:
+        return "malformed", []
+
+    if not isinstance(rows, list):
+        return "malformed", []
+    normalized: list[dict] = []
+    for raw in rows:
+        row = _coerce_order_row(raw)
+        if row is None or not _looks_like_order_row(row):
+            return "malformed", []
+        normalized.append(row)
+    return "available", normalized
+
+
+def _list_open_orders_truth(broker: Any) -> tuple[str, list[dict]]:
+    """Return order-list truth without laundering lookup failure into an empty page."""
+    for method_name in ("list_orders", "list_open_orders", "get_open_orders", "orders"):
         method = getattr(broker, method_name, None)
         if not callable(method):
             continue
@@ -100,53 +298,151 @@ def _list_open_orders(broker: Any) -> list[dict]:
                 result = method(status="open")
             except TypeError:
                 result = method()
-            if result is None:
-                log.warning("broker.%s returned None during autonomous recovery", method_name)
-                continue
-            if isinstance(result, dict):
-                for key in ("orders", "data", "results", "items"):
-                    if isinstance(result.get(key), list):
-                        return [dict(x) for x in result[key] if isinstance(x, dict)]
-                return [result]
-            if isinstance(result, list):
-                return [dict(x) for x in result if isinstance(x, dict)]
         except Exception as exc:
             log.warning("broker.%s failed during autonomous recovery: %s", method_name, exc)
-    return []
+            return "unavailable", []
+        state, rows = _parse_order_payload(result)
+        if state != "available":
+            log.warning("broker.%s returned %s during autonomous recovery", method_name, state)
+        return state, rows
+
+    # Legacy adapters may expose only the raw endpoint.  This fallback is kept
+    # after the authoritative list-orders interface so current TradierBroker
+    # pagination/includeTags/error propagation remains in force.
+    raw_get_declared = getattr(type(broker), "_get", None)
+    account_value = str(
+        getattr(getattr(broker, "cfg", None), "account_id", None) or ""
+    ).strip()
+    if callable(raw_get_declared) and account_value:
+        try:
+            result = broker._get(f"/v1/accounts/{account_value}/orders")
+        except Exception as exc:
+            log.warning("broker._get orders failed during autonomous recovery: %s", exc)
+            return "unavailable", []
+        state, rows = _parse_order_payload(result)
+        if state != "available":
+            log.warning("broker._get orders returned %s during autonomous recovery", state)
+        return state, rows
+    return "unavailable", []
 
 
-def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
-    if not broker_order_id:
-        return None
+def _list_open_orders(broker: Any) -> list[dict]:
+    # Compatibility wrapper for callers that only need rows.  Recovery paths
+    # use _list_open_orders_truth so an empty list is never negative proof.
+    _state, rows = _list_open_orders_truth(broker)
+    return rows
+
+
+def _filled_order_quantity(raw: dict) -> Optional[int]:
+    for key in (
+        "filled_qty",
+        "filled_quantity",
+        "exec_quantity",
+        "exec_qty",
+        "quantity_filled",
+        "quantity",
+    ):
+        if key in raw and raw.get(key) not in (None, ""):
+            return _strict_qty(raw.get(key))
+    return None
+
+
+def _extract_fill_price(raw: dict) -> Optional[float]:
+    # A submitted limit price is not execution economics.
+    for key in (
+        "avg_fill_price",
+        "average_fill_price",
+        "fill_price",
+        "last_fill_price",
+        "filled_avg_price",
+    ):
+        value = raw.get(key)
+        if value in (None, "") or isinstance(value, bool):
+            continue
+        try:
+            price = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if price.is_finite() and price > 0:
+            return float(price)
+    return None
+
+
+def _get_order_truth(broker: Any, broker_order_id: str) -> tuple[str, Optional[dict]]:
+    """Fetch one order while preserving unavailable/malformed truth as HOLD."""
+    requested_id = _norm(broker_order_id)
+    if not requested_id:
+        return "unavailable", None
     method = getattr(broker, "get_order", None)
     if not callable(method):
-        log.warning("broker.get_order missing during autonomous recovery")
-        return None
+        return "unavailable", None
     try:
-        raw = method(broker_order_id)
-        if isinstance(raw, dict):
-            return dict(raw)
-        log.warning("broker.get_order(%s) returned non-dict payload: %r", broker_order_id, raw)
-        return None
+        raw = method(requested_id)
     except Exception as exc:
-        log.warning("broker.get_order(%s) failed: %s", broker_order_id, exc)
-        return None
+        log.warning("broker.get_order(%s) failed during autonomous recovery: %s", requested_id, exc)
+        return "unavailable", None
+    row = _coerce_order_row(raw)
+    if row is None or _explicit_order_error(row):
+        return "malformed", None
+    if _broker_order_id(row) != requested_id:
+        return "identity_unproven", None
+    if not _status(row):
+        return "malformed", None
+    if not _has_structured_order_direction(row):
+        return "malformed", None
+    if not _contract(row) or not _is_exit_like(row):
+        return "identity_unproven", None
+    order_qty = _qty(row)
+    if order_qty is None or order_qty <= 0:
+        return "malformed", None
+    if _status(row) == "filled":
+        filled_qty = _filled_order_quantity(row)
+        fill_price = _extract_fill_price(row)
+        if filled_qty is None or filled_qty <= 0 or fill_price is None:
+            return "malformed", None
+        row["_recovery_fill_qty"] = filled_qty
+        row["_recovery_fill_price"] = fill_price
+    return "available", row
+
+
+def _matching_open_exit_orders_with_truth(
+    broker: Any,
+    contract: str,
+    *,
+    exclude_broker_id: str = "",
+) -> tuple[str, list[tuple[str, dict]]]:
+    if not is_valid_exact_occ_contract(contract):
+        return "identity_unproven", []
+    state, rows = _list_open_orders_truth(broker)
+    if state != "available":
+        return state, []
+    matches: list[tuple[str, dict]] = []
+    for row in rows:
+        if not _is_exit_like(row):
+            continue
+        row_contract = _contract(row)
+        if not row_contract:
+            return "identity_unproven", []
+        if row_contract != contract:
+            continue
+        status = _status(row)
+        if not status:
+            return "malformed", []
+        if status not in OPEN_BROKER_STATUSES:
+            continue
+        broker_id = _broker_order_id(row)
+        if not broker_id:
+            return "identity_unproven", []
+        if exclude_broker_id and broker_id == exclude_broker_id:
+            continue
+        matches.append((broker_id, row))
+    return "available", matches
 
 
 def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> list[tuple[str, dict]]:
-    matches: list[tuple[str, dict]] = []
-    for raw in _list_open_orders(broker):
-        if contract and _contract(raw) != contract:
-            continue
-        if not _is_exit_like(raw):
-            continue
-        st = _status(raw)
-        if st and st not in OPEN_BROKER_STATUSES:
-            continue
-        bid = _broker_order_id(raw)
-        if not bid or (exclude_broker_id and bid == exclude_broker_id):
-            continue
-        matches.append((bid, raw))
+    _state, matches = _matching_open_exit_orders_with_truth(
+        broker, contract, exclude_broker_id=exclude_broker_id
+    )
     return matches
 
 
@@ -194,7 +490,26 @@ def _cancel_order_with_proof(
 
 
 def _position_contract(pos: Any) -> str:
-    return _norm_contract(getattr(pos, "option_symbol", "") or getattr(pos, "contract", "") or getattr(pos, "symbol", ""))
+    exact: set[str] = set()
+    underlying: set[str] = set()
+    invalid = False
+    for name in ("option_symbol", "contract", "symbol", "instrument"):
+        value = getattr(pos, name, "")
+        if value in (None, ""):
+            continue
+        normalized = _norm_contract(value)
+        if is_valid_exact_occ_contract(value):
+            exact.add(normalized)
+        elif name in {"symbol", "instrument"} and re.fullmatch(r"[A-Z0-9.]{1,6}", normalized):
+            underlying.add(normalized)
+        else:
+            invalid = True
+    if invalid or len(exact) != 1:
+        return ""
+    contract = next(iter(exact))
+    if any(value != contract[:-15] for value in underlying):
+        return ""
+    return contract
 
 
 def _position_id(pos: Any) -> str:
@@ -206,6 +521,51 @@ def _pending_identity(pos: Any) -> tuple[str, str]:
         _norm(getattr(pos, "pending_exit_local_order_id", "")),
         _norm(getattr(pos, "pending_exit_broker_order_id", "")),
     )
+
+
+def _position_remaining(pos: Any) -> Optional[int]:
+    for name in ("quantity_remaining", "contracts", "quantity"):
+        value = getattr(pos, name, None)
+        if value not in (None, ""):
+            return _strict_qty(value)
+    return None
+
+
+def _order_identity_mismatch(raw: dict, pos: Any) -> str:
+    expected_client = _norm(getattr(pos, "client_id", "")).lower()
+    expected_mode = _norm(getattr(pos, "execution_mode", "")).lower()
+    records = [raw]
+    nested = raw.get("raw") if isinstance(raw, dict) else None
+    if isinstance(nested, dict):
+        records.append(nested)
+    for record in records:
+        for key in ("client_id", "clientId", "email"):
+            value = _norm(record.get(key)).lower()
+            if value and expected_client and value != expected_client:
+                return "client"
+        for key in ("execution_mode", "executionMode", "mode"):
+            value = _norm(record.get(key)).lower()
+            if value and expected_mode and value != expected_mode:
+                return "execution_mode"
+    return ""
+
+
+def _order_has_explicit_owner(raw: dict) -> bool:
+    records = [raw]
+    nested = raw.get("raw") if isinstance(raw, dict) else None
+    if isinstance(nested, dict):
+        records.append(nested)
+    has_client = any(
+        _norm(record.get(key))
+        for record in records
+        for key in ("client_id", "clientId", "email")
+    )
+    has_mode = any(
+        _norm(record.get(key)).lower() in {"live", "paper"}
+        for record in records
+        for key in ("execution_mode", "executionMode", "mode")
+    )
+    return bool(has_client and has_mode)
 
 
 def quote_health(pos: Any, *, stale_sec: int = QUOTE_STALE_WARN_SEC) -> dict:
@@ -232,6 +592,24 @@ class RecoveryAction:
     details: dict = field(default_factory=dict)
 
 
+def _string_identity_attr(obj: Any, name: str) -> str:
+    value = getattr(obj, name, None) if obj is not None else None
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _recovery_engine_identity(exit_engine: Any) -> tuple[str, str]:
+    client_id = (
+        _string_identity_attr(exit_engine, "_email")
+        or _string_identity_attr(exit_engine, "client_id")
+    )
+    mode = ""
+    master_control = getattr(exit_engine, "master_control", None) if exit_engine is not None else None
+    candidate = getattr(master_control, "mode", None) if master_control is not None else None
+    if isinstance(candidate, str):
+        mode = candidate.strip().lower()
+    return client_id, mode
+
+
 def _mark_replacement_safe(exit_engine: Any, pid: str, *, reason: str, local_id: str, broker_id: str, details: dict) -> RecoveryAction:
     if exit_engine and hasattr(exit_engine, "mark_exit_replacement_safe"):
         exit_engine.mark_exit_replacement_safe(
@@ -254,145 +632,364 @@ def _mark_replacement_safe(exit_engine: Any, pid: str, *, reason: str, local_id:
     return RecoveryAction("NOOP", "no_replacement_or_clear_hook_available", pid, local_id, broker_id, details)
 
 
-def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm: Any = None) -> RecoveryAction:
+def _hold(
+    reason: str,
+    pid: str = "",
+    local_id: str = "",
+    broker_id: str = "",
+    details: Optional[dict] = None,
+) -> RecoveryAction:
+    return RecoveryAction("NOOP", reason, pid, local_id, broker_id, details or {})
+
+
+def _broker_position_state(broker: Any, *, client_id: str, contract: str) -> str:
+    if not is_valid_exact_occ_contract(contract):
+        return "identity_unproven"
+    try:
+        truth = resolve_exit_broker_truth(
+            broker=broker,
+            client_id=client_id,
+            contract=contract,
+        )
+    except Exception as exc:
+        log.warning("broker position truth failed during autonomous recovery: %s", exc)
+        return "unavailable"
+    if truth.get("is_fresh_exact") is not True:
+        snapshot_status = str((truth.get("audit") or {}).get("snapshot_status") or "")
+        if snapshot_status == "broker_positions_malformed":
+            return "malformed"
+        if snapshot_status == "contract_identity_unproven":
+            return "identity_unproven"
+        return "unavailable"
+    quantity = truth.get("broker_truth_open_qty")
+    if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity < 0:
+        return "malformed"
+    return "held" if quantity > 0 else "flat"
+
+
+def _pending_order_quantity(pos: Any, raw: dict) -> Optional[int]:
+    order_qty = _qty(raw)
+    if order_qty is not None and order_qty > 0:
+        return order_qty
+    position_qty = _strict_qty(getattr(pos, "pending_exit_qty", None))
+    return position_qty if position_qty is not None and position_qty > 0 else None
+
+
+def recover_exit_position(
+    pos: Any,
+    *,
+    broker: Any,
+    exit_engine: Any = None,
+    osm: Any = None,
+    expected_client_id: Optional[str] = None,
+    expected_execution_mode: Optional[str] = None,
+) -> RecoveryAction:
     pid = _position_id(pos)
     local_id, pending_broker_id = _pending_identity(pos)
     contract = _position_contract(pos)
     qh = quote_health(pos)
+    position_client = _norm(getattr(pos, "client_id", ""))
+    position_mode = _norm(getattr(pos, "execution_mode", "")).lower()
 
     if not broker or not pid:
-        return RecoveryAction("NOOP", "missing_broker_or_position_id", pid, local_id, pending_broker_id, {"quote_health": qh})
+        return _hold("missing_broker_or_position_id", pid, local_id, pending_broker_id, {"quote_health": qh})
+    if not position_client or position_mode not in {"live", "paper"}:
+        return _hold(
+            "recovery_position_identity_unproven",
+            pid,
+            local_id,
+            pending_broker_id,
+            {"client_id": position_client, "execution_mode": position_mode, "quote_health": qh},
+        )
+    engine_client, engine_mode = _recovery_engine_identity(exit_engine)
+    expected_client = _norm(expected_client_id) if expected_client_id is not None else engine_client
+    expected_mode = _norm(expected_execution_mode).lower() if expected_execution_mode is not None else engine_mode
+    if expected_client and position_client.lower() != expected_client.lower():
+        return _hold(
+            "recovery_client_identity_mismatch",
+            pid,
+            local_id,
+            pending_broker_id,
+            {"client_id": position_client, "expected_client_id": expected_client, "quote_health": qh},
+        )
+    if expected_mode and position_mode != expected_mode:
+        return _hold(
+            "recovery_execution_mode_mismatch",
+            pid,
+            local_id,
+            pending_broker_id,
+            {"execution_mode": position_mode, "expected_execution_mode": expected_mode, "quote_health": qh},
+        )
+    if not contract:
+        return _hold("broker_contract_identity_unproven", pid, local_id, pending_broker_id, {"quote_health": qh})
 
     # Exact broker identity path.
     if pending_broker_id:
-        raw = _get_order(broker, pending_broker_id)
-        if raw:
-            st = _status(raw)
-            if st in OPEN_BROKER_STATUSES:
+        order_state, raw = _get_order_truth(broker, pending_broker_id)
+        if order_state != "available" or raw is None:
+            return _hold(
+                f"broker_order_truth_{order_state}",
+                pid,
+                local_id,
+                pending_broker_id,
+                {"contract": contract, "quote_health": qh},
+            )
+        if _contract(raw) != contract:
+            return _hold(
+                "broker_contract_identity_unproven",
+                pid,
+                local_id,
+                pending_broker_id,
+                {"contract": contract, "broker_contract": _contract(raw), "quote_health": qh},
+            )
+        identity_mismatch = _order_identity_mismatch(raw, pos)
+        if identity_mismatch:
+            return _hold(
+                f"broker_order_{identity_mismatch}_identity_mismatch",
+                pid,
+                local_id,
+                pending_broker_id,
+                {"contract": contract, "identity_field": identity_mismatch, "quote_health": qh},
+            )
+
+        status = _status(raw)
+        if status in OPEN_BROKER_STATUSES:
+            pending_qty = _pending_order_quantity(pos, raw)
+            if pending_qty is None:
+                return _hold(
+                    "broker_order_quantity_unproven",
+                    pid,
+                    local_id,
+                    pending_broker_id,
+                    {"status": status, "contract": contract, "quote_health": qh},
+                )
+            if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
+                exit_engine.set_pending_exit_order(
+                    pid,
+                    local_order_id=local_id,
+                    broker_order_id=pending_broker_id,
+                    qty=pending_qty,
+                    reason="autonomous_recovery_confirmed_broker_open_exit",
+                )
+            return RecoveryAction("CONFIRMED_OPEN", "broker_order_still_open", pid, local_id, pending_broker_id, {"status": status, "quote_health": qh})
+
+        if status == "filled":
+            filled_qty = raw.get("_recovery_fill_qty")
+            fill_price = raw.get("_recovery_fill_price")
+            remaining = _position_remaining(pos)
+            if (
+                not isinstance(filled_qty, int)
+                or isinstance(filled_qty, bool)
+                or filled_qty <= 0
+                or fill_price is None
+                or remaining is None
+                or remaining <= 0
+                or filled_qty > remaining
+            ):
+                return _hold(
+                    "broker_order_fill_quantity_unproven",
+                    pid,
+                    local_id,
+                    pending_broker_id,
+                    {
+                        "status": status,
+                        "filled_qty": filled_qty,
+                        "local_remaining": remaining,
+                        "contract": contract,
+                        "quote_health": qh,
+                    },
+                )
+            if filled_qty == remaining:
+                if not (exit_engine and hasattr(exit_engine, "mark_position_closed")):
+                    return _hold("broker_order_fill_close_hook_missing", pid, local_id, pending_broker_id, {"quote_health": qh})
+                exit_engine.mark_position_closed(
+                    pid,
+                    reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
+                    qty_filled=filled_qty,
+                    fill_price=fill_price,
+                    local_order_id=local_id,
+                    broker_order_id=pending_broker_id,
+                    cumulative_filled=filled_qty,
+                    reconciled=True,
+                )
+                return RecoveryAction(
+                    "MARKED_CLOSED",
+                    "broker_order_filled",
+                    pid,
+                    local_id,
+                    pending_broker_id,
+                    {"status": status, "filled_qty": filled_qty, "fill_price": fill_price, "quote_health": qh},
+                )
+            if not (exit_engine and hasattr(exit_engine, "note_partial_exit_fill")):
+                return _hold("broker_order_partial_fill_hook_missing", pid, local_id, pending_broker_id, {"quote_health": qh})
+            exit_engine.note_partial_exit_fill(
+                pid,
+                qty_filled=filled_qty,
+                fill_price=fill_price,
+                local_order_id=local_id,
+                broker_order_id=pending_broker_id,
+                cumulative_filled=filled_qty,
+            )
+            return RecoveryAction(
+                "PARTIAL_FILL_APPLIED",
+                "broker_order_partial_fill",
+                pid,
+                local_id,
+                pending_broker_id,
+                {"status": status, "filled_qty": filled_qty, "fill_price": fill_price, "quote_health": qh},
+            )
+
+        if status in TERMINAL_BROKER_STATUSES:
+            # A terminal old id is not negative proof.  We only adopt a
+            # different exact open order; replacement authorization remains a
+            # separate follow-up with complete pagination/ownership proof.
+            order_state, other_matches = _matching_open_exit_orders_with_truth(
+                broker, contract, exclude_broker_id=pending_broker_id
+            )
+            if order_state != "available":
+                return _hold(
+                    f"broker_order_truth_{order_state}",
+                    pid,
+                    local_id,
+                    pending_broker_id,
+                    {"old_status": status, "contract": contract, "quote_health": qh},
+                )
+            for other_id, other_raw in other_matches:
+                mismatch = _order_identity_mismatch(other_raw, pos)
+                if mismatch:
+                    return _hold(
+                        f"broker_order_{mismatch}_identity_mismatch",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {"broker_order_id": other_id, "identity_field": mismatch, "quote_health": qh},
+                    )
+            if len(other_matches) == 1:
+                other_id, other_raw = other_matches[0]
+                pending_qty = _pending_order_quantity(pos, other_raw)
+                if pending_qty is None:
+                    return _hold("broker_order_quantity_unproven", pid, local_id, pending_broker_id, {"quote_health": qh})
                 if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
                     exit_engine.set_pending_exit_order(
                         pid,
                         local_order_id=local_id,
-                        broker_order_id=pending_broker_id,
-                        qty=int(getattr(pos, "pending_exit_qty", 0) or 0),
-                        reason="autonomous_recovery_confirmed_broker_open_exit",
+                        broker_order_id=other_id,
+                        qty=pending_qty,
+                        reason="autonomous_recovery_found_different_open_exit",
                     )
-                return RecoveryAction("CONFIRMED_OPEN", "broker_order_still_open", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
-            if st == "filled":
-                filled_qty = _qty(raw) or int(getattr(pos, "pending_exit_qty", 0) or 0)
-                fill_price = None
-                for key in ("avg_fill_price", "average_fill_price", "fill_price", "filled_avg_price", "price"):
-                    try:
-                        if raw.get(key) not in (None, ""):
-                            fill_price = float(raw.get(key))
-                            break
-                    except Exception:
-                        pass
-                if exit_engine and hasattr(exit_engine, "mark_position_closed"):
-                    exit_engine.mark_position_closed(
-                        pid,
-                        reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
-                        qty_filled=filled_qty,
-                        fill_price=fill_price,
-                        local_order_id=local_id,
-                        broker_order_id=pending_broker_id,
-                        cumulative_filled=filled_qty,
-                        reconciled=True,
-                    )
-                return RecoveryAction("MARKED_CLOSED", "broker_order_filled", pid, local_id, pending_broker_id, {"status": st, "filled_qty": filled_qty, "quote_health": qh})
-            if st in TERMINAL_BROKER_STATUSES:
-                # CRITICAL safety: terminal status for the old pending id is NOT enough.
-                # Scan broker for a different live exit on the same contract before allowing replacement.
-                other_matches = _matching_open_exit_orders(broker, contract, exclude_broker_id=pending_broker_id)
-                if len(other_matches) == 1:
-                    other_bid, other_raw = other_matches[0]
-                    if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
-                        exit_engine.set_pending_exit_order(
-                            pid,
-                            local_order_id=local_id,
-                            broker_order_id=other_bid,
-                            qty=int(_qty(other_raw) or getattr(pos, "pending_exit_qty", 0) or 0),
-                            reason="autonomous_recovery_found_different_open_exit",
-                        )
-                    return RecoveryAction("CONFIRMED_OPEN", "different_broker_exit_still_open", pid, local_id, other_bid, {"old_status": st, "contract": contract, "quote_health": qh})
-                if len(other_matches) > 1:
-                    return RecoveryAction("NOOP", "multiple_different_open_exits_block_replacement", pid, local_id, pending_broker_id, {"old_status": st, "matches": [m[0] for m in other_matches], "quote_health": qh})
-                return _mark_replacement_safe(
-                    exit_engine,
+                return RecoveryAction("CONFIRMED_OPEN", "different_broker_exit_still_open", pid, local_id, other_id, {"old_status": status, "contract": contract, "quote_health": qh})
+            if len(other_matches) > 1:
+                return _hold(
+                    "multiple_different_open_exits_block_replacement",
                     pid,
-                    reason=f"autonomous_recovery_broker_terminal_{st}",
-                    local_id=local_id,
-                    broker_id=pending_broker_id,
-                    details={"status": st, "quote_health": qh},
+                    local_id,
+                    pending_broker_id,
+                    {"old_status": status, "matches": [item[0] for item in other_matches], "quote_health": qh},
                 )
-            return RecoveryAction("NOOP", "broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
+            position_state = _broker_position_state(
+                broker, client_id=position_client, contract=contract
+            )
+            if position_state == "flat":
+                return _hold(
+                    "broker_flat_requires_exact_external_fill",
+                    pid,
+                    local_id,
+                    pending_broker_id,
+                    {"old_status": status, "contract": contract, "quote_health": qh},
+                )
+            if position_state != "held":
+                return _hold(
+                    f"broker_position_truth_{position_state}",
+                    pid,
+                    local_id,
+                    pending_broker_id,
+                    {"old_status": status, "contract": contract, "quote_health": qh},
+                )
+            return _hold(
+                "replacement_authorization_deferred",
+                pid,
+                local_id,
+                pending_broker_id,
+                {"old_status": status, "contract": contract, "broker_position_state": position_state, "quote_health": qh},
+            )
+        return _hold("broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": status, "quote_health": qh})
 
-    # Missing broker id: scan open orders for matching exit order.
-    matches = _matching_open_exit_orders(broker, contract)
-
+    # Missing broker id: exact order-list ownership is not complete enough for
+    # autonomous adoption in this containment change.  We can still recognize
+    # a single explicitly fenced order, but never cancel or unlock on a
+    # non-paginated negative result.
+    order_state, matches = _matching_open_exit_orders_with_truth(broker, contract)
+    if order_state != "available":
+        return _hold(f"broker_order_truth_{order_state}", pid, local_id, "", {"contract": contract, "quote_health": qh})
+    for broker_id, raw in matches:
+        mismatch = _order_identity_mismatch(raw, pos)
+        if mismatch:
+            return _hold(
+                f"broker_order_{mismatch}_identity_mismatch",
+                pid,
+                local_id,
+                "",
+                {"broker_order_id": broker_id, "identity_field": mismatch, "quote_health": qh},
+            )
+        # Without explicit broker-side client/mode ownership, a same-contract
+        # row could belong to another worker/account.  Leave it for canonical
+        # reconciliation rather than adopting it here.
+        if not _order_has_explicit_owner(raw):
+            return _hold(
+                "broker_order_owner_unproven",
+                pid,
+                local_id,
+                broker_id,
+                {"contract": contract, "quote_health": qh},
+            )
     if len(matches) == 1:
-        recovered_broker_id, raw = matches[0]
+        recovered_id, raw = matches[0]
+        pending_qty = _pending_order_quantity(pos, raw)
+        if pending_qty is None:
+            return _hold("broker_order_quantity_unproven", pid, local_id, recovered_id, {"quote_health": qh})
         if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
             exit_engine.set_pending_exit_order(
                 pid,
                 local_order_id=local_id,
-                broker_order_id=recovered_broker_id,
-                qty=int(getattr(pos, "pending_exit_qty", 0) or _qty(raw) or 0),
+                broker_order_id=recovered_id,
+                qty=pending_qty,
                 reason="autonomous_recovery_matched_live_exit_order",
             )
-        return RecoveryAction("RECOVERED_BROKER_ID", "matched_single_live_exit_order", pid, local_id, recovered_broker_id, {"contract": contract, "quote_health": qh})
-
+        return RecoveryAction("RECOVERED_BROKER_ID", "matched_single_live_exit_order", pid, local_id, recovered_id, {"contract": contract, "quote_health": qh})
     if len(matches) > 1:
-        cancel_results = []
-        all_canceled = True
-        for bid, raw in matches:
-            ok, proof = _cancel_order_with_proof(broker, bid)
-            cancel_results.append({"broker_order_id": bid, "ok": ok, "proof": proof})
-            if not ok:
-                all_canceled = False
-        if all_canceled:
-            return _mark_replacement_safe(
-                exit_engine,
-                pid,
-                reason="autonomous_recovery_multiple_live_exit_orders_canceled",
-                local_id=local_id,
-                broker_id="",
-                details={"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh},
-            )
-        return RecoveryAction("NOOP", "multiple_live_exit_orders_cancel_not_proven", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
-
-    # Negative proof: no matching open sell-to-close order currently at broker.
-    # Before marking replacement safe, verify the contract is still held.
-    # If position is flat at the broker (exit filled, callback dropped), close it
-    # instead of spawning a duplicate sell-to-close that Tradier will reject.
-    try:
-        _broker_positions = broker.list_positions() if hasattr(broker, "list_positions") else []
-        _contract_held = any(
-            str(p.get("symbol") or "").upper() == str(contract or "").upper()
-            for p in (_broker_positions or [])
-            if int(p.get("quantity") or 0) != 0
+        return _hold(
+            "multiple_live_exit_orders_replacement_deferred",
+            pid,
+            local_id,
+            "",
+            {"match_count": len(matches), "quote_health": qh},
         )
-        if not _contract_held and contract:
-            # Position is flat at broker — exit filled but callback was dropped.
-            # Mark position closed rather than allowing a duplicate exit submission.
-            if exit_engine and hasattr(exit_engine, "mark_position_closed"):
-                exit_engine.mark_position_closed(pid, exit_price=None, filled_qty=getattr(pos, "contracts", 0))
-            return RecoveryAction(
-                "MARKED_CLOSED",
-                "autonomous_recovery_contract_flat_at_broker",
-                pid, local_id, "",
-                {"contract": contract, "quote_health": qh, "source": "negative_proof_position_check"},
-            )
-    except Exception as _bp_exc:
-        log.debug("exit_autonomous_recovery: broker position check failed (non-fatal): %s", _bp_exc)
 
-    return _mark_replacement_safe(
-        exit_engine,
+    position_state = _broker_position_state(
+        broker, client_id=position_client, contract=contract
+    )
+    if position_state == "flat":
+        return _hold(
+            "broker_flat_requires_exact_external_fill",
+            pid,
+            local_id,
+            "",
+            {"contract": contract, "quote_health": qh},
+        )
+    if position_state != "held":
+        return _hold(
+            f"broker_position_truth_{position_state}",
+            pid,
+            local_id,
+            "",
+            {"contract": contract, "quote_health": qh},
+        )
+    return _hold(
+        "replacement_authorization_deferred",
         pid,
-        reason="autonomous_recovery_no_matching_live_exit_order",
-        local_id=local_id,
-        broker_id="",
-        details={"contract": contract, "quote_health": qh},
+        local_id,
+        "",
+        {"contract": contract, "broker_position_state": position_state, "quote_health": qh},
     )
 
 
@@ -407,12 +1004,28 @@ def recover_exit_engine(exit_engine: Any, *, broker: Any, osm: Any = None, max_p
     except Exception:
         positions = []
 
+    expected_client_id, expected_execution_mode = _recovery_engine_identity(exit_engine)
     actions: list[RecoveryAction] = []
     for pos in positions[:max_positions]:
-        if not (getattr(pos, "exit_identity_quarantine", False) or getattr(pos, "last_callback_identity_missing", False) or getattr(pos, "exit_in_flight", False)):
+        if not (
+            getattr(pos, "exit_identity_quarantine", False)
+            or getattr(pos, "last_callback_identity_missing", False)
+            or getattr(pos, "exit_in_flight", False)
+            or getattr(pos, "protective_monitoring_state", "") == BROKER_FLAT_RECONCILIATION_PENDING
+            or getattr(pos, "broker_flat_reconciliation_pending", False)
+        ):
             continue
         try:
-            actions.append(recover_exit_position(pos, broker=broker, exit_engine=exit_engine, osm=osm))
+            actions.append(
+                recover_exit_position(
+                    pos,
+                    broker=broker,
+                    exit_engine=exit_engine,
+                    osm=osm,
+                    expected_client_id=expected_client_id or None,
+                    expected_execution_mode=expected_execution_mode or None,
+                )
+            )
         except Exception as exc:
             log.exception("autonomous recovery failed for pos=%s: %s", _position_id(pos), exc)
             actions.append(RecoveryAction("ERROR", str(exc), _position_id(pos)))

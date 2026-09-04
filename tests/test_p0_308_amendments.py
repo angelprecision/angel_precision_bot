@@ -6,7 +6,7 @@ Covers the 7 specific requirements from the amendment document.
 
 Amendment requirements:
   R1: broker truth open qty > 0 + circuit breaker tripped → protective exit allowed
-  R2: broker truth qty == 0 + synthetic broker-repair position → no broker POST, local closed
+  R2: broker truth qty == 0 + synthetic broker-repair position → no broker POST, reconciliation marker only
   R3: broker truth missing/None → original circuit breaker behavior unchanged
   R4: duplicate/in-flight exit still blocks duplicate submit
   R5: manual close/reconciler terminal row prevents synthetic stale exit
@@ -830,16 +830,16 @@ class TestBrokerFlatProductionShape:
 
 class TestExitEngineFlatCleanup:
     """
-    Final amendment: ap_exit_engine.py must durably close/mark the stale local
-    position when it detects flat broker truth at the submit seam.
-    Clearing exit_in_flight alone is insufficient — the position row must be
-    marked CLOSED so the next tick sees terminal state and does not re-evaluate.
+    Containment amendment: ap_exit_engine.py must durably mark the stale local
+    position when it detects flat broker truth at the submit seam, without
+    fabricating a close or fill.  The marker routes the row to exact external
+    fill reconciliation while preserving the active row and quantity.
     """
 
-    def test_flat_broker_truth_no_post_and_position_marked_closed(self):
+    def test_flat_broker_truth_no_post_and_position_marked_pending(self):
         """
         Required test: ap_exit_engine flat broker truth → no broker POST
-        → position marked CLOSED/stale → next exit evaluation does not fire again.
+        → position marked reconciliation-pending → no synthetic close.
         """
         position_closed_calls = []
         broker_post_calls    = []
@@ -848,17 +848,21 @@ class TestExitEngineFlatCleanup:
         is_fresh_exact = True
         broker_truth_qty = 0
 
-        # Simulate clearing in-flight and calling durable close
+        # Simulate clearing in-flight and calling the containment marker.
         exit_in_flight = True
         pending_exit_reason = "take_profit"
+        position_status = "OPEN"
+        position_qty = 1
+        position_meta = {}
 
         def _clear_inflight():
             nonlocal exit_in_flight, pending_exit_reason
             exit_in_flight = False
             pending_exit_reason = ""
 
-        def _mark_position_closed(position_id, client_id, meta):
+        def _mark_broker_flat_pending(position_id, client_id, meta):
             position_closed_calls.append((position_id, client_id, meta))
+            position_meta.update(meta)
 
         def _broker_post(**kwargs):
             broker_post_calls.append(kwargs)
@@ -866,9 +870,13 @@ class TestExitEngineFlatCleanup:
         # Simulate the amended exit engine path:
         if is_fresh_exact and int(broker_truth_qty or 0) == 0:
             _clear_inflight()
-            _mark_position_closed(
+            _mark_broker_flat_pending(
                 _POSITION_ID, _CLIENT_ID,
-                {"synthetic_position_stale_broker_flat": True}
+                {
+                    "synthetic_position_stale_broker_flat": True,
+                    "protective_monitoring_state": "BROKER_FLAT_CLOSE_PENDING",
+                    "reconciler_manual_close_needed": True,
+                },
             )
             # do NOT call broker_post
         else:
@@ -880,30 +888,34 @@ class TestExitEngineFlatCleanup:
         assert exit_in_flight is False, "exit_in_flight must be cleared"
         assert pending_exit_reason == "", "pending_exit_reason must be cleared"
         assert len(position_closed_calls) == 1, (
-            "Local position MUST be marked closed/stale after flat broker truth — "
-            "not just clearing in-flight flag"
+            "Local position MUST receive a durable reconciliation marker after flat broker truth"
         )
-        stale_meta = position_closed_calls[0][2]
-        assert stale_meta.get("synthetic_position_stale_broker_flat") is True
+        marked_meta = position_closed_calls[0][2]
+        assert marked_meta.get("synthetic_position_stale_broker_flat") is True
+        assert marked_meta.get("protective_monitoring_state") == "BROKER_FLAT_CLOSE_PENDING"
+        assert marked_meta.get("reconciler_manual_close_needed") is True
+        assert position_status == "OPEN"
+        assert position_qty == 1
 
-    def test_exit_engine_stale_close_prevents_repeat_fire(self):
+    def test_exit_engine_flat_marker_does_not_fabricate_terminal_state(self):
         """
-        After the exit engine marks position CLOSED via the durable stale-close,
-        _exit_position_terminal_state must block on the next tick because
-        status=CLOSED is a terminal state.
+        A broker-flat marker is not a terminal state.  The next submit must
+        re-check exact broker truth and reach the same containment seam; it
+        must not rely on a fabricated CLOSED/zero-quantity local row.
         """
         from ap.exit_safety import _exit_position_terminal_state
 
         db = MagicMock()
-        # Simulate what exit engine wrote:
+        # Simulate what the containment marker wrote:
         db.fetchone.return_value = {
-            "status":             "CLOSED",   # set by exit engine stale-close
-            "quantity_remaining": 0,
+            "status":             "OPEN",
+            "quantity_remaining": 1,
             "client_id":          _CLIENT_ID,
             "contract":           _CONTRACT,
             "meta": {
                 "synthetic_position_stale_broker_flat": True,
-                "stale_source": "exit_engine_submit_seam",
+                "protective_monitoring_state": "BROKER_FLAT_CLOSE_PENDING",
+                "reconciler_manual_close_needed": True,
             },
         }
 
@@ -915,49 +927,42 @@ class TestExitEngineFlatCleanup:
                 contract=_CONTRACT,
             )
 
-        assert result["blocked"] is True, (
-            "After exit engine marks position CLOSED, next tick must be blocked. "
-            "This proves the durable close prevents the repeat-fire loop."
+        assert result["blocked"] is False, (
+            "A reconciliation marker must not pretend the local position is terminal; "
+            "the broker truth guard owns the next decision."
         )
 
-    def test_exit_engine_has_durable_stale_close_in_source(self):
+    def test_exit_engine_has_durable_flat_reconciliation_marker_in_source(self):
         """
-        Structural: ap_exit_engine.py must contain the UPDATE positions stale-close
-        inside the flat-broker-truth block at the submit seam.
+        Structural: ap_exit_engine.py must contain the UPDATE positions
+        reconciliation marker inside the flat-broker-truth block at the submit
+        seam, with no local CLOSED mutation.
         """
         src = open("ap_exit_engine.py").read()
-        # The stale-close must be after the is_fresh_exact/qty==0 check
-        flat_check_pos  = src.find("is_fresh_exact") and src.find("int(_broker_truth_qty or 0) == 0")
-        stale_close_pos = src.find("synthetic_position_stale_broker_flat")
-        stale_source_pos = src.find('"stale_source": "exit_engine_submit_seam"')
+        marker_pos = src.find("synthetic_position_stale_broker_flat")
 
-        assert stale_close_pos > 0, (
+        assert marker_pos > 0, (
             "synthetic_position_stale_broker_flat must be set in ap_exit_engine.py"
         )
-        assert stale_source_pos > 0, (
-            '"stale_source": "exit_engine_submit_seam" must be present in exit engine — '
-            "distinguishes engine-initiated close from OSM-initiated close"
+        assert "PROTECTIVE_STATE_BROKER_FLAT_PENDING" in src, (
+            "flat broker truth must persist the explicit reconciliation-pending state"
         )
-        # The UPDATE positions statement must be present
-        assert "UPDATE positions" in src[stale_close_pos - 200:stale_close_pos + 2000] or \
-               "UPDATE positions" in src, (
-            "UPDATE positions must be in ap_exit_engine.py stale-close block"
+        assert "reconciler_manual_close_needed" in src, (
+            "flat broker truth must signal canonical/manual external-fill reconciliation"
+        )
+        assert "SET status = 'CLOSED'" not in src[marker_pos - 500:marker_pos + 2500], (
+            "flat broker truth must not synthesize a local CLOSED state"
         )
 
-    def test_stale_close_failure_logs_warning_not_silently_swallowed(self):
+    def test_flat_marker_failure_logs_critical_not_silently_swallowed(self):
         """
-        If the durable stale-close DB write fails, it must log a WARNING
-        (not silently pass) so operators know the position may re-fire.
+        If the durable flat marker write fails, it must log a critical event so
+        operators know exact reconciliation is still required.
         """
         src = open("ap_exit_engine.py").read()
-        # Find the stale-close exception handler
-        stale_exc_pos = src.find("SYNTHETIC_POSITION_STALE_BROKER_FLAT local-close failed")
-        assert stale_exc_pos > 0, (
-            "Exit engine must log WARNING when stale-close fails — "
-            "silent swallowing would hide position re-fire risk"
-        )
-        # Must log 'may re-fire on next tick' to alert operators
-        context = src[stale_exc_pos:stale_exc_pos + 300]
-        assert "re-fire" in context or "next tick" in context, (
-            "Warning must mention re-fire risk so operators know to reconcile manually"
+        marker_exc_pos = src.find("BROKER_FLAT_RECONCILIATION_MARKER_UNPERSISTED")
+        marker_error_pos = src.find("BROKER_FLAT_DURABLE_CLOSE_ERROR")
+        assert marker_exc_pos > 0 or marker_error_pos > 0, (
+            "Exit engine must log when the flat reconciliation marker fails — "
+            "silent swallowing would hide the reconciliation requirement"
         )

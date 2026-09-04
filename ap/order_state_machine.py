@@ -58,7 +58,10 @@ from ap.db import conn, run_with_retry
 from ap.exit_safety import (
     alert_exit_submission_halted,
     evaluate_exit_submission_safety,
+    is_valid_exact_occ_contract,
     resolve_exit_broker_truth,
+    _exit_position_terminal_state,
+    _normalize_contract,
 )
 try:
     from psycopg2 import errors as pg_errors
@@ -6062,6 +6065,16 @@ class APOrderStateMachine:
                 "error": "exit_requested_quantity_invalid",
             }
 
+        contract = _normalize_contract(contract)
+        if not is_valid_exact_occ_contract(contract):
+            return {
+                "ok": False,
+                "local_order_id": reserved_local_id or None,
+                "broker_order_id": None,
+                "status": OrderStatus.ERROR,
+                "error": "exit_contract_identity_unproven",
+            }
+
         def _reserved_exit_identity_mismatches(order_row) -> list[str]:
             if not isinstance(order_row, dict):
                 return ["row_missing"]
@@ -6167,6 +6180,47 @@ class APOrderStateMachine:
                 limit_price=limit_price, local_order_id=reserved_local_id or None,
                 execution_mode=execution_mode,
             )
+        # Preserve the durable local terminal guard before querying the broker.
+        # A closed/missing local row must remain the decisive answer; an
+        # unconfigured mock or unavailable broker snapshot must not obscure it.
+        try:
+            def _local_position_probe():
+                with conn() as c:
+                    return _exit_position_terminal_state(
+                        c,
+                        position_id=str(position_id),
+                        client_id=self.client_id,
+                        execution_mode=execution_mode,
+                        contract=str(contract or ""),
+                        broker_truth_open_qty=None,
+                        allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
+                    )
+
+            local_position_state = run_with_retry(_local_position_probe)
+        except Exception:
+            local_position_state = None
+        if (
+            isinstance(local_position_state, dict)
+            and local_position_state.get("blocked")
+            and not (
+                local_position_state.get("reason") == "position_missing"
+                and str(position_id or "").startswith("broker-repair-")
+            )
+        ):
+            blocked_reason = str(local_position_state.get("reason") or "exit_submission_blocked")
+            try:
+                self.transition(local_id, OrderStatus.CANCELED, last_error=blocked_reason)
+            except Exception as exc:
+                log.debug("[%s] local terminal guard cancel transition failed for %s: %s", self.client_id, local_id, exc)
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": None,
+                "status": OrderStatus.CANCELED,
+                "error": blocked_reason,
+                "skipped": True,
+                "reason": blocked_reason,
+            }
         broker_truth = resolve_exit_broker_truth(
             broker=broker,
             client_id=self.client_id,
@@ -6182,6 +6236,43 @@ class APOrderStateMachine:
                     _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
                 except Exception as _upd_bt_exc:
                     log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
+        if (
+            broker_truth.get("is_fresh_exact") is not True
+            or broker_truth_qty is None
+            or isinstance(broker_truth_qty, bool)
+            or not isinstance(broker_truth_qty, int)
+            or broker_truth_qty < 0
+        ):
+            blocked_reason = (
+                "BROKER_TRUTH_QUANTITY_UNKNOWN"
+                if broker_truth.get("is_fresh_exact") is True
+                else "BROKER_TRUTH_UNAVAILABLE"
+            )
+            broker_truth_audit.update({"result": blocked_reason})
+            _upd_bt = getattr(self, "update_order_meta", None)
+            if callable(_upd_bt):
+                try:
+                    _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+                except Exception as _upd_bt_exc:
+                    log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
+            log.error(
+                "[%s] %s | position_id=%s contract=%s snapshot_status=%s",
+                self.client_id,
+                blocked_reason,
+                position_id,
+                contract,
+                broker_truth_audit.get("snapshot_status", "unknown"),
+            )
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": None,
+                "status": OrderStatus.EXIT_REQUESTED,
+                "error": blocked_reason,
+                "skipped": True,
+                "reason": blocked_reason,
+                "reconciliation_required": True,
+            }
         if broker_truth.get("is_fresh_exact") and int(broker_truth_qty or 0) == 0:
             blocked_reason = "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
             broker_truth_audit.update(
@@ -6215,11 +6306,13 @@ class APOrderStateMachine:
                     _stale_c.execute(
                         """
                         UPDATE positions
-                        SET status = 'CLOSED',
-                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
                         WHERE id = %s
                           AND client_id = %s
-                          AND status NOT IN ('CLOSED', 'EXPIRED')
+                          AND LOWER(COALESCE(execution_mode, '')) = %s
+                          AND COALESCE(contract, '') = %s
+                          AND status IN ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                          AND COALESCE(quantity_remaining, qty, 0) > 0
                         """,
                         (
                             __import__("json").dumps({
@@ -6233,6 +6326,8 @@ class APOrderStateMachine:
                             }),
                             str(position_id),
                             self.client_id,
+                            str(execution_mode or "").strip().lower(),
+                            str(contract or ""),
                         ),
                     )
             except Exception as exc:
@@ -6378,79 +6473,18 @@ class APOrderStateMachine:
                 except Exception as exc:
                     log.warning("[%s] exit circuit-breaker alert failed: %s", self.client_id, exc)
 
-            # ── P0 (PR #307): new reason codes from broker-truth override ────
-            # SYNTHETIC_POSITION_STALE_BROKER_FLAT: broker says qty=0 but the
-            # local position thinks it's still open. Stop repeated exit firing
-            # by marking the local position stale so the exit engine stops
-            # evaluating it on every tick.
-            # ── Req 5: synthetic-flat block — ALL writes nested under the exact condition ──
-            # The broker-truth metadata update, warning log, and positions CLOSED
-            # mutation must execute ONLY when:
-            #   1. blocked_reason == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
-            #   2. broker_truth.get("is_fresh_exact") is True
-            #   3. int(broker_truth.get("broker_truth_open_qty") or 0) == 0
-            # Any other blocked reason must NOT mark the position CLOSED.
+            # Flat broker truth is handled above, before the generic safety
+            # evaluation, and only records a reconciliation marker.  Keep this
+            # defensive branch side-effect free if a downstream guard returns
+            # the same reason unexpectedly: a broker-flat snapshot is not fill
+            # economics and must never synthesize a local close.
             if blocked_reason == "SYNTHETIC_POSITION_STALE_BROKER_FLAT":
-                broker_truth_audit.update(
-                    {
-                        "result": blocked_reason,
-                        "broker_truth_open_qty": 0,
-                        "manual_close_needed": True,
-                    }
-                )
-                _upd_bt = getattr(self, "update_order_meta", None)
-                if callable(_upd_bt):
-                    try:
-                        _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
-                    except Exception as _upd_bt_exc:
-                        log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
                 log.warning(
                     "[%s] SYNTHETIC_POSITION_STALE_BROKER_FLAT "
                     "position_id=%s contract=%s — broker is flat; "
-                    "marking local position stale to stop repeated exit firing",
+                    "local close remains deferred pending exact external fill",
                     self.client_id, position_id, contract,
                 )
-                # ── Triple-condition guard on the CLOSED write ────────────────
-                # Only mark the position CLOSED when all three are true.
-                # Missing, non-exact, or non-zero broker truth must not close it.
-                if (
-                    broker_truth.get("is_fresh_exact") is True
-                    and int(broker_truth.get("broker_truth_open_qty") or 0) == 0
-                ):
-                    try:
-                        with conn() as _stale_c:
-                            _stale_c.execute(
-                                """
-                                UPDATE positions
-                                SET status = 'CLOSED',
-                                    meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
-                                WHERE id = %s
-                                  AND client_id = %s
-                                  AND status NOT IN ('CLOSED', 'EXPIRED')
-                                """,
-                                (
-                                    __import__("json").dumps({
-                                        "synthetic_position_stale_broker_flat": True,
-                                        "stale_marked_at": __import__("datetime").datetime.now(
-                                            __import__("datetime").timezone.utc
-                                        ).isoformat(),
-                                        "broker_truth_open_qty": 0,
-                                        "exit_circuit_breaker_broker_truth": broker_truth_audit,
-                                        "reconciler_manual_close_needed": True,
-                                    }),
-                                    str(position_id),
-                                    self.client_id,
-                                ),
-                            )
-                        log.info(
-                            "[%s] position %s marked CLOSED (broker flat, fresh exact broker truth, qty=0) | reconciler/manual-close-needed",
-                            self.client_id, position_id,
-                        )
-                    except Exception as _stale_exc:
-                        log.warning(
-                            "[%s] failed to mark position %s stale: %s",
-                            self.client_id, position_id, _stale_exc,
-                        )
 
             return {
                 "ok": False,

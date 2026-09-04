@@ -4136,11 +4136,19 @@ class APExitEngine:
         position_id = str(getattr(pos, "position_id", "") or "").strip()
         client_id = str(getattr(pos, "client_id", "") or "").strip()
         execution_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
-        contract = str(getattr(pos, "option_symbol", "") or "").strip()
-        if not position_id or not client_id or not execution_mode or not contract:
+        contract = str(getattr(pos, "option_symbol", "") or "").strip().upper()
+        try:
+            from ap.exit_safety import is_valid_exact_occ_contract, _normalize_contract
+        except Exception:
             return None
-        if execution_mode not in {"live", "paper"}:
+        if (
+            not position_id
+            or not client_id
+            or execution_mode not in {"live", "paper"}
+            or not is_valid_exact_occ_contract(contract)
+        ):
             return None
+        contract = _normalize_contract(contract)
         return ProtectivePositionIdentity(
             position_id=position_id,
             client_id=client_id,
@@ -4270,23 +4278,24 @@ class APExitEngine:
                 "broker_truth_open_qty": 0,
                 "exit_circuit_breaker_broker_truth": broker_truth,
                 "stale_source": "protective_monitoring_degraded",
-                "protective_monitoring_state": PROTECTIVE_STATE_RESOLVED,
+                "reconciler_manual_close_needed": True,
+                "protective_monitoring_state": PROTECTIVE_STATE_BROKER_FLAT_PENDING,
             }
+            pos.protective_monitoring_state = PROTECTIVE_STATE_BROKER_FLAT_PENDING
+            pos.behavior_quieted = False
 
             def _update():
                 with conn() as c:
                     c.execute(
                         """
                         UPDATE positions
-                        SET status = 'CLOSED',
-                            quantity_remaining = 0,
-                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
                             updated_at = NOW()
                         WHERE id = %s
                           AND client_id = %s
                           AND LOWER(COALESCE(execution_mode, '')) = %s
                           AND COALESCE(contract, '') = %s
-                          AND status IN ('OPEN', 'CLOSING')
+                          AND status IN ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
                           AND COALESCE(quantity_remaining, qty, 0) > 0
                         """,
                         (
@@ -4297,59 +4306,16 @@ class APExitEngine:
                             identity.contract,
                         ),
                     )
-                    rowcount = int(c.rowcount or 0)
-                    if rowcount != 1:
-                        return rowcount, None
-                    c.execute(
-                        """
-                        SELECT
-                            id,
-                            client_id,
-                            execution_mode,
-                            contract,
-                            status,
-                            quantity_remaining
-                        FROM positions
-                        WHERE id = %s
-                          AND client_id = %s
-                          AND LOWER(COALESCE(execution_mode, '')) = %s
-                          AND COALESCE(contract, '') = %s
-                        LIMIT 1
-                        """,
-                        (
-                            identity.position_id,
-                            identity.client_id,
-                            identity.execution_mode,
-                            identity.contract,
-                        ),
-                    )
-                    return rowcount, c.fetchone()
+                    return int(c.rowcount or 0)
 
-            rowcount, row = run_with_retry(_update) or (0, None)
-            row = dict(row or {})
-            remaining_state, parsed_remaining = _classify_exact_broker_open_qty(row.get("quantity_remaining"))
-            verified = (
-                int(rowcount or 0) == 1
-                and str(row.get("id") or "") == identity.position_id
-                and str(row.get("client_id") or "") == identity.client_id
-                and str(row.get("execution_mode") or "").lower() == identity.execution_mode
-                and str(row.get("contract") or "") == identity.contract
-                and str(row.get("status") or "").upper() in {"CLOSED", "EXPIRED"}
-                and remaining_state == BrokerPositionTruth.FLAT
-                and parsed_remaining == 0
-            )
-            if not verified:
-                pos.protective_monitoring_state = PROTECTIVE_STATE_BROKER_FLAT_PENDING
+            rowcount = int(run_with_retry(_update) or 0)
+            if rowcount != 1:
                 log.critical(
-                    "[%s] BROKER_FLAT_DURABLE_CLOSE_UNVERIFIED | pos_id=%s client_id=%s mode=%s contract=%s rowcount=%s row=%s",
-                    pos.ticker, identity.position_id, identity.client_id, identity.execution_mode, identity.contract, rowcount, row,
+                    "[%s] BROKER_FLAT_RECONCILIATION_MARKER_UNPERSISTED | pos_id=%s client_id=%s mode=%s contract=%s rowcount=%s",
+                    pos.ticker, identity.position_id, identity.client_id, identity.execution_mode, identity.contract, rowcount,
                 )
-                return BrokerFlatCloseResult(False, int(rowcount or 0), False, "durable_close_unverified", None)
-
-            pos.closed = True
-            pos.quantity_remaining = 0
-            self._positions_by_id.pop(identity.position_id, None)
-            return BrokerFlatCloseResult(True, int(rowcount or 0), True, "closed", None)
+                return BrokerFlatCloseResult(False, rowcount, False, "reconciliation_marker_unpersisted", None)
+            return BrokerFlatCloseResult(False, rowcount, False, "reconciliation_pending", None)
         except Exception as exc:
             pos.protective_monitoring_state = PROTECTIVE_STATE_BROKER_FLAT_PENDING
             log.critical(
@@ -8575,8 +8541,31 @@ class APExitEngine:
             from ap.exit_safety import (
                 alert_exit_submission_halted,
                 evaluate_exit_submission_safety,
+                is_valid_exact_occ_contract,
                 resolve_exit_broker_truth,
             )
+            if not is_valid_exact_occ_contract(option_symbol):
+                with self._lock:
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                self._emit_exit_event(
+                    pos,
+                    decision="HOLD",
+                    reason_code="BROKER_CONTRACT_IDENTITY_UNPROVEN",
+                    explanation=(
+                        "Blocked exit submit before broker truth lookup: exact OCC "
+                        "contract identity is missing or invalid."
+                    ),
+                    stage="exit_submission",
+                    extra_inputs={"contract": option_symbol, "identity_state": "unproven"},
+                )
+                log.error(
+                    "[%s] BROKER_CONTRACT_IDENTITY_UNPROVEN | position_id=%s contract=%s",
+                    ticker,
+                    position_id or "?",
+                    option_symbol or "?",
+                )
+                return False
             _broker_truth = resolve_exit_broker_truth(
                 broker=getattr(self, "broker", None),
                 client_id=str(getattr(pos, "client_id", "") or self.client_id),
@@ -8591,13 +8580,45 @@ class APExitEngine:
             _broker_truth_audit["requested_qty"] = int(decision.quantity or 0)
             _broker_truth_audit["broker_truth_state"] = _broker_truth_state.value
             _broker_truth_audit["broker_truth_parsed_open_qty"] = _broker_truth_parsed_qty
-            if _broker_truth_fresh_exact and _broker_truth_state == BrokerPositionTruth.UNKNOWN:
+            if (
+                not _broker_truth_fresh_exact
+                or _broker_truth_qty is None
+                or _broker_truth_state == BrokerPositionTruth.UNKNOWN
+            ):
+                with self._lock:
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                _truth_reason = (
+                    "BROKER_TRUTH_QUANTITY_UNKNOWN"
+                    if _broker_truth_fresh_exact
+                    else "BROKER_TRUTH_UNAVAILABLE"
+                )
                 self._emit_degraded_critical(
                     pos,
-                    "BROKER_TRUTH_QUANTITY_UNKNOWN",
-                    "fresh exact broker truth had an unknown or malformed open quantity at submit seam; broker-flat close is forbidden",
+                    _truth_reason,
+                    "exit submission is held because authoritative broker position truth is unavailable or malformed",
                     extra={"broker_truth": _broker_truth_audit},
                 )
+                self._emit_exit_event(
+                    pos,
+                    decision="HOLD",
+                    reason_code=_truth_reason,
+                    explanation=(
+                        "Blocked exit submit before broker callback: broker position truth "
+                        "must be authoritative HELD or FLAT."
+                    ),
+                    stage="exit_submission",
+                    extra_inputs={"broker_truth": _broker_truth_audit},
+                )
+                log.error(
+                    "[%s] %s | position_id=%s contract=%s snapshot_status=%s",
+                    ticker,
+                    _truth_reason,
+                    position_id or "?",
+                    option_symbol,
+                    _broker_truth_audit.get("snapshot_status", "unknown"),
+                )
+                return False
             if _broker_truth_fresh_exact and _broker_truth_state == BrokerPositionTruth.FLAT:
                 with self._lock:
                     pos.exit_in_flight   = False
@@ -8709,11 +8730,23 @@ class APExitEngine:
                 )
                 return False
         except Exception as _guard_err:
-            log.warning(
-                "[%s] exit pre-submit guard unavailable; continuing with callback submit: %s",
+            with self._lock:
+                pos.exit_in_flight = False
+                pos.pending_exit_reason = ""
+            log.exception(
+                "[%s] exit pre-submit truth guard failed closed before callback submit: %s",
                 ticker,
                 _guard_err,
             )
+            self._emit_exit_event(
+                pos,
+                decision="HOLD",
+                reason_code="BROKER_TRUTH_GUARD_ERROR",
+                explanation="Exit submit held because the broker truth guard failed.",
+                stage="exit_submission",
+                extra_inputs={"error": str(_guard_err)},
+            )
+            return False
 
         # 2) External callback outside lock.
         callback_result  = None
