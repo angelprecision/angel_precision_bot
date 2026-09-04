@@ -68,6 +68,22 @@ def _safe_int(value: Any) -> Optional[int]:
     return int(quantity)
 
 
+def _safe_signed_int(value: Any) -> Optional[int]:
+    """Parse a signed integral broker quantity without lossy coercion."""
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        quantity = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        not quantity.is_finite()
+        or quantity != quantity.to_integral_value()
+    ):
+        return None
+    return int(quantity)
+
+
 OCC_CONTRACT_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
 _PADDED_OCC_CONTRACT_RE = re.compile(r"^([A-Z0-9.]{1,6})\s+(\d{6}[CP]\d{8})$")
 _UNDERLYING_SYMBOL_RE = re.compile(r"^[A-Z0-9.]{1,6}$")
@@ -199,7 +215,7 @@ def _extract_long_position_qty(raw: dict[str, Any]) -> Optional[int]:
         for record in (raw, nested):
             if key not in record or record.get(key) in (None, ""):
                 continue
-            parsed = _safe_int(record.get(key))
+            parsed = _safe_signed_int(record.get(key))
             if parsed is None:
                 return None
             quantities.append(parsed)
@@ -219,6 +235,12 @@ def _extract_long_position_qty(raw: dict[str, Any]) -> Optional[int]:
     if "short" in side_text and "long" in side_text:
         return None
     if "short" in side_text:
+        # Keep a signed negative value visible to the target-contract guard.
+        # A short row with a positive broker quantity is not long exposure and
+        # remains normalized to zero, but a negative target quantity is
+        # contradictory evidence and must stay UNKNOWN rather than flat.
+        if quantities[0] < 0:
+            return quantities[0]
         return 0
     return quantities[0]
 
