@@ -1490,8 +1490,8 @@ class TestAmendment10Required:
 
 
 class _AuthoritativeOrdersBroker:
-    def __init__(self, pages=None, error=None):
-        self.cfg = SimpleNamespace(account_id="acct-live")
+    def __init__(self, pages=None, error=None, *, account_id="acct-live"):
+        self.cfg = SimpleNamespace(account_id=account_id)
         self.pages = pages or {1: {"orders": "null"}}
         self.error = error
         self.paths = []
@@ -1506,18 +1506,23 @@ class _AuthoritativeOrdersBroker:
         return self.pages.get(page, {"orders": "null"})
 
 
-def _phase_one_crash_row(reason="DIRECT_QUOTE_ZERO_BID_ASK"):
+def _phase_one_crash_row(
+    reason="DIRECT_QUOTE_ZERO_BID_ASK", execution_mode="live"
+):
     from ap_canonical_signal import build_canonical_signal_id
 
     now = datetime.now(timezone.utc)
-    oid = "phase-one-live-order"
-    signal_id = "phase-one-live-signal"
-    owner = "recovery_retry:client@test.com:phase-one-live-order:8"
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"live", "paper"}:
+        raise ValueError(f"unsupported test execution mode: {execution_mode!r}")
+    oid = f"phase-one-{mode}-order"
+    signal_id = f"phase-one-{mode}-signal"
+    owner = f"recovery_retry:client@test.com:{oid}:8"
     row = _row(
         local_order_id=oid,
         signal_id=signal_id,
         client_id="client@test.com",
-        execution_mode="live",
+        execution_mode=mode,
         meta={
             "watcher_audit": {"reason_code": "trigger_ready"},
             "trigger_price": 450.0,
@@ -1525,7 +1530,7 @@ def _phase_one_crash_row(reason="DIRECT_QUOTE_ZERO_BID_ASK"):
             "trigger_crossed_at_provenance": {
                 "canonical_signal_id": build_canonical_signal_id(signal_id),
                 "client_id": "client@test.com",
-                "execution_mode": "live",
+                "execution_mode": mode,
                 "local_order_id": oid,
             },
             "absolute_entry_deadline": (now + timedelta(hours=2)).isoformat(),
@@ -1561,12 +1566,15 @@ def _phase_one_crash_row(reason="DIRECT_QUOTE_ZERO_BID_ASK"):
     return row
 
 
-def _phase_one_recovery(row, broker):
+def _phase_one_recovery(row, broker, *, recovery_mode=None):
     osm = _MockOSM()
     osm.seed(row)
+    mode = str(
+        recovery_mode or row.get("execution_mode") or ""
+    ).strip().lower()
     rec = PendingTriggerRestartRecovery(
         client_id="client@test.com",
-        execution_mode="live",
+        execution_mode=mode,
         osm=osm,
         broker=broker,
         quote_check_fn=lambda *_a, **_k: (_ for _ in ()).throw(
@@ -1577,16 +1585,24 @@ def _phase_one_recovery(row, broker):
 
 
 class TestPhaseOneCrashRecovery:
-    def test_exact_absence_restores_retry_wait_at_same_attempt(self, monkeypatch):
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
+    def test_exact_absence_restores_retry_wait_at_same_attempt(
+        self, monkeypatch, execution_mode
+    ):
         monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
-        row = _phase_one_crash_row()
-        broker = _AuthoritativeOrdersBroker()
+        row = _phase_one_crash_row(execution_mode=execution_mode)
+        account_id = f"acct-{execution_mode}"
+        broker = _AuthoritativeOrdersBroker(account_id=account_id)
         rec, osm = _phase_one_recovery(row, broker)
 
         outcome = rec.recover_one_row(row)
 
         assert outcome == _RowOutcome.RETRY_OWNED
         assert len(osm.phase_one_recovery_calls) == 1
+        assert osm.phase_one_recovery_calls[0][1]["execution_mode"] == execution_mode
+        assert broker.paths == [
+            f"/v1/accounts/{account_id}/orders?includeTags=true&page=1&limit=500"
+        ]
         reread = osm.get_order(row["local_order_id"])
         meta = reread["meta"]
         assert meta["materialization_generation"] == 7
@@ -1602,21 +1618,27 @@ class TestPhaseOneCrashRecovery:
         broker.submit_order.assert_not_called()
         broker.cancel_order.assert_not_called()
 
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
     @pytest.mark.parametrize("broker_shape", ["found", "error", "unavailable"])
-    def test_broker_found_or_unknown_never_mutates(self, monkeypatch, broker_shape):
+    def test_broker_found_or_unknown_never_mutates(
+        self, monkeypatch, broker_shape, execution_mode
+    ):
         from ap.broker_submit_identity import canonical_broker_submit_key
 
         monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
-        row = _phase_one_crash_row()
+        row = _phase_one_crash_row(execution_mode=execution_mode)
+        account_id = f"acct-{execution_mode}"
         if broker_shape == "found":
             broker = _AuthoritativeOrdersBroker({
                 1: {"orders": {"order": {
                     "id": "broker-1",
                     "tag": canonical_broker_submit_key(row["local_order_id"]),
                 }}}
-            })
+            }, account_id=account_id)
         elif broker_shape == "error":
-            broker = _AuthoritativeOrdersBroker(error=RuntimeError("transport down"))
+            broker = _AuthoritativeOrdersBroker(
+                error=RuntimeError("transport down"), account_id=account_id
+            )
         else:
             broker = MagicMock()
         rec, osm = _phase_one_recovery(row, broker)
@@ -1624,6 +1646,23 @@ class TestPhaseOneCrashRecovery:
         assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
         assert osm.phase_one_recovery_calls == []
         assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_cross_mode_owner_fails_closed_without_cleanup(self, monkeypatch):
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(execution_mode="live")
+        broker = _AuthoritativeOrdersBroker(account_id="acct-live")
+        rec, osm = _phase_one_recovery(
+            row, broker, recovery_mode="paper"
+        )
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.phase_one_recovery_calls == []
+        assert osm.cancel_calls == []
+        assert broker.paths == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
 
     def test_pagination_finds_exact_tag_on_second_page(self, monkeypatch):
         from ap.broker_submit_identity import canonical_broker_submit_key
