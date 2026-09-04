@@ -1147,20 +1147,75 @@ class _RecoveryBroker:
 
 
 class _RawRecoveryBroker(_RecoveryBroker):
-    def __init__(self, *, positions_payload, orders_payload=None):
+    def __init__(self, *, positions_payload, orders_payload=None, orders_pages=None):
         super().__init__(orders=[], positions=[], position_exc=RuntimeError("legacy path must not run"))
         self.cfg = SimpleNamespace(account_id="acct-566")
         self.positions_payload = positions_payload
         self.orders_payload = orders_payload or {"orders": {"order": []}}
+        self.orders_pages = orders_pages
         self.raw_get_calls = []
 
     def _get(self, path, params=None):
         self.raw_get_calls.append(path)
         if path.endswith("/positions"):
             return self.positions_payload
-        if path.endswith("/orders"):
+        if "/orders" in path:
+            if self.orders_pages is not None:
+                page = 1
+                if "page=" in path:
+                    page = int(path.split("page=", 1)[1].split("&", 1)[0])
+                if page <= len(self.orders_pages):
+                    return self.orders_pages[page - 1]
+                return {"orders": {"order": []}}
             return self.orders_payload
         raise AssertionError(path)
+
+
+class _RecoveryDurableOSM:
+    def __init__(self, *, status="EXIT_REQUESTED", adoption_disposition="ADOPTED", update_on_adopt=True):
+        tag = canonical_broker_submit_key("local-exit-566")
+        self.row = {
+            "local_order_id": "local-exit-566",
+            "client_id": "jason@example.com",
+            "position_id": "pos-recovery-566",
+            "kind": "EXIT",
+            "contract": _RECOVERY_OCC,
+            "qty": 2,
+            "status": status,
+            "execution_mode": "live",
+            "broker_order_id": "",
+            "submitted_ts": None,
+            "meta": {
+                "submit_intent_at": "2026-09-04T15:00:00+00:00",
+                "broker_submit_payload_hash": "hash-566",
+                "broker_submit_key": tag,
+                "current_owner": f"broker_submit:{tag}",
+                "split_brain_quarantine": False,
+                "reconciliation_required": False,
+            },
+        }
+        self.adoption_disposition = adoption_disposition
+        self.update_on_adopt = update_on_adopt
+        self.adopt_calls = []
+        self.get_order_calls = []
+
+    def get_order(self, local_order_id):
+        self.get_order_calls.append(local_order_id)
+        if local_order_id != self.row["local_order_id"]:
+            return None
+        return dict(self.row)
+
+    def adopt_broker_owned_exit_request(self, local_order_id, **kwargs):
+        self.adopt_calls.append((local_order_id, dict(kwargs)))
+        disposition = self.adoption_disposition
+        if disposition in {"ADOPTED", "ALREADY_BROKER_OWNED_ACTIVE"} and self.update_on_adopt:
+            self.row["status"] = "EXIT_SUBMITTED"
+            self.row["broker_order_id"] = str(kwargs["broker_order_id"])
+        return {
+            "disposition": disposition,
+            "adopted": disposition == "ADOPTED",
+            "status": "EXIT_SUBMITTED" if disposition == "ADOPTED" else self.row["status"],
+        }
 
 
 class _RecoveryHooks:
@@ -1169,6 +1224,9 @@ class _RecoveryHooks:
         self.closed_calls = []
         self.partial_calls = []
         self.replacement_calls = []
+        # Missing-broker-id recovery must prove durable OSM authority before
+        # it is allowed to scan the broker order list.
+        self.order_state_machine = _RecoveryDurableOSM()
 
     def set_pending_exit_order(self, position_id, **kwargs):
         self.open_calls.append((position_id, kwargs))
@@ -1292,21 +1350,34 @@ def test_pr566_incomplete_empty_positions_container_is_unknown_not_flat():
     assert broker.list_positions_calls == 0
 
 
-def test_pr566_authoritative_list_orders_wins_over_raw_endpoint_fallback():
+def test_pr566_paginated_include_tags_finds_exact_order_beyond_first_page():
+    page_one = [
+        _recovery_open_order(
+            contract=_RECOVERY_OTHER_OCC,
+            broker_id=f"other-contract-{index}",
+        )
+        for index in range(500)
+    ]
     broker = _RawRecoveryBroker(
         positions_payload={
             "positions": {
                 "position": [{"symbol": _RECOVERY_OCC, "quantity": 2}]
             }
         },
-        orders_payload={"orders": {"order": []}},
+        orders_pages=[
+            {"orders": {"order": page_one}},
+            {
+                "orders": {
+                    "order": [
+                        _recovery_open_order(
+                            broker_id="paginated-authoritative-open",
+                            tag=canonical_broker_submit_key("local-exit-566"),
+                        )
+                    ]
+                }
+            },
+        ],
     )
-    broker._orders = [
-        _recovery_open_order(
-            broker_id="authoritative-open",
-            tag=canonical_broker_submit_key("local-exit-566"),
-        )
-    ]
     hooks = _RecoveryHooks()
 
     result = recover_exit_position(
@@ -1314,9 +1385,14 @@ def test_pr566_authoritative_list_orders_wins_over_raw_endpoint_fallback():
     )
 
     assert result.action == "RECOVERED_BROKER_ID"
-    assert result.broker_order_id == "authoritative-open"
-    assert broker.list_orders_calls == 1
-    assert broker.raw_get_calls == []
+    assert result.broker_order_id == "paginated-authoritative-open"
+    assert broker.list_orders_calls == 0
+    order_paths = [path for path in broker.raw_get_calls if "/orders" in path]
+    assert len(order_paths) == 2
+    assert all("includeTags=true" in path and "limit=500" in path for path in order_paths)
+    assert "page=1" in order_paths[0]
+    assert "page=2" in order_paths[1]
+    assert len(hooks.order_state_machine.adopt_calls) == 1
     _assert_no_recovery_mutation(broker, hooks)
 
 
@@ -1345,6 +1421,90 @@ def test_pr566_unrelated_equity_order_does_not_poison_option_recovery():
 
     assert result.action == "RECOVERED_BROKER_ID"
     assert result.broker_order_id == "option-exit-order"
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_missing_id_requires_fresh_durable_authority_before_order_scan():
+    broker = _RecoveryBroker(
+        orders=[
+            _recovery_open_order(
+                broker_id="would-be-owned",
+                tag=canonical_broker_submit_key("local-exit-566"),
+            )
+        ],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+    hooks.order_state_machine.row["meta"]["current_owner"] = "watcher:other-owner"
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_submit_authority_unproven"
+    assert "current_owner" in result.details["failed_fields"]
+    assert broker.list_orders_calls == 0
+    assert hooks.open_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_missing_id_without_osm_authority_does_not_scan_broker():
+    broker = _RecoveryBroker(
+        orders=[
+            _recovery_open_order(
+                broker_id="would-be-owned-no-osm",
+                tag=canonical_broker_submit_key("local-exit-566"),
+            )
+        ],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+    hooks.order_state_machine = None
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_submit_authority_unavailable"
+    assert broker.list_orders_calls == 0
+    assert hooks.open_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+@pytest.mark.parametrize(
+    ("adoption_disposition", "update_on_adopt", "expected_reason"),
+    [
+        ("DB_ERROR", True, "broker_submit_adoption_not_accepted"),
+        ("ADOPTED", False, "broker_submit_adoption_reread_unproven"),
+    ],
+)
+def test_pr566_tagged_recovery_requires_accepted_adoption_and_reread(
+    adoption_disposition, update_on_adopt, expected_reason
+):
+    broker = _RecoveryBroker(
+        orders=[
+            _recovery_open_order(
+                broker_id="tagged-but-unproven",
+                tag=canonical_broker_submit_key("local-exit-566"),
+            )
+        ],
+        positions=[_recovery_held_position()],
+    )
+    hooks = _RecoveryHooks()
+    hooks.order_state_machine = _RecoveryDurableOSM(
+        adoption_disposition=adoption_disposition,
+        update_on_adopt=update_on_adopt,
+    )
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == expected_reason
+    assert hooks.open_calls == []
     _assert_no_recovery_mutation(broker, hooks)
 
 

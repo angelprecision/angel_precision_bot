@@ -17,6 +17,7 @@ Safety rules
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -32,6 +33,7 @@ from ap.exit_safety import (
     is_valid_exact_occ_contract,
     resolve_exit_broker_truth,
 )
+from ap.manual_close_reconciliation import fetch_all_current_session_orders
 
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
@@ -290,41 +292,24 @@ def _parse_order_payload(payload: Any) -> tuple[str, list[dict]]:
 
 def _list_open_orders_truth(broker: Any) -> tuple[str, list[dict]]:
     """Return order-list truth without laundering lookup failure into an empty page."""
-    for method_name in ("list_orders", "list_open_orders", "get_open_orders", "orders"):
-        method = getattr(broker, method_name, None)
-        if not callable(method):
-            continue
-        try:
-            try:
-                result = method(status="open")
-            except TypeError:
-                result = method()
-        except Exception as exc:
-            log.warning("broker.%s failed during autonomous recovery: %s", method_name, exc)
-            return "unavailable", []
-        state, rows = _parse_order_payload(result)
-        if state != "available":
-            log.warning("broker.%s returned %s during autonomous recovery", method_name, state)
-        return state, rows
-
-    # Legacy adapters may expose only the raw endpoint.  This fallback is kept
-    # after the authoritative list-orders interface so current TradierBroker
-    # pagination/includeTags/error propagation remains in force.
-    raw_get_declared = getattr(type(broker), "_get", None)
-    account_value = str(
-        getattr(getattr(broker, "cfg", None), "account_id", None) or ""
-    ).strip()
-    if callable(raw_get_declared) and account_value:
-        try:
-            result = broker._get(f"/v1/accounts/{account_value}/orders")
-        except Exception as exc:
-            log.warning("broker._get orders failed during autonomous recovery: %s", exc)
-            return "unavailable", []
-        state, rows = _parse_order_payload(result)
-        if state != "available":
-            log.warning("broker._get orders returned %s during autonomous recovery", state)
-        return state, rows
-    return "unavailable", []
+    # Use the same account-scoped, includeTags=true, paginated seam as manual
+    # reconciliation.  A one-page list_orders() result is not complete enough
+    # to prove that an exact tagged EXIT is absent after a restart.
+    try:
+        result = fetch_all_current_session_orders(broker)
+    except Exception as exc:
+        log.warning(
+            "broker order pagination failed during autonomous recovery: %s",
+            exc,
+        )
+        return "unavailable", []
+    state, rows = _parse_order_payload(result)
+    if state != "available":
+        log.warning(
+            "broker paginated orders returned %s during autonomous recovery",
+            state,
+        )
+    return state, rows
 
 
 def _list_open_orders(broker: Any) -> list[dict]:
@@ -719,6 +704,219 @@ def _order_matches_local_exit_tag(raw: dict, local_order_id: str) -> bool:
     return bool(tags) and all(tag == expected for tag in tags)
 
 
+def _recovery_order_state_machine(osm: Any, exit_engine: Any) -> Any:
+    """Resolve the canonical OSM used by recovery, including the engine wiring."""
+    return (
+        osm
+        or getattr(exit_engine, "order_state_machine", None)
+        or getattr(exit_engine, "osm", None)
+    )
+
+
+def _durable_meta(row: dict) -> dict:
+    raw_meta = row.get("meta")
+    if isinstance(raw_meta, dict):
+        return dict(raw_meta)
+    if isinstance(raw_meta, str) and raw_meta.strip():
+        try:
+            decoded = json.loads(raw_meta)
+        except Exception:
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _meta_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_durable_recovery_order(osm: Any, local_order_id: str) -> tuple[str, Optional[dict]]:
+    """Read one durable order row without treating a missing read as proof."""
+    getter = getattr(osm, "get_order", None) if osm is not None else None
+    if not callable(getter):
+        getter = getattr(osm, "_get_order", None) if osm is not None else None
+    if not callable(getter):
+        return "unavailable", None
+    try:
+        row = getter(local_order_id)
+    except Exception as exc:
+        log.warning(
+            "durable EXIT recovery authority read failed local=%s: %s",
+            local_order_id,
+            exc,
+        )
+        return "unavailable", None
+    if row is None:
+        return "missing", None
+    if isinstance(row, dict):
+        return "available", dict(row)
+    try:
+        return "available", dict(row)
+    except Exception:
+        return "malformed", None
+
+
+def _durable_exit_row_proof(
+    osm: Any,
+    pos: Any,
+    *,
+    local_order_id: str,
+    contract: str,
+    expected_statuses: set[str],
+    expected_broker_order_id: str = "",
+) -> tuple[bool, Optional[dict], str, dict]:
+    """Prove the exact durable OSM identity before/after broker adoption.
+
+    The missing-broker-id path may query Tradier only after this proof.  Keep
+    every predicate explicit so a partial row cannot become broker ownership
+    authority through a convenient in-memory position object.
+    """
+    state, row = _read_durable_recovery_order(osm, local_order_id)
+    details: dict[str, Any] = {
+        "authority_source": "durable_osm",
+        "proof_state": state,
+        "local_order_id": local_order_id,
+    }
+    if state != "available" or row is None:
+        return (
+            False,
+            row,
+            "broker_submit_authority_unavailable"
+            if state == "unavailable"
+            else "broker_submit_authority_missing"
+            if state == "missing"
+            else "broker_submit_authority_unproven",
+            details,
+        )
+
+    expected_position_id = _position_id(pos)
+    expected_client_id = _norm(getattr(pos, "client_id", ""))
+    expected_execution_mode = _norm(getattr(pos, "execution_mode", "")).lower()
+    expected_qty = _strict_qty(getattr(pos, "pending_exit_qty", None))
+    expected_tag = canonical_broker_submit_key(local_order_id)
+    meta = _durable_meta(row)
+    mismatches: list[str] = []
+
+    if row.get("local_order_id") != local_order_id:
+        mismatches.append("local_order_id")
+    if row.get("client_id") != expected_client_id:
+        mismatches.append("client_id")
+    if row.get("kind") != "EXIT":
+        mismatches.append("kind")
+    if row.get("status") not in expected_statuses:
+        mismatches.append("status")
+    if row.get("execution_mode") != expected_execution_mode:
+        mismatches.append("execution_mode")
+    if str(row.get("position_id") or "") != expected_position_id:
+        mismatches.append("position_id")
+    durable_contract = row.get("contract")
+    if (
+        not is_valid_exact_occ_contract(durable_contract)
+        or _norm_contract(durable_contract) != contract
+    ):
+        mismatches.append("contract")
+    durable_qty = _strict_qty(row.get("qty"))
+    if expected_qty is None or expected_qty <= 0 or durable_qty != expected_qty:
+        mismatches.append("qty")
+
+    durable_broker_id = str(row.get("broker_order_id") or "").strip()
+    if expected_broker_order_id:
+        if durable_broker_id != expected_broker_order_id:
+            mismatches.append("broker_order_id")
+    elif durable_broker_id:
+        mismatches.append("broker_order_id")
+
+    if not expected_broker_order_id and row.get("submitted_ts"):
+        mismatches.append("submitted_ts")
+
+    submit_intent = _norm(meta.get("submit_intent_at"))
+    payload_hash = _norm(meta.get("broker_submit_payload_hash"))
+    if not submit_intent:
+        mismatches.append("submit_intent_at")
+    if not payload_hash:
+        mismatches.append("broker_submit_payload_hash")
+    if not expected_tag or meta.get("broker_submit_key") != expected_tag:
+        mismatches.append("broker_submit_key")
+    if meta.get("current_owner") != f"broker_submit:{expected_tag}":
+        mismatches.append("current_owner")
+    for flag in ("split_brain_quarantine", "reconciliation_required"):
+        if _meta_flag(meta.get(flag)) or _meta_flag(row.get(flag)):
+            mismatches.append(flag)
+
+    details.update(
+        {
+            "expected_statuses": sorted(expected_statuses),
+            "expected_qty": expected_qty,
+            "expected_broker_order_id": expected_broker_order_id,
+            "broker_submit_key": expected_tag,
+            "failed_fields": mismatches,
+        }
+    )
+    if mismatches:
+        return False, row, "broker_submit_authority_unproven", details
+    return True, row, "", details
+
+
+def _adopt_tagged_exit_order(
+    osm: Any,
+    pos: Any,
+    *,
+    local_order_id: str,
+    broker_order_id: str,
+    contract: str,
+    source: str,
+) -> tuple[bool, Optional[dict], dict, str]:
+    """Adopt a tagged broker order through OSM, then prove the reread."""
+    adopt = getattr(osm, "adopt_broker_owned_exit_request", None)
+    if not callable(adopt):
+        return False, None, {}, "broker_submit_adoption_unavailable"
+    expected_qty = _strict_qty(getattr(pos, "pending_exit_qty", None))
+    if expected_qty is None or expected_qty <= 0:
+        return False, None, {}, "broker_order_quantity_unproven"
+    try:
+        result = adopt(
+            local_order_id,
+            broker_order_id=broker_order_id,
+            execution_mode=_norm(getattr(pos, "execution_mode", "")).lower(),
+            client_id=_norm(getattr(pos, "client_id", "")),
+            position_id=_position_id(pos),
+            expected_qty=expected_qty,
+            source=source,
+        )
+    except Exception as exc:
+        log.warning(
+            "durable EXIT adoption failed local=%s broker=%s: %s",
+            local_order_id,
+            broker_order_id,
+            exc,
+        )
+        return False, None, {}, "broker_submit_adoption_failed"
+
+    if not isinstance(result, dict):
+        return False, None, {"raw_result_type": type(result).__name__}, "broker_submit_adoption_unproven"
+    result = dict(result)
+    disposition = _norm(result.get("disposition")).upper()
+    accepted = disposition in {"ADOPTED", "ALREADY_BROKER_OWNED_ACTIVE"}
+    result["adoption_accepted"] = accepted
+    if not accepted:
+        return False, None, result, "broker_submit_adoption_not_accepted"
+
+    proven, refreshed, _proof_reason, proof_details = _durable_exit_row_proof(
+        osm,
+        pos,
+        local_order_id=local_order_id,
+        contract=contract,
+        expected_statuses={"EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL"},
+        expected_broker_order_id=broker_order_id,
+    )
+    result["durable_reread_proof"] = proof_details
+    if not proven:
+        return False, refreshed, result, "broker_submit_adoption_reread_unproven"
+    return True, refreshed, result, ""
+
+
 def quote_health(pos: Any, *, stale_sec: int = QUOTE_STALE_WARN_SEC) -> dict:
     option_age = _dt_age_seconds(getattr(pos, "last_option_quote_update_ts", None) or getattr(pos, "last_quote_update_ts", None))
     underlying_age = _dt_age_seconds(getattr(pos, "last_underlying_quote_update_ts", None) or getattr(pos, "last_quote_update_ts", None))
@@ -873,6 +1071,8 @@ def recover_exit_position(
         )
     if not contract:
         return _hold("broker_contract_identity_unproven", pid, local_id, pending_broker_id, {"quote_health": qh})
+
+    recovery_osm = _recovery_order_state_machine(osm, exit_engine)
 
     # Exact broker identity path.
     if pending_broker_id:
@@ -1193,6 +1393,23 @@ def recover_exit_position(
     # Angel Precision's client/mode fields; those synthetic fields are not
     # ownership proof.  This path still never cancels or authorizes a
     # replacement.
+    authority_proven, _durable_order, authority_reason, authority_details = (
+        _durable_exit_row_proof(
+            recovery_osm,
+            pos,
+            local_order_id=local_id,
+            contract=contract,
+            expected_statuses={"EXIT_REQUESTED"},
+        )
+    )
+    if not authority_proven:
+        return _hold(
+            authority_reason,
+            pid,
+            local_id,
+            "",
+            {"contract": contract, "quote_health": qh, **authority_details},
+        )
     order_state, matches = _matching_open_exit_orders_with_truth(broker, contract)
     if order_state != "available":
         return _hold(f"broker_order_truth_{order_state}", pid, local_id, "", {"contract": contract, "quote_health": qh})
@@ -1242,6 +1459,40 @@ def recover_exit_position(
         pending_qty = _pending_order_quantity(pos, raw)
         if pending_qty is None:
             return _hold("broker_order_quantity_unproven", pid, local_id, recovered_id, {"quote_health": qh})
+        if pending_qty != authority_details.get("expected_qty"):
+            return _hold(
+                "broker_order_quantity_identity_mismatch",
+                pid,
+                local_id,
+                recovered_id,
+                {
+                    "broker_order_qty": pending_qty,
+                    "durable_requested_qty": authority_details.get("expected_qty"),
+                    "quote_health": qh,
+                },
+            )
+        adopted, _refreshed, adoption_result, adoption_reason = _adopt_tagged_exit_order(
+            recovery_osm,
+            pos,
+            local_order_id=local_id,
+            broker_order_id=recovered_id,
+            contract=contract,
+            source="autonomous_recovery",
+        )
+        if not adopted:
+            return _hold(
+                adoption_reason,
+                pid,
+                local_id,
+                recovered_id,
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "adoption": adoption_result,
+                },
+            )
+        # OSM is the durable authority.  This call only hydrates the runtime
+        # mirror after accepted/idempotent adoption and a fresh durable reread.
         if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
             exit_engine.set_pending_exit_order(
                 pid,
@@ -1259,6 +1510,8 @@ def recover_exit_position(
             {
                 "contract": contract,
                 "ownership_evidence": "account_scoped_order_list+exact_occ+canonical_tag",
+                "adoption_disposition": adoption_result.get("disposition"),
+                "durable_reread_proof": True,
                 "quote_health": qh,
             },
         )
