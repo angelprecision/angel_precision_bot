@@ -1470,6 +1470,24 @@ class ManagedPosition:
     # already advanced or closed this position while the callback was executing.
     _submit_generation: int = 0
 
+    # PR #558 amendment (Blocker 1): temporary non-canonical broker-truth-only owner.
+    # Set True on a ManagedPosition installed by _install_or_refresh_degraded_broker_truth_owner
+    # when durable canonical DB repair is temporarily unavailable but broker truth
+    # proves the position is open.  The degraded owner:
+    #   - IS behavior-active (participates in existing exit monitoring)
+    #   - is NOT canonical (position_id carries the "broker-repair-degraded:" prefix,
+    #     signal_id/entry_local_order_id/entry_broker_order_id/entry_price/underlying_*
+    #     remain unfabricated)
+    #   - has stable identity across repair cycles (same client+mode+OCC+account
+    #     always resolves to the same degraded_id) so repeated broker prechecks
+    #     never accumulate multiple degraded owners for the same broker-open position
+    #   - is atomically superseded by canonical when durable repair later succeeds
+    #     (see _take_over_degraded_owner_if_any) — accumulated runtime state is
+    #     transferred and the degraded owner is removed
+    broker_repair_degraded: bool = False
+    broker_repair_degraded_reason: str = ""
+    broker_repair_degraded_account_id: str = ""
+
     # Quote-health fields
     last_quote_update_ts: Optional[datetime] = None
     last_quote_missing_ts: Optional[datetime] = None
@@ -7068,15 +7086,58 @@ class APExitEngine:
                 and str(row.get("execution_mode") or "").strip().lower() == normalized_mode
                 and _broker_repair_positive_int(row.get("filled_qty")) is not None
             ]
-            if len(candidates) > 1:
+            # PR #558 amendment (Blocker 2): apply broker evidence to EVERY
+            # surviving candidate BEFORE deciding ambiguity.  Two historical
+            # ENTRY rows can share (client, mode, OCC, positive filled qty)
+            # while only one matches the actual broker-open position economics
+            # and timing.  Declaring AMBIGUOUS on len(candidates) > 1 before
+            # broker matching throws away the disambiguation authority that
+            # _broker_repair_order_matches was designed to provide.
+            #
+            # Ordering:
+            #   Stage 1 — identity filter (above)
+            #   Stage 2 — broker-evidence narrowing (below, when broker_position given)
+            #   Stage 3 — decide from the narrowed survivors:
+            #       exactly 1 → return that row (canonical provenance proven)
+            #       0        → return None (provenance unresolved; caller
+            #                   must not fabricate canonical history and must
+            #                   keep the degraded broker-truth owner active)
+            #       2+       → AMBIGUOUS (true ambiguity even with broker
+            #                   evidence; caller keeps degraded owner)
+            if not candidates:
+                return None
+            if broker_position is not None and len(candidates) > 1:
+                narrowed = [
+                    row for row in candidates
+                    if _broker_repair_order_matches(row, broker_position)
+                ]
+                if len(narrowed) == 1:
+                    return narrowed[0]
+                if len(narrowed) == 0:
+                    log.error(
+                        "[exit_eng] BROKER_REPAIR_ENTRY_EVIDENCE_UNRESOLVED "
+                        "client=%s mode=%s contract=%s pre_broker_candidates=%d "
+                        "post_broker_survivors=0",
+                        self._email, normalized_mode, contract, len(candidates),
+                    )
+                    return None
                 log.error(
                     "[exit_eng] BROKER_REPAIR_ENTRY_EVIDENCE_AMBIGUOUS "
-                    "client=%s mode=%s contract=%s candidates=%d",
+                    "client=%s mode=%s contract=%s pre_broker_candidates=%d "
+                    "post_broker_survivors=%d",
+                    self._email, normalized_mode, contract,
+                    len(candidates), len(narrowed),
+                )
+                return {"_broker_repair_lookup_status": "AMBIGUOUS"}
+            if len(candidates) > 1:
+                # broker_position not provided — cannot narrow, must fail closed
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_ENTRY_EVIDENCE_AMBIGUOUS "
+                    "client=%s mode=%s contract=%s candidates=%d "
+                    "reason=no_broker_evidence_supplied",
                     self._email, normalized_mode, contract, len(candidates),
                 )
                 return {"_broker_repair_lookup_status": "AMBIGUOUS"}
-            if not candidates:
-                return None
             if broker_position is not None and not _broker_repair_order_matches(
                 candidates[0], broker_position
             ):
@@ -7094,6 +7155,296 @@ class APExitEngine:
                 self._email, normalized_mode, contract, type(exc).__name__, exc,
             )
             return {"_broker_repair_lookup_status": "UNAVAILABLE"}
+
+    # ── PR #558 amendment (Blocker 1) — degraded broker-truth owner ─────────
+    # When broker truth proves a LIVE/PAPER position is open but durable
+    # canonical DB repair is temporarily unavailable, install exactly one
+    # non-canonical ManagedPosition owner so the position never disappears
+    # from behavior-active exit ownership.  The owner is stable across repair
+    # cycles, fabricates no history, and is atomically superseded by the
+    # canonical owner when durable repair later succeeds.
+
+    _DEGRADED_ID_PREFIX = "broker-repair-degraded:"
+
+    def _degraded_broker_owner_id(self, sym: str, account_id: str) -> str:
+        """Deterministic stable id for the degraded owner of one broker-open
+        position.  Same (client, mode, OCC, account) always resolves to the
+        same id, so repeated broker prechecks with unavailable canonical
+        repair never accumulate multiple degraded owners for the same
+        broker-open position."""
+        import hashlib
+        _mode = self._resolved_execution_mode()
+        _contract = str(sym or "").strip().upper()
+        _account = str(account_id or "").strip()
+        _client = str(self._email or "").strip().lower()
+        # sha1 truncated — collision risk is negligible for the domain
+        # (per-client-per-mode-per-account-per-OCC namespace) and the id is
+        # not used as a cryptographic secret.
+        digest = hashlib.sha1(
+            f"{_client}|{_mode}|{_contract}|{_account}".encode()
+        ).hexdigest()[:16]
+        return f"{self._DEGRADED_ID_PREFIX}{digest}"
+
+    def _find_degraded_broker_owner_by_contract(self, sym: str) -> "ManagedPosition | None":
+        """Look up an existing degraded owner for this client+mode+OCC.
+        Called before installing a new one (stable identity) and before
+        installing a canonical replacement (convergence)."""
+        _contract = str(sym or "").strip().upper()
+        _mode = self._resolved_execution_mode()
+        if not _contract or _mode not in {"live", "paper"}:
+            return None
+        with self._lock:
+            for existing in self._positions:
+                if existing.closed:
+                    continue
+                if not getattr(existing, "broker_repair_degraded", False):
+                    continue
+                if str(existing.option_symbol or "").strip().upper() != _contract:
+                    continue
+                if str(existing.execution_mode or "").strip().lower() != _mode:
+                    continue
+                if str(existing.client_id or "").strip().lower() != str(self._email or "").strip().lower():
+                    continue
+                return existing
+        return None
+
+    def _install_or_refresh_degraded_broker_truth_owner(
+        self,
+        sym: str,
+        broker_position: dict,
+        broker_qty: int,
+        account_id: str,
+        repair_failed_reason: str,
+    ) -> "ManagedPosition | None":
+        """Install or refresh exactly one degraded ManagedPosition owner for
+        this client+mode+OCC, backed only by fresh broker truth.
+
+        Fail-closed fences (Angel spec, Required Degraded Owner Authority):
+        every one must be exact and proven or this returns None (no owner is
+        created and the caller preserves current 'no owner' behavior for
+        malformed truth).
+
+        Fabricates nothing.  underlying_entry / stop / target / signal_id /
+        entry order ids / entry_price all stay at their unset defaults;
+        broker cost_basis is NOT laundered into entry_price.  The owner
+        represents only 'fresh broker truth says this exact client/mode/OCC
+        position is currently open'.
+
+        Stable identity: repeated calls with the same inputs return the
+        SAME ManagedPosition object (in-place qty refresh + reason update),
+        preserving accumulated runtime exit state (peak_pnl_pct,
+        touched_profit, exit_in_flight, pending_exit_* identity, quote
+        watermarks, etc.)."""
+        _contract = str(sym or "").strip().upper()
+        _mode = self._resolved_execution_mode()
+        _client = str(self._email or "").strip()
+        _account = str(account_id or "").strip()
+
+        # Fence 1 — client, mode, OCC, positive broker qty, account authority
+        if not _client:
+            log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=client_id_unproven contract=%s", _contract)
+            return None
+        if _mode not in {"live", "paper"}:
+            log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=execution_mode_unproven client=%s contract=%s", _client, _contract)
+            return None
+        if not _contract:
+            log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=occ_identity_unproven client=%s mode=%s contract=%s", _client, _mode, _contract)
+            return None
+        try:
+            from ap.exit_safety import is_valid_exact_occ_contract as _occ_valid
+        except Exception:
+            _occ_valid = lambda _c: bool(_c)  # noqa: E731 — permissive fallback if module unimportable
+        if not _occ_valid(_contract):
+            log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=occ_identity_malformed client=%s mode=%s contract=%s", _client, _mode, _contract)
+            return None
+        if not _account:
+            log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=broker_account_unproven client=%s mode=%s contract=%s", _client, _mode, _contract)
+            return None
+        qty_int = _broker_repair_positive_int(broker_qty)
+        if qty_int is None or qty_int <= 0:
+            log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=broker_qty_invalid client=%s mode=%s contract=%s qty=%r", _client, _mode, _contract, broker_qty)
+            return None
+
+        # Fence 2 — malformed broker position payload (contradictory identity)
+        bp = broker_position if isinstance(broker_position, dict) else {}
+        bp_contract = str(
+            bp.get("contract") or bp.get("option_symbol")
+            or bp.get("symbol") or ""
+        ).strip().upper()
+        if bp_contract and bp_contract != _contract:
+            log.error(
+                "[exit_eng] DEGRADED_OWNER_BLOCKED reason=broker_position_contract_mismatch "
+                "client=%s mode=%s contract=%s broker_contract=%s",
+                _client, _mode, _contract, bp_contract,
+            )
+            return None
+
+        # Stable identity: if a degraded owner for this (client, mode, OCC)
+        # already exists, refresh in place rather than creating a new one.
+        existing = self._find_degraded_broker_owner_by_contract(_contract)
+        if existing is not None:
+            with self._lock:
+                # Broker truth is the authoritative qty; do NOT reduce below
+                # what broker reports.  Increase if broker qty grew.
+                if qty_int > int(existing.quantity or 0):
+                    existing.quantity = qty_int
+                if qty_int > int(existing.quantity_remaining or 0):
+                    existing.quantity_remaining = qty_int
+                existing.broker_repair_degraded_reason = str(repair_failed_reason or "")
+                existing.broker_repair_degraded_account_id = _account
+            log.info(
+                "[exit_eng] DEGRADED_OWNER_REFRESHED client=%s mode=%s contract=%s "
+                "position_id=%s qty=%d reason=%s",
+                _client, _mode, _contract, existing.position_id, qty_int,
+                repair_failed_reason,
+            )
+            return existing
+
+        # New degraded owner — construct with only broker-truth-derivable
+        # fields.  Everything else stays at dataclass defaults (no fabrication).
+        degraded_id = self._degraded_broker_owner_id(_contract, _account)
+        ticker_from_occ = self._underlying_from_occ(_contract)
+        side_from_occ = self._parse_occ_side(_contract)
+        pos = ManagedPosition(
+            ticker            = ticker_from_occ,
+            option_symbol     = _contract,
+            side              = side_from_occ,
+            quantity          = qty_int,
+            entry_price       = 0.0,        # UNFABRICATED — broker cost_basis is not entry_price
+            underlying_entry  = 0.0,        # UNFABRICATED
+            underlying_target = 0.0,        # UNFABRICATED (no scanner geometry)
+            underlying_stop   = 0.0,        # UNFABRICATED (no scanner geometry)
+            position_id       = degraded_id,
+            client_id         = _client,
+            signal_id         = "",         # UNFABRICATED — no proven entry signal
+            execution_mode    = _mode,
+            quantity_remaining= qty_int,
+        )
+        pos.broker_repair_degraded = True
+        pos.broker_repair_degraded_reason = str(repair_failed_reason or "")
+        pos.broker_repair_degraded_account_id = _account
+
+        with self._lock:
+            # Direct registration, bypassing add_position's canonical dedup.
+            # We already proved uniqueness via _find_degraded_broker_owner_by_contract
+            # above.  A future _take_over_degraded_owner_if_any call will
+            # remove this entry when canonical repair succeeds.
+            self._positions.append(pos)
+            self._positions_by_id[degraded_id] = pos
+
+        log.warning(
+            "[exit_eng] DEGRADED_OWNER_INSTALLED client=%s mode=%s contract=%s "
+            "position_id=%s qty=%d reason=%s "
+            "— non-canonical, exit-active, awaiting canonical repair convergence",
+            _client, _mode, _contract, degraded_id, qty_int, repair_failed_reason,
+        )
+        return pos
+
+    # Runtime-state keys transferred from degraded to canonical at convergence.
+    # Only fields that represent accumulated exit-behavior evidence — not
+    # identity fields (position_id, signal_id, entry_price, etc.) which the
+    # canonical owner sets from proven durable state.
+    _DEGRADED_RUNTIME_TRANSFER_KEYS = (
+        "current_option_price", "current_bid", "current_ask", "current_underlying",
+        "peak_pnl_pct", "touched_profit", "max_profit_seen",
+        "last_rejection_ts", "last_exit_rejected", "_exit_stuck_count",
+        "protective_monitoring_state",
+        "exit_in_flight", "pending_exit_reason", "pending_exit_action",
+        "pending_exit_qty", "pending_exit_filled_qty", "pending_scale_counted",
+        "pending_exit_local_order_id", "pending_exit_broker_order_id",
+        "last_applied_exit_local_order_id", "last_applied_exit_broker_order_id",
+        "last_applied_exit_cum_fill", "last_applied_exit_cum_fill_by_order",
+        "last_exit_signal_ts",
+        "last_quote_update_ts", "last_quote_missing_ts",
+        "last_option_quote_update_ts", "last_option_quote_missing_ts",
+        "last_underlying_quote_update_ts", "last_underlying_quote_missing_ts",
+        "_stop_breach_ts", "_underlying_stop_breach_ts",
+        "_underlying_stop_breach_quote_ts",
+        "realized_pnl", "unrealized_pnl",
+    )
+
+    def _take_over_degraded_owner_if_any(self, sym: str) -> dict | None:
+        """Convergence: if a degraded owner exists for this client+mode+OCC,
+        remove it from the engine and return a dict of accumulated runtime
+        state to seed onto the canonical owner about to be installed.
+
+        Returns None when no degraded owner exists (normal case — canonical
+        install proceeds without state transfer).  The caller applies the
+        returned state to the canonical ManagedPosition AFTER add_position
+        so quote/peak/pending-exit state accumulated during the degraded
+        window is not silently discarded."""
+        existing = self._find_degraded_broker_owner_by_contract(sym)
+        if existing is None:
+            return None
+        transfer: dict = {}
+        for key in self._DEGRADED_RUNTIME_TRANSFER_KEYS:
+            if hasattr(existing, key):
+                transfer[key] = getattr(existing, key)
+        # Copy the dict-valued watermark defensively so canonical doesn't
+        # share the degraded owner's mutable ref (which is about to be gone).
+        if isinstance(transfer.get("last_applied_exit_cum_fill_by_order"), dict):
+            transfer["last_applied_exit_cum_fill_by_order"] = dict(
+                transfer["last_applied_exit_cum_fill_by_order"]
+            )
+        with self._lock:
+            try:
+                self._positions.remove(existing)
+            except ValueError:
+                pass
+            self._positions_by_id.pop(existing.position_id, None)
+        log.info(
+            "[exit_eng] DEGRADED_OWNER_CONVERGED_TO_CANONICAL client=%s mode=%s "
+            "contract=%s degraded_id=%s transferred_keys=%d",
+            self._email, self._resolved_execution_mode(),
+            str(sym or "").strip().upper(),
+            existing.position_id, len(transfer),
+        )
+        return transfer
+
+    def _apply_degraded_runtime_transfer(
+        self, canonical_pos: "ManagedPosition", transfer: dict | None
+    ) -> None:
+        """Apply runtime-state transfer from a superseded degraded owner
+        onto a freshly installed canonical ManagedPosition.  Never overwrites
+        identity fields; only accumulated exit-behavior state."""
+        if not transfer or canonical_pos is None:
+            return
+        for key, value in transfer.items():
+            try:
+                current = getattr(canonical_pos, key, None)
+                # For scalar exit-progress state, prefer the higher/truthier
+                # value so we never regress peak/profit tracking during the
+                # takeover.  Straight overwrite for identity-carrying pending
+                # exit fields (canonical seed from DB does not have these).
+                if key in {"peak_pnl_pct", "max_profit_seen", "last_applied_exit_cum_fill"}:
+                    try:
+                        merged = max(float(current or 0), float(value or 0))
+                    except (TypeError, ValueError):
+                        merged = value
+                    setattr(canonical_pos, key, merged)
+                elif key == "last_applied_exit_cum_fill_by_order":
+                    if isinstance(current, dict) and isinstance(value, dict):
+                        for _k, _v in value.items():
+                            try:
+                                current[_k] = max(int(current.get(_k, 0) or 0), int(_v or 0))
+                            except (TypeError, ValueError):
+                                current[_k] = _v
+                    elif isinstance(value, dict):
+                        setattr(canonical_pos, key, dict(value))
+                elif key == "touched_profit":
+                    # Sticky — once touched, always touched.
+                    setattr(canonical_pos, key, bool(current) or bool(value))
+                else:
+                    # Only apply when canonical seed left the field at its default
+                    # (avoid clobbering DB-sourced identity/state with a stale
+                    # degraded snapshot).
+                    if current in (None, "", 0, 0.0, False):
+                        setattr(canonical_pos, key, value)
+            except Exception as _e:
+                log.debug(
+                    "[exit_eng] degraded->canonical transfer failed for key=%s: %s",
+                    key, _e,
+                )
 
     def _load_db_position_row(self, sym: str) -> dict | None:
         """Look up an active positions row for this client + contract symbol.
@@ -7997,6 +8348,15 @@ class APExitEngine:
                             type(_dre).__name__, _dre,
                         )
                 try:
+                    # PR #558 amendment (Blocker 1 convergence): if a degraded
+                    # broker-truth owner exists for this exact client+mode+OCC
+                    # from a prior cycle when durable repair was unavailable,
+                    # pop it out and transfer its accumulated runtime state
+                    # (peak_pnl_pct, touched_profit, pending_exit_* identity,
+                    # quote watermarks, etc.) onto the canonical owner about
+                    # to be installed.  This preserves exit-behavior state
+                    # earned during the degraded window.
+                    _degraded_transfer = self._take_over_degraded_owner_if_any(sym)
                     # Broker-truth mode: prefer_qty_override ensures stale qr=0 is overridden
                     pos = self._managed_position_from_row(
                         db_row,
@@ -8009,6 +8369,9 @@ class APExitEngine:
                     )
                     if not _loaded_active:
                         raise RuntimeError("add_position did not install behavior-active DB owner")
+                    # Apply runtime transfer AFTER add_position so canonical
+                    # is registered before state is written onto it.
+                    self._apply_degraded_runtime_transfer(pos, _degraded_transfer)
                     loaded_db_syms.append(sym)
                 except Exception as _le:
                     log.warning(
@@ -8077,27 +8440,72 @@ class APExitEngine:
                     )
                     if not _loaded_active:
                         raise RuntimeError("add_position did not install behavior-active broker owner")
+                    # PR #558 amendment (Blocker 1 convergence): canonical
+                    # repair just succeeded — supersede any prior degraded
+                    # owner for this contract and transfer accumulated
+                    # runtime state onto the canonical owner.  Ordered AFTER
+                    # add_position so the canonical is registered first.
+                    _degraded_transfer_success = self._take_over_degraded_owner_if_any(sym)
+                    self._apply_degraded_runtime_transfer(pos, _degraded_transfer_success)
                     repaired_syms.append(sym)              # confirmed DB row
                 except Exception as _re_err:
-                    repair_failed_syms.append(sym)
                     repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
                     log.error(
                         "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
                         "client=%s account=%s contract_symbol=%s error=%s",
                         self._email, _account_id, sym, repair_failed_reason,
                     )
-                    log.error(
+                    # PR #558 amendment (Blocker 1): broker truth proved this
+                    # position is open, but durable canonical DB repair is
+                    # temporarily unavailable.  Install (or refresh, if one
+                    # already exists) exactly one stable degraded broker-truth
+                    # owner so the position remains behavior-active in the
+                    # exit engine.  The helper fails closed on every authority
+                    # fence (client, mode, OCC validity, positive qty, broker
+                    # account authority, broker payload identity contradiction).
+                    # If any fence rejects, we fall through to the pre-amendment
+                    # "no owner" behavior — no synthetic owner is manufactured
+                    # from uncertainty.
+                    degraded_pos = self._install_or_refresh_degraded_broker_truth_owner(
+                        sym=sym,
+                        broker_position=bp,
+                        broker_qty=broker_qty,
+                        account_id=_account_id,
+                        repair_failed_reason=repair_failed_reason,
+                    )
+                    if degraded_pos is None:
+                        repair_failed_syms.append(sym)
+                        log.error(
+                            "[exit_eng] EXIT_BROKER_POSITION_ADDED_TO_ENGINE "
+                            "client=%s account=%s contract_symbol=%s "
+                            "db_seen_before=%s db_status_before=%s db_qty_before=%s "
+                            "broker_qty=%d loaded_qty=0 db_repaired=%s "
+                            "repair_failed_reason=%s added_to_engine=false "
+                            "will_evaluate_this_cycle=false quote_status=N/A "
+                            "degraded_owner=blocked_by_fence",
+                            self._email, _account_id, sym,
+                            db_seen, db_status_before, db_qty_before,
+                            broker_qty, db_repaired, repair_failed_reason,
+                        )
+                        continue
+                    # Degraded owner installed — the position remains
+                    # exit-active.  Continue the cycle so quote seeding and
+                    # normal exit monitoring run against it.  Do NOT mark the
+                    # symbol repaired (that flag means canonical DB row exists).
+                    pos = degraded_pos
+                    repair_failed_syms.append(sym)  # canonical still unresolved
+                    log.warning(
                         "[exit_eng] EXIT_BROKER_POSITION_ADDED_TO_ENGINE "
                         "client=%s account=%s contract_symbol=%s "
                         "db_seen_before=%s db_status_before=%s db_qty_before=%s "
-                        "broker_qty=%d loaded_qty=0 db_repaired=%s "
-                        "repair_failed_reason=%s added_to_engine=false "
-                        "will_evaluate_this_cycle=false quote_status=N/A",
+                        "broker_qty=%d loaded_qty=%d db_repaired=false "
+                        "repair_failed_reason=%s added_to_engine=true "
+                        "will_evaluate_this_cycle=true owner_kind=degraded_broker_truth",
                         self._email, _account_id, sym,
                         db_seen, db_status_before, db_qty_before,
-                        broker_qty, db_repaired, repair_failed_reason,
+                        broker_qty, int(pos.quantity_remaining or 0),
+                        repair_failed_reason,
                     )
-                    continue
 
             # ── 3c. Verify loaded_qty > 0 (fail-safe broker-truth enforcement) ─
             loaded_qty = int(getattr(pos, "quantity_remaining", 0) or 0)

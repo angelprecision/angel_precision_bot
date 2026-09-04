@@ -1238,3 +1238,489 @@ def test_postgres_fixture_wrapper_returns_dict_rows(monkeypatch):
         assert isinstance(row, dict), f"Expected dict, got {type(row).__name__}"
         assert row["id"] == "wrap-1"
         assert row["execution_mode"] == "live"
+
+
+# ─── PR #558 amendment — Blocker 1 (degraded owner) + Blocker 2 (entry disambig) ──
+#
+# These regressions lock in the two lifecycle invariants Angel's amendment
+# spec requires:
+#   Blocker 1 — broker-proven open position must remain behavior-active
+#               even when durable canonical DB repair is temporarily
+#               unavailable, via ONE stable non-canonical degraded owner.
+#   Blocker 2 — historical filled-ENTRY candidates must be narrowed by
+#               broker economics/timestamp evidence BEFORE ambiguity is
+#               declared.
+#
+# Source-inspection tests guard the invariants against future refactors.
+# Behavioral tests exercise the exact lifecycles via the fake-DB pattern
+# used by the rest of this file.  Behavioral tests skip locally when
+# ap_exit_engine cannot be imported without full deps; they run in CI.
+
+
+def test_pr558_blocker2_broker_evidence_applied_before_ambiguity():
+    """Blocker 2: _find_exact_filled_entry_order must not return AMBIGUOUS
+    on len(candidates) > 1 before applying broker evidence.  Two rows can
+    share (client, mode, OCC, positive filled qty) while only one matches
+    broker economics/timestamp.  The narrowing must happen first."""
+    src = EE_SRC
+    start = src.find("def _find_exact_filled_entry_order")
+    end   = src.find("\n    def ", start + 1)
+    body  = src[start:end]
+
+    # The comment / ordering marker must be present so future edits that
+    # revert the ordering are visibly wrong.
+    assert "Blocker 2" in body, (
+        "Blocker 2 rationale comment must be preserved in _find_exact_filled_entry_order"
+    )
+    assert "narrowed = [" in body, (
+        "Broker-evidence narrowing pass over ALL candidates must exist"
+    )
+    assert "_broker_repair_order_matches" in body, (
+        "Narrowing must reuse the existing _broker_repair_order_matches helper"
+    )
+    # The three-way decision must produce distinct outcomes so the caller
+    # can distinguish 'unresolved' from 'true ambiguity'.
+    assert "BROKER_REPAIR_ENTRY_EVIDENCE_UNRESOLVED" in body, (
+        "Zero-survivor case must produce UNRESOLVED (caller keeps degraded owner)"
+    )
+    assert "BROKER_REPAIR_ENTRY_EVIDENCE_AMBIGUOUS" in body, (
+        "Two-or-more-survivor case must still be AMBIGUOUS"
+    )
+    # The AMBIGUOUS log must include the pre- and post-broker counts so
+    # ops can see the narrowing happened.
+    assert "pre_broker_candidates" in body and "post_broker_survivors" in body, (
+        "AMBIGUOUS log must include pre_broker_candidates and post_broker_survivors"
+    )
+
+
+def test_pr558_blocker1_degraded_owner_helpers_exist():
+    """Blocker 1: the degraded broker-truth owner helpers must exist on
+    APExitEngine with the exact spec-required semantics."""
+    src = EE_SRC
+    for name in (
+        "_degraded_broker_owner_id",
+        "_find_degraded_broker_owner_by_contract",
+        "_install_or_refresh_degraded_broker_truth_owner",
+        "_take_over_degraded_owner_if_any",
+        "_apply_degraded_runtime_transfer",
+    ):
+        assert f"def {name}" in src, f"required helper {name} is missing"
+    # ManagedPosition must carry the degraded flag so convergence can
+    # find/replace the degraded owner and _is_behavior_active_position
+    # (which does NOT read this flag) keeps it exit-active.
+    assert "broker_repair_degraded: bool = False" in src, (
+        "ManagedPosition must declare the broker_repair_degraded field"
+    )
+    # Stable identity prefix
+    assert '_DEGRADED_ID_PREFIX = "broker-repair-degraded:"' in src, (
+        "Stable degraded id prefix must be a class constant so convergence "
+        "code, tests, and log parsing agree on it"
+    )
+
+
+def test_pr558_blocker1_degraded_installer_has_authority_fences():
+    """The installer must fail closed on every authority fence Angel spec'd:
+    unproven client, execution mode, OCC identity + OCC format, broker
+    account authority, invalid broker qty, and broker payload identity
+    contradiction (contract mismatch)."""
+    src = EE_SRC
+    start = src.find("def _install_or_refresh_degraded_broker_truth_owner")
+    end   = src.find("\n    def ", start + 1)
+    body  = src[start:end]
+    # Every fence produces a distinct DEGRADED_OWNER_BLOCKED reason line.
+    for reason in (
+        "client_id_unproven",
+        "execution_mode_unproven",
+        "occ_identity_unproven",
+        "occ_identity_malformed",
+        "broker_account_unproven",
+        "broker_qty_invalid",
+        "broker_position_contract_mismatch",
+    ):
+        assert reason in body, f"authority fence '{reason}' missing from installer"
+    # Fabrication rejection markers — every field that Angel forbade must
+    # carry the UNFABRICATED marker in the constructor call so a future
+    # edit that starts writing e.g. broker.cost_basis into entry_price is
+    # visibly wrong.
+    assert "UNFABRICATED" in body, (
+        "The constructor must comment which fields stay unfabricated so a "
+        "future edit that starts laundering broker cost_basis into "
+        "entry_price is visibly wrong"
+    )
+
+
+def test_pr558_blocker1_orchestrator_installs_degraded_on_repair_failure():
+    """The broker-precheck orchestrator's 3b repair-failure branch must
+    call _install_or_refresh_degraded_broker_truth_owner instead of
+    unconditionally continueing with no owner."""
+    src = EE_SRC
+    # Locate the 3b block.
+    idx_3b = src.find("# ── 3b. Create DB row from broker truth if still no pos ───────────")
+    idx_3c = src.find("# ── 3c. Verify loaded_qty > 0", idx_3b)
+    assert idx_3b > 0 and idx_3c > idx_3b, "3b / 3c section markers missing"
+    body = src[idx_3b:idx_3c]
+    assert "_install_or_refresh_degraded_broker_truth_owner" in body, (
+        "3b repair-failure branch must install a degraded broker-truth owner"
+    )
+    # And the convergence takeover must fire on the success side.
+    assert "_take_over_degraded_owner_if_any" in body, (
+        "3b canonical-repair-success branch must supersede any degraded owner"
+    )
+    assert "_apply_degraded_runtime_transfer" in body, (
+        "Convergence must transfer accumulated runtime state onto canonical"
+    )
+    # Distinct log tag so ops can tell degraded from canonical.
+    assert "owner_kind=degraded_broker_truth" in body, (
+        "Degraded install must emit a distinguishable EXIT_BROKER_POSITION_ADDED_TO_ENGINE log line"
+    )
+
+
+def test_pr558_blocker1_orchestrator_3a_converges_degraded():
+    """Section 3a (DB row load path) must also converge any preexisting
+    degraded owner before installing canonical.  Otherwise a later cycle
+    that hydrates a canonical row without going through repair would leave
+    a stale degraded owner alongside canonical → two exit authorities."""
+    src = EE_SRC
+    idx_3a = src.find("# ── 3a. Try DB load ───────────────────────────────────────────────")
+    idx_3b = src.find("# ── 3b. Create DB row from broker truth if still no pos ───────────", idx_3a)
+    assert idx_3a > 0 and idx_3b > idx_3a, "3a / 3b markers missing"
+    body = src[idx_3a:idx_3b]
+    assert "_take_over_degraded_owner_if_any" in body, (
+        "3a DB load path must supersede any prior degraded owner "
+        "for this contract before installing canonical"
+    )
+    assert "_apply_degraded_runtime_transfer" in body, (
+        "3a path must transfer degraded runtime state onto canonical"
+    )
+
+
+def test_pr558_blocker1_degraded_id_is_deterministic_and_client_scoped():
+    """Same client+mode+OCC+account must always yield the SAME degraded id
+    (stable identity across repair cycles).  Different clients or accounts
+    must never collide."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not importable in this environment")
+    def _mk(email, mode):
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = email
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        # Stub the execution mode resolver
+        eng._resolved_execution_mode = lambda: mode
+        return eng
+
+    e1 = _mk("jason@example.com", "live")
+    e2 = _mk("jason@example.com", "live")
+    e3 = _mk("jason@example.com", "paper")
+    e4 = _mk("jose@example.com", "live")
+
+    sym = "IWM260117C00220000"
+    acct = "acct-jason-live"
+
+    id1 = e1._degraded_broker_owner_id(sym, acct)
+    id2 = e2._degraded_broker_owner_id(sym, acct)
+    id3 = e3._degraded_broker_owner_id(sym, acct)
+    id4 = e4._degraded_broker_owner_id(sym, acct)
+    id5 = e1._degraded_broker_owner_id(sym, "acct-different")
+
+    # Same inputs → same id (stable identity, no accumulation across cycles).
+    assert id1 == id2, "same inputs must produce identical degraded id"
+    # Prefix is the canonical marker used by convergence + log parsing.
+    assert id1.startswith("broker-repair-degraded:")
+    # Any input variation → different id (no cross-client/mode/account collision).
+    assert id1 != id3, "LIVE and PAPER for the same client must not collide"
+    assert id1 != id4, "different clients must not collide"
+    assert id1 != id5, "different broker accounts must not collide"
+
+
+def test_pr558_blocker1_stable_owner_across_repeated_repair_cycles():
+    """Repeated broker prechecks with durable repair still unavailable must
+    resolve to the SAME degraded ManagedPosition object (in-place refresh)
+    — never accumulate multiple degraded owners for one broker-open
+    position."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if engine_cls is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable in this environment")
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "jason@example.com"
+    eng._lock = __import__("threading").Lock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng._resolved_execution_mode = lambda: "live"
+    # Stub OCC parsers used by the installer to avoid needing the full env.
+    eng._underlying_from_occ = lambda s: "IWM"
+    eng._parse_occ_side = lambda s: "CALL"
+
+    sym = "IWM260117C00220000"
+    bp = {"contract": sym, "quantity": 2, "cost_basis": 2.40}
+
+    p1 = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position=bp, broker_qty=2,
+        account_id="acct-live-1", repair_failed_reason="db_upsert_returned_no_id",
+    )
+    p2 = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position=bp, broker_qty=2,
+        account_id="acct-live-1", repair_failed_reason="db_upsert_returned_no_id",
+    )
+    p3 = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position=bp, broker_qty=2,
+        account_id="acct-live-1", repair_failed_reason="db_upsert_returned_no_id",
+    )
+    assert p1 is not None
+    # Identical object across all three cycles — no accumulation.
+    assert p1 is p2 is p3, (
+        "repeated repair-failure cycles must refresh the SAME degraded owner"
+    )
+    # Exactly one behavior-active owner exists for this contract.
+    same_contract = [
+        p for p in eng._positions
+        if str(p.option_symbol).upper() == sym.upper() and not p.closed
+    ]
+    assert len(same_contract) == 1, (
+        f"expected exactly one degraded owner for {sym}, got {len(same_contract)}"
+    )
+
+
+def test_pr558_blocker1_degraded_installer_fails_closed_on_bad_truth():
+    """Malformed / uncertain broker truth must not manufacture a degraded
+    owner.  Angel spec: 'do not manufacture open. Do not manufacture flat.'
+    """
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not importable in this environment")
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "jason@example.com"
+    eng._lock = __import__("threading").Lock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng._resolved_execution_mode = lambda: "live"
+    eng._underlying_from_occ = lambda s: "IWM"
+    eng._parse_occ_side = lambda s: "CALL"
+
+    sym = "IWM260117C00220000"
+
+    # Missing account authority
+    p = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 2},
+        broker_qty=2, account_id="", repair_failed_reason="test",
+    )
+    assert p is None and eng._positions == []
+
+    # Zero broker qty
+    p = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 0},
+        broker_qty=0, account_id="acct", repair_failed_reason="test",
+    )
+    assert p is None and eng._positions == []
+
+    # Negative broker qty
+    p = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": -1},
+        broker_qty=-1, account_id="acct", repair_failed_reason="test",
+    )
+    assert p is None and eng._positions == []
+
+    # Broker payload names a different contract (identity contradiction)
+    p = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": "SPY260117C00500000", "quantity": 2},
+        broker_qty=2, account_id="acct", repair_failed_reason="test",
+    )
+    assert p is None and eng._positions == []
+
+
+def test_pr558_blocker1_convergence_transfers_runtime_state():
+    """When canonical repair later succeeds, _take_over + _apply_transfer
+    must remove the degraded owner and preserve accumulated exit state
+    (peak_pnl_pct, touched_profit, pending_exit_* identity, quote
+    watermarks) onto the canonical owner."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if engine_cls is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable in this environment")
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "jason@example.com"
+    eng._lock = __import__("threading").Lock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng._resolved_execution_mode = lambda: "live"
+    eng._underlying_from_occ = lambda s: "IWM"
+    eng._parse_occ_side = lambda s: "CALL"
+
+    sym = "IWM260117C00220000"
+
+    degraded = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 2},
+        broker_qty=2, account_id="acct-live-1",
+        repair_failed_reason="db_upsert_returned_no_id",
+    )
+    assert degraded is not None
+    # Simulate accumulated exit state during the degraded window.
+    degraded.peak_pnl_pct = 0.27
+    degraded.touched_profit = True
+    degraded.current_bid = 1.15
+    degraded.pending_exit_local_order_id = "local-exit-abc"
+    degraded.pending_exit_broker_order_id = "broker-exit-xyz"
+    degraded.pending_exit_qty = 2
+    degraded.exit_in_flight = True
+
+    # Take over — degraded must be removed from the engine.
+    transfer = eng._take_over_degraded_owner_if_any(sym)
+    assert transfer is not None
+    assert degraded not in eng._positions, "degraded owner must be popped from engine on takeover"
+    assert eng._positions_by_id.get(degraded.position_id) is None
+
+    # Freshly seeded canonical owner (all runtime fields at their defaults).
+    canonical = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL",
+        quantity=2, entry_price=2.40, underlying_entry=210.0,
+        underlying_target=225.0, underlying_stop=205.0,
+        position_id="canonical-uuid-real",
+        client_id="jason@example.com",
+        signal_id="real-sig-1", execution_mode="live",
+        quantity_remaining=2,
+    )
+    eng._apply_degraded_runtime_transfer(canonical, transfer)
+
+    assert canonical.peak_pnl_pct == 0.27, "peak_pnl_pct must survive convergence"
+    assert canonical.touched_profit is True, "touched_profit must be sticky"
+    assert canonical.current_bid == 1.15
+    assert canonical.pending_exit_local_order_id == "local-exit-abc"
+    assert canonical.pending_exit_broker_order_id == "broker-exit-xyz"
+    assert canonical.pending_exit_qty == 2
+    assert canonical.exit_in_flight is True
+    # Identity fields must NOT have been touched.
+    assert canonical.position_id == "canonical-uuid-real"
+    assert canonical.signal_id == "real-sig-1"
+    assert canonical.entry_price == 2.40
+
+
+def test_pr558_blocker1_degraded_owner_makes_no_fabricated_history():
+    """The degraded owner represents only 'fresh broker truth says this
+    position is open'.  It must not carry any fabricated history:
+    signal_id, entry_price, underlying_entry / stop / target."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not importable in this environment")
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "jason@example.com"
+    eng._lock = __import__("threading").Lock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng._resolved_execution_mode = lambda: "live"
+    eng._underlying_from_occ = lambda s: "IWM"
+    eng._parse_occ_side = lambda s: "CALL"
+
+    sym = "IWM260117C00220000"
+    # Broker payload carries a cost_basis and date_acquired that MUST NOT
+    # be laundered into local entry_price / opened_at as if they were
+    # proven local entry provenance.
+    bp = {"contract": sym, "quantity": 2, "cost_basis": 2.40, "date_acquired": "2026-08-01"}
+    pos = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position=bp, broker_qty=2,
+        account_id="acct-live-1", repair_failed_reason="db_upsert_returned_no_id",
+    )
+    assert pos is not None
+    # Broker-truth-only fields
+    assert pos.option_symbol == sym
+    assert pos.quantity == 2 and pos.quantity_remaining == 2
+    assert pos.execution_mode == "live"
+    assert pos.client_id == "jason@example.com"
+    assert pos.broker_repair_degraded is True
+    # Nothing fabricated
+    assert pos.entry_price == 0.0, "broker cost_basis MUST NOT be laundered into entry_price"
+    assert pos.underlying_entry == 0.0
+    assert pos.underlying_target == 0.0
+    assert pos.underlying_stop == 0.0
+    assert pos.signal_id == ""
+    assert pos.position_id.startswith("broker-repair-degraded:")
+
+
+def test_pr558_blocker1_degraded_owner_is_behavior_active():
+    """The degraded owner must appear in engine.active_positions() — the
+    whole point is to keep the position exit-active during the degraded
+    window.  A future refactor that marks degraded owners as quarantined
+    would silently disable exit monitoring."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not importable in this environment")
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "jason@example.com"
+    eng._lock = __import__("threading").Lock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng._resolved_execution_mode = lambda: "live"
+    eng._underlying_from_occ = lambda s: "IWM"
+    eng._parse_occ_side = lambda s: "CALL"
+
+    sym = "IWM260117C00220000"
+    pos = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 2},
+        broker_qty=2, account_id="acct", repair_failed_reason="test",
+    )
+    assert pos is not None
+    active = eng.active_positions()
+    assert pos in active, "degraded owner must be behavior-active"
+    assert len(active) == 1
+
+
+def test_pr558_blocker2_multi_candidate_narrowed_by_broker_returns_survivor():
+    """Two historical ENTRY rows share (client, mode, OCC, filled_qty>0),
+    only one matches broker economics.  Reordered code returns the single
+    survivor rather than AMBIGUOUS."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not importable in this environment")
+
+    # Two candidates with same OCC/client/mode/filled_qty; only one matches
+    # broker cost basis.
+    rows = [
+        {"id": "old-order", "client_id": "jason@example.com", "execution_mode": "live",
+         "contract": "IWM260117C00220000", "kind": "ENTRY", "status": "FILLED",
+         "filled_qty": 2, "avg_fill_price": 1.10, "fill_price": 1.10},  # mismatch on price
+        {"id": "current-order", "client_id": "jason@example.com", "execution_mode": "live",
+         "contract": "IWM260117C00220000", "kind": "ENTRY", "status": "FILLED",
+         "filled_qty": 2, "avg_fill_price": 2.40, "fill_price": 2.40},  # matches broker
+    ]
+    # Broker position matching the second candidate.
+    broker_position = {"quantity": 2, "cost_basis": 4.80}  # 2 * 2.40
+
+    # Install fake ap.db returning our rows.
+    from contextlib import contextmanager
+    class _Cur:
+        def execute(self, sql, params=()):
+            return self
+        def fetchall(self):
+            return rows
+        def fetchone(self):
+            return rows[0] if rows else None
+    @contextmanager
+    def fake_conn():
+        yield _Cur()
+    fake_db = types.SimpleNamespace(conn=fake_conn, run_with_retry=lambda fn, **_: fn())
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_db
+
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "jason@example.com"
+    eng._lock = __import__("threading").Lock()
+    try:
+        result = eng._find_exact_filled_entry_order(
+            "IWM260117C00220000", "live", broker_position=broker_position,
+        )
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert isinstance(result, dict)
+    # Must NOT be an AMBIGUOUS/UNAVAILABLE/MISMATCH marker.
+    assert "_broker_repair_lookup_status" not in result, (
+        f"expected the narrowed survivor, got lookup marker: {result}"
+    )
+    assert result.get("id") == "current-order", (
+        "broker evidence should have narrowed to the current-order row"
+    )
