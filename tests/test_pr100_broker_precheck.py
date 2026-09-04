@@ -234,6 +234,13 @@ def _build_engine_under_test():
             m = re.match(r'^([A-Z]+)\d', sym.upper())
             return m.group(1) if m else sym[:4]
 
+        def _resolved_execution_mode(self):
+            # PR #557 amendment: precheck consults _resolved_execution_mode
+            # to build the degraded-retry set and to fence the converger.
+            # The test _FakeEngine defaults to LIVE mode to preserve the
+            # existing broker-side positive-quantity semantics.
+            return "live"
+
         def add_position(self, pos):
             self._positions.append(pos)
 
