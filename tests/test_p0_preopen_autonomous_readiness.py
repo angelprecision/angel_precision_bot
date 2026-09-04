@@ -320,6 +320,41 @@ def test_wrong_restart_rearm_owner_still_blocks_live_entries(monkeypatch):
     assert unowned == [{"local_order_id": "L-1", "signal_id": "sig-1"}]
 
 
+def test_restart_rearm_owner_with_wrong_signal_still_blocks_live_entries():
+    runner = _Runner(mode="live", watcher=_Watcher(set()))
+    now_utc = datetime.now(timezone.utc)
+    durable_row = {
+        "local_order_id": "L-1",
+        "signal_id": "different-signal",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {
+            "restart_rearm_status": "RETRY_PENDING",
+            "restart_rearm_owner": "restart_rearm:jason@example.com:live:L-1",
+            "restart_rearm_reason": "late_attachment_market_truth_unavailable_or_unresolved",
+            "restart_rearm_attempt": 1,
+            "restart_rearm_next_at": (now_utc + timedelta(seconds=30)).isoformat(),
+            "restart_rearm_deadline": (now_utc + timedelta(minutes=3)).isoformat(),
+            "restart_rearm_first_failed_at": now_utc.isoformat(),
+            "restart_rearm_client_id": "jason@example.com",
+            "restart_rearm_execution_mode": "live",
+        },
+    }
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(durable_row) if oid == "L-1" else None
+    )
+
+    unowned = pr._pending_trigger_without_watcher(
+        runner,
+        [{"local_order_id": "L-1", "signal_id": "expected-signal"}],
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+
+    assert unowned == [{"local_order_id": "L-1", "signal_id": "expected-signal"}]
+
+
 def test_mode_mismatch_is_critical(monkeypatch):
     _stub_common(monkeypatch)
     runner = _Runner(mode="paper")

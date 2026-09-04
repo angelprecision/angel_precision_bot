@@ -3121,14 +3121,6 @@ class TestWatcherOwnedWithInflight:
 
 class TestLateMarketValidityRecovery:
     def test_post_open_through_trigger_routes_to_canonical_watcher_policy(self, monkeypatch):
-        import ap.pending_trigger_restart_recovery as ptr
-        from zoneinfo import ZoneInfo
-
-        monkeypatch.setattr(
-            ptr,
-            "_et_now_ptr",
-            lambda: datetime(2026, 9, 2, 9, 31, tzinfo=ZoneInfo("America/New_York")),
-        )
         r = _row(meta={
             "trigger_price": 450.0,
             "late_attachment_policy_eligible": True,
@@ -3163,15 +3155,7 @@ class TestLateMarketValidityRecovery:
         assert summary["terminalized"] == 1
         assert "restart_recovery_already_through_trigger" in osm.cancel_calls[0][1]
 
-    def test_final_preopen_seconds_become_owned_retry_not_terminal(self, monkeypatch):
-        import ap.pending_trigger_restart_recovery as ptr
-        from zoneinfo import ZoneInfo
-
-        monkeypatch.setattr(
-            ptr,
-            "_et_now_ptr",
-            lambda: datetime(2026, 9, 2, 9, 29, 45, tzinfo=ZoneInfo("America/New_York")),
-        )
+    def test_preopen_restart_recovery_installs_watcher_without_clock_hold(self):
         r = _row(meta={
             "trigger_price": 450.0,
             "late_attachment_policy_eligible": True,
@@ -3191,12 +3175,11 @@ class TestLateMarketValidityRecovery:
         summary = rec.recover_all([r])
         all_meta = {k: v for _oid, item in osm.meta_writes for k, v in item.items()}
 
-        assert watcher.watch_calls == 0
-        assert summary["retry_rows_owned"] == 1
-        assert summary["restart_rearm_retry_owned_count"] == 1
+        assert watcher.watch_calls == 1
+        assert summary["watchers_rearmed"] == 1
+        assert summary["retry_rows_owned"] == 0
         assert summary["ownerless_rows_remaining"] == 0
-        assert all_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
-        assert all_meta[_RR_REASON_FIELD] == "regular_session_market_truth_not_yet_available"
+        assert _RR_STATUS_FIELD not in all_meta
         assert osm.cancel_calls == []
 
     def test_exact_runtime_owner_is_preserved_without_second_watch(self):
@@ -3284,6 +3267,26 @@ class TestLateMarketValidityRecovery:
         assert osm.get_order(r["local_order_id"])["last_error"] == "target_already_complete_terminal"
         assert osm.cancel_calls == []
 
+    def test_late_policy_uses_canonical_watcher_when_coarse_quote_is_unavailable(self):
+        r = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(
+            r,
+            watcher=watcher,
+            quote_result=None,
+        )
+
+        summary = rec.recover_all([r])
+
+        assert summary["watchers_rearmed"] == 1
+        assert summary["retry_rows_owned"] == 0
+        assert summary["ownerless_rows_remaining"] == 0
+        assert len(watcher._pending) == 1
+        assert osm.cancel_calls == []
+
     def test_confirmed_trigger_missing_truth_remains_retry_owned(self):
         crossed_at = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
         local_order_id = str(uuid.uuid4())
@@ -3306,7 +3309,7 @@ class TestLateMarketValidityRecovery:
         )
         rec, osm = _make_recovery(
             r,
-            watcher=_MockWatcher(watch_returns=True),
+            watcher=_MockWatcher(watch_returns=False),
             quote_result=None,
         )
         summary = rec.recover_all([r])
@@ -3339,7 +3342,7 @@ class TestLateMarketValidityRecovery:
         )
         rec, osm = _make_recovery(
             r,
-            watcher=_MockWatcher(watch_returns=True),
+            watcher=_MockWatcher(watch_returns=False),
             quote_result=None,
         )
 
@@ -3362,3 +3365,4 @@ def test_pr569_no_clock_terminal_authority_survives():
 
     source = inspect.getsource(ov) + inspect.getsource(ptr)
     assert "PREOPEN_OWNERSHIP_DEADLINE_MISSED" not in source
+    assert "09:29:30" not in source

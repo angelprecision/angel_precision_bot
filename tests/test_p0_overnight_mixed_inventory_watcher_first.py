@@ -119,11 +119,53 @@ class _OSM:
 
 
 class _Watcher:
-    def __init__(self):
+    def __init__(self, *, watch_returns: bool = True):
         self.calls: list[tuple[object, str]] = []
+        self._pending: list[object] = []
+        self._dedup_set: set[str] = set()
+        self._watch_returns = watch_returns
 
-    def watch(self, plan, local_order_id: str) -> bool:
+    def has_order(self, local_order_id: str) -> bool:
+        return any(
+            str(getattr(item, "signal", {}).get("local_order_id") or "")
+            == local_order_id
+            for item in self._pending
+        )
+
+    def watch(
+        self,
+        plan,
+        local_order_id: str,
+        *,
+        registration_provenance_out: dict | None = None,
+        **_kwargs,
+    ) -> bool:
         self.calls.append((plan, local_order_id))
+        if not self._watch_returns:
+            self._last_reject_reason = "RECOVERY_REARM_QUOTE_UNAVAILABLE"
+            return False
+        get_value = (
+            (lambda key, default="": plan.get(key, default))
+            if isinstance(plan, dict)
+            else (lambda key, default="": getattr(plan, key, default))
+        )
+        signal_id = str(get_value("signal_id") or "")
+        item = SimpleNamespace(
+            state="PENDING",
+            _ownership_quarantine=False,
+            _registration_token=f"token-{local_order_id}",
+            signal={
+                "local_order_id": local_order_id,
+                "signal_id": signal_id,
+                "client_id": str(get_value("client_id") or ""),
+                "execution_mode": str(get_value("execution_mode") or "").lower(),
+            },
+        )
+        self._pending.append(item)
+        self._dedup_set.add(signal_id)
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = True
+            registration_provenance_out["registration_token"] = item._registration_token
         return True
 
 
@@ -137,6 +179,8 @@ def _run_harness(
     client_id: str = "jose@example.com",
     execution_mode: str = "PAPER",
     now_et: datetime | None = None,
+    recovery_quote: tuple[float, float] | None = (100.0, 100.1),
+    watch_returns: bool = True,
 ):
     run_now = now_et or FIXED_ET
     counters = {"prior": [], "snapshot": []}
@@ -154,6 +198,17 @@ def _run_harness(
                 "prior_day_high": 101.0,
                 "prior_day_low": 95.0,
                 "prior_day_close": 98.0,
+                "source": "test",
+                "observed_at": run_now.isoformat(),
+            }
+
+        def get_quote(self, _ticker: str):
+            if recovery_quote is None:
+                return None
+            bid, ask = recovery_quote
+            return {
+                "bid": bid,
+                "ask": ask,
                 "source": "test",
                 "observed_at": run_now.isoformat(),
             }
@@ -230,7 +285,7 @@ def _run_harness(
 
     selector = MagicMock()
     osm = osm or _OSM()
-    watcher = _Watcher()
+    watcher = _Watcher(watch_returns=watch_returns)
     result = ov.run_overnight_reeval(
         client_id=client_id,
         broker=broker,
@@ -255,38 +310,37 @@ def _run_harness(
     )
 
 
-def test_final_preopen_seconds_hold_for_regular_session_truth(monkeypatch):
+def test_092945_exact_new_lifecycle_installs_watcher_before_open(monkeypatch):
     state = _run_harness(
         monkeypatch,
         [_job("late-proof", _signal("late-proof", "NFLX"))],
         execution_mode="LIVE",
-        now_et=datetime(2026, 7, 22, 9, 29, 30, tzinfo=ZoneInfo("America/New_York")),
+        now_et=datetime(2026, 7, 22, 9, 29, 45, tzinfo=ZoneInfo("America/New_York")),
     )
 
-    assert state.result["market_truth_deferred"] == 1
+    assert state.result["market_truth_deferred"] == 0
     assert state.result["retryable_deferred"] == 0
-    assert state.result["retry_owned"] == 1
-    assert state.result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
+    assert state.result["retry_owned"] == 0
+    assert state.result["armed"] == 1
     assert state.result["completed"] is True
     assert state.result["retryable"] is False
     assert len(state.osm.create_calls) == 1
-    assert state.osm.rows["local-1"]["meta"]["restart_rearm_status"] == "RETRY_PENDING"
-    assert state.osm.rows["local-1"]["meta"]["restart_rearm_owner"] == (
-        "restart_rearm:jose@example.com:live:local-1"
-    )
-    assert state.watcher.calls == []
+    assert [oid for _plan, oid in state.watcher.calls] == ["local-1"]
+    assert len(state.watcher._pending) == 1
     state.broker.submit_order.assert_not_called()
     state.broker.place_order.assert_not_called()
     state.broker.cancel_order.assert_not_called()
     state.broker.replace_order.assert_not_called()
 
 
-def test_final_preopen_seconds_fail_closed_when_retry_owner_is_unproven(monkeypatch):
+def test_post_open_missing_quote_fails_closed_when_retry_owner_is_unproven(monkeypatch):
     state = _run_harness(
         monkeypatch,
         [_job("late-unowned", _signal("late-unowned", "BMY"))],
         execution_mode="LIVE",
-        now_et=datetime(2026, 7, 22, 9, 29, 30, tzinfo=ZoneInfo("America/New_York")),
+        now_et=datetime(2026, 7, 22, 9, 30, 5, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
         osm=_OSM(fail_meta_update=True),
     )
 
@@ -294,7 +348,8 @@ def test_final_preopen_seconds_fail_closed_when_retry_owner_is_unproven(monkeypa
     assert state.result["retryable_deferred"] == 1
     assert state.result["completed"] is False
     assert state.result["retryable"] is True
-    assert state.watcher.calls == []
+    assert [oid for _plan, oid in state.watcher.calls] == ["local-1"]
+    assert state.watcher._pending == []
     state.broker.submit_order.assert_not_called()
     state.broker.place_order.assert_not_called()
     state.broker.cancel_order.assert_not_called()
@@ -305,13 +360,35 @@ def test_post_open_new_arm_routes_to_watcher_market_validity(monkeypatch):
         monkeypatch,
         [_job("late-valid", _signal("late-valid", "C"))],
         execution_mode="LIVE",
-        now_et=datetime(2026, 7, 22, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+        now_et=datetime(2026, 7, 22, 9, 30, 5, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
     )
 
     assert state.result["market_truth_deferred"] == 0
     assert state.result["armed"] == 1
     assert state.result["completed"] is True
     assert len(state.watcher.calls) == 1
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+
+
+def test_post_open_missing_quote_gets_durable_retry_owner(monkeypatch):
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-hold", _signal("late-hold", "BMY"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 30, 5, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+    )
+
+    assert state.result["retry_owned"] == 1
+    assert state.result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
+    assert state.result["completed"] is True
+    assert [oid for _plan, oid in state.watcher.calls] == ["local-1"]
+    assert state.watcher._pending == []
+    assert state.osm.rows["local-1"]["meta"]["restart_rearm_status"] == "RETRY_PENDING"
     state.broker.submit_order.assert_not_called()
     state.broker.place_order.assert_not_called()
     state.broker.cancel_order.assert_not_called()

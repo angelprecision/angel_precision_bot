@@ -741,10 +741,11 @@ def test_13_no_selector_or_broker_calls_for_terminal_dispositions(monkeypatch, d
     assert len(broker_replace_calls) == 0, f"broker.replace called for {disposition!r}"
 
 
-def test_final_preopen_reattach_gets_verified_retry_owner_without_broker_mutation(monkeypatch):
+def test_092945_reattach_installs_same_watcher_without_broker_mutation(monkeypatch):
     broker_submit_calls = []
     broker_cancel_calls = []
     broker_replace_calls = []
+    watcher_calls = []
     existing = _order_row(
         "local-reattach-1",
         "PENDING_TRIGGER",
@@ -758,17 +759,17 @@ def test_final_preopen_reattach_gets_verified_retry_owner_without_broker_mutatio
         disposition=ov._DISPOSITION_REATTACH_WATCHER,
         existing_order=existing,
         now_et=datetime(
-            2026, 7, 22, 9, 29, 30,
+            2026, 7, 22, 9, 29, 45,
             tzinfo=ZoneInfo("America/New_York"),
         ),
+        watch_fn=lambda _plan, oid: watcher_calls.append(oid) or True,
         broker_submit_calls=broker_submit_calls,
         broker_cancel_calls=broker_cancel_calls,
         broker_replace_calls=broker_replace_calls,
     )
 
-    assert result["retry_owned"] == 1
-    assert result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
-    assert result["completed"] is True
+    assert watcher_calls == ["local-reattach-1"]
+    assert result["retry_owned"] == 0
     assert broker_submit_calls == []
     assert broker_cancel_calls == []
     assert broker_replace_calls == []
@@ -998,7 +999,7 @@ def _run_shared_ap_signals_harness(
         def has_order(self, _local_order_id):
             return False
 
-        def watch(self, plan, local_order_id):
+        def watch(self, plan, local_order_id, **_kwargs):
             if watch_fn:
                 return watch_fn(plan, local_order_id)
             return True
@@ -1008,6 +1009,7 @@ def _run_shared_ap_signals_harness(
     monkeypatch.setattr(ov, "_mark_job_error", lambda *a, **k: None)
     monkeypatch.setattr(ov, "_mark_job_watching_reason", lambda *a, **k: None)
     monkeypatch.setattr(ov, "_mark_job_watching_armed", lambda *a, **k: None)
+    monkeypatch.setattr(ov, "_persist_reattach_in_progress_fence", lambda **_kwargs: True)
 
     return ov.run_overnight_reeval(
         client_id="jose@example.com",

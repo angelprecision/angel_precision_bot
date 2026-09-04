@@ -42,7 +42,7 @@ def _force_regular_live_session(monkeypatch, watcher=None):
     slightly different ways depending on whether the module has been
     reloaded in the test session)."""
     from datetime import datetime as _real_dt
-    _fixed = _real_dt(2026, 7, 23, 10, 15, tzinfo=ZoneInfo("America/New_York"))
+    _fixed = _real_dt(2026, 7, 23, 9, 30, 5, tzinfo=ZoneInfo("America/New_York"))
 
     class _FrozenDT(_real_dt):
         @classmethod

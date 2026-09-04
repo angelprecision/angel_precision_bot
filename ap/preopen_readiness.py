@@ -511,7 +511,10 @@ def _pending_trigger_without_watcher(
         try:
             if (
                 retry_owner is not None
-                and retry_owner.prove_restart_rearm_retry_owner(local_order_id)
+                and retry_owner.prove_restart_rearm_retry_owner(
+                    local_order_id,
+                    expected_signal_id=str(row.get("signal_id") or "").strip(),
+                )
                 is not None
             ):
                 continue
