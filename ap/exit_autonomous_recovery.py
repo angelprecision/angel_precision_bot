@@ -347,6 +347,23 @@ def _filled_order_quantity(raw: dict) -> Optional[int]:
     return None
 
 
+def _validated_quantity_aliases(
+    raw: dict, keys: tuple[str, ...]
+) -> tuple[bool, Optional[int]]:
+    """Return one quantity only when all present aliases agree."""
+    values: list[int] = []
+    for key in keys:
+        if key not in raw or raw.get(key) in (None, ""):
+            continue
+        value = _strict_qty(raw.get(key))
+        if value is None:
+            return True, None
+        values.append(value)
+    if len(set(values)) > 1:
+        return True, None
+    return bool(values), (values[0] if values else None)
+
+
 def _extract_fill_price(raw: dict) -> Optional[float]:
     # A submitted limit price is not execution economics.
     for key in (
@@ -398,7 +415,27 @@ def _get_order_truth(broker: Any, broker_order_id: str) -> tuple[str, Optional[d
     if _status(row) == "filled":
         filled_qty = _filled_order_quantity(row)
         fill_price = _extract_fill_price(row)
-        if filled_qty is None or filled_qty <= 0 or fill_price is None:
+        order_alias_present, declared_order_qty = _validated_quantity_aliases(
+            row, ("qty", "quantity", "order_qty")
+        )
+        filled_alias_present, declared_filled_qty = _validated_quantity_aliases(
+            row,
+            (
+                "filled_qty",
+                "filled_quantity",
+                "exec_quantity",
+                "exec_qty",
+                "quantity_filled",
+            ),
+        )
+        if (
+            filled_qty is None
+            or filled_qty <= 0
+            or fill_price is None
+            or (order_alias_present and declared_order_qty is None)
+            or (filled_alias_present and declared_filled_qty is None)
+            or filled_qty != order_qty
+        ):
             return "malformed", None
         row["_recovery_fill_qty"] = filled_qty
         row["_recovery_fill_price"] = fill_price

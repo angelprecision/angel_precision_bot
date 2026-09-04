@@ -1352,7 +1352,7 @@ def test_pr566_filled_partial_requires_exact_fill_fields_and_preserves_remaining
             "status": "filled",
             "filled_qty": 1,
             "avg_fill_price": 1.25,
-            "quantity": 2,
+            "quantity": 1,
         },
     )
     hooks = _RecoveryHooks()
@@ -1370,6 +1370,35 @@ def test_pr566_filled_partial_requires_exact_fill_fields_and_preserves_remaining
     assert hooks.closed_calls == []
     assert hooks.replacement_calls == []
     assert broker.cancel_calls == []
+
+
+def test_pr566_conflicting_filled_order_quantity_requires_hold():
+    broker = _RecoveryBroker(
+        positions=[_recovery_held_position()],
+        get_order_payload={
+            "id": "conflicting-filled-order",
+            "symbol": "IWM",
+            "option_symbol": _RECOVERY_OCC,
+            "side": "sell_to_close",
+            "status": "filled",
+            "quantity": 1,
+            "exec_quantity": 2,
+            "avg_fill_price": 1.25,
+        },
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(pending_broker_id="conflicting-filled-order"),
+        broker=broker,
+        exit_engine=hooks,
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_truth_malformed"
+    assert hooks.open_calls == []
+    assert hooks.partial_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
 
 
 def test_pr566_filled_limit_price_without_execution_price_is_hold():
