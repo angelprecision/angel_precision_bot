@@ -1130,6 +1130,7 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
                     exit_in_flight BOOLEAN NOT NULL DEFAULT FALSE,
                     pending_exit_broker_order_id TEXT,
                     pending_exit_local_order_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
@@ -1265,6 +1266,7 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
             "realized_pnl", "realized_pnl_pct", "exit_reason", "close_source",
             "close_confidence", "execution_mode", "local_order_id",
             "broker_order_id", "updated_at",
+            "created_at",
         }
         monkeypatch.setattr(
             pm_module.APPositionManager,
@@ -1833,6 +1835,111 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
         assert recovery_broker.post_calls == []
         assert recovery_broker.cancel_calls == []
         assert recovery_broker.replace_calls == []
+
+        # Production-shaped partial-fill crash boundary: the durable order row
+        # is already EXIT_PARTIAL_FILL when the old runtime disappears.  A new
+        # APExitEngine must hydrate the persisted cumulative quantity before
+        # the broker reports that same cumulative snapshot again.
+        from ap_exit_engine import APExitEngine
+
+        partial_position_id = "position-partial-restart-566"
+        partial_entry_id = "entry-partial-restart-566"
+        partial_exit_id = "exit-partial-restart-566"
+        partial_contract = "MSFT260904C00200000"
+        partial_broker_id = "broker-partial-restart-566"
+        partial_fill_ts = "2026-09-04T17:20:00+00:00"
+        with _pg_conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO positions
+                    (id, client_id, status, quantity_remaining, qty, avg_fill,
+                     entry_price, contract, underlying, ticker, side, direction,
+                     entry_ts, execution_mode, local_order_id)
+                VALUES
+                    (%s, 'tradefluence', 'OPEN', 3, 5, 1.00, 1.00,
+                     %s, 'MSFT', 'MSFT', 'CALL', 'CALL',
+                     '2026-09-04T17:00:00+00:00', 'paper', %s)
+                """,
+                (partial_position_id, partial_contract, partial_entry_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, execution_mode, qty, filled_qty,
+                     fill_price, symbol, contract, direction)
+                VALUES
+                    (%s, 'tradefluence', %s, 'ENTRY', 'FILLED',
+                     'entry-broker-partial-restart-566', 'paper', 5, 5,
+                     1.00, 'MSFT', %s, 'CALL')
+                """,
+                (partial_entry_id, partial_position_id, partial_contract),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, submitted_ts, filled_ts, filled_qty,
+                     fill_price, execution_mode, qty, symbol, contract, direction)
+                VALUES
+                    (%s, 'tradefluence', %s, 'EXIT', 'EXIT_PARTIAL_FILL',
+                     %s, '2026-09-04T17:10:00+00:00', %s, 2,
+                     1.20, 'paper', 5, 'MSFT', %s, 'CALL')
+                """,
+                (
+                    partial_exit_id,
+                    partial_position_id,
+                    partial_broker_id,
+                    partial_fill_ts,
+                    partial_contract,
+                ),
+            )
+
+        restarted_engine = APExitEngine(SimpleNamespace(), email="tradefluence")
+        restarted_engine._emit_exit_event = lambda *args, **kwargs: None
+        restarted_engine.seed_from_db(pm_module.APPositionManager("tradefluence"))
+        hydrated_partial = restarted_engine.get_position(partial_position_id)
+
+        assert hydrated_partial is not None
+        assert hydrated_partial.pending_exit_local_order_id == partial_exit_id
+        assert hydrated_partial.pending_exit_broker_order_id == partial_broker_id
+        assert hydrated_partial.pending_exit_qty == 5
+        assert hydrated_partial.pending_exit_filled_qty == 2
+        assert hydrated_partial.last_applied_exit_cum_fill_by_order == {
+            partial_broker_id: 2,
+            partial_exit_id: 2,
+        }
+
+        # The first post-restart broker snapshot repeats the durable partial;
+        # it is a read-only duplicate, not another two-contract fill.
+        restarted_engine.note_partial_exit_fill(
+            partial_position_id,
+            qty_filled=2,
+            fill_price=1.20,
+            local_order_id=partial_exit_id,
+            broker_order_id=partial_broker_id,
+            cumulative_filled=2,
+            filled_ts=partial_fill_ts,
+        )
+        assert hydrated_partial.quantity_remaining == 3
+        assert hydrated_partial.pending_exit_filled_qty == 2
+
+        # A later cumulative=5 snapshot applies only the new three-contract
+        # delta and closes exactly once; the closed position cannot be mutated
+        # by a duplicate callback.
+        restarted_engine.note_partial_exit_fill(
+            partial_position_id,
+            qty_filled=3,
+            fill_price=1.20,
+            local_order_id=partial_exit_id,
+            broker_order_id=partial_broker_id,
+            cumulative_filled=5,
+            filled_ts=partial_fill_ts,
+        )
+        assert hydrated_partial.closed is True
+        assert hydrated_partial.quantity_remaining == 0
+        assert restarted_engine.get_position(partial_position_id) is None
+        assert hydrated_partial.last_applied_exit_cum_fill_by_order[partial_broker_id] == 5
 
         # The same real recovery seam must hold before adoption when the
         # broker's FILLED row has no explicit execution timestamp.

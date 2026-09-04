@@ -33,7 +33,18 @@ from ap.exit_safety import (
     is_valid_exact_occ_contract,
     resolve_exit_broker_truth,
 )
-from ap.manual_close_reconciliation import fetch_all_current_session_orders, order_filled_at
+from ap.manual_close_reconciliation import (
+    ORDERS_AVAILABLE_COMPLETE,
+    ORDERS_AVAILABLE_EMPTY,
+    ORDERS_MALFORMED,
+    ORDERS_UNAVAILABLE,
+    fetch_all_current_session_orders,
+    order_contract as _shared_order_contract,
+    order_filled_at,
+    order_has_instrument_identity as _shared_order_has_instrument_identity,
+    order_has_structured_direction as _shared_order_has_structured_direction,
+    order_is_exit_like as _shared_order_is_exit_like,
+)
 
 log = logging.getLogger("ap.exit_autonomous_recovery")
 
@@ -67,40 +78,7 @@ def _broker_order_id(raw: dict) -> str:
 
 
 def _contract(raw: dict) -> str:
-    records = [raw]
-    nested = raw.get("raw") if isinstance(raw, dict) else None
-    if isinstance(nested, dict):
-        records.append(nested)
-    exact_values: set[str] = set()
-    underlying_values: set[str] = set()
-    invalid = False
-    for record in records:
-        for key in (
-            "option_symbol",
-            "optionSymbol",
-            "contract",
-            "instrument",
-            "option_contract",
-            "optionContract",
-            "symbol",
-        ):
-            if key not in record or record.get(key) in (None, ""):
-                continue
-            value = record.get(key)
-            normalized = _norm_contract(value)
-            if is_valid_exact_occ_contract(value):
-                exact_values.add(normalized)
-            elif key in {"symbol", "instrument"} and re.fullmatch(r"[A-Z0-9.]{1,6}", normalized):
-                underlying_values.add(normalized)
-            else:
-                invalid = True
-    if len(exact_values) != 1 or invalid:
-        return ""
-    exact = next(iter(exact_values))
-    root = exact[:-15]
-    if any(value != root for value in underlying_values):
-        return ""
-    return exact
+    return _shared_order_contract(raw)
 
 
 def _strict_qty(value: Any) -> Optional[int]:
@@ -128,78 +106,16 @@ def _qty(raw: dict) -> Optional[int]:
 
 
 def _is_exit_like(raw: dict) -> bool:
-    values: list[str] = []
-    records = [raw]
-    nested = raw.get("raw") if isinstance(raw, dict) else None
-    if isinstance(nested, dict):
-        records.append(nested)
-    for record in records:
-        values.extend(
-            str(record.get(key) or "").strip().lower()
-            for key in (
-                "side",
-                "action",
-                "instruction",
-                "order_action",
-                "transaction_type",
-                "trade_action",
-                "position_effect",
-            )
-        )
-    compact = {re.sub(r"[\s_-]+", "", value) for value in values if value}
-    if compact.intersection({"selltoclose", "stc"}):
-        return True
-    return "sell" in compact and bool(compact.intersection({"close", "closing"}))
+    return _shared_order_is_exit_like(raw)
 
 
 def _has_structured_order_direction(raw: dict) -> bool:
-    records = [raw]
-    nested = raw.get("raw") if isinstance(raw, dict) else None
-    if isinstance(nested, dict):
-        records.append(nested)
-    return any(
-        str(record.get(key) or "").strip()
-        for record in records
-        for key in (
-            "side",
-            "action",
-            "instruction",
-            "order_action",
-            "transaction_type",
-            "trade_action",
-            "position_effect",
-        )
-    )
+    return _shared_order_has_structured_direction(raw)
 
 
 def _has_order_instrument_identity(raw: dict) -> bool:
     """Accept valid option or underlying identities in account-wide order pages."""
-    records = [raw]
-    nested = raw.get("raw") if isinstance(raw, dict) else None
-    if isinstance(nested, dict):
-        records.append(nested)
-    saw_identity = False
-    for record in records:
-        for key in (
-            "option_symbol",
-            "optionSymbol",
-            "contract",
-            "instrument",
-            "option_contract",
-            "optionContract",
-            "symbol",
-        ):
-            if key not in record or record.get(key) in (None, ""):
-                continue
-            value = record.get(key)
-            if is_valid_exact_occ_contract(value):
-                saw_identity = True
-                continue
-            if key in {"symbol", "instrument"} and re.fullmatch(r"[A-Z0-9.]{1,6}", _norm_contract(value)):
-                saw_identity = True
-                continue
-            return False
-    return saw_identity
+    return _shared_order_has_instrument_identity(raw)
 
 
 def _dt_age_seconds(dt: Any) -> Optional[float]:
@@ -296,20 +212,29 @@ def _list_open_orders_truth(broker: Any) -> tuple[str, list[dict]]:
     # reconciliation.  A one-page list_orders() result is not complete enough
     # to prove that an exact tagged EXIT is absent after a restart.
     try:
-        result = fetch_all_current_session_orders(broker)
+        fetch_state, result = fetch_all_current_session_orders(broker)
     except Exception as exc:
         log.warning(
             "broker order pagination failed during autonomous recovery: %s",
             exc,
         )
-        return "unavailable", []
-    state, rows = _parse_order_payload(result)
-    if state != "available":
+        return ORDERS_UNAVAILABLE, []
+    if fetch_state not in {ORDERS_AVAILABLE_COMPLETE, ORDERS_AVAILABLE_EMPTY}:
         log.warning(
             "broker paginated orders returned %s during autonomous recovery",
-            state,
+            fetch_state,
         )
-    return state, rows
+        return fetch_state, []
+    if fetch_state == ORDERS_AVAILABLE_EMPTY:
+        return fetch_state, []
+    parse_state, rows = _parse_order_payload(result)
+    if parse_state != "available":
+        log.warning(
+            "broker paginated orders returned %s during autonomous recovery",
+            parse_state,
+        )
+        return ORDERS_MALFORMED, []
+    return fetch_state, rows
 
 
 def _list_open_orders(broker: Any) -> list[dict]:
@@ -454,7 +379,9 @@ def _matching_open_exit_orders_with_truth(
     if not is_valid_exact_occ_contract(contract):
         return "identity_unproven", []
     state, rows = _list_open_orders_truth(broker)
-    if state != "available":
+    if state not in {ORDERS_AVAILABLE_COMPLETE, ORDERS_AVAILABLE_EMPTY}:
+        return state, []
+    if state == ORDERS_AVAILABLE_EMPTY:
         return state, []
     matches: list[tuple[str, dict]] = []
     for row in rows:
@@ -503,7 +430,7 @@ def _matching_open_exit_orders_with_truth(
             row["_recovery_fill_qty"] = filled_qty
             row["_recovery_fill_price"] = fill_price
         matches.append((broker_id, row))
-    return "available", matches
+    return state, matches
 
 
 def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> list[tuple[str, dict]]:
@@ -1349,7 +1276,7 @@ def recover_exit_position(
             order_state, other_matches = _matching_open_exit_orders_with_truth(
                 broker, contract, exclude_broker_id=pending_broker_id
             )
-            if order_state != "available":
+            if order_state not in {ORDERS_AVAILABLE_COMPLETE, ORDERS_AVAILABLE_EMPTY}:
                 return _hold(
                     f"broker_order_truth_{order_state}",
                     pid,
@@ -1472,7 +1399,7 @@ def recover_exit_position(
         contract,
         include_filled=True,
     )
-    if order_state != "available":
+    if order_state not in {ORDERS_AVAILABLE_COMPLETE, ORDERS_AVAILABLE_EMPTY}:
         return _hold(f"broker_order_truth_{order_state}", pid, local_id, "", {"contract": contract, "quote_health": qh})
     tagged_matches: list[tuple[str, dict]] = []
     untagged_matches: list[tuple[str, dict]] = []

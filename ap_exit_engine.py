@@ -6470,6 +6470,19 @@ class APExitEngine:
             pos.pending_exit_broker_order_id  = broker_id
             pos.pending_exit_qty              = int(row.get("qty")        or getattr(pos, "quantity_remaining", 0) or 0)
             pos.pending_exit_filled_qty       = int(row.get("filled_qty") or 0)
+            # The durable EXIT row stores the broker's cumulative fill.  Seed
+            # both possible callback identities at restart so the first
+            # repeated broker snapshot applies only a new delta, never the
+            # already-persisted partial fill a second time.
+            durable_cum_fill = max(0, pos.pending_exit_filled_qty)
+            pos.last_applied_exit_cum_fill = durable_cum_fill
+            pos.last_applied_exit_cum_fill_by_order = {
+                order_id: durable_cum_fill
+                for order_id in (broker_id, local_id)
+                if order_id
+            }
+            pos.last_applied_exit_local_order_id = local_id
+            pos.last_applied_exit_broker_order_id = broker_id
 
             log.warning(
                 "[%s] HYDRATED ACTIVE EXIT IDENTITY | pos=%s local=%s broker=%s status=%s",

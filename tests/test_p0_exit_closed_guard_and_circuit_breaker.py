@@ -13,6 +13,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 sys.path.insert(0, str(REPO_ROOT))
 
 from ap import exit_safety as exit_safety_mod  # noqa: E402
+from ap import manual_close_reconciliation as manual_mod  # noqa: E402
 from ap import order_state_machine as osm_mod  # noqa: E402
 from ap.broker_submit_identity import canonical_broker_submit_key  # noqa: E402
 from ap.exit_autonomous_recovery import recover_exit_engine, recover_exit_position  # noqa: E402
@@ -1118,11 +1119,25 @@ class _RecoveryBroker:
         self._order_exc = order_exc
         self._position_exc = position_exc
         self.account_id = "acct-566"
+        self.cfg = SimpleNamespace(account_id=self.account_id)
+        # Exercise the production account-scoped order seam in these recovery
+        # tests.  Keep this instance-only so exit_safety's legacy position
+        # adapter assertions remain unchanged.
+        self._get = self._get_orders
         self.list_orders_calls = 0
         self.list_positions_calls = 0
         self.get_order_calls = []
         self.cancel_calls = []
         self.post_calls = 0
+
+    def _get_orders(self, path, params=None):
+        if "/orders" not in path:
+            raise AssertionError(path)
+        if self._order_exc is not None:
+            raise self._order_exc
+        if isinstance(self._orders, dict):
+            return self._orders
+        return {"orders": {"order": list(self._orders or [])}}
 
     def list_orders(self, status="open"):
         self.list_orders_calls += 1
@@ -1150,9 +1165,14 @@ class _RecoveryBroker:
 class _RawRecoveryBroker(_RecoveryBroker):
     def __init__(self, *, positions_payload, orders_payload=None, orders_pages=None):
         super().__init__(orders=[], positions=[], position_exc=RuntimeError("legacy path must not run"))
+        del self._get  # use this fixture's raw positions/orders implementation
         self.cfg = SimpleNamespace(account_id="acct-566")
         self.positions_payload = positions_payload
-        self.orders_payload = orders_payload or {"orders": {"order": []}}
+        self.orders_payload = (
+            {"orders": {"order": []}}
+            if orders_payload is None
+            else orders_payload
+        )
         self.orders_pages = orders_pages
         self.raw_get_calls = []
 
@@ -1419,6 +1439,120 @@ def test_pr566_paginated_include_tags_finds_exact_order_beyond_first_page():
     assert "page=1" in order_paths[0]
     assert "page=2" in order_paths[1]
     assert len(hooks.order_state_machine.adopt_calls) == 1
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+@pytest.mark.parametrize(
+    "orders_payload",
+    [
+        {"error": "Tradier unavailable"},
+        {"message": "rate limited"},
+        {},
+        {"orders": {}},
+        {"orders": None},
+        {"orders": "null"},
+        {"orders": {"order": None}},
+        {"orders": {"order": ["not-an-order-row"]}},
+    ],
+)
+def test_pr566_order_truth_failures_never_become_negative_proof(orders_payload):
+    broker = _RawRecoveryBroker(
+        positions_payload={
+            "positions": {"position": [_recovery_held_position()]}
+        },
+        orders_payload=orders_payload,
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_truth_malformed"
+    assert hooks.open_calls == []
+    assert broker.list_positions_calls == 0
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_order_truth_no_progress_is_incomplete_not_empty(monkeypatch):
+    monkeypatch.setattr(manual_mod, "MANUAL_CLOSE_ORDERS_PAGE_LIMIT", 1)
+    page = {"orders": {"order": [_recovery_open_order(
+        contract=_RECOVERY_OTHER_OCC,
+        broker_id="same-page-order",
+    )]}}
+    broker = _RawRecoveryBroker(
+        positions_payload={
+            "positions": {"position": [_recovery_held_position()]}
+        },
+        orders_pages=[page, page],
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_truth_incomplete"
+    assert len([path for path in broker.raw_get_calls if "/orders" in path]) == 2
+    assert hooks.open_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+def test_pr566_order_truth_hard_stop_is_incomplete_not_empty(monkeypatch):
+    monkeypatch.setattr(manual_mod, "MANUAL_CLOSE_ORDERS_PAGE_LIMIT", 1)
+    pages = [
+        {"orders": {"order": [_recovery_open_order(
+            contract=_RECOVERY_OTHER_OCC,
+            broker_id=f"hard-stop-{page}",
+        )]}}
+        for page in range(50)
+    ]
+    broker = _RawRecoveryBroker(
+        positions_payload={
+            "positions": {"position": [_recovery_held_position()]}
+        },
+        orders_pages=pages,
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "NOOP"
+    assert result.reason == "broker_order_truth_incomplete"
+    assert len([path for path in broker.raw_get_calls if "/orders" in path]) == 50
+    assert hooks.open_calls == []
+    _assert_no_recovery_mutation(broker, hooks)
+
+
+@pytest.mark.parametrize("leg_key", ["leg", "legs"])
+def test_pr566_tagged_exit_in_leg_shapes_is_adopted(leg_key):
+    order = _recovery_open_order(
+        broker_id=f"leg-shaped-{leg_key}",
+        tag=canonical_broker_submit_key("local-exit-566"),
+    )
+    order.pop("option_symbol")
+    order.pop("side")
+    order[leg_key] = {"symbol": _RECOVERY_OCC, "side": "sell_to_close"}
+    broker = _RawRecoveryBroker(
+        positions_payload={
+            "positions": {"position": [_recovery_held_position()]}
+        },
+        orders_payload={"orders": {"order": [order]}},
+    )
+    hooks = _RecoveryHooks()
+
+    result = recover_exit_position(
+        _recovery_position(), broker=broker, exit_engine=hooks
+    )
+
+    assert result.action == "RECOVERED_BROKER_ID"
+    assert result.broker_order_id == f"leg-shaped-{leg_key}"
+    assert len(hooks.order_state_machine.adopt_calls) == 1
+    assert len(hooks.open_calls) == 1
     _assert_no_recovery_mutation(broker, hooks)
 
 

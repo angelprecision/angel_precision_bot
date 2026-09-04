@@ -57,6 +57,17 @@ MANUAL_CLOSE_FUTURE_SKEW_SEC = float(
 MANUAL_CLOSE_ORDERS_PAGE_LIMIT = int(
     os.getenv("MANUAL_CLOSE_ORDERS_PAGE_LIMIT", "500")
 )
+# Order-list truth is safety-sensitive: an empty page is only negative proof
+# when the account-scoped pagination completed.  Keep the transport/envelope
+# state separate from the rows so callers cannot mistake a failed or truncated
+# read for "no orders".
+ORDERS_AVAILABLE_COMPLETE = "available_complete"
+ORDERS_AVAILABLE_EMPTY = "available_empty"
+ORDERS_MALFORMED = "malformed"
+ORDERS_UNAVAILABLE = "unavailable"
+ORDERS_INCOMPLETE = "incomplete"
+_ORDER_PAGE_DATA = "data"
+_ORDER_PAGE_EMPTY = "empty"
 VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 MANUAL_CLOSE_SIDES = frozenset(
     {"sell_to_close", "sell-to-close", "selltoclose", "stc"}
@@ -297,41 +308,59 @@ def fetch_authoritative_broker_positions(broker: Any) -> list[dict]:
     return normalize_positions_payload(payload)
 
 
-def _normalize_orders_page(payload: Any) -> list[dict]:
-    """Tradier orders payload → list of dict orders. Empty on empty node.
-    Raises on structurally malformed payloads (never silently drop truth)."""
+def _order_page_row_is_structured(row: Any) -> bool:
+    """Require enough envelope shape to distinguish a row from malformed data."""
+    return isinstance(row, dict) and bool(order_id(row)) and bool(order_status(row))
+
+
+def _normalize_orders_page(payload: Any) -> tuple[str, list[dict]]:
+    """Normalize one order page without laundering malformed truth into empty."""
     if payload is None or payload == "null":
-        return []
+        return ORDERS_MALFORMED, []
     if isinstance(payload, list):
-        return [dict(row) for row in payload if isinstance(row, dict)]
-    if not isinstance(payload, dict):
-        raise ValueError("BROKER_ORDERS_PAGE_MALFORMED")
-    node = payload.get("orders")
-    if node is None or node == "null":
-        return []
-    if isinstance(node, list):
-        return [dict(row) for row in node if isinstance(row, dict)]
-    if not isinstance(node, dict):
-        raise ValueError("BROKER_ORDERS_NODE_MALFORMED")
-    rows = node.get("order")
-    if rows is None or rows == "null":
-        return []
-    if isinstance(rows, dict):
-        return [dict(rows)]
-    if isinstance(rows, list):
-        return [dict(row) for row in rows if isinstance(row, dict)]
-    raise ValueError("BROKER_ORDERS_ROWS_MALFORMED")
+        rows = payload
+    elif isinstance(payload, dict):
+        if any(
+            key in payload and payload.get(key) not in (None, "")
+            for key in ("error", "errors", "message", "reason")
+        ):
+            return ORDERS_MALFORMED, []
+        if "orders" not in payload:
+            return ORDERS_MALFORMED, []
+        node = payload.get("orders")
+        if node is None or node == "null":
+            return ORDERS_MALFORMED, []
+        if isinstance(node, list):
+            rows = node
+        elif isinstance(node, dict):
+            if "order" not in node:
+                return ORDERS_MALFORMED, []
+            rows = node.get("order")
+        else:
+            return ORDERS_MALFORMED, []
+        if rows is None or rows == "null":
+            return ORDERS_MALFORMED, []
+        if isinstance(rows, dict):
+            rows = [rows]
+    else:
+        return ORDERS_MALFORMED, []
+
+    if not isinstance(rows, list):
+        return ORDERS_MALFORMED, []
+    if any(not _order_page_row_is_structured(row) for row in rows):
+        return ORDERS_MALFORMED, []
+    normalized = [dict(row) for row in rows]
+    return (_ORDER_PAGE_EMPTY if not normalized else _ORDER_PAGE_DATA), normalized
 
 
-def fetch_all_current_session_orders(broker: Any) -> list[dict]:
-    """Fetch every current-session order via paginated broker call.
+def fetch_all_current_session_orders(broker: Any) -> tuple[str, list[dict]]:
+    """Fetch every current-session order and preserve completeness state.
 
     Tradier's /v1/accounts/{id}/orders defaults to ~25 rows without an
-    explicit limit and returns only the current market session. This
-    helper requests an explicit high limit and paginates until an empty
-    page. If the broker exposes no ``_get`` / ``cfg.account_id``, falls
-    back to ``list_orders()`` with a WARNING logged so the caller and
-    operators know the 25-cap risk is in play.
+    explicit limit and returns only the current market session. This helper
+    requests an explicit high limit and paginates until a valid short/empty
+    page. A fallback ``list_orders()`` result is deliberately INCOMPLETE
+    because that API does not prove that all current-session rows were seen.
     """
     raw_get = getattr(broker, "_get", None)
     cfg = getattr(broker, "cfg", None)
@@ -340,25 +369,46 @@ def fetch_all_current_session_orders(broker: Any) -> list[dict]:
     if not callable(raw_get) or not account_id:
         list_orders = getattr(broker, "list_orders", None)
         if not callable(list_orders):
-            raise RuntimeError("BROKER_ORDERS_UNAVAILABLE")
+            return ORDERS_UNAVAILABLE, []
         log.warning(
             "MANUAL_CLOSE_ORDERS_PAGINATION_UNAVAILABLE using list_orders "
             "(subject to ~25-row default cap on Tradier)"
         )
-        return normalize_broker_orders(list_orders())
+        try:
+            page_state, rows = _normalize_orders_page(list_orders())
+        except Exception as exc:
+            log.error("MANUAL_CLOSE_ORDERS_FALLBACK_FAILED err=%s", exc)
+            return ORDERS_UNAVAILABLE, []
+        if page_state == ORDERS_MALFORMED:
+            return ORDERS_MALFORMED, []
+        return ORDERS_INCOMPLETE, rows
 
     all_rows: list[dict] = []
     seen_ids: set[str] = set()
     page = 1
     limit = MANUAL_CLOSE_ORDERS_PAGE_LIMIT
     while True:
-        payload = raw_get(
-            f"/v1/accounts/{account_id}/orders?includeTags=true"
-            f"&page={page}&limit={limit}"
-        )
-        rows = _normalize_orders_page(payload)
-        if not rows:
-            break
+        try:
+            payload = raw_get(
+                f"/v1/accounts/{account_id}/orders?includeTags=true"
+                f"&page={page}&limit={limit}"
+            )
+        except Exception as exc:
+            log.warning(
+                "MANUAL_CLOSE_ORDERS_PAGE_UNAVAILABLE page=%s err=%s",
+                page, exc,
+            )
+            return ORDERS_UNAVAILABLE, []
+        page_state, rows = _normalize_orders_page(payload)
+        if page_state == ORDERS_MALFORMED:
+            log.warning("MANUAL_CLOSE_ORDERS_PAGE_MALFORMED page=%s", page)
+            return ORDERS_MALFORMED, []
+        if page_state == _ORDER_PAGE_EMPTY:
+            return (
+                ORDERS_AVAILABLE_EMPTY if not all_rows
+                else ORDERS_AVAILABLE_COMPLETE,
+                all_rows,
+            )
         added = 0
         for row in rows:
             oid = str(row.get("id") or row.get("order_id") or "").strip()
@@ -370,16 +420,21 @@ def fetch_all_current_session_orders(broker: Any) -> list[dict]:
             added += 1
         # Terminate when page is short (last page) or when nothing new was
         # added (defensive; broker occasionally returns overlapping pages).
-        if added == 0 or len(rows) < limit:
-            break
+        if added == 0:
+            log.warning(
+                "MANUAL_CLOSE_ORDERS_PAGE_INCOMPLETE_NO_PROGRESS page=%s total=%s",
+                page, len(all_rows),
+            )
+            return ORDERS_INCOMPLETE, all_rows
+        if len(rows) < limit:
+            return ORDERS_AVAILABLE_COMPLETE, all_rows
         page += 1
         if page > 50:  # hard ceiling — 50 * 500 = 25k orders
             log.warning(
                 "MANUAL_CLOSE_ORDERS_PAGE_HARD_STOP page=%s total=%s",
                 page, len(all_rows),
             )
-            break
-    return all_rows
+            return ORDERS_INCOMPLETE, all_rows
 
 
 def order_legs(order: dict) -> list[dict]:
@@ -396,30 +451,121 @@ def order_legs(order: dict) -> list[dict]:
     return []
 
 
+_ORDER_IDENTITY_KEYS = (
+    "option_symbol",
+    "optionSymbol",
+    "contract",
+    "instrument",
+    "option_contract",
+    "optionContract",
+    "symbol",
+)
+_ORDER_DIRECTION_KEYS = (
+    "side",
+    "action",
+    "instruction",
+    "order_action",
+    "transaction_type",
+    "trade_action",
+    "position_effect",
+)
+
+
+def _order_records(order: dict) -> list[dict]:
+    records = [order] if isinstance(order, dict) else []
+    nested = order.get("raw") if isinstance(order, dict) else None
+    if isinstance(nested, dict):
+        records.append(nested)
+    return records
+
+
+def _order_identity_records(order: dict):
+    for record in _order_records(order):
+        yield record
+        yield from order_legs(record)
+
+
 def order_contract(order: dict) -> str:
-    for key in ("option_symbol", "contract"):
-        contract = normalize_contract(order.get(key))
-        if is_valid_occ_contract(contract):
-            return contract
-
-    for leg in order_legs(order):
-        for key in ("option_symbol", "contract", "symbol"):
-            contract = normalize_contract(leg.get(key))
+    exact_values: set[str] = set()
+    underlying_values: set[str] = set()
+    invalid = False
+    for record in _order_identity_records(order):
+        for key in _ORDER_IDENTITY_KEYS:
+            if key not in record or record.get(key) in (None, ""):
+                continue
+            value = record.get(key)
+            contract = normalize_contract(value)
             if is_valid_occ_contract(contract):
-                return contract
+                exact_values.add(contract)
+            elif key in {"symbol", "instrument"} and re.fullmatch(
+                r"[A-Z0-9.]{1,6}", contract
+            ):
+                underlying_values.add(contract)
+            else:
+                invalid = True
+    if len(exact_values) != 1 or invalid:
+        return ""
+    exact = next(iter(exact_values))
+    underlying = exact[:-15]
+    if any(value != underlying for value in underlying_values):
+        return ""
+    return exact
 
-    symbol = normalize_contract(order.get("symbol"))
-    return symbol if is_valid_occ_contract(symbol) else ""
+
+def order_has_instrument_identity(order: dict) -> bool:
+    """Return whether root/raw/leg identity fields are structurally valid."""
+    saw_identity = False
+    for record in _order_identity_records(order):
+        for key in _ORDER_IDENTITY_KEYS:
+            if key not in record or record.get(key) in (None, ""):
+                continue
+            value = record.get(key)
+            normalized = normalize_contract(value)
+            if is_valid_occ_contract(normalized):
+                saw_identity = True
+                continue
+            if key in {"symbol", "instrument"} and re.fullmatch(
+                r"[A-Z0-9.]{1,6}", normalized
+            ):
+                saw_identity = True
+                continue
+            return False
+    return saw_identity
+
+
+def order_direction_values(order: dict) -> list[str]:
+    values: list[str] = []
+    for record in _order_records(order):
+        for candidate in (record, *order_legs(record)):
+            for key in _ORDER_DIRECTION_KEYS:
+                value = str(candidate.get(key) or "").lower().replace(" ", "_").strip()
+                if value:
+                    values.append(value)
+    return values
+
+
+def order_has_structured_direction(order: dict) -> bool:
+    return bool(order_direction_values(order))
+
+
+def order_is_exit_like(order: dict) -> bool:
+    values = order_direction_values(order)
+    compact = {re.sub(r"[\s_-]+", "", value) for value in values}
+    if compact.intersection({"selltoclose", "stc"}):
+        return True
+    return "sell" in compact and bool(compact.intersection({"close", "closing"}))
 
 
 def order_side(order: dict) -> str:
-    raw = str(order.get("side") or "").lower().replace(" ", "_").strip()
-    if raw:
-        return raw
-    legs = order_legs(order)
-    if len(legs) == 1:
-        return str(legs[0].get("side") or "").lower().replace(" ", "_").strip()
-    return ""
+    values = order_direction_values(order)
+    if not values:
+        return ""
+    compact = {re.sub(r"[\s_-]+", "", value) for value in values}
+    if compact.intersection({"selltoclose", "stc"}):
+        return "sell_to_close"
+    if "sell" in compact and compact.intersection({"close", "closing"}):
+        return "sell_to_close"
+    return values[0]
 
 
 def order_status(order: dict) -> str:
@@ -1749,12 +1895,19 @@ def detect_manual_closes(self) -> None:
     # Fetch current-session orders only now — only for positions that still
     # need new external fill discovery (not for durable-covered ones).
     try:
-        broker_orders = fetch_all_current_session_orders(broker)
-    except Exception as exc:
+        orders_state, broker_orders = fetch_all_current_session_orders(broker)
+    except Exception as exc:  # defensive boundary for custom broker adapters
+        orders_state, broker_orders = ORDERS_UNAVAILABLE, []
         log.error(
             "[%s] MANUAL_CLOSE_SCAN_UNCERTAIN broker_orders_failed "
             "missing_positions=%s err=%s — no state mutation",
             client_id, len(missing_positions), exc,
+        )
+    if orders_state not in {ORDERS_AVAILABLE_COMPLETE, ORDERS_AVAILABLE_EMPTY}:
+        log.error(
+            "[%s] MANUAL_CLOSE_SCAN_UNCERTAIN broker_orders_state=%s "
+            "missing_positions=%s — no state mutation",
+            client_id, orders_state, len(missing_positions),
         )
         return
 
