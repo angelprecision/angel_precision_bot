@@ -6228,6 +6228,25 @@ class APOrderStateMachine:
         )
         broker_truth_qty = broker_truth.get("broker_truth_open_qty")
         broker_truth_audit = dict((broker_truth.get("audit") or {}))
+        broker_truth_degraded_reason = None
+        if (
+            broker_truth.get("is_fresh_exact") is not True
+            or broker_truth_qty is None
+            or isinstance(broker_truth_qty, bool)
+            or not isinstance(broker_truth_qty, int)
+            or broker_truth_qty < 0
+        ):
+            broker_truth_degraded_reason = (
+                "BROKER_TRUTH_QUANTITY_UNKNOWN"
+                if broker_truth.get("is_fresh_exact") is True
+                else "BROKER_TRUTH_UNAVAILABLE"
+            )
+            broker_truth_audit.update(
+                {
+                    "result": broker_truth_degraded_reason,
+                    "canonical_exit_submit": "allowed",
+                }
+            )
         if broker_truth_audit:
             broker_truth_audit["requested_qty"] = requested_qty
             _upd_bt = getattr(self, "update_order_meta", None)
@@ -6236,43 +6255,15 @@ class APOrderStateMachine:
                     _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
                 except Exception as _upd_bt_exc:
                     log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
-        if (
-            broker_truth.get("is_fresh_exact") is not True
-            or broker_truth_qty is None
-            or isinstance(broker_truth_qty, bool)
-            or not isinstance(broker_truth_qty, int)
-            or broker_truth_qty < 0
-        ):
-            blocked_reason = (
-                "BROKER_TRUTH_QUANTITY_UNKNOWN"
-                if broker_truth.get("is_fresh_exact") is True
-                else "BROKER_TRUTH_UNAVAILABLE"
-            )
-            broker_truth_audit.update({"result": blocked_reason})
-            _upd_bt = getattr(self, "update_order_meta", None)
-            if callable(_upd_bt):
-                try:
-                    _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
-                except Exception as _upd_bt_exc:
-                    log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
-            log.error(
-                "[%s] %s | position_id=%s contract=%s snapshot_status=%s",
+        if broker_truth_degraded_reason:
+            log.warning(
+                "[%s] %s | position_id=%s contract=%s snapshot_status=%s — continuing with canonical exit submit",
                 self.client_id,
-                blocked_reason,
+                broker_truth_degraded_reason,
                 position_id,
                 contract,
                 broker_truth_audit.get("snapshot_status", "unknown"),
             )
-            return {
-                "ok": False,
-                "local_order_id": local_id,
-                "broker_order_id": None,
-                "status": OrderStatus.EXIT_REQUESTED,
-                "error": blocked_reason,
-                "skipped": True,
-                "reason": blocked_reason,
-                "reconciliation_required": True,
-            }
         if broker_truth.get("is_fresh_exact") and int(broker_truth_qty or 0) == 0:
             blocked_reason = "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
             broker_truth_audit.update(

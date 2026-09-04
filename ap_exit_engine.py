@@ -8585,9 +8585,6 @@ class APExitEngine:
                 or _broker_truth_qty is None
                 or _broker_truth_state == BrokerPositionTruth.UNKNOWN
             ):
-                with self._lock:
-                    pos.exit_in_flight = False
-                    pos.pending_exit_reason = ""
                 _truth_reason = (
                     "BROKER_TRUTH_QUANTITY_UNKNOWN"
                     if _broker_truth_fresh_exact
@@ -8596,29 +8593,18 @@ class APExitEngine:
                 self._emit_degraded_critical(
                     pos,
                     _truth_reason,
-                    "exit submission is held because authoritative broker position truth is unavailable or malformed",
+                    "authoritative broker position truth is unavailable or malformed at the submit seam; "
+                    "the existing canonical exit remains allowed and broker-flat close is forbidden",
                     extra={"broker_truth": _broker_truth_audit},
                 )
-                self._emit_exit_event(
-                    pos,
-                    decision="HOLD",
-                    reason_code=_truth_reason,
-                    explanation=(
-                        "Blocked exit submit before broker callback: broker position truth "
-                        "must be authoritative HELD or FLAT."
-                    ),
-                    stage="exit_submission",
-                    extra_inputs={"broker_truth": _broker_truth_audit},
-                )
-                log.error(
-                    "[%s] %s | position_id=%s contract=%s snapshot_status=%s",
+                log.warning(
+                    "[%s] %s | position_id=%s contract=%s snapshot_status=%s — continuing with canonical exit callback",
                     ticker,
                     _truth_reason,
                     position_id or "?",
                     option_symbol,
                     _broker_truth_audit.get("snapshot_status", "unknown"),
                 )
-                return False
             if _broker_truth_fresh_exact and _broker_truth_state == BrokerPositionTruth.FLAT:
                 with self._lock:
                     pos.exit_in_flight   = False
@@ -8730,23 +8716,11 @@ class APExitEngine:
                 )
                 return False
         except Exception as _guard_err:
-            with self._lock:
-                pos.exit_in_flight = False
-                pos.pending_exit_reason = ""
-            log.exception(
-                "[%s] exit pre-submit truth guard failed closed before callback submit: %s",
+            log.warning(
+                "[%s] exit pre-submit guard unavailable; continuing with callback submit: %s",
                 ticker,
                 _guard_err,
             )
-            self._emit_exit_event(
-                pos,
-                decision="HOLD",
-                reason_code="BROKER_TRUTH_GUARD_ERROR",
-                explanation="Exit submit held because the broker truth guard failed.",
-                stage="exit_submission",
-                extra_inputs={"error": str(_guard_err)},
-            )
-            return False
 
         # 2) External callback outside lock.
         callback_result  = None

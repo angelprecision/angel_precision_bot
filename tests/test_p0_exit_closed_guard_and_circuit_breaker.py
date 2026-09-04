@@ -520,7 +520,18 @@ def test_broker_repair_position_with_broker_truth_is_not_blocked_as_missing(monk
     assert result["position_state"]["quantity_remaining"] == 3
 
 
-def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_truth(monkeypatch):
+@pytest.mark.parametrize(
+    ("broker_truth_mode", "guard_error"),
+    [
+        ("held", False),
+        ("unavailable", False),
+        ("unavailable", True),
+    ],
+    ids=["held", "unavailable", "guard-error"],
+)
+def test_exit_engine_callback_path_preserves_canonical_exit_liveness(
+    monkeypatch, broker_truth_mode, guard_error
+):
     from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition
     import ap_exit_engine as exit_engine_mod
 
@@ -538,13 +549,18 @@ def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_tru
     engine.order_state_machine = None
     engine.osm = None
     engine.broker = MagicMock()
-    engine.broker.list_positions.return_value = [
-        {"symbol": "SMCI260626P00032500", "quantity": 3},
-    ]
+    if broker_truth_mode == "held":
+        engine.broker.list_positions.return_value = [
+            {"symbol": "SMCI260626P00032500", "quantity": 3},
+        ]
+    else:
+        engine.broker.list_positions.side_effect = RuntimeError("positions down")
     engine._positions = []
     engine._positions_by_id = {}
+    engine._can_submit_exit = lambda *args, **kwargs: True
     engine.hydrate_pending_exit_identity_from_db = lambda pos: False
-    engine._emit_exit_event = lambda *args, **kwargs: None
+    events = []
+    engine._emit_exit_event = lambda *args, **kwargs: events.append(kwargs)
     engine._extract_exit_order_identity = lambda result: {
         "accepted": True,
         "local_order_id": "L-EXIT-001",
@@ -560,6 +576,8 @@ def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_tru
     calls = {}
 
     def _fake_guard(**kwargs):
+        if guard_error:
+            raise RuntimeError("truth guard down")
         calls.update(kwargs)
         return {
             "blocked": False,
@@ -586,6 +604,11 @@ def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_tru
         "status": "accepted",
     }
 
+    position_id = (
+        "broker-repair-jason@example.com-SMCI260626P00032500"
+        if broker_truth_mode == "held"
+        else "pos-live-unavailable"
+    )
     pos = ManagedPosition(
         ticker="SMCI",
         option_symbol="SMCI260626P00032500",
@@ -595,7 +618,7 @@ def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_tru
         underlying_entry=100.0,
         underlying_target=90.0,
         underlying_stop=110.0,
-        position_id="broker-repair-jason@example.com-SMCI260626P00032500",
+        position_id=position_id,
         client_id="jason@example.com",
         execution_mode="live",
         current_bid=1.2,
@@ -616,13 +639,23 @@ def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_tru
     engine._positions = [pos]
     engine._positions_by_id = {pos.position_id: pos}
 
-    result = engine._submit_exit_decision(pos, decision)
+    if broker_truth_mode == "held":
+        result = engine._submit_exit_decision(pos, decision)
+    else:
+        submit = getattr(APExitEngine, "_AP_EXIT_SUBMIT_ORIGINAL", APExitEngine._submit_exit_decision)
+        result = submit(engine, pos, decision)
 
     assert result is True
-    assert callback_calls == [("broker-repair-jason@example.com-SMCI260626P00032500", 3)]
-    assert calls["position_id"] == "broker-repair-jason@example.com-SMCI260626P00032500"
-    assert calls["broker_truth_open_qty"] == 3
-    assert calls["allow_missing_position_with_broker_truth"] is True
+    assert callback_calls == [(position_id, 3)]
+    assert pos.exit_in_flight is True
+    if broker_truth_mode == "unavailable":
+        assert any(event.get("reason_code") == "BROKER_TRUTH_UNAVAILABLE" for event in events)
+    if guard_error:
+        assert calls == {}
+    else:
+        assert calls["position_id"] == position_id
+        assert calls["broker_truth_open_qty"] == (3 if broker_truth_mode == "held" else None)
+        assert calls["allow_missing_position_with_broker_truth"] is (broker_truth_mode == "held")
 
 
 def test_exit_engine_callback_path_does_not_allow_missing_non_repair_position(monkeypatch):
@@ -900,13 +933,16 @@ def test_broker_other_account_does_not_override_breaker(monkeypatch, mock_broker
     assert mock_broker.session.post.call_count == 0
 
 
-def test_broker_truth_unavailable_preserves_original_breaker(monkeypatch, mock_broker):
-    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+def test_broker_truth_unavailable_preserves_canonical_exit_liveness(monkeypatch, mock_broker):
     fake_conn = _patch_db(
         monkeypatch,
-        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
     )
     mock_broker.list_positions.side_effect = RuntimeError("positions down")
+    mock_broker.session.post.return_value = _resp(
+        200,
+        json_body={"order": {"id": "BO-LIVE", "status": "open"}},
+    )
     osm = _MockOSM()
 
     result = osm.submit_exit(
@@ -920,23 +956,29 @@ def test_broker_truth_unavailable_preserves_original_breaker(monkeypatch, mock_b
         execution_mode="live",
     )
 
-    assert result["ok"] is False
-    assert result["reason"] == "BROKER_TRUTH_UNAVAILABLE"
-    assert result["status"] == "EXIT_REQUESTED"
-    assert osm.exit_row["status"] == "EXIT_REQUESTED"
-    assert mock_broker.session.post.call_count == 0
+    assert result["ok"] is True
+    assert mock_broker.session.post.call_count == 1
+    assert any(
+        "canonical_exit_submit" in str(params)
+        for sql, params in fake_conn.queries
+        if "UPDATE orders" in sql
+    )
     assert not any(
         "UPDATE positions" in sql and "status = 'CLOSED'" in sql
         for sql, _ in fake_conn.queries
     )
 
 
-def test_osm_holds_open_position_when_broker_truth_is_unavailable(monkeypatch, mock_broker):
+def test_osm_allows_open_position_when_broker_truth_method_is_unavailable(monkeypatch, mock_broker):
     fake_conn = _patch_db(
         monkeypatch,
         lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
     )
     mock_broker.list_positions = None
+    mock_broker.session.post.return_value = _resp(
+        200,
+        json_body={"order": {"id": "BO-LIVE-METHOD-MISSING", "status": "open"}},
+    )
     osm = _MockOSM()
 
     result = osm.submit_exit(
@@ -950,11 +992,8 @@ def test_osm_holds_open_position_when_broker_truth_is_unavailable(monkeypatch, m
         execution_mode="live",
     )
 
-    assert result["ok"] is False
-    assert result["reason"] == "BROKER_TRUTH_UNAVAILABLE"
-    assert result["status"] == "EXIT_REQUESTED"
-    assert osm.exit_row["status"] == "EXIT_REQUESTED"
-    assert mock_broker.session.post.call_count == 0
+    assert result["ok"] is True
+    assert mock_broker.session.post.call_count == 1
     assert not any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
 
 
