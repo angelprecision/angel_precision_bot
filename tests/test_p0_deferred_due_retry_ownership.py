@@ -2881,7 +2881,10 @@ def test_market_truth_claim_defers_attempt_mirror_until_atomic_advance():
     assert advanced_patch["materialization_attempts"] == 3
 
 
-def test_phase_one_restart_cas_preserves_attempt_and_requires_broker_fences():
+@pytest.mark.parametrize("execution_mode", ["live", "paper"])
+def test_phase_one_restart_cas_preserves_attempt_and_requires_broker_fences(
+    execution_mode,
+):
     import json
     from unittest.mock import patch
     from ap.order_state_machine import APOrderStateMachine
@@ -2910,7 +2913,7 @@ def test_phase_one_restart_cas_preserves_attempt_and_requires_broker_fences():
         attempt=3,
         max_attempts=5,
         signal_id=SIGNAL_ID,
-        execution_mode="live",
+        execution_mode=execution_mode,
         reason_code="DIRECT_QUOTE_ZERO_BID_ASK",
         next_retry_at="2026-12-31T00:00:08+00:00",
         selector_failure={"reason_code": "DIRECT_QUOTE_ZERO_BID_ASK"},
@@ -2940,8 +2943,9 @@ def test_phase_one_restart_cas_preserves_attempt_and_requires_broker_fences():
     ):
         assert broker_fence in sql
 
+    wrong_mode = "paper" if execution_mode == "live" else "live"
     assert not osm.recover_stale_market_truth_pending_retry(
-        LOCAL_ORDER_ID, **{**kwargs, "execution_mode": "paper"}
+        LOCAL_ORDER_ID, **{**kwargs, "execution_mode": wrong_mode}
     )
 
 
