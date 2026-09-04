@@ -1008,7 +1008,7 @@ class PendingTriggerRestartRecovery:
         self, row: dict, local_oid: str
     ) -> Optional[str]:
         """Recover an expired phase-one claim at the same selector attempt."""
-        if self.execution_mode != "live" or self.is_past_eod:
+        if self.execution_mode not in {"live", "paper"} or self.is_past_eod:
             return None
         meta = _extract_meta(row)
         if not (
@@ -1110,7 +1110,7 @@ class PendingTriggerRestartRecovery:
                 attempt=attempt,
                 max_attempts=max_attempts,
                 signal_id=signal_id,
-                execution_mode="live",
+                execution_mode=self.execution_mode,
                 reason_code=reason,
                 next_retry_at=next_retry_at,
                 selector_failure=selector_failure,
