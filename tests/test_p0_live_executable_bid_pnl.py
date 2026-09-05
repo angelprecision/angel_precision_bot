@@ -1114,7 +1114,7 @@ class TestCanonicalPlusRepairCollapse:
         assert repair in engine._positions
         assert getattr(repair, "adoption_identity_quarantined", False) is True
 
-    def test_broker_precheck_failed_repair_holds_without_synthetic_owner(self):
+    def test_broker_precheck_failed_repair_keeps_degraded_owner_active(self):
         from ap_exit_engine import APExitEngine
 
         class _Broker:
@@ -1132,11 +1132,21 @@ class TestCanonicalPlusRepairCollapse:
         engine._load_db_position_row = lambda sym: None
         engine._upsert_broker_position_to_db = lambda sym, bp: None
 
+        # Canonical DB repair is still degraded, so the precheck reports False.
+        # The broker position must nevertheless retain exactly one stable,
+        # behavior-active degraded owner for exit monitoring and capacity truth.
         assert engine._broker_position_precheck() is False
-        assert engine._positions == []
-        assert engine._positions_by_id == {}
+        degraded = [
+            p for p in engine._positions
+            if getattr(p, "broker_repair_degraded", False)
+        ]
+        assert len(degraded) == 1
+        assert degraded[0].execution_mode == "live"
+        assert degraded[0].quantity_remaining == 1
+        assert engine._positions_by_id[degraded[0].position_id] is degraded[0]
+        assert engine.active_positions() == degraded
 
-    def test_paper_broker_precheck_failed_repair_holds_without_synthetic_owner(self):
+    def test_paper_broker_precheck_failed_repair_keeps_degraded_owner_active(self):
         from ap_exit_engine import APExitEngine
 
         class _Broker:
@@ -1155,8 +1165,15 @@ class TestCanonicalPlusRepairCollapse:
         engine._upsert_broker_position_to_db = lambda sym, bp: None
 
         assert engine._broker_position_precheck() is False
-        assert engine._positions == []
-        assert engine._positions_by_id == {}
+        degraded = [
+            p for p in engine._positions
+            if getattr(p, "broker_repair_degraded", False)
+        ]
+        assert len(degraded) == 1
+        assert degraded[0].execution_mode == "paper"
+        assert degraded[0].quantity_remaining == 1
+        assert engine._positions_by_id[degraded[0].position_id] is degraded[0]
+        assert engine.active_positions() == degraded
 
     def test_broker_precheck_unknown_mode_quarantines_without_live_default(self):
         from ap_exit_engine import APExitEngine
