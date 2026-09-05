@@ -4421,6 +4421,52 @@ class APExitEngine:
             pos.underlying_target, pos.underlying_stop, pos.position_id or "n/a",
         )
 
+    def seed_canonical_position_if_absent(
+        self, pos: "ManagedPosition"
+    ) -> "tuple[bool, str]":
+        """Atomically seed a canonical position only if no owner already exists.
+
+        For use EXCLUSIVELY by the reconciler NO_REPAIR_FOUND path. Acquires
+        the engine lock, checks for an existing canonical owner by position_id,
+        and only calls add_position if the position is truly absent.
+
+        Returns:
+            (True,  "seeded")        — position was new; added successfully.
+            (False, "already_owned") — a canonical owner already exists; no-op.
+            (False, "missing_id")    — pos has no position_id; cannot be tracked.
+        """
+        if pos is None:
+            return False, "missing_id"
+        _pos_id = str(getattr(pos, "position_id", "") or "").strip()
+        if not _pos_id:
+            return False, "missing_id"
+
+        with self._lock:
+            # O(1) check via the ID index (kept in sync by add_position/expiry).
+            if self._positions_by_id.get(_pos_id) is not None:
+                log.warning(
+                    "[exit_eng] seed_canonical_position_if_absent: "
+                    "already_owned | pos_id=%s contract=%s",
+                    _pos_id, getattr(pos, "option_symbol", "?"),
+                )
+                return False, "already_owned"
+            # Belt-and-suspenders: scan for any non-closed position with same ID
+            # in case the index is transiently out of sync (should not happen).
+            for p in self._positions:
+                if (
+                    str(getattr(p, "position_id", "") or "") == _pos_id
+                    and not getattr(p, "closed", False)
+                ):
+                    log.warning(
+                        "[exit_eng] seed_canonical_position_if_absent: "
+                        "already_owned (scan) | pos_id=%s contract=%s",
+                        _pos_id, getattr(pos, "option_symbol", "?"),
+                    )
+                    return False, "already_owned"
+            # Safe: no existing owner.  add_position re-acquires RLock (safe).
+            self.add_position(pos)
+            return True, "seeded"
+
     def start(self):
         if self._thread and self._thread.is_alive():
             log.debug("APExitEngine already running [%s]", self._email or "default")
@@ -11412,3 +11458,4 @@ class APExitEngine:
                         )
 
         log.info("_refresh_quotes: refreshed %d position(s) with live quotes", len(active))
+
