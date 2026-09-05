@@ -2605,6 +2605,144 @@ def test_amend5_callback_exception_schedules_durable_retry():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PR #568 amendment §2 — backoff must not schedule past the entry deadline
+# ─────────────────────────────────────────────────────────────────────────────
+# Binding invariant: when the bounded stepped ladder would push next_retry_at
+# past absolute_entry_deadline, resume must terminate with
+# RETRY_DEADLINE_WOULD_EXHAUST instead of writing a durable "doomed" retry.
+# The pre-CAS RETRY_DEADLINE_EXHAUSTED already handles "already past";
+# this handles "backoff would step past". No broker POST, no cancel, and the
+# schedule seam must NOT be called with a next_retry_at that exceeds the
+# deadline.
+
+
+def test_pr568_backoff_clip_terminates_when_ladder_would_pass_deadline():
+    """attempt=5 (60s cap) with deadline 20s away must terminate cleanly.
+
+    Model: force the callback to raise (same seam as amend5) so the resume
+    reaches _schedule_retry_wait. Then verify the clip rejects rather
+    than writing a durable retry past the deadline.
+    """
+    import os as _os_local
+    # Ensure the base delay is at its production default so attempt=5 hits
+    # the 60s cap rather than a raised floor that would exceed the deadline
+    # trivially at any attempt.
+    prior_base = _os_local.environ.pop("BREACH_SELECTOR_RETRY_DELAY_SECONDS", None)
+    prior_step1 = _os_local.environ.pop(
+        "VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", None
+    )
+    try:
+        core = _core()
+        row = _row(retry_attempt=4)  # next callback attempt = 5 → 60s ladder
+        now = datetime.now(timezone.utc)
+        row["meta"]["absolute_entry_deadline"] = _iso(
+            now + timedelta(seconds=20)
+        )
+        core.order_state_machine.get_order.return_value = row
+        core.order_state_machine.claim_deferred_materialization.return_value = True
+        core._on_entry_trigger.side_effect = RuntimeError("network error")
+        core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+        result = core.resume_deferred_materialization_retry(
+            local_order_id=LOCAL_ORDER_ID,
+            expected_generation=1,
+            expected_retry_attempt=5,
+            owner="owner-clip",
+        )
+
+        # Clean terminal EXPIRED — never a doomed RETRY_WAIT past deadline.
+        assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+        assert result["reason_code"] == "RETRY_DEADLINE_WOULD_EXHAUST"
+        assert result["terminal_status"] == "EXPIRED"
+        # The schedule seam must NOT have been called: no durable doomed row.
+        core.order_state_machine.schedule_deferred_materialization_retry.assert_not_called()
+        core.broker.submit_order.assert_not_called()
+        core.broker.cancel_order.assert_not_called()
+    finally:
+        if prior_base is not None:
+            _os_local.environ["BREACH_SELECTOR_RETRY_DELAY_SECONDS"] = prior_base
+        if prior_step1 is not None:
+            _os_local.environ["VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS"] = prior_step1
+
+
+def test_pr568_backoff_still_schedules_when_deadline_is_comfortably_out():
+    """Sanity: the clip is scoped — with deadline hours away, RETRY_WAIT works.
+
+    Guarantees the clip did not become a blanket refusal for all retries.
+    """
+    import os as _os_local
+    prior_base = _os_local.environ.pop("BREACH_SELECTOR_RETRY_DELAY_SECONDS", None)
+    prior_step1 = _os_local.environ.pop(
+        "VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", None
+    )
+    try:
+        core = _core()
+        row = _row(retry_attempt=4)
+        now = datetime.now(timezone.utc)
+        # Deadline hours away — 60s ladder step lands comfortably inside.
+        row["meta"]["absolute_entry_deadline"] = _iso(now + timedelta(hours=2))
+        core.order_state_machine.get_order.return_value = row
+        core.order_state_machine.claim_deferred_materialization.return_value = True
+        core._on_entry_trigger.side_effect = RuntimeError("network error")
+        core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+        result = core.resume_deferred_materialization_retry(
+            local_order_id=LOCAL_ORDER_ID,
+            expected_generation=1,
+            expected_retry_attempt=5,
+            owner="owner-comfy",
+        )
+
+        assert result["disposition"] == "RETRY_WAIT"
+        core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()
+    finally:
+        if prior_base is not None:
+            _os_local.environ["BREACH_SELECTOR_RETRY_DELAY_SECONDS"] = prior_base
+        if prior_step1 is not None:
+            _os_local.environ["VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS"] = prior_step1
+
+
+def test_pr568_backoff_clip_noop_when_no_deadline_present():
+    """No absolute_entry_deadline in meta → clip must not activate.
+
+    The existing cutoff/session fences still apply upstream, but the clip
+    itself must be inert when the deadline field is absent (defensive).
+    """
+    import os as _os_local
+    prior_base = _os_local.environ.pop("BREACH_SELECTOR_RETRY_DELAY_SECONDS", None)
+    prior_step1 = _os_local.environ.pop(
+        "VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", None
+    )
+    try:
+        core = _core()
+        row = _row(retry_attempt=4)
+        # No deadline field at all — remove any variant the fixture may set.
+        for key in (
+            "absolute_entry_deadline", "retry_deadline", "deferred_retry_deadline",
+        ):
+            row["meta"].pop(key, None)
+        core.order_state_machine.get_order.return_value = row
+        core.order_state_machine.claim_deferred_materialization.return_value = True
+        core._on_entry_trigger.side_effect = RuntimeError("network error")
+        core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+        result = core.resume_deferred_materialization_retry(
+            local_order_id=LOCAL_ORDER_ID,
+            expected_generation=1,
+            expected_retry_attempt=5,
+            owner="owner-nodeadline",
+        )
+        # Clip is inert: normal RETRY_WAIT scheduling.
+        assert result["disposition"] == "RETRY_WAIT"
+        core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()
+    finally:
+        if prior_base is not None:
+            _os_local.environ["BREACH_SELECTOR_RETRY_DELAY_SECONDS"] = prior_base
+        if prior_step1 is not None:
+            _os_local.environ["VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS"] = prior_step1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Second-round blocker tests from reviewer
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -3482,6 +3482,7 @@ class APExecutionCore:
             or meta.get("retry_deadline")
             or meta.get("deferred_retry_deadline")
         )
+        _deadline_dt: "datetime | None" = None
         if _deadline_raw:
             try:
                 _deadline_dt = datetime.fromisoformat(str(_deadline_raw))
@@ -3606,7 +3607,22 @@ class APExecutionCore:
                     cfg={"validity_bound_retry_backoff_step1_seconds": _retry_delay_base},
                 ),
             )
-            _next_retry_at = (_now + timedelta(seconds=_retry_delay)).isoformat()
+            _candidate_next = _now + timedelta(seconds=_retry_delay)
+            # PR #568 amendment §2: the backoff must not push next_retry_at
+            # past the absolute entry deadline. Writing a doomed row would
+            # violate the amendment's cadence contract, waste a scheduler
+            # cycle, and mislead observers. Terminate cleanly here — the
+            # pre-CAS deadline check above already handles the "now past
+            # deadline" case; this handles the "backoff would step past
+            # deadline" case that the ladder introduces.
+            if _deadline_dt is not None and _candidate_next >= _deadline_dt:
+                return _term(
+                    "RETRY_DEADLINE_WOULD_EXHAUST",
+                    status="EXPIRED",
+                    attempt=_callback_attempt,
+                    max_attempts=max_attempts,
+                )
+            _next_retry_at = _candidate_next.isoformat()
             _schedule = getattr(osm, "schedule_deferred_materialization_retry", None)
             _ok = False
             if callable(_schedule):

@@ -1004,6 +1004,49 @@ class PendingTriggerRestartRecovery:
             return False
         return now_et.hour * 100 + now_et.minute < cutoff
 
+    def _retry_entry_deadline(self, row: dict) -> "datetime | None":
+        """Return the earliest applicable retry-deadline for this row, or None.
+
+        Used by the phase-one bounded-backoff clip (PR #568 amendment §2) to
+        refuse writing a ``next_retry_at`` that would land past the entry
+        cutoff. Combines the durable absolute deadline (if any) with the
+        BREACH_SELECTOR_RETRY_CUTOFF_ET wall-clock ceiling so callers only
+        need one comparison. Returns ``None`` only when no deadline is
+        parseable — the caller must not treat that as "safe to schedule
+        forever"; the ordinary lifecycle fences still apply.
+        """
+        meta = _extract_meta(row)
+        candidates: list = []
+
+        deadline_raw = (
+            meta.get("absolute_entry_deadline")
+            or meta.get("retry_deadline")
+            or meta.get("deferred_retry_deadline")
+        )
+        if deadline_raw:
+            parsed = _parse_iso(deadline_raw)
+            if parsed is not None:
+                candidates.append(parsed)
+
+        try:
+            cutoff = int(
+                str(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "1530")).strip()
+            )
+        except (TypeError, ValueError):
+            cutoff = None
+        if cutoff is not None and 0 <= cutoff <= 2359 and cutoff % 100 < 60:
+            eastern = ZoneInfo("America/New_York")
+            now_et = datetime.now(eastern)
+            cutoff_dt_et = now_et.replace(
+                hour=cutoff // 100,
+                minute=cutoff % 100,
+                second=0,
+                microsecond=0,
+            )
+            candidates.append(cutoff_dt_et.astimezone(timezone.utc))
+
+        return min(candidates) if candidates else None
+
     def _recover_stale_market_truth_pending(
         self, row: dict, local_oid: str
     ) -> Optional[str]:
@@ -1108,9 +1151,17 @@ class PendingTriggerRestartRecovery:
                 cfg={"validity_bound_retry_backoff_step1_seconds": _base_delay},
             ),
         )
-        next_retry_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=delay)
-        ).isoformat()
+        _candidate_next_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        # PR #568 amendment §2: never schedule past the absolute entry
+        # deadline. _inside_retry_entry_window(row) above already blocked
+        # the "already past" case; this blocks the "backoff would step
+        # past" case introduced by the ladder. Leave the row UNRESOLVED
+        # so the ordinary lifecycle (deadline / EOD cutoff) terminates it
+        # on the next poll instead of writing a doomed retry.
+        _deadline_dt = self._retry_entry_deadline(row)
+        if _deadline_dt is not None and _candidate_next_dt >= _deadline_dt:
+            return _RowOutcome.UNRESOLVED
+        next_retry_at = _candidate_next_dt.isoformat()
         recover = getattr(
             self.osm, "recover_stale_market_truth_pending_retry", None
         )

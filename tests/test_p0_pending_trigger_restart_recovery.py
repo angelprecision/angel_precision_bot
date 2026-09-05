@@ -1734,6 +1734,61 @@ class TestPhaseOneCrashRecovery:
         osm.recover_stale_market_truth_pending_retry.assert_called_once()
         assert osm.cancel_calls == []
 
+    # ── PR #568 amendment §2 — backoff deadline clip ──────────────────────────
+    # Binding invariant: the bounded-backoff ladder must NOT schedule
+    # next_retry_at past the absolute entry deadline. When the ladder would
+    # step past the deadline, recovery must leave the row UNRESOLVED (letting
+    # the ordinary lifecycle terminate it on the next poll) rather than write
+    # a doomed retry row.
+
+    def test_backoff_that_would_pass_deadline_leaves_row_unresolved(self, monkeypatch):
+        """attempt=4 (60s cap) with deadline 20s away must NOT schedule.
+
+        The prior behavior (fixed 8s delay) would have written a retry 8s
+        out — safely inside the 20s deadline. The new ladder at attempt=4
+        wants 60s, which would land 40s past the deadline. The clip must
+        refuse and leave the row UNRESOLVED so the ordinary deadline fence
+        terminates it on the next poll instead of a durable doomed row.
+        """
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        now = datetime.now(timezone.utc)
+        row = _phase_one_crash_row()
+        # Push attempt into the 60s ladder rung; move deadline within 20s.
+        row["meta"]["retry_attempt"] = 4
+        row["meta"]["breach_attempt_count"] = 4
+        row["meta"]["materialization_attempts"] = 4
+        row["meta"]["retry_max_attempts"] = 10
+        row["meta"]["absolute_entry_deadline"] = (
+            now + timedelta(seconds=20)
+        ).isoformat()
+
+        rec, osm = _phase_one_recovery(row, _AuthoritativeOrdersBroker())
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        # Zero DB mutation, zero broker action.
+        assert osm.phase_one_recovery_calls == []
+        assert osm.cancel_calls == []
+
+    def test_backoff_within_deadline_still_schedules_normally(self, monkeypatch):
+        """Sanity check the clip is *only* triggered when the ladder overruns.
+
+        attempt=1 (8s step) with a deadline 5 minutes away must still
+        schedule cleanly — the clip must not become a blanket refusal.
+        """
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        now = datetime.now(timezone.utc)
+        row = _phase_one_crash_row()
+        row["meta"]["absolute_entry_deadline"] = (
+            now + timedelta(minutes=5)
+        ).isoformat()
+
+        rec, osm = _phase_one_recovery(row, _AuthoritativeOrdersBroker())
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert len(osm.phase_one_recovery_calls) == 1
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PR #521 — P0 MATERIALIZATION_IN_FLIGHT fence
