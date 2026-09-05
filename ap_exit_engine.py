@@ -3878,6 +3878,8 @@ class APExitEngine:
         order_filled_ts=None,
         underlying_entry: float = 0.0,
         underlying_entry_trusted: Optional[bool] = None,
+        quantity: Optional[int] = None,
+        quantity_remaining: Optional[int] = None,
         score: float = 0.0,
         tier: str = "",
         pattern: str = "",
@@ -3928,6 +3930,73 @@ class APExitEngine:
                 _set_position_attr_pair(target, "underlying_entry", _underlying_entry)
                 if underlying_entry_trusted is True:
                     _set_position_attr_pair(target, "underlying_entry_untrusted", False)
+
+        _quantity_supplied = quantity is not None or quantity_remaining is not None
+        _canonical_quantity = (
+            _broker_repair_positive_int(quantity) if quantity is not None else None
+        )
+        _canonical_remaining = (
+            _broker_repair_positive_int(quantity_remaining)
+            if quantity_remaining is not None else None
+        )
+        if _quantity_supplied and (
+            (_canonical_quantity is None if quantity is not None else False)
+            or (_canonical_remaining is None if quantity_remaining is not None else False)
+            or (
+                _canonical_quantity is not None
+                and _canonical_remaining is not None
+                and _canonical_remaining > _canonical_quantity
+            )
+        ):
+            return CanonicalAdoptionResult(
+                disposition="RETRY_IDENTITY_CONFLICT", adopted=False,
+                safe_to_seed=False, retryable=True,
+                reason="quantity_truth_invalid",
+            )
+
+        def _apply_quantity_truth(target) -> bool:
+            """Apply proven DB quantity without ever increasing live remainder."""
+            if not _quantity_supplied:
+                return True
+            target_qty = _broker_repair_positive_int(
+                getattr(target, "quantity", None)
+            )
+            if (
+                _canonical_quantity is not None
+                and target_qty is not None
+                and target_qty > _canonical_quantity
+            ):
+                return False
+            if _canonical_quantity is not None and (
+                target_qty is None or target_qty < _canonical_quantity
+            ):
+                target.quantity = _canonical_quantity
+
+            if _canonical_remaining is not None:
+                target_remaining = _broker_repair_positive_int(
+                    getattr(target, "quantity_remaining", None)
+                )
+                if target_remaining is None or target_remaining <= 0:
+                    target.quantity_remaining = _canonical_remaining
+                elif target_remaining > _canonical_remaining:
+                    target.quantity_remaining = _canonical_remaining
+                # A smaller in-memory remainder is retained fail-closed; the
+                # durable row cannot safely reopen contracts already consumed.
+                if _canonical_quantity is not None:
+                    target.quantity_remaining = min(
+                        int(getattr(target, "quantity_remaining", 0) or 0),
+                        _canonical_quantity,
+                    )
+            return int(getattr(target, "quantity_remaining", 0) or 0) > 0
+
+        def _quantity_truth_conflicts(target) -> bool:
+            """Reject an in-memory full size larger than proven durable truth."""
+            if not _quantity_supplied or _canonical_quantity is None:
+                return False
+            target_qty = _broker_repair_positive_int(
+                getattr(target, "quantity", None)
+            )
+            return target_qty is not None and target_qty > _canonical_quantity
 
         with self._lock:
             # ── Final Blocker 1: Canonical + repair collapse ───────────────────
@@ -3998,7 +4067,16 @@ class APExitEngine:
                         adopted=False, safe_to_seed=False, retryable=True,
                         reason="canonical_object_mismatch",
                     )
-
+                # Validate the existing target before removing any matching
+                # repair owners or clearing degraded metadata.  A stale live
+                # full size greater than proven durable truth is a hard HOLD,
+                # not a partially-applied convergence.
+                if _quantity_truth_conflicts(_existing_canon):
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_IDENTITY_CONFLICT", adopted=False,
+                        safe_to_seed=False, retryable=True,
+                        reason="canonical_quantity_conflict",
+                    )
                 # Merge every active broker-repair for this exact client/mode/contract
                 # into canonical. Unknown-client, foreign-client, blank-mode, or
                 # wrong-mode repairs stay quarantined and cannot donate quote authority.
@@ -4139,6 +4217,12 @@ class APExitEngine:
                         reason=f"retained_repairs={len(_identity_unproven_repairs)}",
                     )
 
+                if not _apply_quantity_truth(_existing_canon):
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_IDENTITY_CONFLICT", adopted=False,
+                        safe_to_seed=False, retryable=True,
+                        reason="canonical_quantity_conflict",
+                    )
                 _apply_underlying_entry_truth(_existing_canon)
                 _reclassify_hard_ref_for_entry(_existing_canon)
 
@@ -4194,6 +4278,12 @@ class APExitEngine:
 
                 # Found a valid broker-repair position — upgrade in place.
                 old_id = _pid
+                if not _apply_quantity_truth(pos):
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_IDENTITY_CONFLICT", adopted=False,
+                        safe_to_seed=False, retryable=True,
+                        reason="repair_quantity_conflict",
+                    )
 
                 # ── Blocker 3: Remove contaminated midpoint state ────────────
                 _prior_peak_source = str(
@@ -4424,15 +4514,20 @@ class APExitEngine:
     def seed_canonical_position_if_absent(
         self, pos: "ManagedPosition"
     ) -> "tuple[bool, str]":
-        """Atomically seed a canonical position only if no owner already exists.
+        """Atomically seed a canonical position only if its exact owner domain is empty.
 
         For use EXCLUSIVELY by the reconciler NO_REPAIR_FOUND path. Acquires
-        the engine lock, checks for an existing canonical owner by position_id,
-        and only calls add_position if the position is truly absent.
+        the engine lock, checks the exact client/mode/OCC domain, and only calls
+        add_position if that behavior-active owner domain is truly empty.  The
+        post-add checks prove that the supplied object was actually registered.
 
         Returns:
             (True,  "seeded")        — position was new; added successfully.
             (False, "already_owned") — a canonical owner already exists; no-op.
+            (False, "degraded_owner_present") — a degraded owner appeared; retry adoption.
+            (False, "owner_conflict") — another exact-domain owner exists; HOLD.
+            (False, "seed_failed")   — add_position did not register the exact owner.
+            (False, "identity_unproven") — client/mode/OCC was not proven.
             (False, "missing_id")    — pos has no position_id; cannot be tracked.
         """
         if pos is None:
@@ -4441,31 +4536,88 @@ class APExitEngine:
         if not _pos_id:
             return False, "missing_id"
 
+        _client = str(getattr(pos, "client_id", "") or "").strip().lower()
+        _mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+        _contract = str(
+            getattr(pos, "option_symbol", "")
+            or getattr(pos, "contract", "")
+            or ""
+        ).strip().upper()
+        try:
+            from ap.exit_safety import _normalize_contract as _normalize_owner_contract
+            _contract = _normalize_owner_contract(_contract)
+        except Exception:
+            pass
+        if not _client or _mode not in {"live", "paper"} or not _contract:
+            return False, "identity_unproven"
+
+        def _same_domain(candidate) -> bool:
+            if not _is_behavior_active_position(candidate):
+                return False
+            candidate_client = str(
+                getattr(candidate, "client_id", "") or ""
+            ).strip().lower()
+            candidate_mode = str(
+                getattr(candidate, "execution_mode", "") or ""
+            ).strip().lower()
+            candidate_contract = str(
+                getattr(candidate, "option_symbol", "")
+                or getattr(candidate, "contract", "")
+                or ""
+            ).strip().upper()
+            try:
+                candidate_contract = _normalize_owner_contract(candidate_contract)
+            except Exception:
+                pass
+            return (
+                candidate_client == _client
+                and candidate_mode == _mode
+                and candidate_contract == _contract
+            )
+
+        def _classify(owners) -> str:
+            if len(owners) != 1:
+                return "owner_conflict" if owners else ""
+            existing = owners[0]
+            existing_id = str(getattr(existing, "position_id", "") or "").strip()
+            if (
+                existing_id.startswith("broker-repair-")
+                or getattr(existing, "broker_repair_degraded", False)
+            ):
+                return "degraded_owner_present"
+            if existing_id == _pos_id:
+                return "already_owned"
+            return "owner_conflict"
+
         with self._lock:
-            # O(1) check via the ID index (kept in sync by add_position/expiry).
-            if self._positions_by_id.get(_pos_id) is not None:
+            # The full exact client/mode/OCC domain is the uniqueness boundary,
+            # not position_id alone.  This recheck is under the same lock as the
+            # add and closes the adoption->degraded-owner TOCTOU window.
+            exact_domain_owners = [p for p in self._positions if _same_domain(p)]
+            if exact_domain_owners:
+                _reason = _classify(exact_domain_owners)
                 log.warning(
-                    "[exit_eng] seed_canonical_position_if_absent: "
-                    "already_owned | pos_id=%s contract=%s",
-                    _pos_id, getattr(pos, "option_symbol", "?"),
+                    "[exit_eng] seed_canonical_position_if_absent: %s | "
+                    "pos_id=%s client=%s mode=%s contract=%s owners=%s",
+                    _reason, _pos_id, _client, _mode, _contract,
+                    [getattr(owner, "position_id", "") for owner in exact_domain_owners],
                 )
-                return False, "already_owned"
-            # Belt-and-suspenders: scan for any non-closed position with same ID
-            # in case the index is transiently out of sync (should not happen).
-            for p in self._positions:
-                if (
-                    str(getattr(p, "position_id", "") or "") == _pos_id
-                    and not getattr(p, "closed", False)
-                ):
-                    log.warning(
-                        "[exit_eng] seed_canonical_position_if_absent: "
-                        "already_owned (scan) | pos_id=%s contract=%s",
-                        _pos_id, getattr(pos, "option_symbol", "?"),
-                    )
-                    return False, "already_owned"
-            # Safe: no existing owner.  add_position re-acquires RLock (safe).
+                return False, _reason
+
+            # Safe: the exact behavior-active domain is empty. add_position
+            # re-acquires this RLock and may still reject the object; verify the
+            # actual registration rather than reporting that call as success.
             self.add_position(pos)
-            return True, "seeded"
+            exact_domain_owners = [p for p in self._positions if _same_domain(p)]
+            if (
+                len(exact_domain_owners) == 1
+                and exact_domain_owners[0] is pos
+                and self._positions_by_id.get(_pos_id) is pos
+            ):
+                return True, "seeded"
+            if exact_domain_owners:
+                return False, _classify(exact_domain_owners) or "seed_failed"
+            return False, "seed_failed"
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -11458,4 +11610,3 @@ class APExitEngine:
                         )
 
         log.info("_refresh_quotes: refreshed %d position(s) with live quotes", len(active))
-

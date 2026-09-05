@@ -33,18 +33,43 @@ Spec branch created from:
 main@91965ab43cc3a3a3db0bbf13abd235a2c5ca651f
 ```
 
-That main includes merged PR #544 and does **not** yet include #545 or the final #516 repair.
+That historical spec base includes merged PR #544 and predates #545 and the
+broker-recovery correction now merged through #585. The implementation is
+rebased onto current main `9c719d72b2b9c3dba7f8c883d118142f48ce3246`,
+which contains both dependencies.
 
 ### Required implementation ancestry
 
 Implementation must be rebuilt/rebased from fresh current main **after**:
 
 1. #545 is merged, because #545 owns reconciler historical-entry truth;
-2. #516 is merged, because #516 owns broker-open / DB-lag canonical position identity and should stop creating new engine-only `broker-repair-*` owners in that recovery path.
+2. #585 is merged, because #585 supersedes #516 and owns broker-open / DB-lag canonical position identity and canonical owner convergence.
 
 This PR remains Draft/HARD HOLD until those ancestry requirements are satisfied.
 
-Do not copy #545 or #516 code into this PR. Rebase onto their merged commits.
+Do not copy #545 or #585 code into this PR. Rebase onto their merged commits.
+
+### Post-rebase amendment boundary
+
+The implementation also carries these narrowly scoped corrections required by
+the #585 integration audit:
+
+- A historical FILLED ENTRY with a blank `position_id` may be accepted only
+  when client, mode, OCC, and an exact local/broker order linkage all agree;
+  a nonblank conflicting predecessor ID remains a HOLD.
+- Filled ENTRY lookup is enrichment-only. A complete canonical row may adopt
+  through a temporary orders-read outage; lookup is required only for missing
+  adoption metadata.
+- Proven full and remaining quantities are passed through both adoption paths.
+  A smaller in-memory remainder is retained fail-closed, while malformed or
+  contradictory quantity truth is rejected.
+- `NO_REPAIR_FOUND` seeding rechecks the exact client/mode/OCC domain under the
+  exit-engine lock and proves the supplied object was registered. A degraded or
+  conflicting owner blocks the generic add without takeover.
+- If the atomic seed API is unavailable, the reconciler returns
+  `atomic_seed_unavailable` and performs no generic `add_position()` fallback.
+- P0 CI checks out and asserts the submitted PR head SHA, rather than relying
+  on GitHub's synthetic pull-request merge ref.
 
 ---
 
@@ -320,6 +345,17 @@ Do not choose newest.
 
 Do not choose whichever source is convenient.
 
+When the historical ENTRY predates canonical position creation, a blank
+`ENTRY.position_id` is not itself a contradiction. It may be linked by the
+exact local or broker ENTRY order ID inside the already fenced client/mode/OCC
+domain. A nonblank predecessor ID that differs from the canonical UUID remains
+an identity conflict.
+
+If the canonical row already contains the required adoption fields, a temporary
+ENTRY lookup outage must not block ownership convergence. Missing fill or
+identity fields still require one exact, proven ENTRY lookup; a missing fill
+timestamp alone may use the adoption API's deterministic fallback.
+
 Do not overwrite a durable canonical value to make adoption succeed.
 
 ### Historical entry truth
@@ -407,6 +443,17 @@ adoption -> NO_REPAIR_FOUND
 -> add_position() at most once
 -> verify exact canonical-owner postcondition
 ```
+
+The seed helper must perform its final check under the same engine lock as the
+add. It must re-check the exact client/mode/OCC domain immediately before the
+add, refuse a newly appeared degraded/broker-repair or conflicting owner, and
+return success only when the supplied canonical object is behavior-active,
+indexed by its canonical ID, and is the sole exact-domain owner.
+
+For partial exits, the adoption call receives both the proven original size and
+the proven remaining size on `ADOPTED` and `ALREADY_CANONICAL_REPAIR_REMOVED`.
+It may lower a stale remainder but must never increase it; a target whose full
+size exceeds proven truth remains a retry/HOLD before cleanup.
 
 Postcondition:
 
@@ -511,7 +558,7 @@ Do not import fill-monitor private helpers just to reuse a few lines. Avoid circ
 
 # REQUIRED FAIL-FIRST PRODUCTION REPRODUCTION
 
-Before changing production code, add a focused test that reproduces current-main behavior after rebasing onto final #545 + #516 lineage.
+Before changing production code, add a focused test that reproduces current-main behavior after rebasing onto final #545 + #585 lineage.
 
 Suggested file:
 
@@ -801,11 +848,11 @@ Do not create a second historical-entry lookup implementation in 517-B.
 
 ---
 
-# #516 INTEGRATION REQUIREMENTS
+# #585 INTEGRATION REQUIREMENTS
 
-#516 owns broker-open / DB-lag durable identity creation.
+#585 supersedes #516 and owns broker-open / DB-lag durable identity creation.
 
-After #516:
+After #585:
 
 ```text
 new broker-open recovery should prefer canonical filled ENTRY position_id
@@ -819,12 +866,12 @@ and should not create a new engine-only broker-repair owner when DB identity is 
 - races where canonical state becomes visible after a repair owner was already installed by an older process;
 - any other existing `broker-repair-*` object encountered by the reconciler.
 
-517-B must not duplicate #516's DB INSERT / UUID / broker-position repair logic.
+517-B must not duplicate #585's DB INSERT / UUID / broker-position repair logic.
 
-Required regression after #516 ancestry:
+Required regression after #585 ancestry:
 
 ```text
-normal new #516 canonical recovery
+normal new #585 canonical recovery
 -> reconciler sees canonical position
 -> no repair owner exists
 -> adoption returns NO_REPAIR_FOUND
@@ -974,7 +1021,7 @@ Also run all exact #470 canonical adoption / durable-identity tests available on
 
 Also run #176 degraded-LIVE exit safety tests unchanged.
 
-Also run final #516 focused tests unchanged.
+Also run merged #585 focused tests unchanged.
 
 Then run authoritative exact-head P0 GitHub Actions with PostgreSQL.
 
@@ -1023,7 +1070,7 @@ IMPLEMENTATION BASE SHA
 FINAL HEAD SHA
 FINAL CURRENT MAIN SHA
 #545 merged SHA
-#516 merged SHA
+#585 merged SHA
 exact changed files
 production LOC delta
 fail-first test and exact pre-fix failure
@@ -1040,7 +1087,7 @@ LIVE/PAPER isolation proof
 exact OCC proof
 ambiguous evidence proof
 #545 compatibility
-#516 compatibility
+#585 compatibility
 #470 compatibility
 #176 compatibility
 broker submit call-site delta
@@ -1068,7 +1115,7 @@ Do not report tests that were skipped as passed.
 ## MERGE only if
 
 - #545 is in ancestry;
-- final #516 fix is in ancestry;
+- final #585 fix is in ancestry;
 - implementation is rebased onto current main;
 - only the canonical-owner adoption slice is changed;
 - reconciler calls existing canonical adoption API before generic add;
@@ -1082,13 +1129,14 @@ Do not report tests that were skipped as passed.
 - exact OCC fencing remains mandatory;
 - #545 historical entry truth remains immutable;
 - no current quote becomes historical entry;
-- #516 behavior remains intact;
+- #585 behavior remains intact;
 - #470 adoption tests remain green;
 - #176 degraded-LIVE protections remain green;
 - no broker submit/cancel diff exists;
 - no proof or queue mutation is added;
 - new focused test is registered in authoritative P0 CI;
 - exact-head P0 CI passes;
+- the workflow asserts `git rev-parse HEAD` equals the submitted PR head SHA;
 - independent final diff audit returns MERGE.
 
 ## HOLD if
@@ -1096,7 +1144,7 @@ Do not report tests that were skipped as passed.
 Implementation is logically correct but waiting on:
 
 - #545 merge;
-- #516 merge;
+- #585 merge;
 - final rebase;
 - exact-head CI;
 - independent audit.
@@ -1111,7 +1159,7 @@ Implementation is logically correct but waiting on:
 - current quote/current underlying becomes historical entry again;
 - broker submit/cancel authority appears;
 - exit strategy thresholds change;
-- #516 or #545 code is duplicated into this PR;
+- #585 or #545 code is duplicated into this PR;
 - old #517 is restored wholesale.
 
 ---

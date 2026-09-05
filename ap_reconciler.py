@@ -4008,18 +4008,37 @@ class APBrokerReconciler:
                 return "AMBIGUOUS", None
 
             row = rows[0]
+            _entry_position_id = str(row.get("position_id") or "").strip()
             if (
                 str(row.get("client_id") or "").strip().lower()
                 != str(self.client_id or "").strip().lower()
                 or _durable_execution_mode(row) != execution_mode
                 or self._norm_contract(row.get("contract")) != contract
-                or str(row.get("position_id") or "").strip() != position_id
                 or str(row.get("kind") or "").strip().upper() != "ENTRY"
                 or str(row.get("status") or "").strip().upper() not in {
                     "FILLED", "PARTIAL_FILL", "PARTIALLY_FILLED"
                 }
             ):
                 return "IDENTITY_CONFLICT", None
+            # A nonblank predecessor position_id is durable identity and must
+            # match the canonical row exactly.  A blank predecessor id is not
+            # a contradiction: #585 can create the canonical positions.id
+            # after an older exact ENTRY was persisted without one.  Accept
+            # that narrow fallback only when an exact local/broker ENTRY id
+            # links the row inside the already fenced client/mode/OCC domain.
+            if _entry_position_id and _entry_position_id != position_id:
+                return "IDENTITY_CONFLICT", None
+            if not _entry_position_id:
+                _linked_by_exact_order_id = any(
+                    canonical_value
+                    and str(row.get(row_key) or "").strip() == canonical_value
+                    for row_key, canonical_value in (
+                        ("local_order_id", local_order_id),
+                        ("broker_order_id", broker_order_id),
+                    )
+                )
+                if not _linked_by_exact_order_id:
+                    return "IDENTITY_CONFLICT", None
             for key, canonical_value in (
                 ("local_order_id", local_order_id),
                 ("broker_order_id", broker_order_id),
@@ -4186,7 +4205,11 @@ class APBrokerReconciler:
             return False, "OWNER_COUNT_0", owner_ids
         if len(owners) > 1:
             return False, "OWNER_COUNT_GT1", owner_ids
-        if any(owner_id.startswith("broker-repair-") for owner_id in owner_ids):
+        if any(
+            owner_id.startswith("broker-repair-")
+            or getattr(owner, "broker_repair_degraded", False)
+            for owner_id, owner in zip(owner_ids, owners)
+        ):
             return False, "BROKER_REPAIR_OWNER_PRESENT", owner_ids
         if owner_ids[0] != position_id:
             return False, "CANONICAL_OWNER_MISSING", owner_ids
@@ -4282,6 +4305,16 @@ class APBrokerReconciler:
         entry_px, entry_ok = self._canonical_positive_number(
             pos, "avg_fill", "entry_price"
         )
+        _entry_price_present = any(
+            raw is not None
+            and not (isinstance(raw, str) and not raw.strip())
+            for raw in (pos.get("avg_fill"), pos.get("entry_price"))
+        )
+        _entry_price_missing = not _entry_price_present
+        entry_ts = pos.get("entry_ts") or pos.get("opened_at")
+        _entry_ts_missing = entry_ts is None or (
+            isinstance(entry_ts, str) and not entry_ts.strip()
+        )
         qty = int(qty_value) if qty_ok else 0
         _, historical_entry_malformed = (
             _historical_underlying_from_mapping(pos)
@@ -4328,7 +4361,7 @@ class APBrokerReconciler:
             or side not in {"CALL", "PUT"}
             or side != occ_side
             or not qty_ok
-            or not entry_ok
+            or (not entry_ok and not _entry_price_missing)
             or historical_entry_malformed
             or not stop_ok
             or not target_ok
@@ -4358,22 +4391,46 @@ class APBrokerReconciler:
                 disposition="RETRY_IDENTITY_CONFLICT",
             )
 
-        evidence_status, evidence = self._filled_entry_evidence_for_canonical_position(
-            contract=contract,
-            position_id=pos_id,
-            execution_mode=engine_mode,
-            local_order_id=local_order_id,
-            broker_order_id=broker_order_id,
-            signal_id=signal_id,
-            canonical_signal_id=canonical_signal_id,
-        )
-        if evidence_status not in {"NO_EVIDENCE", "PROVEN"}:
-            return self._canonical_owner_hold(
+        # Canonical durable position truth is authoritative when it already
+        # carries every field the adoption API consumes.  The orders lookup is
+        # enrichment only; do not turn a transient orders outage into a HOLD
+        # for a complete canonical row.  Missing identity/fill data still
+        # requires one exact ENTRY lookup before proceeding.  A missing
+        # timestamp alone is not a lookup blocker: the adoption API has a
+        # deterministic fill-time fallback, and an outage must not strand an
+        # otherwise complete canonical owner.
+        _entry_evidence_needed = any((
+            _entry_price_missing,
+            not local_order_id,
+            not broker_order_id,
+            not signal_id,
+        ))
+        if _entry_evidence_needed:
+            evidence_status, evidence = self._filled_entry_evidence_for_canonical_position(
                 contract=contract,
                 position_id=pos_id,
                 execution_mode=engine_mode,
-                disposition=f"RETRY_ENTRY_EVIDENCE_{evidence_status}",
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                signal_id=signal_id,
+                canonical_signal_id=canonical_signal_id,
             )
+            if evidence_status not in {"NO_EVIDENCE", "PROVEN"}:
+                return self._canonical_owner_hold(
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                    disposition=f"RETRY_ENTRY_EVIDENCE_{evidence_status}",
+                )
+            if evidence_status == "NO_EVIDENCE":
+                return self._canonical_owner_hold(
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                    disposition="RETRY_ENTRY_EVIDENCE_NO_EVIDENCE",
+                )
+        else:
+            evidence_status, evidence = "SKIPPED", None
 
         if evidence:
             for key, canonical_value in (
@@ -4400,7 +4457,10 @@ class APBrokerReconciler:
                     else:
                         canonical_signal_id = evidence_value
             evidence_fill = _positive_finite_float(evidence.get("fill_price"))
-            if evidence_fill > 0 and not math.isclose(
+            if evidence_fill > 0 and _entry_price_missing:
+                entry_px = evidence_fill
+                entry_ok = True
+            elif evidence_fill > 0 and not math.isclose(
                 entry_px, evidence_fill, rel_tol=1e-9, abs_tol=1e-9
             ):
                 return self._canonical_owner_hold(
@@ -4409,6 +4469,16 @@ class APBrokerReconciler:
                     execution_mode=engine_mode,
                     disposition="RETRY_ENTRY_FILL_CONFLICT",
                 )
+            if _entry_ts_missing and evidence.get("filled_ts") not in (None, ""):
+                entry_ts = evidence.get("filled_ts")
+
+        if not entry_ok:
+            return self._canonical_owner_hold(
+                contract=contract,
+                position_id=pos_id,
+                execution_mode=engine_mode,
+                disposition="RETRY_ENTRY_FILL_UNPROVEN",
+            )
 
         # ── Partial-exit quantity authority resolution ──────────────────────────
         # If quantity_remaining < full qty we need durable EXIT evidence before
@@ -4451,12 +4521,14 @@ class APBrokerReconciler:
                 signal_id=signal_id,
                 canonical_signal_id=canonical_signal_id,
                 entry_fill=entry_px,
-                entry_ts=pos.get("entry_ts") or pos.get("opened_at"),
+                entry_ts=entry_ts,
                 order_filled_ts=(evidence or {}).get("filled_ts"),
                 execution_mode=engine_mode,
                 client_id=expected_client,
                 underlying_entry=underlying_entry,
                 underlying_entry_trusted=underlying_entry > 0,
+                quantity=qty,
+                quantity_remaining=canonical_qty,
                 score=self._safe_float(pos.get("score"), 0.0),
                 tier=str(pos.get("tier") or ""),
                 pattern=str(pos.get("pattern") or ""),
@@ -4563,7 +4635,7 @@ class APBrokerReconciler:
         target_underlying=0.0,
         underlying_entry: float = 0.0,
         price_untrusted: bool = False,
-    ) -> bool:
+    ) -> str:
         _ee = getattr(self, "exit_engine", None)
         if not _ee:
             log.critical(
@@ -4621,21 +4693,21 @@ class APBrokerReconciler:
             # owner and adds atomically under the engine lock.  If another
             # reconciler pass already seeded this position, we return "already_owned"
             # and let the postcondition verify the single owner.
-            # Falls back to add_position only when the engine predates this API
-            # (should not happen in deployed code — log CRITICAL if it does).
+            # The atomic helper is part of the deployed reconciler/exit-engine
+            # contract.  An engine without it cannot prove the ownership
+            # boundary, so fail closed instead of reviving the unsafe generic
+            # add path.
             _atomic_seed_fn = getattr(_ee, "seed_canonical_position_if_absent", None)
-            if callable(_atomic_seed_fn):
-                _seeded, _seed_reason = _atomic_seed_fn(mp)
-            else:
+            if not callable(_atomic_seed_fn):
                 log.critical(
                     "[%s] EXIT_ENGINE_ATOMIC_SEED_UNAVAILABLE | %s | "
                     "seed_canonical_position_if_absent not present — "
-                    "falling back to add_position (non-atomic)",
+                    "refusing generic add_position",
                     self.client_id, contract,
                 )
-                _ee.add_position(mp)
-                _seeded, _seed_reason = True, "seeded_legacy"
-            _seed_status = "seeded" if _seeded else "already_owned"
+                return "atomic_seed_unavailable"
+            _seeded, _seed_reason = _atomic_seed_fn(mp)
+            _seed_status = "seeded" if _seeded else str(_seed_reason or "seed_failed")
             log.critical(
                 "[%s] EXIT_ENGINE_SEEDED_FROM_RECONCILER | %s | qty=%s entry=%.4f "
                 "underlying_entry=%.4f price_untrusted=%s seed_status=%s pos=%s",
@@ -5463,4 +5535,3 @@ class APBrokerReconciler:
             self._alert_fn(f"[reconciler:{self.client_id}] {msg}")
         except Exception as _e:
             log.warning("reconciler_alert_fn_failed: %s", _e)
-
