@@ -613,6 +613,120 @@ def is_validity_bound_deferred_retry_reason(reason_code: "str | None") -> bool:
     )
 
 
+# ── Bounded backoff for validity-bound retries (PR #568 amendment) ────────────
+#
+# Validity-bound retries stay lifecycle-owned until session/cutoff authority
+# expires. That must not translate into hammering an unavailable/rate-limited
+# provider every fixed ``BREACH_SELECTOR_RETRY_DELAY_SECONDS`` window. This
+# helper is the single source of truth for the effective per-attempt delay.
+#
+# Design constraints (PR #568 amendment §2):
+#   * Retry count is NOT terminal authority.  This helper decides only *when*
+#     the next retry may run.
+#   * PROVIDER_RATE_LIMITED must not spin at high frequency — it starts at the
+#     second step of the ladder to give the provider immediate breathing room.
+#   * No second retry system, no new queue, no new scheduler.
+#   * Terminal quality/policy/invariant/UNKNOWN outcomes never reach this
+#     function in the retry path; if they do (defensive), we still return the
+#     configured base delay rather than escalate.
+#   * The caller must still cap the resulting ``next_retry_at`` against the
+#     absolute entry cutoff — bounded backoff is not permission to schedule
+#     past it.
+#
+# Stepped ladder (attempt → seconds), overridable via env for tuning:
+#     1 → base            (default 8)
+#     2 → step2           (default 15)
+#     3 → step3           (default 30)
+#     4+ → cap            (default 60)
+#
+# PROVIDER_RATE_LIMITED begins at step2 (never step1) for attempt 1 so the very
+# first retry is already at least 15s out.
+
+_BACKOFF_LADDER_ENV_KEYS: tuple = (
+    ("VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", 8),
+    ("VALIDITY_BOUND_RETRY_BACKOFF_STEP2_SECONDS", 15),
+    ("VALIDITY_BOUND_RETRY_BACKOFF_STEP3_SECONDS", 30),
+    ("VALIDITY_BOUND_RETRY_BACKOFF_CAP_SECONDS", 60),
+)
+
+
+def _positive_int_from_env(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or not str(raw).strip():
+            return int(default)
+        value = int(str(raw).strip())
+        return value if value > 0 else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _resolve_backoff_ladder(cfg: "dict | None" = None) -> tuple:
+    """Return (step1, step2, step3, cap) as positive monotonic seconds."""
+    if not isinstance(cfg, dict):
+        cfg = {}
+    ladder = []
+    for env_name, default in _BACKOFF_LADDER_ENV_KEYS:
+        cfg_key = env_name.lower()
+        raw = cfg.get(cfg_key) if cfg_key in cfg else None
+        if raw is None:
+            ladder.append(_positive_int_from_env(env_name, default))
+            continue
+        try:
+            value = int(raw)
+            ladder.append(value if value > 0 else int(default))
+        except (TypeError, ValueError):
+            ladder.append(int(default))
+    # Enforce monotonic non-decreasing so misconfiguration never inverts.
+    monotone: list = []
+    prior = 0
+    for value in ladder:
+        chosen = max(value, prior)
+        monotone.append(chosen)
+        prior = chosen
+    return tuple(monotone)
+
+
+def compute_retry_backoff_seconds(
+    attempt: "int | None",
+    reason_code: "str | None" = "",
+    *,
+    cfg: "dict | None" = None,
+) -> int:
+    """Return the bounded delay in seconds before the next validity-bound retry.
+
+    ``attempt`` is the 1-indexed attempt number the caller is about to schedule
+    (i.e. the attempt whose selector call has just failed).  Non-positive or
+    non-integral values are coerced to 1, which yields the base step.
+
+    ``reason_code`` allows per-reason cadence adjustment.  PROVIDER_RATE_LIMITED
+    is the only reason today that starts one step out from the base — every
+    other validity-bound reason follows the plain stepped ladder.
+
+    The ladder is monotonically non-decreasing and capped, so no matter how
+    many times this is called the delay never grows unbounded and never
+    inverts.  Callers must still clip ``now + delay`` against the entry
+    cutoff before writing ``next_retry_at``.
+    """
+    step1, step2, step3, cap = _resolve_backoff_ladder(cfg)
+    ladder = (step1, step2, step3, cap)
+
+    try:
+        attempt_int = int(attempt) if attempt is not None else 1
+    except (TypeError, ValueError):
+        attempt_int = 1
+    if attempt_int < 1:
+        attempt_int = 1
+
+    reason = str(reason_code or "").strip().upper()
+    # PROVIDER_RATE_LIMITED must never spin at step1: bump one rung.
+    if reason == "PROVIDER_RATE_LIMITED":
+        attempt_int += 1
+
+    idx = min(attempt_int, len(ladder)) - 1
+    return int(ladder[idx])
+
+
 def deferred_retry_count_exhaustion_applies(
     reason_code: "str | None",
     *,

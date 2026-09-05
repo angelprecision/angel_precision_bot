@@ -1093,7 +1093,21 @@ class PendingTriggerRestartRecovery:
         except DeferredMaterializationConfigConflict:
             return _RowOutcome.UNRESOLVED
         max_attempts = max(max_attempts, attempt)
-        delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
+        # PR #568 amendment §2: bounded stepped backoff, not a fixed 8s.
+        # Recovery inherits the same per-attempt cadence so a crashed +
+        # restored phase-one claim cannot become a tight provider loop.
+        from ap.selector_retry_policy import (
+            compute_retry_backoff_seconds as _compute_backoff,
+        )
+        _base_delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
+        delay = max(
+            int(_base_delay),
+            _compute_backoff(
+                attempt,
+                reason,
+                cfg={"validity_bound_retry_backoff_step1_seconds": _base_delay},
+            ),
+        )
         next_retry_at = (
             datetime.now(timezone.utc) + timedelta(seconds=delay)
         ).isoformat()

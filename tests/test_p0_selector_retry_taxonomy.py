@@ -971,3 +971,134 @@ def test_preexisting_terminal_invariants_keep_historical_deferred_quality_action
         "retryable_reason": False,
     }
     assert _deferred_selector_status(decision) == "CONTRACT_SELECTION_QUALITY_REJECT"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #568 amendment §2 + §4: bounded validity-bound retry cadence.
+#
+# These prove the money-path safety property:
+#   * a validity-bound retry that stays lifecycle-owned until the entry cutoff
+#     may not spin against an unavailable/rate-limited provider at the fixed
+#     BREACH_SELECTOR_RETRY_DELAY_SECONDS interval (8s in prod default);
+#   * the ladder is monotonic non-decreasing, capped, and never inverts;
+#   * PROVIDER_RATE_LIMITED starts one rung out from the base;
+#   * misconfiguration (blank/zero/negative env) falls back to the safe
+#     defaults rather than collapsing to a tight spin;
+#   * retry count remains telemetry, not terminal authority — the ladder does
+#     not itself schedule past cutoff (cutoff clipping is the caller's fence
+#     and lives in ap_execution_core / phase-one recovery).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_bounded_backoff_matches_stepped_ladder_default():
+    """Default ladder is 8s → 15s → 30s → 60s → 60s cap."""
+    from ap.selector_retry_policy import compute_retry_backoff_seconds
+    ladder = [compute_retry_backoff_seconds(i, "NO_CHAIN_DATA") for i in range(1, 7)]
+    assert ladder == [8, 15, 30, 60, 60, 60]
+
+
+def test_bounded_backoff_is_monotonic_non_decreasing_over_many_attempts():
+    """Ladder never inverts, never grows unbounded, even at extreme attempts."""
+    from ap.selector_retry_policy import compute_retry_backoff_seconds
+    ladder = [compute_retry_backoff_seconds(i, "NO_CHAIN_DATA") for i in range(1, 200)]
+    for a, b in zip(ladder, ladder[1:]):
+        assert b >= a, f"backoff regressed: {a} → {b}"
+    assert max(ladder) == 60, "cap must bound the ladder"
+
+
+def test_provider_rate_limited_never_spins_at_base_step():
+    """PR #568 amendment: PROVIDER_RATE_LIMITED must not tight-loop.
+
+    The very first retry must be at least step2 (default 15s), not step1
+    (default 8s). Every subsequent attempt is one rung ahead of the plain
+    ladder for the same attempt number.
+    """
+    from ap.selector_retry_policy import compute_retry_backoff_seconds
+    plain = [compute_retry_backoff_seconds(i, "NO_CHAIN_DATA") for i in range(1, 5)]
+    throttled = [compute_retry_backoff_seconds(i, "PROVIDER_RATE_LIMITED") for i in range(1, 5)]
+    # First rate-limited retry >= second plain retry, never step1.
+    assert throttled[0] >= plain[1]
+    assert throttled[0] >= 15
+    for i in range(len(plain) - 1):
+        assert throttled[i] >= plain[i], (
+            f"rate-limited attempt {i+1} regressed below plain: "
+            f"{throttled[i]} vs {plain[i]}"
+        )
+
+
+def test_bounded_backoff_falls_back_on_non_positive_or_non_integral_attempt():
+    """Bad attempt inputs never produce a sub-base or negative delay."""
+    from ap.selector_retry_policy import compute_retry_backoff_seconds
+    assert compute_retry_backoff_seconds(0, "NO_CHAIN_DATA") == 8
+    assert compute_retry_backoff_seconds(-5, "NO_CHAIN_DATA") == 8
+    assert compute_retry_backoff_seconds(None, "NO_CHAIN_DATA") == 8
+    assert compute_retry_backoff_seconds("garbage", "NO_CHAIN_DATA") == 8
+
+
+def test_bounded_backoff_falls_back_on_misconfigured_env(monkeypatch):
+    """Blank/zero/negative env overrides fall back to safe defaults."""
+    from ap.selector_retry_policy import compute_retry_backoff_seconds
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", "")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP2_SECONDS", "0")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP3_SECONDS", "-5")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_CAP_SECONDS", "notanumber")
+    ladder = [compute_retry_backoff_seconds(i, "NO_CHAIN_DATA") for i in range(1, 6)]
+    assert ladder == [8, 15, 30, 60, 60]
+
+
+def test_bounded_backoff_enforces_monotonic_when_env_inverts(monkeypatch):
+    """A misconfigured env with a lower step2 than step1 must not invert."""
+    from ap.selector_retry_policy import compute_retry_backoff_seconds
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", "45")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP2_SECONDS", "10")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP3_SECONDS", "20")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_CAP_SECONDS", "5")
+    ladder = [compute_retry_backoff_seconds(i, "NO_CHAIN_DATA") for i in range(1, 5)]
+    # Every entry >= the previous (monotonic clamp), step1 respected.
+    assert ladder[0] == 45
+    for a, b in zip(ladder, ladder[1:]):
+        assert b >= a
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "NO_CHAIN_DATA",
+        "CHAIN_PROVIDER_ERROR",
+        "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+        "CHAIN_PROVIDER_EMPTY_OPTIONS",
+        "CHAIN_PARSE_EMPTY",
+        "CHAIN_EMPTY",
+        "CHAIN_FETCH_FAILED",
+        "DIRECT_QUOTE_UNAVAILABLE",
+        "CHAIN_ROW_ZERO_BID_ASK",
+        "DIRECT_QUOTE_ZERO_BID_ASK",
+        "QUOTE_FETCH_FAILED",
+        "QUOTE_ZERO_BID_ASK",
+        "CURRENT_PRICE_FETCH_FAILED",
+        "MARKET_DATA_THROTTLE_UNAVAILABLE",
+        "PROVIDER_TIMEOUT",
+    ],
+)
+def test_every_transient_data_reason_uses_bounded_backoff(reason):
+    """All non-rate-limited transient-data reasons follow the base ladder."""
+    from ap.selector_retry_policy import compute_retry_backoff_seconds
+    assert compute_retry_backoff_seconds(1, reason) == 8
+    assert compute_retry_backoff_seconds(2, reason) == 15
+    assert compute_retry_backoff_seconds(10, reason) == 60
+
+
+def test_bounded_backoff_reflects_base_delay_config_override():
+    """Passing cfg={step1: N} raises the floor for callers using their own base."""
+    from ap.selector_retry_policy import compute_retry_backoff_seconds
+    delay = compute_retry_backoff_seconds(
+        1, "NO_CHAIN_DATA",
+        cfg={"validity_bound_retry_backoff_step1_seconds": 20},
+    )
+    assert delay == 20
+    # Step2 must not regress below the raised floor.
+    delay_next = compute_retry_backoff_seconds(
+        2, "NO_CHAIN_DATA",
+        cfg={"validity_bound_retry_backoff_step1_seconds": 20},
+    )
+    assert delay_next >= delay

@@ -3569,12 +3569,23 @@ class APExecutionCore:
         # Every RETRY_WAIT return MUST call this so the durable row
         # transitions out of MATERIALIZING before we return — never
         # leave the row stranded at MATERIALIZING until lease expiry.
+        #
+        # PR #568 amendment §2: the effective per-retry delay is a bounded
+        # stepped ladder scoped to this attempt+reason so a validity-bound
+        # loop cannot hammer an unavailable/rate-limited provider every
+        # fixed 8 seconds. ``BREACH_SELECTOR_RETRY_DELAY_SECONDS`` remains
+        # the base floor for legacy compatibility; the ladder monotonically
+        # extends it as attempts climb, and PROVIDER_RATE_LIMITED starts one
+        # rung out. The delay is still capped and still fenced by the
+        # existing entry cutoff at the caller.
         try:
-            _retry_delay = _positive_int_env_config(
+            _retry_delay_base = _positive_int_env_config(
                 "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
             )
         except (TypeError, ValueError):
-            _retry_delay = 20
+            _retry_delay_base = 20
+
+        from ap.selector_retry_policy import compute_retry_backoff_seconds as _compute_backoff
 
         def _schedule_retry_wait(reason_code: str, selector_failure: dict | None = None) -> dict:
             """Write a durable RETRY_WAIT row; return truthful disposition.
@@ -3584,6 +3595,17 @@ class APExecutionCore:
             so recovery can retain ownership and re-attempt on the next pass.
             Recovery must never treat a failed schedule as durably owned.
             """
+            # Bounded stepped backoff per (attempt, reason). Never below the
+            # configured base floor; never above the ladder cap. See
+            # ap/selector_retry_policy.compute_retry_backoff_seconds.
+            _retry_delay = max(
+                int(_retry_delay_base),
+                _compute_backoff(
+                    _callback_attempt,
+                    reason_code,
+                    cfg={"validity_bound_retry_backoff_step1_seconds": _retry_delay_base},
+                ),
+            )
             _next_retry_at = (_now + timedelta(seconds=_retry_delay)).isoformat()
             _schedule = getattr(osm, "schedule_deferred_materialization_retry", None)
             _ok = False
