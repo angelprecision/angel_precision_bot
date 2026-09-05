@@ -59,6 +59,10 @@ def mock_broker():
     b.base_url = "https://sandbox.tradier.com"
     b.account_id = "VATEST"
     b.session = MagicMock()
+    b.list_positions.return_value = [
+        {"symbol": "BA260522C00220000", "quantity": 2, "account_id": "VATEST"},
+        {"symbol": "SMCI260626P00032500", "quantity": 3, "account_id": "VATEST"},
+    ]
     return b
 
 

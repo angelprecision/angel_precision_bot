@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
 from ap.db import conn, run_with_retry
@@ -50,16 +52,134 @@ def _normalize_mode(value: Any) -> Optional[str]:
 
 
 def _safe_int(value: Any) -> Optional[int]:
-    try:
-        if value in (None, ""):
-            return None
-        return int(float(value))
-    except Exception:
+    """Parse a non-negative integral broker quantity without lossy coercion."""
+    if value in (None, "") or isinstance(value, bool):
         return None
+    try:
+        quantity = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        not quantity.is_finite()
+        or quantity != quantity.to_integral_value()
+        or quantity < 0
+    ):
+        return None
+    return int(quantity)
+
+
+def _safe_signed_int(value: Any) -> Optional[int]:
+    """Parse a signed integral broker quantity without lossy coercion."""
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        quantity = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        not quantity.is_finite()
+        or quantity != quantity.to_integral_value()
+    ):
+        return None
+    return int(quantity)
+
+
+OCC_CONTRACT_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
+_PADDED_OCC_CONTRACT_RE = re.compile(r"^([A-Z0-9.]{1,6})\s+(\d{6}[CP]\d{8})$")
+_UNDERLYING_SYMBOL_RE = re.compile(r"^[A-Z0-9.]{1,6}$")
+_POSITION_IDENTITY_FIELDS = (
+    "option_symbol",
+    "optionSymbol",
+    "contract",
+    "instrument",
+    "option_contract",
+    "optionContract",
+    "symbol",
+)
 
 
 def _normalize_contract(value: Any) -> str:
-    return str(value or "").strip().upper().replace(" ", "")
+    text = str(value or "").strip().upper()
+    if OCC_CONTRACT_RE.fullmatch(text):
+        return text
+    # Tradier may return the OCC root padded before the date.  Accept only that
+    # provider shape; whitespace elsewhere is not an exact contract identity.
+    padded = _PADDED_OCC_CONTRACT_RE.fullmatch(text)
+    if padded:
+        return f"{padded.group(1)}{padded.group(2)}"
+    return text
+
+
+def is_valid_exact_occ_contract(value: Any) -> bool:
+    return bool(OCC_CONTRACT_RE.fullmatch(_normalize_contract(value)))
+
+
+def _occ_root(contract: str) -> str:
+    match = OCC_CONTRACT_RE.fullmatch(contract)
+    return match.group(0)[:-15] if match else ""
+
+
+def _iter_position_identity_values(raw: dict[str, Any]) -> tuple[str, str]:
+    """Return (state, exact OCC) for one broker position row.
+
+    A bare ``symbol`` can be an underlying row in an account snapshot and is
+    therefore non-target data.  A value supplied as an explicit contract field
+    must be an exact OCC identity.  Conflicting or malformed option identity
+    stays unknown rather than becoming a false flat result.
+    """
+    records: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        records.append(raw)
+        nested = raw.get("raw")
+        if isinstance(nested, dict):
+            records.append(nested)
+
+    exact_values: set[str] = set()
+    underlying_values: set[str] = set()
+    saw_identity = False
+    invalid = False
+    for record in records:
+        for key in _POSITION_IDENTITY_FIELDS:
+            if key not in record or record.get(key) in (None, ""):
+                continue
+            saw_identity = True
+            value = record.get(key)
+            normalized = _normalize_contract(value)
+            if is_valid_exact_occ_contract(value):
+                exact_values.add(normalized)
+            elif key in {"symbol", "instrument"} and _UNDERLYING_SYMBOL_RE.fullmatch(normalized):
+                underlying_values.add(normalized)
+            else:
+                invalid = True
+
+    if len(exact_values) > 1:
+        return "ambiguous", ""
+    if exact_values:
+        exact = next(iter(exact_values))
+        if invalid or any(value != _occ_root(exact) for value in underlying_values):
+            return "invalid", ""
+        return "valid", exact
+    if invalid:
+        return "invalid", ""
+    if underlying_values or not saw_identity:
+        return "missing", ""
+    return "invalid", ""
+
+
+def _has_underlying_position_identity(raw: dict[str, Any]) -> bool:
+    records: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        records.append(raw)
+        nested = raw.get("raw")
+        if isinstance(nested, dict):
+            records.append(nested)
+    return any(
+        key in record
+        and record.get(key) not in (None, "")
+        and _UNDERLYING_SYMBOL_RE.fullmatch(_normalize_contract(record.get(key)))
+        for record in records
+        for key in ("symbol", "instrument")
+    )
 
 
 def _extract_broker_account_id(broker: Any) -> str:
@@ -84,26 +204,23 @@ def _extract_position_account_id(raw: dict[str, Any]) -> str:
 
 
 def _extract_position_contract(raw: dict[str, Any]) -> str:
-    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
-    for key in ("contract", "option_symbol", "symbol", "instrument"):
-        value = raw.get(key)
-        if value not in (None, ""):
-            return _normalize_contract(value)
-        value = nested.get(key)
-        if value not in (None, ""):
-            return _normalize_contract(value)
-    return ""
+    state, exact = _iter_position_identity_values(raw)
+    return exact if state == "valid" else ""
 
 
-def _extract_long_position_qty(raw: dict[str, Any]) -> int:
+def _extract_long_position_qty(raw: dict[str, Any]) -> Optional[int]:
     nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
-    qty = None
+    quantities: list[int] = []
     for key in ("quantity", "qty", "quantity_remaining", "remaining_quantity"):
-        qty = _safe_int(raw.get(key))
-        if qty is None:
-            qty = _safe_int(nested.get(key))
-        if qty is not None:
-            break
+        for record in (raw, nested):
+            if key not in record or record.get(key) in (None, ""):
+                continue
+            parsed = _safe_signed_int(record.get(key))
+            if parsed is None:
+                return None
+            quantities.append(parsed)
+    if not quantities or len(set(quantities)) > 1:
+        return None
     side_text = " ".join(
         str(v or "")
         for v in (
@@ -115,13 +232,97 @@ def _extract_long_position_qty(raw: dict[str, Any]) -> int:
             nested.get("direction"),
         )
     ).strip().lower()
-    if qty is None:
-        return 0
-    if qty < 0:
-        return 0
+    if "short" in side_text and "long" in side_text:
+        return None
     if "short" in side_text:
+        # Keep a signed negative value visible to the target-contract guard.
+        # A short row with a positive broker quantity is not long exposure and
+        # remains normalized to zero, but a negative target quantity is
+        # contradictory evidence and must stay UNKNOWN rather than flat.
+        if quantities[0] < 0:
+            return quantities[0]
         return 0
-    return int(qty)
+    return quantities[0]
+
+
+def _authoritative_position_payload(broker: Any) -> tuple[str, Any, str]:
+    """Fetch positions without allowing adapter errors to look like flatness."""
+    authoritative = getattr(type(broker), "list_positions_authoritative", None)
+    if callable(authoritative):
+        try:
+            return "available", broker.list_positions_authoritative(), "broker.list_positions_authoritative"
+        except Exception as exc:
+            return "error", None, f"{type(exc).__name__}:{exc}"
+
+    raw_get = getattr(type(broker), "_get", None)
+    account_value = str(_extract_broker_account_id(broker) or "").strip()
+    account_id = _normalize_text(account_value)
+    if callable(raw_get) and account_id:
+        try:
+            payload = broker._get(f"/v1/accounts/{account_value}/positions")
+            return "available", payload, "broker._get:/positions"
+        except Exception as exc:
+            return "error", None, f"{type(exc).__name__}:{exc}"
+
+    list_positions = getattr(broker, "list_positions", None)
+    if not callable(list_positions):
+        return "unavailable", None, "broker_list_positions_missing"
+    try:
+        return "available", list_positions(), "broker.list_positions"
+    except Exception as exc:
+        return "error", None, f"{type(exc).__name__}:{exc}"
+
+
+def _parse_authoritative_position_payload(payload: Any) -> tuple[str, list[dict[str, Any]]]:
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        if any(payload.get(key) not in (None, "") for key in ("error", "errors", "message")):
+            return "malformed", []
+        if _normalize_text(payload.get("status")) in {"error", "failed", "failure", "unavailable"}:
+            return "malformed", []
+        if "positions" not in payload:
+            return "malformed", []
+        positions = payload.get("positions")
+        if positions is None or positions == "null":
+            return "available", []
+        # A bare empty object is an incomplete provider envelope, not the
+        # documented empty-position shape.  Treating it as an authoritative
+        # empty account could suppress a real EXIT during a malformed read.
+        if isinstance(positions, dict) and not positions:
+            return "malformed", []
+        if not isinstance(positions, dict) or "position" not in positions:
+            return "malformed", []
+        rows = positions.get("position")
+        if rows is None or rows == "null":
+            return "available", []
+        if isinstance(rows, dict):
+            rows = [rows]
+    else:
+        return "malformed", []
+
+    if not isinstance(rows, list):
+        return "malformed", []
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return "malformed", []
+        identity_state, exact = _iter_position_identity_values(row)
+        if identity_state in {"invalid", "ambiguous"}:
+            return "malformed", []
+        if identity_state == "missing" and not _has_underlying_position_identity(row):
+            return "malformed", []
+        quantity = _extract_long_position_qty(row)
+        if quantity is None:
+            return "malformed", []
+        normalized.append(
+            {
+                "contract": exact,
+                "quantity": quantity,
+                "account": _extract_position_account_id(row),
+            }
+        )
+    return "available", normalized
 
 
 def resolve_exit_broker_truth(
@@ -132,9 +333,9 @@ def resolve_exit_broker_truth(
 ) -> dict[str, Any]:
     checked_at = now_utc_iso()
     normalized_contract = _normalize_contract(contract)
-    account_id = _extract_broker_account_id(broker)
+    account_id = _normalize_text(_extract_broker_account_id(broker))
     audit = {
-        "source": "broker.list_positions",
+        "source": "broker.authoritative_positions",
         "checked_at": checked_at,
         "client_id": str(client_id or "").strip().lower(),
         "account": account_id,
@@ -143,34 +344,34 @@ def resolve_exit_broker_truth(
         "exact_contract_match": False,
     }
 
-    list_positions = getattr(broker, "list_positions", None)
-    if not callable(list_positions):
-        audit["snapshot_status"] = "broker_positions_unavailable"
-        audit["error"] = "broker_list_positions_missing"
+    if not is_valid_exact_occ_contract(normalized_contract):
+        audit["snapshot_status"] = "contract_identity_unproven"
+        audit["error"] = "exact_occ_contract_required"
         return {
             "broker_truth_open_qty": None,
             "is_fresh_exact": False,
             "audit": audit,
         }
 
-    try:
-        rows = list_positions()
-    except Exception as exc:
-        audit["snapshot_status"] = "broker_positions_error"
-        audit["error"] = str(exc)
+    fetch_state, payload, fetch_detail = _authoritative_position_payload(broker)
+    audit["source_detail"] = fetch_detail
+    if fetch_state != "available":
+        audit["snapshot_status"] = (
+            "broker_positions_error"
+            if fetch_state == "error"
+            else "broker_positions_unavailable"
+        )
+        audit["error"] = fetch_detail
         return {
             "broker_truth_open_qty": None,
             "is_fresh_exact": False,
             "audit": audit,
         }
 
-    if rows is None:
-        rows = []
-    if isinstance(rows, dict):
-        rows = [rows]
-    if not isinstance(rows, list):
+    parse_state, rows = _parse_authoritative_position_payload(payload)
+    if parse_state != "available":
         audit["snapshot_status"] = "broker_positions_malformed"
-        audit["error"] = f"unexpected_payload:{type(rows).__name__}"
+        audit["error"] = "authoritative_position_payload_malformed"
         return {
             "broker_truth_open_qty": None,
             "is_fresh_exact": False,
@@ -179,22 +380,36 @@ def resolve_exit_broker_truth(
 
     matched_rows: list[dict[str, Any]] = []
     broker_truth_open_qty = 0
-    for raw in rows:
-        if not isinstance(raw, dict):
+    for row in rows:
+        row_contract = row.get("contract") or ""
+        if row_contract != normalized_contract:
             continue
-        row_contract = _extract_position_contract(raw)
-        if not row_contract or row_contract != normalized_contract:
-            continue
-        row_account = _extract_position_account_id(raw)
+        row_account = _normalize_text(row.get("account"))
+        if row_account and not account_id:
+            audit["snapshot_status"] = "broker_positions_account_identity_unproven"
+            audit["error"] = "position_account_present_broker_account_missing"
+            return {
+                "broker_truth_open_qty": None,
+                "is_fresh_exact": False,
+                "audit": audit,
+            }
         if row_account and account_id and row_account != account_id:
             continue
-        long_qty = _extract_long_position_qty(raw)
-        broker_truth_open_qty += max(int(long_qty), 0)
+        long_qty = row.get("quantity")
+        if not isinstance(long_qty, int) or isinstance(long_qty, bool) or long_qty < 0:
+            audit["snapshot_status"] = "broker_positions_malformed"
+            audit["error"] = "invalid_normalized_quantity"
+            return {
+                "broker_truth_open_qty": None,
+                "is_fresh_exact": False,
+                "audit": audit,
+            }
+        broker_truth_open_qty += long_qty
         matched_rows.append(
             {
                 "contract": row_contract,
                 "account": row_account or account_id,
-                "long_qty": int(long_qty),
+                "long_qty": long_qty,
             }
         )
 

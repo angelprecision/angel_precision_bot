@@ -125,6 +125,7 @@ jobs:
             tests/test_p0_pr418_preflight_coverage_parity.py \
             tests/test_p0_broker_owned_exit_requested_recovery.py \
             tests/test_p0_broker_owned_exit_recovery_preflight.py \
+            tests/test_p0_pr566_signed_position_truth.py \
             tests/test_fill_monitor_mvp_hardening.py \
             tests/test_p0_trace_non_authority.py \
             tests/test_p0_filled_entry_durable_identity_handoff.py \

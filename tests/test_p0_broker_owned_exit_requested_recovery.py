@@ -1006,8 +1006,8 @@ def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_positio
     osm._finalize_position_from_exit_order.assert_not_called()
 
 
-def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypatch):
-    """Two full reducers race one recovered EXIT; Postgres permits one economy."""
+def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypatch):
+    """Prove the complete durable #566 restart-to-fill lifecycle once."""
     from contextlib import contextmanager
     import uuid
 
@@ -1091,6 +1091,7 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                     fill_price NUMERIC,
                     execution_mode TEXT NOT NULL,
                     qty INTEGER NOT NULL,
+                    direction TEXT,
                     meta JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                     last_error TEXT,
                     symbol TEXT,
@@ -1125,6 +1126,11 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                     execution_mode TEXT NOT NULL,
                     local_order_id TEXT,
                     broker_order_id TEXT,
+                    opened_at TIMESTAMPTZ,
+                    exit_in_flight BOOLEAN NOT NULL DEFAULT FALSE,
+                    pending_exit_broker_order_id TEXT,
+                    pending_exit_local_order_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
@@ -1235,11 +1241,24 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                      'ORCL260807P00155000')
                 """
             )
+            cursor.execute(
+                f"""
+                INSERT INTO "{schema}".proof_trades
+                    (client_email, position_id, local_order_id,
+                     exit_option_price, option_pnl_pct, win, exit_reason)
+                VALUES
+                    ('tradefluence', 'position-orcl-1', 'entry-orcl-425',
+                     NULL, NULL, NULL, NULL)
+                """
+            )
 
         monkeypatch.setattr(osm_module, "conn", _pg_conn)
         monkeypatch.setattr(osm_module, "run_with_retry", lambda fn, **kwargs: fn())
         monkeypatch.setattr(pm_module, "conn", _pg_conn)
         monkeypatch.setattr(pm_module, "run_with_retry", lambda fn, **kwargs: fn())
+        from ap import db as db_module
+        monkeypatch.setattr(db_module, "conn", _pg_conn)
+        monkeypatch.setattr(db_module, "run_with_retry", lambda fn, **kwargs: fn())
         position_columns = {
             "id", "client_id", "status", "quantity_remaining", "qty",
             "avg_fill", "entry_price", "contract", "underlying", "ticker",
@@ -1247,6 +1266,7 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
             "realized_pnl", "realized_pnl_pct", "exit_reason", "close_source",
             "close_confidence", "execution_mode", "local_order_id",
             "broker_order_id", "updated_at",
+            "created_at",
         }
         monkeypatch.setattr(
             pm_module.APPositionManager,
@@ -1254,35 +1274,6 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
             lambda self: set(position_columns),
         )
 
-        # Keep proof publication at its external boundary while the canonical
-        # orders -> positions economic reducer remains completely real.  The
-        # durable test proof uses the production position identity and a unique
-        # key, so duplicate economic accounting is directly queryable.
-        def _persist_test_terminal_proof(self, **kwargs):
-            with _pg_conn() as connection:
-                connection.execute(
-                    "INSERT INTO proof_trades "
-                    "(client_email, position_id, local_order_id, "
-                    " exit_option_price, option_pnl_pct, win, exit_reason) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
-                    "ON CONFLICT (client_email, position_id) DO NOTHING",
-                    (
-                        self.client_id,
-                        kwargs["position_id"],
-                        kwargs.get("local_order_id"),
-                        kwargs.get("exit_option_price"),
-                        kwargs.get("option_pnl_pct"),
-                        float(kwargs.get("option_pnl_pct") or 0) > 0,
-                        kwargs.get("exit_reason"),
-                    ),
-                )
-            return True
-
-        monkeypatch.setattr(
-            pm_module.APPositionManager,
-            "_ensure_terminal_close_proof",
-            _persist_test_terminal_proof,
-        )
         engine = _CanonicalExitEngine()
         monkeypatch.setitem(osm_module._exit_engine_registry, "tradefluence", engine)
 
@@ -1490,6 +1481,635 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
         assert money_path["cancel"] == []
         assert money_path["delete"] == []
         assert len(engine.closed_calls) == 1
+
+        # Production-shaped restart boundary: the original durable
+        # EXIT_REQUESTED row has no broker id, but its exact submit authority
+        # survives the crash.  Recovery must use the real OSM adoption CAS,
+        # then the real EXIT_FILLED transition, position finalizer, and proof
+        # binding before a later manual-close scan is allowed to run.
+        from ap import manual_close_reconciliation as manual_close
+        from ap.exit_autonomous_recovery import recover_exit_position
+
+        recovered_position_id = "position-restart-566"
+        recovered_entry_id = "entry-restart-566"
+        recovered_exit_id = "exit-restart-566"
+        recovered_contract = "AAPL260807P00200000"
+        recovered_broker_id = "broker-restart-566"
+        recovered_fill_ts = "2026-09-04T16:00:00+00:00"
+        recovered_tag = osm_module.canonical_broker_submit_key(recovered_exit_id)
+        recovered_meta = json.dumps(
+            {
+                "submit_intent_at": "2026-09-04T15:59:00+00:00",
+                "broker_submit_payload_hash": "sha256:restart-566",
+                "broker_submit_key": recovered_tag,
+                "current_owner": f"broker_submit:{recovered_tag}",
+                "split_brain_quarantine": False,
+                "reconciliation_required": False,
+            }
+        )
+        with _pg_conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO positions
+                    (id, client_id, status, quantity_remaining, qty, avg_fill,
+                     entry_price, contract, underlying, ticker, side, direction,
+                     entry_ts, execution_mode, local_order_id)
+                VALUES
+                    (%s, 'tradefluence', 'OPEN', 4, 4, 1.00, 1.00,
+                     %s, 'AAPL', 'AAPL', 'AAPL', 'PUT',
+                     %s, 'paper', %s)
+                """,
+                (
+                    recovered_position_id,
+                    recovered_contract,
+                    "2026-09-04T15:30:00+00:00",
+                    recovered_entry_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, execution_mode, qty, filled_qty,
+                     fill_price, symbol, contract, direction)
+                VALUES
+                    (%s, 'tradefluence', %s, 'ENTRY', 'FILLED',
+                     'entry-broker-restart-566', 'paper', 4, 4, 1.00,
+                     'AAPL', %s, 'PUT')
+                """,
+                (recovered_entry_id, recovered_position_id, recovered_contract),
+            )
+            connection.execute(
+                """
+                INSERT INTO proof_trades
+                    (client_email, position_id, local_order_id,
+                     exit_option_price, option_pnl_pct, win, exit_reason)
+                VALUES ('tradefluence', %s, %s, NULL, NULL, NULL, NULL)
+                """,
+                (recovered_position_id, recovered_entry_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, execution_mode, qty, filled_qty,
+                     fill_price, symbol, contract, direction, meta)
+                VALUES
+                    (%s, 'tradefluence', %s, 'EXIT', 'EXIT_REQUESTED',
+                     NULL, 'paper', 4, 0, NULL, 'AAPL', %s, 'PUT',
+                     %s::jsonb)
+                """,
+                (
+                    recovered_exit_id,
+                    recovered_position_id,
+                    recovered_contract,
+                    recovered_meta,
+                ),
+            )
+
+        recovery_order = {
+            "id": recovered_broker_id,
+            "client_id": "tradefluence",
+            "execution_mode": "paper",
+            "account_id": "VA_TEST",
+            "symbol": "AAPL",
+            "option_symbol": recovered_contract,
+            "side": "sell_to_close",
+            "status": "filled",
+            "quantity": 4,
+            "filled_quantity": 4,
+            "avg_fill_price": 1.25,
+            "last_fill_date": recovered_fill_ts,
+            "tag": recovered_tag,
+        }
+
+        class _PaginatedRecoveryBroker:
+            def __init__(self, rows):
+                self.cfg = SimpleNamespace(account_id="VA_TEST")
+                self.rows = list(rows)
+                self.raw_get_calls = []
+                self.get_calls = []
+                self.post_calls = []
+                self.cancel_calls = []
+                self.replace_calls = []
+
+            def _get(self, path):
+                self.raw_get_calls.append(path)
+                if "/orders" in path:
+                    return {"orders": {"order": [dict(row) for row in self.rows]}}
+                if "/positions" in path:
+                    return {"positions": {"position": []}}
+                raise AssertionError(f"unexpected broker path: {path}")
+
+            def get_order(self, broker_order_id):
+                self.get_calls.append(str(broker_order_id))
+                for row in self.rows:
+                    if str(row.get("id")) == str(broker_order_id):
+                        return dict(row)
+                return None
+
+            def submit_order(self, *args, **kwargs):
+                self.post_calls.append((args, kwargs))
+                raise AssertionError("recovery must never submit a replacement EXIT")
+
+            def cancel_order(self, *args, **kwargs):
+                self.cancel_calls.append((args, kwargs))
+                raise AssertionError("recovery must never cancel the owned EXIT")
+
+            def replace_order(self, *args, **kwargs):
+                self.replace_calls.append((args, kwargs))
+                raise AssertionError("recovery must never replace the owned EXIT")
+
+        recovery_broker = _PaginatedRecoveryBroker([recovery_order])
+        recovery_engine = _CanonicalExitEngine(
+            position_id=recovered_position_id,
+            quantity_remaining=4,
+        )
+        monkeypatch.setitem(
+            osm_module._exit_engine_registry,
+            "tradefluence",
+            recovery_engine,
+        )
+        recovery_osm = APOrderStateMachine("tradefluence")
+        recovery_osm._emit_transition_event = lambda **kwargs: None
+        recovery_position = SimpleNamespace(
+            position_id=recovered_position_id,
+            option_symbol=recovered_contract,
+            contract=recovered_contract,
+            symbol="AAPL",
+            pending_exit_local_order_id=recovered_exit_id,
+            pending_exit_broker_order_id="",
+            pending_exit_qty=4,
+            pending_exit_filled_qty=0,
+            quantity_remaining=4,
+            contracts=4,
+            client_id="tradefluence",
+            execution_mode="paper",
+        )
+
+        recovered = recover_exit_position(
+            recovery_position,
+            broker=recovery_broker,
+            exit_engine=recovery_engine,
+            osm=recovery_osm,
+            expected_client_id="tradefluence",
+            expected_execution_mode="paper",
+        )
+
+        assert recovered.action == "MARKED_CLOSED"
+        assert recovered.reason == "broker_order_filled_via_canonical_osm"
+        assert recovered.broker_order_id == recovered_broker_id
+        assert recovered.details["filled_qty"] == 4
+        assert recovered.details["fill_price"] == 1.25
+        assert recovered.details["filled_ts"] == recovered_fill_ts
+        assert len(recovery_engine.pending_calls) == 1
+        assert len(recovery_engine.closed_calls) == 1
+
+        with _pg_conn() as connection:
+            connection.execute(
+                """
+                SELECT local_order_id, status, broker_order_id, submitted_ts,
+                       filled_ts, filled_qty, fill_price, meta
+                FROM orders WHERE local_order_id=%s
+                """,
+                (recovered_exit_id,),
+            )
+            recovered_order_row = dict(connection.fetchone())
+            connection.execute(
+                """
+                SELECT id, status, quantity_remaining, local_order_id,
+                       broker_order_id, exit_price, exit_ts, close_source
+                FROM positions WHERE id=%s
+                """,
+                (recovered_position_id,),
+            )
+            recovered_position_row = dict(connection.fetchone())
+            connection.execute(
+                """
+                SELECT * FROM exit_filled_lifecycle_events
+                WHERE local_order_id=%s ORDER BY id
+                """,
+                (recovered_exit_id,),
+            )
+            recovered_lifecycle = [dict(row) for row in connection.fetchall()]
+            connection.execute(
+                """
+                SELECT * FROM position_economic_finalizations
+                WHERE position_id=%s ORDER BY id
+                """,
+                (recovered_position_id,),
+            )
+            recovered_economic = [dict(row) for row in connection.fetchall()]
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM proof_trades
+                WHERE client_email=%s AND position_id=%s
+                """,
+                ("tradefluence", recovered_position_id),
+            )
+            recovered_proof_count = int(connection.fetchone()["count"])
+
+        assert recovered_order_row["local_order_id"] == recovered_exit_id
+        assert recovered_order_row["status"] == "EXIT_FILLED"
+        assert recovered_order_row["broker_order_id"] == recovered_broker_id
+        assert recovered_order_row["submitted_ts"] is None
+        assert recovered_order_row["filled_qty"] == 4
+        assert float(recovered_order_row["fill_price"]) == 1.25
+        assert recovered_order_row["filled_ts"].astimezone(timezone.utc) == datetime.fromisoformat(
+            recovered_fill_ts
+        )
+        persisted_recovery_meta = dict(recovered_order_row["meta"])
+        assert persisted_recovery_meta["broker_submit_key"] == recovered_tag
+        assert persisted_recovery_meta["current_owner"] == f"broker_submit:{recovered_tag}"
+        assert recovered_position_row == {
+            "id": recovered_position_id,
+            "status": "CLOSED",
+            "quantity_remaining": 0,
+            "local_order_id": recovered_entry_id,
+            "broker_order_id": recovered_broker_id,
+            "exit_price": recovered_position_row["exit_price"],
+            "exit_ts": recovered_position_row["exit_ts"],
+            "close_source": "broker_exit_fill",
+        }
+        assert float(recovered_position_row["exit_price"]) == 1.25
+        assert len(recovered_lifecycle) == 1
+        assert recovered_lifecycle[0]["old_status"] == "EXIT_SUBMITTED"
+        assert recovered_lifecycle[0]["new_status"] == "EXIT_FILLED"
+        assert recovered_lifecycle[0]["filled_qty"] == 4
+        assert recovered_lifecycle[0]["broker_order_id"] == recovered_broker_id
+        assert len(recovered_economic) == 1
+        assert recovered_economic[0]["old_quantity_remaining"] == 4
+        assert recovered_economic[0]["new_quantity_remaining"] == 0
+        assert recovered_economic[0]["old_status"] == "OPEN"
+        assert recovered_economic[0]["new_status"] == "CLOSED"
+        assert recovered_proof_count == 1
+
+        active_after_recovery, bot_ids_after_recovery, adopted_after_recovery = (
+            manual_close.load_manual_close_state("tradefluence", "paper")
+        )
+        assert recovered_broker_id in bot_ids_after_recovery
+        assert all(
+            str(row.get("id") or "") != recovered_position_id
+            for row in active_after_recovery
+        )
+        assert adopted_after_recovery.get(recovered_position_id, []) == []
+
+        scanner = SimpleNamespace(
+            email="tradefluence",
+            mode="paper",
+            broker=recovery_broker,
+            position_manager=pm_module.APPositionManager("tradefluence"),
+            core=SimpleNamespace(exit_eng=recovery_engine),
+            _last_manual_close_check_ts=0.0,
+        )
+        manual_close.detect_manual_closes(scanner)
+
+        with _pg_conn() as connection:
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM orders
+                WHERE client_id=%s AND local_order_id LIKE 'external-exit:%%'
+                """,
+                ("tradefluence",),
+            )
+            external_exit_count = int(connection.fetchone()["count"])
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM orders
+                WHERE client_id=%s AND position_id=%s
+                  AND COALESCE(meta->>'source','') =
+                      'manual_client_close_broker_fill'
+                """,
+                ("tradefluence", recovered_position_id),
+            )
+            manual_provenance_count = int(connection.fetchone()["count"])
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM proof_trades
+                WHERE client_email=%s AND position_id=%s
+                """,
+                ("tradefluence", recovered_position_id),
+            )
+            proof_count_after_scan = int(connection.fetchone()["count"])
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM position_economic_finalizations
+                WHERE position_id=%s
+                """,
+                (recovered_position_id,),
+            )
+            economic_count_after_scan = int(connection.fetchone()["count"])
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM exit_filled_lifecycle_events
+                WHERE local_order_id=%s
+                """,
+                (recovered_exit_id,),
+            )
+            lifecycle_count_after_scan = int(connection.fetchone()["count"])
+
+        assert external_exit_count == 0
+        assert manual_provenance_count == 0
+        assert proof_count_after_scan == 1
+        assert economic_count_after_scan == 1
+        assert lifecycle_count_after_scan == 1
+        assert recovery_broker.post_calls == []
+        assert recovery_broker.cancel_calls == []
+        assert recovery_broker.replace_calls == []
+        assert len(recovery_engine.closed_calls) == 1
+
+        # A second restart sees the exact filled broker order, but the durable
+        # cumulative watermark makes the fill a read-only duplicate.
+        recovery_position.pending_exit_broker_order_id = recovered_broker_id
+        replayed = recover_exit_position(
+            recovery_position,
+            broker=recovery_broker,
+            exit_engine=recovery_engine,
+            osm=recovery_osm,
+            expected_client_id="tradefluence",
+            expected_execution_mode="paper",
+        )
+        assert replayed.action == "NOOP"
+        assert replayed.reason == "duplicate_exit_fill_ignored"
+        assert len(recovery_engine.closed_calls) == 1
+        assert recovery_broker.post_calls == []
+        assert recovery_broker.cancel_calls == []
+        assert recovery_broker.replace_calls == []
+
+        # Production-shaped partial-fill crash boundary: the durable order row
+        # is already EXIT_PARTIAL_FILL when the old runtime disappears.  A new
+        # APExitEngine must hydrate the persisted cumulative quantity before
+        # the broker reports that same cumulative snapshot again.
+        from ap_exit_engine import APExitEngine
+
+        partial_position_id = "position-partial-restart-566"
+        partial_entry_id = "entry-partial-restart-566"
+        partial_exit_id = "exit-partial-restart-566"
+        partial_contract = "MSFT260904C00200000"
+        partial_broker_id = "broker-partial-restart-566"
+        partial_fill_ts = "2026-09-04T17:20:00+00:00"
+        with _pg_conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO positions
+                    (id, client_id, status, quantity_remaining, qty, avg_fill,
+                     entry_price, contract, underlying, ticker, side, direction,
+                     entry_ts, execution_mode, local_order_id)
+                VALUES
+                    (%s, 'tradefluence', 'OPEN', 3, 5, 1.00, 1.00,
+                     %s, 'MSFT', 'MSFT', 'CALL', 'CALL',
+                     '2026-09-04T17:00:00+00:00', 'paper', %s)
+                """,
+                (partial_position_id, partial_contract, partial_entry_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, execution_mode, qty, filled_qty,
+                     fill_price, symbol, contract, direction)
+                VALUES
+                    (%s, 'tradefluence', %s, 'ENTRY', 'FILLED',
+                     'entry-broker-partial-restart-566', 'paper', 5, 5,
+                     1.00, 'MSFT', %s, 'CALL')
+                """,
+                (partial_entry_id, partial_position_id, partial_contract),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, submitted_ts, filled_ts, filled_qty,
+                     fill_price, execution_mode, qty, symbol, contract, direction)
+                VALUES
+                    (%s, 'tradefluence', %s, 'EXIT', 'EXIT_PARTIAL_FILL',
+                     %s, '2026-09-04T17:10:00+00:00', %s, 2,
+                     1.20, 'paper', 5, 'MSFT', %s, 'CALL')
+                """,
+                (
+                    partial_exit_id,
+                    partial_position_id,
+                    partial_broker_id,
+                    partial_fill_ts,
+                    partial_contract,
+                ),
+            )
+
+        restarted_engine = APExitEngine(SimpleNamespace(), email="tradefluence")
+        restarted_engine._emit_exit_event = lambda *args, **kwargs: None
+        restarted_engine.seed_from_db(pm_module.APPositionManager("tradefluence"))
+        hydrated_partial = restarted_engine.get_position(partial_position_id)
+
+        assert hydrated_partial is not None
+        assert hydrated_partial.pending_exit_local_order_id == partial_exit_id
+        assert hydrated_partial.pending_exit_broker_order_id == partial_broker_id
+        assert hydrated_partial.pending_exit_qty == 5
+        assert hydrated_partial.pending_exit_filled_qty == 2
+        assert hydrated_partial.last_applied_exit_cum_fill_by_order == {
+            partial_broker_id: 2,
+            partial_exit_id: 2,
+        }
+
+        # The first post-restart broker snapshot repeats the durable partial;
+        # it is a read-only duplicate, not another two-contract fill.
+        restarted_engine.note_partial_exit_fill(
+            partial_position_id,
+            qty_filled=2,
+            fill_price=1.20,
+            local_order_id=partial_exit_id,
+            broker_order_id=partial_broker_id,
+            cumulative_filled=2,
+            filled_ts=partial_fill_ts,
+        )
+        assert hydrated_partial.quantity_remaining == 3
+        assert hydrated_partial.pending_exit_filled_qty == 2
+
+        # A later cumulative=5 snapshot applies only the new three-contract
+        # delta and closes exactly once; the closed position cannot be mutated
+        # by a duplicate callback.
+        restarted_engine.note_partial_exit_fill(
+            partial_position_id,
+            qty_filled=3,
+            fill_price=1.20,
+            local_order_id=partial_exit_id,
+            broker_order_id=partial_broker_id,
+            cumulative_filled=5,
+            filled_ts=partial_fill_ts,
+        )
+        assert hydrated_partial.closed is True
+        assert hydrated_partial.quantity_remaining == 0
+        assert restarted_engine.get_position(partial_position_id) is None
+        assert hydrated_partial.last_applied_exit_cum_fill_by_order[partial_broker_id] == 5
+
+        # The same real recovery seam must hold before adoption when the
+        # broker's FILLED row has no explicit execution timestamp.
+        malformed_position_id = "position-missing-ts-566"
+        malformed_entry_id = "entry-missing-ts-566"
+        malformed_exit_id = "exit-missing-ts-566"
+        malformed_contract = "TSLA260807C00200000"
+        malformed_broker_id = "broker-missing-ts-566"
+        malformed_tag = osm_module.canonical_broker_submit_key(malformed_exit_id)
+        malformed_meta = json.dumps(
+            {
+                "submit_intent_at": "2026-09-04T16:10:00+00:00",
+                "broker_submit_payload_hash": "sha256:missing-ts-566",
+                "broker_submit_key": malformed_tag,
+                "current_owner": f"broker_submit:{malformed_tag}",
+                "split_brain_quarantine": False,
+                "reconciliation_required": False,
+            }
+        )
+        with _pg_conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO positions
+                    (id, client_id, status, quantity_remaining, qty, avg_fill,
+                     entry_price, contract, underlying, ticker, side, direction,
+                     entry_ts, execution_mode, local_order_id)
+                VALUES
+                    (%s, 'tradefluence', 'OPEN', 2, 2, 1.00, 1.00,
+                     %s, 'TSLA', 'TSLA', 'TSLA', 'CALL',
+                     %s, 'paper', %s)
+                """,
+                (
+                    malformed_position_id,
+                    malformed_contract,
+                    "2026-09-04T16:20:00+00:00",
+                    malformed_entry_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, execution_mode, qty, filled_qty,
+                     fill_price, symbol, contract, direction)
+                VALUES
+                    (%s, 'tradefluence', %s, 'ENTRY', 'FILLED',
+                     'entry-broker-missing-ts-566', 'paper', 2, 2, 1.00,
+                     'TSLA', %s, 'CALL')
+                """,
+                (malformed_entry_id, malformed_position_id, malformed_contract),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, execution_mode, qty, filled_qty,
+                     fill_price, symbol, contract, direction, meta)
+                VALUES
+                    (%s, 'tradefluence', %s, 'EXIT', 'EXIT_REQUESTED',
+                     NULL, 'paper', 2, 0, NULL, 'TSLA', %s, 'CALL',
+                     %s::jsonb)
+                """,
+                (
+                    malformed_exit_id,
+                    malformed_position_id,
+                    malformed_contract,
+                    malformed_meta,
+                ),
+            )
+
+        recovery_broker.rows.append(
+            {
+                "id": malformed_broker_id,
+                "client_id": "tradefluence",
+                "execution_mode": "paper",
+                "account_id": "VA_TEST",
+                "symbol": "TSLA",
+                "option_symbol": malformed_contract,
+                "side": "sell_to_close",
+                "status": "filled",
+                "quantity": 2,
+                "filled_quantity": 2,
+                "avg_fill_price": 1.10,
+                "tag": malformed_tag,
+            }
+        )
+        malformed_engine = _CanonicalExitEngine(
+            position_id=malformed_position_id,
+            quantity_remaining=2,
+        )
+        monkeypatch.setitem(
+            osm_module._exit_engine_registry,
+            "tradefluence",
+            malformed_engine,
+        )
+        malformed_position = SimpleNamespace(
+            position_id=malformed_position_id,
+            option_symbol=malformed_contract,
+            contract=malformed_contract,
+            symbol="TSLA",
+            pending_exit_local_order_id=malformed_exit_id,
+            pending_exit_broker_order_id="",
+            pending_exit_qty=2,
+            pending_exit_filled_qty=0,
+            quantity_remaining=2,
+            contracts=2,
+            client_id="tradefluence",
+            execution_mode="paper",
+        )
+        malformed = recover_exit_position(
+            malformed_position,
+            broker=recovery_broker,
+            exit_engine=malformed_engine,
+            osm=recovery_osm,
+            expected_client_id="tradefluence",
+            expected_execution_mode="paper",
+        )
+
+        assert malformed.action == "NOOP"
+        assert malformed.reason == "broker_order_fill_timestamp_unproven"
+        assert malformed_engine.pending_calls == []
+        assert malformed_engine.closed_calls == []
+        assert recovery_broker.post_calls == []
+        assert recovery_broker.cancel_calls == []
+        assert recovery_broker.replace_calls == []
+        with _pg_conn() as connection:
+            connection.execute(
+                """
+                SELECT status, broker_order_id, filled_qty, filled_ts
+                FROM orders WHERE local_order_id=%s
+                """,
+                (malformed_exit_id,),
+            )
+            malformed_order_row = dict(connection.fetchone())
+            connection.execute(
+                """
+                SELECT status, quantity_remaining FROM positions WHERE id=%s
+                """,
+                (malformed_position_id,),
+            )
+            malformed_position_row = dict(connection.fetchone())
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM proof_trades
+                WHERE client_email=%s AND position_id=%s
+                """,
+                ("tradefluence", malformed_position_id),
+            )
+            malformed_proof_count = int(connection.fetchone()["count"])
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM position_economic_finalizations
+                WHERE position_id=%s
+                """,
+                (malformed_position_id,),
+            )
+            malformed_economic_count = int(connection.fetchone()["count"])
+
+        assert malformed_order_row == {
+            "status": "EXIT_REQUESTED",
+            "broker_order_id": None,
+            "filled_qty": 0,
+            "filled_ts": None,
+        }
+        assert malformed_position_row == {
+            "status": "OPEN",
+            "quantity_remaining": 2,
+        }
+        assert malformed_proof_count == 0
+        assert malformed_economic_count == 0
     finally:
         try:
             with admin.cursor() as cursor:
