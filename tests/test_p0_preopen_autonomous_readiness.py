@@ -272,6 +272,7 @@ def test_exact_restart_rearm_retry_owner_does_not_block_unrelated_live_entries(m
             "restart_rearm_first_failed_at": now_utc.isoformat(),
             "restart_rearm_client_id": "jason@example.com",
             "restart_rearm_execution_mode": "live",
+            "restart_rearm_generation": 1,
             "late_attachment_policy_eligible": True,
         },
     }
@@ -306,6 +307,7 @@ def test_future_restart_rearm_lease_remains_unowned_for_readiness(monkeypatch):
             "restart_rearm_first_failed_at": now_utc.isoformat(),
             "restart_rearm_client_id": "jason@example.com",
             "restart_rearm_execution_mode": "live",
+            "restart_rearm_generation": 1,
             "late_attachment_policy_eligible": True,
         },
     }
@@ -321,6 +323,36 @@ def test_future_restart_rearm_lease_remains_unowned_for_readiness(monkeypatch):
     )
 
     assert unowned == [{"local_order_id": "L-future", "signal_id": "sig-future"}]
+
+
+def test_restart_rearm_owner_proof_failure_is_logged(caplog, monkeypatch):
+    from ap.pending_trigger_restart_recovery import PendingTriggerRestartRecovery
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("canonical verifier unavailable")
+
+    monkeypatch.setattr(
+        PendingTriggerRestartRecovery,
+        "prove_restart_rearm_retry_owner",
+        _raise,
+    )
+    runner = _Runner(mode="live", watcher=_Watcher(set()))
+    runner.order_state_machine = SimpleNamespace()
+    pending = [{"local_order_id": "L-proof-error", "signal_id": "sig-proof-error"}]
+
+    with caplog.at_level("WARNING", logger="ap.preopen_readiness"):
+        unowned = pr._pending_trigger_without_watcher(
+            runner,
+            pending,
+            client_id="jason@example.com",
+            execution_mode="live",
+        )
+
+    assert unowned == pending
+    assert any(
+        "PREOPEN_RESTART_REARM_OWNER_PROOF_FAILED" in record.message
+        for record in caplog.records
+    )
 
 
 def test_wrong_restart_rearm_owner_still_blocks_live_entries(monkeypatch):

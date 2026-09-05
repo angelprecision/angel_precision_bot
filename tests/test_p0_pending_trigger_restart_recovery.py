@@ -43,7 +43,9 @@ from ap.pending_trigger_restart_recovery import (
     _RR_DEADLINE_FIELD,
     _RR_CLIENT_FIELD,
     _RR_MODE_FIELD,
+    _RR_GENERATION_FIELD,
     _RR_CLOSE_REASON,
+    _LATE_REARM_MAX_GENERATIONS,
     _build_plan,
     _late_attachment_policy_eligible,
 )
@@ -3308,6 +3310,7 @@ class TestLateMarketValidityRecovery:
                 },
                 "canonical_signal_id": signal_id,
                 "late_attachment_policy_eligible": True,
+                _RR_GENERATION_FIELD: 1,
             },
         )
         rec, osm = _make_recovery(
@@ -3341,6 +3344,7 @@ class TestLateMarketValidityRecovery:
                 ),
                 "trigger_price": 450.0,
                 "late_attachment_policy_eligible": True,
+                _RR_GENERATION_FIELD: 1,
             },
         )
         rec, osm = _make_recovery(
@@ -3357,8 +3361,159 @@ class TestLateMarketValidityRecovery:
         assert summary["ownerless_rows_remaining"] == 0
         assert final_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
         assert final_meta[_RR_ATTEMPT_FIELD] == 1
+        assert final_meta[_RR_GENERATION_FIELD] == 2
         assert datetime.fromisoformat(final_meta[_RR_DEADLINE_FIELD]) > datetime.now(timezone.utc)
         assert osm.cancel_calls == []
+
+    def test_final_late_generation_expires_to_named_terminal_without_broker_mutation(self):
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        row = _canonical_late_retry_row(
+            local_order_id="late-final-generation",
+            next_at=expired,
+            deadline=expired,
+            attempt=6,
+            generation=_LATE_REARM_MAX_GENERATIONS,
+        )
+        watcher = _MonitorWatcher(watch_returns=False)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        persisted = osm.get_order(row["local_order_id"])
+        meta = persisted["meta"]
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert persisted["status"] == "CANCELED"
+        assert persisted["last_error"] == "late_attachment_market_truth_expired"
+        assert meta[_RR_STATUS_FIELD] == "CLOSED"
+        assert meta[_RR_CLOSE_REASON] == "late_attachment_market_truth_expired"
+        assert meta[_RR_GENERATION_FIELD] == _LATE_REARM_MAX_GENERATIONS
+        assert meta[_RR_NEXT_AT_FIELD] is None
+        assert meta[_RR_DEADLINE_FIELD] is None
+        assert meta["restart_rearm_exhausted_generation"] == _LATE_REARM_MAX_GENERATIONS
+        assert watcher.watch_calls == 0
+        assert osm.cancel_calls == [
+            (row["local_order_id"], "late_attachment_market_truth_expired")
+        ]
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_restart_preserves_late_generation_and_cannot_reset_total_authority(self):
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        row = _canonical_late_retry_row(
+            local_order_id="late-restart-generation",
+            next_at=expired,
+            deadline=expired,
+            attempt=6,
+            generation=1,
+        )
+
+        rec_one, osm = _make_recovery(
+            row,
+            watcher=_MonitorWatcher(watch_returns=False),
+            quote_result=None,
+        )
+        assert rec_one.recover_one_row(row) == _RowOutcome.RETRY_OWNED
+        assert osm.get_order(row["local_order_id"])["meta"][_RR_GENERATION_FIELD] == 2
+
+        row_two = osm.get_order(row["local_order_id"])
+        row_two["meta"][_RR_NEXT_AT_FIELD] = expired
+        row_two["meta"][_RR_DEADLINE_FIELD] = expired
+        row_two["meta"][_RR_ATTEMPT_FIELD] = 6
+        rec_two, _ = _make_recovery(
+            row_two,
+            osm=osm,
+            watcher=_MonitorWatcher(watch_returns=False),
+            quote_result=None,
+        )
+        assert rec_two.recover_one_row(row_two) == _RowOutcome.RETRY_OWNED
+        assert osm.get_order(row["local_order_id"])["meta"][_RR_GENERATION_FIELD] == 3
+
+        row_three = osm.get_order(row["local_order_id"])
+        row_three["meta"][_RR_NEXT_AT_FIELD] = expired
+        row_three["meta"][_RR_DEADLINE_FIELD] = expired
+        row_three["meta"][_RR_ATTEMPT_FIELD] = 6
+        rec_three, _ = _make_recovery(
+            row_three,
+            osm=osm,
+            watcher=_MonitorWatcher(watch_returns=False),
+            quote_result=None,
+        )
+        assert rec_three.recover_one_row(row_three) == _RowOutcome.TERMINALIZED
+        final = osm.get_order(row["local_order_id"])
+        assert final["meta"][_RR_GENERATION_FIELD] == 3
+        assert final["last_error"] == "late_attachment_market_truth_expired"
+        assert len(osm.cancel_calls) == 1
+
+    @pytest.mark.parametrize("malformation", ["missing", "string", "zero", "too_high", "bool"])
+    def test_malformed_or_missing_late_generation_cannot_grant_extra_attempts(self, malformation):
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        row = _canonical_late_retry_row(
+            local_order_id=f"late-malformed-generation-{malformation}",
+            next_at=expired,
+            deadline=expired,
+            attempt=6,
+            generation=1,
+        )
+        if malformation == "missing":
+            row["meta"].pop(_RR_GENERATION_FIELD)
+        elif malformation == "string":
+            row["meta"][_RR_GENERATION_FIELD] = "1"
+        elif malformation == "zero":
+            row["meta"][_RR_GENERATION_FIELD] = 0
+        elif malformation == "too_high":
+            row["meta"][_RR_GENERATION_FIELD] = _LATE_REARM_MAX_GENERATIONS + 1
+        else:
+            row["meta"][_RR_GENERATION_FIELD] = True
+
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_generation_rollover_preserves_exact_live_paper_client_order_identity(self, mode):
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        local_order_id = f"late-identity-{mode}"
+        signal_id = f"late-signal-{mode}"
+        row = _canonical_late_retry_row(
+            local_order_id=local_order_id,
+            signal_id=signal_id,
+            client_id="client@test.com",
+            mode=mode,
+            next_at=expired,
+            deadline=expired,
+            attempt=6,
+            generation=1,
+        )
+        rec, osm = _make_recovery(
+            row,
+            watcher=_MonitorWatcher(watch_returns=False),
+            mode=mode,
+            client_id="client@test.com",
+            quote_result=None,
+        )
+
+        assert rec.recover_one_row(row) == _RowOutcome.RETRY_OWNED
+
+        persisted = osm.get_order(local_order_id)
+        meta = persisted["meta"]
+        assert persisted["local_order_id"] == local_order_id
+        assert persisted["signal_id"] == signal_id
+        assert persisted["client_id"] == "client@test.com"
+        assert persisted["execution_mode"] == mode
+        assert meta[_RR_CLIENT_FIELD] == "client@test.com"
+        assert meta[_RR_MODE_FIELD] == mode
+        assert meta[_RR_OWNER_FIELD] == (
+            f"restart_rearm:client@test.com:{mode}:{local_order_id}"
+        )
+        assert meta[_RR_GENERATION_FIELD] == 2
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
 
 
 class _MonitorWatcher(_MockWatcher):
@@ -3390,6 +3545,7 @@ def _canonical_late_retry_row(
     next_at=None,
     deadline=None,
     attempt=1,
+    generation=1,
     late_policy=True,
 ):
     now = datetime.now(timezone.utc)
@@ -3412,6 +3568,7 @@ def _canonical_late_retry_row(
             "restart_rearm_first_failed_at": (now - timedelta(seconds=31)).isoformat(),
             _RR_CLIENT_FIELD: client_id.lower(),
             _RR_MODE_FIELD: mode.lower(),
+            _RR_GENERATION_FIELD: generation,
         },
     )
 

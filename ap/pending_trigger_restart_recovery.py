@@ -97,8 +97,15 @@ _RR_FIRST_FAILED_AT  = "restart_rearm_first_failed_at"
 _RR_LAST_FAILED_AT   = "restart_rearm_last_failed_at"
 _RR_CLIENT_FIELD     = "restart_rearm_client_id"
 _RR_MODE_FIELD       = "restart_rearm_execution_mode"
+_RR_GENERATION_FIELD = "restart_rearm_generation"
 _RR_CLOSED_AT        = "restart_rearm_closed_at"
 _RR_CLOSE_REASON     = "restart_rearm_close_reason"
+
+# Late-attachment market truth may be unavailable for a bounded number of
+# durable lease generations.  The generation is persisted in orders.meta so a
+# process restart cannot reset the total allowance.
+_LATE_REARM_MAX_GENERATIONS = 3
+_LATE_REARM_EXPIRED_REASON = "late_attachment_market_truth_expired"
 
 _RETRY_MATERIALIZATION = "MATERIALIZATION_RETRY"
 _RETRY_RESTART_REARM  = "RESTART_REARM_RETRY"
@@ -770,6 +777,9 @@ class PendingTriggerRestartRecovery:
         next_at = proof["restart_rearm_next_at_dt"]
         deadline = proof["restart_rearm_deadline_dt"]
         attempt = int(proof["restart_rearm_attempt"])
+        generation = proof.get("restart_rearm_generation")
+        if generation is not None:
+            generation = int(generation)
         max_attempts = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
 
         if now < next_at:
@@ -797,8 +807,10 @@ class PendingTriggerRestartRecovery:
                 local_oid,
                 row,
                 reason="late_attachment_market_truth_unavailable_or_unresolved",
-                prior_attempt=0,
-                first_failed_at=None,
+                prior_attempt=attempt,
+                first_failed_at=proof["restart_rearm_first_failed_at"],
+                prior_generation=generation,
+                new_generation=True,
             )
 
         # Due late retries return to the same canonical watcher path.  Its
@@ -1029,6 +1041,8 @@ class PendingTriggerRestartRecovery:
         reason: str,
         prior_attempt: Optional[int] = None,
         first_failed_at: Optional[str] = None,
+        prior_generation: Optional[int] = None,
+        new_generation: bool = False,
     ) -> str:
         if has_broker_handoff_evidence(row) or (
             _has_trigger_or_submit_evidence(row)
@@ -1038,18 +1052,85 @@ class PendingTriggerRestartRecovery:
             log.critical("RESTART_RECOVERY_RESTART_REARM_BLOCKED local=%s trigger_or_submit_evidence=true", local_oid)
             return _RowOutcome.UNRESOLVED
 
+        _late_policy = _late_attachment_policy_eligible(row)
+        _meta = _extract_meta(row)
+        _generation = None
+        if _late_policy:
+            _raw_generation = _meta.get(_RR_GENERATION_FIELD)
+            if prior_generation is not None:
+                if (
+                    type(prior_generation) is not int
+                    or not 1 <= prior_generation <= _LATE_REARM_MAX_GENERATIONS
+                    or (
+                        _RR_GENERATION_FIELD in _meta
+                        and _raw_generation != prior_generation
+                    )
+                ):
+                    self._mark_failure(local_oid, "retry_verification:late_generation")
+                    log.critical(
+                        "RESTART_RECOVERY_LATE_REARM_GENERATION_UNPROVEN "
+                        "local=%s — preserving row",
+                        local_oid,
+                    )
+                    return _RowOutcome.UNRESOLVED
+                _generation = prior_generation
+            elif _RR_GENERATION_FIELD in _meta:
+                if (
+                    type(_raw_generation) is not int
+                    or not 1 <= _raw_generation <= _LATE_REARM_MAX_GENERATIONS
+                ):
+                    self._mark_failure(local_oid, "retry_verification:late_generation")
+                    log.critical(
+                        "RESTART_RECOVERY_LATE_REARM_GENERATION_UNPROVEN "
+                        "local=%s — preserving row",
+                        local_oid,
+                    )
+                    return _RowOutcome.UNRESOLVED
+                _generation = _raw_generation
+            elif any(
+                field in _meta
+                for field in (
+                    _RR_STATUS_FIELD,
+                    _RR_OWNER_FIELD,
+                    _RR_REASON_FIELD,
+                    _RR_ATTEMPT_FIELD,
+                    _RR_NEXT_AT_FIELD,
+                    _RR_DEADLINE_FIELD,
+                    _RR_FIRST_FAILED_AT,
+                    _RR_CLIENT_FIELD,
+                    _RR_MODE_FIELD,
+                )
+            ):
+                # A row that already carries restart-rearm state must carry
+                # the durable generation too; infer no authority from a
+                # malformed or legacy retry shape.
+                self._mark_failure(local_oid, "retry_verification:late_generation")
+                log.critical(
+                    "RESTART_RECOVERY_LATE_REARM_GENERATION_MISSING "
+                    "local=%s — preserving row",
+                    local_oid,
+                )
+                return _RowOutcome.UNRESOLVED
+            else:
+                _generation = 1
+
         _delay = _env_int("RESTART_REARM_RETRY_DELAY_SECONDS", 30)
         _deadline_secs = _env_int("RESTART_REARM_RETRY_DEADLINE_SECONDS", 180)
         _max = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
         _now = datetime.now(timezone.utc)
-        _attempts = int(prior_attempt if prior_attempt is not None else (_extract_meta(row).get(_RR_ATTEMPT_FIELD) or 0)) + 1
+        _attempts = int(prior_attempt if prior_attempt is not None else (_meta.get(_RR_ATTEMPT_FIELD) or 0)) + 1
+        _roll_generation = bool(new_generation and _late_policy)
+        if _roll_generation:
+            _attempts = 1
+            first_failed_at = None
         # A proven late market-data HOLD is not setup invalidity.  Start a new
         # bounded lease generation instead of converting retry exhaustion into
         # a permanent trade decision.  Ordinary restart retries retain their
         # existing terminal exhaustion behavior.
-        if _attempts > _max and _late_attachment_policy_eligible(row):
+        if _attempts > _max and _late_policy:
             _attempts = 1
             first_failed_at = None
+            _roll_generation = True
         elif _attempts > _max:
             return self._terminalize_with_reason(
                 local_oid,
@@ -1063,10 +1144,11 @@ class PendingTriggerRestartRecovery:
             if first_failed_at and _parse_iso(first_failed_at) is not None
             else _now + timedelta(seconds=_deadline_secs)
         )
-        if _deadline_dt <= _now and _late_attachment_policy_eligible(row):
+        if _deadline_dt <= _now and _late_policy:
             _attempts = 1
             first_failed_at = None
             _deadline_dt = _now + timedelta(seconds=_deadline_secs)
+            _roll_generation = True
         elif _deadline_dt <= _now:
             return self._terminalize_with_reason(
                 local_oid,
@@ -1074,6 +1156,24 @@ class PendingTriggerRestartRecovery:
                 "restart_rearm_quote_retry_exhausted",
                 meta_patch={"restart_rearm_exhausted_attempt": _attempts},
             )
+
+        if _late_policy and _roll_generation:
+            _next_generation = _generation + 1
+            if _next_generation > _LATE_REARM_MAX_GENERATIONS:
+                return self._terminalize_with_reason(
+                    local_oid,
+                    row,
+                    _LATE_REARM_EXPIRED_REASON,
+                    meta_patch={
+                        _RR_STATUS_FIELD: "CLOSED",
+                        _RR_CLOSE_REASON: _LATE_REARM_EXPIRED_REASON,
+                        _RR_GENERATION_FIELD: _generation,
+                        _RR_NEXT_AT_FIELD: None,
+                        _RR_DEADLINE_FIELD: None,
+                        "restart_rearm_exhausted_generation": _generation,
+                    },
+                )
+            _generation = _next_generation
         _next_dt = min(_now + timedelta(seconds=_delay), _deadline_dt)
         _next = _next_dt.isoformat()
         _deadline = _deadline_dt.isoformat()
@@ -1093,6 +1193,8 @@ class PendingTriggerRestartRecovery:
             "restart_recovery_retry_subtype": _RETRY_RESTART_REARM,
             "restart_recovery_at": _now.isoformat(),
         }
+        if _late_policy:
+            _patch[_RR_GENERATION_FIELD] = _generation
         if not self._safe_meta_update(local_oid, _patch):
             self._mark_failure(local_oid, "restart_rearm_retry_write_failed")
             return _RowOutcome.UNRESOLVED
@@ -1103,6 +1205,7 @@ class PendingTriggerRestartRecovery:
             expected_owner=_owner,
             expected_next_at=_next,
             expected_deadline=_deadline,
+            expected_generation=_generation if _late_policy else None,
             expected_signal_id=str(row.get("signal_id") or "").strip(),
         )
         if proof is None:
@@ -1748,6 +1851,7 @@ class PendingTriggerRestartRecovery:
         expected_owner: Optional[str] = None,
         expected_next_at: Optional[str] = None,
         expected_deadline: Optional[str] = None,
+        expected_generation: Optional[int] = None,
         expected_signal_id: str = "",
         allow_expired: bool = False,
         require_late_policy: bool = False,
@@ -1780,7 +1884,8 @@ class PendingTriggerRestartRecovery:
             return None
         if not rr_signal_id or not expected_signal_id or rr_signal_id != expected_signal_id:
             return None
-        if require_late_policy and not _late_attachment_policy_eligible(reread):
+        _late_policy = _late_attachment_policy_eligible(reread)
+        if require_late_policy and not _late_policy:
             return None
         if any(
             value is not None
@@ -1800,7 +1905,7 @@ class PendingTriggerRestartRecovery:
         # original pre-breach-only retry fence.
         if has_broker_handoff_evidence(reread) or (
             _has_trigger_or_submit_evidence(reread)
-            and not _late_attachment_policy_eligible(reread)
+            and not _late_policy
         ):
             return None
 
@@ -1842,6 +1947,15 @@ class PendingTriggerRestartRecovery:
         if type(attempt_raw) is not int:
             return None
         attempt = attempt_raw
+        generation = None
+        if _late_policy:
+            generation_raw = meta.get(_RR_GENERATION_FIELD)
+            if (
+                type(generation_raw) is not int
+                or not 1 <= generation_raw <= _LATE_REARM_MAX_GENERATIONS
+            ):
+                return None
+            generation = generation_raw
         if _RR_ATTEMPT_FIELD in reread:
             top_attempt = reread.get(_RR_ATTEMPT_FIELD)
             if type(top_attempt) is not int or top_attempt != attempt:
@@ -1862,7 +1976,7 @@ class PendingTriggerRestartRecovery:
             return None
         now = datetime.now(timezone.utc)
         if (
-            _late_attachment_policy_eligible(reread)
+            _late_policy
             and deadline_dt > now + timedelta(seconds=retry_deadline_secs)
         ):
             # A durable late-retry owner is only valid for the configured
@@ -1885,6 +1999,8 @@ class PendingTriggerRestartRecovery:
             return None
         if expected_deadline is not None and deadline != expected_deadline:
             return None
+        if expected_generation is not None and generation != expected_generation:
+            return None
         return {
             "local_order_id": local_oid,
             "restart_rearm_status": restart_status,
@@ -1896,6 +2012,7 @@ class PendingTriggerRestartRecovery:
             "restart_rearm_deadline": deadline,
             "restart_rearm_deadline_dt": deadline_dt,
             "restart_rearm_first_failed_at": first_failed_at,
+            "restart_rearm_generation": generation,
         }
 
     # ── Registry verification — 6-way proof (Blocker 4) ──────────────────────

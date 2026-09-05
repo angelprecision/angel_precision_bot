@@ -518,8 +518,12 @@ def _pending_trigger_without_watcher(
                 is not None
             ):
                 continue
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning(
+                "PREOPEN_RESTART_REARM_OWNER_PROOF_FAILED local=%s: %s",
+                local_order_id,
+                exc,
+            )
         out.append(row)
     return out
 
