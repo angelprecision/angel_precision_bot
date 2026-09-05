@@ -473,6 +473,13 @@ class TradierBroker(BrokerAdapter):
         Returns list of dicts with: symbol, quantity, cost_basis, side
         Returns [] if no positions or on error.
         """
+        return self._list_positions(strict=False)
+
+    def list_positions_strict(self) -> list:
+        """Return positions, raising when broker truth is unavailable."""
+        return self._list_positions(strict=True)
+
+    def _list_positions(self, *, strict: bool) -> list:
         try:
             resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
             positions = resp.get("positions", {})
@@ -497,4 +504,6 @@ class TradierBroker(BrokerAdapter):
             return result
         except Exception as e:
             log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
+            if strict:
+                raise
             return []
