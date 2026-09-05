@@ -208,6 +208,35 @@ def _extract_position_contract(raw: dict[str, Any]) -> str:
     return exact if state == "valid" else ""
 
 
+def _extract_position_value(raw: dict[str, Any], *keys: str) -> Any:
+    """Return the first explicitly supplied value from a broker row.
+
+    The raw Tradier row is retained by the authoritative normalizer so
+    recovery callers can use non-identity economics (for example
+    ``cost_basis``) without reimplementing the envelope/identity parser.
+    ``None`` and empty strings are treated as absent, but numeric zero is
+    preserved as an explicit broker value.
+    """
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    for key in keys:
+        for record in (raw, nested):
+            if key in record and record.get(key) not in (None, ""):
+                return record.get(key)
+    return None
+
+
+def _extract_position_symbol(raw: dict[str, Any], exact: str) -> str:
+    if exact:
+        return exact
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    for record in (raw, nested):
+        for key in ("symbol", "instrument"):
+            value = _normalize_contract(record.get(key))
+            if _UNDERLYING_SYMBOL_RE.fullmatch(value):
+                return value
+    return ""
+
+
 def _extract_long_position_qty(raw: dict[str, Any]) -> Optional[int]:
     nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
     quantities: list[int] = []
@@ -315,14 +344,80 @@ def _parse_authoritative_position_payload(payload: Any) -> tuple[str, list[dict[
         quantity = _extract_long_position_qty(row)
         if quantity is None:
             return "malformed", []
-        normalized.append(
-            {
-                "contract": exact,
-                "quantity": quantity,
-                "account": _extract_position_account_id(row),
-            }
-        )
+        normalized_row = dict(row)
+        # Preserve the provider row for audit/economic fields while replacing
+        # only the fields whose semantics were proven by this normalizer.
+        normalized_row.setdefault("raw", dict(row))
+        normalized_row["contract"] = exact
+        normalized_row["symbol"] = _extract_position_symbol(row, exact)
+        normalized_row["quantity"] = quantity
+        normalized_row["account"] = _extract_position_account_id(row)
+        for key, aliases in {
+            "cost_basis": ("cost_basis", "costBasis"),
+            "date_acquired": ("date_acquired", "dateAcquired"),
+            "side": ("side", "position_type", "positionType"),
+        }.items():
+            value = _extract_position_value(row, *aliases)
+            if value is not None:
+                if normalized_row.get(key) in (None, ""):
+                    normalized_row[key] = value
+        normalized.append(normalized_row)
     return "available", normalized
+
+
+def resolve_authoritative_broker_positions(*, broker: Any) -> dict[str, Any]:
+    """Return one parsed, authoritative broker-position snapshot.
+
+    This is the shared PR #566 truth seam for consumers that need the full
+    normalized position rows.  Fetch errors, malformed provider envelopes,
+    contradictory identity, and invalid quantities all return
+    ``is_fresh_exact=False``; only a successfully parsed list (including a
+    documented empty list) is considered fresh broker truth.
+    """
+    checked_at = now_utc_iso()
+    account_id = _normalize_text(_extract_broker_account_id(broker))
+    audit = {
+        "source": "broker.authoritative_positions",
+        "checked_at": checked_at,
+        "account": account_id,
+    }
+
+    fetch_state, payload, fetch_detail = _authoritative_position_payload(broker)
+    audit["source_detail"] = fetch_detail
+    if fetch_state != "available":
+        audit["snapshot_status"] = (
+            "broker_positions_error"
+            if fetch_state == "error"
+            else "broker_positions_unavailable"
+        )
+        audit["error"] = fetch_detail
+        return {
+            "positions": [],
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    parse_state, rows = _parse_authoritative_position_payload(payload)
+    if parse_state != "available":
+        audit.update({
+            "snapshot_status": "broker_positions_malformed",
+            "error": "authoritative_position_payload_malformed",
+        })
+        return {
+            "positions": [],
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    audit.update({
+        "snapshot_status": "available",
+        "broker_position_count": len(rows),
+    })
+    return {
+        "positions": rows,
+        "is_fresh_exact": True,
+        "audit": audit,
+    }
 
 
 def resolve_exit_broker_truth(

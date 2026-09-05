@@ -560,7 +560,7 @@ def test_exit_engine_callback_path_preserves_canonical_exit_liveness(
     engine._positions = []
     engine._positions_by_id = {}
     engine._can_submit_exit = lambda *args, **kwargs: True
-    engine.hydrate_pending_exit_identity_from_db = lambda pos: False
+    engine.hydrate_pending_exit_identity_from_db = lambda pos, **_kwargs: False
     events = []
     engine._emit_exit_event = lambda *args, **kwargs: events.append(kwargs)
     engine._extract_exit_order_identity = lambda result: {
@@ -683,7 +683,7 @@ def test_exit_engine_callback_path_does_not_allow_missing_non_repair_position(mo
     ]
     engine._positions = []
     engine._positions_by_id = {}
-    engine.hydrate_pending_exit_identity_from_db = lambda pos: False
+    engine.hydrate_pending_exit_identity_from_db = lambda pos, **_kwargs: False
     engine._emit_exit_event = lambda *args, **kwargs: None
     engine._extract_exit_order_identity = lambda result: {
         "accepted": True,

@@ -672,7 +672,11 @@ def test_restart_seed_restores_degraded_retry_owner_and_deadline(monkeypatch):
             ]
         },
     )()
-    monkeypatch.setattr(engine, "hydrate_pending_exit_identity_from_db", lambda pos: False)
+    monkeypatch.setattr(
+        engine,
+        "hydrate_pending_exit_identity_from_db",
+        lambda pos, **_kwargs: False,
+    )
 
     engine.seed_from_db(pm)
 
