@@ -3924,44 +3924,64 @@ class APBrokerReconciler:
             return 0.0, False
         return values[0], True
 
+    @staticmethod
+    def _canonical_nonnegative_number(pos: dict, *keys: str) -> tuple[float, bool]:
+        """Return one finite nonnegative value, rejecting malformed aliases."""
+        values = []
+        for key in keys:
+            raw = pos.get(key)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            if isinstance(raw, bool):
+                return 0.0, False
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0, False
+            if not math.isfinite(value) or value < 0:
+                return 0.0, False
+            values.append(value)
+        if any(value != values[0] for value in values[1:]):
+            return 0.0, False
+        return (values[0] if values else 0.0), True
+
     def _filled_entry_evidence_for_canonical_position(
         self,
         *,
         contract: str,
         position_id: str,
         execution_mode: str,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        signal_id: str = "",
+        canonical_signal_id: str = "",
     ) -> tuple[str, Optional[dict]]:
-        """Read at most one exact filled ENTRY row for adoption provenance."""
+        """Read and validate every exact identity-linked ENTRY candidate."""
         try:
             from ap.db import conn, run_with_retry
-            from ap.order_state_machine import (
-                _DURABLE_EXECUTION_MODE_SQL,
-                _durable_execution_mode,
-            )
+            from ap.order_state_machine import _durable_execution_mode
 
             def _fetch() -> list[dict]:
                 with conn() as c:
                     c.execute(
-                        f"""
-                        SELECT local_order_id, broker_order_id, signal_id,
+                        """
+                        SELECT client_id, kind, status,
+                               local_order_id, broker_order_id, signal_id,
                                canonical_signal_id, fill_price, filled_qty,
                                filled_ts, execution_mode, position_id, contract,
                                meta
                         FROM orders
-                        WHERE client_id=%s
-                          AND {_DURABLE_EXECUTION_MODE_SQL}
-                          AND UPPER(TRIM(COALESCE(contract,'')))=%s
-                          AND UPPER(TRIM(COALESCE(kind,'')))='ENTRY'
-                          AND UPPER(TRIM(COALESCE(status,''))) IN
-                              ('FILLED','PARTIAL_FILL','PARTIALLY_FILLED')
-                          AND position_id::text=%s
-                          AND COALESCE(filled_qty,0)>0
-                          AND fill_price IS NOT NULL
-                          AND filled_ts IS NOT NULL
+                        WHERE position_id::text=%s
+                           OR (%s<>'' AND local_order_id=%s)
+                           OR (%s<>'' AND broker_order_id=%s)
                         ORDER BY filled_ts DESC NULLS LAST
                         LIMIT 2
                         """,
-                        (self.client_id, execution_mode, contract, position_id),
+                        (
+                            position_id,
+                            local_order_id, local_order_id,
+                            broker_order_id, broker_order_id,
+                        ),
                     )
                     return [dict(row) for row in (c.fetchall() or [])]
 
@@ -3973,18 +3993,41 @@ class APBrokerReconciler:
 
             row = rows[0]
             if (
-                _durable_execution_mode(row) != execution_mode
+                str(row.get("client_id") or "").strip().lower()
+                != str(self.client_id or "").strip().lower()
+                or _durable_execution_mode(row) != execution_mode
                 or self._norm_contract(row.get("contract")) != contract
                 or str(row.get("position_id") or "").strip() != position_id
+                or str(row.get("kind") or "").strip().upper() != "ENTRY"
+                or str(row.get("status") or "").strip().upper() not in {
+                    "FILLED", "PARTIAL_FILL", "PARTIALLY_FILLED"
+                }
             ):
                 return "IDENTITY_CONFLICT", None
+            for key, canonical_value in (
+                ("local_order_id", local_order_id),
+                ("broker_order_id", broker_order_id),
+                ("signal_id", signal_id),
+                ("canonical_signal_id", canonical_signal_id),
+            ):
+                row_value = str(row.get(key) or "").strip()
+                if canonical_value and row_value and canonical_value != row_value:
+                    return "IDENTITY_CONFLICT", None
             fill_price = _positive_finite_float(row.get("fill_price"))
             filled_qty = _positive_finite_float(row.get("filled_qty"))
+            filled_ts = row.get("filled_ts")
+            timestamp_valid = isinstance(filled_ts, datetime)
+            if isinstance(filled_ts, str) and filled_ts.strip():
+                try:
+                    datetime.fromisoformat(filled_ts.strip().replace("Z", "+00:00"))
+                    timestamp_valid = True
+                except ValueError:
+                    timestamp_valid = False
             if (
                 fill_price <= 0
                 or filled_qty <= 0
                 or filled_qty != int(filled_qty)
-                or not row.get("filled_ts")
+                or not timestamp_valid
             ):
                 return "MALFORMED", None
             return "PROVEN", row
@@ -4086,10 +4129,11 @@ class APBrokerReconciler:
         if not pos:
             return False
 
-        pos_id     = str(pos.get("id") or pos.get("position_id") or "")
+        pos_id     = str(pos.get("id") or pos.get("position_id") or "").strip()
         contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
         underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
-        side       = str(pos.get("direction") or pos.get("side") or "CALL").upper()
+        side, side_ok = self._canonical_nonblank_value(pos, "direction", "side")
+        side = side.upper()
         qty_keys = (
             ("qty", "quantity")
             if pos.get("qty") is not None or pos.get("quantity") is not None
@@ -4102,10 +4146,19 @@ class APBrokerReconciler:
             pos, "avg_fill", "entry_price"
         )
         qty = int(qty_value) if qty_ok else 0
+        _, historical_entry_malformed = (
+            _historical_underlying_from_mapping(pos)
+        )
         underlying_entry = self._derive_underlying_entry_from_position(
             pos,
             underlying=underlying,
             contract=contract,
+        )
+        stop_underlying, stop_ok = self._canonical_nonnegative_number(
+            pos, "stop_underlying", "underlying_stop"
+        )
+        target_underlying, target_ok = self._canonical_nonnegative_number(
+            pos, "target_underlying", "underlying_target"
         )
         price_untrusted = bool(
             pos.get("price_untrusted")
@@ -4122,6 +4175,11 @@ class APBrokerReconciler:
             position_mode = None
         placeholder_ids = {"", "0", "none", "null", "n/a", "na", "unknown", "pending"}
         exact_occ = bool(re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract))
+        occ_match = _OCC_CP_RE.search(contract)
+        occ_side = (
+            "CALL" if occ_match and occ_match.group(1) == "C"
+            else "PUT" if occ_match else ""
+        )
         if (
             pos_id.strip().lower() in placeholder_ids
             or not expected_client
@@ -4129,8 +4187,14 @@ class APBrokerReconciler:
             or engine_mode is None
             or position_mode != engine_mode
             or not exact_occ
+            or not side_ok
+            or side not in {"CALL", "PUT"}
+            or side != occ_side
             or not qty_ok
             or not entry_ok
+            or historical_entry_malformed
+            or not stop_ok
+            or not target_ok
         ):
             return self._canonical_owner_hold(
                 contract=contract,
@@ -4161,6 +4225,10 @@ class APBrokerReconciler:
             contract=contract,
             position_id=pos_id,
             execution_mode=engine_mode,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            signal_id=signal_id,
+            canonical_signal_id=canonical_signal_id,
         )
         if evidence_status not in {"NO_EVIDENCE", "PROVEN"}:
             return self._canonical_owner_hold(
@@ -4229,17 +4297,14 @@ class APBrokerReconciler:
                 execution_mode=engine_mode,
                 client_id=expected_client,
                 underlying_entry=underlying_entry,
+                underlying_entry_trusted=underlying_entry > 0,
                 score=self._safe_float(pos.get("score"), 0.0),
                 tier=str(pos.get("tier") or ""),
                 pattern=str(pos.get("pattern") or ""),
                 direction=side,
                 timeframe=str(pos.get("timeframe") or ""),
-                underlying_stop=self._safe_float(
-                    pos.get("stop_underlying") or pos.get("underlying_stop"), 0.0
-                ),
-                underlying_target=self._safe_float(
-                    pos.get("target_underlying") or pos.get("underlying_target"), 0.0
-                ),
+                underlying_stop=stop_underlying,
+                underlying_target=target_underlying,
             )
         except Exception:
             return self._canonical_owner_hold(
@@ -4287,8 +4352,8 @@ class APBrokerReconciler:
                     side=side,
                     qty=qty,
                     entry_px=entry_px,
-                    stop_underlying=pos.get("stop_underlying") or pos.get("underlying_stop") or 0.0,
-                    target_underlying=pos.get("target_underlying") or pos.get("underlying_target") or 0.0,
+                    stop_underlying=stop_underlying,
+                    target_underlying=target_underlying,
                     underlying_entry=underlying_entry,
                     price_untrusted=price_untrusted,
                 )

@@ -3877,6 +3877,7 @@ class APExitEngine:
         client_id: str,
         order_filled_ts=None,
         underlying_entry: float = 0.0,
+        underlying_entry_trusted: Optional[bool] = None,
         score: float = 0.0,
         tier: str = "",
         pattern: str = "",
@@ -3901,6 +3902,32 @@ class APExitEngine:
                 disposition="RETRY_ADOPTION_ERROR", adopted=False,
                 safe_to_seed=False, retryable=True, reason="missing_contract_or_id",
             )
+
+        try:
+            _underlying_entry = float(underlying_entry)
+        except (TypeError, ValueError, OverflowError):
+            _underlying_entry = float("nan")
+        if (
+            underlying_entry_trusted not in {None, True, False}
+            or not math.isfinite(_underlying_entry)
+            or _underlying_entry < 0
+            or (underlying_entry_trusted is True and _underlying_entry <= 0)
+            or (underlying_entry_trusted is False and _underlying_entry != 0)
+        ):
+            return CanonicalAdoptionResult(
+                disposition="RETRY_IDENTITY_CONFLICT", adopted=False,
+                safe_to_seed=False, retryable=True,
+                reason="underlying_entry_trust_conflict",
+            )
+
+        def _apply_underlying_entry_truth(target) -> None:
+            if underlying_entry_trusted is False:
+                _set_position_attr_pair(target, "underlying_entry", 0.0)
+                _set_position_attr_pair(target, "underlying_entry_untrusted", True)
+            elif _underlying_entry > 0:
+                _set_position_attr_pair(target, "underlying_entry", _underlying_entry)
+                if underlying_entry_trusted is True:
+                    _set_position_attr_pair(target, "underlying_entry_untrusted", False)
 
         with self._lock:
             # ── Final Blocker 1: Canonical + repair collapse ───────────────────
@@ -4112,6 +4139,9 @@ class APExitEngine:
                         reason=f"retained_repairs={len(_identity_unproven_repairs)}",
                     )
 
+                _apply_underlying_entry_truth(_existing_canon)
+                _reclassify_hard_ref_for_entry(_existing_canon)
+
                 return CanonicalAdoptionResult(
                     disposition="ALREADY_CANONICAL_REPAIR_REMOVED",
                     adopted=True, safe_to_seed=False, retryable=False,
@@ -4228,9 +4258,9 @@ class APExitEngine:
                     except Exception as _e:
                         log.debug("[exit_eng] adopt opened_at: %s", _e)
 
-                if underlying_entry > 0:
+                if underlying_entry_trusted is not None or _underlying_entry > 0:
                     try:
-                        pos.underlying_entry = underlying_entry
+                        _apply_underlying_entry_truth(pos)
                     except Exception as _ue_err:
                         log.debug("[exit_eng] adopt: underlying_entry set skipped: %s", _ue_err)
 

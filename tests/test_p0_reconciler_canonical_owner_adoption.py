@@ -364,6 +364,121 @@ def test_unknown_historical_entry_remains_zero_and_never_reads_current_quote():
         _position(underlying_entry=0.0)
     ) is True
     assert engine.adopt_calls[0]["underlying_entry"] == 0.0
+    assert engine.adopt_calls[0]["underlying_entry_trusted"] is False
+
+
+def test_real_exit_engine_clears_stale_repair_entry_when_canonical_truth_unknown():
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._email = CLIENT
+    engine._lock = threading.RLock()
+    repair_id = f"broker-repair-{CLIENT}-{CONTRACT}"
+    repair = ManagedPosition(
+        ticker="NOW",
+        option_symbol=CONTRACT,
+        side="PUT",
+        quantity=1,
+        entry_price=1.30,
+        underlying_entry=999.0,
+        underlying_target=120.0,
+        underlying_stop=130.0,
+    )
+    repair.position_id = repair_id
+    repair.client_id = CLIENT
+    repair.execution_mode = "live"
+    repair.underlying_entry_untrusted = False
+    engine._positions = [repair]
+    engine._positions_by_id = {repair_id: repair}
+
+    reconciler = _reconciler(engine)
+    reconciler._filled_entry_underlying_for_position = lambda **_kwargs: 0.0
+    assert reconciler._seed_exit_engine_from_position(
+        _position(underlying_entry=0.0)
+    ) is True
+    assert repair.position_id == POSITION_ID
+    assert repair.underlying_entry == 0.0
+    assert repair.underlying_entry_untrusted is True
+
+
+def test_existing_canonical_owner_clears_stale_entry_when_truth_unknown():
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._email = CLIENT
+    engine._lock = threading.RLock()
+    canonical = ManagedPosition(
+        ticker="NOW", option_symbol=CONTRACT, side="PUT", quantity=1,
+        entry_price=1.30, underlying_entry=999.0,
+        underlying_target=120.0, underlying_stop=130.0,
+    )
+    canonical.position_id = POSITION_ID
+    canonical.client_id = CLIENT
+    canonical.execution_mode = "live"
+    canonical.underlying_entry_untrusted = False
+    repair = ManagedPosition(
+        ticker="NOW", option_symbol=CONTRACT, side="PUT", quantity=1,
+        entry_price=1.30, underlying_entry=999.0,
+        underlying_target=120.0, underlying_stop=130.0,
+    )
+    repair.position_id = f"broker-repair-{CLIENT}-{CONTRACT}"
+    repair.client_id = CLIENT
+    repair.execution_mode = "live"
+    engine._positions = [canonical, repair]
+    engine._positions_by_id = {
+        canonical.position_id: canonical,
+        repair.position_id: repair,
+    }
+
+    reconciler = _reconciler(engine)
+    reconciler._filled_entry_underlying_for_position = lambda **_kwargs: 0.0
+    assert reconciler._seed_exit_engine_from_position(
+        _position(underlying_entry=0.0)
+    ) is True
+    assert engine.active_positions() == [canonical]
+    assert canonical.underlying_entry == 0.0
+    assert canonical.underlying_entry_untrusted is True
+
+
+def test_conflicting_historical_underlying_aliases_hold_before_adoption():
+    engine = _ExitEngine(owners=[_owner("broker-repair-held")])
+    position = _position(entry_underlying=128.0)
+    assert _reconciler(engine)._seed_exit_engine_from_position(position) is False
+    assert engine.adopt_calls == []
+    assert engine.add_calls == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"direction": ""},
+        {"direction": "PUT", "side": "CALL"},
+        {"direction": "CALL"},
+    ],
+)
+def test_unproven_or_occ_conflicting_direction_holds_before_adoption(overrides):
+    engine = _ExitEngine(owners=[_owner("broker-repair-held")])
+    assert _reconciler(engine)._seed_exit_engine_from_position(
+        _position(**overrides)
+    ) is False
+    assert engine.adopt_calls == []
+    assert engine.add_calls == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"stop_underlying": 130.0, "underlying_stop": 131.0},
+        {"target_underlying": 120.0, "underlying_target": 119.0},
+    ],
+)
+def test_conflicting_exit_geometry_aliases_hold_before_adoption(overrides):
+    engine = _ExitEngine(owners=[_owner("broker-repair-held")])
+    assert _reconciler(engine)._seed_exit_engine_from_position(
+        _position(**overrides)
+    ) is False
+    assert engine.adopt_calls == []
+    assert engine.add_calls == []
 
 
 def test_structurally_inconsistent_success_result_holds():
@@ -399,6 +514,9 @@ def test_entry_evidence_lookup_is_exactly_domain_fenced(monkeypatch):
     import ap.db as db
 
     row = {
+        "client_id": CLIENT,
+        "kind": "ENTRY",
+        "status": "FILLED",
         "local_order_id": "entry-local-1",
         "broker_order_id": "143201293",
         "signal_id": "signal-1",
@@ -421,14 +539,118 @@ def test_entry_evidence_lookup_is_exactly_domain_fenced(monkeypatch):
         contract=CONTRACT,
         position_id=POSITION_ID,
         execution_mode="live",
+        local_order_id="entry-local-1",
+        broker_order_id="143201293",
+        signal_id="signal-1",
+        canonical_signal_id="canonical-signal-1",
     )
 
     assert status == "PROVEN"
     assert evidence == row
-    assert cursor.params == (CLIENT, "live", CONTRACT, POSITION_ID)
-    assert "client_id=%s" in cursor.sql
+    assert cursor.params == (
+        POSITION_ID,
+        "entry-local-1",
+        "entry-local-1",
+        "143201293",
+        "143201293",
+    )
+    assert "client_id=%s" not in cursor.sql
     assert "position_id::text=%s" in cursor.sql
+    assert "local_order_id=%s" in cursor.sql
+    assert "broker_order_id=%s" in cursor.sql
+    assert "filled_qty" not in cursor.sql.split("FROM orders", 1)[1]
+    assert "execution_mode" not in cursor.sql.split("FROM orders", 1)[1]
     assert "LIMIT 2" in cursor.sql
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_status"),
+    [
+        ("filled_ts", "not-a-timestamp", "MALFORMED"),
+        ("filled_qty", "not-a-number", "MALFORMED"),
+        ("execution_mode", "paper", "IDENTITY_CONFLICT"),
+        ("status", "REJECTED", "IDENTITY_CONFLICT"),
+    ],
+)
+def test_entry_evidence_lookup_rejects_invalid_candidate_truth(
+    monkeypatch, field, value, expected_status
+):
+    import ap.db as db
+
+    row = {
+        "client_id": CLIENT,
+        "kind": "ENTRY",
+        "status": "FILLED",
+        "local_order_id": "entry-local-1",
+        "broker_order_id": "143201293",
+        "signal_id": "signal-1",
+        "canonical_signal_id": "canonical-signal-1",
+        "fill_price": 1.30,
+        "filled_qty": 1,
+        "filled_ts": "2026-08-25T14:31:00+00:00",
+        "execution_mode": "live",
+        "position_id": POSITION_ID,
+        "contract": CONTRACT,
+        "meta": {},
+    }
+    row[field] = value
+    cursor = _EvidenceCursor([row])
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = reconciler.__class__._filled_entry_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        local_order_id="entry-local-1",
+        broker_order_id="143201293",
+        signal_id="signal-1",
+        canonical_signal_id="canonical-signal-1",
+    )
+
+    assert status == expected_status
+    assert evidence is None
+
+
+def test_entry_evidence_lookup_rejects_conflicting_linked_position(monkeypatch):
+    import ap.db as db
+
+    row = {
+        "client_id": CLIENT,
+        "kind": "ENTRY",
+        "status": "FILLED",
+        "local_order_id": "entry-local-1",
+        "broker_order_id": "143201293",
+        "signal_id": "signal-1",
+        "canonical_signal_id": "canonical-signal-1",
+        "fill_price": 1.30,
+        "filled_qty": 1,
+        "filled_ts": "2026-08-25T14:31:00+00:00",
+        "execution_mode": "live",
+        "position_id": "different-position-id",
+        "contract": CONTRACT,
+        "meta": {},
+    }
+    cursor = _EvidenceCursor([row])
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = reconciler.__class__._filled_entry_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        local_order_id="entry-local-1",
+        broker_order_id="143201293",
+        signal_id="signal-1",
+        canonical_signal_id="canonical-signal-1",
+    )
+
+    assert status == "IDENTITY_CONFLICT"
+    assert evidence is None
 
 
 def test_entry_evidence_lookup_rejects_ambiguous_exact_rows(monkeypatch):
