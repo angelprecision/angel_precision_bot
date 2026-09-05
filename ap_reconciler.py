@@ -3892,21 +3892,216 @@ class APBrokerReconciler:
         except Exception:
             return None
 
-    def _seed_exit_engine_from_position(self, pos: dict) -> None:
+    @staticmethod
+    def _canonical_nonblank_value(pos: dict, *keys: str) -> tuple[str, bool]:
+        """Return one durable string value, rejecting contradictory aliases."""
+        values = {
+            str(pos.get(key) or "").strip()
+            for key in keys
+            if str(pos.get(key) or "").strip()
+        }
+        if len(values) > 1:
+            return "", False
+        return (next(iter(values)) if values else ""), True
+
+    @staticmethod
+    def _canonical_positive_number(
+        pos: dict,
+        *keys: str,
+        integral: bool = False,
+    ) -> tuple[float, bool]:
+        """Return one positive finite numeric truth, rejecting alias drift."""
+        values = []
+        for key in keys:
+            raw = pos.get(key)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            value = _positive_finite_float(raw)
+            if value <= 0 or (integral and value != int(value)):
+                return 0.0, False
+            values.append(value)
+        if not values or any(value != values[0] for value in values[1:]):
+            return 0.0, False
+        return values[0], True
+
+    def _filled_entry_evidence_for_canonical_position(
+        self,
+        *,
+        contract: str,
+        position_id: str,
+        execution_mode: str,
+    ) -> tuple[str, Optional[dict]]:
+        """Read at most one exact filled ENTRY row for adoption provenance."""
+        try:
+            from ap.db import conn, run_with_retry
+            from ap.order_state_machine import (
+                _DURABLE_EXECUTION_MODE_SQL,
+                _durable_execution_mode,
+            )
+
+            def _fetch() -> list[dict]:
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        SELECT local_order_id, broker_order_id, signal_id,
+                               canonical_signal_id, fill_price, filled_qty,
+                               filled_ts, execution_mode, position_id, contract,
+                               meta
+                        FROM orders
+                        WHERE client_id=%s
+                          AND {_DURABLE_EXECUTION_MODE_SQL}
+                          AND UPPER(TRIM(COALESCE(contract,'')))=%s
+                          AND UPPER(TRIM(COALESCE(kind,'')))='ENTRY'
+                          AND UPPER(TRIM(COALESCE(status,''))) IN
+                              ('FILLED','PARTIAL_FILL','PARTIALLY_FILLED')
+                          AND position_id::text=%s
+                          AND COALESCE(filled_qty,0)>0
+                          AND fill_price IS NOT NULL
+                          AND filled_ts IS NOT NULL
+                        ORDER BY filled_ts DESC NULLS LAST
+                        LIMIT 2
+                        """,
+                        (self.client_id, execution_mode, contract, position_id),
+                    )
+                    return [dict(row) for row in (c.fetchall() or [])]
+
+            rows = run_with_retry(_fetch) or []
+            if not rows:
+                return "NO_EVIDENCE", None
+            if len(rows) != 1:
+                return "AMBIGUOUS", None
+
+            row = rows[0]
+            if (
+                _durable_execution_mode(row) != execution_mode
+                or self._norm_contract(row.get("contract")) != contract
+                or str(row.get("position_id") or "").strip() != position_id
+            ):
+                return "IDENTITY_CONFLICT", None
+            fill_price = _positive_finite_float(row.get("fill_price"))
+            filled_qty = _positive_finite_float(row.get("filled_qty"))
+            if (
+                fill_price <= 0
+                or filled_qty <= 0
+                or filled_qty != int(filled_qty)
+                or not row.get("filled_ts")
+            ):
+                return "MALFORMED", None
+            return "PROVEN", row
+        except Exception as exc:
+            log.error(
+                "[%s] RECONCILER_CANONICAL_OWNER_ENTRY_LOOKUP_FAILED | "
+                "mode=%s contract=%s position_id=%s error=%s",
+                self.client_id, execution_mode, contract, position_id, exc,
+            )
+            return "UNAVAILABLE", None
+
+    def _canonical_owner_postcondition(
+        self,
+        *,
+        contract: str,
+        position_id: str,
+        execution_mode: str,
+    ) -> tuple[bool, str, list[str]]:
+        """Prove exactly one behavior-active canonical owner in one domain."""
+        engine = getattr(self, "exit_engine", None)
+        active_fn = getattr(engine, "active_positions", None)
+        if not callable(active_fn):
+            return False, "OWNER_LOOKUP_UNAVAILABLE", []
+        try:
+            active = active_fn() or []
+        except Exception:
+            return False, "OWNER_LOOKUP_FAILED", []
+
+        expected_client = str(self.client_id or "").strip().lower()
+        owners = []
+        for owner in active:
+            if getattr(owner, "closed", False):
+                continue
+            owner_contract = self._norm_contract(
+                getattr(owner, "option_symbol", "")
+                or getattr(owner, "contract", "")
+            )
+            owner_client = str(getattr(owner, "client_id", "") or "").strip().lower()
+            owner_mode = _normalize_execution_mode(
+                getattr(owner, "execution_mode", "")
+            )
+            if (
+                owner_contract == contract
+                and owner_client == expected_client
+                and owner_mode == execution_mode
+            ):
+                owners.append(owner)
+
+        owner_ids = [str(getattr(owner, "position_id", "") or "") for owner in owners]
+        if not owners:
+            return False, "OWNER_COUNT_0", owner_ids
+        if len(owners) > 1:
+            return False, "OWNER_COUNT_GT1", owner_ids
+        if any(owner_id.startswith("broker-repair-") for owner_id in owner_ids):
+            return False, "BROKER_REPAIR_OWNER_PRESENT", owner_ids
+        if owner_ids[0] != position_id:
+            return False, "CANONICAL_OWNER_MISSING", owner_ids
+        return True, "OK", owner_ids
+
+    def _canonical_owner_diagnostic(
+        self,
+        event: str,
+        *,
+        contract: str,
+        position_id: str,
+        execution_mode: str,
+        disposition: str,
+        owner_reason: str = "",
+        owner_ids: Optional[list[str]] = None,
+        generic_add_ran: bool = False,
+    ) -> None:
+        log.critical(
+            "[%s] %s | mode=%s contract=%s position_id=%s "
+            "disposition=%s owner_reason=%s owner_ids=%s generic_add_ran=%s",
+            self.client_id, event, execution_mode, contract, position_id,
+            disposition or "<unreadable>", owner_reason or "n/a",
+            owner_ids or [], bool(generic_add_ran),
+        )
+
+    def _canonical_owner_hold(
+        self,
+        *,
+        contract: str,
+        position_id: str,
+        execution_mode: str,
+        disposition: str,
+        event: str = "RECONCILER_CANONICAL_OWNER_RETRY_HOLD",
+    ) -> bool:
+        self._canonical_owner_diagnostic(
+            event,
+            contract=contract,
+            position_id=position_id,
+            execution_mode=execution_mode,
+            disposition=disposition,
+        )
+        return False
+
+    def _seed_exit_engine_from_position(self, pos: dict) -> bool:
         if not pos:
-            return
+            return False
 
         pos_id     = str(pos.get("id") or pos.get("position_id") or "")
         contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
         underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
         side       = str(pos.get("direction") or pos.get("side") or "CALL").upper()
-        qty        = int(
-            pos.get("qty")
-            or pos.get("quantity")
-            or pos.get("quantity_remaining")
-            or 0
+        qty_keys = (
+            ("qty", "quantity")
+            if pos.get("qty") is not None or pos.get("quantity") is not None
+            else ("quantity_remaining",)
         )
-        entry_px         = self._safe_float(pos.get("avg_fill") or pos.get("entry_price"), 0.0)
+        qty_value, qty_ok = self._canonical_positive_number(
+            pos, *qty_keys, integral=True
+        )
+        entry_px, entry_ok = self._canonical_positive_number(
+            pos, "avg_fill", "entry_price"
+        )
+        qty = int(qty_value) if qty_ok else 0
         underlying_entry = self._derive_underlying_entry_from_position(
             pos,
             underlying=underlying,
@@ -3917,20 +4112,211 @@ class APBrokerReconciler:
             or str(pos.get("close_confidence") or "").upper().endswith("PRICE_UNTRUSTED")
         )
 
-        if qty <= 0 or entry_px <= 0 or not contract:
-            return
+        expected_client = str(self.client_id or "").strip().lower()
+        position_client = str(pos.get("client_id") or "").strip().lower()
+        engine_mode = _normalize_execution_mode(self.execution_mode)
+        try:
+            from ap.order_state_machine import _durable_execution_mode
+            position_mode = _durable_execution_mode(pos)
+        except Exception:
+            position_mode = None
+        placeholder_ids = {"", "0", "none", "null", "n/a", "na", "unknown", "pending"}
+        exact_occ = bool(re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract))
+        if (
+            pos_id.strip().lower() in placeholder_ids
+            or not expected_client
+            or position_client != expected_client
+            or engine_mode is None
+            or position_mode != engine_mode
+            or not exact_occ
+            or not qty_ok
+            or not entry_ok
+        ):
+            return self._canonical_owner_hold(
+                contract=contract,
+                position_id=pos_id,
+                execution_mode=position_mode or "",
+                disposition="RETRY_CANONICAL_IDENTITY_UNPROVEN",
+            )
 
-        self._seed_exit_engine_from_import(
-            pos_id=pos_id,
+        local_order_id, local_ok = self._canonical_nonblank_value(
+            pos, "local_order_id", "entry_local_order_id"
+        )
+        broker_order_id, broker_ok = self._canonical_nonblank_value(
+            pos, "broker_order_id", "entry_broker_order_id"
+        )
+        signal_id, signal_ok = self._canonical_nonblank_value(pos, "signal_id")
+        canonical_signal_id, canonical_signal_ok = self._canonical_nonblank_value(
+            pos, "canonical_signal_id"
+        )
+        if not all((local_ok, broker_ok, signal_ok, canonical_signal_ok)):
+            return self._canonical_owner_hold(
+                contract=contract,
+                position_id=pos_id,
+                execution_mode=engine_mode,
+                disposition="RETRY_IDENTITY_CONFLICT",
+            )
+
+        evidence_status, evidence = self._filled_entry_evidence_for_canonical_position(
             contract=contract,
-            underlying=underlying,
-            side=side,
-            qty=qty,
-            entry_px=entry_px,
-            stop_underlying=pos.get("stop_underlying") or pos.get("underlying_stop") or 0.0,
-            target_underlying=pos.get("target_underlying") or pos.get("underlying_target") or 0.0,
-            underlying_entry=underlying_entry,
-            price_untrusted=price_untrusted,
+            position_id=pos_id,
+            execution_mode=engine_mode,
+        )
+        if evidence_status not in {"NO_EVIDENCE", "PROVEN"}:
+            return self._canonical_owner_hold(
+                contract=contract,
+                position_id=pos_id,
+                execution_mode=engine_mode,
+                disposition=f"RETRY_ENTRY_EVIDENCE_{evidence_status}",
+            )
+
+        if evidence:
+            for key, canonical_value in (
+                ("local_order_id", local_order_id),
+                ("broker_order_id", broker_order_id),
+                ("signal_id", signal_id),
+                ("canonical_signal_id", canonical_signal_id),
+            ):
+                evidence_value = str(evidence.get(key) or "").strip()
+                if canonical_value and evidence_value and canonical_value != evidence_value:
+                    return self._canonical_owner_hold(
+                        contract=contract,
+                        position_id=pos_id,
+                        execution_mode=engine_mode,
+                        disposition="RETRY_IDENTITY_CONFLICT",
+                    )
+                if not canonical_value and evidence_value:
+                    if key == "local_order_id":
+                        local_order_id = evidence_value
+                    elif key == "broker_order_id":
+                        broker_order_id = evidence_value
+                    elif key == "signal_id":
+                        signal_id = evidence_value
+                    else:
+                        canonical_signal_id = evidence_value
+            evidence_fill = _positive_finite_float(evidence.get("fill_price"))
+            if evidence_fill > 0 and not math.isclose(
+                entry_px, evidence_fill, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                return self._canonical_owner_hold(
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                    disposition="RETRY_ENTRY_FILL_CONFLICT",
+                )
+
+        engine = getattr(self, "exit_engine", None)
+        adoption_fn = getattr(engine, "adopt_canonical_position_identity", None)
+        if not callable(adoption_fn):
+            return self._canonical_owner_hold(
+                contract=contract,
+                position_id=pos_id,
+                execution_mode=engine_mode,
+                disposition="RETRY_ADOPTION_API_UNAVAILABLE",
+            )
+
+        try:
+            adoption = adoption_fn(
+                contract=contract,
+                canonical_position_id=pos_id,
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                signal_id=signal_id,
+                canonical_signal_id=canonical_signal_id,
+                entry_fill=entry_px,
+                entry_ts=pos.get("entry_ts") or pos.get("opened_at"),
+                order_filled_ts=(evidence or {}).get("filled_ts"),
+                execution_mode=engine_mode,
+                client_id=expected_client,
+                underlying_entry=underlying_entry,
+                score=self._safe_float(pos.get("score"), 0.0),
+                tier=str(pos.get("tier") or ""),
+                pattern=str(pos.get("pattern") or ""),
+                direction=side,
+                timeframe=str(pos.get("timeframe") or ""),
+                underlying_stop=self._safe_float(
+                    pos.get("stop_underlying") or pos.get("underlying_stop"), 0.0
+                ),
+                underlying_target=self._safe_float(
+                    pos.get("target_underlying") or pos.get("underlying_target"), 0.0
+                ),
+            )
+        except Exception:
+            return self._canonical_owner_hold(
+                contract=contract,
+                position_id=pos_id,
+                execution_mode=engine_mode,
+                disposition="RETRY_ADOPTION_EXCEPTION",
+                event="RECONCILER_CANONICAL_OWNER_ADOPTION_EXCEPTION",
+            )
+
+        disposition = str(getattr(adoption, "disposition", "") or "")
+        adopted = getattr(adoption, "adopted", None)
+        safe_to_seed = getattr(adoption, "safe_to_seed", None)
+        retryable = getattr(adoption, "retryable", None)
+        if disposition in {"ADOPTED", "ALREADY_CANONICAL_REPAIR_REMOVED"}:
+            if adopted is True and safe_to_seed is False and retryable is False:
+                ok, owner_reason, owner_ids = self._canonical_owner_postcondition(
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                )
+                event = (
+                    "RECONCILER_CANONICAL_OWNER_ADOPTED"
+                    if disposition == "ADOPTED"
+                    else "RECONCILER_CANONICAL_OWNER_ALREADY_CANONICAL"
+                )
+                self._canonical_owner_diagnostic(
+                    event if ok else "RECONCILER_CANONICAL_OWNER_POSTCONDITION_FAILED",
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                    disposition=disposition,
+                    owner_reason=owner_reason,
+                    owner_ids=owner_ids,
+                )
+                return ok
+            disposition = "RETRY_UNREADABLE_ADOPTION_RESULT"
+
+        if disposition == "NO_REPAIR_FOUND":
+            if adopted is False and safe_to_seed is True and retryable is False:
+                add_ran = self._seed_exit_engine_from_import(
+                    pos_id=pos_id,
+                    contract=contract,
+                    underlying=underlying,
+                    side=side,
+                    qty=qty,
+                    entry_px=entry_px,
+                    stop_underlying=pos.get("stop_underlying") or pos.get("underlying_stop") or 0.0,
+                    target_underlying=pos.get("target_underlying") or pos.get("underlying_target") or 0.0,
+                    underlying_entry=underlying_entry,
+                    price_untrusted=price_untrusted,
+                )
+                ok, owner_reason, owner_ids = self._canonical_owner_postcondition(
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                )
+                self._canonical_owner_diagnostic(
+                    "RECONCILER_CANONICAL_OWNER_SEEDED_NO_REPAIR"
+                    if add_ran and ok
+                    else "RECONCILER_CANONICAL_OWNER_POSTCONDITION_FAILED",
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                    disposition=disposition,
+                    owner_reason=owner_reason,
+                    owner_ids=owner_ids,
+                    generic_add_ran=add_ran,
+                )
+                return bool(add_ran and ok)
+            disposition = "RETRY_UNREADABLE_ADOPTION_RESULT"
+
+        return self._canonical_owner_hold(
+            contract=contract,
+            position_id=pos_id,
+            execution_mode=engine_mode,
+            disposition=disposition or "RETRY_UNREADABLE_ADOPTION_RESULT",
         )
 
     def _seed_exit_engine_from_import(
@@ -3946,7 +4332,7 @@ class APBrokerReconciler:
         target_underlying=0.0,
         underlying_entry: float = 0.0,
         price_untrusted: bool = False,
-    ) -> None:
+    ) -> bool:
         _ee = getattr(self, "exit_engine", None)
         if not _ee:
             log.critical(
@@ -3967,7 +4353,7 @@ class APBrokerReconciler:
                 price_untrusted=price_untrusted,
                 underlying_entry=underlying_entry,
             )
-            return
+            return False
 
         try:
             from ap_exit_engine import ManagedPosition
@@ -4030,6 +4416,7 @@ class APBrokerReconciler:
                 underlying_entry=underlying_entry_u,
                 price_untrusted=bool(price_untrusted),
             )
+            return True
         except Exception as e:
             log.error("[%s] Failed to seed exit engine for %s: %s",
                       self.client_id, contract, e)
@@ -4049,6 +4436,7 @@ class APBrokerReconciler:
                 price_untrusted=price_untrusted,
             )
             self._report_health_error(f"exit_engine_seed_failed: {e}", fatal=False)
+            return False
 
     def _broker_position_mark_price(self, bp: dict) -> float:
         """Best-effort option mark/last extraction when cost basis is missing."""
