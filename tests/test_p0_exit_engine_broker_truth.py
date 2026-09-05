@@ -4,6 +4,7 @@ P0: exit-engine broker-truth visibility repair.
 """
 import os, re, sqlite3, pytest, types, sys
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -2070,6 +2071,8 @@ def _pr558_new_engine(email="jason@example.com"):
     eng._positions = []
     eng._positions_by_id = {}
     eng._broker_truth_hold_symbols = set()
+    eng._pending_exit_hydration_status = {}
+    eng._pending_exit_identity_hold_position_ids = set()
     eng._resolved_execution_mode = lambda: "live"
     eng._underlying_from_occ = lambda s: "IWM"
     eng._parse_occ_side = lambda s: "CALL"
@@ -2527,10 +2530,264 @@ def test_pr558_blocker1_test23_crash_restart_convergence_same_canonical_identity
     assert active[0].pending_exit_broker_order_id == "legacy-exit-broker"
     assert active[0].pending_exit_filled_qty == 1
     assert active[0].last_applied_exit_cum_fill == 1
+    assert eng_after._pending_exit_hydration_status[active[0].position_id] == "FOUND"
+    assert active[0].position_id not in eng_after._pending_exit_identity_hold_position_ids
     assert all(
         not getattr(p, "broker_repair_degraded", False)
         for p in eng_after._positions
     )
+
+
+def test_pr558_blocker1_restart_hydration_failure_holds_canonical_owner():
+    """A canonical owner must stay mutation-inert when EXIT hydration fails.
+
+    The durable row may still contain an EXIT keyed by the pre-restart
+    degraded owner.  A transient orders-query failure is not proof that no
+    EXIT exists, so the canonical owner remains active but cannot submit or
+    cancel until a later hydration succeeds.
+    """
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    sym = "IWM270117C00220000"
+
+    class _Broker:
+        account_id = "acct-live-1"
+        mode = "live"
+
+        def list_positions(self):
+            return [{
+                "symbol": sym,
+                "quantity": 1,
+                "cost_basis": 240.0,
+                "date_acquired": "2026-08-01",
+            }]
+
+    empty_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+
+    # Process A owns the broker-open position only through the deterministic
+    # degraded identity and has an active EXIT pending under that identity.
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: None
+    eng._upsert_broker_position_to_db = lambda _sym, _bp: None
+    eng._fetch_broker_quote = empty_quote
+    assert eng._broker_position_precheck() is False
+    degraded = eng._positions[0]
+    degraded.exit_in_flight = True
+    degraded.pending_exit_local_order_id = "legacy-exit-local"
+    degraded.pending_exit_broker_order_id = "legacy-exit-broker"
+
+    # Process B sees the canonical row after restart, but the active EXIT
+    # lookup is temporarily unavailable.  The canonical owner must still be
+    # installed exactly once and held without mutation.
+    eng_after = _pr558_new_engine()
+    canonical_row = {
+        "id": "durable-canonical-558-hydration-hold",
+        "client_id": "jason@example.com",
+        "contract": sym,
+        "option_symbol": sym,
+        "underlying": "IWM",
+        "side": "CALL",
+        "direction": "CALL",
+        "qty": 1,
+        "quantity_remaining": 1,
+        "entry_price": 2.40,
+        "avg_fill": 2.40,
+        "entry_ts": "2026-08-01T13:00:00Z",
+        "status": "OPEN",
+        "signal_id": "signal-558",
+        "execution_mode": "live",
+    }
+    eng_after.broker = _Broker()
+    eng_after._load_db_position_row = lambda _sym: canonical_row
+    eng_after._upsert_broker_position_to_db = lambda *_args: pytest.fail(
+        "canonical restart hydration must not insert a duplicate owner"
+    )
+    eng_after._fetch_broker_quote = empty_quote
+
+    class _FailingCursor:
+        def execute(self, *_args, **_kwargs):
+            raise RuntimeError("temporary orders lookup outage")
+
+        def fetchone(self):
+            return None
+
+    @contextmanager
+    def failing_conn():
+        yield _FailingCursor()
+
+    fake = types.SimpleNamespace(
+        conn=failing_conn,
+        run_with_retry=lambda fn, **_kwargs: fn(),
+    )
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake
+    try:
+        assert eng_after._broker_position_precheck() is True
+        active = eng_after.active_positions()
+        assert len(active) == 1
+        canonical = active[0]
+        assert canonical.position_id == "durable-canonical-558-hydration-hold"
+        assert canonical.broker_repair_degraded is False
+        assert canonical.position_id in eng_after._pending_exit_identity_hold_position_ids
+        assert eng_after._pending_exit_hydration_status[canonical.position_id] == "UNAVAILABLE"
+        assert sym in eng_after._broker_truth_hold_symbols
+
+        eng_after._run_sentinels = lambda: None
+        eng_after._kill_switch_fn = None
+        eng_after._submit_exit_decision = MagicMock()
+        eng_after._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
+        eng_after._submit_exit_decision.assert_not_called()
+
+        # A later retry can prove the same durable EXIT under the stable
+        # degraded-owner identity and release the canonical owner for normal
+        # monitoring, without creating a second EXIT.
+        pending_exit_row = {
+            "position_id": degraded.position_id,
+            "local_order_id": "legacy-exit-local",
+            "broker_order_id": "legacy-exit-broker",
+            "status": "EXIT_SUBMITTED",
+            "qty": 1,
+            "filled_qty": 0,
+            "created_ts": "2026-08-01T13:01:00Z",
+            "submitted_ts": "2026-08-01T13:01:01Z",
+            "updated_ts": "2026-08-01T13:01:02Z",
+        }
+        success_fake, restore_success = _pr558_fake_db_with_rows([pending_exit_row])
+        sys.modules["ap.db"] = success_fake
+        try:
+            status = eng_after._hydrate_pending_exit_identity_for_broker_recovery(
+                canonical, sym, "acct-live-1",
+            )
+        finally:
+            restore_success()
+        assert status == "FOUND"
+        assert canonical.position_id not in eng_after._pending_exit_identity_hold_position_ids
+        assert canonical.pending_exit_local_order_id == "legacy-exit-local"
+        assert canonical.pending_exit_broker_order_id == "legacy-exit-broker"
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+
+def test_pr558_blocker1_proven_no_pending_exit_allows_normal_exit():
+    """A successful empty hydration must not permanently suppress exits."""
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM270117C00220000"
+    pos = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=1,
+        entry_price=2.40, underlying_entry=0.0,
+        underlying_target=0.0, underlying_stop=0.0,
+        position_id="canonical-no-pending-exit",
+        client_id="jason@example.com", execution_mode="live",
+        quantity_remaining=1,
+    )
+    eng._positions = [pos]
+    eng._positions_by_id = {pos.position_id: pos}
+    eng.broker = types.SimpleNamespace(
+        account_id="acct-live-1",
+        mode="live",
+        list_positions=lambda: [],
+    )
+
+    fake, restore = _pr558_fake_db_with_rows([])
+    sys.modules["ap.db"] = fake
+    try:
+        assert eng.hydrate_pending_exit_identity_from_db(pos) is False
+        assert eng._pending_exit_hydration_status[pos.position_id] == "NONE"
+        assert pos.position_id not in eng._pending_exit_identity_hold_position_ids
+
+        eng._run_sentinels = lambda: None
+        eng._kill_switch_fn = None
+        eng._submit_exit_decision = MagicMock()
+        # EOD is an unconditional normal exit decision for this future OCC.
+        eng._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
+        eng._submit_exit_decision.assert_called_once()
+    finally:
+        restore()
+
+
+def test_pr558_blocker2_canonical_adoption_clears_degraded_metadata():
+    """Both canonical adoption success paths must stop degraded retry state."""
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM270117C00220000"
+
+    degraded = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym,
+        broker_position={"contract": sym, "quantity": 1},
+        broker_qty=1,
+        account_id="acct-live-1",
+        repair_failed_reason="temporary-repair-failure",
+    )
+    assert degraded is not None
+    result = eng.adopt_canonical_position_identity(
+        contract=sym,
+        canonical_position_id="durable-canonical-adopt-558",
+        local_order_id="entry-local",
+        broker_order_id="entry-broker",
+        signal_id="signal-558",
+        canonical_signal_id="canonical-signal-558",
+        entry_fill=2.40,
+        entry_ts=None,
+        execution_mode="live",
+        client_id="jason@example.com",
+    )
+    assert result.adopted is True
+    assert degraded.position_id == "durable-canonical-adopt-558"
+    assert degraded.broker_repair_degraded is False
+    assert degraded.broker_repair_degraded_reason == ""
+    assert degraded.broker_repair_degraded_account_id == ""
+
+    # Exercise the already-canonical collapse path as well: stale degraded
+    # flags on a canonical object must be cleared before the next precheck.
+    existing = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=1,
+        entry_price=2.40, underlying_entry=0.0,
+        underlying_target=0.0, underlying_stop=0.0,
+        position_id="durable-canonical-existing-558",
+        client_id="jason@example.com", execution_mode="live",
+        quantity_remaining=1,
+    )
+    existing.broker_repair_degraded = True
+    existing.broker_repair_degraded_reason = "stale"
+    existing.broker_repair_degraded_account_id = "acct-live-1"
+    eng2 = _pr558_new_engine()
+    eng2._positions = [existing]
+    eng2._positions_by_id = {existing.position_id: existing}
+    result_existing = eng2.adopt_canonical_position_identity(
+        contract=sym,
+        canonical_position_id=existing.position_id,
+        local_order_id="entry-local",
+        broker_order_id="entry-broker",
+        signal_id="signal-558",
+        canonical_signal_id="canonical-signal-558",
+        entry_fill=2.40,
+        entry_ts=None,
+        execution_mode="live",
+        client_id="jason@example.com",
+    )
+    assert result_existing.adopted is True
+    assert existing.broker_repair_degraded is False
+    assert existing.broker_repair_degraded_reason == ""
+    assert existing.broker_repair_degraded_account_id == ""
+
+    eng2.broker = types.SimpleNamespace(
+        account_id="acct-live-1",
+        mode="live",
+        list_positions=lambda: [{"symbol": sym, "quantity": 1}],
+    )
+    assert eng2._broker_position_precheck() is True
+    assert not existing.broker_repair_degraded
 
 
 # ─── Structural completeness (tests 18, 19) ───────────────────────────────────

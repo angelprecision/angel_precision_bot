@@ -91,6 +91,11 @@ except Exception:
 log = logging.getLogger("ap.exit_engine")
 ET  = ZoneInfo("America/New_York")
 
+_PENDING_EXIT_HYDRATION_FOUND = "FOUND"
+_PENDING_EXIT_HYDRATION_NONE = "NONE"
+_PENDING_EXIT_HYDRATION_UNAVAILABLE = "UNAVAILABLE"
+_PENDING_EXIT_HYDRATION_AMBIGUOUS = "AMBIGUOUS"
+
 # ── EXIT DECISION LEDGER — best-effort audit; never blocks live exits ─────────
 try:
     from ap.exit_decision_ledger import record_exit_decision as _ledger_record
@@ -1005,6 +1010,16 @@ def _clear_adoption_identity_quarantine(pos) -> None:
         pos.adoptionidentityquarantinereason = ""
     except Exception as _e:
         log.debug("[exit_eng] clear adoption identity quarantine failed: %s", _e)
+
+
+def _clear_broker_repair_degraded_metadata(pos) -> None:
+    """Clear engine-only degraded ownership after canonical adoption."""
+    try:
+        pos.broker_repair_degraded = False
+        pos.broker_repair_degraded_reason = ""
+        pos.broker_repair_degraded_account_id = ""
+    except Exception as _e:
+        log.debug("[exit_eng] clear broker-repair degraded metadata failed: %s", _e)
 
 
 def _is_behavior_active_position(pos) -> bool:
@@ -3606,6 +3621,11 @@ class APExitEngine:
         # They remain behavior-active for monitoring, but this cycle must not
         # manufacture an exit mutation from unproven flatness.
         self._broker_truth_hold_symbols: set[str] = set()
+        # Restart recovery must distinguish "no active EXIT" from an
+        # unavailable/ambiguous durable lookup.  The latter is a per-owner
+        # fail-closed HOLD until a later hydration attempt proves the state.
+        self._pending_exit_hydration_status: dict[str, str] = {}
+        self._pending_exit_identity_hold_position_ids: set[str] = set()
         self._lock         = threading.RLock()
 
         # QPM/admin safety controls:
@@ -3960,6 +3980,11 @@ class APExitEngine:
                         _canon_id, _rp_id, _contract,
                     )
 
+                # Canonical identity is now proven and owns the lifecycle.  Do
+                # not leave engine-only degraded metadata on the canonical
+                # object; otherwise the next precheck can retry/quarantine an
+                # already-canonical owner as if durable repair were pending.
+                _clear_broker_repair_degraded_metadata(_existing_canon)
                 _reclassify_hard_ref_for_entry(_existing_canon)
 
                 # Assert exactly one nonclosed active object for this contract.
@@ -4164,6 +4189,7 @@ class APExitEngine:
                 self._positions_by_id.pop(old_id, None)
                 self._positions_by_id[_canon_id] = pos
                 _clear_adoption_identity_quarantine(pos)
+                _clear_broker_repair_degraded_metadata(pos)
 
                 log.info(
                     "[exit_eng] CANONICAL_POSITION_ADOPTED "
@@ -6623,6 +6649,99 @@ class APExitEngine:
 
         return True
 
+    def _set_pending_exit_hydration_status(
+        self,
+        pos: ManagedPosition,
+        status: str,
+    ) -> None:
+        """Record durable EXIT hydration truth for one active owner.
+
+        A boolean return cannot distinguish a successful empty lookup from a
+        transient/ambiguous lookup.  Keep that distinction outside the
+        position dataclass so legacy test doubles and persisted rows remain
+        unchanged.
+        """
+        position_id = str(getattr(pos, "position_id", "") or "").strip()
+        if not position_id:
+            return
+        statuses = getattr(self, "_pending_exit_hydration_status", None)
+        if not isinstance(statuses, dict):
+            statuses = {}
+            self._pending_exit_hydration_status = statuses
+        holds = getattr(self, "_pending_exit_identity_hold_position_ids", None)
+        if not isinstance(holds, set):
+            holds = set(holds or ())
+            self._pending_exit_identity_hold_position_ids = holds
+        statuses[position_id] = str(status or _PENDING_EXIT_HYDRATION_UNAVAILABLE)
+        if statuses[position_id] in {
+            _PENDING_EXIT_HYDRATION_UNAVAILABLE,
+            _PENDING_EXIT_HYDRATION_AMBIGUOUS,
+        }:
+            holds.add(position_id)
+        else:
+            holds.discard(position_id)
+
+    def _pending_exit_identity_is_unresolved(self, pos: ManagedPosition) -> bool:
+        position_id = str(getattr(pos, "position_id", "") or "").strip()
+        holds = getattr(self, "_pending_exit_identity_hold_position_ids", set())
+        return bool(position_id and position_id in holds)
+
+    def _hydrate_pending_exit_identity_for_broker_recovery(
+        self,
+        pos: ManagedPosition,
+        sym: str,
+        account_id: str,
+    ) -> str:
+        """Hydrate a recovered owner and convert unknown identity to HOLD."""
+        try:
+            self.hydrate_pending_exit_identity_from_db(
+                pos,
+                fallback_position_ids=(
+                    self._degraded_broker_owner_id(sym, account_id),
+                ) if account_id else (),
+            )
+        except Exception as exc:
+            # The production helper is defensive, but keep the broker-repair
+            # seam fail-closed if a test/double or future implementation lets
+            # an exception escape.
+            self._set_pending_exit_hydration_status(
+                pos, _PENDING_EXIT_HYDRATION_UNAVAILABLE,
+            )
+            log.error(
+                "[exit_eng] EXIT_PENDING_IDENTITY_HYDRATION_UNAVAILABLE "
+                "client=%s account=%s contract_symbol=%s position_id=%s "
+                "error=%s",
+                self._email, account_id, sym,
+                getattr(pos, "position_id", ""), exc,
+            )
+
+        statuses = getattr(self, "_pending_exit_hydration_status", {})
+        status = str(
+            statuses.get(
+                str(getattr(pos, "position_id", "") or "").strip(),
+                _PENDING_EXIT_HYDRATION_UNAVAILABLE,
+            )
+        )
+        if status in {
+            _PENDING_EXIT_HYDRATION_UNAVAILABLE,
+            _PENDING_EXIT_HYDRATION_AMBIGUOUS,
+        }:
+            holds = getattr(self, "_broker_truth_hold_symbols", None)
+            if not isinstance(holds, set):
+                holds = set(holds or ())
+                self._broker_truth_hold_symbols = holds
+            normalized_sym = str(sym or "").strip().upper()
+            if normalized_sym:
+                holds.add(normalized_sym)
+            log.error(
+                "[exit_eng] EXIT_PENDING_IDENTITY_HOLD "
+                "client=%s account=%s contract_symbol=%s position_id=%s "
+                "hydration_status=%s — no EXIT submit/cancel mutation this cycle",
+                self._email, account_id, normalized_sym,
+                getattr(pos, "position_id", ""), status,
+            )
+        return status
+
     def hydrate_pending_exit_identity_from_db(
         self,
         pos: ManagedPosition,
@@ -6661,6 +6780,9 @@ class APExitEngine:
                 if candidate and candidate not in position_ids:
                     position_ids.append(candidate)
             if not position_ids:
+                self._set_pending_exit_hydration_status(
+                    pos, _PENDING_EXIT_HYDRATION_UNAVAILABLE,
+                )
                 return False
             position_placeholders = ", ".join("%s" for _ in position_ids)
 
@@ -6691,12 +6813,30 @@ class APExitEngine:
 
             row = run_with_retry(_fn)
             if not row:
+                self._set_pending_exit_hydration_status(
+                    pos, _PENDING_EXIT_HYDRATION_NONE,
+                )
                 return False
 
             row = dict(row)
             local_id  = str(row.get("local_order_id")  or "")
             broker_id = str(row.get("broker_order_id") or "")
             status    = str(row.get("status")           or "")
+
+            if not local_id and not broker_id:
+                # A matching active EXIT row without either durable identity is
+                # not proof that it is safe to submit another EXIT.  Preserve
+                # the owner, mark the lookup ambiguous, and let a later
+                # hydration retry resolve it.
+                self._set_pending_exit_hydration_status(
+                    pos, _PENDING_EXIT_HYDRATION_AMBIGUOUS,
+                )
+                log.error(
+                    "[%s] EXIT_PENDING_IDENTITY_AMBIGUOUS | pos=%s status=%s "
+                    "— refusing to fabricate EXIT identity",
+                    pos.ticker, pos.position_id, status,
+                )
+                return False
 
             pos.exit_in_flight                = True
             pos.pending_exit_local_order_id   = local_id
@@ -6721,8 +6861,14 @@ class APExitEngine:
                 "[%s] HYDRATED ACTIVE EXIT IDENTITY | pos=%s local=%s broker=%s status=%s",
                 pos.ticker, pos.position_id, local_id, broker_id, status,
             )
+            self._set_pending_exit_hydration_status(
+                pos, _PENDING_EXIT_HYDRATION_FOUND,
+            )
             return True
         except Exception as exc:
+            self._set_pending_exit_hydration_status(
+                pos, _PENDING_EXIT_HYDRATION_UNAVAILABLE,
+            )
             log.error(
                 "[%s] hydrate_pending_exit_identity_from_db failed | pos=%s | %s",
                 getattr(pos, "ticker", "?"), getattr(pos, "position_id", "?"),
@@ -6947,7 +7093,11 @@ class APExitEngine:
                     self.add_position(mp)
                     # Reattach any active broker exit order so engine can
                     # monitor/cancel/replace without resubmitting blindly.
-                    self.hydrate_pending_exit_identity_from_db(mp)
+                    self._hydrate_pending_exit_identity_for_broker_recovery(
+                        mp,
+                        str(getattr(mp, "option_symbol", "") or ""),
+                        self._broker_account_id(),
+                    )
                     seeded += 1
                 except Exception as e:
                     log.warning("seed_from_db: skipping row %s: %s", row.get("id"), e)
@@ -8642,11 +8792,8 @@ class APExitEngine:
                     self._install_canonical_owner_atomically(
                         pos, sym, account_id=_account_id
                     )
-                    self.hydrate_pending_exit_identity_from_db(
-                        pos,
-                        fallback_position_ids=(
-                            self._degraded_broker_owner_id(sym, _account_id),
-                        ) if _account_id else (),
+                    self._hydrate_pending_exit_identity_for_broker_recovery(
+                        pos, sym, _account_id,
                     )
                     loaded_db_syms.append(sym)
                 except Exception as _le:
@@ -8714,11 +8861,8 @@ class APExitEngine:
                     self._install_canonical_owner_atomically(
                         pos, sym, account_id=_account_id
                     )
-                    self.hydrate_pending_exit_identity_from_db(
-                        pos,
-                        fallback_position_ids=(
-                            self._degraded_broker_owner_id(sym, _account_id),
-                        ) if _account_id else (),
+                    self._hydrate_pending_exit_identity_for_broker_recovery(
+                        pos, sym, _account_id,
                     )
                     repaired_syms.append(sym)              # confirmed DB row
                 except Exception as _re_err:
@@ -9031,6 +9175,17 @@ class APExitEngine:
             for symbol in getattr(self, "_broker_truth_hold_symbols", set())
             if str(symbol or "").strip()
         }
+        pending_identity_holds = getattr(
+            self, "_pending_exit_identity_hold_position_ids", set()
+        )
+        if pending_identity_holds:
+            broker_truth_hold_symbols.update(
+                str(getattr(pos, "option_symbol", "") or "").strip().upper()
+                for pos in active
+                if str(getattr(pos, "position_id", "") or "").strip()
+                in pending_identity_holds
+                and str(getattr(pos, "option_symbol", "") or "").strip()
+            )
 
         # ── P0-3 tick-level safety: daily-loss self-check ─────────────────────
         # The entry gate triggers the force-close breaker when a NEW signal hits
@@ -9728,6 +9883,25 @@ class APExitEngine:
         option_symbol = str(pos.option_symbol or "")
         position_id   = str(pos.position_id or "")
 
+        # A recovered owner with an unavailable or ambiguous durable EXIT
+        # lookup must remain behavior-active but mutation-inert.  Retry the
+        # lookup once here so a later successful hydration can resume normal
+        # monitoring; never fabricate an in-flight identity or submit a new
+        # EXIT while the identity remains unresolved.
+        if self._pending_exit_identity_is_unresolved(pos):
+            self._hydrate_pending_exit_identity_for_broker_recovery(
+                pos,
+                option_symbol,
+                self._broker_account_id(),
+            )
+            if self._pending_exit_identity_is_unresolved(pos):
+                log.error(
+                    "[%s] EXIT_PENDING_IDENTITY_HOLD | pos=%s "
+                    "— suppressing EXIT submission while durable identity is unresolved",
+                    ticker, position_id,
+                )
+                return False
+
         # ── RESUBMIT GUARD ────────────────────────────────────────────────────
         # Block duplicate exit submission when an active exit order already exists
         # in the DB (EXIT_REQUESTED / EXIT_SUBMITTED / EXIT_ACKNOWLEDGED / PARTIAL).
@@ -9740,7 +9914,18 @@ class APExitEngine:
                 # from DB first so the guard can compare real order status.
                 if (getattr(pos, "exit_in_flight", False)
                         and not getattr(pos, "pending_exit_local_order_id", "")):
-                    self.hydrate_pending_exit_identity_from_db(pos)
+                    self._hydrate_pending_exit_identity_for_broker_recovery(
+                        pos,
+                        option_symbol,
+                        self._broker_account_id(),
+                    )
+                    if self._pending_exit_identity_is_unresolved(pos):
+                        log.error(
+                            "[%s] EXIT_PENDING_IDENTITY_HOLD | pos=%s "
+                            "— resubmit guard cannot prove durable EXIT state",
+                            ticker, position_id,
+                        )
+                        return False
 
                 _osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
                 _active_exit = None
