@@ -2,9 +2,9 @@
 tests/test_p0_exit_engine_broker_truth.py
 P0: exit-engine broker-truth visibility repair.
 """
-import os, re, sqlite3, pytest, types, sys
+import os, re, sqlite3, pytest, types, sys, threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -687,6 +687,22 @@ def test_upsert_broker_position_to_db_persists_exact_mode_in_postgres(monkeypatc
     with _postgres_positions_table(monkeypatch) as pg_conn:
         contract = "QQQ260821P00450000"
         client = "mode-upsert@example.com"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, position_id, kind, status,
+                    contract, execution_mode, filled_qty, fill_price, filled_ts,
+                    meta
+                ) VALUES (%s, %s, %s, 'ENTRY', 'FILLED', %s, 'paper',
+                          %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    "paper-entry-for-recovery", client, "paper-entry-position",
+                    contract, 2, 0.75, "2026-07-22T13:00:00Z", "{}",
+                ),
+            )
+        pg_conn.commit()
 
         eng = engine_cls.__new__(engine_cls)
         eng._email = client
@@ -884,12 +900,17 @@ def test_broker_fetch_failure_does_not_mark_flat():
     Test 4: broker.list_positions() raises → log EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE,
     return False, never touches local engine positions.
     """
-    # Source check: return False after the log (not clearing positions)
-    # Find the except block that handles broker.list_positions failure
-    idx = EE_SRC.find("broker.list_positions() or []")
-    except_start = EE_SRC.find("except Exception as _bp_err:", idx)
-    except_end   = EE_SRC.find("\n        broker_map", except_start)
-    except_block = EE_SRC[except_start:except_end]
+    # Source check: the precheck must consume the shared authoritative truth
+    # seam and return False when that seam reports transport/malformed truth.
+    idx = EE_SRC.find("resolve_authoritative_broker_positions")
+    precheck_start = EE_SRC.rfind("def _broker_position_precheck", 0, idx)
+    precheck_end = EE_SRC.find("\n    def ", idx)
+    precheck_body = EE_SRC[precheck_start:precheck_end]
+    assert idx > precheck_start
+    assert "is_fresh_exact" in precheck_body
+    except_start = precheck_body.find("except Exception as _bp_err:")
+    except_end   = precheck_body.find("\n        broker_map", except_start)
+    except_block = precheck_body[except_start:except_end]
     assert "return False" in except_block, (
         "Broker fetch failure must return False (not proceed)"
     )
@@ -1237,6 +1258,14 @@ class TestDbDictRowContract:
 
     def test_insert_returning_id_extracts_from_dict(self):
         eng = self._new_engine()
+        # Strict broker recovery now requires a proven filled ENTRY before an
+        # INSERT can be exercised.  Keep this test focused on dict-shaped
+        # INSERT ... RETURNING rows by supplying that proven predecessor.
+        eng._find_exact_filled_entry_order = lambda *_args: {
+            "position_id": "entry-position-dict",
+            "filled_qty": 1,
+            "fill_price": 0.97,
+        }
         prior, _ = self._install_dict_fake_db(insert_id="inserted-id-xyz")
         try:
             row_id = eng._upsert_broker_position_to_db(
@@ -1249,6 +1278,11 @@ class TestDbDictRowContract:
 
     def test_conflict_requery_id_extracts_from_dict(self):
         eng = self._new_engine()
+        eng._find_exact_filled_entry_order = lambda *_args: {
+            "position_id": "existing-uuid-99",
+            "filled_qty": 1,
+            "fill_price": 0.97,
+        }
         # INSERT returns None → ON CONFLICT DO NOTHING → re-query hits existing.
         prior, _ = self._install_dict_fake_db(insert_id=None, existing_id="existing-uuid-99")
         try:
@@ -1899,6 +1933,275 @@ def test_pr558_blocker1_convergence_transfers_runtime_state():
     assert canonical.entry_price == 2.40
 
 
+def test_pr585_degraded_protective_reference_is_not_canonical_entry():
+    """Cost basis may support risk-only P&L, never canonical provenance."""
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM270117C00220000"
+    pos = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym,
+        broker_position={"contract": sym, "quantity": 2, "cost_basis": 400.0},
+        broker_qty=2,
+        account_id="acct-live-1",
+        repair_failed_reason="durable_entry_unresolved",
+    )
+    assert pos is not None
+    assert pos.entry_price == 0.0
+    assert pos.signal_id == ""
+    assert pos.underlying_entry == 0.0
+    assert pos.broker_repair_protective_entry_reference == pytest.approx(2.0)
+    assert pos.broker_repair_protective_entry_source == "broker_cost_basis_per_contract"
+
+    now = datetime.now(timezone.utc)
+    pos.current_bid = 1.20
+    pos.current_ask = 1.25
+    pos.current_option_price = 1.20
+    pos.option_bid_valid = True
+    pos.option_quote_fresh = True
+    pos.last_option_bid_update_ts = now
+    pos.last_option_quote_update_ts = now
+    decision = _EE_MOD.evaluate_exit(
+        pos,
+        now.astimezone(_EE_MOD.ET),
+    )
+    assert decision.action == "STOP"
+    assert decision.pnl_pct == pytest.approx(-0.40)
+    assert pos.entry_price == 0.0, "risk-only reference must not become canonical entry"
+
+
+def test_pr585_invalid_or_contradictory_cost_basis_clears_risk_reference():
+    """A later unproven basis retains ownership but cannot retain stale risk data."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    sym = "IWM270117C00220000"
+    pos = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym,
+        broker_position={"contract": sym, "quantity": 1, "cost_basis": 200.0},
+        broker_qty=1,
+        account_id="acct-live-1",
+        repair_failed_reason="temporary",
+    )
+    assert pos is not None
+    assert pos.broker_repair_protective_entry_reference == pytest.approx(2.0)
+
+    refreshed = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym,
+        broker_position={
+            "contract": sym,
+            "quantity": 1,
+            "cost_basis": 200.0,
+            "raw": {"contract": sym, "quantity": 1, "cost_basis": 250.0},
+        },
+        broker_qty=1,
+        account_id="acct-live-1",
+        repair_failed_reason="basis_conflict",
+    )
+    assert refreshed is pos
+    assert refreshed.entry_price == 0.0
+    assert refreshed.broker_repair_protective_entry_reference == 0.0
+    assert refreshed.broker_repair_protective_entry_source == ""
+
+
+def test_pr585_degraded_protective_loss_reaches_existing_exit_submit_path():
+    """Fresh bid P&L may trigger the existing protective OSM handoff only."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if engine_cls is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+
+    class _Broker:
+        account_id = "acct-live-1"
+        mode = "live"
+
+        def list_positions(self):
+            return [{
+                "symbol": "IWM270117C00220000",
+                "quantity": 2,
+                "cost_basis": 400.0,
+            }]
+
+    eng = engine_cls.__new__(engine_cls)
+    eng._email = "jason@example.com"
+    eng._lock = __import__("threading").RLock()
+    eng._positions = []
+    eng._positions_by_id = {}
+    eng._broker_truth_hold_symbols = set()
+    eng._pending_exit_hydration_status = {}
+    eng._pending_exit_identity_hold_position_ids = set()
+    eng._resolved_execution_mode = lambda: "live"
+    eng.broker = _Broker()
+    eng.order_state_machine = None
+    eng.osm = None
+    eng.on_scale = None
+    eng._emit_exit_event = lambda *args, **kwargs: None
+    eng._clear_degraded_monitoring_state = lambda *args, **kwargs: None
+    eng.on_exit = MagicMock(
+        return_value={
+            "accepted": True,
+            "local_order_id": "protective-exit-local",
+            "broker_order_id": "protective-exit-broker",
+        }
+    )
+    pos = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym="IWM270117C00220000",
+        broker_position={
+            "contract": "IWM270117C00220000",
+            "quantity": 2,
+            "cost_basis": 400.0,
+        },
+        broker_qty=2,
+        account_id="acct-live-1",
+        repair_failed_reason="entry_provenance_unresolved",
+    )
+    assert pos is not None
+    now = datetime.now(timezone.utc)
+    pos.opened_at = now - timedelta(minutes=20)
+    pos.current_bid = 1.20
+    pos.current_ask = 1.25
+    pos.current_option_price = 1.20
+    pos.option_bid_valid = True
+    pos.option_quote_fresh = True
+    pos.last_option_bid_update_ts = now
+    pos.last_option_quote_update_ts = now
+
+    decision = _EE_MOD.evaluate_exit(pos, now.astimezone(_EE_MOD.ET))
+    assert decision.action == "STOP"
+    assert decision.pnl_pct == pytest.approx(-0.40)
+
+    import ap.exit_safety as exit_safety
+    with patch.object(
+        exit_safety,
+        "evaluate_exit_submission_safety",
+        return_value={"blocked": False},
+    ):
+        submitted = eng._submit_exit_decision(pos, decision)
+
+    assert submitted is True
+    eng.on_exit.assert_called_once()
+    assert pos.pending_exit_local_order_id == "protective-exit-local"
+    assert pos.pending_exit_broker_order_id == "protective-exit-broker"
+    assert pos.entry_price == 0.0
+    assert pos.signal_id == ""
+    assert pos.underlying_entry == 0.0
+    assert pos.pending_exit_action == "STOP"
+
+
+def test_pr585_degraded_install_race_canonical_wins_in_locked_recheck():
+    """A canonical owner inserted during the pre-read prevents a duplicate."""
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM270117C00220000"
+    pre_read_returned = threading.Event()
+    release_pre_read = threading.Event()
+    original_find = eng._find_degraded_broker_owner_by_contract
+
+    def paused_find(contract, account_id=None):
+        pre_read_returned.set()
+        assert release_pre_read.wait(2.0)
+        return original_find(contract, account_id)
+
+    eng._find_degraded_broker_owner_by_contract = paused_find
+    result = []
+    errors = []
+
+    def install():
+        try:
+            result.append(
+                eng._install_or_refresh_degraded_broker_truth_owner(
+                    sym=sym,
+                    broker_position={"contract": sym, "quantity": 1, "cost_basis": 200.0},
+                    broker_qty=1,
+                    account_id="acct-live-1",
+                    repair_failed_reason="temporary",
+                )
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = threading.Thread(target=install)
+    thread.start()
+    assert pre_read_returned.wait(2.0)
+
+    canonical = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=1,
+        quantity_remaining=1, entry_price=2.0,
+        underlying_entry=0.0, underlying_target=0.0, underlying_stop=0.0,
+        position_id="canonical-race-owner", client_id="jason@example.com",
+        execution_mode="live",
+    )
+    with eng._lock:
+        eng._positions.append(canonical)
+        eng._positions_by_id[canonical.position_id] = canonical
+    release_pre_read.set()
+    thread.join(timeout=2.0)
+
+    assert not errors
+    assert result == [canonical]
+    assert eng.active_positions() == [canonical]
+    assert not any(getattr(pos, "broker_repair_degraded", False) for pos in eng._positions)
+
+
+def test_pr585_exit_fill_watermark_transfer_is_identity_scoped():
+    """A new EXIT generation cannot inherit the prior generation's scalar."""
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM270117C00220000"
+
+    canonical = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=2,
+        quantity_remaining=2, entry_price=2.0,
+        underlying_entry=0.0, underlying_target=0.0, underlying_stop=0.0,
+        position_id="canonical-watermark", client_id="jason@example.com",
+        execution_mode="live",
+    )
+    canonical.last_applied_exit_local_order_id = "local-generation-a"
+    canonical.last_applied_exit_broker_order_id = "broker-generation-a"
+    canonical.last_applied_exit_cum_fill = 2
+    canonical.last_applied_exit_cum_fill_by_order = {
+        "local-generation-a": 2,
+        "broker-generation-a": 2,
+    }
+    eng._apply_degraded_runtime_transfer(
+        canonical,
+        {
+            "last_applied_exit_local_order_id": "local-generation-b",
+            "last_applied_exit_broker_order_id": "broker-generation-b",
+            "last_applied_exit_cum_fill": 7,
+            "last_applied_exit_cum_fill_by_order": {
+                "local-generation-b": 7,
+                "broker-generation-b": 7,
+            },
+        },
+    )
+    assert canonical.last_applied_exit_cum_fill == 2
+    assert canonical.last_applied_exit_cum_fill_by_order == {
+        "local-generation-a": 2,
+        "broker-generation-a": 2,
+    }
+
+    eng._apply_degraded_runtime_transfer(
+        canonical,
+        {
+            "last_applied_exit_local_order_id": "local-generation-a",
+            "last_applied_exit_broker_order_id": "broker-generation-a",
+            "last_applied_exit_cum_fill": 3,
+            "last_applied_exit_cum_fill_by_order": {
+                "local-generation-a": 3,
+                "broker-generation-a": 3,
+            },
+        },
+    )
+    assert canonical.last_applied_exit_cum_fill == 3
+    assert canonical.last_applied_exit_cum_fill_by_order["broker-generation-a"] == 3
+
+
 def test_pr558_blocker1_degraded_owner_makes_no_fabricated_history():
     """The degraded owner represents only 'fresh broker truth says this
     position is open'.  It must not carry any fabricated history:
@@ -2134,6 +2437,117 @@ def test_pr558_blocker2_test09_multi_candidate_zero_broker_matches_returns_unres
     assert result is None, (
         f"expected None (UNRESOLVED, keep degraded), got: {result}"
     )
+
+
+def test_pr585_unresolved_entry_provenance_blocks_canonical_upsert():
+    """No exact filled ENTRY match may become a UUID-backed OPEN row."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    contract = "IWM260117C00220000"
+    executed_sql = []
+
+    class _Cursor:
+        def execute(self, sql, params=()):
+            executed_sql.append(str(sql))
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+    @contextmanager
+    def _conn():
+        yield _Cursor()
+
+    fake = types.SimpleNamespace(conn=_conn, run_with_retry=lambda fn, **_: fn())
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake
+    try:
+        with patch.object(
+            _EE_MOD._uuid,
+            "uuid4",
+            side_effect=AssertionError("UUID must not be generated"),
+        ):
+            row_id = eng._upsert_broker_position_to_db(
+                contract,
+                {"contract": contract, "quantity": 2, "cost_basis": 400.0},
+            )
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert row_id is None
+    assert not any("INSERT INTO positions" in sql for sql in executed_sql)
+
+
+def test_pr585_authoritative_precheck_ignores_unrelated_signed_positions():
+    """Unrelated stock/short rows must not poison exact target recovery."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    target = "IWM270117C00220000"
+    unrelated_short_option = "SPY270117P00400000"
+
+    class _Broker:
+        account_id = "acct-live-1"
+        mode = "live"
+
+        def list_positions(self):
+            return [
+                {"symbol": "AAPL", "quantity": -100},
+                {
+                    "symbol": unrelated_short_option,
+                    "quantity": -3,
+                    "side": "short",
+                },
+                {
+                    "symbol": target,
+                    "quantity": 2,
+                    "cost_basis": 400.0,
+                },
+            ]
+
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: None
+    eng._upsert_broker_position_to_db = lambda _sym, _bp: None
+    result = eng._broker_position_precheck()
+
+    assert result is False  # durable repair intentionally remains unavailable
+    degraded = [
+        pos for pos in eng._positions
+        if getattr(pos, "broker_repair_degraded", False)
+    ]
+    assert len(degraded) == 1
+    assert degraded[0].option_symbol == target
+    assert degraded[0].quantity_remaining == 2
+    assert degraded[0].broker_repair_protective_entry_reference == pytest.approx(2.0)
+    assert all(pos.option_symbol == target for pos in degraded)
+
+
+def test_pr585_authoritative_malformed_empty_envelope_holds_without_owner():
+    """A bare positions={} envelope is malformed, never authoritative flat."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+
+    class _Broker:
+        account_id = "acct-live-1"
+        mode = "live"
+
+        def list_positions_authoritative(self):
+            return {"positions": {}}
+
+        def list_positions(self):
+            pytest.fail("weak list_positions fallback must not be used")
+
+    eng.broker = _Broker()
+    assert eng._broker_position_precheck() is False
+    assert eng._positions == []
+    assert eng._positions_by_id == {}
 
 
 def test_pr558_blocker2_test10_multi_candidate_both_match_returns_ambiguous():
@@ -2505,6 +2919,10 @@ def test_pr558_blocker1_test23_crash_restart_convergence_same_canonical_identity
 
     pending_exit_row = {
         "position_id": degraded[0].position_id,
+        "client_id": "jason@example.com",
+        "contract": sym,
+        "execution_mode": "live",
+        "kind": "EXIT",
         "local_order_id": "legacy-exit-local",
         "broker_order_id": "legacy-exit-broker",
         "status": "EXIT_SUBMITTED",
@@ -2633,7 +3051,10 @@ def test_pr558_blocker1_restart_hydration_failure_holds_canonical_owner():
         assert canonical.broker_repair_degraded is False
         assert canonical.position_id in eng_after._pending_exit_identity_hold_position_ids
         assert eng_after._pending_exit_hydration_status[canonical.position_id] == "UNAVAILABLE"
-        assert sym in eng_after._broker_truth_hold_symbols
+        assert sym not in eng_after._broker_truth_hold_symbols, (
+            "pending EXIT identity must not become a permanent broker-symbol hold; "
+            "the position-specific identity hold is retried normally"
+        )
 
         eng_after._run_sentinels = lambda: None
         eng_after._kill_switch_fn = None
@@ -2646,6 +3067,10 @@ def test_pr558_blocker1_restart_hydration_failure_holds_canonical_owner():
         # monitoring, without creating a second EXIT.
         pending_exit_row = {
             "position_id": degraded.position_id,
+            "client_id": "jason@example.com",
+            "contract": sym,
+            "execution_mode": "live",
+            "kind": "EXIT",
             "local_order_id": "legacy-exit-local",
             "broker_order_id": "legacy-exit-broker",
             "status": "EXIT_SUBMITTED",
@@ -2714,6 +3139,73 @@ def test_pr558_blocker1_proven_no_pending_exit_allows_normal_exit():
         restore()
 
 
+def test_pr585_pending_exit_identity_hold_retries_and_resumes_action_loop():
+    """A transient hydration hold must clear on a later successful read."""
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM270117C00220000"
+    pos = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=1,
+        quantity_remaining=1, entry_price=2.0,
+        underlying_entry=0.0, underlying_target=0.0, underlying_stop=0.0,
+        position_id="canonical-retry-owner", client_id="jason@example.com",
+        execution_mode="live",
+    )
+    eng._positions = [pos]
+    eng._positions_by_id = {pos.position_id: pos}
+    eng.broker = types.SimpleNamespace(
+        account_id="acct-live-1",
+        mode="live",
+        list_positions=lambda: [],
+    )
+    eng._run_sentinels = lambda: None
+    eng._kill_switch_fn = None
+    eng._emit_exit_event = lambda *args, **kwargs: None
+    eng._submit_exit_decision = MagicMock()
+    eng._set_pending_exit_hydration_status(
+        pos, "UNAVAILABLE",
+    )
+
+    @contextmanager
+    def failing_conn():
+        class _Cursor:
+            def execute(self, *_args, **_kwargs):
+                raise RuntimeError("temporary orders lookup outage")
+
+            def fetchall(self):
+                return []
+
+        yield _Cursor()
+
+    failing_db = types.SimpleNamespace(
+        conn=failing_conn,
+        run_with_retry=lambda fn, **_kwargs: fn(),
+    )
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = failing_db
+    try:
+        eng._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
+        eng._submit_exit_decision.assert_not_called()
+        assert pos.position_id in eng._pending_exit_identity_hold_position_ids
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    success_db, restore = _pr558_fake_db_with_rows([])
+    sys.modules["ap.db"] = success_db
+    try:
+        eng._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
+    finally:
+        restore()
+
+    eng._submit_exit_decision.assert_called_once()
+    assert pos.position_id not in eng._pending_exit_identity_hold_position_ids
+
+
 def test_pr558_blocker1_multiple_active_exit_rows_are_ambiguous():
     """Canonical+degraded active EXIT rows must fail closed as AMBIGUOUS."""
     eng = _pr558_new_engine()
@@ -2735,6 +3227,10 @@ def test_pr558_blocker1_multiple_active_exit_rows_are_ambiguous():
     rows = [
         {
             "position_id": pos.position_id,
+            "client_id": "jason@example.com",
+            "contract": sym,
+            "execution_mode": "live",
+            "kind": "EXIT",
             "local_order_id": "canonical-exit-local",
             "broker_order_id": "canonical-exit-broker",
             "status": "EXIT_ACKNOWLEDGED",
@@ -2746,6 +3242,10 @@ def test_pr558_blocker1_multiple_active_exit_rows_are_ambiguous():
         },
         {
             "position_id": degraded_id,
+            "client_id": "jason@example.com",
+            "contract": sym,
+            "execution_mode": "live",
+            "kind": "EXIT",
             "local_order_id": "degraded-exit-local",
             "broker_order_id": "degraded-exit-broker",
             "status": "EXIT_SUBMITTED",
@@ -2777,6 +3277,47 @@ def test_pr558_blocker1_multiple_active_exit_rows_are_ambiguous():
         eng._submit_exit_decision.assert_not_called()
     finally:
         restore()
+
+
+def test_pr585_pending_exit_wrong_mode_or_occ_is_ambiguous():
+    """A durable row must match current client/mode/exact OCC/owner."""
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM270117C00220000"
+    pos = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=1,
+        entry_price=2.40, underlying_entry=0.0, underlying_target=0.0,
+        underlying_stop=0.0, position_id="canonical-identity-fence",
+        client_id="jason@example.com", execution_mode="live",
+        quantity_remaining=1,
+    )
+    eng._positions = [pos]
+    eng._positions_by_id = {pos.position_id: pos}
+    rows = [{
+        "position_id": pos.position_id,
+        "client_id": "jason@example.com",
+        "contract": "IWM270117P00220000",
+        "execution_mode": "paper",
+        "kind": "EXIT",
+        "local_order_id": "wrong-exit-local",
+        "broker_order_id": "wrong-exit-broker",
+        "status": "EXIT_SUBMITTED",
+        "qty": 1,
+        "filled_qty": 0,
+    }]
+    fake, restore = _pr558_fake_db_with_rows(rows)
+    sys.modules["ap.db"] = fake
+    try:
+        status = eng.hydrate_pending_exit_identity_from_db(pos)
+    finally:
+        restore()
+    assert status is False
+    assert eng._pending_exit_hydration_status[pos.position_id] == "AMBIGUOUS"
+    assert pos.position_id in eng._pending_exit_identity_hold_position_ids
+    assert pos.pending_exit_local_order_id == ""
+    assert pos.pending_exit_broker_order_id == ""
 
 
 def test_pr558_blocker2_canonical_adoption_clears_degraded_metadata():

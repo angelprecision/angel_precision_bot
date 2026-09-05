@@ -290,7 +290,10 @@ class ExitDecisionSnapshot:
                              (NEVER midpoint/ask/last for soft exit decisions)
     option_bid_valid       — bid is a real finite positive number
     option_quote_fresh     — quote timestamp within EXIT_ENGINE_STALE_OPTION_QUOTE_SEC
-    exit_executable_pnl_pct — bid-based P&L vs entry; None when bid unavailable
+    entry_price             — canonical entry, or a separately labelled
+                              degraded risk-only reference
+    exit_executable_pnl_pct — bid-based P&L vs the selected risk denominator;
+                              None when bid unavailable
     display_pnl_pct        — midpoint-based P&L for charting / display only
 
     underlying_available   — current underlying price is a real positive number
@@ -455,7 +458,10 @@ def _build_exit_decision_snapshot(
         und_fresh = und_available and _und_ts_fresh
 
     # ── P&L ──────────────────────────────────────────────────────────────────
-    entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    # For a degraded broker-truth owner this is a risk-only denominator.  It
+    # is deliberately not copied into pos.entry_price or any canonical
+    # identity/history field.
+    entry_price, _entry_source = _protective_entry_reference(pos)
     exec_pnl: Optional[float] = None
     disp_pnl: Optional[float] = None
 
@@ -646,6 +652,45 @@ def _normalize_hard_ref_ts(ts, *, now_utc: Optional[datetime] = None) -> Optiona
         return normalize_hard_ref_ts(ts, now_utc=now_utc or datetime.now(timezone.utc))
     except Exception:
         return None
+
+
+def _protective_entry_reference(
+    pos: "ManagedPosition",
+) -> tuple[float, str]:
+    """Return a proven entry denominator for risk-only option protection.
+
+    Canonical ``entry_price`` remains the only historical/identity entry
+    value.  A degraded broker-truth owner may additionally carry a separately
+    labelled per-contract reference derived from an exact OCC position's
+    positive total cost basis.  That reference is intentionally visible only
+    to protective P&L consumers; it is never written back to canonical
+    identity, signal, geometry, or proof fields.
+    """
+    try:
+        canonical_entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        canonical_entry = 0.0
+    if math.isfinite(canonical_entry) and canonical_entry > 0.0:
+        return canonical_entry, "canonical_entry"
+
+    if not bool(getattr(pos, "broker_repair_degraded", False)):
+        return 0.0, ""
+    source_raw = getattr(pos, "broker_repair_protective_entry_source", None)
+    if source_raw in (None, ""):
+        source_raw = getattr(pos, "brokerrepairprotectiveentrysource", "")
+    source = str(source_raw or "").strip().lower()
+    if source != "broker_cost_basis_per_contract":
+        return 0.0, ""
+    reference_raw = getattr(pos, "broker_repair_protective_entry_reference", None)
+    if reference_raw in (None, "", 0, 0.0):
+        reference_raw = getattr(pos, "brokerrepairprotectiveentryreference", 0.0)
+    try:
+        reference = float(reference_raw or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, ""
+    if not math.isfinite(reference) or reference <= 0.0:
+        return 0.0, ""
+    return reference, source
 
 
 def get_effective_hard_exit_reference(
@@ -930,7 +975,7 @@ def _dedicated_bid_pnl(
     try:
         bid = float(getattr(pos, "current_bid",
                             getattr(pos, "currentbid", 0.0)) or 0.0)
-        entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        entry, _entry_source = _protective_entry_reference(pos)
     except (TypeError, ValueError):
         return None, None
     if bid <= 0.0 or entry <= 0.0:
@@ -1018,6 +1063,10 @@ def _clear_broker_repair_degraded_metadata(pos) -> None:
         pos.broker_repair_degraded = False
         pos.broker_repair_degraded_reason = ""
         pos.broker_repair_degraded_account_id = ""
+        pos.broker_repair_protective_entry_reference = 0.0
+        pos.brokerrepairprotectiveentryreference = 0.0
+        pos.broker_repair_protective_entry_source = ""
+        pos.brokerrepairprotectiveentrysource = ""
     except Exception as _e:
         log.debug("[exit_eng] clear broker-repair degraded metadata failed: %s", _e)
 
@@ -1502,6 +1551,12 @@ class ManagedPosition:
     broker_repair_degraded: bool = False
     broker_repair_degraded_reason: str = ""
     broker_repair_degraded_account_id: str = ""
+    # Risk-only broker repair reference.  This is intentionally separate from
+    # canonical entry_price: it may support protective option P&L decisions
+    # while durable ENTRY provenance remains unresolved.  It must never feed
+    # identity, signal, geometry, proof, or canonical history.
+    broker_repair_protective_entry_reference: float = 0.0
+    broker_repair_protective_entry_source: str = ""
 
     # Quote-health fields
     last_quote_update_ts: Optional[datetime] = None
@@ -1851,9 +1906,18 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     _effective_hard_ref = get_effective_hard_exit_reference(pos, now_utc)
 
     hour, minute = now_et.hour, now_et.minute
-    # option_pnl: backward-compatible (bid for LIVE, mid for PAPER) — ONLY used
-    # by hard exits that must fire even without a valid bid.
+    # option_pnl: backward-compatible (bid for LIVE, mid for PAPER), with the
+    # degraded owner's separately labelled risk-only denominator when one is
+    # available.  This local value never writes canonical entry_price.
     option_pnl   = pos.option_pnl_pct
+    _risk_entry_price, _risk_entry_source = _protective_entry_reference(pos)
+    if _risk_entry_source == "broker_cost_basis_per_contract" and _risk_entry_price > 0.0:
+        try:
+            _risk_price = float(getattr(pos, "current_option_price", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            _risk_price = 0.0
+        if _risk_price > 0.0:
+            option_pnl = (_risk_price - _risk_entry_price) / _risk_entry_price
     _decision_pnl = _effective_hard_ref if _effective_hard_ref is not None else option_pnl
     # exec_pnl: always BID-based — used by ALL soft exit branches.
     # May be None when bid is missing.  Soft exit gates will catch None.
@@ -3438,6 +3502,37 @@ def _broker_repair_float(value) -> Optional[float]:
     return result if math.isfinite(result) else None
 
 
+def _broker_repair_cost_basis(broker_position: dict) -> Optional[float]:
+    """Return cost basis only when every supplied copy agrees.
+
+    The authoritative normalizer retains the provider row under ``raw`` so
+    recovery can consume economics without rebuilding identity parsing.  A
+    provider/test double can therefore expose the same field at both levels;
+    contradictory or malformed copies must not become a protective
+    denominator or canonical-entry input.
+    """
+    if not isinstance(broker_position, dict):
+        return None
+    records = [broker_position]
+    nested = broker_position.get("raw")
+    if isinstance(nested, dict):
+        records.append(nested)
+    values = []
+    saw_value = False
+    for record in records:
+        for key in ("cost_basis", "costBasis"):
+            if key not in record or record.get(key) in (None, ""):
+                continue
+            saw_value = True
+            parsed = _broker_repair_float(record.get(key))
+            if parsed is None:
+                return None
+            values.append(parsed)
+    if not saw_value or any(candidate != values[0] for candidate in values[1:]):
+        return None
+    return values[0]
+
+
 def _broker_repair_positive_int(value) -> Optional[int]:
     if value is None or isinstance(value, bool):
         return None
@@ -3575,7 +3670,7 @@ def _broker_repair_order_matches(order: dict, broker_position: dict) -> bool:
         elif abs((order_ts - broker_ts).total_seconds()) > 600:
             return False
 
-    cost_basis = _broker_repair_float(broker_position.get("cost_basis"))
+    cost_basis = _broker_repair_cost_basis(broker_position)
     fill_price = _broker_repair_float(
         order.get("fill_price") or order.get("avg_fill") or order.get("price")
     )
@@ -6726,17 +6821,12 @@ class APExitEngine:
             _PENDING_EXIT_HYDRATION_UNAVAILABLE,
             _PENDING_EXIT_HYDRATION_AMBIGUOUS,
         }:
-            holds = getattr(self, "_broker_truth_hold_symbols", None)
-            if not isinstance(holds, set):
-                holds = set(holds or ())
-                self._broker_truth_hold_symbols = holds
             normalized_sym = str(sym or "").strip().upper()
-            if normalized_sym:
-                holds.add(normalized_sym)
             log.error(
                 "[exit_eng] EXIT_PENDING_IDENTITY_HOLD "
                 "client=%s account=%s contract_symbol=%s position_id=%s "
-                "hydration_status=%s — no EXIT submit/cancel mutation this cycle",
+                "hydration_status=%s — retryable identity hold; no EXIT "
+                "submit/cancel mutation until durable identity is proven",
                 self._email, account_id, normalized_sym,
                 getattr(pos, "position_id", ""), status,
             )
@@ -6771,6 +6861,46 @@ class APExitEngine:
         try:
             from ap.db import conn, run_with_retry
 
+            expected_client_id = str(
+                getattr(pos, "client_id", None) or self._email or ""
+            ).strip().lower()
+            expected_mode = str(
+                getattr(pos, "execution_mode", None) or ""
+            ).strip().lower()
+            expected_contract = str(
+                getattr(pos, "option_symbol", None)
+                or getattr(pos, "optionsymbol", None)
+                or ""
+            ).strip().upper()
+            try:
+                from ap.exit_safety import (
+                    _normalize_contract as _normalize_broker_contract,
+                    is_valid_exact_occ_contract as _is_exact_occ,
+                )
+                expected_contract = _normalize_broker_contract(expected_contract)
+            except Exception:
+                _is_exact_occ = lambda value: bool(  # noqa: E731
+                    __import__("re").fullmatch(
+                        r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}",
+                        str(value or "").strip().upper(),
+                    )
+                )
+            if (
+                not expected_client_id
+                or expected_mode not in {"live", "paper"}
+                or not _is_exact_occ(expected_contract)
+            ):
+                self._set_pending_exit_hydration_status(
+                    pos, _PENDING_EXIT_HYDRATION_AMBIGUOUS,
+                )
+                log.error(
+                    "[%s] EXIT_PENDING_IDENTITY_AMBIGUOUS | pos=%s "
+                    "reason=current_owner_identity_unproven client=%s mode=%s contract=%s",
+                    getattr(pos, "ticker", "?"), getattr(pos, "position_id", "?"),
+                    expected_client_id, expected_mode, expected_contract,
+                )
+                return False
+
             position_ids = []
             for candidate in (
                 getattr(pos, "position_id", ""),
@@ -6790,7 +6920,8 @@ class APExitEngine:
                 with conn() as c:
                     c.execute(
                         f"""
-                        SELECT local_order_id, broker_order_id, status,
+                        SELECT position_id, client_id, contract, execution_mode, kind,
+                               local_order_id, broker_order_id, status,
                                qty, filled_qty, created_ts, submitted_ts, updated_ts
                         FROM orders
                         WHERE client_id = %s
@@ -6834,6 +6965,39 @@ class APExitEngine:
                 return False
 
             row = dict(rows[0])
+            row_client_id = str(row.get("client_id") or "").strip().lower()
+            row_position_id = str(row.get("position_id") or "").strip()
+            row_mode = str(row.get("execution_mode") or "").strip().lower()
+            row_contract = str(row.get("contract") or "").strip().upper()
+            try:
+                row_contract = _normalize_broker_contract(row_contract)
+            except Exception:
+                pass
+            if (
+                row_client_id != expected_client_id
+                or row_position_id not in position_ids
+                or row_mode != expected_mode
+                or not _is_exact_occ(row_contract)
+                or row_contract != expected_contract
+                or str(row.get("kind") or "EXIT").strip().upper() != "EXIT"
+            ):
+                # SQL scopes the candidate by client/owner/kind/status, but
+                # mode and exact OCC still need to be proven from the row.
+                # A mismatched durable row is AMBIGUOUS, not an empty lookup:
+                # choosing NONE here could permit a duplicate EXIT submit.
+                self._set_pending_exit_hydration_status(
+                    pos, _PENDING_EXIT_HYDRATION_AMBIGUOUS,
+                )
+                log.error(
+                    "[%s] EXIT_PENDING_IDENTITY_AMBIGUOUS | pos=%s "
+                    "durable_client=%s durable_position=%s durable_mode=%s "
+                    "durable_contract=%s expected_client=%s expected_position_ids=%s "
+                    "expected_mode=%s expected_contract=%s",
+                    getattr(pos, "ticker", "?"), getattr(pos, "position_id", "?"),
+                    row_client_id, row_position_id, row_mode, row_contract,
+                    expected_client_id, position_ids, expected_mode, expected_contract,
+                )
+                return False
             local_id  = str(row.get("local_order_id")  or "")
             broker_id = str(row.get("broker_order_id") or "")
             status    = str(row.get("status")           or "")
@@ -7481,7 +7645,11 @@ class APExitEngine:
             log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=occ_identity_unproven client=%s mode=%s contract=%s", _client, _mode, _contract)
             return None
         try:
-            from ap.exit_safety import is_valid_exact_occ_contract as _occ_valid
+            from ap.exit_safety import (
+                is_valid_exact_occ_contract as _occ_valid,
+                _normalize_contract as _normalize_broker_contract,
+            )
+            _contract = _normalize_broker_contract(_contract)
         except Exception:
             import re as _re
             _occ_valid = lambda _c: bool(  # noqa: E731 — strict local fallback
@@ -7500,10 +7668,17 @@ class APExitEngine:
 
         # Fence 2 — malformed broker position payload (contradictory identity)
         bp = broker_position if isinstance(broker_position, dict) else {}
+        bp_raw = bp.get("raw") if isinstance(bp.get("raw"), dict) else {}
         bp_contract = str(
             bp.get("contract") or bp.get("option_symbol")
-            or bp.get("symbol") or ""
+            or bp.get("symbol")
+            or bp_raw.get("contract") or bp_raw.get("option_symbol")
+            or bp_raw.get("symbol") or ""
         ).strip().upper()
+        try:
+            bp_contract = _normalize_broker_contract(bp_contract)
+        except Exception:
+            pass
         if bp_contract and bp_contract != _contract:
             log.error(
                 "[exit_eng] DEGRADED_OWNER_BLOCKED reason=broker_position_contract_mismatch "
@@ -7512,27 +7687,40 @@ class APExitEngine:
             )
             return None
 
-        # Stable identity: if a degraded owner for this (client, mode, OCC)
-        # already exists, refresh in place rather than creating a new one.
-        existing = self._find_degraded_broker_owner_by_contract(_contract, _account)
-        if existing is not None:
-            with self._lock:
-                # Broker truth is authoritative for this non-canonical owner.
-                # Reconcile both fields exactly, including broker-confirmed
-                # partial reductions (for example 2 -> 1).  Keeping the old
-                # maximum would leave exit sizing stale and could block a
-                # valid close against current broker truth.
-                existing.quantity = qty_int
-                existing.quantity_remaining = qty_int
-                existing.broker_repair_degraded_reason = str(repair_failed_reason or "")
-                existing.broker_repair_degraded_account_id = _account
-            log.info(
-                "[exit_eng] DEGRADED_OWNER_REFRESHED client=%s mode=%s contract=%s "
-                "position_id=%s qty=%d reason=%s",
-                _client, _mode, _contract, existing.position_id, qty_int,
-                repair_failed_reason,
+        # Broker cost basis is never canonical ENTRY provenance.  When the
+        # exact position row nevertheless supplies a finite positive total
+        # basis, retain only a separately labelled per-contract reference for
+        # risk-reducing option protection.  An absent/invalid basis leaves the
+        # owner protected by the existing quote/identity holds without
+        # manufacturing an entry denominator.
+        _bp_account = str(
+            bp.get("account")
+            or bp.get("account_id")
+            or bp.get("account_number")
+            or bp_raw.get("account")
+            or bp_raw.get("account_id")
+            or bp_raw.get("account_number")
+            or ""
+        ).strip().lower()
+        if _bp_account and _bp_account != _account.lower():
+            log.error(
+                "[exit_eng] DEGRADED_OWNER_BLOCKED reason=broker_account_mismatch "
+                "client=%s mode=%s contract=%s expected_account=%s row_account=%s",
+                _client, _mode, _contract, _account, _bp_account,
             )
-            return existing
+            return None
+
+        _cost_basis_value = _broker_repair_cost_basis(bp)
+        _protective_entry_reference_value = 0.0
+        if _cost_basis_value is not None and _cost_basis_value > 0.0:
+            _candidate_reference = _cost_basis_value / qty_int / 100.0
+            if math.isfinite(_candidate_reference) and _candidate_reference > 0.0:
+                _protective_entry_reference_value = _candidate_reference
+
+        # This read is only an optimization/diagnostic.  A canonical owner can
+        # appear after it returns, so installation below must recheck both
+        # owner classes under the same write lock as the append.
+        self._find_degraded_broker_owner_by_contract(_contract, _account)
 
         # New degraded owner — construct with only broker-truth-derivable
         # fields.  Everything else stays at dataclass defaults (no fabrication).
@@ -7557,14 +7745,134 @@ class APExitEngine:
         pos.broker_repair_degraded = True
         pos.broker_repair_degraded_reason = str(repair_failed_reason or "")
         pos.broker_repair_degraded_account_id = _account
+        if _protective_entry_reference_value > 0.0:
+            _set_position_attr_pair(
+                pos,
+                "broker_repair_protective_entry_reference",
+                _protective_entry_reference_value,
+            )
+            _set_position_attr_pair(
+                pos,
+                "broker_repair_protective_entry_source",
+                "broker_cost_basis_per_contract",
+            )
 
+        try:
+            from ap.exit_safety import _normalize_contract as _normalize_broker_contract
+            _normalized_contract = _normalize_broker_contract(_contract)
+        except Exception:
+            _normalized_contract = _contract
+
+        _refresh_owner = None
+        _canonical_owner = None
         with self._lock:
-            # Direct registration, bypassing add_position's canonical dedup.
-            # We already proved uniqueness via _find_degraded_broker_owner_by_contract
-            # above.  A future _take_over_degraded_owner_if_any call will
-            # remove this entry when canonical repair succeeds.
-            self._positions.append(pos)
-            self._positions_by_id[degraded_id] = pos
+            # The canonical recheck closes the read-then-append race: if a
+            # durable behavior-active owner was installed while the initial
+            # degraded lookup was outside the lock, it wins and no degraded
+            # duplicate is appended.
+            for _candidate in self._positions:
+                if getattr(_candidate, "broker_repair_degraded", False):
+                    continue
+                if not _is_behavior_active_position(_candidate):
+                    continue
+                if str(getattr(_candidate, "client_id", "") or "").strip().lower() != _client.lower():
+                    continue
+                if str(getattr(_candidate, "execution_mode", "") or "").strip().lower() != _mode:
+                    continue
+                try:
+                    _candidate_contract = _normalize_broker_contract(
+                        getattr(_candidate, "option_symbol", "") or ""
+                    )
+                except Exception:
+                    _candidate_contract = str(
+                        getattr(_candidate, "option_symbol", "") or ""
+                    ).strip().upper()
+                if _candidate_contract == _normalized_contract:
+                    _canonical_owner = _candidate
+                    break
+
+            if _canonical_owner is None:
+                # Recheck degraded ownership too; the pre-read above is not
+                # authority for uniqueness once concurrent writers are in play.
+                for _candidate in self._positions:
+                    if not getattr(_candidate, "broker_repair_degraded", False):
+                        continue
+                    if not _is_behavior_active_position(_candidate):
+                        continue
+                    if str(getattr(_candidate, "option_symbol", "") or "").strip().upper() != _contract:
+                        continue
+                    if str(getattr(_candidate, "execution_mode", "") or "").strip().lower() != _mode:
+                        continue
+                    if str(getattr(_candidate, "client_id", "") or "").strip().lower() != _client.lower():
+                        continue
+                    if str(
+                        getattr(_candidate, "broker_repair_degraded_account_id", "")
+                        or ""
+                    ).strip() != _account:
+                        continue
+                    _refresh_owner = _candidate
+                    break
+
+            if _canonical_owner is None and _refresh_owner is None:
+                # Direct registration, bypassing add_position's canonical
+                # dedup.  The canonical/degraded uniqueness checks and this
+                # append are one locked operation.
+                self._positions.append(pos)
+                self._positions_by_id[degraded_id] = pos
+
+            if _refresh_owner is not None:
+                # Broker truth is authoritative for this non-canonical owner.
+                # Reconcile both fields exactly, including broker-confirmed
+                # partial reductions (for example 2 -> 1).
+                _refresh_owner.quantity = qty_int
+                _refresh_owner.quantity_remaining = qty_int
+                _refresh_owner.broker_repair_degraded_reason = str(
+                    repair_failed_reason or ""
+                )
+                _refresh_owner.broker_repair_degraded_account_id = _account
+                if _protective_entry_reference_value > 0.0:
+                    _set_position_attr_pair(
+                        _refresh_owner,
+                        "broker_repair_protective_entry_reference",
+                        _protective_entry_reference_value,
+                    )
+                    _set_position_attr_pair(
+                        _refresh_owner,
+                        "broker_repair_protective_entry_source",
+                        "broker_cost_basis_per_contract",
+                    )
+                else:
+                    # A later authoritative snapshot without a valid positive
+                    # basis cannot prove that the prior risk denominator still
+                    # describes the broker position.  Keep the degraded owner,
+                    # but clear the optional risk-only reference fail-closed.
+                    _set_position_attr_pair(
+                        _refresh_owner,
+                        "broker_repair_protective_entry_reference",
+                        0.0,
+                    )
+                    _set_position_attr_pair(
+                        _refresh_owner,
+                        "broker_repair_protective_entry_source",
+                        "",
+                    )
+
+        if _canonical_owner is not None:
+            log.info(
+                "[exit_eng] DEGRADED_OWNER_INSTALL_SKIPPED_CANONICAL "
+                "client=%s mode=%s contract=%s canonical_position_id=%s",
+                _client, _mode, _contract,
+                getattr(_canonical_owner, "position_id", ""),
+            )
+            return _canonical_owner
+        if _refresh_owner is not None:
+            log.info(
+                "[exit_eng] DEGRADED_OWNER_REFRESHED client=%s mode=%s contract=%s "
+                "position_id=%s qty=%d reason=%s",
+                _client, _mode, _contract, _refresh_owner.position_id, qty_int,
+                repair_failed_reason,
+            )
+            return _refresh_owner
 
         log.warning(
             "[exit_eng] DEGRADED_OWNER_INSTALLED client=%s mode=%s contract=%s "
@@ -7645,28 +7953,125 @@ class APExitEngine:
         identity fields; only accumulated exit-behavior state."""
         if not transfer or canonical_pos is None:
             return
+
+        def _identity_from_state(state: dict) -> tuple[str, str, bool]:
+            values = {"local": set(), "broker": set()}
+            for role, pending_key, applied_key in (
+                (
+                    "local",
+                    "pending_exit_local_order_id",
+                    "last_applied_exit_local_order_id",
+                ),
+                (
+                    "broker",
+                    "pending_exit_broker_order_id",
+                    "last_applied_exit_broker_order_id",
+                ),
+            ):
+                for raw in (state.get(pending_key), state.get(applied_key)):
+                    text = str(raw or "").strip()
+                    if text:
+                        values[role].add(text)
+            contradictory = any(len(role_values) > 1 for role_values in values.values())
+            return (
+                next(iter(values["local"])) if len(values["local"]) == 1 else "",
+                next(iter(values["broker"])) if len(values["broker"]) == 1 else "",
+                contradictory,
+            )
+
+        canonical_state = {
+            key: getattr(canonical_pos, key, None)
+            for key in self._DEGRADED_RUNTIME_TRANSFER_KEYS
+        }
+        canonical_local, canonical_broker, canonical_contradictory = _identity_from_state(
+            canonical_state
+        )
+        transfer_local, transfer_broker, transfer_contradictory = _identity_from_state(
+            transfer
+        )
+
+        def _has_unidentified_exit_progress(state: dict) -> bool:
+            if bool(state.get("exit_in_flight", False)):
+                return True
+            for key in (
+                "pending_exit_qty",
+                "pending_exit_filled_qty",
+                "last_applied_exit_cum_fill",
+            ):
+                try:
+                    if int(state.get(key, 0) or 0) > 0:
+                        return True
+                except (TypeError, ValueError):
+                    return True
+            return bool(state.get("last_applied_exit_cum_fill_by_order"))
+
+        # Fill watermarks and pending EXIT state are transferable only when
+        # the generation is provably the same.  A freshly seeded canonical
+        # owner with no EXIT identity may adopt a non-empty incoming identity;
+        # an already-progressed owner with no identity is ambiguous and stays
+        # untouched.  Different/contradictory generations never use max().
+        exit_identity_relation = "unknown"
+        if not canonical_contradictory and not transfer_contradictory:
+            if canonical_local or canonical_broker:
+                _same_local = bool(
+                    canonical_local and transfer_local and canonical_local == transfer_local
+                )
+                _same_broker = bool(
+                    canonical_broker and transfer_broker and canonical_broker == transfer_broker
+                )
+                _role_conflict = bool(
+                    canonical_local and transfer_local and canonical_local != transfer_local
+                ) or bool(
+                    canonical_broker and transfer_broker and canonical_broker != transfer_broker
+                )
+                if not _role_conflict and (_same_local or _same_broker):
+                    exit_identity_relation = "same"
+                else:
+                    exit_identity_relation = "different"
+            elif transfer_local or transfer_broker:
+                exit_identity_relation = (
+                    "adopt"
+                    if not _has_unidentified_exit_progress(canonical_state)
+                    else "unknown"
+                )
+            elif _has_unidentified_exit_progress(transfer):
+                exit_identity_relation = "unknown"
+
+        _identity_transfer_allowed = exit_identity_relation in {"same", "adopt"}
+        _identity_sensitive_keys = {
+            "exit_in_flight",
+            "pending_exit_reason", "pending_exit_action", "pending_exit_qty",
+            "pending_exit_filled_qty", "pending_scale_counted",
+            "pending_exit_local_order_id", "pending_exit_broker_order_id",
+            "last_applied_exit_local_order_id", "last_applied_exit_broker_order_id",
+            "last_applied_exit_cum_fill", "last_applied_exit_cum_fill_by_order",
+        }
+
         for key, value in transfer.items():
             try:
                 current = getattr(canonical_pos, key, None)
-                # For scalar exit-progress state, prefer the higher/truthier
-                # value so we never regress peak/profit tracking during the
-                # takeover.  Straight overwrite for identity-carrying pending
-                # exit fields (canonical seed from DB does not have these).
-                if key in {"peak_pnl_pct", "max_profit_seen", "last_applied_exit_cum_fill"}:
+                if key in _identity_sensitive_keys:
+                    if not _identity_transfer_allowed:
+                        continue
+                    if key in {
+                        "last_applied_exit_cum_fill",
+                        "last_applied_exit_cum_fill_by_order",
+                    }:
+                        # These are merged in one identity-scoped pass below.
+                        continue
+                    # Straight transfer is safe only for a fresh canonical
+                    # default or the already-proven same generation.
+                    if current in (None, "", 0, 0.0, False) or exit_identity_relation == "same":
+                        setattr(canonical_pos, key, value)
+                    continue
+                # Peak/profit state is monotonic evidence and has no order
+                # generation identity.  It may safely use max().
+                if key in {"peak_pnl_pct", "max_profit_seen"}:
                     try:
                         merged = max(float(current or 0), float(value or 0))
                     except (TypeError, ValueError):
                         merged = value
                     setattr(canonical_pos, key, merged)
-                elif key == "last_applied_exit_cum_fill_by_order":
-                    if isinstance(current, dict) and isinstance(value, dict):
-                        for _k, _v in value.items():
-                            try:
-                                current[_k] = max(int(current.get(_k, 0) or 0), int(_v or 0))
-                            except (TypeError, ValueError):
-                                current[_k] = _v
-                    elif isinstance(value, dict):
-                        setattr(canonical_pos, key, dict(value))
                 elif key == "touched_profit":
                     # Sticky — once touched, always touched.
                     setattr(canonical_pos, key, bool(current) or bool(value))
@@ -7681,6 +8086,71 @@ class APExitEngine:
                     "[exit_eng] degraded->canonical transfer failed for key=%s: %s",
                     key, _e,
                 )
+
+        if _identity_transfer_allowed:
+            identity_keys = {
+                value
+                for value in (
+                    canonical_local,
+                    canonical_broker,
+                    transfer_local,
+                    transfer_broker,
+                )
+                if value
+            }
+            current_map = getattr(
+                canonical_pos, "last_applied_exit_cum_fill_by_order", None
+            )
+            if not isinstance(current_map, dict):
+                current_map = {}
+                setattr(canonical_pos, "last_applied_exit_cum_fill_by_order", current_map)
+            incoming_map = transfer.get("last_applied_exit_cum_fill_by_order")
+            if isinstance(incoming_map, dict):
+                for order_id in identity_keys:
+                    if order_id not in incoming_map:
+                        continue
+                    try:
+                        incoming_value = max(0, int(incoming_map[order_id] or 0))
+                        current_value = max(0, int(current_map.get(order_id, 0) or 0))
+                        current_map[order_id] = max(current_value, incoming_value)
+                    except (TypeError, ValueError):
+                        continue
+
+            def _identity_watermark(state: dict, order_map: dict | None, ids: set[str]) -> int:
+                values = []
+                if isinstance(order_map, dict):
+                    for order_id in ids:
+                        try:
+                            values.append(max(0, int(order_map.get(order_id, 0) or 0)))
+                        except (TypeError, ValueError):
+                            pass
+                try:
+                    # A scalar is meaningful only because the state has a
+                    # proven current identity; it is never used without ids.
+                    if ids:
+                        values.append(max(0, int(state.get("last_applied_exit_cum_fill", 0) or 0)))
+                except (TypeError, ValueError):
+                    pass
+                return max(values or [0])
+
+            all_ids = identity_keys
+            current_watermark = _identity_watermark(
+                canonical_state,
+                getattr(canonical_pos, "last_applied_exit_cum_fill_by_order", None),
+                all_ids,
+            )
+            incoming_watermark = _identity_watermark(
+                transfer,
+                incoming_map if isinstance(incoming_map, dict) else None,
+                all_ids,
+            )
+            merged_watermark = max(current_watermark, incoming_watermark)
+            if all_ids:
+                setattr(canonical_pos, "last_applied_exit_cum_fill", merged_watermark)
+                for order_id in all_ids:
+                    current_map[order_id] = max(
+                        int(current_map.get(order_id, 0) or 0), merged_watermark
+                    )
 
     def _install_canonical_owner_atomically(
         self,
@@ -7869,7 +8339,7 @@ class APExitEngine:
         broker_position = bp if isinstance(bp, dict) else {}
         contract = str(sym or "").strip().upper()
         qty = _broker_repair_positive_int(broker_position.get("quantity"))
-        cost_basis = _broker_repair_float(broker_position.get("cost_basis"))
+        cost_basis = _broker_repair_cost_basis(broker_position)
         raw_entry_ts = _broker_repair_entry_timestamp(broker_position)
         if (
             not self._email
@@ -7904,6 +8374,17 @@ class APExitEngine:
             lookup = self._find_exact_filled_entry_order(
                 contract, _mode, broker_position
             )
+            if lookup is None:
+                # No exact filled ENTRY provenance (including a broker
+                # economics mismatch) is a terminal recovery hold for this
+                # attempt.  Never turn broker cost basis alone into a
+                # canonical OPEN position with a fabricated UUID.
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_ENTRY_PROVENANCE_UNRESOLVED "
+                    "client=%s mode=%s contract=%s — canonical insert blocked",
+                    self._email, _mode, contract,
+                )
+                return None
             if isinstance(lookup, dict) and lookup.get("_broker_repair_lookup_status"):
                 log.error(
                     "[exit_eng] BROKER_REPAIR_ENTRY_%s client=%s mode=%s contract=%s "
@@ -7913,7 +8394,7 @@ class APExitEngine:
                 )
                 return None
 
-            order = dict(lookup or {})
+            order = dict(lookup)
             raw_order_ts = order.get("filled_ts")
             if raw_order_ts not in (None, "") and _broker_repair_timestamp(raw_order_ts) is None:
                 log.error(
@@ -8528,7 +9009,14 @@ class APExitEngine:
         _account_id = self._broker_account_id()
         self._broker_truth_hold_symbols = set()
 
-        if not self.broker or not hasattr(self.broker, "list_positions"):
+        _broker_has_position_source = bool(
+            self.broker
+            and (
+                callable(getattr(self.broker, "list_positions", None))
+                or callable(getattr(type(self.broker), "list_positions_authoritative", None))
+            )
+        )
+        if not _broker_has_position_source:
             return True
 
         # ── 0. Count current engine positions for structured logging ──────────
@@ -8540,13 +9028,15 @@ class APExitEngine:
 
         # ── 1. Fetch broker positions ─────────────────────────────────────────
         try:
-            _strict_list_positions = getattr(
-                type(self.broker), "list_positions_strict", None
-            )
-            if callable(_strict_list_positions):
-                broker_positions = _strict_list_positions(self.broker) or []
-            else:
-                broker_positions = self.broker.list_positions() or []
+            from ap.exit_safety import resolve_authoritative_broker_positions
+
+            _broker_truth = resolve_authoritative_broker_positions(broker=self.broker)
+            if not _broker_truth.get("is_fresh_exact", False):
+                _audit = _broker_truth.get("audit") or {}
+                raise RuntimeError(
+                    str(_audit.get("error") or _audit.get("snapshot_status") or "unknown")
+                )
+            broker_positions = _broker_truth.get("positions") or []
         except Exception as _bp_err:
             log.error(
                 "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
@@ -8562,6 +9052,7 @@ class APExitEngine:
 
         broker_map = {}
         broker_observed_map = {}
+        broker_account_mismatch_symbols = set()
         for broker_position in broker_positions:
             if not isinstance(broker_position, dict):
                 log.error(
@@ -8570,13 +9061,57 @@ class APExitEngine:
                     self._email, _account_id,
                 )
                 return False
-            symbol = str(broker_position.get("symbol") or "").strip().upper()
+            symbol = str(
+                broker_position.get("contract")
+                or broker_position.get("symbol")
+                or broker_position.get("option_symbol")
+                or ""
+            ).strip().upper()
+            row_account = str(broker_position.get("account") or "").strip().lower()
+            if row_account and (
+                not _account_id or row_account != str(_account_id).strip().lower()
+            ):
+                # A valid position in another account is not broker truth for
+                # this engine.  Exclude it from both repair and observation;
+                # never let it create a cross-account owner.
+                log.error(
+                    "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
+                    "client=%s account=%s row_account=%s symbol=%s "
+                    "reason=position_account_mismatch",
+                    self._email, _account_id, row_account, symbol or "unknown",
+                )
+                if symbol:
+                    broker_account_mismatch_symbols.add(symbol)
+                continue
+            # The authoritative snapshot also contains legitimate stock rows.
+            # They are valid broker data, but this recovery path owns exact OCC
+            # option contracts only.  Ignore non-option rows so an unrelated
+            # signed stock holding cannot become an invalid repair target.
+            try:
+                from ap.exit_safety import is_valid_exact_occ_contract
+                _is_exact_option = is_valid_exact_occ_contract(
+                    broker_position.get("contract")
+                )
+            except Exception:
+                _is_exact_option = bool(
+                    re.fullmatch(
+                        r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}",
+                        str(broker_position.get("contract") or "").strip().upper(),
+                    )
+                )
+            if not _is_exact_option:
+                log.debug(
+                    "[exit_eng] EXIT_BROKER_PRECHECK_IGNORED_NON_OPTION_ROW "
+                    "client=%s account=%s symbol=%s",
+                    self._email, _account_id, symbol or "unknown",
+                )
+                continue
+            symbol = str(broker_position.get("contract") or "").strip().upper()
             raw_qty = broker_position.get("quantity")
             numeric_qty = _broker_repair_float(raw_qty)
             if (
                 raw_qty in (None, "")
                 or numeric_qty is None
-                or numeric_qty < 0
                 or not numeric_qty.is_integer()
             ):
                 log.error(
@@ -8592,17 +9127,23 @@ class APExitEngine:
                     self._email, _account_id,
                 )
                 return False
-            if symbol and symbol in broker_observed_map:
+            if not symbol:
+                log.error(
+                    "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
+                    "client=%s account=%s reason=position_identity_missing",
+                    self._email, _account_id,
+                )
+                return False
+            if symbol in broker_observed_map:
                 log.error(
                     "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                     "client=%s account=%s symbol=%s reason=duplicate_position_rows",
                     self._email, _account_id, symbol,
                 )
                 return False
-            if symbol:
-                broker_observed_map[symbol] = broker_position
-                if numeric_qty > 0:
-                    broker_map[symbol] = broker_position
+            broker_observed_map[symbol] = broker_position
+            if numeric_qty > 0:
+                broker_map[symbol] = broker_position
         broker_syms = set(broker_map.keys())
 
         # ── 2. Current engine symbols ─────────────────────────────────────────
@@ -8627,6 +9168,16 @@ class APExitEngine:
                 getattr(tracked_pos, "option_symbol", "") or ""
             ).strip().upper()
             if not tracked_sym:
+                continue
+            if tracked_sym in broker_account_mismatch_symbols:
+                broker_zero_unknown_syms.add(tracked_sym)
+                self._broker_truth_hold_symbols.add(tracked_sym)
+                log.error(
+                    "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
+                    "client=%s account=%s contract_symbol=%s "
+                    "reason=position_account_mismatch_for_tracked_owner",
+                    self._email, _account_id, tracked_sym,
+                )
                 continue
             observed = broker_observed_map.get(tracked_sym)
             if observed is None:
@@ -8710,7 +9261,7 @@ class APExitEngine:
         for sym in repair_syms:
             bp         = broker_map[sym]
             broker_qty = _broker_repair_positive_int(bp.get("quantity"))
-            cost_basis_value = _broker_repair_float(bp.get("cost_basis"))
+            cost_basis_value = _broker_repair_cost_basis(bp)
             if broker_qty is None:
                 repair_failed_syms.append(sym)
                 log.error(
@@ -9001,8 +9552,11 @@ class APExitEngine:
             # single seed observation would defeat QPM's two-consecutive-fresh-BID
             # confirmation contract.  QPM arms it within ~2 polls of restart.
             broker_pnl_pct = 0.0
-            if pos.entry_price > 0 and broker_bid > 0:
-                broker_pnl_pct = (broker_bid - pos.entry_price) / pos.entry_price
+            _risk_entry_price, _risk_entry_source = _protective_entry_reference(pos)
+            if _risk_entry_price > 0 and broker_bid > 0:
+                broker_pnl_pct = (
+                    broker_bid - _risk_entry_price
+                ) / _risk_entry_price
                 if broker_pnl_pct > 0 and broker_pnl_pct > pos.peak_pnl_pct:
                     pos.peak_pnl_pct = broker_pnl_pct
                     if broker_pnl_pct > pos.max_profit_seen:
@@ -9185,22 +9739,25 @@ class APExitEngine:
         active = self.active_positions()
         if not active:
             return
+
+        # Pending EXIT identity is a retryable durable-read condition, not a
+        # permanent broker-truth symbol hold.  Rehydrate before the normal
+        # action loop so a later successful lookup can resume monitoring in
+        # this same cycle.  Failure remains mutation-inert below.
+        _pending_retry_account = self._broker_account_id()
+        for _pending_pos in active:
+            if self._pending_exit_identity_is_unresolved(_pending_pos):
+                self._hydrate_pending_exit_identity_for_broker_recovery(
+                    _pending_pos,
+                    str(getattr(_pending_pos, "option_symbol", "") or "").strip().upper(),
+                    _pending_retry_account,
+                )
+
         broker_truth_hold_symbols = {
             str(symbol or "").strip().upper()
             for symbol in getattr(self, "_broker_truth_hold_symbols", set())
             if str(symbol or "").strip()
         }
-        pending_identity_holds = getattr(
-            self, "_pending_exit_identity_hold_position_ids", set()
-        )
-        if pending_identity_holds:
-            broker_truth_hold_symbols.update(
-                str(getattr(pos, "option_symbol", "") or "").strip().upper()
-                for pos in active
-                if str(getattr(pos, "position_id", "") or "").strip()
-                in pending_identity_holds
-                and str(getattr(pos, "option_symbol", "") or "").strip()
-            )
 
         # ── P0-3 tick-level safety: daily-loss self-check ─────────────────────
         # The entry gate triggers the force-close breaker when a NEW signal hits
@@ -9258,6 +9815,17 @@ class APExitEngine:
             for pos in active:
                 now_utc = datetime.now(timezone.utc)
 
+                if self._pending_exit_identity_is_unresolved(pos):
+                    log.warning(
+                        "[exit_eng] EXIT_PENDING_IDENTITY_HOLD "
+                        "client=%s contract_symbol=%s position_id=%s "
+                        "— preserving owner; retry will occur on a later cycle",
+                        self._email,
+                        str(getattr(pos, "option_symbol", "") or "").strip().upper(),
+                        getattr(pos, "position_id", ""),
+                    )
+                    continue
+
                 _broker_truth_hold_sym = str(
                     getattr(pos, "option_symbol", "") or ""
                 ).strip().upper()
@@ -9314,7 +9882,20 @@ class APExitEngine:
                             )
                             pos.last_underlying_quote_missing_ts = None
 
-                option_pnl = pos.option_pnl_pct
+                _risk_entry_price, _risk_entry_source = _protective_entry_reference(pos)
+                if _risk_entry_price > 0.0:
+                    _risk_mark = float(
+                        getattr(pos, "current_option_price", 0.0) or 0.0
+                    )
+                    if _risk_mark <= 0.0:
+                        _risk_mark = float(getattr(pos, "current_bid", 0.0) or 0.0)
+                    option_pnl = (
+                        (_risk_mark - _risk_entry_price) / _risk_entry_price
+                        if _risk_mark > 0.0
+                        else 0.0
+                    )
+                else:
+                    option_pnl = pos.option_pnl_pct
 
                 # EOD PRE-GATE: this must run before any quote/eligibility gate.
                 # After 3:50 PM ET or after market close, a zero/stale option quote
@@ -9440,23 +10021,26 @@ class APExitEngine:
                 # arming authority via two-consecutive-fresh-BID confirmation
                 # (position-scoped).  A single engine-side observation arming
                 # touched_profit would defeat that confirmation contract.
-                if pos.entry_price > 0:
+                if _risk_entry_price > 0:
                     _pg_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
                     _pg_bid_valid = _pg_bid > 0.0
                     if _pg_bid_valid:
-                        _bid_pnl = (_pg_bid - pos.entry_price) / pos.entry_price
+                        _bid_pnl = (_pg_bid - _risk_entry_price) / _risk_entry_price
                         if _bid_pnl > pos.peak_pnl_pct:
                             pos.peak_pnl_pct = _bid_pnl
                             log.debug(
-                                "[%s] PEAK UPDATE (pre-gate, bid) | peak=%.1f%% | bid=$%.2f entry=$%.2f",
-                                pos.ticker, _bid_pnl * 100, _pg_bid, pos.entry_price,
+                                "[%s] PEAK UPDATE (pre-gate, bid) | peak=%.1f%% | bid=$%.2f risk_entry=$%.2f source=%s",
+                                pos.ticker, _bid_pnl * 100, _pg_bid,
+                                _risk_entry_price, _risk_entry_source,
                             )
                         if _bid_pnl > 0 and _bid_pnl > pos.max_profit_seen:
                             pos.max_profit_seen = _bid_pnl
                     # Keep in-memory option_pnl_pct fresh for the DB write below
                     # (display/hard-exit authority — mode-specific, unchanged).
                     if pos.current_option_price > 0:
-                        _raw_pnl = (pos.current_option_price - pos.entry_price) / pos.entry_price
+                        _raw_pnl = (
+                            pos.current_option_price - _risk_entry_price
+                        ) / _risk_entry_price
                         try:
                             pos.option_pnl_pct = _raw_pnl
                         except Exception:
@@ -9477,7 +10061,7 @@ class APExitEngine:
                 # 3. Position is past time-stop threshold
                 # Without this, a QPM gap silently freezes ALL exit logic for
                 # the affected position — stops, force-closes, everything.
-                _has_entry_price  = (getattr(pos, "entry_price", 0) or 0) > 0
+                _has_entry_price  = _risk_entry_price > 0
                 _age_mins         = _position_age_minutes(pos)
                 _stale_age_thresh = float(os.getenv("HARD_STOP_STALE_AGE_MINUTES", "8"))
                 _position_old_enough = _age_mins >= _stale_age_thresh
