@@ -1510,15 +1510,19 @@ def test_pr558_placeholder_account_is_not_authority():
 
 
 def test_pr558_atomic_convergence_orders_add_before_takeover_and_rolls_back():
-    """The canonical handoff seam must register first and remove degraded
-    only afterward, with rollback on registration failure."""
+    """The canonical handoff must keep degraded ownership until transfer
+    validation succeeds, with rollback on any failed handoff."""
     start = EE_SRC.find("def _install_canonical_owner_atomically")
     end = EE_SRC.find("\n    def ", start + 1)
     body = EE_SRC[start:end]
     add_idx = body.find("self.add_position(canonical_pos)")
     take_idx = body.find("self._take_over_degraded_owner_if_any(sym")
     transfer_idx = body.find("self._apply_degraded_runtime_transfer(canonical_pos, transfer)")
-    assert 0 <= add_idx < take_idx < transfer_idx
+    retire_idx = body.find("self._positions.remove(degraded_owner)")
+    assert 0 <= add_idx < take_idx < transfer_idx < retire_idx
+    assert "owner_retained=true" in EE_SRC
+    assert "owner_retained=false" in body[retire_idx:]
+    assert "degraded_removed" in body[transfer_idx:]
     assert "canonical_pos" in body[body.find("except Exception"):]
     assert "existing is not canonical_pos" in body
 
@@ -1868,10 +1872,9 @@ def test_pr558_blocker1_degraded_installer_fails_closed_on_bad_truth():
 
 
 def test_pr558_blocker1_convergence_transfers_runtime_state():
-    """When canonical repair later succeeds, _take_over + _apply_transfer
-    must remove the degraded owner and preserve accumulated exit state
-    (peak_pnl_pct, touched_profit, pending_exit_* identity, quote
-    watermarks) onto the canonical owner."""
+    """When canonical repair later succeeds, the full handoff must preserve
+    accumulated exit state (peak_pnl_pct, touched_profit, pending_exit_*
+    identity, quote watermarks) and leave exactly one active owner."""
     engine_cls = getattr(_EE_MOD, "APExitEngine", None)
     mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
     if engine_cls is None or mp_cls is None:
@@ -1902,12 +1905,6 @@ def test_pr558_blocker1_convergence_transfers_runtime_state():
     degraded.pending_exit_qty = 2
     degraded.exit_in_flight = True
 
-    # Take over — degraded must be removed from the engine.
-    transfer = eng._take_over_degraded_owner_if_any(sym)
-    assert transfer is not None
-    assert degraded not in eng._positions, "degraded owner must be popped from engine on takeover"
-    assert eng._positions_by_id.get(degraded.position_id) is None
-
     # Freshly seeded canonical owner (all runtime fields at their defaults).
     canonical = mp_cls(
         ticker="IWM", option_symbol=sym, side="CALL",
@@ -1918,8 +1915,12 @@ def test_pr558_blocker1_convergence_transfers_runtime_state():
         signal_id="real-sig-1", execution_mode="live",
         quantity_remaining=2,
     )
-    eng._apply_degraded_runtime_transfer(canonical, transfer)
+    eng._install_canonical_owner_atomically(
+        canonical, sym, account_id="acct-live-1",
+    )
 
+    assert eng.active_positions() == [canonical]
+    assert degraded not in eng._positions
     assert canonical.peak_pnl_pct == 0.27, "peak_pnl_pct must survive convergence"
     assert canonical.touched_profit is True, "touched_profit must be sticky"
     assert canonical.current_bid == 1.15
@@ -1931,6 +1932,70 @@ def test_pr558_blocker1_convergence_transfers_runtime_state():
     assert canonical.position_id == "canonical-uuid-real"
     assert canonical.signal_id == "real-sig-1"
     assert canonical.entry_price == 2.40
+
+
+def test_pr585_malformed_canonical_watermark_keeps_degraded_owner_and_no_mutation():
+    """A malformed canonical EXIT watermark must fail the handoff closed.
+
+    The failed transfer must roll back the newly registered canonical object,
+    preserve the deterministic degraded owner and its valid watermark, and
+    invoke no broker/proof callback.
+    """
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM260117C00220000"
+    degraded = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 1},
+        broker_qty=1, account_id="acct-live-1", repair_failed_reason="test",
+    )
+    assert degraded is not None
+    degraded.exit_in_flight = True
+    degraded.pending_exit_local_order_id = "same-exit-local"
+    degraded.pending_exit_broker_order_id = "same-exit-broker"
+    degraded.last_applied_exit_local_order_id = "same-exit-local"
+    degraded.last_applied_exit_broker_order_id = "same-exit-broker"
+    degraded.last_applied_exit_cum_fill = 3
+    degraded.last_applied_exit_cum_fill_by_order = {
+        "same-exit-local": 3,
+        "same-exit-broker": 3,
+    }
+    degraded_map_before = dict(degraded.last_applied_exit_cum_fill_by_order)
+
+    canonical = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=1,
+        entry_price=2.40, underlying_entry=210.0,
+        underlying_target=225.0, underlying_stop=205.0,
+        position_id="canonical-malformed-watermark",
+        client_id="jason@example.com", signal_id="signal-watermark",
+        execution_mode="live", quantity_remaining=1,
+    )
+    canonical.last_applied_exit_local_order_id = "same-exit-local"
+    canonical.last_applied_exit_broker_order_id = "same-exit-broker"
+    canonical.last_applied_exit_cum_fill_by_order = {
+        "same-exit-local": "garbage",
+    }
+
+    eng.on_exit = MagicMock()
+    eng.on_scale = MagicMock()
+    eng._emit_exit_event = MagicMock()
+    eng.broker = MagicMock()
+
+    with pytest.raises(RuntimeError, match="malformed state"):
+        eng._install_canonical_owner_atomically(
+            canonical, sym, account_id="acct-live-1",
+        )
+
+    assert eng.active_positions() == [degraded]
+    assert canonical not in eng._positions
+    assert eng._positions_by_id.get(degraded.position_id) is degraded
+    assert degraded.last_applied_exit_cum_fill == 3
+    assert degraded.last_applied_exit_cum_fill_by_order == degraded_map_before
+    eng.on_exit.assert_not_called()
+    eng.on_scale.assert_not_called()
+    eng._emit_exit_event.assert_not_called()
+    eng.broker.assert_not_called()
 
 
 def test_pr585_degraded_protective_reference_is_not_canonical_entry():
@@ -2686,11 +2751,12 @@ def test_pr558_blocker2_test14_zero_or_negative_fill_qty_excluded():
 def test_pr558_blocker1_test06_external_canonical_row_converges():
     """Test 6: a degraded owner exists (from prior repair failure cycle).
     Then a canonical DB row appears externally (another subsystem, restart,
-    reconciler).  The take-over helper must remove the degraded owner and
-    return the runtime-state transfer dict so the caller can seed canonical.
-    No duplicate owner, no duplicate DB insertion attempt."""
+    reconciler).  The canonical handoff must transfer the runtime state and
+    retire degraded only after the canonical owner is fully valid.  No
+    duplicate owner, no duplicate DB insertion attempt."""
     engine_cls = getattr(_EE_MOD, "APExitEngine", None)
-    if engine_cls is None:
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if engine_cls is None or mp_cls is None:
         pytest.skip("APExitEngine not importable")
     eng = _pr558_new_engine()
 
@@ -2705,26 +2771,27 @@ def test_pr558_blocker1_test06_external_canonical_row_converges():
     degraded.peak_pnl_pct = 0.15
     degraded.touched_profit = True
 
-    # Cycle 2 — canonical row appears externally.  Simulate the section 3a
-    # convergence step: take_over → apply_transfer on the canonical.
-    transfer = eng._take_over_degraded_owner_if_any(sym)
-    assert transfer is not None, "external canonical convergence must produce transfer"
-    assert degraded not in eng._positions, "degraded owner must be removed atomically"
-
-    # Postcondition per Angel spec: exactly one behavior-active owner.
-    # (The canonical position install is the caller's responsibility;
-    # what we assert here is that no duplicate degraded remains.)
-    remaining_degraded = [
-        p for p in eng._positions
-        if getattr(p, "broker_repair_degraded", False)
-        and str(p.option_symbol).upper() == sym.upper()
-    ]
-    assert len(remaining_degraded) == 0, (
-        "no degraded owner may remain after external canonical convergence"
+    # Cycle 2 — canonical row appears externally.  Exercise the same full
+    # convergence seam used by the production DB-load path.
+    canonical = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=2,
+        entry_price=2.40, underlying_entry=210.0,
+        underlying_target=225.0, underlying_stop=205.0,
+        position_id="durable-canonical-external",
+        client_id="jason@example.com", signal_id="signal-external",
+        execution_mode="live", quantity_remaining=2,
     )
-    # And the transfer preserved accumulated runtime state
-    assert transfer.get("peak_pnl_pct") == 0.15
-    assert transfer.get("touched_profit") is True
+    eng._install_canonical_owner_atomically(
+        canonical, sym, account_id="acct-live-1",
+    )
+
+    # Postcondition per Angel spec: exactly one behavior-active owner and the
+    # accumulated degraded runtime state survived the handoff.
+    assert eng.active_positions() == [canonical]
+    assert degraded not in eng._positions
+    assert eng._positions_by_id.get(canonical.position_id) is canonical
+    assert canonical.peak_pnl_pct == 0.15
+    assert canonical.touched_profit is True
 
 
 def test_pr558_blocker1_test16_orchestrator_never_installs_degraded_on_broker_flat():
@@ -2954,6 +3021,132 @@ def test_pr558_blocker1_test23_crash_restart_convergence_same_canonical_identity
         not getattr(p, "broker_repair_degraded", False)
         for p in eng_after._positions
     )
+
+
+def test_pr585_restart_still_degraded_reuses_active_exit_without_duplicate_submit():
+    """A restart that remains degraded must recover the deterministic owner
+    and its already-active EXIT, without a second submit or cancellation."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    sym = "IWM260117C00220000"
+
+    class _Broker:
+        account_id = "acct-live-1"
+        mode = "live"
+
+        def list_positions(self):
+            return [{
+                "symbol": sym,
+                "quantity": 1,
+                "cost_basis": 240.0,
+                "date_acquired": "2026-08-01",
+            }]
+
+    # Process A: the broker-open position is protected by the degraded owner
+    # and reaches the existing protective EXIT callback.
+    eng.broker = _Broker()
+    degraded = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 1},
+        broker_qty=1, account_id="acct-live-1", repair_failed_reason="test",
+    )
+    assert degraded is not None
+    now = datetime.now(timezone.utc)
+    degraded.opened_at = now - timedelta(minutes=20)
+    degraded.current_bid = 1.20
+    degraded.current_ask = 1.25
+    degraded.current_option_price = 1.20
+    degraded.option_bid_valid = True
+    degraded.option_quote_fresh = True
+    degraded.last_option_bid_update_ts = now
+    degraded.last_option_quote_update_ts = now
+    eng._clear_degraded_monitoring_state = lambda *args, **kwargs: None
+    eng._emit_exit_event = lambda *args, **kwargs: None
+    eng.on_exit = MagicMock(return_value={
+        "accepted": True,
+        "local_order_id": "restart-exit-local",
+        "broker_order_id": "restart-exit-broker",
+    })
+    decision = _EE_MOD.ExitDecision(
+        action="STOP", quantity=1, reason="HARD STOP",
+        urgency="IMMEDIATE", pnl_pct=-0.40, reason_code="HARD_STOP",
+    )
+    import ap.exit_safety as exit_safety
+    with patch.object(
+        exit_safety,
+        "evaluate_exit_submission_safety",
+        return_value={"blocked": False},
+    ):
+        assert eng._submit_exit_decision(degraded, decision) is True
+    eng.on_exit.assert_called_once()
+    active_exit_row = {
+        "position_id": degraded.position_id,
+        "client_id": "jason@example.com",
+        "contract": sym,
+        "execution_mode": "live",
+        "kind": "EXIT",
+        "local_order_id": "restart-exit-local",
+        "broker_order_id": "restart-exit-broker",
+        "status": "EXIT_SUBMITTED",
+        "qty": 1,
+        "filled_qty": 0,
+        "created_ts": "2026-08-01T13:01:00Z",
+        "submitted_ts": "2026-08-01T13:01:01Z",
+        "updated_ts": "2026-08-01T13:01:02Z",
+    }
+
+    # Process B: canonical repair is still unavailable, so the same
+    # deterministic degraded owner is reconstructed.  The active EXIT is
+    # hydrated by its degraded position id before action generation.
+    eng_after = _pr558_new_engine()
+    eng_after.broker = _Broker()
+    eng_after._load_db_position_row = lambda _sym: None
+    eng_after._upsert_broker_position_to_db = lambda *_args: None
+    eng_after._fetch_broker_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+    fake, restore = _pr558_fake_db_with_rows([active_exit_row])
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake
+    try:
+        assert eng_after._broker_position_precheck() is False
+    finally:
+        restore()
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+
+    active = eng_after.active_positions()
+    assert len(active) == 1
+    restarted = active[0]
+    assert restarted.broker_repair_degraded is True
+    assert restarted.position_id == degraded.position_id
+    assert restarted.exit_in_flight is True
+    assert restarted.pending_exit_local_order_id == "restart-exit-local"
+    assert restarted.pending_exit_broker_order_id == "restart-exit-broker"
+    assert eng_after._pending_exit_hydration_status[restarted.position_id] == "FOUND"
+    assert restarted.position_id not in eng_after._pending_exit_identity_hold_position_ids
+
+    cancel_calls = []
+
+    class _OSM:
+        def _get_active_exit_order(self, position_id):
+            return active_exit_row if position_id == restarted.position_id else None
+
+        def cancel_exit(self, *args, **kwargs):
+            cancel_calls.append((args, kwargs))
+
+    eng_after.order_state_machine = _OSM()
+    eng_after.on_exit = MagicMock()
+    eng_after.on_scale = MagicMock()
+    eng_after._emit_exit_event = lambda *args, **kwargs: None
+    duplicate_decision = _EE_MOD.ExitDecision(
+        action="STOP", quantity=1, reason="HARD STOP",
+        urgency="IMMEDIATE", pnl_pct=-0.40, reason_code="HARD_STOP",
+    )
+    assert eng_after._submit_exit_decision(restarted, duplicate_decision) is False
+    eng_after.on_exit.assert_not_called()
+    eng_after.on_scale.assert_not_called()
+    assert cancel_calls == []
 
 
 def test_pr558_blocker1_restart_hydration_failure_holds_canonical_owner():

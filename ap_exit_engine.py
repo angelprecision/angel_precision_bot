@@ -7917,37 +7917,44 @@ class APExitEngine:
     def _take_over_degraded_owner_if_any(
         self, sym: str, account_id: str | None = None
     ) -> dict | None:
-        """Convergence: if a degraded owner exists for this client+mode+OCC,
-        remove it from the engine and return a dict of accumulated runtime
-        state to seed onto the canonical owner about to be installed.
+        """Convergence: snapshot a degraded owner's runtime state.
+
+        This helper intentionally does *not* retire the degraded owner.  The
+        degraded owner remains the behavior-active authority until the caller
+        has registered the canonical owner, applied and validated the runtime
+        transfer, and is ready to complete the handoff.  Retiring it here
+        would make a malformed transfer capable of leaving the contract with
+        no in-memory exit owner.
 
         Returns None when no degraded owner exists (normal case — canonical
         install proceeds without state transfer).  The caller applies the
         returned state to the canonical ManagedPosition AFTER add_position
         so quote/peak/pending-exit state accumulated during the degraded
-        window is not silently discarded."""
+        window is not silently discarded, then retires the same degraded
+        owner only after validation succeeds."""
         existing = self._find_degraded_broker_owner_by_contract(sym, account_id)
         if existing is None:
             return None
         transfer: dict = {}
-        for key in self._DEGRADED_RUNTIME_TRANSFER_KEYS:
-            if hasattr(existing, key):
-                transfer[key] = getattr(existing, key)
-        # Copy the dict-valued watermark defensively so canonical doesn't
-        # share the degraded owner's mutable ref (which is about to be gone).
-        if isinstance(transfer.get("last_applied_exit_cum_fill_by_order"), dict):
-            transfer["last_applied_exit_cum_fill_by_order"] = dict(
-                transfer["last_applied_exit_cum_fill_by_order"]
-            )
         with self._lock:
-            try:
-                self._positions.remove(existing)
-            except ValueError:
-                pass
-            self._positions_by_id.pop(existing.position_id, None)
+            if not any(candidate is existing for candidate in self._positions):
+                return None
+            if getattr(existing, "closed", False):
+                return None
+            for key in self._DEGRADED_RUNTIME_TRANSFER_KEYS:
+                if hasattr(existing, key):
+                    transfer[key] = getattr(existing, key)
+            # Copy the dict-valued watermark defensively.  The degraded owner
+            # remains indexed and active, so canonical must not share its
+            # mutable ref while the transaction is still in flight.
+            if isinstance(transfer.get("last_applied_exit_cum_fill_by_order"), dict):
+                transfer["last_applied_exit_cum_fill_by_order"] = dict(
+                    transfer["last_applied_exit_cum_fill_by_order"]
+                )
         log.info(
-            "[exit_eng] DEGRADED_OWNER_CONVERGED_TO_CANONICAL client=%s mode=%s "
-            "contract=%s degraded_id=%s transferred_keys=%d",
+            "[exit_eng] DEGRADED_OWNER_RUNTIME_SNAPSHOT_FOR_CANONICAL "
+            "client=%s mode=%s contract=%s degraded_id=%s transferred_keys=%d "
+            "owner_retained=true",
             self._email, self._resolved_execution_mode(),
             str(sym or "").strip().upper(),
             existing.position_id, len(transfer),
@@ -7956,12 +7963,37 @@ class APExitEngine:
 
     def _apply_degraded_runtime_transfer(
         self, canonical_pos: "ManagedPosition", transfer: dict | None
-    ) -> None:
+    ) -> bool:
         """Apply runtime-state transfer from a superseded degraded owner
         onto a freshly installed canonical ManagedPosition.  Never overwrites
-        identity fields; only accumulated exit-behavior state."""
-        if not transfer or canonical_pos is None:
-            return
+        identity fields; only accumulated exit-behavior state.
+
+        Returns False when a watermark is malformed.  The caller treats that
+        as a failed transfer and rolls back canonical registration while the
+        degraded owner remains untouched; raw conversion errors never escape
+        this boundary."""
+        if canonical_pos is None:
+            return False
+        if not transfer:
+            return True
+
+        _watermark_transfer_valid = True
+
+        def _coerce_watermark(raw, *, order_id: str = "", source: str = "") -> int:
+            nonlocal _watermark_transfer_valid
+            try:
+                value = int(raw or 0)
+                if value < 0:
+                    raise ValueError("negative cumulative fill")
+                return value
+            except (TypeError, ValueError, OverflowError) as _watermark_exc:
+                _watermark_transfer_valid = False
+                log.warning(
+                    "[exit_eng] DEGRADED_RUNTIME_TRANSFER_INVALID_WATERMARK "
+                    "source=%s order_id=%s raw=%r err=%s",
+                    source or "unknown", order_id or "?", raw, _watermark_exc,
+                )
+                return 0
 
         def _identity_from_state(state: dict) -> tuple[str, str, bool]:
             values = {"local": set(), "broker": set()}
@@ -8000,6 +8032,7 @@ class APExitEngine:
         )
 
         def _has_unidentified_exit_progress(state: dict) -> bool:
+            nonlocal _watermark_transfer_valid
             if bool(state.get("exit_in_flight", False)):
                 return True
             for key in (
@@ -8010,7 +8043,8 @@ class APExitEngine:
                 try:
                     if int(state.get(key, 0) or 0) > 0:
                         return True
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    _watermark_transfer_valid = False
                     return True
             return bool(state.get("last_applied_exit_cum_fill_by_order"))
 
@@ -8110,44 +8144,58 @@ class APExitEngine:
             current_map = getattr(
                 canonical_pos, "last_applied_exit_cum_fill_by_order", None
             )
-            if not isinstance(current_map, dict):
+            if current_map is not None and not isinstance(current_map, dict):
+                _watermark_transfer_valid = False
+                log.warning(
+                    "[exit_eng] DEGRADED_RUNTIME_TRANSFER_INVALID_WATERMARK_MAP "
+                    "source=canonical raw_type=%s",
+                    type(current_map).__name__,
+                )
+                current_map = {}
+                setattr(canonical_pos, "last_applied_exit_cum_fill_by_order", current_map)
+            elif current_map is None:
                 current_map = {}
                 setattr(canonical_pos, "last_applied_exit_cum_fill_by_order", current_map)
             incoming_map = transfer.get("last_applied_exit_cum_fill_by_order")
+            if incoming_map is not None and not isinstance(incoming_map, dict):
+                _watermark_transfer_valid = False
+                log.warning(
+                    "[exit_eng] DEGRADED_RUNTIME_TRANSFER_INVALID_WATERMARK_MAP "
+                    "source=degraded raw_type=%s",
+                    type(incoming_map).__name__,
+                )
             if isinstance(incoming_map, dict):
                 for order_id in identity_keys:
                     if order_id not in incoming_map:
                         continue
-                    try:
-                        incoming_value = max(0, int(incoming_map[order_id] or 0))
-                        current_value = max(0, int(current_map.get(order_id, 0) or 0))
-                        current_map[order_id] = max(current_value, incoming_value)
-                    except (TypeError, ValueError):
-                        continue
+                    incoming_value = _coerce_watermark(
+                        incoming_map[order_id],
+                        order_id=order_id,
+                        source="degraded_map",
+                    )
+                    current_value = _coerce_watermark(
+                        current_map.get(order_id, 0),
+                        order_id=order_id,
+                        source="canonical_map",
+                    )
+                    current_map[order_id] = max(current_value, incoming_value)
 
             def _identity_watermark(state: dict, order_map: dict | None, ids: set[str]) -> int:
                 values = []
                 if isinstance(order_map, dict):
                     for order_id in ids:
-                        try:
-                            values.append(max(0, int(order_map.get(order_id, 0) or 0)))
-                        except (TypeError, ValueError) as _watermark_exc:
-                            log.warning(
-                                "[exit_eng] DEGRADED_RUNTIME_TRANSFER_INVALID_ORDER_WATERMARK "
-                                "order_id=%s err=%s",
-                                order_id, _watermark_exc,
-                            )
-                try:
-                    # A scalar is meaningful only because the state has a
-                    # proven current identity; it is never used without ids.
-                    if ids:
-                        values.append(max(0, int(state.get("last_applied_exit_cum_fill", 0) or 0)))
-                except (TypeError, ValueError) as _watermark_exc:
-                    log.warning(
-                        "[exit_eng] DEGRADED_RUNTIME_TRANSFER_INVALID_SCALAR_WATERMARK "
-                        "err=%s",
-                        _watermark_exc,
-                    )
+                        values.append(_coerce_watermark(
+                            order_map.get(order_id, 0),
+                            order_id=order_id,
+                            source="identity_map",
+                        ))
+                # A scalar is meaningful only because the state has a
+                # proven current identity; it is never used without ids.
+                if ids:
+                    values.append(_coerce_watermark(
+                        state.get("last_applied_exit_cum_fill", 0),
+                        source="identity_scalar",
+                    ))
                 return max(values or [0])
 
             all_ids = identity_keys
@@ -8166,8 +8214,15 @@ class APExitEngine:
                 setattr(canonical_pos, "last_applied_exit_cum_fill", merged_watermark)
                 for order_id in all_ids:
                     current_map[order_id] = max(
-                        int(current_map.get(order_id, 0) or 0), merged_watermark
+                        _coerce_watermark(
+                            current_map.get(order_id, 0),
+                            order_id=order_id,
+                            source="canonical_map_final",
+                        ),
+                        merged_watermark,
                     )
+
+        return _watermark_transfer_valid
 
     def _install_canonical_owner_atomically(
         self,
@@ -8189,18 +8244,106 @@ class APExitEngine:
 
         with self._lock:
             canonical_added = False
+            degraded_owner = None
+            degraded_removed = False
+            degraded_index = None
+            degraded_index_entry = None
+            _missing_index_entry = object()
+
+            def _canonical_is_valid() -> bool:
+                canonical_id = str(getattr(canonical_pos, "position_id", "") or "")
+                return (
+                    any(existing is canonical_pos for existing in self._positions)
+                    and _is_behavior_active_position(canonical_pos)
+                    and (
+                        not canonical_id
+                        or self._positions_by_id.get(canonical_id) is canonical_pos
+                    )
+                )
+
             try:
                 self.add_position(canonical_pos)
-                canonical_added = any(
-                    existing is canonical_pos for existing in self._positions
-                )
-                if not canonical_added or not _is_behavior_active_position(canonical_pos):
+                canonical_added = any(existing is canonical_pos for existing in self._positions)
+                if not canonical_added or not _canonical_is_valid():
                     raise RuntimeError(
                         "canonical owner was not registered as behavior-active"
                     )
                 transfer = self._take_over_degraded_owner_if_any(sym, account_id)
-                self._apply_degraded_runtime_transfer(canonical_pos, transfer)
+                if not self._apply_degraded_runtime_transfer(canonical_pos, transfer):
+                    raise RuntimeError(
+                        "degraded runtime transfer rejected malformed state"
+                    )
+
+                # Canonical must still be registered and indexed after every
+                # transfer operation, before the old behavior-active owner is
+                # retired.  A failed verification leaves both owners intact
+                # until the rollback below removes only the new canonical.
+                if not _canonical_is_valid():
+                    raise RuntimeError(
+                        "canonical owner became invalid during runtime transfer"
+                    )
+
+                if transfer is not None:
+                    degraded_owner = self._find_degraded_broker_owner_by_contract(
+                        sym, account_id
+                    )
+                    if degraded_owner is None or not _is_behavior_active_position(
+                        degraded_owner
+                    ):
+                        raise RuntimeError(
+                            "degraded owner disappeared before canonical handoff"
+                        )
+                    degraded_index = next(
+                        (
+                            index
+                            for index, existing in enumerate(self._positions)
+                            if existing is degraded_owner
+                        ),
+                        None,
+                    )
+                    if degraded_index is None:
+                        raise RuntimeError(
+                            "degraded owner is not registered before canonical handoff"
+                        )
+                    degraded_index_entry = self._positions_by_id.get(
+                        degraded_owner.position_id, _missing_index_entry
+                    )
+                    self._positions.remove(degraded_owner)
+                    degraded_removed = True
+                    self._positions_by_id.pop(degraded_owner.position_id, None)
+
+                # This final invariant is intentionally inside the transaction.
+                # If a future transfer/retirement change violates it, the
+                # exception path restores the degraded object before exposing
+                # the failure to the broker-repair caller.
+                if not _canonical_is_valid() or (
+                    degraded_owner is not None
+                    and any(existing is degraded_owner for existing in self._positions)
+                ):
+                    raise RuntimeError(
+                        "canonical/degraded owner convergence invariant failed"
+                    )
+                if degraded_owner is not None:
+                    log.info(
+                        "[exit_eng] DEGRADED_OWNER_CONVERGED_TO_CANONICAL "
+                        "client=%s mode=%s contract=%s degraded_id=%s "
+                        "transferred_keys=%d owner_retained=false",
+                        self._email, self._resolved_execution_mode(),
+                        str(sym or "").strip().upper(),
+                        degraded_owner.position_id, len(transfer or {}),
+                    )
             except Exception:
+                if degraded_removed and degraded_owner is not None:
+                    if not any(existing is degraded_owner for existing in self._positions):
+                        restore_at = min(
+                            degraded_index if degraded_index is not None else len(self._positions),
+                            len(self._positions),
+                        )
+                        self._positions.insert(restore_at, degraded_owner)
+                    if degraded_index_entry is _missing_index_entry:
+                        self._positions_by_id.pop(degraded_owner.position_id, None)
+                    else:
+                        self._positions_by_id[degraded_owner.position_id] = degraded_index_entry
                 if canonical_added:
                     self._positions[:] = [
                         existing for existing in self._positions
@@ -9494,6 +9637,15 @@ class APExitEngine:
                     # symbol repaired (that flag means canonical DB row exists).
                     pos = degraded_pos
                     repair_failed_syms.append(sym)  # canonical still unresolved
+                    # A degraded owner has a deterministic identity.  On a
+                    # restart, reattach any already-active EXIT under that
+                    # identity before the normal action loop can consider a
+                    # new protective submission.  An unavailable or
+                    # ambiguous lookup becomes the existing per-position
+                    # mutation-inert hold.
+                    self._hydrate_pending_exit_identity_for_broker_recovery(
+                        pos, sym, _account_id,
+                    )
                     log.warning(
                         "[exit_eng] EXIT_BROKER_POSITION_ADDED_TO_ENGINE "
                         "client=%s account=%s contract_symbol=%s "
