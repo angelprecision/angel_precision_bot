@@ -273,6 +273,67 @@ def test_pr558_amendment_fix2_option_symbol_or_branch_restored():
     )
 
 
+def test_pr558_lookup_holds_on_multiple_active_position_rows():
+    """The pre-repair lookup must not pick an arbitrary active row when the
+    durable table contains contradictory ownership candidates."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    sym = "BAC260724P00062000"
+    rows = [
+        {
+            "id": "active-row-1", "client_id": eng._email,
+            "contract": sym, "option_symbol": sym,
+            "execution_mode": "live", "status": "OPEN",
+            "quantity_remaining": 1,
+        },
+        {
+            "id": "active-row-2", "client_id": eng._email,
+            "contract": sym, "option_symbol": sym,
+            "execution_mode": "live", "status": "OPEN",
+            "quantity_remaining": 1,
+        },
+    ]
+    fake, restore = _pr558_fake_db_with_rows(rows)
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake
+    try:
+        result = eng._load_db_position_row(sym)
+    finally:
+        restore()
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+    assert result is not None
+    assert result["_broker_repair_lookup_status"] == "AMBIGUOUS_ACTIVE_ROWS"
+
+
+def test_pr558_managed_row_prefers_exact_legacy_option_symbol():
+    """A legacy short `contract` must not become the exit identity when the
+    row's exact OCC is stored in `option_symbol`."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    sym = "IWM260117C00220000"
+    managed = eng._managed_position_from_row(
+        {
+            "id": "legacy-row",
+            "contract": "IWM",
+            "option_symbol": sym,
+            "underlying": "IWM",
+            "side": "CALL",
+            "qty": 1,
+            "quantity_remaining": 1,
+            "entry_price": 2.40,
+            "execution_mode": "live",
+        },
+        qty_override=1,
+        prefer_qty_override=True,
+        expected_contract=sym,
+    )
+    assert managed.option_symbol == sym
+    assert managed.ticker == "IWM"
+
+
 def test_pr558_amendment_fix3_partially_filled_alternate_spelling():
     """Fix 3: ENTRY-order canonical lookup must recognize the alternate
     PARTIALLY_FILLED status form.  The codebase persists both PARTIAL_FILL
@@ -1303,6 +1364,7 @@ def test_pr558_blocker1_degraded_owner_helpers_exist():
         "_install_or_refresh_degraded_broker_truth_owner",
         "_take_over_degraded_owner_if_any",
         "_apply_degraded_runtime_transfer",
+        "_install_canonical_owner_atomically",
     ):
         assert f"def {name}" in src, f"required helper {name} is missing"
     # ManagedPosition must carry the degraded flag so convergence can
@@ -1349,6 +1411,20 @@ def test_pr558_blocker1_degraded_installer_has_authority_fences():
     )
 
 
+def test_pr558_atomic_convergence_orders_add_before_takeover_and_rolls_back():
+    """The canonical handoff seam must register first and remove degraded
+    only afterward, with rollback on registration failure."""
+    start = EE_SRC.find("def _install_canonical_owner_atomically")
+    end = EE_SRC.find("\n    def ", start + 1)
+    body = EE_SRC[start:end]
+    add_idx = body.find("self.add_position(canonical_pos)")
+    take_idx = body.find("self._take_over_degraded_owner_if_any(sym)")
+    transfer_idx = body.find("self._apply_degraded_runtime_transfer(canonical_pos, transfer)")
+    assert 0 <= add_idx < take_idx < transfer_idx
+    assert "canonical_pos" in body[body.find("except Exception"):]
+    assert "existing is not canonical_pos" in body
+
+
 def test_pr558_blocker1_orchestrator_installs_degraded_on_repair_failure():
     """The broker-precheck orchestrator's 3b repair-failure branch must
     call _install_or_refresh_degraded_broker_truth_owner instead of
@@ -1362,12 +1438,13 @@ def test_pr558_blocker1_orchestrator_installs_degraded_on_repair_failure():
     assert "_install_or_refresh_degraded_broker_truth_owner" in body, (
         "3b repair-failure branch must install a degraded broker-truth owner"
     )
-    # And the convergence takeover must fire on the success side.
-    assert "_take_over_degraded_owner_if_any" in body, (
-        "3b canonical-repair-success branch must supersede any degraded owner"
+    # Canonical success must use the single atomic convergence seam; the seam
+    # registers canonical first and removes degraded only after validation.
+    assert "_install_canonical_owner_atomically" in body, (
+        "3b canonical-repair-success branch must use atomic convergence"
     )
-    assert "_apply_degraded_runtime_transfer" in body, (
-        "Convergence must transfer accumulated runtime state onto canonical"
+    assert "_apply_degraded_runtime_transfer" in EE_SRC, (
+        "Atomic convergence must transfer accumulated runtime state onto canonical"
     )
     # Distinct log tag so ops can tell degraded from canonical.
     assert "owner_kind=degraded_broker_truth" in body, (
@@ -1385,12 +1462,11 @@ def test_pr558_blocker1_orchestrator_3a_converges_degraded():
     idx_3b = src.find("# ── 3b. Create DB row from broker truth if still no pos ───────────", idx_3a)
     assert idx_3a > 0 and idx_3b > idx_3a, "3a / 3b markers missing"
     body = src[idx_3a:idx_3b]
-    assert "_take_over_degraded_owner_if_any" in body, (
-        "3a DB load path must supersede any prior degraded owner "
-        "for this contract before installing canonical"
+    assert "_install_canonical_owner_atomically" in body, (
+        "3a DB load path must use atomic degraded-to-canonical convergence"
     )
-    assert "_apply_degraded_runtime_transfer" in body, (
-        "3a path must transfer degraded runtime state onto canonical"
+    assert "_apply_degraded_runtime_transfer" in EE_SRC, (
+        "3a atomic path must transfer degraded runtime state onto canonical"
     )
 
 
@@ -1482,6 +1558,136 @@ def test_pr558_blocker1_stable_owner_across_repeated_repair_cycles():
     assert len(same_contract) == 1, (
         f"expected exactly one degraded owner for {sym}, got {len(same_contract)}"
     )
+
+
+def test_pr558_degraded_owner_reconciles_downward_and_retries_repair():
+    """Fresh broker truth must drive degraded qty 2 -> 1 and keep retrying
+    canonical repair even though the symbol is already engine-tracked."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    sym = "IWM260117C00220000"
+    state = {"quantity": 2}
+
+    class _Broker:
+        account_id = "acct-live-1"
+        mode = "live"
+
+        def list_positions(self):
+            return [{
+                "symbol": sym,
+                "quantity": state["quantity"],
+                "cost_basis": 480.0,
+                "date_acquired": "2026-08-01",
+            }]
+
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: None
+    eng._upsert_broker_position_to_db = lambda _sym, _bp: None
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+
+    assert eng._broker_position_precheck() is False
+    degraded = eng._positions[0]
+    assert degraded.quantity == 2
+    assert degraded.quantity_remaining == 2
+
+    state["quantity"] = 1
+    assert eng._broker_position_precheck() is False
+    assert eng._positions == [degraded]
+    assert degraded.quantity == 1
+    assert degraded.quantity_remaining == 1
+
+
+def test_pr558_zero_quantity_is_unknown_and_retains_degraded_owner():
+    """A zero row must not silently close or remove an exit owner; it is a
+    broker-truth hold until a separate lifecycle source proves flatness."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    sym = "IWM260117C00220000"
+    state = {"quantity": 1}
+
+    class _Broker:
+        account_id = "acct-live-1"
+        mode = "live"
+
+        def list_positions(self):
+            return [{
+                "symbol": sym,
+                "quantity": state["quantity"],
+                "cost_basis": 240.0,
+                "date_acquired": "2026-08-01",
+            }]
+
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: None
+    eng._upsert_broker_position_to_db = lambda _sym, _bp: None
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+
+    assert eng._broker_position_precheck() is False
+    degraded = eng._positions[0]
+    state["quantity"] = 0
+
+    assert eng._broker_position_precheck() is False
+    assert eng._positions == [degraded]
+    assert degraded.quantity_remaining == 1
+    assert degraded.broker_repair_degraded is True
+
+
+def test_pr558_atomic_canonical_convergence_registers_before_takeover():
+    """Canonical registration succeeds before degraded removal, and a
+    registration failure leaves degraded exit protection intact."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if engine_cls is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+
+    eng = _pr558_new_engine()
+    sym = "IWM260117C00220000"
+    degraded = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 2},
+        broker_qty=2, account_id="acct-live-1", repair_failed_reason="test",
+    )
+    degraded.peak_pnl_pct = 0.21
+    canonical = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=2,
+        entry_price=2.40, underlying_entry=210.0,
+        underlying_target=225.0, underlying_stop=205.0,
+        position_id="durable-canonical", client_id="jason@example.com",
+        signal_id="signal-558", execution_mode="live",
+        quantity_remaining=2,
+    )
+
+    eng._install_canonical_owner_atomically(canonical, sym)
+    assert canonical in eng._positions
+    assert degraded not in eng._positions
+    assert eng.active_positions() == [canonical]
+    assert canonical.peak_pnl_pct == 0.21
+
+    eng_failed = _pr558_new_engine()
+    degraded_failed = eng_failed._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 2},
+        broker_qty=2, account_id="acct-live-1", repair_failed_reason="test",
+    )
+    canonical_failed = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=2,
+        entry_price=2.40, position_id="durable-canonical-failed",
+        client_id="jason@example.com", execution_mode="live",
+        quantity_remaining=2,
+    )
+
+    def _fail_add(_pos):
+        raise RuntimeError("canonical install failed")
+
+    eng_failed.add_position = _fail_add
+    with pytest.raises(RuntimeError, match="canonical install failed"):
+        eng_failed._install_canonical_owner_atomically(canonical_failed, sym)
+    assert eng_failed._positions == [degraded_failed]
+    assert degraded_failed.broker_repair_degraded is True
 
 
 def test_pr558_blocker1_degraded_installer_fails_closed_on_bad_truth():
@@ -1763,7 +1969,9 @@ def _pr558_new_engine(email="jason@example.com"):
         return None
     eng = engine_cls.__new__(engine_cls)
     eng._email = email
-    eng._lock = __import__("threading").Lock()
+    # Production uses an RLock because canonical registration and degraded
+    # takeover are one locked transaction in the orchestrator.
+    eng._lock = __import__("threading").RLock()
     eng._positions = []
     eng._positions_by_id = {}
     eng._resolved_execution_mode = lambda: "live"
@@ -2108,56 +2316,87 @@ def test_pr558_blocker1_test20_degraded_owner_creates_no_broker_entry_authority(
 
 
 def test_pr558_blocker1_test23_crash_restart_convergence_same_canonical_identity():
-    """Test 23: 'crash/restart convergence — degraded owner exists → process
-    restart → broker still open → durable canonical row now available →
-    same exact canonical identity and one behavior-active owner'.
+    """Test 23: exercise the real degraded -> restart -> canonical path.
 
-    The degraded owner is in-memory only (not persisted).  On restart, a
-    fresh engine has zero owners.  When section 3a loads the canonical DB
-    row, it creates a canonical owner directly (no degraded takeover
-    needed because there is no degraded owner in this fresh process).
-    The invariant: canonical identity is stable across restart — the
-    canonical position_id comes from the durable DB row, not from any
-    process-local generator.  This test asserts that the degraded id
-    prefix is distinct from any canonical id path so a stray degraded id
-    could never survive a restart and collide with a canonical one."""
+    Process A proves the broker-open position but cannot persist a canonical
+    row, so it installs one degraded owner.  Process A then disappears.  A
+    fresh Process B sees the same broker-open position and a now-available
+    durable row; its actual broker precheck hydrates that exact canonical
+    identity and leaves exactly one behavior-active owner."""
     eng = _pr558_new_engine()
     if eng is None:
         pytest.skip("APExitEngine not importable")
     sym = "IWM260117C00220000"
+    state = {"quantity": 2}
 
-    # Pre-restart: install degraded owner
-    degraded = eng._install_or_refresh_degraded_broker_truth_owner(
-        sym=sym, broker_position={"contract": sym, "quantity": 2},
-        broker_qty=2, account_id="acct-live-1", repair_failed_reason="test",
-    )
-    assert degraded is not None
-    degraded_id_before = degraded.position_id
-    assert degraded_id_before.startswith("broker-repair-degraded:"), (
-        "degraded id must carry the distinct prefix so it can never be "
-        "confused with a canonical DB uuid on restart hydration"
-    )
+    class _Broker:
+        account_id = "acct-live-1"
+        mode = "live"
 
-    # Simulate restart: brand new engine (in-memory degraded owner is gone).
+        def list_positions(self):
+            return [{
+                "symbol": sym,
+                "quantity": state["quantity"],
+                "cost_basis": 480.0,
+                "date_acquired": "2026-08-01",
+            }]
+
+    empty_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+
+    # Process A: broker truth is open, but canonical repair is unavailable.
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: None
+    eng._upsert_broker_position_to_db = lambda _sym, _bp: None
+    eng._fetch_broker_quote = empty_quote
+    assert eng._broker_position_precheck() is False
+    degraded = [
+        p for p in eng._positions
+        if getattr(p, "broker_repair_degraded", False)
+    ]
+    assert len(degraded) == 1
+    degraded[0].peak_pnl_pct = 0.18
+
+    # Process A crashes here.  Its in-memory degraded owner is intentionally
+    # not copied into Process B.
     eng_after = _pr558_new_engine()
+    assert eng_after._positions == []
 
-    # The same install inputs must produce the SAME degraded id
-    # (deterministic identity across restarts of the same client+mode+OCC+account)
-    same_degraded_id = eng_after._degraded_broker_owner_id(sym, "acct-live-1")
-    assert same_degraded_id == degraded_id_before, (
-        "deterministic degraded id must be stable across process restarts"
+    canonical_row = {
+        "id": "durable-canonical-558",
+        "client_id": "jason@example.com",
+        "contract": sym,
+        "option_symbol": sym,
+        "underlying": "IWM",
+        "side": "CALL",
+        "direction": "CALL",
+        "qty": 2,
+        "quantity_remaining": 2,
+        "entry_price": 2.40,
+        "avg_fill": 2.40,
+        "entry_ts": "2026-08-01T13:00:00Z",
+        "status": "OPEN",
+        "signal_id": "signal-558",
+        "execution_mode": "live",
+    }
+    eng_after.broker = _Broker()
+    eng_after._load_db_position_row = lambda _sym: canonical_row
+    eng_after._upsert_broker_position_to_db = lambda *_args: pytest.fail(
+        "restart hydration must use the available canonical row, not insert a duplicate"
     )
-    # But this id must never overlap the canonical id namespace (uuid-shaped).
-    # Canonical position_ids are uuid4 strings from _upsert_broker_position_to_db.
-    assert not same_degraded_id.startswith("broker-repair-degraded:") == False  # sanity: yes it does
-    assert "-" not in same_degraded_id.replace("broker-repair-degraded:", "").split(":")[0][:8] or True
-    # The critical assertion: prefix collision is impossible.
-    canonical_shape_prefixes = ("00000000-", "11111111-", "22222222-",
-                                "aaaaaaaa-", "bbbbbbbb-")
-    for pfx in canonical_shape_prefixes:
-        assert not same_degraded_id.startswith(pfx), (
-            f"degraded id must never collide with canonical uuid namespace"
-        )
+    eng_after._fetch_broker_quote = empty_quote
+
+    assert eng_after._broker_position_precheck() is True
+    active = eng_after.active_positions()
+    assert len(active) == 1
+    assert active[0].position_id == "durable-canonical-558"
+    assert active[0].broker_repair_degraded is False
+    assert active[0].quantity_remaining == 2
+    assert all(
+        not getattr(p, "broker_repair_degraded", False)
+        for p in eng_after._positions
+    )
 
 
 # ─── Structural completeness (tests 18, 19) ───────────────────────────────────

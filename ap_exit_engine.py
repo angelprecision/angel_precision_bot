@@ -4217,14 +4217,30 @@ class APExitEngine:
                         and _incoming_client
                         and _incoming_mode in {"live", "paper"}
                     )
+                    _existing_client = str(
+                        getattr(existing, "client_id", "") or ""
+                    ).strip().lower()
+                    _existing_mode = str(
+                        getattr(existing, "execution_mode", "") or ""
+                    ).strip().lower()
+                    _canonical_may_replace_degraded = (
+                        same_sym
+                        and bool(getattr(existing, "broker_repair_degraded", False))
+                        and _incoming_is_proven_canonical
+                        and _incoming_client == _existing_client
+                        and _incoming_mode == _existing_mode
+                    )
                     if (
                         same_sym
                         and not same_id
-                        and _is_adoption_identity_quarantined(existing)
+                        and (
+                            _is_adoption_identity_quarantined(existing)
+                            or _canonical_may_replace_degraded
+                        )
                         and _incoming_is_proven_canonical
                     ):
                         log.warning(
-                            "[exit_eng] ADD_POSITION_CANONICAL_BYPASSES_QUARANTINED_REPAIR "
+                            "[exit_eng] ADD_POSITION_CANONICAL_BYPASSES_NONCANONICAL_OWNER "
                             "| canonical=%s repair=%s contract=%s",
                             _incoming_id,
                             getattr(existing, "position_id", ""),
@@ -7284,12 +7300,13 @@ class APExitEngine:
         existing = self._find_degraded_broker_owner_by_contract(_contract)
         if existing is not None:
             with self._lock:
-                # Broker truth is the authoritative qty; do NOT reduce below
-                # what broker reports.  Increase if broker qty grew.
-                if qty_int > int(existing.quantity or 0):
-                    existing.quantity = qty_int
-                if qty_int > int(existing.quantity_remaining or 0):
-                    existing.quantity_remaining = qty_int
+                # Broker truth is authoritative for this non-canonical owner.
+                # Reconcile both fields exactly, including broker-confirmed
+                # partial reductions (for example 2 -> 1).  Keeping the old
+                # maximum would leave exit sizing stale and could block a
+                # valid close against current broker truth.
+                existing.quantity = qty_int
+                existing.quantity_remaining = qty_int
                 existing.broker_repair_degraded_reason = str(repair_failed_reason or "")
                 existing.broker_repair_degraded_account_id = _account
             log.info(
@@ -7446,6 +7463,44 @@ class APExitEngine:
                     key, _e,
                 )
 
+    def _install_canonical_owner_atomically(
+        self, canonical_pos: "ManagedPosition", sym: str
+    ) -> None:
+        """Install a durable owner before removing any degraded owner.
+
+        The degraded owner is the last known behavior-active authority while
+        durable repair is unavailable.  Canonical convergence therefore has
+        a strict ordering: register and validate the canonical owner first,
+        then transfer runtime state and remove the degraded owner, all under
+        the engine re-entrant lock.  If canonical registration fails, roll it
+        back and leave the degraded owner untouched.
+        """
+        if canonical_pos is None:
+            raise RuntimeError("canonical owner is missing")
+
+        with self._lock:
+            canonical_added = False
+            try:
+                self.add_position(canonical_pos)
+                canonical_added = any(
+                    existing is canonical_pos for existing in self._positions
+                )
+                if not canonical_added or not _is_behavior_active_position(canonical_pos):
+                    raise RuntimeError(
+                        "canonical owner was not registered as behavior-active"
+                    )
+                transfer = self._take_over_degraded_owner_if_any(sym)
+                self._apply_degraded_runtime_transfer(canonical_pos, transfer)
+            except Exception:
+                if canonical_added:
+                    self._positions[:] = [
+                        existing for existing in self._positions
+                        if existing is not canonical_pos
+                    ]
+                    if canonical_pos.position_id:
+                        self._positions_by_id.pop(canonical_pos.position_id, None)
+                raise
+
     def _load_db_position_row(self, sym: str) -> dict | None:
         """Look up an active positions row for this client + contract symbol.
 
@@ -7484,7 +7539,7 @@ class APExitEngine:
                 "    OR UPPER(TRIM(COALESCE(option_symbol, ''))) = UPPER(TRIM(%s)) "
                 "  ) "
                 "ORDER BY entry_ts DESC NULLS LAST "
-                "LIMIT 1"
+                "LIMIT 2"
             )
             _FULL_COLS = (
                 "id, client_id, underlying, contract, option_symbol, "
@@ -7510,6 +7565,16 @@ class APExitEngine:
             )
             _params = (self._email, _mode, sym, sym)
 
+            def _rows_from_cursor(c):
+                rows = c.fetchall() or []
+                # Keep small test/double cursors that only implement
+                # fetchone() compatible with the production dict cursor.
+                if not rows:
+                    row = c.fetchone()
+                    if row is not None:
+                        rows = [row]
+                return [dict(row) for row in rows]
+
             def _q_extended():
                 # Own transaction.  If UndefinedColumn fires here, this
                 # `with conn()` block exits via exception, ap.db rolls
@@ -7517,8 +7582,7 @@ class APExitEngine:
                 # returned to the pool clean.
                 with conn() as c:
                     c.execute(f"SELECT {_FULL_COLS} FROM positions {_WHERE}", _params)
-                    row = c.fetchone()
-                    return None if row is None else dict(row)
+                    return _rows_from_cursor(c)
 
             def _q_minimal():
                 # Runs in a FRESH `with conn()` (fresh transaction) —
@@ -7528,11 +7592,10 @@ class APExitEngine:
                 # connection raise InFailedSqlTransaction.
                 with conn() as c:
                     c.execute(f"SELECT {_MIN_COLS} FROM positions {_WHERE}", _params)
-                    row = c.fetchone()
-                    return None if row is None else dict(row)
+                    return _rows_from_cursor(c)
 
             try:
-                row_dict = run_with_retry(_q_extended)
+                row_rows = run_with_retry(_q_extended) or []
             except Exception as _exc:
                 _is_undef = (
                     _PgUndefinedColumn is not None
@@ -7549,7 +7612,19 @@ class APExitEngine:
                     "minimal projection in FRESH transaction sym=%s err=%s",
                     sym, _exc,
                 )
-                row_dict = run_with_retry(_q_minimal)
+                row_rows = run_with_retry(_q_minimal) or []
+            if len(row_rows) > 1:
+                log.critical(
+                    "[exit_eng] BROKER_REPAIR_LOOKUP_AMBIGUOUS "
+                    "client=%s mode=%s contract=%s active_rows=%d "
+                    "— durable ownership is contradictory; recovery held",
+                    self._email, _mode, sym, len(row_rows),
+                )
+                return {
+                    "_broker_repair_lookup_status": "AMBIGUOUS_ACTIVE_ROWS",
+                    "_broker_repair_match_count": len(row_rows),
+                }
+            row_dict = row_rows[0] if row_rows else None
             if row_dict is None:
                 return None
             for _k in _OPTIONAL_KEYS:
@@ -7973,7 +8048,12 @@ class APExitEngine:
             return None
 
     def _managed_position_from_row(
-        self, row: dict, qty_override: int = 0, *, prefer_qty_override: bool = False
+        self,
+        row: dict,
+        qty_override: int = 0,
+        *,
+        prefer_qty_override: bool = False,
+        expected_contract: str = "",
     ) -> "ManagedPosition":
         """
         Build a ManagedPosition from a DB row (or minimal broker data dict).
@@ -7987,7 +8067,42 @@ class APExitEngine:
             Stale quantity_remaining=0 is overridden by broker truth.
             Only used inside _broker_position_precheck().
         """
-        sym       = str(row.get("contract") or row.get("option_symbol") or "")
+        _row_contract = str(row.get("contract") or "").strip().upper()
+        _row_option = str(row.get("option_symbol") or "").strip().upper()
+        try:
+            from ap.exit_safety import is_valid_exact_occ_contract as _occ_valid
+        except Exception:
+            _occ_valid = lambda value: bool(  # noqa: E731 - import fallback
+                re.fullmatch(r"[A-Z]{1,6}\d{6}[CP]\d{8}", str(value or ""))
+            )
+        _exact_row_contracts = {
+            value for value in (_row_contract, _row_option) if _occ_valid(value)
+        }
+        if len(_exact_row_contracts) > 1:
+            raise ValueError(
+                "broker repair row carries contradictory exact OCC identities"
+            )
+        _expected_contract = str(expected_contract or "").strip().upper()
+        if _expected_contract:
+            if _exact_row_contracts and _expected_contract not in _exact_row_contracts:
+                raise ValueError(
+                    "broker repair row exact OCC does not match broker truth"
+                )
+            if not _exact_row_contracts and _expected_contract not in {
+                _row_contract, _row_option
+            }:
+                raise ValueError(
+                    "broker repair row does not prove the expected OCC identity"
+                )
+            sym = _expected_contract
+        elif _exact_row_contracts:
+            sym = next(iter(_exact_row_contracts))
+        else:
+            # Legacy DB rows may carry a short underlying in `contract` while
+            # `option_symbol` carries the exact OCC.  Prefer exact OCC when it
+            # is available; never let the short legacy value become the exit
+            # owner identity.
+            sym = _row_option or _row_contract
         ticker    = str(row.get("underlying") or self._underlying_from_occ(sym))
         side_raw  = str(row.get("side") or row.get("direction") or "").upper()
         side      = side_raw if side_raw in ("CALL", "PUT") else self._parse_occ_side(sym)
@@ -8204,6 +8319,7 @@ class APExitEngine:
             return False
 
         broker_map = {}
+        broker_observed_map = {}
         for broker_position in broker_positions:
             if not isinstance(broker_position, dict):
                 log.error(
@@ -8234,54 +8350,119 @@ class APExitEngine:
                     self._email, _account_id,
                 )
                 return False
-            if symbol and numeric_qty and numeric_qty > 0 and symbol in broker_map:
+            if symbol and symbol in broker_observed_map:
                 log.error(
                     "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                     "client=%s account=%s symbol=%s reason=duplicate_position_rows",
                     self._email, _account_id, symbol,
                 )
                 return False
-            if symbol and numeric_qty and numeric_qty > 0:
-                broker_map[symbol] = broker_position
+            if symbol:
+                broker_observed_map[symbol] = broker_position
+                if numeric_qty > 0:
+                    broker_map[symbol] = broker_position
         broker_syms = set(broker_map.keys())
 
         # ── 2. Current engine symbols ─────────────────────────────────────────
         with self._lock:
+            active_engine_positions = [
+                p for p in self._positions if _is_behavior_active_position(p)
+            ]
             engine_syms = {
                 str(getattr(p, "option_symbol", "") or "").upper()
-                for p in self._positions
-                if _is_behavior_active_position(p)
+                for p in active_engine_positions
             }
+
+        # Inspect every already-tracked owner against fresh broker truth.  A
+        # degraded owner must not stay at its historical maximum quantity or
+        # bypass durable-repair retry merely because its symbol is already
+        # present in the engine.
+        broker_zero_unknown_syms = set()
+        degraded_retry_syms = set()
+        unresolved_degraded_syms = set()
+        for tracked_pos in active_engine_positions:
+            tracked_sym = str(
+                getattr(tracked_pos, "option_symbol", "") or ""
+            ).strip().upper()
+            if not tracked_sym:
+                continue
+            observed = broker_observed_map.get(tracked_sym)
+            if observed is None:
+                if getattr(tracked_pos, "broker_repair_degraded", False):
+                    # Omission is not durable proof that a previously
+                    # broker-open degraded owner is flat.  Keep monitoring
+                    # and keep readiness fail-closed until fresh truth
+                    # either confirms the position or a separate lifecycle
+                    # reconciler proves closure.
+                    unresolved_degraded_syms.add(tracked_sym)
+                continue
+            observed_qty = _broker_repair_float(observed.get("quantity"))
+            if observed_qty == 0:
+                broker_zero_unknown_syms.add(tracked_sym)
+                log.error(
+                    "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_QTY_ZERO_UNKNOWN "
+                    "client=%s account=%s contract_symbol=%s "
+                    "— retaining local owner; broker flatness is unproven",
+                    self._email, _account_id, tracked_sym,
+                )
+                continue
+            if (
+                observed_qty is None
+                or observed_qty < 0
+                or not observed_qty.is_integer()
+                or observed_qty <= 0
+            ):
+                # The initial payload validation should already catch this;
+                # keep the reconciliation seam fail-closed if it changes.
+                broker_zero_unknown_syms.add(tracked_sym)
+                continue
+            observed_qty_int = int(observed_qty)
+            if getattr(tracked_pos, "broker_repair_degraded", False):
+                with self._lock:
+                    tracked_pos.quantity = observed_qty_int
+                    tracked_pos.quantity_remaining = observed_qty_int
+                degraded_retry_syms.add(tracked_sym)
+                log.info(
+                    "[exit_eng] DEGRADED_OWNER_QTY_RECONCILED "
+                    "client=%s account=%s contract_symbol=%s qty=%d",
+                    self._email, _account_id, tracked_sym, observed_qty_int,
+                )
 
         missing_from_engine = broker_syms - engine_syms
 
         log.info(
             "[exit_eng] EXIT_BROKER_PRECHECK_START "
             "client=%s account=%s broker_position_count=%d engine_position_count=%d "
-            "broker_symbols=%s engine_symbols=%s missing_from_engine=%s",
+            "broker_symbols=%s engine_symbols=%s missing_from_engine=%s "
+            "degraded_repair_retry=%s broker_zero_unknown=%s",
             self._email, _account_id,
             len(broker_syms), len(engine_syms),
             sorted(broker_syms), sorted(engine_syms),
-            sorted(missing_from_engine),
+            sorted(missing_from_engine), sorted(degraded_retry_syms),
+            sorted(broker_zero_unknown_syms),
         )
 
-        if not missing_from_engine:
+        repair_syms = sorted(set(missing_from_engine) | degraded_retry_syms)
+        if not repair_syms:
             # All broker positions already tracked — log summary and return
             log.info(
                 "[exit_eng] EXIT_BROKER_PRECHECK_SUMMARY "
                 "client=%s account=%s broker_position_count=%d "
                 "engine_position_count=%d missing_from_engine=0 "
-                "all_broker_positions_tracked=true",
+                "all_broker_positions_tracked=true broker_zero_unknown=%s "
+                "unresolved_degraded=%s",
                 self._email, _account_id, len(broker_syms), len(engine_syms),
+                sorted(broker_zero_unknown_syms),
+                sorted(unresolved_degraded_syms),
             )
-            return True
+            return not broker_zero_unknown_syms and not unresolved_degraded_syms
 
         # ── 3. Repair / load each missing position ────────────────────────────
         repaired_syms               = []   # DB insert/re-query confirmed real id
         loaded_db_syms              = []   # existing DB row found and loaded
         repair_failed_syms          = []   # add_position never called
 
-        for sym in sorted(missing_from_engine):
+        for sym in repair_syms:
             bp         = broker_map[sym]
             broker_qty = _broker_repair_positive_int(bp.get("quantity"))
             cost_basis_value = _broker_repair_float(bp.get("cost_basis"))
@@ -8312,6 +8493,19 @@ class APExitEngine:
 
             # ── 3a. Try DB load ───────────────────────────────────────────────
             db_row = self._load_db_position_row(sym)
+            if (
+                isinstance(db_row, dict)
+                and db_row.get("_broker_repair_lookup_status")
+            ):
+                repair_failed_syms.append(sym)
+                log.error(
+                    "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                    "client=%s account=%s contract_symbol=%s "
+                    "reason=%s — no owner mutation permitted",
+                    self._email, _account_id, sym,
+                    db_row.get("_broker_repair_lookup_status"),
+                )
+                continue
             if db_row:
                 db_seen          = True
                 db_status_before = db_row.get("status")
@@ -8358,30 +8552,14 @@ class APExitEngine:
                             type(_dre).__name__, _dre,
                         )
                 try:
-                    # PR #558 amendment (Blocker 1 convergence): if a degraded
-                    # broker-truth owner exists for this exact client+mode+OCC
-                    # from a prior cycle when durable repair was unavailable,
-                    # pop it out and transfer its accumulated runtime state
-                    # (peak_pnl_pct, touched_profit, pending_exit_* identity,
-                    # quote watermarks, etc.) onto the canonical owner about
-                    # to be installed.  This preserves exit-behavior state
-                    # earned during the degraded window.
-                    _degraded_transfer = self._take_over_degraded_owner_if_any(sym)
                     # Broker-truth mode: prefer_qty_override ensures stale qr=0 is overridden
                     pos = self._managed_position_from_row(
                         db_row,
                         qty_override=broker_qty,
                         prefer_qty_override=True,
+                        expected_contract=sym,
                     )
-                    self.add_position(pos)
-                    _loaded_active = (
-                        pos in self.active_positions()
-                    )
-                    if not _loaded_active:
-                        raise RuntimeError("add_position did not install behavior-active DB owner")
-                    # Apply runtime transfer AFTER add_position so canonical
-                    # is registered before state is written onto it.
-                    self._apply_degraded_runtime_transfer(pos, _degraded_transfer)
+                    self._install_canonical_owner_atomically(pos, sym)
                     loaded_db_syms.append(sym)
                 except Exception as _le:
                     log.warning(
@@ -8443,20 +8621,9 @@ class APExitEngine:
                         minimal_row,
                         qty_override=broker_qty,
                         prefer_qty_override=True,
+                        expected_contract=sym,
                     )
-                    self.add_position(pos)
-                    _loaded_active = (
-                        pos in self.active_positions()
-                    )
-                    if not _loaded_active:
-                        raise RuntimeError("add_position did not install behavior-active broker owner")
-                    # PR #558 amendment (Blocker 1 convergence): canonical
-                    # repair just succeeded — supersede any prior degraded
-                    # owner for this contract and transfer accumulated
-                    # runtime state onto the canonical owner.  Ordered AFTER
-                    # add_position so the canonical is registered first.
-                    _degraded_transfer_success = self._take_over_degraded_owner_if_any(sym)
-                    self._apply_degraded_runtime_transfer(pos, _degraded_transfer_success)
+                    self._install_canonical_owner_atomically(pos, sym)
                     repaired_syms.append(sym)              # confirmed DB row
                 except Exception as _re_err:
                     repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
@@ -8616,16 +8783,21 @@ class APExitEngine:
             "client=%s account=%s broker_position_count=%d broker_symbols=%s "
             "engine_position_count=%d engine_symbols=%s missing_from_engine=%s "
             "loaded_from_db=%s repaired_from_broker=%s "
-            "repair_failed=%s",
+            "repair_failed=%s broker_zero_unknown=%s unresolved_degraded=%s",
             self._email, _account_id,
             len(broker_syms), sorted(broker_syms),
             len(engine_syms), sorted(engine_syms),
             sorted(missing_from_engine),
             loaded_db_syms, repaired_syms,
-            repair_failed_syms,
+            repair_failed_syms, sorted(broker_zero_unknown_syms),
+            sorted(unresolved_degraded_syms),
         )
 
-        return len(repair_failed_syms) == 0
+        return (
+            len(repair_failed_syms) == 0
+            and not broker_zero_unknown_syms
+            and not unresolved_degraded_syms
+        )
 
     def _check_all_positions(self, now_et: Optional[datetime] = None):
         today_et = _et_session_date()
