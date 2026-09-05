@@ -3601,6 +3601,11 @@ class APExitEngine:
         # Kept in sync with self._positions by add_position(), expired-contract
         # cleanup, mark_position_closed(), and note_partial_exit_fill() close path.
         self._positions_by_id: dict[str, ManagedPosition] = {}
+        # Broker-truth HOLD symbols are set by the precheck when a tracked
+        # position has an explicit zero or unresolved degraded broker row.
+        # They remain behavior-active for monitoring, but this cycle must not
+        # manufacture an exit mutation from unproven flatness.
+        self._broker_truth_hold_symbols: set[str] = set()
         self._lock         = threading.RLock()
 
         # QPM/admin safety controls:
@@ -6618,7 +6623,12 @@ class APExitEngine:
 
         return True
 
-    def hydrate_pending_exit_identity_from_db(self, pos: ManagedPosition) -> bool:
+    def hydrate_pending_exit_identity_from_db(
+        self,
+        pos: ManagedPosition,
+        *,
+        fallback_position_ids: tuple[str, ...] = (),
+    ) -> bool:
         """
         Reattach an active EXIT order from DB to the in-memory ManagedPosition.
 
@@ -6630,21 +6640,39 @@ class APExitEngine:
 
         Without this, the engine cannot monitor, cancel, replace, or avoid
         resubmitting a broker order it has forgotten about.
+
+        During broker-truth recovery, fallback_position_ids may include the
+        deterministic degraded-owner id.  That preserves pending EXIT
+        identity across a process restart where the canonical owner is newly
+        hydrated but the durable EXIT row was written while the engine-only
+        degraded owner was active.
         """
         if not pos or not getattr(pos, "position_id", ""):
             return False
         try:
             from ap.db import conn, run_with_retry
 
+            position_ids = []
+            for candidate in (
+                getattr(pos, "position_id", ""),
+                *(fallback_position_ids or ()),
+            ):
+                candidate = str(candidate or "").strip()
+                if candidate and candidate not in position_ids:
+                    position_ids.append(candidate)
+            if not position_ids:
+                return False
+            position_placeholders = ", ".join("%s" for _ in position_ids)
+
             def _fn():
                 with conn() as c:
                     c.execute(
-                        """
+                        f"""
                         SELECT local_order_id, broker_order_id, status,
                                qty, filled_qty, created_ts, submitted_ts, updated_ts
                         FROM orders
                         WHERE client_id = %s
-                          AND position_id = %s
+                          AND position_id IN ({position_placeholders})
                           AND kind = 'EXIT'
                           AND status IN (
                               'EXIT_REQUESTED','EXIT_SUBMITTED',
@@ -6654,7 +6682,10 @@ class APExitEngine:
                                  created_ts DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (getattr(pos, "client_id", None) or self._email or "", pos.position_id),
+                        (
+                            getattr(pos, "client_id", None) or self._email or "",
+                            *position_ids,
+                        ),
                     )
                     return c.fetchone()
 
@@ -7201,7 +7232,9 @@ class APExitEngine:
         ).hexdigest()[:16]
         return f"{self._DEGRADED_ID_PREFIX}{digest}"
 
-    def _find_degraded_broker_owner_by_contract(self, sym: str) -> "ManagedPosition | None":
+    def _find_degraded_broker_owner_by_contract(
+        self, sym: str, account_id: str | None = None
+    ) -> "ManagedPosition | None":
         """Look up an existing degraded owner for this client+mode+OCC.
         Called before installing a new one (stable identity) and before
         installing a canonical replacement (convergence)."""
@@ -7209,6 +7242,13 @@ class APExitEngine:
         _mode = self._resolved_execution_mode()
         if not _contract or _mode not in {"live", "paper"}:
             return None
+        requested_account = None
+        if account_id is not None:
+            requested_account = str(account_id or "").strip()
+            if requested_account.lower() in _BROKER_REPAIR_PLACEHOLDERS:
+                # A canonical owner must not consume a degraded owner when the
+                # current broker account is unavailable or a placeholder.
+                return None
         with self._lock:
             for existing in self._positions:
                 if existing.closed:
@@ -7220,6 +7260,15 @@ class APExitEngine:
                 if str(existing.execution_mode or "").strip().lower() != _mode:
                     continue
                 if str(existing.client_id or "").strip().lower() != str(self._email or "").strip().lower():
+                    continue
+                if (
+                    requested_account is not None
+                    and str(
+                        getattr(existing, "broker_repair_degraded_account_id", "")
+                        or ""
+                    ).strip()
+                    != requested_account
+                ):
                     continue
                 return existing
         return None
@@ -7269,11 +7318,14 @@ class APExitEngine:
         try:
             from ap.exit_safety import is_valid_exact_occ_contract as _occ_valid
         except Exception:
-            _occ_valid = lambda _c: bool(_c)  # noqa: E731 — permissive fallback if module unimportable
+            import re as _re
+            _occ_valid = lambda _c: bool(  # noqa: E731 — strict local fallback
+                _re.fullmatch(r"[A-Z]{1,6}\d{6}[CP]\d{8}", str(_c or ""))
+            )
         if not _occ_valid(_contract):
             log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=occ_identity_malformed client=%s mode=%s contract=%s", _client, _mode, _contract)
             return None
-        if not _account:
+        if _account.lower() in _BROKER_REPAIR_PLACEHOLDERS:
             log.error("[exit_eng] DEGRADED_OWNER_BLOCKED reason=broker_account_unproven client=%s mode=%s contract=%s", _client, _mode, _contract)
             return None
         qty_int = _broker_repair_positive_int(broker_qty)
@@ -7297,7 +7349,7 @@ class APExitEngine:
 
         # Stable identity: if a degraded owner for this (client, mode, OCC)
         # already exists, refresh in place rather than creating a new one.
-        existing = self._find_degraded_broker_owner_by_contract(_contract)
+        existing = self._find_degraded_broker_owner_by_contract(_contract, _account)
         if existing is not None:
             with self._lock:
                 # Broker truth is authoritative for this non-canonical owner.
@@ -7380,7 +7432,9 @@ class APExitEngine:
         "realized_pnl", "unrealized_pnl",
     )
 
-    def _take_over_degraded_owner_if_any(self, sym: str) -> dict | None:
+    def _take_over_degraded_owner_if_any(
+        self, sym: str, account_id: str | None = None
+    ) -> dict | None:
         """Convergence: if a degraded owner exists for this client+mode+OCC,
         remove it from the engine and return a dict of accumulated runtime
         state to seed onto the canonical owner about to be installed.
@@ -7390,7 +7444,7 @@ class APExitEngine:
         returned state to the canonical ManagedPosition AFTER add_position
         so quote/peak/pending-exit state accumulated during the degraded
         window is not silently discarded."""
-        existing = self._find_degraded_broker_owner_by_contract(sym)
+        existing = self._find_degraded_broker_owner_by_contract(sym, account_id)
         if existing is None:
             return None
         transfer: dict = {}
@@ -7464,7 +7518,10 @@ class APExitEngine:
                 )
 
     def _install_canonical_owner_atomically(
-        self, canonical_pos: "ManagedPosition", sym: str
+        self,
+        canonical_pos: "ManagedPosition",
+        sym: str,
+        account_id: str | None = None,
     ) -> None:
         """Install a durable owner before removing any degraded owner.
 
@@ -7489,7 +7546,7 @@ class APExitEngine:
                     raise RuntimeError(
                         "canonical owner was not registered as behavior-active"
                     )
-                transfer = self._take_over_degraded_owner_if_any(sym)
+                transfer = self._take_over_degraded_owner_if_any(sym, account_id)
                 self._apply_degraded_runtime_transfer(canonical_pos, transfer)
             except Exception:
                 if canonical_added:
@@ -8267,6 +8324,25 @@ class APExitEngine:
         except Exception:
             return _empty
 
+    def _broker_account_id(self) -> str:
+        """Return a proven broker account id, or empty when unavailable.
+
+        TradierBroker keeps the account in TradierConfig, while test and other
+        adapters may expose it directly.  Placeholder values are not account
+        authority and must never become part of a degraded-owner identity.
+        """
+        broker = getattr(self, "broker", None)
+        cfg = getattr(broker, "cfg", None) if broker is not None else None
+        for candidate in (
+            getattr(broker, "account_id", None),
+            getattr(cfg, "account_id", None),
+            getattr(broker, "_account_id", None),
+        ):
+            value = str(candidate or "").strip()
+            if value and value.lower() not in _BROKER_REPAIR_PLACEHOLDERS:
+                return value
+        return ""
+
     def _broker_position_precheck(self) -> bool:
         """
         Before every exit cycle: fetch broker positions and repair/load any
@@ -8284,7 +8360,8 @@ class APExitEngine:
           - Quote failure never blocks position loading (quote_status=QUOTE_UNAVAILABLE).
           - source column never written — production schema may not have it.
         """
-        _account_id = getattr(self.broker, "account_id", "?")
+        _account_id = self._broker_account_id()
+        self._broker_truth_hold_symbols = set()
 
         if not self.broker or not hasattr(self.broker, "list_positions"):
             return True
@@ -8395,10 +8472,12 @@ class APExitEngine:
                     # either confirms the position or a separate lifecycle
                     # reconciler proves closure.
                     unresolved_degraded_syms.add(tracked_sym)
+                    self._broker_truth_hold_symbols.add(tracked_sym)
                 continue
             observed_qty = _broker_repair_float(observed.get("quantity"))
             if observed_qty == 0:
                 broker_zero_unknown_syms.add(tracked_sym)
+                self._broker_truth_hold_symbols.add(tracked_sym)
                 log.error(
                     "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_QTY_ZERO_UNKNOWN "
                     "client=%s account=%s contract_symbol=%s "
@@ -8415,6 +8494,7 @@ class APExitEngine:
                 # The initial payload validation should already catch this;
                 # keep the reconciliation seam fail-closed if it changes.
                 broker_zero_unknown_syms.add(tracked_sym)
+                self._broker_truth_hold_symbols.add(tracked_sym)
                 continue
             observed_qty_int = int(observed_qty)
             if getattr(tracked_pos, "broker_repair_degraded", False):
@@ -8559,7 +8639,15 @@ class APExitEngine:
                         prefer_qty_override=True,
                         expected_contract=sym,
                     )
-                    self._install_canonical_owner_atomically(pos, sym)
+                    self._install_canonical_owner_atomically(
+                        pos, sym, account_id=_account_id
+                    )
+                    self.hydrate_pending_exit_identity_from_db(
+                        pos,
+                        fallback_position_ids=(
+                            self._degraded_broker_owner_id(sym, _account_id),
+                        ) if _account_id else (),
+                    )
                     loaded_db_syms.append(sym)
                 except Exception as _le:
                     log.warning(
@@ -8623,7 +8711,15 @@ class APExitEngine:
                         prefer_qty_override=True,
                         expected_contract=sym,
                     )
-                    self._install_canonical_owner_atomically(pos, sym)
+                    self._install_canonical_owner_atomically(
+                        pos, sym, account_id=_account_id
+                    )
+                    self.hydrate_pending_exit_identity_from_db(
+                        pos,
+                        fallback_position_ids=(
+                            self._degraded_broker_owner_id(sym, _account_id),
+                        ) if _account_id else (),
+                    )
                     repaired_syms.append(sym)              # confirmed DB row
                 except Exception as _re_err:
                     repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
@@ -8930,6 +9026,11 @@ class APExitEngine:
         active = self.active_positions()
         if not active:
             return
+        broker_truth_hold_symbols = {
+            str(symbol or "").strip().upper()
+            for symbol in getattr(self, "_broker_truth_hold_symbols", set())
+            if str(symbol or "").strip()
+        }
 
         # ── P0-3 tick-level safety: daily-loss self-check ─────────────────────
         # The entry gate triggers the force-close breaker when a NEW signal hits
@@ -8986,6 +9087,19 @@ class APExitEngine:
         with self._lock:
             for pos in active:
                 now_utc = datetime.now(timezone.utc)
+
+                _broker_truth_hold_sym = str(
+                    getattr(pos, "option_symbol", "") or ""
+                ).strip().upper()
+                if _broker_truth_hold_sym in broker_truth_hold_symbols:
+                    log.warning(
+                        "[exit_eng] EXIT_BROKER_TRUTH_HOLD "
+                        "client=%s contract_symbol=%s reason=zero_or_unresolved "
+                        "— preserving owner without exit mutation this cycle",
+                        self._email,
+                        _broker_truth_hold_sym,
+                    )
+                    continue
 
                 # Enrich from QUOTES authority if available and QPM has a fresh snapshot.
                 # This supplements the apply_quote_snapshots() path (which QPM calls

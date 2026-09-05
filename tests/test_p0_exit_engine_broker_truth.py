@@ -1413,6 +1413,67 @@ def test_pr558_blocker1_degraded_installer_has_authority_fences():
     )
 
 
+def test_pr558_occ_fallback_is_strict_when_exit_safety_is_unavailable():
+    """The degraded-owner OCC fallback must remain fail-closed if the
+    optional validator import is unavailable."""
+    start = EE_SRC.find("def _install_or_refresh_degraded_broker_truth_owner")
+    end = EE_SRC.find("\n    def ", start + 1)
+    body = EE_SRC[start:end]
+    assert "_re.fullmatch" in body
+    assert "_occ_valid = lambda _c: bool(_c)" not in body
+
+
+def test_pr558_account_authority_uses_tradier_config_and_scopes_owner():
+    """Tradier's production account authority lives at cfg.account_id.
+    Two account configs must not share a degraded owner identity."""
+    class _Broker:
+        mode = "live"
+
+        def __init__(self, account_id):
+            self.cfg = types.SimpleNamespace(account_id=account_id)
+
+        def list_positions(self):
+            return [{
+                "symbol": "IWM270117C00220000",
+                "quantity": 1,
+                "cost_basis": 240.0,
+            }]
+
+    owners = []
+    for account_id in ("acct-cfg-a", "acct-cfg-b"):
+        eng = _pr558_new_engine()
+        if eng is None:
+            pytest.skip("APExitEngine not importable")
+        eng.broker = _Broker(account_id)
+        eng._load_db_position_row = lambda _sym: None
+        eng._upsert_broker_position_to_db = lambda _sym, _bp: None
+        eng._fetch_broker_quote = lambda _sym: {
+            "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+        }
+        assert eng._broker_account_id() == account_id
+        assert eng._broker_position_precheck() is False
+        owner = eng._positions[0]
+        assert owner.broker_repair_degraded_account_id == account_id
+        owners.append(owner)
+
+    assert owners[0].position_id != owners[1].position_id
+
+
+def test_pr558_placeholder_account_is_not_authority():
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    eng.broker = types.SimpleNamespace(account_id="?", mode="live")
+    assert eng._broker_account_id() == ""
+    assert eng._install_or_refresh_degraded_broker_truth_owner(
+        sym="IWM270117C00220000",
+        broker_position={"contract": "IWM270117C00220000", "quantity": 1},
+        broker_qty=1,
+        account_id="?",
+        repair_failed_reason="test",
+    ) is None
+
+
 def test_pr558_atomic_convergence_orders_add_before_takeover_and_rolls_back():
     """The canonical handoff seam must register first and remove degraded
     only afterward, with rollback on registration failure."""
@@ -1420,7 +1481,7 @@ def test_pr558_atomic_convergence_orders_add_before_takeover_and_rolls_back():
     end = EE_SRC.find("\n    def ", start + 1)
     body = EE_SRC[start:end]
     add_idx = body.find("self.add_position(canonical_pos)")
-    take_idx = body.find("self._take_over_degraded_owner_if_any(sym)")
+    take_idx = body.find("self._take_over_degraded_owner_if_any(sym")
     transfer_idx = body.find("self._apply_degraded_runtime_transfer(canonical_pos, transfer)")
     assert 0 <= add_idx < take_idx < transfer_idx
     assert "canonical_pos" in body[body.find("except Exception"):]
@@ -1638,6 +1699,36 @@ def test_pr558_zero_quantity_is_unknown_and_retains_degraded_owner():
     assert eng._positions == [degraded]
     assert degraded.quantity_remaining == 1
     assert degraded.broker_repair_degraded is True
+    assert sym in eng._broker_truth_hold_symbols, (
+        "explicit broker zero must mark the tracked symbol HOLD for this cycle"
+    )
+
+
+def test_pr558_zero_truth_hold_suppresses_exit_mutation_for_the_cycle():
+    """An explicit broker zero is unknown, not proof that an exit is safe.
+    The owner remains behavior-active, but the normal exit loop must not
+    create an action while the broker/lifecycle truth is unresolved."""
+    eng = _pr558_new_engine()
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    sym = "IWM270117C00220000"
+    pos = eng._install_or_refresh_degraded_broker_truth_owner(
+        sym=sym, broker_position={"contract": sym, "quantity": 1},
+        broker_qty=1, account_id="acct-live-1", repair_failed_reason="test",
+    )
+    assert pos is not None
+
+    eng._broker_position_precheck = lambda: (
+        eng._broker_truth_hold_symbols.add(sym) or False
+    )
+    eng._run_sentinels = lambda: None
+    eng._kill_switch_fn = None
+    eng._submit_exit_decision = MagicMock()
+
+    eng._check_all_positions()
+
+    assert pos in eng.active_positions()
+    eng._submit_exit_decision.assert_not_called()
 
 
 def test_pr558_atomic_canonical_convergence_registers_before_takeover():
@@ -1978,6 +2069,7 @@ def _pr558_new_engine(email="jason@example.com"):
     eng._lock = __import__("threading").RLock()
     eng._positions = []
     eng._positions_by_id = {}
+    eng._broker_truth_hold_symbols = set()
     eng._resolved_execution_mode = lambda: "live"
     eng._underlying_from_occ = lambda s: "IWM"
     eng._parse_occ_side = lambda s: "CALL"
@@ -2320,13 +2412,14 @@ def test_pr558_blocker1_test20_degraded_owner_creates_no_broker_entry_authority(
 
 
 def test_pr558_blocker1_test23_crash_restart_convergence_same_canonical_identity():
-    """Test 23: exercise the real degraded -> restart -> canonical path.
+    """Test 23: exercise restart recovery through production seed/precheck
+    seams, including a pending EXIT row still keyed to the degraded owner.
 
     Process A proves the broker-open position but cannot persist a canonical
-    row, so it installs one degraded owner.  Process A then disappears.  A
-    fresh Process B sees the same broker-open position and a now-available
-    durable row; its actual broker precheck hydrates that exact canonical
-    identity and leaves exactly one behavior-active owner."""
+    row, so it installs one degraded owner and accumulates pending EXIT state.
+    Process B is a fresh engine, runs seed_from_db, then its broker precheck
+    loads the durable canonical row and reattaches the pending EXIT identity
+    from the stable degraded-owner id without creating a duplicate owner."""
     eng = _pr558_new_engine()
     if eng is None:
         pytest.skip("APExitEngine not importable")
@@ -2361,10 +2454,26 @@ def test_pr558_blocker1_test23_crash_restart_convergence_same_canonical_identity
     ]
     assert len(degraded) == 1
     degraded[0].peak_pnl_pct = 0.18
+    degraded[0].exit_in_flight = True
+    degraded[0].pending_exit_local_order_id = "legacy-exit-local"
+    degraded[0].pending_exit_broker_order_id = "legacy-exit-broker"
+    degraded[0].pending_exit_qty = 2
+    degraded[0].pending_exit_filled_qty = 1
+    degraded[0].last_applied_exit_cum_fill = 1
 
     # Process A crashes here.  Its in-memory degraded owner is intentionally
     # not copied into Process B.
     eng_after = _pr558_new_engine()
+    assert eng_after._positions == []
+
+    class _PositionManager:
+        def get_active_positions(self):
+            return []
+
+    # This is the actual production boot seam.  There are no canonical rows
+    # available at startup; the broker precheck below discovers the row after
+    # the fresh process has been initialized.
+    eng_after.seed_from_db(_PositionManager())
     assert eng_after._positions == []
 
     canonical_row = {
@@ -2391,12 +2500,33 @@ def test_pr558_blocker1_test23_crash_restart_convergence_same_canonical_identity
     )
     eng_after._fetch_broker_quote = empty_quote
 
-    assert eng_after._broker_position_precheck() is True
+    pending_exit_row = {
+        "position_id": degraded[0].position_id,
+        "local_order_id": "legacy-exit-local",
+        "broker_order_id": "legacy-exit-broker",
+        "status": "EXIT_SUBMITTED",
+        "qty": 2,
+        "filled_qty": 1,
+        "created_ts": "2026-08-01T13:01:00Z",
+        "submitted_ts": "2026-08-01T13:01:01Z",
+        "updated_ts": "2026-08-01T13:01:02Z",
+    }
+    fake, restore = _pr558_fake_db_with_rows([pending_exit_row])
+    sys.modules["ap.db"] = fake
+    try:
+        assert eng_after._broker_position_precheck() is True
+    finally:
+        restore()
     active = eng_after.active_positions()
     assert len(active) == 1
     assert active[0].position_id == "durable-canonical-558"
     assert active[0].broker_repair_degraded is False
     assert active[0].quantity_remaining == 2
+    assert active[0].exit_in_flight is True
+    assert active[0].pending_exit_local_order_id == "legacy-exit-local"
+    assert active[0].pending_exit_broker_order_id == "legacy-exit-broker"
+    assert active[0].pending_exit_filled_qty == 1
+    assert active[0].last_applied_exit_cum_fill == 1
     assert all(
         not getattr(p, "broker_repair_degraded", False)
         for p in eng_after._positions
