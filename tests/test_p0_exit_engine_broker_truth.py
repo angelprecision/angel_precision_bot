@@ -1685,7 +1685,7 @@ def test_pr558_blocker2_multi_candidate_narrowed_by_broker_returns_survivor():
          "filled_qty": 2, "avg_fill_price": 2.40, "fill_price": 2.40},  # matches broker
     ]
     # Broker position matching the second candidate.
-    broker_position = {"quantity": 2, "cost_basis": 4.80}  # 2 * 2.40
+    broker_position = {"quantity": 2, "cost_basis": 480.0}  # 2 * 2.40 * 100
 
     # Install fake ap.db returning our rows.
     from contextlib import contextmanager
@@ -1785,7 +1785,7 @@ def test_pr558_blocker2_test07_single_historical_candidate_returns_it():
         "contract": "IWM260117C00220000", "kind": "ENTRY", "status": "FILLED",
         "filled_qty": 2, "avg_fill_price": 2.40, "fill_price": 2.40,
     }]
-    broker_position = {"quantity": 2, "cost_basis": 4.80}
+    broker_position = {"quantity": 2, "cost_basis": 480.0}
     fake, restore = _pr558_fake_db_with_rows(rows)
     sys.modules["ap.db"] = fake
     try:
@@ -1813,7 +1813,7 @@ def test_pr558_blocker2_test09_multi_candidate_zero_broker_matches_returns_unres
          "contract": "IWM260117C00220000", "kind": "ENTRY", "status": "FILLED",
          "filled_qty": 2, "avg_fill_price": 1.20, "fill_price": 1.20},
     ]
-    broker_position = {"quantity": 2, "cost_basis": 4.80}  # $2.40/contract — matches neither
+    broker_position = {"quantity": 2, "cost_basis": 480.0}  # $2.40/contract — matches neither (480.00 total basis)
     fake, restore = _pr558_fake_db_with_rows(rows)
     sys.modules["ap.db"] = fake
     try:
@@ -1844,7 +1844,7 @@ def test_pr558_blocker2_test10_multi_candidate_both_match_returns_ambiguous():
          "contract": "IWM260117C00220000", "kind": "ENTRY", "status": "FILLED",
          "filled_qty": 2, "avg_fill_price": 2.40, "fill_price": 2.40},
     ]
-    broker_position = {"quantity": 2, "cost_basis": 4.80}
+    broker_position = {"quantity": 2, "cost_basis": 480.0}
     fake, restore = _pr558_fake_db_with_rows(rows)
     sys.modules["ap.db"] = fake
     try:
@@ -1878,7 +1878,7 @@ def test_pr558_blocker2_test11_wrong_client_historical_row_excluded():
     try:
         result = eng._find_exact_filled_entry_order(
             "IWM260117C00220000", "live",
-            broker_position={"quantity": 2, "cost_basis": 4.80},
+            broker_position={"quantity": 2, "cost_basis": 480.0},
         )
     finally:
         restore()
@@ -1903,7 +1903,7 @@ def test_pr558_blocker2_test12_live_paper_cross_mode_row_excluded():
     try:
         result = eng._find_exact_filled_entry_order(
             "IWM260117C00220000", "live",
-            broker_position={"quantity": 2, "cost_basis": 4.80},
+            broker_position={"quantity": 2, "cost_basis": 480.0},
         )
     finally:
         restore()
@@ -1926,7 +1926,7 @@ def test_pr558_blocker2_test13_wrong_occ_historical_row_excluded():
     try:
         result = eng._find_exact_filled_entry_order(
             "IWM260117C00220000", "live",
-            broker_position={"quantity": 2, "cost_basis": 4.80},
+            broker_position={"quantity": 2, "cost_basis": 480.0},
         )
     finally:
         restore()
@@ -1950,7 +1950,7 @@ def test_pr558_blocker2_test14_zero_or_negative_fill_qty_excluded():
         try:
             result = eng._find_exact_filled_entry_order(
                 "IWM260117C00220000", "live",
-                broker_position={"quantity": 2, "cost_basis": 4.80},
+                broker_position={"quantity": 2, "cost_basis": 480.0},
             )
         finally:
             restore()
