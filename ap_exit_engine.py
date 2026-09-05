@@ -7897,11 +7897,21 @@ class APExitEngine:
                                 entry_ts,
                             ),
                         )
+                    # Consume the INSERT ... RETURNING result before releasing
+                    # the savepoint.  PostgreSQL replaces/discards the cursor result
+                    # when RELEASE SAVEPOINT is executed; fetching afterward raises
+                    # "no results to fetch" and falsely converts a successful durable
+                    # repair into degraded ownership.
                     if _extended_ok:
+                        row = c.fetchone()
                         c.execute(f"RELEASE SAVEPOINT {_sp}")
-                    row = c.fetchone()
+                    else:
+                        # The fallback INSERT already released the savepoint after
+                        # rolling back the extended attempt; consume its RETURNING
+                        # row while it is still the active cursor result.
+                        row = c.fetchone()
                     if row:
-                        row_id = row.get("id")
+                        row_id = row.get("id") if isinstance(row, dict) else None
                         if row_id:
                             return _remember(row_id)
 
