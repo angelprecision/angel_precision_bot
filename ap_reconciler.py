@@ -4134,13 +4134,8 @@ class APBrokerReconciler:
         underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
         side, side_ok = self._canonical_nonblank_value(pos, "direction", "side")
         side = side.upper()
-        qty_keys = (
-            ("qty", "quantity")
-            if pos.get("qty") is not None or pos.get("quantity") is not None
-            else ("quantity_remaining",)
-        )
         qty_value, qty_ok = self._canonical_positive_number(
-            pos, *qty_keys, integral=True
+            pos, "qty", "quantity", "quantity_remaining", integral=True
         )
         entry_px, entry_ok = self._canonical_positive_number(
             pos, "avg_fill", "entry_price"

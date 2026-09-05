@@ -241,6 +241,51 @@ def test_repeated_reconciliation_is_idempotent():
     assert [owner.position_id for owner in engine.owners] == [POSITION_ID]
 
 
+def test_no_repair_race_never_exposes_two_behavior_active_owners():
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    ready = threading.Event()
+    installed = threading.Event()
+    observed_counts = []
+
+    class _RacingExitEngine(APExitEngine):
+        def add_position(self, position):
+            if position.position_id == POSITION_ID:
+                ready.set()
+                assert installed.wait(timeout=2)
+            super().add_position(position)
+            observed_counts.append(len(self.active_positions()))
+
+    engine = _RacingExitEngine.__new__(_RacingExitEngine)
+    engine._email = CLIENT
+    engine._lock = threading.RLock()
+    engine._positions = []
+    engine._positions_by_id = {}
+    competing = ManagedPosition(
+        ticker="NOW", option_symbol=CONTRACT, side="PUT", quantity=1,
+        entry_price=1.30, underlying_entry=127.425,
+        underlying_target=120.0, underlying_stop=130.0,
+    )
+    competing.position_id = f"broker-repair-degraded:{CLIENT}:{CONTRACT}"
+    competing.client_id = CLIENT
+    competing.execution_mode = "live"
+
+    def _install_competing_owner():
+        assert ready.wait(timeout=2)
+        APExitEngine.add_position(engine, competing)
+        observed_counts.append(len(engine.active_positions()))
+        installed.set()
+
+    worker = threading.Thread(target=_install_competing_owner)
+    worker.start()
+    assert _reconciler(engine)._seed_exit_engine_from_position(_position()) is False
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert observed_counts and max(observed_counts) == 1
+    assert engine.active_positions() == [competing]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -277,6 +322,32 @@ def test_conflicting_quantity_aliases_hold_before_adoption():
     engine = _ExitEngine(owners=[_owner("broker-repair-held")])
     position = _position(quantity=2)
     assert _reconciler(engine)._seed_exit_engine_from_position(position) is False
+    assert engine.adopt_calls == []
+    assert engine.add_calls == []
+
+
+def test_total_and_remaining_quantity_must_agree_for_adoption():
+    engine = _ExitEngine("NO_REPAIR_FOUND")
+    position = _position(qty=2, quantity_remaining=2)
+    assert _reconciler(engine)._seed_exit_engine_from_position(position) is True
+    assert engine.add_calls[0].quantity == 2
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"qty": 2, "quantity_remaining": 1},
+        {"qty": 1, "quantity_remaining": 2},
+        {"qty": 2, "quantity_remaining": 1.5},
+        {"qty": 2, "quantity_remaining": -1},
+        {"qty": 2, "quantity": 3, "quantity_remaining": 2},
+    ],
+)
+def test_unproven_quantity_conflict_holds_before_adoption(overrides):
+    engine = _ExitEngine(owners=[_owner("broker-repair-held")])
+    assert _reconciler(engine)._seed_exit_engine_from_position(
+        _position(**overrides)
+    ) is False
     assert engine.adopt_calls == []
     assert engine.add_calls == []
 
