@@ -1881,7 +1881,9 @@ def test_pr558_blocker1_convergence_transfers_runtime_state():
         pytest.skip("APExitEngine/ManagedPosition not importable in this environment")
     eng = engine_cls.__new__(engine_cls)
     eng._email = "jason@example.com"
-    eng._lock = __import__("threading").Lock()
+    # The production engine uses an RLock because convergence holds the
+    # engine lock while calling add_position(), which acquires it again.
+    eng._lock = __import__("threading").RLock()
     eng._positions = []
     eng._positions_by_id = {}
     eng._resolved_execution_mode = lambda: "live"
