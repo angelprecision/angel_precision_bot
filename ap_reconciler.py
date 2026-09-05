@@ -3963,6 +3963,14 @@ class APBrokerReconciler:
 
             def _fetch() -> list[dict]:
                 with conn() as c:
+                    # Exact identity fencing in SQL (not just Python post-filter):
+                    # client_id, execution_mode, kind=ENTRY, and filled status are
+                    # in the WHERE clause so the candidate set cannot span clients,
+                    # modes, non-entry order kinds, or unfilled rows.
+                    # LIMIT 2 retained for ambiguity detection.
+                    # Local/broker IDs remain OR conditions (supplemental linkage),
+                    # but they cannot broaden the candidate set across the fenced
+                    # client/mode/kind/status domain.
                     c.execute(
                         """
                         SELECT client_id, kind, status,
@@ -3971,13 +3979,21 @@ class APBrokerReconciler:
                                filled_ts, execution_mode, position_id, contract,
                                meta
                         FROM orders
-                        WHERE position_id::text=%s
-                           OR (%s<>'' AND local_order_id=%s)
-                           OR (%s<>'' AND broker_order_id=%s)
+                        WHERE client_id = %s
+                          AND execution_mode = %s
+                          AND kind = 'ENTRY'
+                          AND status IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')
+                          AND (
+                                position_id::text = %s
+                             OR (%s <> '' AND local_order_id = %s)
+                             OR (%s <> '' AND broker_order_id = %s)
+                          )
                         ORDER BY filled_ts DESC NULLS LAST
                         LIMIT 2
                         """,
                         (
+                            str(self.client_id or ""),
+                            execution_mode,
                             position_id,
                             local_order_id, local_order_id,
                             broker_order_id, broker_order_id,
@@ -4036,6 +4052,95 @@ class APBrokerReconciler:
                 "[%s] RECONCILER_CANONICAL_OWNER_ENTRY_LOOKUP_FAILED | "
                 "mode=%s contract=%s position_id=%s error=%s",
                 self.client_id, execution_mode, contract, position_id, exc,
+            )
+            return "UNAVAILABLE", None
+
+    def _partial_exit_evidence_for_canonical_position(
+        self,
+        *,
+        contract: str,
+        position_id: str,
+        execution_mode: str,
+        expected_exited_qty: int,
+    ) -> tuple:
+        """Prove durable partial-exit evidence for a partially exited canonical position.
+
+        Queries filled EXIT orders for this exact position and verifies that
+        their cumulative filled_qty equals expected_exited_qty exactly.
+
+        Returns ("PROVEN", row) when durable evidence accounts for exactly
+        expected_exited_qty contracts.  Otherwise returns (status, None):
+          NO_EVIDENCE      — no EXIT rows found
+          MALFORMED        — expected_exited_qty <= 0 or a row has bad fill data
+          IDENTITY_CONFLICT — a row fails client/mode/kind/contract/position fencing
+          AMBIGUOUS        — rows exist but cumulative qty does not equal expected
+          UNAVAILABLE      — DB error
+        """
+        if expected_exited_qty <= 0:
+            return "MALFORMED", None
+        try:
+            from ap.db import conn, run_with_retry
+            from ap.order_state_machine import _durable_execution_mode
+
+            def _fetch() -> list:
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT client_id, kind, status, position_id, contract,
+                               local_order_id, broker_order_id,
+                               fill_price, filled_qty, filled_ts, execution_mode
+                        FROM orders
+                        WHERE client_id = %s
+                          AND execution_mode = %s
+                          AND kind = 'EXIT'
+                          AND status IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')
+                          AND position_id::text = %s
+                          AND contract = %s
+                        ORDER BY filled_ts DESC NULLS LAST
+                        LIMIT 5
+                        """,
+                        (
+                            str(self.client_id or ""),
+                            execution_mode,
+                            position_id,
+                            contract,
+                        ),
+                    )
+                    return [dict(row) for row in (c.fetchall() or [])]
+
+            rows = run_with_retry(_fetch) or []
+            if not rows:
+                return "NO_EVIDENCE", None
+
+            total_exited = 0
+            for row in rows:
+                if (
+                    str(row.get("client_id") or "").strip().lower()
+                    != str(self.client_id or "").strip().lower()
+                    or _durable_execution_mode(row) != execution_mode
+                    or self._norm_contract(row.get("contract")) != contract
+                    or str(row.get("position_id") or "").strip() != position_id
+                    or str(row.get("kind") or "").strip().upper() != "EXIT"
+                    or str(row.get("status") or "").strip().upper() not in {
+                        "FILLED", "PARTIAL_FILL", "PARTIALLY_FILLED"
+                    }
+                ):
+                    return "IDENTITY_CONFLICT", None
+                fqty = _positive_finite_float(row.get("filled_qty"))
+                if fqty <= 0 or fqty != int(fqty):
+                    return "MALFORMED", None
+                total_exited += int(fqty)
+
+            if total_exited == expected_exited_qty:
+                return "PROVEN", rows[0]
+            return "AMBIGUOUS", None
+
+        except Exception as exc:
+            log.error(
+                "[%s] RECONCILER_PARTIAL_EXIT_EVIDENCE_LOOKUP_FAILED | "
+                "mode=%s contract=%s position_id=%s expected_exited=%s error=%s",
+                self.client_id, execution_mode, contract, position_id,
+                expected_exited_qty, exc,
             )
             return "UNAVAILABLE", None
 
@@ -4134,9 +4239,46 @@ class APBrokerReconciler:
         underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
         side, side_ok = self._canonical_nonblank_value(pos, "direction", "side")
         side = side.upper()
+        # ── Quantity authority: validate all three fields together ──────────────
+        # BUG (pre-fix): the old qty_keys shortcircuit silently ignored
+        # quantity_remaining when qty/quantity was present, allowing
+        # qty=2 / quantity_remaining=1 to certify as quantity=2. For a partially
+        # exited live position this hands the canonical exit owner stale size.
+        #
+        # Rule table (all integral, positive):
+        #   qty or quantity malformed/missing       → HOLD (qty_ok=False, caught below)
+        #   qty and quantity both present but differ → HOLD (_canonical_positive_number)
+        #   quantity_remaining absent               → no partial exit; proceed w/ full qty
+        #   quantity_remaining == agreed_qty        → consistent; proceed w/ full qty
+        #   quantity_remaining < agreed_qty         → partial-exit candidate; requires
+        #                                             durable EXIT proof later
+        #   quantity_remaining > agreed_qty         → impossible; HOLD (qty_ok=False)
+        #   quantity_remaining non-integer or ≤ 0  → malformed; HOLD (qty_ok=False)
         qty_value, qty_ok = self._canonical_positive_number(
-            pos, "qty", "quantity", "quantity_remaining", integral=True
+            pos, "qty", "quantity", integral=True
         )
+        _partial_exit_candidate: bool = False
+        _partial_qty: int = 0
+        if qty_ok:
+            _qty_remaining_raw = pos.get("quantity_remaining")
+            if _qty_remaining_raw is not None and not (
+                isinstance(_qty_remaining_raw, str)
+                and not str(_qty_remaining_raw).strip()
+            ):
+                _qr_val = _positive_finite_float(_qty_remaining_raw)
+                _full_qty = int(qty_value)
+                if (
+                    _qr_val <= 0
+                    or _qr_val != int(_qr_val)
+                    or int(_qr_val) > _full_qty
+                ):
+                    # Impossible or malformed quantity_remaining → fail closed
+                    qty_ok = False
+                elif int(_qr_val) < _full_qty:
+                    # Partial exit: remaining < agreed full qty
+                    _partial_exit_candidate = True
+                    _partial_qty = int(_qr_val)
+                # else: int(_qr_val) == _full_qty → consistent, proceed normally
         entry_px, entry_ok = self._canonical_positive_number(
             pos, "avg_fill", "entry_price"
         )
@@ -4268,6 +4410,28 @@ class APBrokerReconciler:
                     disposition="RETRY_ENTRY_FILL_CONFLICT",
                 )
 
+        # ── Partial-exit quantity authority resolution ──────────────────────────
+        # If quantity_remaining < full qty we need durable EXIT evidence before
+        # we can adopt or seed with the remaining quantity.  This check runs after
+        # full identity verification (local/broker/signal/canonical IDs above)
+        # so we only query for partial-exit proof on well-identified positions.
+        canonical_qty: int = int(qty_value) if qty_ok else 0
+        if _partial_exit_candidate and _partial_qty > 0:
+            partial_status, _ = self._partial_exit_evidence_for_canonical_position(
+                contract=contract,
+                position_id=pos_id,
+                execution_mode=engine_mode,
+                expected_exited_qty=canonical_qty - _partial_qty,
+            )
+            if partial_status != "PROVEN":
+                return self._canonical_owner_hold(
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                    disposition="RETRY_PARTIAL_EXIT_UNPROVEN",
+                )
+            canonical_qty = _partial_qty
+
         engine = getattr(self, "exit_engine", None)
         adoption_fn = getattr(engine, "adopt_canonical_position_identity", None)
         if not callable(adoption_fn):
@@ -4340,12 +4504,13 @@ class APBrokerReconciler:
 
         if disposition == "NO_REPAIR_FOUND":
             if adopted is False and safe_to_seed is True and retryable is False:
-                add_ran = self._seed_exit_engine_from_import(
+                # canonical_qty carries partial-exit adjusted quantity (or full qty).
+                seed_status = self._seed_exit_engine_from_import(
                     pos_id=pos_id,
                     contract=contract,
                     underlying=underlying,
                     side=side,
-                    qty=qty,
+                    qty=canonical_qty,
                     entry_px=entry_px,
                     stop_underlying=stop_underlying,
                     target_underlying=target_underlying,
@@ -4357,19 +4522,25 @@ class APBrokerReconciler:
                     position_id=pos_id,
                     execution_mode=engine_mode,
                 )
+                _seed_succeeded = seed_status in {"seeded", "already_owned"}
+                if ok:
+                    _diag_event = {
+                        "seeded":        "RECONCILER_CANONICAL_OWNER_SEEDED_NO_REPAIR",
+                        "already_owned": "RECONCILER_CANONICAL_OWNER_SEED_ALREADY_OWNED",
+                    }.get(seed_status, "RECONCILER_CANONICAL_OWNER_POSTCONDITION_FAILED")
+                else:
+                    _diag_event = "RECONCILER_CANONICAL_OWNER_POSTCONDITION_FAILED"
                 self._canonical_owner_diagnostic(
-                    "RECONCILER_CANONICAL_OWNER_SEEDED_NO_REPAIR"
-                    if add_ran and ok
-                    else "RECONCILER_CANONICAL_OWNER_POSTCONDITION_FAILED",
+                    _diag_event,
                     contract=contract,
                     position_id=pos_id,
                     execution_mode=engine_mode,
                     disposition=disposition,
                     owner_reason=owner_reason,
                     owner_ids=owner_ids,
-                    generic_add_ran=add_ran,
+                    generic_add_ran=_seed_succeeded,
                 )
-                return bool(add_ran and ok)
+                return bool(_seed_succeeded and ok)
             disposition = "RETRY_UNREADABLE_ADOPTION_RESULT"
 
         return self._canonical_owner_hold(
@@ -4413,7 +4584,7 @@ class APBrokerReconciler:
                 price_untrusted=price_untrusted,
                 underlying_entry=underlying_entry,
             )
-            return False
+            return "failed"
 
         try:
             from ap_exit_engine import ManagedPosition
@@ -4445,38 +4616,58 @@ class APBrokerReconciler:
             mp.price_untrusted          = bool(price_untrusted)
             mp.underlying_entry_untrusted = bool(underlying_entry_u <= 0)
             mp.imported_by_reconciler   = True
-            _ee.add_position(mp)
+            # ── Atomic seed: use engine helper to prevent concurrent double-add ──
+            # seed_canonical_position_if_absent checks for an existing canonical
+            # owner and adds atomically under the engine lock.  If another
+            # reconciler pass already seeded this position, we return "already_owned"
+            # and let the postcondition verify the single owner.
+            # Falls back to add_position only when the engine predates this API
+            # (should not happen in deployed code — log CRITICAL if it does).
+            _atomic_seed_fn = getattr(_ee, "seed_canonical_position_if_absent", None)
+            if callable(_atomic_seed_fn):
+                _seeded, _seed_reason = _atomic_seed_fn(mp)
+            else:
+                log.critical(
+                    "[%s] EXIT_ENGINE_ATOMIC_SEED_UNAVAILABLE | %s | "
+                    "seed_canonical_position_if_absent not present — "
+                    "falling back to add_position (non-atomic)",
+                    self.client_id, contract,
+                )
+                _ee.add_position(mp)
+                _seeded, _seed_reason = True, "seeded_legacy"
+            _seed_status = "seeded" if _seeded else "already_owned"
             log.critical(
                 "[%s] EXIT_ENGINE_SEEDED_FROM_RECONCILER | %s | qty=%s entry=%.4f "
-                "underlying_entry=%.4f price_untrusted=%s pos=%s",
+                "underlying_entry=%.4f price_untrusted=%s seed_status=%s pos=%s",
                 self.client_id, contract, qty, entry_px,
-                underlying_entry_u, bool(price_untrusted), pos_id or "n/a",
+                underlying_entry_u, bool(price_untrusted), _seed_status, pos_id or "n/a",
             )
-            self._record_position_reseeded(
-                signal_id=str(pos_id or f"reconciled:{contract}"),
-                ticker=self._norm_underlying(underlying or contract),
-                reason="position_seeded_into_exit_engine_by_reconciler",
-                contract=contract,
-                pos_id=pos_id,
-                qty=qty,
-                side=side,
-                entry_px=entry_px,
-                underlying_entry=underlying_entry_u,
-                price_untrusted=price_untrusted,
-                exit_engine_seeded=True,
-                quote_monitor_attached=False,
-                client_id=self.client_id,
-            )
-            self._heartbeat(
-                "exit_engine_seed",
-                contract=contract,
-                position_id=str(pos_id or ""),
-                qty=qty,
-                entry_px=entry_px,
-                underlying_entry=underlying_entry_u,
-                price_untrusted=bool(price_untrusted),
-            )
-            return True
+            if _seeded:
+                self._record_position_reseeded(
+                    signal_id=str(pos_id or f"reconciled:{contract}"),
+                    ticker=self._norm_underlying(underlying or contract),
+                    reason="position_seeded_into_exit_engine_by_reconciler",
+                    contract=contract,
+                    pos_id=pos_id,
+                    qty=qty,
+                    side=side,
+                    entry_px=entry_px,
+                    underlying_entry=underlying_entry_u,
+                    price_untrusted=price_untrusted,
+                    exit_engine_seeded=True,
+                    quote_monitor_attached=False,
+                    client_id=self.client_id,
+                )
+                self._heartbeat(
+                    "exit_engine_seed",
+                    contract=contract,
+                    position_id=str(pos_id or ""),
+                    qty=qty,
+                    entry_px=entry_px,
+                    underlying_entry=underlying_entry_u,
+                    price_untrusted=bool(price_untrusted),
+                )
+            return _seed_status
         except Exception as e:
             log.error("[%s] Failed to seed exit engine for %s: %s",
                       self.client_id, contract, e)
@@ -4496,7 +4687,7 @@ class APBrokerReconciler:
                 price_untrusted=price_untrusted,
             )
             self._report_health_error(f"exit_engine_seed_failed: {e}", fatal=False)
-            return False
+            return "failed"
 
     def _broker_position_mark_price(self, bp: dict) -> float:
         """Best-effort option mark/last extraction when cost basis is missing."""
@@ -5272,3 +5463,4 @@ class APBrokerReconciler:
             self._alert_fn(f"[reconciler:{self.client_id}] {msg}")
         except Exception as _e:
             log.warning("reconciler_alert_fn_failed: %s", _e)
+
