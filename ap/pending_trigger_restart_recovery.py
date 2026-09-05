@@ -28,6 +28,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.logger import get_logger
@@ -1063,7 +1064,10 @@ class PendingTriggerRestartRecovery:
                     or not 1 <= prior_generation <= _LATE_REARM_MAX_GENERATIONS
                     or (
                         _RR_GENERATION_FIELD in _meta
-                        and _raw_generation != prior_generation
+                        and (
+                            type(_raw_generation) is not int
+                            or _raw_generation != prior_generation
+                        )
                     )
                 ):
                     self._mark_failure(local_oid, "retry_verification:late_generation")
