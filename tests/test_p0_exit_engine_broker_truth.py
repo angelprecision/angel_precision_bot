@@ -926,7 +926,9 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
     # Build a minimal engine stub
     eng = engine_cls.__new__(engine_cls)
     eng._email      = "jasoncosby1@gmail.com"
-    eng._lock       = threading.Lock()
+    # The production engine uses an RLock because 3a canonical hydration
+    # registers the canonical owner before checking/removing a degraded owner.
+    eng._lock       = threading.RLock()
     eng._positions  = []
     eng._positions_by_id = {}
 
