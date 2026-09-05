@@ -1677,7 +1677,9 @@ def test_pr558_atomic_canonical_convergence_registers_before_takeover():
     )
     canonical_failed = mp_cls(
         ticker="IWM", option_symbol=sym, side="CALL", quantity=2,
-        entry_price=2.40, position_id="durable-canonical-failed",
+        entry_price=2.40, underlying_entry=0.0,
+        underlying_target=0.0, underlying_stop=0.0,
+        position_id="durable-canonical-failed",
         client_id="jason@example.com", execution_mode="live",
         quantity_remaining=2,
     )
