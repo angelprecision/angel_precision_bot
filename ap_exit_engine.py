@@ -6971,8 +6971,13 @@ class APExitEngine:
             row_contract = str(row.get("contract") or "").strip().upper()
             try:
                 row_contract = _normalize_broker_contract(row_contract)
-            except Exception:
-                pass
+            except Exception as _contract_exc:
+                log.warning(
+                    "[%s] EXIT_PENDING_IDENTITY_CONTRACT_NORMALIZATION_FAILED "
+                    "pos=%s contract=%s err=%s",
+                    getattr(pos, "ticker", "?"), getattr(pos, "position_id", "?"),
+                    row_contract, _contract_exc,
+                )
             if (
                 row_client_id != expected_client_id
                 or row_position_id not in position_ids
@@ -7677,8 +7682,12 @@ class APExitEngine:
         ).strip().upper()
         try:
             bp_contract = _normalize_broker_contract(bp_contract)
-        except Exception:
-            pass
+        except Exception as _contract_exc:
+            log.warning(
+                "[exit_eng] DEGRADED_OWNER_CONTRACT_NORMALIZATION_FAILED "
+                "client=%s mode=%s contract=%s err=%s",
+                _client, _mode, bp_contract, _contract_exc,
+            )
         if bp_contract and bp_contract != _contract:
             log.error(
                 "[exit_eng] DEGRADED_OWNER_BLOCKED reason=broker_position_contract_mismatch "
@@ -8122,15 +8131,23 @@ class APExitEngine:
                     for order_id in ids:
                         try:
                             values.append(max(0, int(order_map.get(order_id, 0) or 0)))
-                        except (TypeError, ValueError):
-                            pass
+                        except (TypeError, ValueError) as _watermark_exc:
+                            log.warning(
+                                "[exit_eng] DEGRADED_RUNTIME_TRANSFER_INVALID_ORDER_WATERMARK "
+                                "order_id=%s err=%s",
+                                order_id, _watermark_exc,
+                            )
                 try:
                     # A scalar is meaningful only because the state has a
                     # proven current identity; it is never used without ids.
                     if ids:
                         values.append(max(0, int(state.get("last_applied_exit_cum_fill", 0) or 0)))
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as _watermark_exc:
+                    log.warning(
+                        "[exit_eng] DEGRADED_RUNTIME_TRANSFER_INVALID_SCALAR_WATERMARK "
+                        "err=%s",
+                        _watermark_exc,
+                    )
                 return max(values or [0])
 
             all_ids = identity_keys
