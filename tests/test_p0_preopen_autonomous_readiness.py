@@ -287,6 +287,42 @@ def test_exact_restart_rearm_retry_owner_does_not_block_unrelated_live_entries(m
     assert result["details"]["pending_trigger_without_watcher"] == []
 
 
+def test_future_restart_rearm_lease_remains_unowned_for_readiness(monkeypatch):
+    runner = _Runner(mode="live", watcher=_Watcher(set()))
+    now_utc = datetime.now(timezone.utc)
+    row = {
+        "local_order_id": "L-future",
+        "signal_id": "sig-future",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {
+            "restart_rearm_status": "RETRY_PENDING",
+            "restart_rearm_owner": "restart_rearm:jason@example.com:live:L-future",
+            "restart_rearm_reason": "late_attachment_market_truth_unavailable_or_unresolved",
+            "restart_rearm_attempt": 1,
+            "restart_rearm_next_at": (now_utc + timedelta(days=3650)).isoformat(),
+            "restart_rearm_deadline": (now_utc + timedelta(days=3650, minutes=3)).isoformat(),
+            "restart_rearm_first_failed_at": now_utc.isoformat(),
+            "restart_rearm_client_id": "jason@example.com",
+            "restart_rearm_execution_mode": "live",
+            "late_attachment_policy_eligible": True,
+        },
+    }
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(row) if oid == "L-future" else None
+    )
+
+    unowned = pr._pending_trigger_without_watcher(
+        runner,
+        [{"local_order_id": "L-future", "signal_id": "sig-future"}],
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+
+    assert unowned == [{"local_order_id": "L-future", "signal_id": "sig-future"}]
+
+
 def test_wrong_restart_rearm_owner_still_blocks_live_entries(monkeypatch):
     runner = _Runner(mode="live", watcher=_Watcher(set()))
     now_utc = datetime.now(timezone.utc)

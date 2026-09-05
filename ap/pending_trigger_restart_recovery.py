@@ -1847,6 +1847,9 @@ class PendingTriggerRestartRecovery:
             if type(top_attempt) is not int or top_attempt != attempt:
                 return None
         max_attempts = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
+        retry_deadline_secs = _env_int(
+            "RESTART_REARM_RETRY_DEADLINE_SECONDS", 180
+        )
         next_dt = _parse_retry_iso(next_at)
         deadline_dt = _parse_retry_iso(deadline)
         if restart_status != "RETRY_PENDING":
@@ -1857,7 +1860,17 @@ class PendingTriggerRestartRecovery:
             return None
         if next_dt is None or deadline_dt is None or next_dt > deadline_dt:
             return None
-        if not allow_expired and datetime.now(timezone.utc) > deadline_dt:
+        now = datetime.now(timezone.utc)
+        if (
+            _late_attachment_policy_eligible(reread)
+            and deadline_dt > now + timedelta(seconds=retry_deadline_secs)
+        ):
+            # A durable late-retry owner is only valid for the configured
+            # bounded recovery window.  Without this horizon check a
+            # malformed future lease can hide an ownerless PENDING_TRIGGER
+            # from readiness and make the monitor skip it indefinitely.
+            return None
+        if not allow_expired and now > deadline_dt:
             return None
         if rr_client_meta != self.client_id.lower() or rr_mode_meta != self.execution_mode:
             return None

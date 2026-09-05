@@ -3727,6 +3727,23 @@ class TestPR569OrderMonitorRetryLiveness:
         assert osm.cancel_calls == []
         _assert_no_broker_mutation(broker)
 
+    def test_future_late_retry_lease_never_bypasses_monitor(self):
+        now = datetime.now(timezone.utc)
+        row = _canonical_late_retry_row(
+            next_at=(now + timedelta(days=3650)).isoformat(),
+            deadline=(now + timedelta(days=3650, minutes=3)).isoformat(),
+        )
+        watcher = _MonitorWatcher(watch_returns=True)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+
+        assert watcher.watch_calls == 0
+        assert watcher._pending == []
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
     def test_contradictory_attempt_mirror_never_rearms(self):
         row = _canonical_late_retry_row(attempt=2)
         row[_RR_ATTEMPT_FIELD] = 1
