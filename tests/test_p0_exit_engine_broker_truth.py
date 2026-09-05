@@ -2714,6 +2714,71 @@ def test_pr558_blocker1_proven_no_pending_exit_allows_normal_exit():
         restore()
 
 
+def test_pr558_blocker1_multiple_active_exit_rows_are_ambiguous():
+    """Canonical+degraded active EXIT rows must fail closed as AMBIGUOUS."""
+    eng = _pr558_new_engine()
+    mp_cls = getattr(_EE_MOD, "ManagedPosition", None)
+    if eng is None or mp_cls is None:
+        pytest.skip("APExitEngine/ManagedPosition not importable")
+    sym = "IWM270117C00220000"
+    pos = mp_cls(
+        ticker="IWM", option_symbol=sym, side="CALL", quantity=1,
+        entry_price=2.40, underlying_entry=0.0,
+        underlying_target=0.0, underlying_stop=0.0,
+        position_id="durable-canonical-ambiguous-558",
+        client_id="jason@example.com", execution_mode="live",
+        quantity_remaining=1,
+    )
+    eng._positions = [pos]
+    eng._positions_by_id = {pos.position_id: pos}
+    degraded_id = eng._degraded_broker_owner_id(sym, "acct-live-1")
+    rows = [
+        {
+            "position_id": pos.position_id,
+            "local_order_id": "canonical-exit-local",
+            "broker_order_id": "canonical-exit-broker",
+            "status": "EXIT_ACKNOWLEDGED",
+            "qty": 1,
+            "filled_qty": 0,
+            "created_ts": "2026-08-01T13:01:00Z",
+            "submitted_ts": "2026-08-01T13:01:01Z",
+            "updated_ts": "2026-08-01T13:02:00Z",
+        },
+        {
+            "position_id": degraded_id,
+            "local_order_id": "degraded-exit-local",
+            "broker_order_id": "degraded-exit-broker",
+            "status": "EXIT_SUBMITTED",
+            "qty": 1,
+            "filled_qty": 0,
+            "created_ts": "2026-08-01T13:01:30Z",
+            "submitted_ts": "2026-08-01T13:01:31Z",
+            "updated_ts": "2026-08-01T13:03:00Z",
+        },
+    ]
+    fake, restore = _pr558_fake_db_with_rows(rows)
+    sys.modules["ap.db"] = fake
+    try:
+        status = eng._hydrate_pending_exit_identity_for_broker_recovery(
+            pos, sym, "acct-live-1",
+        )
+        assert status == "AMBIGUOUS"
+        assert pos.position_id in eng._pending_exit_identity_hold_position_ids
+        assert eng._pending_exit_hydration_status[pos.position_id] == "AMBIGUOUS"
+        assert pos.exit_in_flight is False
+        assert pos.pending_exit_local_order_id == ""
+        assert pos.pending_exit_broker_order_id == ""
+
+        eng._broker_position_precheck = lambda: False
+        eng._run_sentinels = lambda: None
+        eng._kill_switch_fn = None
+        eng._submit_exit_decision = MagicMock()
+        eng._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
+        eng._submit_exit_decision.assert_not_called()
+    finally:
+        restore()
+
+
 def test_pr558_blocker2_canonical_adoption_clears_degraded_metadata():
     """Both canonical adoption success paths must stop degraded retry state."""
     eng = _pr558_new_engine()

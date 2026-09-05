@@ -6802,23 +6802,38 @@ class APExitEngine:
                           )
                         ORDER BY updated_ts DESC NULLS LAST,
                                  created_ts DESC NULLS LAST
-                        LIMIT 1
+                        LIMIT 2
                         """,
                         (
                             getattr(pos, "client_id", None) or self._email or "",
                             *position_ids,
                         ),
                     )
-                    return c.fetchone()
+                    # Fetch two rows so a second active EXIT candidate across
+                    # canonical and degraded owner ids is visible.  Choosing
+                    # the newest row would silently convert contradictory
+                    # durable authority into an arbitrary identity.
+                    return c.fetchall() or []
 
-            row = run_with_retry(_fn)
-            if not row:
+            rows = run_with_retry(_fn) or []
+            if not rows:
                 self._set_pending_exit_hydration_status(
                     pos, _PENDING_EXIT_HYDRATION_NONE,
                 )
                 return False
 
-            row = dict(row)
+            if len(rows) > 1:
+                self._set_pending_exit_hydration_status(
+                    pos, _PENDING_EXIT_HYDRATION_AMBIGUOUS,
+                )
+                log.error(
+                    "[%s] EXIT_PENDING_IDENTITY_AMBIGUOUS | pos=%s "
+                    "active_exit_candidates=%d — refusing to choose one durable identity",
+                    pos.ticker, pos.position_id, len(rows),
+                )
+                return False
+
+            row = dict(rows[0])
             local_id  = str(row.get("local_order_id")  or "")
             broker_id = str(row.get("broker_order_id") or "")
             status    = str(row.get("status")           or "")
