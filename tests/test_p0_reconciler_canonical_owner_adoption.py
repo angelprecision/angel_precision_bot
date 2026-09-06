@@ -448,6 +448,62 @@ def test_exact_filled_entry_enriches_blank_canonical_metadata():
 
 
 @pytest.mark.parametrize(
+    ("local_order_id", "broker_order_id"),
+    [("entry-local-only", ""), ("", "entry-broker-only")],
+)
+def test_strict_seeder_holds_on_incomplete_entry_evidence(
+    local_order_id, broker_order_id
+):
+    evidence = {
+        "local_order_id": local_order_id,
+        "broker_order_id": broker_order_id,
+        "signal_id": "signal-1",
+        "canonical_signal_id": "canonical-signal-1",
+        "fill_price": 1.30,
+        "filled_ts": "2026-08-25T14:31:00+00:00",
+    }
+    engine = _ExitEngine(owners=[_owner("broker-repair-held")])
+    position = _position(
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+    )
+    reconciler = _reconciler(engine, evidence_status="PROVEN", evidence=evidence)
+
+    assert reconciler._seed_exit_engine_from_position(position) is False
+    assert engine.adopt_calls == []
+    assert engine.add_calls == []
+
+
+@pytest.mark.parametrize(
+    ("local_order_id", "broker_order_id"),
+    [("entry-local-1", ""), ("", "143201293")],
+)
+def test_strict_seeder_enriches_one_missing_entry_id_from_complete_evidence(
+    local_order_id, broker_order_id
+):
+    evidence = {
+        "local_order_id": "entry-local-1",
+        "broker_order_id": "143201293",
+        "signal_id": "signal-1",
+        "canonical_signal_id": "canonical-signal-1",
+        "fill_price": 1.30,
+        "filled_ts": "2026-08-25T14:31:00+00:00",
+    }
+    engine = _ExitEngine(owners=[_owner("broker-repair-held")])
+    position = _position(
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+    )
+    reconciler = _reconciler(engine, evidence_status="PROVEN", evidence=evidence)
+
+    assert reconciler._seed_exit_engine_from_position(position) is True
+    assert len(engine.adopt_calls) == 1
+    assert engine.adopt_calls[0]["local_order_id"] == "entry-local-1"
+    assert engine.adopt_calls[0]["broker_order_id"] == "143201293"
+    assert engine.add_calls == []
+
+
+@pytest.mark.parametrize(
     ("status", "evidence"),
     [
         ("AMBIGUOUS", None),
@@ -632,7 +688,7 @@ def test_entry_evidence_lookup_is_exactly_domain_fenced(monkeypatch):
     row = {
         "client_id": CLIENT,
         "kind": "ENTRY",
-        "status": "FILLED",
+        "status": " FILLED ",
         "local_order_id": "entry-local-1",
         "broker_order_id": "143201293",
         "signal_id": "signal-1",
@@ -678,8 +734,52 @@ def test_entry_evidence_lookup_is_exactly_domain_fenced(monkeypatch):
     assert "position_id::text = %s" in cursor.sql
     assert "local_order_id = %s" in cursor.sql
     assert "broker_order_id = %s" in cursor.sql
+    assert "upper(btrim(status)) IN" in cursor.sql
     assert "filled_qty" not in cursor.sql.split("FROM orders", 1)[1]
     assert "LIMIT 2" in cursor.sql
+
+
+@pytest.mark.parametrize(
+    ("local_order_id", "broker_order_id"),
+    [("entry-local-only", ""), ("", "entry-broker-only")],
+)
+def test_entry_evidence_requires_both_execution_ids(monkeypatch, local_order_id, broker_order_id):
+    import ap.db as db
+
+    row = {
+        "client_id": CLIENT,
+        "kind": "ENTRY",
+        "status": " FILLED ",
+        "local_order_id": local_order_id,
+        "broker_order_id": broker_order_id,
+        "signal_id": "signal-1",
+        "canonical_signal_id": "canonical-signal-1",
+        "fill_price": 1.30,
+        "filled_qty": 1,
+        "filled_ts": "2026-08-25T14:31:00+00:00",
+        "execution_mode": "live",
+        "position_id": POSITION_ID,
+        "contract": CONTRACT,
+        "meta": {},
+    }
+    cursor = _EvidenceCursor([row])
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = rec.APBrokerReconciler._filled_entry_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        signal_id="signal-1",
+        canonical_signal_id="canonical-signal-1",
+    )
+
+    assert status == "IDENTITY_INCOMPLETE"
+    assert evidence is None
 
 
 def test_entry_evidence_accepts_durable_metadata_mode_fallback(monkeypatch):

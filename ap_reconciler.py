@@ -4290,7 +4290,9 @@ class APBrokerReconciler:
                         WHERE client_id = %s
                           AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                           AND kind = 'ENTRY'
-                          AND status IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')
+                          AND upper(btrim(status)) IN (
+                                'FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED'
+                          )
                           AND (
                                 position_id::text = %s
                              OR (%s <> '' AND local_order_id = %s)
@@ -4356,6 +4358,15 @@ class APBrokerReconciler:
                 row_value = str(row.get(key) or "").strip()
                 if canonical_value and row_value and canonical_value != row_value:
                     return "IDENTITY_CONFLICT", None
+            # Canonical execution identity is a pair. Do not certify a
+            # partially persisted ENTRY row, even when every other durable
+            # field is valid; the missing counterpart must remain
+            # broker-truth-only rather than being fabricated or combined from
+            # another candidate.
+            row_local_order_id = str(row.get("local_order_id") or "").strip()
+            row_broker_order_id = str(row.get("broker_order_id") or "").strip()
+            if not row_local_order_id or not row_broker_order_id:
+                return "IDENTITY_INCOMPLETE", None
             fill_price = _positive_finite_float(row.get("fill_price"))
             filled_qty = _positive_finite_float(row.get("filled_qty"))
             filled_ts = row.get("filled_ts")
@@ -4789,6 +4800,13 @@ class APBrokerReconciler:
                 signal_id=signal_id,
                 canonical_signal_id=canonical_signal_id,
             )
+            if evidence_status == "IDENTITY_INCOMPLETE":
+                return self._canonical_owner_hold(
+                    contract=contract,
+                    position_id=pos_id,
+                    execution_mode=engine_mode,
+                    disposition="RETRY_ENTRY_IDENTITY_INCOMPLETE",
+                )
             if evidence_status not in {"NO_EVIDENCE", "PROVEN"}:
                 return self._canonical_owner_hold(
                     contract=contract,
@@ -4875,6 +4893,16 @@ class APBrokerReconciler:
                     disposition="RETRY_PARTIAL_EXIT_UNPROVEN",
                 )
             canonical_qty = _partial_qty
+
+        # Defense in depth: the owner API must never receive a one-sided
+        # execution identity, even if an evidence helper later regresses.
+        if not local_order_id or not broker_order_id:
+            return self._canonical_owner_hold(
+                contract=contract,
+                position_id=pos_id,
+                execution_mode=engine_mode,
+                disposition="RETRY_ENTRY_IDENTITY_INCOMPLETE",
+            )
 
         engine = getattr(self, "exit_engine", None)
         adoption_fn = getattr(engine, "adopt_canonical_position_identity", None)
