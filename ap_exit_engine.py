@@ -4545,11 +4545,19 @@ class APExitEngine:
             or ""
         ).strip().upper()
         try:
-            from ap.exit_safety import _normalize_contract as _normalize_owner_contract
+            from ap.exit_safety import (
+                _normalize_contract as _normalize_owner_contract,
+                is_valid_exact_occ_contract as _is_exact_occ_contract,
+            )
             _contract = _normalize_owner_contract(_contract)
         except Exception:
-            pass
-        if not _client or _mode not in {"live", "paper"} or not _contract:
+            return False, "identity_unproven"
+        if (
+            not _client
+            or _mode not in {"live", "paper"}
+            or not _contract
+            or not _is_exact_occ_contract(_contract)
+        ):
             return False, "identity_unproven"
 
         def _same_domain(candidate) -> bool:

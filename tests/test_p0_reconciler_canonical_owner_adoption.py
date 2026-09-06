@@ -1549,6 +1549,29 @@ def test_real_atomic_seed_rechecks_exact_domain_for_degraded_owner():
     assert engine._positions == [degraded]
 
 
+def test_real_atomic_seed_rejects_non_occ_contract():
+    """The atomic ownership boundary accepts option contracts only."""
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._email = CLIENT
+    engine._lock = threading.RLock()
+    engine._positions = []
+    engine._positions_by_id = {}
+    stock = ManagedPosition(
+        ticker="AAPL", option_symbol="AAPL", side="CALL", quantity=1,
+        entry_price=1.30, underlying_entry=0.0,
+        underlying_target=0.0, underlying_stop=0.0,
+        position_id="stock-position", client_id=CLIENT, execution_mode="live",
+    )
+
+    assert engine.seed_canonical_position_if_absent(stock) == (
+        False, "identity_unproven"
+    )
+    assert engine._positions == []
+    assert engine._positions_by_id == {}
+
+
 def test_real_atomic_seed_verifies_add_registration():
     """Calling add_position is not enough; the helper must prove registration."""
     from ap_exit_engine import APExitEngine, ManagedPosition
