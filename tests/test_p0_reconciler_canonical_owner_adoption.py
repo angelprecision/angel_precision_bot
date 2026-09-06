@@ -960,12 +960,8 @@ def test_quantity_remaining_zero_holds():
     assert engine.add_calls == []
 
 
-def test_quantity_remaining_partial_with_exit_evidence_adopts_remaining():
-    """qty=2, quantity_remaining=1 + proven EXIT evidence → adopt remaining=1.
-
-    The canonical exit owner should be seeded with qty=1 (the remaining),
-    not qty=2 (the stale full size).
-    """
+def test_quantity_remaining_partial_with_exit_evidence_preserves_full_and_remaining():
+    """NO_REPAIR_FOUND reconstructs the same (full, remaining) pair as adoption."""
     engine = _ExitEngine("NO_REPAIR_FOUND")
     pos = _position(qty=2, quantity_remaining=1)
     result = _reconciler(
@@ -975,12 +971,9 @@ def test_quantity_remaining_partial_with_exit_evidence_adopts_remaining():
     )._seed_exit_engine_from_position(pos)
     assert result is True
     assert len(engine.add_calls) == 1
-    # Must be seeded with the remaining qty (1), not stale full qty (2)
     seeded = engine.add_calls[0]
-    assert seeded.quantity == 1, (
-        f"Expected quantity=1 (remaining), got quantity={seeded.quantity}. "
-        "The exit owner was handed the stale full size — this is the quantity bug."
-    )
+    assert seeded.quantity == 2
+    assert seeded.quantity_remaining == 1
 
 
 def test_quantity_remaining_partial_without_exit_evidence_holds():
@@ -1482,3 +1475,103 @@ def test_entry_evidence_sql_fences_client_and_mode_in_query(monkeypatch):
             "kind='ENTRY' must appear in the SQL WHERE clause, "
             "not just in Python post-filter."
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Final #546 audit regressions — real atomic index proof + caller visibility
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _real_atomic_seed_fixture():
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._email = CLIENT
+    engine._lock = threading.RLock()
+    existing = ManagedPosition(
+        ticker="NOW", option_symbol=CONTRACT, side="PUT", quantity=2,
+        quantity_remaining=1, entry_price=1.30, underlying_entry=127.425,
+        underlying_target=120.0, underlying_stop=130.0,
+        position_id=POSITION_ID, client_id=CLIENT, execution_mode="live",
+    )
+    incoming = ManagedPosition(
+        ticker="NOW", option_symbol=CONTRACT, side="PUT", quantity=2,
+        quantity_remaining=1, entry_price=1.30, underlying_entry=127.425,
+        underlying_target=120.0, underlying_stop=130.0,
+        position_id=POSITION_ID, client_id=CLIENT, execution_mode="live",
+    )
+    engine._positions = [existing]
+    return engine, existing, incoming
+
+
+def test_real_atomic_seed_already_owned_requires_correct_id_index():
+    engine, existing, incoming = _real_atomic_seed_fixture()
+    engine._positions_by_id = {POSITION_ID: existing}
+    assert engine.seed_canonical_position_if_absent(incoming) == (
+        False, "already_owned"
+    )
+    assert engine._positions == [existing]
+    assert engine._positions_by_id == {POSITION_ID: existing}
+
+
+def test_real_atomic_seed_missing_id_index_holds():
+    engine, existing, incoming = _real_atomic_seed_fixture()
+    engine._positions_by_id = {}
+    assert engine.seed_canonical_position_if_absent(incoming) == (
+        False, "owner_index_conflict"
+    )
+    assert engine._positions == [existing]
+    assert engine._positions_by_id == {}
+
+
+def test_real_atomic_seed_stale_id_index_holds():
+    engine, existing, incoming = _real_atomic_seed_fixture()
+    stale = object()
+    engine._positions_by_id = {POSITION_ID: stale}
+    assert engine.seed_canonical_position_if_absent(incoming) == (
+        False, "owner_index_conflict"
+    )
+    assert engine._positions == [existing]
+    assert engine._positions_by_id[POSITION_ID] is stale
+
+
+def test_filled_entry_existing_position_surfaces_owner_install_failure():
+    reconciler = _reconciler(_ExitEngine())
+    reconciler._find_db_position_by_contract = lambda _contract: _position()
+    reconciler._seed_exit_engine_from_position = lambda _position_row: False
+    reconciler._link_order_to_position = lambda *_args, **_kwargs: pytest.fail(
+        "order must not be linked as successful after owner installation failed"
+    )
+    summary = {"positions_alerted": 0, "errors": []}
+    result = reconciler._ensure_position_for_filled_entry(
+        {
+            "contract": CONTRACT,
+            "execution_mode": "live",
+            "local_order_id": "entry-local-1",
+        },
+        1,
+        1.30,
+        summary,
+    )
+    assert result is None
+    assert summary["positions_alerted"] == 1
+    assert "reconciler_exit_owner_install_failed" in summary["errors"]
+
+
+def test_broker_live_position_surfaces_owner_install_failure():
+    reconciler = _reconciler(_ExitEngine())
+    reconciler._ghost_tracker = {}
+    broker_position = {
+        "symbol": CONTRACT,
+        "quantity": 1,
+        "underlying": "NOW",
+    }
+    reconciler._safe_get_broker_positions = lambda: [broker_position]
+    reconciler._get_open_db_positions = lambda: [_position()]
+    reconciler._seed_exit_engine_from_position = lambda _position_row: False
+    reconciler._import_broker_positions_missing_from_db = lambda **_kwargs: None
+    summary = {"positions_alerted": 0, "errors": []}
+
+    reconciler._reconcile_positions(summary)
+
+    assert summary["positions_alerted"] == 1
+    assert "reconciler_exit_owner_install_failed" in summary["errors"]

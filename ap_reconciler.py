@@ -2244,7 +2244,14 @@ class APBrokerReconciler:
         existing = self._find_db_position_by_contract(contract)
         if existing:
             pos_id = str(existing.get("id") or existing.get("position_id") or "")
-            self._seed_exit_engine_from_position(existing)
+            if not self._seed_exit_engine_from_position(existing):
+                self._record_exit_owner_install_failure(
+                    summary,
+                    contract=contract,
+                    position_id=pos_id,
+                    context="filled_entry_existing_position",
+                )
+                return None
             try:
                 self._link_order_to_position(
                     str(order.get("local_order_id") or ""), pos_id
@@ -2281,8 +2288,14 @@ class APBrokerReconciler:
                 f"qty={filled_qty} avg={avg_fill:.2f}"
             )
             row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)
-            if row:
-                self._seed_exit_engine_from_position(row)
+            if row and not self._seed_exit_engine_from_position(row):
+                self._record_exit_owner_install_failure(
+                    summary,
+                    contract=contract,
+                    position_id=str(pos_id or ""),
+                    context="filled_entry_created_position",
+                )
+                return None
             return str(pos_id) if pos_id else None
         except Exception as _pm_err:
             log.error("[%s] RECONCILE pm.open_position failed %s: %s",
@@ -3205,7 +3218,13 @@ class APBrokerReconciler:
                     summary["positions_alerted"] += 1
 
                 # Belt-and-suspenders: make sure exit engine is tracking this DB-open position.
-                self._seed_exit_engine_from_position(pos)
+                if not self._seed_exit_engine_from_position(pos):
+                    self._record_exit_owner_install_failure(
+                        summary,
+                        contract=contract,
+                        position_id=str(pos_id or ""),
+                        context="broker_live_db_position",
+                    )
                 continue
 
             self._handle_db_position_missing_at_broker(
@@ -3455,7 +3474,15 @@ class APBrokerReconciler:
             )
             if historical:
                 if str(historical.get("status") or "").upper() in DB_OPEN_POSITION_STATUSES:
-                    self._seed_exit_engine_from_position(historical)
+                    if not self._seed_exit_engine_from_position(historical):
+                        self._record_exit_owner_install_failure(
+                            summary,
+                            contract=contract,
+                            position_id=str(historical.get("id") or historical.get("position_id") or ""),
+                            context="historical_active_import_identity",
+                        )
+                        db_contracts.add(contract)
+                        continue
                 summary["positions_import_idempotent"] = int(
                     summary.get("positions_import_idempotent", 0)
                 ) + 1
@@ -3512,9 +3539,9 @@ class APBrokerReconciler:
 
             row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)
             if row:
-                self._seed_exit_engine_from_position(row)
+                owner_ready = self._seed_exit_engine_from_position(row)
             else:
-                self._seed_exit_engine_from_import(
+                seed_status = self._seed_exit_engine_from_import(
                     pos_id=pos_id,
                     contract=contract,
                     underlying=underlying,
@@ -3524,6 +3551,15 @@ class APBrokerReconciler:
                     underlying_entry=underlying_entry,
                     price_untrusted=price_untrusted,
                 )
+                owner_ready = seed_status in {"seeded", "already_owned"}
+            if not owner_ready:
+                self._record_exit_owner_install_failure(
+                    summary,
+                    contract=contract,
+                    position_id=str(pos_id or ""),
+                    context="broker_imported_position",
+                )
+                continue
 
             msg = (
                 f"BROKER_POSITION_IMPORTED | {underlying or '?'} {side} | "
@@ -4253,6 +4289,33 @@ class APBrokerReconciler:
         )
         return False
 
+    def _record_exit_owner_install_failure(
+        self,
+        summary: dict,
+        *,
+        contract: str,
+        position_id: str,
+        context: str,
+    ) -> None:
+        """Surface a failed canonical exit-owner installation to the caller."""
+        code = "reconciler_exit_owner_install_failed"
+        summary.setdefault("errors", []).append(code)
+        summary["positions_alerted"] = int(summary.get("positions_alerted", 0)) + 1
+        log.critical(
+            "[%s] RECONCILER_EXIT_OWNER_INSTALL_FAILED | "
+            "context=%s mode=%s contract=%s position_id=%s",
+            self.client_id,
+            context,
+            self.execution_mode or "unknown",
+            contract or "?",
+            position_id or "?",
+        )
+        self._alert(
+            f"RECONCILER_EXIT_OWNER_INSTALL_FAILED | context={context} "
+            f"mode={self.execution_mode or 'unknown'} contract={contract or '?'} "
+            f"position_id={position_id or '?'}"
+        )
+
     def _seed_exit_engine_from_position(self, pos: dict) -> bool:
         if not pos:
             return False
@@ -4576,13 +4639,15 @@ class APBrokerReconciler:
 
         if disposition == "NO_REPAIR_FOUND":
             if adopted is False and safe_to_seed is True and retryable is False:
-                # canonical_qty carries partial-exit adjusted quantity (or full qty).
+                # Preserve full durable size and proven current remainder as
+                # separate authorities, exactly as the adoption path does.
                 seed_status = self._seed_exit_engine_from_import(
                     pos_id=pos_id,
                     contract=contract,
                     underlying=underlying,
                     side=side,
-                    qty=canonical_qty,
+                    qty=qty,
+                    quantity_remaining=canonical_qty,
                     entry_px=entry_px,
                     stop_underlying=stop_underlying,
                     target_underlying=target_underlying,
@@ -4630,6 +4695,7 @@ class APBrokerReconciler:
         underlying: str,
         side: str,
         qty: int,
+        quantity_remaining: Optional[int] = None,
         entry_px: float,
         stop_underlying=0.0,
         target_underlying=0.0,
@@ -4670,11 +4736,31 @@ class APBrokerReconciler:
                     "underlying_entry remains 0.0; underlying_price_untrusted=True — MANUAL REVIEW REQUIRED"
                 )
 
+            full_qty_value = _positive_finite_float(qty)
+            remaining_source = qty if quantity_remaining is None else quantity_remaining
+            remaining_qty_value = _positive_finite_float(remaining_source)
+            if (
+                full_qty_value <= 0
+                or full_qty_value != int(full_qty_value)
+                or remaining_qty_value <= 0
+                or remaining_qty_value != int(remaining_qty_value)
+                or remaining_qty_value > full_qty_value
+            ):
+                log.critical(
+                    "[%s] EXIT_ENGINE_SEED_QUANTITY_UNPROVEN | %s | "
+                    "full_qty=%r quantity_remaining=%r",
+                    self.client_id, contract, qty, quantity_remaining,
+                )
+                return "invalid_quantity"
+            full_qty = int(full_qty_value)
+            remaining_qty = int(remaining_qty_value)
+
             mp = ManagedPosition(
                 ticker=self._norm_underlying(underlying or contract),
                 option_symbol=contract,
                 side=side,
-                quantity=int(qty),
+                quantity=full_qty,
+                quantity_remaining=remaining_qty,
                 entry_price=float(entry_px),
                 underlying_entry=float(underlying_entry_u),
                 underlying_target=float(target_u),
@@ -5264,11 +5350,18 @@ class APBrokerReconciler:
                             self.client_id, pos_id, contract,
                             rem_qty, broker_qty, restore_status, restore_remaining,
                         )
-                        # Re-seed the exit engine so this position gets managed again
-                        self._seed_exit_engine_from_position(dict(row) | {
+                        # Re-seed the exit engine so this position gets managed again.
+                        restored_position = dict(row) | {
                             "status": restore_status,
                             "quantity_remaining": restore_remaining,
-                        })
+                        }
+                        if not self._seed_exit_engine_from_position(restored_position):
+                            self._record_exit_owner_install_failure(
+                                summary,
+                                contract=contract,
+                                position_id=str(pos_id or ""),
+                                context="closed_partial_restore",
+                            )
                 else:
                     # Broker is flat — fix the DB row (zero remaining, stay CLOSED)
                     def _flatten(pid=pos_id):
