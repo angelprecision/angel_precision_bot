@@ -3256,6 +3256,7 @@ class APBrokerReconciler:
                 position_id_valid = (
                     position_id_alias_ok
                     and position_id_value.lower() not in placeholder_ids
+                    and not position_id_value.lower().startswith("broker-repair-")
                     and position_id_value == str(pos_id or "").strip()
                 )
                 position_client = str(pos.get("client_id") or "").strip().lower()
@@ -4724,6 +4725,7 @@ class APBrokerReconciler:
         )
         if (
             pos_id.strip().lower() in placeholder_ids
+            or pos_id.strip().lower().startswith("broker-repair-")
             or not expected_client
             or position_client != expected_client
             or engine_mode is None
