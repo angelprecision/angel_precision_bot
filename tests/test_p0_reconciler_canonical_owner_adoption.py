@@ -249,6 +249,23 @@ def test_no_repair_found_adds_canonical_once_and_proves_owner():
     assert engine.owners[0].position_id == POSITION_ID
 
 
+def test_no_repair_already_owned_diagnostic_does_not_claim_generic_add_ran():
+    """An atomic already-owned race is success without running add_position."""
+    engine = _ExitEngine("NO_REPAIR_FOUND", owners=[_owner(POSITION_ID)])
+    reconciler = _reconciler(engine)
+    diagnostics = []
+    reconciler._canonical_owner_diagnostic = lambda event, **kwargs: diagnostics.append(
+        (event, kwargs)
+    )
+
+    assert reconciler._seed_exit_engine_from_position(_position()) is True
+    assert engine.add_calls == []
+    assert diagnostics
+    event, fields = diagnostics[-1]
+    assert event == "RECONCILER_CANONICAL_OWNER_SEED_ALREADY_OWNED"
+    assert fields["generic_add_ran"] is False
+
+
 def test_atomic_seed_unavailable_holds_without_generic_add():
     """An engine without the atomic seam must never revive generic seeding."""
     class _NoAtomicExitEngine:
@@ -1005,7 +1022,7 @@ def test_quantity_remaining_partial_non_proven_evidence_statuses_hold(partial_st
 
 
 def test_quantity_remaining_partial_full_adoption_path_uses_remaining_qty():
-    """ADOPTED path with qty=2, quantity_remaining=1, exit evidence → uses qty=1."""
+    """ADOPTED path preserves full=2 and proven remaining=1."""
     engine = _ExitEngine("ADOPTED", owners=[_owner("broker-repair-held")])
     pos = _position(qty=2, quantity_remaining=1)
     # ADOPTED path does not call add_position, but canonical_qty must be correct

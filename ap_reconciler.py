@@ -4675,7 +4675,7 @@ class APBrokerReconciler:
                     disposition=disposition,
                     owner_reason=owner_reason,
                     owner_ids=owner_ids,
-                    generic_add_ran=_seed_succeeded,
+                    generic_add_ran=(seed_status == "seeded"),
                 )
                 return bool(_seed_succeeded and ok)
             disposition = "RETRY_UNREADABLE_ADOPTION_RESULT"
