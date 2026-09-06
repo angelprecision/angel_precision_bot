@@ -36,6 +36,9 @@ jobs:
               if inside and line.strip() == 'PY':
                   break
               if inside:
+                  if line == '':
+                      script.append('')
+                      continue
                   if not line.startswith('          '):
                       raise SystemExit(f'unexpected patch-script indentation: {line!r}')
                   script.append(line[10:])
