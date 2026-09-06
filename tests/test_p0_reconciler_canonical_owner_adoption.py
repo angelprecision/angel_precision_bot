@@ -293,6 +293,34 @@ def test_real_exit_engine_adopts_through_reconciler_boundary():
     assert repair.option_symbol == CONTRACT
 
 
+def test_pr588_partial_restart_without_exit_proof_holds_at_546_boundary():
+    """A durable 2/1 row must reach the real #546 partial-proof gate.
+
+    The broker-truth repair may establish current remaining exposure, but it
+    must not weaken the reconciler's requirement for exact durable EXIT proof.
+    """
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._email = CLIENT
+    engine._lock = threading.RLock()
+    engine._positions = []
+    engine._positions_by_id = {}
+
+    reconciler = _reconciler(
+        engine,
+        partial_evidence_status="NO_EVIDENCE",
+        partial_evidence=None,
+    )
+    partial_row = _position(
+        qty=2,
+        quantity_remaining=1,
+    )
+
+    assert reconciler._seed_exit_engine_from_position(partial_row) is False
+    assert engine._positions == []
+
+
 def test_already_canonical_repair_removed_never_adds():
     engine = _ExitEngine(
         "ALREADY_CANONICAL_REPAIR_REMOVED",

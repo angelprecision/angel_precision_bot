@@ -3724,23 +3724,28 @@ def test_pr588_source_managed_position_from_row_preserves_full_qty():
 
 
 def test_pr588_source_db_repair_preserves_canonical_qty():
-    """Source: the stale-DB-qty repair UPDATE must never touch canonical qty
-    column — only quantity_remaining — and must set PARTIAL status when
-    broker < durable qty."""
+    """Source: durable repair separates canonical full qty from broker
+    remaining qty, and only an exact ENTRY resolver may change ``qty``."""
     precheck_start = EE_SRC.find("def _broker_position_precheck")
     precheck_end   = EE_SRC.find("\n    def ", precheck_start + 1)
     body = EE_SRC[precheck_start:precheck_end]
-    assert "BROKER_REPAIR_DB_QTY_STALE_BLOCKED" in body, (
-        "DB repair must emit BROKER_REPAIR_DB_QTY_STALE_BLOCKED when broker "
-        "remainder exceeds durable qty"
+    assert "_reconcile_existing_broker_position_row" in body, (
+        "all existing-row quantity repair must use the shared durable resolver"
     )
-    # The UPDATE must NOT include 'qty = GREATEST' any more
+    helper_start = EE_SRC.find("def _reconcile_existing_broker_position_row")
+    helper_end = EE_SRC.find("\n    def ", helper_start + 1)
+    helper_body = EE_SRC[helper_start:helper_end]
+    assert "SET qty = %s" in helper_body, (
+        "legacy collapsed qty repair must persist the exact ENTRY-proven full qty"
+    )
+    assert "expected_position_id=position_id" in EE_SRC, (
+        "legacy full-quantity repair must fence ENTRY provenance to the exact position"
+    )
+    assert "_desired_status = \"OPEN\" if _broker_qty == _full_qty else \"PARTIAL\"" in helper_body
+    # No broker-only expansion path is allowed.
     assert "qty               = GREATEST" not in body, (
         "DB repair UPDATE must not expand canonical qty via GREATEST — "
         "broker truth cannot overwrite original entry size"
-    )
-    assert "THEN 'PARTIAL'" in body, (
-        "DB repair must set status=PARTIAL when broker_qty < durable qty"
     )
 
 
@@ -3979,52 +3984,68 @@ def test_pr588_test_b_no_fabricated_economics():
 
 @_skip_if_no_mod
 def test_pr588_test_c_restart_parity_fresh_engine():
-    """Test C (spec): restart from a PARTIAL 2/1 durable state.
-    A freshly instantiated engine loading from the DB row must preserve 2/1,
-    never collapse to 1/1."""
+    """Test C: the real restart seam must HOLD when broker truth is lost.
+
+    This intentionally exercises ``seed_from_db`` and ``_check_all_positions``
+    rather than calling the row helper directly.  A stale durable 2/2 row is
+    not allowed to reach the submit callback after the process restarts and
+    authoritative broker positions are unavailable.
+    """
     engine_cls = getattr(_EE_MOD, "APExitEngine", None)
     if engine_cls is None:
         pytest.skip("APExitEngine not found")
 
-    # Simulate the durable state from Test B: a PARTIAL positions row with
-    # qty=2 (original entry) and quantity_remaining=1 (broker current).
-    partial_row = {
+    contract = "IWM260919C00230000"
+    client = "pr588-c@example.com"
+    stale_row = {
         "id": "pos-c-restart-001",
-        "contract": "IWM260919C00230000",
-        "option_symbol": "IWM260919C00230000",
+        "client_id": client,
+        "contract": contract,
+        "option_symbol": contract,
         "underlying": "IWM",
         "side": "CALL",
         "direction": "CALL",
         "qty": 2,                   # canonical full entry qty (durable)
-        "quantity_remaining": 1,    # broker remaining after partial exit
+        "quantity_remaining": 2,    # stale positive durable remainder
         "entry_price": 1.50,
         "avg_fill": 1.50,
         "entry_ts": None,
-        "status": "PARTIAL",
+        "status": "OPEN",
         "signal_id": "sig-c-001",
         "execution_mode": "live",
     }
 
-    # Process B — genuinely new engine object (not the same in-memory state)
-    eng_b = engine_cls.__new__(engine_cls)
-    eng_b._email = "pr588-c@example.com"
-    eng_b._lock  = __import__("threading").RLock()
-    eng_b._positions = []
-    eng_b._positions_by_id = {}
-    eng_b.broker = types.SimpleNamespace(mode="live")
+    class _UnavailableBroker:
+        mode = "live"
+        account_id = "acct-pr588-c"
 
-    # Restart loads from DB (broker qty=1 confirms current exposure)
-    mp = eng_b._managed_position_from_row(
-        partial_row, qty_override=1, prefer_qty_override=True,
-        expected_contract="IWM260919C00230000",
+        def list_positions(self):
+            raise RuntimeError("broker position snapshot unavailable")
+
+    eng_b = engine_cls(broker=_UnavailableBroker(), email=client)
+    eng_b._hydrate_pending_exit_identity_for_broker_recovery = (
+        lambda *_args, **_kwargs: "NONE"
     )
-    assert mp.quantity == 2, (
-        f"Fresh-process restart must preserve quantity=2 (full entry), got {mp.quantity}. "
-        f"No collapse to 1/1 is allowed."
-    )
-    assert mp.quantity_remaining == 1, (
-        f"Fresh-process restart must preserve quantity_remaining=1 (broker), "
-        f"got {mp.quantity_remaining}"
+
+    class _PositionManager:
+        def get_active_positions(self):
+            return [stale_row]
+
+    eng_b.seed_from_db(_PositionManager())
+    assert len(eng_b.active_positions()) == 1
+    mp = eng_b.active_positions()[0]
+    assert mp.quantity == 2
+    assert mp.quantity_remaining == 2
+    assert mp.broker_repair_quantity_unverified is True
+
+    eng_b._run_sentinels = lambda: None
+    eng_b._kill_switch_fn = None
+    eng_b._submit_exit_decision = MagicMock()
+    eng_b._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
+
+    assert eng_b._submit_exit_decision.call_count == 0, (
+        "stale durable 2/2 must not produce an oversized EXIT callback after "
+        "restart when broker quantity truth is unavailable"
     )
 
 
@@ -4665,6 +4686,472 @@ def test_pr588_test_h_malformed_entry_filled_qty_blocks_insert():
 
 
 # ── Test J: MANDATORY real PostgreSQL INSERT ──────────────────────────────────
+
+@_skip_if_no_mod
+def test_pr588_existing_positive_remaining_2_2_to_2_1_postgresql(monkeypatch):
+    """A real existing 2/2 row must become durable 2/1 PARTIAL."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "IWM260919C00230000"
+        client = "pr588-existing-positive@example.com"
+        position_id = "pr588-existing-positive-row"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, position_id, kind, status,
+                    contract, execution_mode, filled_qty, fill_price, filled_ts,
+                    meta
+                ) VALUES (%s, %s, %s, 'ENTRY', 'FILLED', %s, 'live',
+                          2, 1.50, %s, '{}'::jsonb)
+                """,
+                (
+                    "local-pr588-existing-positive",
+                    client,
+                    position_id,
+                    contract,
+                    "2026-09-01T13:00:00Z",
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO positions (
+                    id, client_id, underlying, contract, option_symbol,
+                    execution_mode, side, direction, qty, quantity_remaining,
+                    avg_fill, entry_price, entry_ts, status, signal_id
+                ) VALUES (%s, %s, 'IWM', %s, %s, 'live', 'CALL', 'CALL',
+                          2, 2, 1.50, 1.50, %s, 'OPEN', 'sig-existing-positive')
+                """,
+                (
+                    position_id,
+                    client,
+                    contract,
+                    contract,
+                    "2026-09-01T13:00:00Z",
+                ),
+            )
+        pg_conn.commit()
+
+        class _Broker:
+            mode = "live"
+            account_id = "acct-pr588-existing-positive"
+
+            def list_positions(self):
+                return [{
+                    "contract": contract,
+                    "quantity": 1,
+                    "cost_basis": 150.0,
+                    "date_acquired": "2026-09-01T13:00:00Z",
+                }]
+
+        eng = engine_cls(
+            broker=_Broker(),
+            email=client,
+        )
+        eng._fetch_broker_quote = lambda _sym: {
+            "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+        }
+        assert eng._broker_position_precheck() is True
+
+        active = eng.active_positions()
+        assert len(active) == 1
+        assert active[0].quantity == 2
+        assert active[0].quantity_remaining == 1
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT qty, quantity_remaining, status FROM positions WHERE id = %s",
+                (position_id,),
+            )
+            row = cur.fetchone()
+        assert row is not None
+        values = dict(row) if isinstance(row, dict) else {
+            "qty": row[0], "quantity_remaining": row[1], "status": row[2],
+        }
+        assert values == {
+            "qty": 2,
+            "quantity_remaining": 1,
+            "status": "PARTIAL",
+        }
+
+
+@_skip_if_no_mod
+def test_pr588_legacy_collapsed_1_1_repairs_from_exact_position_entry_postgresql(monkeypatch):
+    """A legacy 1/1 row may expand only from its exact filled ENTRY."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "QQQ260919C00480000"
+        client = "pr588-legacy-collapse@example.com"
+        position_id = "pr588-legacy-collapse-row"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, position_id, kind, status,
+                    contract, execution_mode, filled_qty, fill_price, filled_ts,
+                    meta
+                ) VALUES (%s, %s, %s, 'ENTRY', 'FILLED', %s, 'live',
+                          2, 1.50, %s, '{}'::jsonb)
+                """,
+                (
+                    "local-pr588-legacy-collapse",
+                    client,
+                    position_id,
+                    contract,
+                    "2026-09-01T13:00:00Z",
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO positions (
+                    id, client_id, underlying, contract, option_symbol,
+                    execution_mode, side, direction, qty, quantity_remaining,
+                    avg_fill, entry_price, entry_ts, status, signal_id
+                ) VALUES (%s, %s, 'QQQ', %s, %s, 'live', 'CALL', 'CALL',
+                          1, 1, 1.50, 1.50, %s, 'OPEN', 'sig-legacy-collapse')
+                """,
+                (
+                    position_id,
+                    client,
+                    contract,
+                    contract,
+                    "2026-09-01T13:00:00Z",
+                ),
+            )
+        pg_conn.commit()
+
+        class _Broker:
+            mode = "live"
+            account_id = "acct-pr588-legacy-collapse"
+
+            def list_positions(self):
+                return [{
+                    "contract": contract,
+                    "quantity": 1,
+                    "cost_basis": 150.0,
+                    "date_acquired": "2026-09-01T13:00:00Z",
+                }]
+
+        eng = engine_cls(broker=_Broker(), email=client)
+        eng._fetch_broker_quote = lambda _sym: {
+            "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+        }
+        assert eng._broker_position_precheck() is True
+
+        active = eng.active_positions()
+        assert len(active) == 1
+        assert (active[0].quantity, active[0].quantity_remaining) == (2, 1)
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT qty, quantity_remaining, status FROM positions WHERE id = %s",
+                (position_id,),
+            )
+            row = cur.fetchone()
+        values = dict(row) if isinstance(row, dict) else {
+            "qty": row[0], "quantity_remaining": row[1], "status": row[2],
+        }
+        assert values == {
+            "qty": 2,
+            "quantity_remaining": 1,
+            "status": "PARTIAL",
+        }
+
+
+@_skip_if_no_mod
+def test_pr588_partial_restart_hydrates_active_exit_without_duplicate_submit_postgresql(monkeypatch):
+    """A durable 2/1 owner with an active EXIT rehydrates and stays idempotent."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "SPY260919C00600000"
+        client = "pr588-partial-exit-restart@example.com"
+        position_id = "pr588-partial-exit-restart-row"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO positions (
+                    id, client_id, underlying, contract, option_symbol,
+                    execution_mode, side, direction, qty, quantity_remaining,
+                    avg_fill, entry_price, entry_ts, status, signal_id
+                ) VALUES (%s, %s, 'SPY', %s, %s, 'live', 'CALL', 'CALL',
+                          2, 1, 1.50, 1.50, %s, 'PARTIAL', 'sig-partial-restart')
+                """,
+                (
+                    position_id,
+                    client,
+                    contract,
+                    contract,
+                    "2026-09-01T13:00:00Z",
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, position_id, kind, status,
+                    contract, execution_mode, filled_qty, fill_price, filled_ts,
+                    meta
+                ) VALUES (%s, %s, %s, 'EXIT', 'EXIT_SUBMITTED', %s, 'live',
+                          0, NULL, %s, '{}'::jsonb)
+                """,
+                (
+                    "local-pr588-active-exit",
+                    client,
+                    position_id,
+                    contract,
+                    "2026-09-01T13:05:00Z",
+                ),
+            )
+        pg_conn.commit()
+
+        class _Broker:
+            mode = "live"
+            account_id = "acct-pr588-partial-restart"
+
+            def list_positions(self):
+                return [{
+                    "contract": contract,
+                    "quantity": 1,
+                    "cost_basis": 150.0,
+                    "date_acquired": "2026-09-01T13:00:00Z",
+                }]
+
+        eng = engine_cls(broker=_Broker(), email=client)
+        eng._fetch_broker_quote = lambda _sym: {
+            "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+        }
+
+        class _PositionManager:
+            def get_active_positions(self):
+                return [{
+                    "id": position_id,
+                    "client_id": client,
+                    "underlying": "SPY",
+                    "contract": contract,
+                    "option_symbol": contract,
+                    "side": "CALL",
+                    "direction": "CALL",
+                    "qty": 2,
+                    "quantity_remaining": 1,
+                    "avg_fill": 1.50,
+                    "entry_price": 1.50,
+                    "entry_ts": "2026-09-01T13:00:00Z",
+                    "status": "PARTIAL",
+                    "signal_id": "sig-partial-restart",
+                    "execution_mode": "live",
+                }]
+
+        eng.seed_from_db(_PositionManager())
+        active = eng.active_positions()
+        assert len(active) == 1
+        assert active[0].exit_in_flight is True
+        assert active[0].pending_exit_local_order_id == "local-pr588-active-exit"
+        assert active[0].broker_repair_quantity_unverified is True
+
+        assert eng._broker_position_precheck() is True
+        assert active[0].broker_repair_quantity_unverified is False
+        assert (active[0].quantity, active[0].quantity_remaining) == (2, 1)
+
+        eng._run_sentinels = lambda: None
+        eng._kill_switch_fn = None
+        eng._submit_exit_decision = MagicMock()
+        eng._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
+        eng._submit_exit_decision.assert_not_called()
+
+
+@_skip_if_no_mod
+def test_pr588_existing_row_update_failure_holds_without_degraded_owner():
+    """A failed durable 2/2 -> 2/1 update cannot fall through to submit-ready ownership."""
+    eng = _pr558_new_engine(email="pr588-update-failure@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    contract = "SPY260919C00600000"
+    db_row = {
+        "id": "pr588-update-failure-row",
+        "client_id": eng._email,
+        "contract": contract,
+        "option_symbol": contract,
+        "underlying": "SPY",
+        "side": "CALL",
+        "direction": "CALL",
+        "qty": 2,
+        "quantity_remaining": 2,
+        "entry_price": 1.50,
+        "avg_fill": 1.50,
+        "entry_ts": None,
+        "status": "OPEN",
+        "signal_id": "sig-update-failure",
+        "execution_mode": "live",
+    }
+
+    class _Broker:
+        mode = "live"
+        account_id = "acct-pr588-update-failure"
+
+        def list_positions(self):
+            return [{
+                "contract": contract,
+                "quantity": 1,
+                "cost_basis": 150.0,
+                "date_acquired": "2026-09-01T13:00:00Z",
+            }]
+
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: db_row
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+    eng._upsert_broker_position_to_db = lambda *_args: pytest.fail(
+        "existing-row update failure must not fall through to upsert"
+    )
+    eng._install_or_refresh_degraded_broker_truth_owner = lambda **_kwargs: pytest.fail(
+        "existing canonical row update failure must remain a HOLD"
+    )
+
+    class _Cur:
+        rowcount = 1
+
+        def execute(self, *_args, **_kwargs):
+            raise RuntimeError("durable update unavailable")
+
+    @contextmanager
+    def _conn():
+        yield _Cur()
+
+    failing_db = types.SimpleNamespace(conn=_conn, run_with_retry=lambda fn, **_: fn())
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = failing_db
+    try:
+        assert eng._broker_position_precheck() is False
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert eng._positions == []
+    assert db_row["qty"] == 2
+    assert db_row["quantity_remaining"] == 2
+    assert contract in eng._broker_truth_hold_symbols
+
+@_skip_if_no_mod
+def test_pr588_existing_collapsed_row_ambiguous_entry_holds_without_mutation():
+    """Ambiguous exact-position ENTRY history cannot expand a legacy row."""
+    eng = _pr558_new_engine(email="pr588-ambiguous-existing@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+    contract = "QQQ260919C00480000"
+    position_id = "pr588-ambiguous-existing-row"
+    db_row = {
+        "id": position_id,
+        "client_id": eng._email,
+        "contract": contract,
+        "option_symbol": contract,
+        "underlying": "QQQ",
+        "side": "CALL",
+        "direction": "CALL",
+        "qty": 1,
+        "quantity_remaining": 1,
+        "entry_price": 1.50,
+        "avg_fill": 1.50,
+        "entry_ts": None,
+        "status": "OPEN",
+        "signal_id": "sig-ambiguous-existing",
+        "execution_mode": "live",
+    }
+    entries = [
+        {
+            "id": "ambiguous-entry-1",
+            "client_id": eng._email,
+            "position_id": position_id,
+            "kind": "ENTRY",
+            "status": "FILLED",
+            "contract": contract,
+            "execution_mode": "live",
+            "filled_qty": 2,
+            "fill_price": 1.50,
+            "filled_ts": "2026-09-01T13:00:00Z",
+        },
+        {
+            "id": "ambiguous-entry-2",
+            "client_id": eng._email,
+            "position_id": position_id,
+            "kind": "ENTRY",
+            "status": "FILLED",
+            "contract": contract,
+            "execution_mode": "live",
+            "filled_qty": 2,
+            "fill_price": 1.50,
+            "filled_ts": "2026-09-01T13:01:00Z",
+        },
+    ]
+
+    class _Broker:
+        mode = "live"
+        account_id = "acct-pr588-ambiguous-existing"
+
+        def list_positions(self):
+            return [{
+                "contract": contract,
+                "quantity": 1,
+                "cost_basis": 150.0,
+                "date_acquired": "2026-09-01T13:00:00Z",
+            }]
+
+    executed = []
+
+    class _Cur:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            executed.append(str(sql))
+            return self
+
+        def fetchall(self):
+            return entries
+
+        def fetchone(self):
+            return None
+
+    @contextmanager
+    def _conn():
+        yield _Cur()
+
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: db_row
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+    eng._upsert_broker_position_to_db = lambda *_args: pytest.fail(
+        "ambiguous existing provenance must not upsert"
+    )
+    eng._install_or_refresh_degraded_broker_truth_owner = lambda **_kwargs: pytest.fail(
+        "ambiguous existing provenance must remain a HOLD"
+    )
+
+    fake_db = types.SimpleNamespace(conn=_conn, run_with_retry=lambda fn, **_: fn())
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_db
+    try:
+        assert eng._broker_position_precheck() is False
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert eng._positions == []
+    assert db_row["qty"] == 1
+    assert db_row["quantity_remaining"] == 1
+    assert not any("UPDATE positions" in sql for sql in executed)
+    assert contract in eng._broker_truth_hold_symbols
 
 @_skip_if_no_mod
 def test_pr588_test_j_real_postgresql_partial_insert(monkeypatch):
