@@ -1749,6 +1749,139 @@ def test_broker_live_position_surfaces_owner_install_failure():
     assert "reconciler_exit_owner_install_failed" in summary["errors"]
 
 
+class _ReadOnlyBroker:
+    def __init__(self):
+        self.calls = []
+
+    def list_positions(self):
+        self.calls.append("list_positions")
+        return [{"symbol": CONTRACT, "quantity": 1, "underlying": "NOW"}]
+
+    def submit_order(self, *args, **kwargs):
+        self.calls.append("submit_order")
+        raise AssertionError("reconciler must not submit broker orders")
+
+    def cancel_order(self, *args, **kwargs):
+        self.calls.append("cancel_order")
+        raise AssertionError("reconciler must not cancel broker orders")
+
+    def replace_order(self, *args, **kwargs):
+        self.calls.append("replace_order")
+        raise AssertionError("reconciler must not replace broker orders")
+
+
+def _run_existing_position_reconcile(reconciler, row, *, broker=None):
+    reconciler._ghost_tracker = {}
+    if broker is None:
+        reconciler._safe_get_broker_positions = lambda: [{
+            "symbol": CONTRACT,
+            "quantity": 1,
+            "underlying": "NOW",
+        }]
+    else:
+        reconciler.broker = broker
+    reconciler._get_open_db_positions = lambda: [row]
+    reconciler._import_broker_positions_missing_from_db = lambda **_kwargs: None
+    summary = {"positions_alerted": 0, "errors": []}
+    reconciler._reconcile_positions(summary)
+    return summary
+
+
+def test_broker_only_reconciled_row_verifies_existing_owner_without_entry_lookup():
+    engine = _ExitEngine(owners=[_owner(POSITION_ID)])
+    reconciler = _reconciler(engine)
+    broker = _ReadOnlyBroker()
+    strict_calls = []
+    reconciler._seed_exit_engine_from_position = (
+        lambda row: strict_calls.append(row) or pytest.fail(
+            "broker-only reconciled owner verification must not require ENTRY adoption"
+        )
+    )
+
+    summary = _run_existing_position_reconcile(
+        reconciler,
+        _position(
+            tier="RECONCILED",
+            plan_id="reconciled:broker-only",
+            local_order_id="",
+            broker_order_id="",
+        ),
+        broker=broker,
+    )
+
+    assert strict_calls == []
+    assert summary["positions_alerted"] == 0
+    assert summary["errors"] == []
+    assert broker.calls == ["list_positions"]
+
+
+def test_broker_only_reconciled_row_without_owner_surfaces_failure():
+    reconciler = _reconciler(_ExitEngine())
+    reconciler._seed_exit_engine_from_position = lambda _row: pytest.fail(
+        "broker-only reconciled owner verification must not require ENTRY adoption"
+    )
+
+    summary = _run_existing_position_reconcile(
+        reconciler,
+        _position(
+            tier="RECONCILED",
+            plan_id="reconciled:broker-only",
+            local_order_id="",
+            broker_order_id="",
+        ),
+    )
+
+    assert summary["positions_alerted"] == 1
+    assert "reconciler_exit_owner_install_failed" in summary["errors"]
+
+
+@pytest.mark.parametrize(
+    "owner_kwargs",
+    [
+        {"contract": "NOW260828C00122000"},
+        {"client_id": "other@example.com"},
+        {"mode": "paper"},
+    ],
+)
+def test_broker_only_reconciled_row_rejects_wrong_domain_owner(owner_kwargs):
+    reconciler = _reconciler(_ExitEngine(owners=[_owner(POSITION_ID, **owner_kwargs)]))
+    reconciler._seed_exit_engine_from_position = lambda _row: pytest.fail(
+        "broker-only reconciled owner verification must not require ENTRY adoption"
+    )
+
+    summary = _run_existing_position_reconcile(
+        reconciler,
+        _position(
+            tier="RECONCILED",
+            plan_id="reconciled:broker-only",
+            local_order_id="",
+            broker_order_id="",
+        ),
+    )
+
+    assert summary["positions_alerted"] == 1
+    assert "reconciler_exit_owner_install_failed" in summary["errors"]
+
+
+def test_reconciled_row_with_entry_identity_keeps_strict_canonical_path():
+    engine = _ExitEngine(owners=[_owner(POSITION_ID)])
+    reconciler = _reconciler(engine)
+    strict_calls = []
+    reconciler._seed_exit_engine_from_position = (
+        lambda row: strict_calls.append(row) or True
+    )
+    row = _position(
+        tier="RECONCILED",
+        plan_id="reconciled:proven-entry",
+    )
+
+    summary = _run_existing_position_reconcile(reconciler, row)
+
+    assert strict_calls == [row]
+    assert summary["positions_alerted"] == 0
+    assert summary["errors"] == []
+
+
 def test_unattributed_import_uses_broker_truth_seed_without_entry_fabrication():
     engine = _ExitEngine()
     reconciler = _reconciler(engine)

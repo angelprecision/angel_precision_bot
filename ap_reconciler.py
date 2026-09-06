@@ -3217,8 +3217,37 @@ class APBrokerReconciler:
                     )
                     summary["positions_alerted"] += 1
 
-                # Belt-and-suspenders: make sure exit engine is tracking this DB-open position.
-                if not self._seed_exit_engine_from_position(pos):
+                # Broker-only reconciled rows intentionally have no ENTRY
+                # execution identity.  Their owner is installed by the
+                # broker-truth import path (or startup hydration), so an
+                # ordinary reconciliation pass must verify that exact owner
+                # rather than manufacture missing ENTRY evidence.  Do not
+                # rebuild, reseed, or consult broker economics here.
+                import_provenance = str(pos.get("tier") or "").strip().upper()
+                import_plan_id = str(pos.get("plan_id") or "").strip().lower()
+                local_order_id = str(
+                    pos.get("local_order_id") or pos.get("entry_local_order_id") or ""
+                ).strip()
+                broker_order_id = str(
+                    pos.get("broker_order_id") or pos.get("entry_broker_order_id") or ""
+                ).strip()
+                broker_import_without_entry_identity = (
+                    (
+                        import_provenance == "RECONCILED"
+                        or import_plan_id.startswith("reconciled:")
+                    )
+                    and not local_order_id
+                    and not broker_order_id
+                )
+                if broker_import_without_entry_identity:
+                    owner_ready = self._canonical_owner_postcondition(
+                        contract=contract,
+                        position_id=str(pos_id or ""),
+                        execution_mode=position_execution_mode,
+                    )[0]
+                else:
+                    owner_ready = self._seed_exit_engine_from_position(pos)
+                if not owner_ready:
                     self._record_exit_owner_install_failure(
                         summary,
                         contract=contract,
