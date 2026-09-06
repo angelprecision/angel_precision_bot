@@ -1169,6 +1169,47 @@ def test_partial_exit_evidence_accepts_durable_metadata_mode_fallback(monkeypatc
     assert cursor.params == (CLIENT, "live", POSITION_ID, CONTRACT)
 
 
+def test_partial_exit_evidence_accounts_for_more_than_five_fills(monkeypatch):
+    """Cumulative proof must include every exact-position EXIT fill."""
+    import ap.db as db
+
+    rows = [
+        _partial_exit_row(
+            local_order_id=f"exit-local-{idx}",
+            broker_order_id=f"exit-broker-{idx}",
+            filled_ts=f"2026-08-25T15:{idx:02d}:00+00:00",
+        )
+        for idx in range(1, 7)
+    ]
+
+    class _LimitAwareEvidenceCursor(_EvidenceCursor):
+        def fetchall(self):
+            # Model a database honoring the old production LIMIT 5 so this
+            # regression fails against the truncated query, not just by SQL
+            # string inspection.
+            if "LIMIT 5" in self.sql.upper():
+                return self.rows[:5]
+            return self.rows
+
+    cursor = _LimitAwareEvidenceCursor(rows)
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = rec.APBrokerReconciler._partial_exit_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        expected_exited_qty=6,
+    )
+
+    assert status == "PROVEN"
+    assert evidence == rows[0]
+    assert "LIMIT 5" not in cursor.sql.upper()
+    assert "UPPER(BTRIM(STATUS))" in cursor.sql.upper()
+
+
 @pytest.mark.parametrize("field", ["fill_price", "filled_ts"])
 def test_partial_exit_evidence_rejects_malformed_fill_truth(monkeypatch, field):
     import ap.db as db
@@ -1700,6 +1741,56 @@ def test_real_atomic_seed_rechecks_exact_domain_for_degraded_owner():
     assert engine._positions == [degraded]
 
 
+def test_real_atomic_seed_ignores_foreign_client_same_occ():
+    """Exact-domain seeding must not be vetoed by another client."""
+    foreign = _managed_owner("foreign-client-owner", client_id="other@example.com")
+    target = _managed_owner("canonical-seed")
+    foreign_identity = (
+        foreign.position_id,
+        foreign.client_id,
+        foreign.execution_mode,
+        foreign.option_symbol,
+    )
+    engine = _real_adoption_engine(foreign)
+
+    result = engine.seed_canonical_position_if_absent(target)
+
+    assert result == (True, "seeded")
+    assert engine._positions == [foreign, target]
+    assert (
+        foreign.position_id,
+        foreign.client_id,
+        foreign.execution_mode,
+        foreign.option_symbol,
+    ) == foreign_identity
+
+
+def test_real_atomic_seed_ignores_foreign_mode_same_occ():
+    """LIVE exact-domain seeding must not be vetoed by a PAPER owner."""
+    foreign = _managed_owner("paper-owner", mode="paper")
+    target = _managed_owner("canonical-seed")
+    engine = _real_adoption_engine(foreign)
+
+    result = engine.seed_canonical_position_if_absent(target)
+
+    assert result == (True, "seeded")
+    assert engine._positions == [foreign, target]
+    assert foreign.execution_mode == "paper"
+
+
+def test_real_atomic_seed_rejects_same_domain_duplicate():
+    """A second active owner in one client/mode/OCC domain still holds."""
+    existing = _managed_owner("existing-seed")
+    target = _managed_owner("canonical-seed")
+    engine = _real_adoption_engine(existing)
+
+    result = engine.seed_canonical_position_if_absent(target)
+
+    assert result == (False, "owner_conflict")
+    assert engine._positions == [existing]
+    assert engine._positions_by_id == {existing.position_id: existing}
+
+
 def test_real_atomic_seed_rejects_non_occ_contract():
     """The atomic ownership boundary accepts option contracts only."""
     from ap_exit_engine import APExitEngine, ManagedPosition
@@ -1732,7 +1823,7 @@ def test_real_atomic_seed_verifies_add_registration():
     engine._lock = threading.RLock()
     engine._positions = []
     engine._positions_by_id = {}
-    engine.add_position = lambda _position: None
+    engine.add_position = lambda _position, **_kwargs: None
     canonical = ManagedPosition(
         ticker="NOW", option_symbol=CONTRACT, side="PUT", quantity=1,
         entry_price=1.30, underlying_entry=127.425,

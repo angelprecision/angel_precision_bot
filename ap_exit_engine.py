@@ -4439,7 +4439,12 @@ class APExitEngine:
             safe_to_seed=True, retryable=False,
         )
 
-    def add_position(self, pos: ManagedPosition):
+    def add_position(
+        self,
+        pos: ManagedPosition,
+        *,
+        _skip_symbol_duplicate: bool = False,
+    ):
         """Track a newly broker-confirmed open position for exit protection."""
         if pos is None:
             return
@@ -4462,6 +4467,7 @@ class APExitEngine:
                     existing.ticker == pos.ticker
                     and existing.option_symbol == pos.option_symbol
                     and not existing.closed
+                    and not _skip_symbol_duplicate
                 )
                 if same_id or same_sym:
                     _incoming_id = str(getattr(pos, "position_id", "") or "")
@@ -4625,10 +4631,12 @@ class APExitEngine:
                 )
                 return False, _reason
 
-            # Safe: the exact behavior-active domain is empty. add_position
-            # re-acquires this RLock and may still reject the object; verify the
-            # actual registration rather than reporting that call as success.
-            self.add_position(pos)
+            # Safe: the exact behavior-active domain is empty.  The legacy
+            # symbol-level duplicate guard is broader than this proven
+            # client/mode/OCC domain, so bypass only that guard for this
+            # insertion.  Position-ID conflicts and registration proof remain
+            # enforced by add_position and the reread below.
+            self.add_position(pos, _skip_symbol_duplicate=True)
             exact_domain_owners = [p for p in self._positions if _same_domain(p)]
             if (
                 len(exact_domain_owners) == 1

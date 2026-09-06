@@ -4434,11 +4434,12 @@ class APBrokerReconciler:
                         WHERE client_id = %s
                           AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                           AND kind = 'EXIT'
-                          AND status IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')
+                          AND upper(btrim(status)) IN (
+                                'FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED'
+                          )
                           AND position_id::text = %s
                           AND contract = %s
                         ORDER BY filled_ts DESC NULLS LAST
-                        LIMIT 5
                         """,
                         (
                             str(self.client_id or ""),
