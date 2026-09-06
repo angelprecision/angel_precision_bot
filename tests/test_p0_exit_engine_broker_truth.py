@@ -3746,7 +3746,13 @@ def test_pr588_source_db_repair_preserves_canonical_qty():
     assert "expected_position_id=position_id" in EE_SRC, (
         "legacy full-quantity repair must fence ENTRY provenance to the exact position"
     )
-    assert "_desired_status = \"OPEN\" if _broker_qty == _full_qty else \"PARTIAL\"" in helper_body
+    assert "_derived_status = \"OPEN\" if _broker_qty == _full_qty else \"PARTIAL\"" in helper_body
+    assert "FOR UPDATE" in helper_body, (
+        "quantity repair must lock and reread the durable row before mutation"
+    )
+    assert "_locked_status in {\"CLOSING\", \"ACTIVE\"}" in helper_body, (
+        "locked active lifecycle authority must survive quantity repair"
+    )
     # No broker-only expansion path is allowed.
     assert "qty               = GREATEST" not in body, (
         "DB repair UPDATE must not expand canonical qty via GREATEST — "
@@ -4052,6 +4058,98 @@ def test_pr588_test_c_restart_parity_fresh_engine():
         "stale durable 2/2 must not produce an oversized EXIT callback after "
         "restart when broker quantity truth is unavailable"
     )
+
+
+@_skip_if_no_mod
+def test_pr588_restart_quantity_hold_blocks_actual_sentinel_and_forced_exit():
+    """A broker-unverified restart owner is blocked at the central submit gate.
+
+    This deliberately leaves ``_run_sentinels`` intact.  Both the sentinel's
+    forced-risk path and the explicit emergency-flatten path must reach the
+    shared gate and remain mutation-inert while the stale durable remainder is
+    not reconciled against fresh broker quantity.
+    """
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    contract = "IWM260919C00230000"
+    client = "pr588-sentinel-quantity-hold@example.com"
+    stale_row = {
+        "id": "pos-c-sentinel-quantity-hold",
+        "client_id": client,
+        "contract": contract,
+        "option_symbol": contract,
+        "underlying": "IWM",
+        "side": "CALL",
+        "direction": "CALL",
+        "qty": 2,
+        "quantity_remaining": 2,
+        "entry_price": 1.50,
+        "avg_fill": 1.50,
+        "entry_ts": None,
+        "status": "OPEN",
+        "signal_id": "sig-c-sentinel-quantity-hold",
+        "execution_mode": "live",
+    }
+
+    broker_mutations = []
+
+    class _UnavailableBroker:
+        mode = "live"
+        account_id = "acct-pr588-sentinel-quantity-hold"
+
+        def list_positions(self):
+            raise RuntimeError("broker position snapshot unavailable")
+
+        def submit_order(self, *args, **kwargs):
+            broker_mutations.append(("submit", args, kwargs))
+
+        def cancel_order(self, *args, **kwargs):
+            broker_mutations.append(("cancel", args, kwargs))
+
+    eng = engine_cls(broker=_UnavailableBroker(), email=client)
+    eng._hydrate_pending_exit_identity_for_broker_recovery = (
+        lambda *_args, **_kwargs: "NONE"
+    )
+
+    class _PositionManager:
+        def get_active_positions(self):
+            return [stale_row]
+
+    eng.seed_from_db(_PositionManager())
+    pos = eng.active_positions()[0]
+    assert pos.broker_repair_quantity_unverified is True
+    now = datetime.now(timezone.utc)
+    pos.opened_at = now - timedelta(minutes=2)
+    pos.current_bid = 0.10
+    pos.current_option_price = 0.10
+    pos.option_bid_valid = True
+    pos.option_quote_fresh = True
+    pos.last_option_bid_update_ts = now
+
+    eng._kill_switch_fn = None
+    eng._emit_exit_event = MagicMock()
+    eng.on_exit = MagicMock()
+    eng.on_scale = MagicMock()
+
+    # _check_all_positions invokes the real sentinel before the normal scan.
+    # The broker precheck also proves the unavailable-truth condition in this
+    # same behavioral path.
+    eng._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
+    assert eng._broker_truth_snapshot_unavailable is True
+    assert pos.broker_repair_quantity_unverified is True
+
+    # Exercise the explicit forced-risk entry point as well; it must share the
+    # same central fence and must not consume the stale 2/2 remainder.
+    assert eng.emergency_flatten(reason="test_quantity_hold", force=True) == 0
+    eng.on_exit.assert_not_called()
+    eng.on_scale.assert_not_called()
+    assert broker_mutations == []
+    assert any(
+        item.kwargs.get("reason_code") == "EXIT_BROKER_TRUTH_QUANTITY_HOLD"
+        for item in eng._emit_exit_event.call_args_list
+    ), "central submit gate must emit the quantity-unverified HOLD diagnostic"
 
 
 # ── Test D: stale existing row (DB qty=2, remaining=0, broker=1) ──────────────
@@ -4692,6 +4790,160 @@ def test_pr588_test_h_malformed_entry_filled_qty_blocks_insert():
 
 # ── Test J: MANDATORY real PostgreSQL INSERT ──────────────────────────────────
 
+@pytest.mark.parametrize(
+    "broker_qty,durable_remaining",
+    [(1, 1), (2, 2)],
+)
+@_skip_if_no_mod
+def test_pr588_closing_lifecycle_survives_existing_quantity_repair_postgresql(
+    monkeypatch, broker_qty, durable_remaining,
+):
+    """Quantity repair must not normalize a durable CLOSING lifecycle."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "IWM260919C00230000"
+        client = f"pr588-closing-lifecycle-{broker_qty}@example.com"
+        position_id = f"pr588-closing-lifecycle-{broker_qty}"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, position_id, kind, status,
+                    contract, execution_mode, filled_qty, fill_price, filled_ts,
+                    meta
+                ) VALUES (%s, %s, %s, 'ENTRY', 'FILLED', %s, 'live',
+                          2, 1.50, %s, '{}'::jsonb)
+                """,
+                (
+                    f"local-pr588-closing-entry-{broker_qty}",
+                    client,
+                    position_id,
+                    contract,
+                    "2026-09-01T13:00:00Z",
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO positions (
+                    id, client_id, underlying, contract, option_symbol,
+                    execution_mode, side, direction, qty, quantity_remaining,
+                    avg_fill, entry_price, entry_ts, status, signal_id
+                ) VALUES (%s, %s, 'IWM', %s, %s, 'live', 'CALL', 'CALL',
+                          2, %s, 1.50, 1.50, %s, 'CLOSING', %s)
+                """,
+                (
+                    position_id,
+                    client,
+                    contract,
+                    contract,
+                    durable_remaining,
+                    "2026-09-01T13:00:00Z",
+                    f"sig-pr588-closing-{broker_qty}",
+                ),
+            )
+        pg_conn.commit()
+
+        class _Broker:
+            mode = "live"
+            account_id = f"acct-pr588-closing-{broker_qty}"
+
+            def list_positions(self):
+                return [{
+                    "contract": contract,
+                    "quantity": broker_qty,
+                    "cost_basis": broker_qty * 150.0,
+                    "date_acquired": "2026-09-01T13:00:00Z",
+                }]
+
+        eng = engine_cls(broker=_Broker(), email=client)
+        eng._fetch_broker_quote = lambda _sym: {
+            "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+        }
+        assert eng._broker_position_precheck() is True
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT qty, quantity_remaining, status FROM positions WHERE id = %s",
+                (position_id,),
+            )
+            row = cur.fetchone()
+        assert row is not None
+        values = dict(row) if isinstance(row, dict) else {
+            "qty": row[0], "quantity_remaining": row[1], "status": row[2],
+        }
+        assert values == {
+            "qty": 2,
+            "quantity_remaining": broker_qty,
+            "status": "CLOSING",
+        }
+
+
+@_skip_if_no_mod
+def test_pr588_locked_lifecycle_wins_when_row_changes_before_reread():
+    """The FOR UPDATE reread, not the stale initial projection, owns status."""
+    eng = _pr558_new_engine(email="pr588-locked-lifecycle@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+
+    contract = "IWM260919C00230000"
+    db_row = {
+        "id": "pr588-locked-lifecycle-row",
+        "client_id": eng._email,
+        "contract": contract,
+        "option_symbol": contract,
+        "qty": 2,
+        "quantity_remaining": 2,
+        "status": "OPEN",  # stale initial projection
+        "execution_mode": "live",
+    }
+    locked_row = dict(db_row, status="CLOSING")
+    executed = []
+
+    class _Cur:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            executed.append((str(sql), params))
+            return self
+
+        def fetchone(self):
+            if executed and "FOR UPDATE" in executed[-1][0]:
+                return locked_row
+            return None
+
+    @contextmanager
+    def _conn():
+        yield _Cur()
+
+    fake_db = types.SimpleNamespace(
+        conn=_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_db
+    try:
+        full_qty, durable_proof = eng._reconcile_existing_broker_position_row(
+            db_row,
+            contract,
+            {"contract": contract, "quantity": 1},
+            1,
+            mode="live",
+        )
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert (full_qty, durable_proof) == (2, True)
+    assert db_row["status"] == "CLOSING"
+    updates = [params for sql, params in executed if "UPDATE positions" in sql]
+    assert updates and updates[0][2] == "CLOSING"
+
+
 @_skip_if_no_mod
 def test_pr588_existing_positive_remaining_2_2_to_2_1_postgresql(monkeypatch):
     """A real existing 2/2 row must become durable 2/1 PARTIAL."""
@@ -4969,6 +5221,173 @@ def test_pr588_partial_restart_hydrates_active_exit_without_duplicate_submit_pos
         eng._submit_exit_decision = MagicMock()
         eng._check_all_positions(now_et=datetime(2026, 9, 5, 16, 0))
         eng._submit_exit_decision.assert_not_called()
+
+
+@_skip_if_no_mod
+def test_pr588_crash_after_closing_quantity_commit_keeps_pending_exit_authority_postgresql(
+    monkeypatch,
+):
+    """A crash after repair commit must not erase CLOSING or duplicate EXIT."""
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    class _CrashAfterCommit(BaseException):
+        pass
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "SPY260919C00600000"
+        client = "pr588-closing-crash-boundary@example.com"
+        position_id = "pr588-closing-crash-boundary-row"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, position_id, kind, status,
+                    contract, execution_mode, filled_qty, fill_price, filled_ts,
+                    meta
+                ) VALUES (%s, %s, %s, 'ENTRY', 'FILLED', %s, 'live',
+                          2, 1.50, %s, '{}'::jsonb)
+                """,
+                (
+                    "local-pr588-closing-crash-entry",
+                    client,
+                    position_id,
+                    contract,
+                    "2026-09-01T13:00:00Z",
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO positions (
+                    id, client_id, underlying, contract, option_symbol,
+                    execution_mode, side, direction, qty, quantity_remaining,
+                    avg_fill, entry_price, entry_ts, status, signal_id
+                ) VALUES (%s, %s, 'SPY', %s, %s, 'live', 'CALL', 'CALL',
+                          2, 2, 1.50, 1.50, %s, 'CLOSING', 'sig-closing-crash')
+                """,
+                (
+                    position_id,
+                    client,
+                    contract,
+                    contract,
+                    "2026-09-01T13:00:00Z",
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, position_id, kind, status,
+                    contract, execution_mode, qty, filled_qty,
+                    broker_order_id, submitted_ts, meta
+                ) VALUES (%s, %s, %s, 'EXIT', 'EXIT_SUBMITTED', %s, 'live',
+                          2, 1, %s, %s, '{}'::jsonb)
+                """,
+                (
+                    "local-pr588-closing-crash-exit",
+                    client,
+                    position_id,
+                    contract,
+                    "broker-pr588-closing-crash-exit",
+                    "2026-09-01T13:05:00Z",
+                ),
+            )
+        pg_conn.commit()
+
+        class _Broker:
+            mode = "live"
+            account_id = "acct-pr588-closing-crash"
+
+            def list_positions(self):
+                return [{
+                    "contract": contract,
+                    "quantity": 1,
+                    "cost_basis": 150.0,
+                    "date_acquired": "2026-09-01T13:00:00Z",
+                }]
+
+            def submit_order(self, *args, **kwargs):
+                broker_mutations.append(("submit", args, kwargs))
+
+            def cancel_order(self, *args, **kwargs):
+                broker_mutations.append(("cancel", args, kwargs))
+
+        broker_mutations = []
+        eng = engine_cls(broker=_Broker(), email=client)
+        eng._fetch_broker_quote = lambda _sym: {
+            "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+        }
+        eng._hydrate_pending_exit_identity_for_broker_recovery = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(_CrashAfterCommit())
+        )
+
+        with pytest.raises(_CrashAfterCommit):
+            eng._broker_position_precheck()
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT qty, quantity_remaining, status FROM positions WHERE id = %s",
+                (position_id,),
+            )
+            row = cur.fetchone()
+        values = dict(row) if isinstance(row, dict) else {
+            "qty": row[0], "quantity_remaining": row[1], "status": row[2],
+        }
+        assert values == {
+            "qty": 2,
+            "quantity_remaining": 1,
+            "status": "CLOSING",
+        }
+
+        eng_restart = engine_cls(broker=_Broker(), email=client)
+        eng_restart._fetch_broker_quote = lambda _sym: {
+            "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+        }
+
+        class _PositionManager:
+            def get_active_positions(self):
+                return [{
+                    "id": position_id,
+                    "client_id": client,
+                    "underlying": "SPY",
+                    "contract": contract,
+                    "option_symbol": contract,
+                    "side": "CALL",
+                    "direction": "CALL",
+                    "qty": 2,
+                    "quantity_remaining": 1,
+                    "avg_fill": 1.50,
+                    "entry_price": 1.50,
+                    "entry_ts": "2026-09-01T13:00:00Z",
+                    "status": "CLOSING",
+                    "signal_id": "sig-closing-crash",
+                    "execution_mode": "live",
+                }]
+
+        eng_restart.seed_from_db(_PositionManager())
+        restarted = eng_restart.active_positions()[0]
+        assert restarted.exit_in_flight is True
+        assert restarted.pending_exit_local_order_id == "local-pr588-closing-crash-exit"
+        assert restarted.pending_exit_broker_order_id == "broker-pr588-closing-crash-exit"
+
+        assert eng_restart._broker_position_precheck() is True
+        assert restarted.broker_repair_quantity_unverified is False
+
+        eng_restart._emit_exit_event = MagicMock()
+        eng_restart.on_exit = MagicMock()
+        eng_restart.on_scale = MagicMock()
+        decision = _EE_MOD.ExitDecision(
+            action="STOP",
+            quantity=1,
+            reason="HARD STOP",
+            urgency="IMMEDIATE",
+            pnl_pct=-0.40,
+            reason_code="HARD_STOP",
+        )
+        assert eng_restart._submit_exit_decision(restarted, decision) is False
+        eng_restart.on_exit.assert_not_called()
+        eng_restart.on_scale.assert_not_called()
+        assert broker_mutations == []
 
 
 @_skip_if_no_mod
