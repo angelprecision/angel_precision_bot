@@ -1,0 +1,91 @@
+name: PR546 final diagnostic correction
+
+on:
+  push:
+    branches:
+      - pr546-final-diagnostic-d613
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify audited parent
+        run: test "$(git rev-parse HEAD^)" = "d61395f641ae7d5d10ac6decb8de3212c13945b9"
+
+      - name: Apply observability correction and regression
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected 1 match, got {count}")
+              return text.replace(old, new, 1)
+
+          p = Path("ap_reconciler.py")
+          text = p.read_text()
+          text = replace_once(
+              text,
+              "                    generic_add_ran=_seed_succeeded,\n",
+              "                    generic_add_ran=(seed_status == \"seeded\"),\n",
+              "generic_add_ran diagnostic",
+          )
+          p.write_text(text)
+
+          p = Path("tests/test_p0_reconciler_canonical_owner_adoption.py")
+          text = p.read_text()
+          text = replace_once(
+              text,
+              '    """ADOPTED path with qty=2, quantity_remaining=1, exit evidence → uses qty=1."""\n',
+              '    """ADOPTED path preserves full=2 and proven remaining=1."""\n',
+              "partial adoption docstring",
+          )
+          marker = '''def test_no_repair_found_adds_canonical_once_and_proves_owner():\n    engine = _ExitEngine("NO_REPAIR_FOUND")\n    assert _reconciler(engine)._seed_exit_engine_from_position(_position()) is True\n    assert len(engine.add_calls) == 1\n    assert engine.owners[0].position_id == POSITION_ID\n'''
+          replacement = marker + '''\n\ndef test_no_repair_already_owned_diagnostic_does_not_claim_generic_add_ran():\n    """An atomic already-owned race is success without running add_position."""\n    engine = _ExitEngine("NO_REPAIR_FOUND", owners=[_owner(POSITION_ID)])\n    reconciler = _reconciler(engine)\n    diagnostics = []\n    reconciler._canonical_owner_diagnostic = lambda event, **kwargs: diagnostics.append(\n        (event, kwargs)\n    )\n\n    assert reconciler._seed_exit_engine_from_position(_position()) is True\n    assert engine.add_calls == []\n    assert diagnostics\n    event, fields = diagnostics[-1]\n    assert event == "RECONCILER_CANONICAL_OWNER_SEED_ALREADY_OWNED"\n    assert fields["generic_add_ran"] is False\n'''
+          text = replace_once(text, marker, replacement, "already-owned diagnostic regression")
+          p.write_text(text)
+
+          Path(".github/workflows/pr546_final_diagnostic_patch.yml").unlink()
+          PY
+
+      - name: Syntax check
+        run: python -m py_compile ap_reconciler.py tests/test_p0_reconciler_canonical_owner_adoption.py
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run focused PR546 tests
+        env:
+          PGSSLMODE: "disable"
+        run: python -m pytest -q tests/test_p0_reconciler_canonical_owner_adoption.py
+
+      - name: Verify surgical diff
+        run: |
+          git diff --check
+          changed="$(git diff --name-only d61395f641ae7d5d10ac6decb8de3212c13945b9 | sort)"
+          expected="$(printf '%s\n' ap_reconciler.py tests/test_p0_reconciler_canonical_owner_adoption.py | sort)"
+          test "$changed" = "$expected"
+
+      - name: Commit correction
+        run: |
+          git config user.name "angelprecision-pr546-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: keep canonical-owner seed diagnostics truthful"
+          git push origin HEAD:pr546-final-diagnostic-d613
