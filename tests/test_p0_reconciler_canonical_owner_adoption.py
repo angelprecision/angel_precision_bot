@@ -1820,6 +1820,7 @@ def test_broker_only_reconciled_row_verifies_existing_owner_without_entry_lookup
     [
         {"meta": {"execution_mode": "paper"}},
         {"direction": "CALL"},
+        {"id": "nan"},
         {"plan_id": "ordinary-plan"},
         {"tier": "B"},
         {"local_order_id": "   ", "entry_local_order_id": "real-entry-id"},
@@ -1827,6 +1828,7 @@ def test_broker_only_reconciled_row_verifies_existing_owner_without_entry_lookup
     ids=[
         "mode-contradiction",
         "direction-occ-conflict",
+        "placeholder-position-id",
         "non-reconciled-plan",
         "non-reconciled-tier",
         "secondary-entry-alias",

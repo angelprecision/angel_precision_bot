@@ -3246,7 +3246,9 @@ class APBrokerReconciler:
                 )
                 side = side.upper()
                 placeholder_ids = {
-                    "", "0", "none", "null", "n/a", "na", "unknown", "pending"
+                    "", "0", "none", "null", "nan", "na", "n/a", "nil",
+                    "unknown", "undefined", "unavailable", "missing",
+                    "placeholder", "true", "false", "?", "-", "pending",
                 }
                 position_id_value, position_id_alias_ok = self._canonical_nonblank_value(
                     pos, "id", "position_id"
@@ -4709,7 +4711,11 @@ class APBrokerReconciler:
             position_mode = _durable_execution_mode(pos)
         except Exception:
             position_mode = None
-        placeholder_ids = {"", "0", "none", "null", "n/a", "na", "unknown", "pending"}
+        placeholder_ids = {
+            "", "0", "none", "null", "nan", "na", "n/a", "nil",
+            "unknown", "undefined", "unavailable", "missing", "placeholder",
+            "true", "false", "?", "-", "pending",
+        }
         exact_occ = bool(re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract))
         occ_match = _OCC_CP_RE.search(contract)
         occ_side = (

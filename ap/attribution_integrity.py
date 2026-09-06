@@ -133,8 +133,10 @@ def _entry_fill_proof(
 
     local_id = str(_row_get(row, "entry_local_order_id", 3) or "").strip()
     broker_id = str(_row_get(row, "entry_broker_order_id", 4) or "").strip()
-    if not (local_id or broker_id):
+    if not local_id and not broker_id:
         return False, "entry_order_identity_missing"
+    if not local_id or not broker_id:
+        return False, "entry_order_identity_incomplete"
 
     raw_fill_price = _row_get(row, "entry_fill_price", 5)
     raw_filled_qty = _row_get(row, "entry_filled_qty", 6)
@@ -270,8 +272,8 @@ def recover_lineage(
                       {mode_clause}
                       AND o.created_ts > now() - (%s || ' days')::interval
                     ORDER BY
-                      (upper(o.status) IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')) DESC,
-                      (upper(o.status) = 'FILLED') DESC,
+                      (upper(btrim(o.status)) IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')) DESC,
+                      (upper(btrim(o.status)) = 'FILLED') DESC,
                       o.created_ts DESC
                     LIMIT 2
                     """,
@@ -289,12 +291,6 @@ def recover_lineage(
                 order_id = str(_row_get(row, "order_id", 0) or "")
                 order_signal_id = str(_row_get(row, "order_signal_id", 1) or "")
                 order_status = str(_row_get(row, "order_status", 2) or "")
-                local_order_id = str(
-                    _row_get(row, "entry_local_order_id", 3) or ""
-                ).strip()
-                broker_order_id = str(
-                    _row_get(row, "entry_broker_order_id", 4) or ""
-                ).strip()
                 signal_id = canonical_signal_id_for_lookup(order_signal_id)
                 if not signal_id:
                     return None
@@ -335,12 +331,13 @@ def recover_lineage(
                 ]
                 entry_identity_proven = False
                 entry_identity_reason = "entry_identity_not_proven"
+                identity_candidate = None
                 if len(filled_candidates) > 1:
                     entry_identity_reason = "entry_identity_ambiguous"
                 else:
-                    candidate = filled_candidates[0] if filled_candidates else row
+                    identity_candidate = filled_candidates[0] if filled_candidates else row
                     candidate_contract = str(
-                        _row_get(candidate, "entry_contract", 8) or contract
+                        _row_get(identity_candidate, "entry_contract", 8) or contract
                     ).strip().upper()
                     mode_proven = normalized_mode in {"live", "paper"}
                     contract_proven = (
@@ -348,7 +345,7 @@ def recover_lineage(
                     )
                     if mode_proven and contract_proven:
                         entry_identity_proven, entry_identity_reason = _entry_fill_proof(
-                            candidate,
+                            identity_candidate,
                             broker_position=broker_position,
                             broker_quantity=broker_quantity,
                             broker_cost_basis=broker_cost_basis,
@@ -367,10 +364,19 @@ def recover_lineage(
                 # Keep the historical return shape stable for callers/tests
                 # whose order fixture predates these columns.  Production rows
                 # with recovered IDs carry them explicitly.
-                if local_order_id and entry_identity_proven:
-                    lineage["entry_local_order_id"] = local_order_id
-                if broker_order_id and entry_identity_proven:
-                    lineage["entry_broker_order_id"] = broker_order_id
+                candidate_local_order_id = ""
+                candidate_broker_order_id = ""
+                if identity_candidate is not None:
+                    candidate_local_order_id = str(
+                        _row_get(identity_candidate, "entry_local_order_id", 3) or ""
+                    ).strip()
+                    candidate_broker_order_id = str(
+                        _row_get(identity_candidate, "entry_broker_order_id", 4) or ""
+                    ).strip()
+                if candidate_local_order_id and entry_identity_proven:
+                    lineage["entry_local_order_id"] = candidate_local_order_id
+                if candidate_broker_order_id and entry_identity_proven:
+                    lineage["entry_broker_order_id"] = candidate_broker_order_id
                 lineage["entry_identity_proven"] = entry_identity_proven
                 lineage["entry_identity_reason"] = entry_identity_reason
                 return lineage
