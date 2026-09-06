@@ -1,0 +1,182 @@
+name: PR546 quantity-authority staging patch
+
+on:
+  push:
+    branches:
+      - pr546-quantity-authority-41ad9fd3
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify staging ancestry
+        run: |
+          test "$(git rev-parse HEAD^)" = "41ad9fd3dd420b07192ce27367021bac2ce252bf"
+
+      - name: Apply surgical correction
+        shell: bash
+        run: |
+          cat > /tmp/patch_pr546.py <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          # ------------------------------------------------------------------
+          # ap_reconciler.py
+          # ------------------------------------------------------------------
+          path = Path("ap_reconciler.py")
+          text = path.read_text()
+
+          marker = "    def _seed_exit_engine_from_position(self, pos: dict) -> bool:\n"
+          helper = '''    def _record_exit_owner_install_failure(\n        self,\n        summary: dict,\n        *,\n        contract: str,\n        position_id: str,\n        context: str,\n    ) -> None:\n        """Surface a failed canonical exit-owner installation to the caller."""\n        code = "reconciler_exit_owner_install_failed"\n        summary.setdefault("errors", []).append(code)\n        summary["positions_alerted"] = int(summary.get("positions_alerted", 0)) + 1\n        log.critical(\n            "[%s] RECONCILER_EXIT_OWNER_INSTALL_FAILED | "\n            "context=%s mode=%s contract=%s position_id=%s",\n            self.client_id,\n            context,\n            self.execution_mode or "unknown",\n            contract or "?",\n            position_id or "?",\n        )\n        self._alert(\n            f"RECONCILER_EXIT_OWNER_INSTALL_FAILED | context={context} "\n            f"mode={self.execution_mode or 'unknown'} contract={contract or '?'} "\n            f"position_id={position_id or '?'}"\n        )\n\n'''
+          if text.count(marker) != 1:
+              raise SystemExit(f"owner-failure helper marker count={text.count(marker)}")
+          text = text.replace(marker, helper + marker, 1)
+
+          text = replace_once(
+              text,
+              '''            self._seed_exit_engine_from_position(existing)\n            try:\n''',
+              '''            if not self._seed_exit_engine_from_position(existing):\n                self._record_exit_owner_install_failure(\n                    summary,\n                    contract=contract,\n                    position_id=pos_id,\n                    context="filled_entry_existing_position",\n                )\n                return None\n            try:\n''',
+              "filled-entry existing owner result",
+          )
+
+          text = replace_once(
+              text,
+              '''            row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)\n            if row:\n                self._seed_exit_engine_from_position(row)\n            return str(pos_id) if pos_id else None\n''',
+              '''            row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)\n            if row and not self._seed_exit_engine_from_position(row):\n                self._record_exit_owner_install_failure(\n                    summary,\n                    contract=contract,\n                    position_id=str(pos_id or ""),\n                    context="filled_entry_created_position",\n                )\n                return None\n            return str(pos_id) if pos_id else None\n''',
+              "filled-entry created owner result",
+          )
+
+          text = replace_once(
+              text,
+              '''                # Belt-and-suspenders: make sure exit engine is tracking this DB-open position.\n                self._seed_exit_engine_from_position(pos)\n                continue\n''',
+              '''                # Belt-and-suspenders: make sure exit engine is tracking this DB-open position.\n                if not self._seed_exit_engine_from_position(pos):\n                    self._record_exit_owner_install_failure(\n                        summary,\n                        contract=contract,\n                        position_id=str(pos_id or ""),\n                        context="broker_live_db_position",\n                    )\n                continue\n''',
+              "broker-live db-position owner result",
+          )
+
+          text = replace_once(
+              text,
+              '''            if historical:\n                if str(historical.get("status") or "").upper() in DB_OPEN_POSITION_STATUSES:\n                    self._seed_exit_engine_from_position(historical)\n                summary["positions_import_idempotent"] = int(\n                    summary.get("positions_import_idempotent", 0)\n                ) + 1\n                db_contracts.add(contract)\n                continue\n''',
+              '''            if historical:\n                if str(historical.get("status") or "").upper() in DB_OPEN_POSITION_STATUSES:\n                    if not self._seed_exit_engine_from_position(historical):\n                        self._record_exit_owner_install_failure(\n                            summary,\n                            contract=contract,\n                            position_id=str(historical.get("id") or historical.get("position_id") or ""),\n                            context="historical_active_import_identity",\n                        )\n                        db_contracts.add(contract)\n                        continue\n                summary["positions_import_idempotent"] = int(\n                    summary.get("positions_import_idempotent", 0)\n                ) + 1\n                db_contracts.add(contract)\n                continue\n''',
+              "historical import owner result",
+          )
+
+          text = replace_once(
+              text,
+              '''            row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)\n            if row:\n                self._seed_exit_engine_from_position(row)\n            else:\n                self._seed_exit_engine_from_import(\n                    pos_id=pos_id,\n                    contract=contract,\n                    underlying=underlying,\n                    side=side,\n                    qty=qty,\n                    entry_px=entry_px,\n                    underlying_entry=underlying_entry,\n                    price_untrusted=price_untrusted,\n                )\n\n            msg = (\n''',
+              '''            row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)\n            if row:\n                owner_ready = self._seed_exit_engine_from_position(row)\n            else:\n                seed_status = self._seed_exit_engine_from_import(\n                    pos_id=pos_id,\n                    contract=contract,\n                    underlying=underlying,\n                    side=side,\n                    qty=qty,\n                    entry_px=entry_px,\n                    underlying_entry=underlying_entry,\n                    price_untrusted=price_untrusted,\n                )\n                owner_ready = seed_status in {"seeded", "already_owned"}\n            if not owner_ready:\n                self._record_exit_owner_install_failure(\n                    summary,\n                    contract=contract,\n                    position_id=str(pos_id or ""),\n                    context="broker_imported_position",\n                )\n                continue\n\n            msg = (\n''',
+              "new broker import owner result",
+          )
+
+          text = replace_once(
+              text,
+              '''                        # Re-seed the exit engine so this position gets managed again\n                        self._seed_exit_engine_from_position(dict(row) | {\n                            "status": restore_status,\n                            "quantity_remaining": restore_remaining,\n                        })\n''',
+              '''                        # Re-seed the exit engine so this position gets managed again.\n                        restored_position = dict(row) | {\n                            "status": restore_status,\n                            "quantity_remaining": restore_remaining,\n                        }\n                        if not self._seed_exit_engine_from_position(restored_position):\n                            self._record_exit_owner_install_failure(\n                                summary,\n                                contract=contract,\n                                position_id=str(pos_id or ""),\n                                context="closed_partial_restore",\n                            )\n''',
+              "closed-partial restore owner result",
+          )
+
+          text = replace_once(
+              text,
+              '''                # canonical_qty carries partial-exit adjusted quantity (or full qty).\n                seed_status = self._seed_exit_engine_from_import(\n                    pos_id=pos_id,\n                    contract=contract,\n                    underlying=underlying,\n                    side=side,\n                    qty=canonical_qty,\n                    entry_px=entry_px,\n''',
+              '''                # Preserve full durable size and proven current remainder as\n                # separate authorities, exactly as the adoption path does.\n                seed_status = self._seed_exit_engine_from_import(\n                    pos_id=pos_id,\n                    contract=contract,\n                    underlying=underlying,\n                    side=side,\n                    qty=qty,\n                    quantity_remaining=canonical_qty,\n                    entry_px=entry_px,\n''',
+              "NO_REPAIR_FOUND full/remaining authority",
+          )
+
+          text = replace_once(
+              text,
+              '''    def _seed_exit_engine_from_import(\n        self,\n        *,\n        pos_id: str,\n        contract: str,\n        underlying: str,\n        side: str,\n        qty: int,\n        entry_px: float,\n''',
+              '''    def _seed_exit_engine_from_import(\n        self,\n        *,\n        pos_id: str,\n        contract: str,\n        underlying: str,\n        side: str,\n        qty: int,\n        quantity_remaining: Optional[int] = None,\n        entry_px: float,\n''',
+              "seed helper quantity_remaining signature",
+          )
+
+          mp_marker = '''            mp = ManagedPosition(\n                ticker=self._norm_underlying(underlying or contract),\n                option_symbol=contract,\n                side=side,\n                quantity=int(qty),\n                entry_price=float(entry_px),\n'''
+          mp_replacement = '''            full_qty_value = _positive_finite_float(qty)\n            remaining_source = qty if quantity_remaining is None else quantity_remaining\n            remaining_qty_value = _positive_finite_float(remaining_source)\n            if (\n                full_qty_value <= 0\n                or full_qty_value != int(full_qty_value)\n                or remaining_qty_value <= 0\n                or remaining_qty_value != int(remaining_qty_value)\n                or remaining_qty_value > full_qty_value\n            ):\n                log.critical(\n                    "[%s] EXIT_ENGINE_SEED_QUANTITY_UNPROVEN | %s | "\n                    "full_qty=%r quantity_remaining=%r",\n                    self.client_id, contract, qty, quantity_remaining,\n                )\n                return "invalid_quantity"\n            full_qty = int(full_qty_value)\n            remaining_qty = int(remaining_qty_value)\n\n            mp = ManagedPosition(\n                ticker=self._norm_underlying(underlying or contract),\n                option_symbol=contract,\n                side=side,\n                quantity=full_qty,\n                quantity_remaining=remaining_qty,\n                entry_price=float(entry_px),\n'''
+          text = replace_once(text, mp_marker, mp_replacement, "ManagedPosition full/remaining seed")
+          path.write_text(text)
+
+          # ------------------------------------------------------------------
+          # ap_exit_engine.py
+          # ------------------------------------------------------------------
+          path = Path("ap_exit_engine.py")
+          text = path.read_text()
+          text = replace_once(
+              text,
+              '''            (False, "already_owned") — a canonical owner already exists; no-op.\n            (False, "degraded_owner_present") — a degraded owner appeared; retry adoption.\n''',
+              '''            (False, "already_owned") — canonical owner exists and ID index agrees; no-op.\n            (False, "owner_index_conflict") — canonical list owner exists but ID index is missing/stale.\n            (False, "degraded_owner_present") — a degraded owner appeared; retry adoption.\n''',
+              "atomic seed return catalog",
+          )
+          text = replace_once(
+              text,
+              '''            if existing_id == _pos_id:\n                return "already_owned"\n            return "owner_conflict"\n''',
+              '''            if existing_id == _pos_id:\n                if self._positions_by_id.get(_pos_id) is existing:\n                    return "already_owned"\n                return "owner_index_conflict"\n            return "owner_conflict"\n''',
+              "atomic seed existing-owner index proof",
+          )
+          path.write_text(text)
+
+          # ------------------------------------------------------------------
+          # focused tests
+          # ------------------------------------------------------------------
+          path = Path("tests/test_p0_reconciler_canonical_owner_adoption.py")
+          text = path.read_text()
+          old_partial = '''def test_quantity_remaining_partial_with_exit_evidence_adopts_remaining():\n    """qty=2, quantity_remaining=1 + proven EXIT evidence → adopt remaining=1.\n\n    The canonical exit owner should be seeded with qty=1 (the remaining),\n    not qty=2 (the stale full size).\n    """\n    engine = _ExitEngine("NO_REPAIR_FOUND")\n    pos = _position(qty=2, quantity_remaining=1)\n    result = _reconciler(\n        engine,\n        partial_evidence_status="PROVEN",\n        partial_evidence={"filled_qty": 1},\n    )._seed_exit_engine_from_position(pos)\n    assert result is True\n    assert len(engine.add_calls) == 1\n    # Must be seeded with the remaining qty (1), not stale full qty (2)\n    seeded = engine.add_calls[0]\n    assert seeded.quantity == 1, (\n        f"Expected quantity=1 (remaining), got quantity={seeded.quantity}. "\n        "The exit owner was handed the stale full size — this is the quantity bug."\n    )\n'''
+          new_partial = '''def test_quantity_remaining_partial_with_exit_evidence_preserves_full_and_remaining():\n    """NO_REPAIR_FOUND reconstructs the same (full, remaining) pair as adoption."""\n    engine = _ExitEngine("NO_REPAIR_FOUND")\n    pos = _position(qty=2, quantity_remaining=1)\n    result = _reconciler(\n        engine,\n        partial_evidence_status="PROVEN",\n        partial_evidence={"filled_qty": 1},\n    )._seed_exit_engine_from_position(pos)\n    assert result is True\n    assert len(engine.add_calls) == 1\n    seeded = engine.add_calls[0]\n    assert seeded.quantity == 2\n    assert seeded.quantity_remaining == 1\n'''
+          text = replace_once(text, old_partial, new_partial, "partial seed authority regression")
+
+          append = r'''\n\n# ═══════════════════════════════════════════════════════════════════════════\n# Final #546 audit regressions — real atomic index proof + caller visibility\n# ═══════════════════════════════════════════════════════════════════════════\n\ndef _real_atomic_seed_fixture():\n    from ap_exit_engine import APExitEngine, ManagedPosition\n\n    engine = APExitEngine.__new__(APExitEngine)\n    engine._email = CLIENT\n    engine._lock = threading.RLock()\n    existing = ManagedPosition(\n        ticker="NOW", option_symbol=CONTRACT, side="PUT", quantity=2,\n        quantity_remaining=1, entry_price=1.30, underlying_entry=127.425,\n        underlying_target=120.0, underlying_stop=130.0,\n        position_id=POSITION_ID, client_id=CLIENT, execution_mode="live",\n    )\n    incoming = ManagedPosition(\n        ticker="NOW", option_symbol=CONTRACT, side="PUT", quantity=2,\n        quantity_remaining=1, entry_price=1.30, underlying_entry=127.425,\n        underlying_target=120.0, underlying_stop=130.0,\n        position_id=POSITION_ID, client_id=CLIENT, execution_mode="live",\n    )\n    engine._positions = [existing]\n    return engine, existing, incoming\n\n\ndef test_real_atomic_seed_already_owned_requires_correct_id_index():\n    engine, existing, incoming = _real_atomic_seed_fixture()\n    engine._positions_by_id = {POSITION_ID: existing}\n    assert engine.seed_canonical_position_if_absent(incoming) == (\n        False, "already_owned"\n    )\n    assert engine._positions == [existing]\n    assert engine._positions_by_id == {POSITION_ID: existing}\n\n\ndef test_real_atomic_seed_missing_id_index_holds():\n    engine, existing, incoming = _real_atomic_seed_fixture()\n    engine._positions_by_id = {}\n    assert engine.seed_canonical_position_if_absent(incoming) == (\n        False, "owner_index_conflict"\n    )\n    assert engine._positions == [existing]\n    assert engine._positions_by_id == {}\n\n\ndef test_real_atomic_seed_stale_id_index_holds():\n    engine, existing, incoming = _real_atomic_seed_fixture()\n    stale = object()\n    engine._positions_by_id = {POSITION_ID: stale}\n    assert engine.seed_canonical_position_if_absent(incoming) == (\n        False, "owner_index_conflict"\n    )\n    assert engine._positions == [existing]\n    assert engine._positions_by_id[POSITION_ID] is stale\n\n\ndef test_filled_entry_existing_position_surfaces_owner_install_failure():\n    reconciler = _reconciler(_ExitEngine())\n    reconciler._find_db_position_by_contract = lambda _contract: _position()\n    reconciler._seed_exit_engine_from_position = lambda _position_row: False\n    reconciler._link_order_to_position = lambda *_args, **_kwargs: pytest.fail(\n        "order must not be linked as successful after owner installation failed"\n    )\n    summary = {"positions_alerted": 0, "errors": []}\n    result = reconciler._ensure_position_for_filled_entry(\n        {\n            "contract": CONTRACT,\n            "execution_mode": "live",\n            "local_order_id": "entry-local-1",\n        },\n        1,\n        1.30,\n        summary,\n    )\n    assert result is None\n    assert summary["positions_alerted"] == 1\n    assert "reconciler_exit_owner_install_failed" in summary["errors"]\n\n\ndef test_broker_live_position_surfaces_owner_install_failure():\n    reconciler = _reconciler(_ExitEngine())\n    reconciler._ghost_tracker = {}\n    broker_position = {\n        "symbol": CONTRACT,\n        "quantity": 1,\n        "underlying": "NOW",\n    }\n    reconciler._safe_get_broker_positions = lambda: [broker_position]\n    reconciler._get_open_db_positions = lambda: [_position()]\n    reconciler._seed_exit_engine_from_position = lambda _position_row: False\n    reconciler._import_broker_positions_missing_from_db = lambda **_kwargs: None\n    summary = {"positions_alerted": 0, "errors": []}\n\n    reconciler._reconcile_positions(summary)\n\n    assert summary["positions_alerted"] == 1\n    assert "reconciler_exit_owner_install_failed" in summary["errors"]\n'''
+          text += append
+          path.write_text(text)
+
+          # This workflow is a staging transport only.  Remove it from the
+          # resulting commit so PR #546's cumulative diff stays surgical.
+          Path(".github/workflows/pr546_quantity_authority_patch.yml").unlink()
+          PY
+          python /tmp/patch_pr546.py
+
+      - name: Syntax check
+        run: python -m py_compile ap_reconciler.py ap_exit_engine.py tests/test_p0_reconciler_canonical_owner_adoption.py
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run focused PR546 tests
+        env:
+          PGSSLMODE: "disable"
+        run: python -m pytest -q tests/test_p0_reconciler_canonical_owner_adoption.py
+
+      - name: Verify surgical diff
+        run: |
+          git diff --check
+          git status --short
+          changed="$(git diff --name-only HEAD | sort)"
+          expected="$(printf '%s\n' ap_exit_engine.py ap_reconciler.py tests/test_p0_reconciler_canonical_owner_adoption.py | sort)"
+          test "$changed" = "$expected"
+
+      - name: Commit staged correction
+        run: |
+          git config user.name "angelprecision-pr546-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: preserve canonical quantity authority across recovery"
+          git push origin HEAD:pr546-quantity-authority-41ad9fd3
+          echo "PATCH_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Show patch head
+        run: echo "$PATCH_HEAD"
