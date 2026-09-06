@@ -58,7 +58,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 
 from ap.logger import get_logger
@@ -67,6 +69,9 @@ log = get_logger("ap.attribution_integrity")
 
 LOOKBACK_DAYS_DEFAULT = 21
 FABRICATED_PREFIX = "reconciled:"
+_FILLED_ENTRY_STATUSES = frozenset({
+    "FILLED", "PARTIAL_FILL", "PARTIALLY_FILLED",
+})
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,16 @@ class ImportIdentity:
     durable_fingerprint: str = ""
     identity_valid: bool = True
     identity_reason: str = ""
+    # The orders.id value is only a row key.  Preserve the actual durable
+    # ENTRY identifiers as well so a broker-only restart import can hand the
+    # identity through to positions and the canonical owner installer.
+    matched_local_order_id: Optional[str] = None
+    matched_broker_order_id: Optional[str] = None
+    # Broad attribution may still be useful when an ENTRY never filled.  These
+    # fields are promoted into the canonical position only for a fill-proven
+    # ENTRY identity.
+    entry_identity_proven: bool = False
+    entry_identity_reason: str = ""
 
     def to_log(self) -> str:
         return (
@@ -104,6 +119,98 @@ def _row_get(row: Any, key: str, index: int) -> Any:
         return None
 
 
+def _entry_fill_proof(
+    row: Any,
+    *,
+    broker_position: Optional[dict[str, Any]] = None,
+    broker_quantity: int = 0,
+    broker_cost_basis: float = 0.0,
+) -> tuple[bool, str]:
+    """Validate durable facts required before ENTRY IDs become authoritative."""
+    status = str(_row_get(row, "order_status", 2) or "").strip().upper()
+    if status not in _FILLED_ENTRY_STATUSES:
+        return False, "entry_status_not_filled"
+
+    local_id = str(_row_get(row, "entry_local_order_id", 3) or "").strip()
+    broker_id = str(_row_get(row, "entry_broker_order_id", 4) or "").strip()
+    if not local_id and not broker_id:
+        return False, "entry_order_identity_missing"
+    if not local_id or not broker_id:
+        return False, "entry_order_identity_incomplete"
+
+    raw_fill_price = _row_get(row, "entry_fill_price", 5)
+    raw_filled_qty = _row_get(row, "entry_filled_qty", 6)
+    raw_filled_ts = _row_get(row, "entry_filled_ts", 7)
+    if isinstance(raw_fill_price, bool):
+        return False, "entry_fill_price_malformed"
+    try:
+        fill_price = float(raw_fill_price)
+    except (TypeError, ValueError, OverflowError):
+        return False, "entry_fill_price_malformed"
+    if not math.isfinite(fill_price) or fill_price <= 0:
+        return False, "entry_fill_price_malformed"
+
+    if isinstance(raw_filled_qty, bool):
+        return False, "entry_filled_qty_malformed"
+    try:
+        filled_qty = float(raw_filled_qty)
+    except (TypeError, ValueError, OverflowError):
+        return False, "entry_filled_qty_malformed"
+    if (
+        not math.isfinite(filled_qty)
+        or filled_qty <= 0
+        or filled_qty != int(filled_qty)
+    ):
+        return False, "entry_filled_qty_malformed"
+    try:
+        broker_qty = int(broker_quantity or 0)
+    except (TypeError, ValueError, OverflowError):
+        broker_qty = 0
+    if broker_qty > 0 and int(filled_qty) < broker_qty:
+        # A single historical ENTRY cannot account for more contracts than it
+        # filled.  More than one plausible fill must remain broker-truth-only.
+        return False, "entry_broker_quantity_conflict"
+
+    try:
+        cost_basis = abs(float(broker_cost_basis or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        cost_basis = 0.0
+    if cost_basis > 0 and broker_qty > 0:
+        expected_basis = fill_price * broker_qty * 100.0
+        if not math.isfinite(expected_basis) or not math.isclose(
+            cost_basis, expected_basis, rel_tol=1e-6, abs_tol=1e-6
+        ):
+            return False, "entry_broker_cost_basis_conflict"
+
+    broker = broker_position if isinstance(broker_position, dict) else {}
+    for key in ("entry_price", "avg_fill", "average_price", "average_cost"):
+        raw_broker_price = broker.get(key)
+        if raw_broker_price in (None, ""):
+            continue
+        if isinstance(raw_broker_price, bool):
+            return False, "entry_broker_price_malformed"
+        try:
+            broker_price = float(raw_broker_price)
+        except (TypeError, ValueError, OverflowError):
+            return False, "entry_broker_price_malformed"
+        if not math.isfinite(broker_price) or broker_price <= 0:
+            return False, "entry_broker_price_malformed"
+        if not math.isclose(broker_price, fill_price, rel_tol=1e-6, abs_tol=1e-6):
+            return False, "entry_broker_price_conflict"
+        break
+
+    timestamp_valid = isinstance(raw_filled_ts, datetime)
+    if isinstance(raw_filled_ts, str) and raw_filled_ts.strip():
+        try:
+            datetime.fromisoformat(raw_filled_ts.strip().replace("Z", "+00:00"))
+            timestamp_valid = True
+        except ValueError:
+            timestamp_valid = False
+    if not timestamp_valid:
+        return False, "entry_filled_ts_malformed"
+    return True, ""
+
+
 def canonical_signal_id_for_lookup(signal_id: str) -> str:
     raw = str(signal_id or "").strip()
     if raw.startswith("REEVAL:"):
@@ -118,12 +225,20 @@ def recover_lineage(
     contract: str,
     client_id: str,
     lookback_days: int = LOOKBACK_DAYS_DEFAULT,
+    execution_mode: str = "",
+    broker_position: Optional[dict[str, Any]] = None,
+    broker_quantity: int = 0,
+    broker_cost_basis: float = 0.0,
 ) -> Optional[dict[str, Any]]:
     """Find the true (signal_id, pattern) for a broker-open contract.
 
     Match: newest ENTRY order for the same client + contract whose signal_id
-    is real (not 'reconciled:*'), FILLED ranked above other statuses, within
-    the lookback. Pattern joined from ap_signals via the composite
+    is real (not 'reconciled:*'), with fill-like statuses ranked first, within
+    the lookback. This broad match recovers research attribution. The returned
+    execution IDs are separately marked as proven only when one unambiguous
+    filled ENTRY also has valid fill quantity/price/time and broker economics.
+    When supplied, execution_mode is resolved from the durable order
+    column/metadata. Pattern joined from ap_signals via the composite
     (signal_id, client_email) identity (#260); ap_signals.signal_id is uuid,
     compared ::text so legacy string ids no-op instead of raising.
 
@@ -137,26 +252,42 @@ def recover_lineage(
         def _q() -> Optional[dict[str, Any]]:
             with conn() as c:
                 c.execute(
-                    """
+                    f"""
                     SELECT
-                      o.id        AS order_id,
-                      o.signal_id AS order_signal_id,
-                      o.status    AS order_status
+                      o.id              AS order_id,
+                      o.signal_id       AS order_signal_id,
+                      o.status          AS order_status,
+                      o.local_order_id  AS entry_local_order_id,
+                      o.broker_order_id AS entry_broker_order_id,
+                      o.fill_price      AS entry_fill_price,
+                      o.filled_qty      AS entry_filled_qty,
+                      o.filled_ts       AS entry_filled_ts,
+                      o.contract        AS entry_contract
                     FROM orders o
                     WHERE o.client_id = %s
                       AND o.contract = %s
                       AND upper(o.kind) = 'ENTRY'
                       AND o.signal_id IS NOT NULL
                       AND o.signal_id NOT LIKE %s
+                      {mode_clause}
                       AND o.created_ts > now() - (%s || ' days')::interval
-                    ORDER BY (o.status = 'FILLED') DESC, o.created_ts DESC
-                    LIMIT 1
+                    ORDER BY
+                      (upper(btrim(o.status)) IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')) DESC,
+                      (upper(btrim(o.status)) = 'FILLED') DESC,
+                      o.created_ts DESC
+                    LIMIT 2
                     """,
-                    (client_id, contract, FABRICATED_PREFIX + "%", str(int(lookback_days))),
+                    (client_id, contract, FABRICATED_PREFIX + "%", *mode_params,
+                     str(int(lookback_days))),
                 )
-                row = c.fetchone()
-                if not row:
+                try:
+                    rows = c.fetchall()
+                except AttributeError:
+                    first = c.fetchone()
+                    rows = [first] if first else []
+                if not rows:
                     return None
+                row = rows[0]
                 order_id = str(_row_get(row, "order_id", 0) or "")
                 order_signal_id = str(_row_get(row, "order_signal_id", 1) or "")
                 order_status = str(_row_get(row, "order_status", 2) or "")
@@ -188,13 +319,79 @@ def recover_lineage(
                         "has no pattern — not recovering", order_id, signal_id,
                     )
                     return None
-                return {
+
+                # The first row remains the broad attribution winner.  Only a
+                # single fill-like candidate may donate execution identity;
+                # two fill-like candidates are ambiguous even when one is
+                # newer, so neither can be promoted into positions.*.
+                filled_candidates = [
+                    candidate for candidate in rows
+                    if str(_row_get(candidate, "order_status", 2) or "")
+                    .strip().upper() in _FILLED_ENTRY_STATUSES
+                ]
+                entry_identity_proven = False
+                entry_identity_reason = "entry_identity_not_proven"
+                identity_candidate = None
+                if len(filled_candidates) > 1:
+                    entry_identity_reason = "entry_identity_ambiguous"
+                else:
+                    identity_candidate = filled_candidates[0] if filled_candidates else row
+                    candidate_contract = str(
+                        _row_get(identity_candidate, "entry_contract", 8) or contract
+                    ).strip().upper()
+                    mode_proven = normalized_mode in {"live", "paper"}
+                    contract_proven = (
+                        candidate_contract == str(contract).strip().upper()
+                    )
+                    if mode_proven and contract_proven:
+                        entry_identity_proven, entry_identity_reason = _entry_fill_proof(
+                            identity_candidate,
+                            broker_position=broker_position,
+                            broker_quantity=broker_quantity,
+                            broker_cost_basis=broker_cost_basis,
+                        )
+                    elif not mode_proven:
+                        entry_identity_reason = "entry_execution_mode_unproven"
+                    else:
+                        entry_identity_reason = "entry_contract_conflict"
+                lineage = {
                     "signal_id": signal_id,
                     "pattern": pattern,
                     "order_id": order_id,
                     "order_status": order_status,
                     "order_signal_id": order_signal_id,
                 }
+                # Keep the historical return shape stable for callers/tests
+                # whose order fixture predates these columns.  Production rows
+                # with recovered IDs carry them explicitly.
+                candidate_local_order_id = ""
+                candidate_broker_order_id = ""
+                if identity_candidate is not None:
+                    candidate_local_order_id = str(
+                        _row_get(identity_candidate, "entry_local_order_id", 3) or ""
+                    ).strip()
+                    candidate_broker_order_id = str(
+                        _row_get(identity_candidate, "entry_broker_order_id", 4) or ""
+                    ).strip()
+                if candidate_local_order_id and entry_identity_proven:
+                    lineage["entry_local_order_id"] = candidate_local_order_id
+                if candidate_broker_order_id and entry_identity_proven:
+                    lineage["entry_broker_order_id"] = candidate_broker_order_id
+                lineage["entry_identity_proven"] = entry_identity_proven
+                lineage["entry_identity_reason"] = entry_identity_reason
+                return lineage
+
+        # A mode is part of durable order identity.  When it is known, use the
+        # same normalized column/metadata resolver as the rest of the order
+        # truth paths; malformed or contradictory rows cannot donate lineage.
+        mode_clause = ""
+        mode_params: tuple[str, ...] = ()
+        normalized_mode = str(execution_mode or "").strip().lower()
+        if normalized_mode in {"live", "paper"}:
+            from ap.order_state_machine import _DURABLE_EXECUTION_MODE_SQL
+
+            mode_clause = f"AND {_DURABLE_EXECUTION_MODE_SQL}"
+            mode_params = (normalized_mode,)
 
         return run_with_retry(_q)
     except Exception as exc:
@@ -231,7 +428,13 @@ def import_identity(
 
     try:
         lineage = recover_lineage(
-            contract=contract, client_id=client_id, lookback_days=lookback_days
+            contract=contract,
+            client_id=client_id,
+            lookback_days=lookback_days,
+            execution_mode=execution_mode,
+            broker_position=broker_position,
+            broker_quantity=broker_quantity,
+            broker_cost_basis=broker_cost_basis,
         )
     except Exception:  # defense in depth; recover_lineage already never raises
         lineage = None
@@ -293,6 +496,16 @@ def import_identity(
             ),
             matched_order_id=lineage.get("order_id"),
             matched_order_status=lineage.get("order_status"),
+            matched_local_order_id=(
+                lineage.get("entry_local_order_id")
+                if lineage.get("entry_identity_proven") else None
+            ),
+            matched_broker_order_id=(
+                lineage.get("entry_broker_order_id")
+                if lineage.get("entry_identity_proven") else None
+            ),
+            entry_identity_proven=bool(lineage.get("entry_identity_proven")),
+            entry_identity_reason=str(lineage.get("entry_identity_reason") or ""),
             durable_fingerprint=fingerprint,
             identity_valid=identity_valid,
             identity_reason=identity_reason,

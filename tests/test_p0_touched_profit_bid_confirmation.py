@@ -293,6 +293,10 @@ def _live_reconciler_with_seeded_position(monkeypatch):
         def add_position(self, pos):
             self.positions.append(pos)
 
+        def seed_canonical_position_if_absent(self, pos):
+            self.add_position(pos)
+            return True, "seeded"
+
     monkeypatch.setattr(
         ap_reconciler.APBrokerReconciler,
         "_register_health",

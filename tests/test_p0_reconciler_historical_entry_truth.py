@@ -553,6 +553,10 @@ def test_import_seed_keeps_unknown_underlying_zero_and_untrusted(monkeypatch):
         def add_position(self, position):
             self.positions.append(position)
 
+        def seed_canonical_position_if_absent(self, position):
+            self.add_position(position)
+            return True, "seeded"
+
     broker = _Broker()
     reconciler = _reconciler(broker)
     reconciler.exit_engine = _ExitEngine()
