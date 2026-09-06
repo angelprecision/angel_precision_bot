@@ -521,6 +521,7 @@ def _postgres_positions_table(monkeypatch):
             filled_qty INTEGER,
             fill_price DOUBLE PRECISION,
             filled_ts TIMESTAMPTZ,
+            submitted_ts TIMESTAMPTZ,
             signal_id TEXT,
             broker_order_id TEXT,
             meta JSONB,

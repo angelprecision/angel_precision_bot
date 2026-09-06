@@ -9627,13 +9627,6 @@ class APExitEngine:
         if broker_qty < canonical_full_qty:
             return canonical_full_qty
 
-        # The durable full-entry quantity is already authoritative when the
-        # fresh broker remainder agrees with it.  Historical ENTRY provenance
-        # is needed only for the unsafe expansion case below (a broker
-        # remainder larger than the durable full quantity).
-        if broker_qty == canonical_full_qty:
-            return canonical_full_qty
-
         position_id = str(db_row.get("id") or "").strip()
         if not position_id:
             raise _BrokerRepairCanonicalQuantityUnproven(
@@ -9647,6 +9640,12 @@ class APExitEngine:
         )
         if isinstance(lookup, dict) and lookup.get("_broker_repair_lookup_status"):
             status = str(lookup.get("_broker_repair_lookup_status") or "").strip()
+            # An unavailable historical lookup cannot invalidate an already
+            # durable full quantity when fresh broker remainder agrees with
+            # it.  It may prevent legacy-quantity expansion, but it must not
+            # turn the safe equal-quantity case into a broker-only fallback.
+            if status == "UNAVAILABLE" and broker_qty == canonical_full_qty:
+                return canonical_full_qty
             if broker_qty > canonical_full_qty:
                 raise _BrokerRepairQuantityAuthorityContradiction(
                     "broker_repair_qty_authority_contradiction"
