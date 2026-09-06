@@ -18,6 +18,9 @@
 #   T4  Price-trust separation: price_untrusted + recovered lineage → real
 #       pattern with attribution_source='recovered_price_untrusted';
 #       price_untrusted + no lineage → BROKER_IMPORT_PRICE_UNTRUSTED.
+#   T6  Execution identity promotion: only one fill-proven ENTRY with valid
+#       quantity/price/time and durable order ID may populate position identity;
+#       broad non-filled attribution remains broker-truth ownership only.
 #   T5  SQL shape: ENTRY matched case-insensitively (kind values are
 #       uppercase in production), fabricated 'reconciled:%' excluded, FILLED
 #       ranked first, composite (signal_id::text, client_email) join for the
@@ -54,6 +57,11 @@ class _FakeCursor:
     def fetchone(self):
         return self._current
 
+    def fetchall(self):
+        if isinstance(self._current, list):
+            return self._current
+        return [self._current] if self._current is not None else []
+
     def __enter__(self):
         return self
 
@@ -80,6 +88,10 @@ def test_t1_recovery_returns_real_lineage(monkeypatch):
             "order_status": "FILLED",
             "entry_local_order_id": "entry-local-123",
             "entry_broker_order_id": "entry-broker-123",
+            "entry_fill_price": 1.25,
+            "entry_filled_qty": 2,
+            "entry_filled_ts": "2026-08-25T14:31:00+00:00",
+            "entry_contract": "GOOGL260710C00360000",
         },
         {"pattern": "2-3"},
     ])
@@ -96,6 +108,7 @@ def test_t1_recovery_returns_real_lineage(monkeypatch):
     assert ident.matched_order_status == "FILLED"
     assert ident.matched_local_order_id == "entry-local-123"
     assert ident.matched_broker_order_id == "entry-broker-123"
+    assert ident.entry_identity_proven is True
     assert ident.plan_id.startswith("reconciled:GOOGL260710C00360000:")  # provenance
 
 
@@ -175,7 +188,7 @@ def test_t5_sql_shape(monkeypatch):
     order_sql, order_params = cur.executed[0]
     assert "upper(o.kind) = 'ENTRY'" in order_sql          # prod kinds uppercase
     assert "NOT LIKE %s" in order_sql                       # fabricated excluded
-    assert "(o.status = 'FILLED') DESC" in order_sql        # FILLED ranked first
+    assert "(upper(o.status) = 'FILLED') DESC" in order_sql  # FILLED ranked first
     assert "%s" in order_sql and "%(" not in order_sql      # psycopg2 positional
     assert order_params[0] == "jasoncosby1@gmail.com"       # full email, not slug
     assert order_params[2] == "reconciled:%"
@@ -222,6 +235,8 @@ def test_dict_row_pattern_lookup_uses_alias(monkeypatch):
         "order_id": "ord-alias",
         "order_status": "SUBMITTED",
         "order_signal_id": "eeee1111-2222-3333-4444-555566667777",
+        "entry_identity_proven": False,
+        "entry_identity_reason": "entry_execution_mode_unproven",
     }
     assert "AS order_id" in cur.executed[0][0]
     assert "AS order_signal_id" in cur.executed[0][0]
@@ -304,6 +319,7 @@ def test_imported_position_pm_path_carries_recovered_order_identity(monkeypatch)
         pattern="2-3",
         matched_local_order_id="entry-local-1",
         matched_broker_order_id="entry-broker-1",
+        entry_identity_proven=True,
     )
 
     result = reconciler._create_imported_position(
@@ -321,3 +337,163 @@ def test_imported_position_pm_path_carries_recovered_order_identity(monkeypatch)
     assert manager.kwargs["broker_order_id"] == "entry-broker-1"
     assert backfills[0][1]["local_order_id"] == "entry-local-1"
     assert backfills[0][1]["broker_order_id"] == "entry-broker-1"
+
+
+@pytest.mark.parametrize("status", ["SUBMITTED", "CANCELED", "EXPIRED", "REJECTED"])
+def test_nonfilled_lineage_never_promotes_entry_identity(monkeypatch, status):
+    _wire(monkeypatch, [
+        {
+            "order_id": "ord-weak",
+            "order_signal_id": "ffff1111-2222-3333-4444-555566667777",
+            "order_status": status,
+            "entry_local_order_id": "entry-local-weak",
+            "entry_broker_order_id": "entry-broker-weak",
+            "entry_fill_price": 1.25,
+            "entry_filled_qty": 1,
+            "entry_filled_ts": "2026-08-25T14:31:00+00:00",
+            "entry_contract": "NOW260710C00122000",
+        },
+        {"pattern": "2-3"},
+    ])
+    ident = import_identity(
+        contract="NOW260710C00122000",
+        client_id="client@example.com",
+        execution_mode="live",
+    )
+    assert ident.attributed is True
+    assert ident.entry_identity_proven is False
+    assert ident.matched_local_order_id is None
+    assert ident.matched_broker_order_id is None
+
+
+def test_partial_fill_with_valid_evidence_promotes_entry_identity(monkeypatch):
+    _wire(monkeypatch, [
+        {
+            "order_id": "ord-partial",
+            "order_signal_id": "11111111-2222-3333-4444-555555555555",
+            "order_status": "PARTIAL_FILL",
+            "entry_local_order_id": "entry-local-partial",
+            "entry_broker_order_id": "entry-broker-partial",
+            "entry_fill_price": 1.25,
+            "entry_filled_qty": 1,
+            "entry_filled_ts": "2026-08-25T14:31:00+00:00",
+            "entry_contract": "NOW260710C00122000",
+        },
+        {"pattern": "2-3"},
+    ])
+    ident = import_identity(
+        contract="NOW260710C00122000",
+        client_id="client@example.com",
+        execution_mode="live",
+    )
+    assert ident.entry_identity_proven is True
+    assert ident.matched_local_order_id == "entry-local-partial"
+    assert ident.matched_broker_order_id == "entry-broker-partial"
+
+
+def test_entry_identity_not_promoted_when_broker_fill_economics_conflict(monkeypatch):
+    _wire(monkeypatch, [
+        {
+            "order_id": "ord-economics",
+            "order_signal_id": "44444444-2222-3333-4444-555555555555",
+            "order_status": "FILLED",
+            "entry_local_order_id": "entry-local-economics",
+            "entry_broker_order_id": "entry-broker-economics",
+            "entry_fill_price": 1.25,
+            "entry_filled_qty": 1,
+            "entry_filled_ts": "2026-08-25T14:31:00+00:00",
+            "entry_contract": "NOW260710C00122000",
+        },
+        {"pattern": "2-3"},
+    ])
+    ident = import_identity(
+        contract="NOW260710C00122000",
+        client_id="client@example.com",
+        execution_mode="live",
+        broker_position={"avg_fill": 2.50},
+        broker_quantity=1,
+    )
+    assert ident.attributed is True
+    assert ident.entry_identity_proven is False
+    assert ident.entry_identity_reason == "entry_broker_price_conflict"
+    assert ident.matched_local_order_id is None
+    assert ident.matched_broker_order_id is None
+
+
+def test_two_filled_lineage_candidates_do_not_promote_newest(monkeypatch):
+    _wire(monkeypatch, [
+        [
+            {
+                "order_id": "ord-new",
+                "order_signal_id": "22222222-2222-3333-4444-555555555555",
+                "order_status": "FILLED",
+                "entry_local_order_id": "entry-local-new",
+                "entry_broker_order_id": "entry-broker-new",
+                "entry_fill_price": 1.25,
+                "entry_filled_qty": 1,
+                "entry_filled_ts": "2026-08-25T15:31:00+00:00",
+                "entry_contract": "NOW260710C00122000",
+            },
+            {
+                "order_id": "ord-old",
+                "order_signal_id": "33333333-2222-3333-4444-555555555555",
+                "order_status": "FILLED",
+                "entry_local_order_id": "entry-local-old",
+                "entry_broker_order_id": "entry-broker-old",
+                "entry_fill_price": 1.10,
+                "entry_filled_qty": 1,
+                "entry_filled_ts": "2026-08-25T14:31:00+00:00",
+                "entry_contract": "NOW260710C00122000",
+            },
+        ],
+        {"pattern": "2-3"},
+    ])
+    ident = import_identity(
+        contract="NOW260710C00122000",
+        client_id="client@example.com",
+        execution_mode="live",
+    )
+    assert ident.attributed is True
+    assert ident.entry_identity_proven is False
+    assert ident.entry_identity_reason == "entry_identity_ambiguous"
+    assert ident.matched_local_order_id is None
+    assert ident.matched_broker_order_id is None
+
+
+def test_older_filled_lineage_beats_newer_submitted_for_identity(monkeypatch):
+    _wire(monkeypatch, [
+        [
+            {
+                "order_id": "ord-filled",
+                "order_signal_id": "55555555-2222-3333-4444-555555555555",
+                "order_status": "FILLED",
+                "entry_local_order_id": "entry-local-filled",
+                "entry_broker_order_id": "entry-broker-filled",
+                "entry_fill_price": 1.25,
+                "entry_filled_qty": 1,
+                "entry_filled_ts": "2026-08-25T14:31:00+00:00",
+                "entry_contract": "NOW260710C00122000",
+            },
+            {
+                "order_id": "ord-submitted",
+                "order_signal_id": "66666666-2222-3333-4444-555555555555",
+                "order_status": "SUBMITTED",
+                "entry_local_order_id": "entry-local-submitted",
+                "entry_broker_order_id": "entry-broker-submitted",
+                "entry_contract": "NOW260710C00122000",
+            },
+        ],
+        {"pattern": "2-3"},
+    ])
+    ident = import_identity(
+        contract="NOW260710C00122000",
+        client_id="client@example.com",
+        execution_mode="live",
+        broker_position={"avg_fill": 1.25},
+        broker_quantity=1,
+        broker_cost_basis=125.0,
+    )
+    assert ident.attributed is True
+    assert ident.matched_order_id == "ord-filled"
+    assert ident.entry_identity_proven is True
+    assert ident.matched_local_order_id == "entry-local-filled"

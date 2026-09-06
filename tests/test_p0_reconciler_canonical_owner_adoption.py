@@ -1055,6 +1055,32 @@ def test_partial_exit_evidence_rejects_duplicate_order_identity(monkeypatch):
     assert evidence is None
 
 
+def test_partial_exit_evidence_rejects_mixed_anonymous_and_identified_rows(monkeypatch):
+    import ap.db as db
+
+    anonymous = _partial_exit_row(local_order_id="", broker_order_id="")
+    identified = _partial_exit_row(
+        local_order_id="exit-local-2",
+        broker_order_id="exit-broker-2",
+        filled_ts="2026-08-25T15:02:00+00:00",
+    )
+    cursor = _EvidenceCursor([anonymous, identified])
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = rec.APBrokerReconciler._partial_exit_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        expected_exited_qty=2,
+    )
+
+    assert status == "AMBIGUOUS"
+    assert evidence is None
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Quantity authority — partial-exit and three-field validation
@@ -1735,6 +1761,32 @@ def test_unattributed_import_uses_broker_truth_seed_without_entry_fabrication():
         seed_calls.append(kwargs) or "seeded"
     )
     identity = SimpleNamespace(attributed=False)
+
+    assert reconciler._seed_imported_position_owner(
+        pos_id=POSITION_ID,
+        contract=CONTRACT,
+        underlying="NOW",
+        side="PUT",
+        qty=1,
+        entry_px=1.30,
+        import_identity_record=identity,
+    ) is True
+    assert strict_calls == []
+    assert seed_calls[0]["pos_id"] == POSITION_ID
+
+
+def test_weak_attribution_uses_broker_truth_seed_without_entry_promotion():
+    engine = _ExitEngine()
+    reconciler = _reconciler(engine)
+    strict_calls = []
+    seed_calls = []
+    reconciler._seed_exit_engine_from_position = lambda _row: strict_calls.append(_row) or pytest.fail(
+        "weak attribution must not enter strict ENTRY ownership"
+    )
+    reconciler._seed_exit_engine_from_import = lambda **kwargs: (
+        seed_calls.append(kwargs) or "seeded"
+    )
+    identity = SimpleNamespace(attributed=True, entry_identity_proven=False)
 
     assert reconciler._seed_imported_position_owner(
         pos_id=POSITION_ID,

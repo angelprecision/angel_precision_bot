@@ -128,6 +128,12 @@ def production_db(monkeypatch):
 
 
 class NoMutationBroker:
+    def __init__(self, positions=None):
+        self._positions = list(positions or [])
+
+    def list_positions(self):
+        return list(self._positions)
+
     def submit_order(self, *_args, **_kwargs):
         raise AssertionError("broker submit is outside PR1 mutation boundary")
 
@@ -193,7 +199,7 @@ def _poll(reconciler, positions):
     return summary
 
 
-def _owner_reconciler(client_id: str, mode: str):
+def _owner_reconciler(client_id: str, mode: str, positions=None):
     """Build the real import/owner seam without broker mutation authority."""
     import threading
     from ap_exit_engine import APExitEngine
@@ -205,11 +211,12 @@ def _owner_reconciler(client_id: str, mode: str):
     engine._positions_by_id = {}
 
     reconciler = APBrokerReconciler.__new__(APBrokerReconciler)
-    reconciler.broker = NoMutationBroker()
+    reconciler.broker = NoMutationBroker(positions)
     reconciler.client_id = client_id
     reconciler.execution_mode = mode
     reconciler.pm = None  # exercise the production SQL import fallback
     reconciler.exit_engine = engine
+    reconciler._ghost_tracker = {}
     reconciler._alert_fn = lambda _message: None
     reconciler._alert = lambda _message: None
     reconciler._record_recovered_position = lambda **_payload: None
@@ -469,11 +476,12 @@ def test_broker_only_restart_import_recovers_entry_identity_and_owner(production
     with production_db.cursor() as cursor:
         cursor.execute(
             "INSERT INTO orders (id, client_id, contract, kind, signal_id, status, "
-            "created_ts, local_order_id, broker_order_id, execution_mode, meta) "
-            "VALUES (%s,%s,%s,'ENTRY',%s,'FILLED',NOW(),%s,%s,%s,%s::jsonb)",
+            "created_ts, local_order_id, broker_order_id, execution_mode, meta, "
+            "fill_price, filled_qty, filled_ts) "
+            "VALUES (%s,%s,%s,'ENTRY',%s,'FILLED',NOW(),%s,%s,%s,%s::jsonb,%s,%s,NOW())",
             (
                 "order-restart-546", client_id, contract, signal_id,
-                local_id, broker_id, mode, '{"execution_mode":"live"}',
+                local_id, broker_id, mode, '{"execution_mode":"live"}', 0.61, 4,
             ),
         )
         cursor.execute(
@@ -489,8 +497,9 @@ def test_broker_only_restart_import_recovers_entry_identity_and_owner(production
         "cost_basis": 244.0,
         "position_id": "broker-position-restart-546",
     }
-    first, first_engine = _owner_reconciler(client_id, mode)
-    first_summary = _poll(first, [broker_position])
+    first, first_engine = _owner_reconciler(client_id, mode, [broker_position])
+    first_summary = _empty_summary(client_id)
+    first._reconcile_positions(first_summary)
 
     assert first_summary["positions_imported"] == 1
     assert len(first_engine.active_positions()) == 1
@@ -507,12 +516,110 @@ def test_broker_only_restart_import_recovers_entry_identity_and_owner(production
 
     # A fresh process/engine converges from the durable row without another
     # import row or any broker submit/cancel authority.
-    second, second_engine = _owner_reconciler(client_id, mode)
-    second_summary = _poll(second, [broker_position])
-    assert second_summary["positions_import_idempotent"] == 1
+    second, second_engine = _owner_reconciler(client_id, mode, [broker_position])
+    second_summary = _empty_summary(client_id)
+    second._reconcile_positions(second_summary)
+    assert second_summary["positions_alerted"] == 0
     assert len(second_engine.active_positions()) == 1
     assert second_engine.active_positions()[0].position_id == position_id
     assert _count(production_db, client_id) == 1
+
+
+def test_true_broker_only_restart_reconciler_reinstalls_owner(production_db):
+    """A no-lineage import remains protected through the real restart caller."""
+    client_id = "broker-only-restart@example.com"
+    mode = "live"
+    contract = _future_contract("NOW", "C", "00124000")
+    broker_position = {
+        "symbol": contract,
+        "underlying": "NOW",
+        "quantity": 3,
+        "cost_basis": 183.0,
+        "position_id": "broker-position-only-546",
+    }
+
+    first, first_engine = _owner_reconciler(client_id, mode, [broker_position])
+    first_summary = _empty_summary(client_id)
+    first._reconcile_positions(first_summary)
+
+    assert first_summary["positions_imported"] == 1
+    assert len(first_engine.active_positions()) == 1
+    position_id = first_engine.active_positions()[0].position_id
+    with production_db.cursor() as cursor:
+        cursor.execute(
+            "SELECT signal_id, pattern, local_order_id, broker_order_id "
+            "FROM positions WHERE id=%s", (position_id,)
+        )
+        signal_id, pattern, local_id, broker_id = cursor.fetchone()
+    assert signal_id.startswith("reconciled:")
+    assert pattern == "BROKER_IMPORT"
+    assert (local_id, broker_id) == (None, None)
+
+    # Reconstruct the production caller with a fresh engine/process boundary.
+    second, second_engine = _owner_reconciler(client_id, mode, [broker_position])
+    second_summary = _empty_summary(client_id)
+    second._reconcile_positions(second_summary)
+
+    assert len(second_engine.active_positions()) == 1
+    assert second_engine.active_positions()[0].position_id == position_id
+    assert "reconciler_exit_owner_install_failed" not in (
+        second_summary.get("errors") or []
+    )
+    assert second_summary["positions_alerted"] == 0
+    assert _count(production_db, client_id) == 1
+
+
+def test_nonfilled_attribution_stays_broker_truth_owned_after_restart(production_db):
+    """A SUBMITTED attribution may label the row but cannot donate ENTRY IDs."""
+    client_id = "weak-attribution-restart@example.com"
+    mode = "live"
+    contract = _future_contract("NOW", "P", "00125000")
+    with production_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO orders (id, client_id, contract, kind, signal_id, status, "
+            "created_ts, local_order_id, broker_order_id, execution_mode, meta) "
+            "VALUES (%s,%s,%s,'ENTRY',%s,'SUBMITTED',NOW(),%s,%s,%s,%s::jsonb)",
+            (
+                "order-weak-546", client_id, contract, "signal-weak-546",
+                "entry-local-weak-546", "entry-broker-weak-546", mode,
+                '{"execution_mode":"live"}',
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO ap_signals (signal_id, client_email, raw_payload, signal_payload) "
+            "VALUES (%s,%s,%s::jsonb,%s::jsonb)",
+            ("signal-weak-546", client_id, '{"pattern":"2-3"}', "{}"),
+        )
+
+    broker_position = {
+        "symbol": contract,
+        "underlying": "NOW",
+        "quantity": 2,
+        "cost_basis": 122.0,
+        "position_id": "broker-position-weak-546",
+    }
+    first, first_engine = _owner_reconciler(client_id, mode, [broker_position])
+    first_summary = _empty_summary(client_id)
+    first._reconcile_positions(first_summary)
+
+    assert first_summary["positions_imported"] == 1
+    assert len(first_engine.active_positions()) == 1
+    position_id = first_engine.active_positions()[0].position_id
+    with production_db.cursor() as cursor:
+        cursor.execute(
+            "SELECT pattern, local_order_id, broker_order_id FROM positions WHERE id=%s",
+            (position_id,),
+        )
+        pattern, local_id, broker_id = cursor.fetchone()
+    assert pattern == "2-3"
+    assert (local_id, broker_id) == (None, None)
+
+    second, second_engine = _owner_reconciler(client_id, mode, [broker_position])
+    second_summary = _empty_summary(client_id)
+    second._reconcile_positions(second_summary)
+    assert len(second_engine.active_positions()) == 1
+    assert second_engine.active_positions()[0].position_id == position_id
+    assert second_summary["positions_alerted"] == 0
 
 
 def test_closed_partial_restore_rereads_full_row_and_preserves_quantity(production_db):
