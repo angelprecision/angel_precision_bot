@@ -4120,8 +4120,7 @@ def test_pr588_test_e_broker_exceeds_entry_fails_closed():
 
 @_skip_if_no_mod
 def test_pr588_test_e_upsert_blocked_on_broker_exceeds_entry():
-    """Test E upsert: _upsert_broker_position_to_db must fail closed and return
-    None when broker_remaining_qty > full_entry_qty."""
+    """Test E upsert: quantity-authority contradictions must abort recovery."""
     engine_cls = getattr(_EE_MOD, "APExitEngine", None)
     if engine_cls is None:
         pytest.skip("APExitEngine not found")
@@ -4176,24 +4175,103 @@ def test_pr588_test_e_upsert_blocked_on_broker_exceeds_entry():
     fake_db = types.SimpleNamespace(conn=_conn, run_with_retry=lambda fn, **_: fn())
     prior = sys.modules.get("ap.db")
     sys.modules["ap.db"] = fake_db
+    contradiction = getattr(
+        _EE_MOD, "_BrokerRepairQuantityAuthorityContradiction", None
+    )
+    if contradiction is None:
+        pytest.fail("quantity-authority contradiction guard is missing")
     try:
         # broker qty=2 > entry filled_qty=1 → must fail closed
-        row_id = eng._upsert_broker_position_to_db(
-            CONTRACT,
-            {"quantity": 2, "cost_basis": 300.0, "date_acquired": "2026-09-01"},
-        )
+        with pytest.raises(contradiction, match="broker_qty_exceeds_entry_qty"):
+            eng._upsert_broker_position_to_db(
+                CONTRACT,
+                {"quantity": 2, "cost_basis": 600.0, "date_acquired": "2026-09-01"},
+            )
     finally:
         if prior is not None:
             sys.modules["ap.db"] = prior
         else:
             sys.modules.pop("ap.db", None)
 
-    assert row_id is None, (
-        f"ENTRY=1, broker=2 must return None (fail closed). Got row_id={row_id}"
-    )
     assert not any("INSERT INTO positions" in s for s in insert_sql_calls), (
         "No INSERT must be executed when broker qty exceeds entry filled_qty"
     )
+
+
+@pytest.mark.parametrize(
+    "db_row",
+    [
+        None,
+        {
+            "id": "pr588-qty-authority-row",
+            "contract": "TSLA260919C00300000",
+            "option_symbol": "TSLA260919C00300000",
+            "underlying": "TSLA",
+            "side": "CALL",
+            "direction": "CALL",
+            "qty": 1,
+            "quantity_remaining": 1,
+            "entry_price": 3.00,
+            "avg_fill": 3.00,
+            "entry_ts": None,
+            "status": "OPEN",
+            "execution_mode": "live",
+        },
+    ],
+)
+def test_pr588_quantity_authority_contradiction_never_installs_degraded_owner(db_row):
+    """A broker remainder larger than canonical ENTRY qty must remain HOLD.
+
+    Exercise both recovery shapes: no durable row (upsert raises the typed
+    contradiction) and an existing durable row (managed-row hydration marks
+    the same contradiction).  Neither may reach degraded behavior-active
+    ownership.
+    """
+    eng = _pr558_new_engine(email="pr588-qty-authority@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+
+    contract = "TSLA260919C00300000"
+    contradiction = getattr(
+        _EE_MOD, "_BrokerRepairQuantityAuthorityContradiction", None
+    )
+    if contradiction is None:
+        pytest.fail("quantity-authority contradiction guard is missing")
+
+    class _Broker:
+        account_id = "acct-pr588-qty-authority"
+        mode = "live"
+
+        def list_positions(self):
+            return [{
+                "symbol": contract,
+                "quantity": 2,
+                "cost_basis": 600.0,
+                "date_acquired": "2026-09-01",
+            }]
+
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: db_row
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+
+    if db_row is None:
+        def _raise_quantity_contradiction(_sym, _bp):
+            raise contradiction("broker_repair_qty_authority_contradiction")
+
+        eng._upsert_broker_position_to_db = _raise_quantity_contradiction
+    else:
+        eng._upsert_broker_position_to_db = lambda *_args: pytest.fail(
+            "existing quantity-authority contradiction must not fall through to upsert"
+        )
+    eng._install_or_refresh_degraded_broker_truth_owner = lambda **_kwargs: pytest.fail(
+        "quantity-authority contradiction must not install a degraded owner"
+    )
+
+    assert eng._broker_position_precheck() is False
+    assert eng._positions == []
+    assert contract in eng._broker_truth_hold_symbols
 
 
 # ── Test G: degraded-to-canonical convergence preserves 2/1 ──────────────────
@@ -4461,20 +4539,22 @@ def test_pr588_test_j_real_postgresql_partial_insert(monkeypatch):
         assert row is not None, (
             "Test J: no row found in positions after _upsert_broker_position_to_db"
         )
-        row_dict = dict(row)
-        assert row_dict["qty"] == FULL_QTY, (
+        row_qty = row["qty"] if isinstance(row, dict) else row[0]
+        row_remaining = row["quantity_remaining"] if isinstance(row, dict) else row[1]
+        row_status = row["status"] if isinstance(row, dict) else row[2]
+        assert row_qty == FULL_QTY, (
             f"MANDATORY Test J FAILURE: positions.qty must be full entry qty "
-            f"({FULL_QTY}), got {row_dict['qty']}. "
+            f"({FULL_QTY}), got {row_qty}. "
             f"This is the primary P0 defect: broker qty={BROKER_QTY} was written "
             f"to both qty and quantity_remaining, erasing the proven entry size."
         )
-        assert row_dict["quantity_remaining"] == BROKER_QTY, (
+        assert row_remaining == BROKER_QTY, (
             f"Test J: positions.quantity_remaining must be broker remaining "
-            f"({BROKER_QTY}), got {row_dict['quantity_remaining']}"
+            f"({BROKER_QTY}), got {row_remaining}"
         )
-        assert row_dict["status"] == "PARTIAL", (
+        assert row_status == "PARTIAL", (
             f"Test J: status must be PARTIAL (not OPEN) when remaining "
-            f"({BROKER_QTY}) < full entry qty ({FULL_QTY}), got {row_dict['status']!r}"
+            f"({BROKER_QTY}) < full entry qty ({FULL_QTY}), got {row_status!r}"
         )
 
 
@@ -4557,18 +4637,20 @@ def test_pr588_test_k_fallback_insert_parity_2_1(monkeypatch):
             row = cur.fetchone()
 
         assert row is not None, "Test K: no row persisted by fallback INSERT"
-        row_dict = dict(row)
-        assert row_dict["qty"] == FULL_QTY, (
-            f"Test K FAILURE: fallback INSERT persisted qty={row_dict['qty']}, "
+        row_qty = row["qty"] if isinstance(row, dict) else row[0]
+        row_remaining = row["quantity_remaining"] if isinstance(row, dict) else row[1]
+        row_status = row["status"] if isinstance(row, dict) else row[2]
+        assert row_qty == FULL_QTY, (
+            f"Test K FAILURE: fallback INSERT persisted qty={row_qty}, "
             f"expected full entry qty={FULL_QTY}. Fallback must use same quantity "
             f"semantics as extended INSERT."
         )
-        assert row_dict["quantity_remaining"] == BROKER_QTY, (
-            f"Test K: fallback INSERT qty_remaining={row_dict['quantity_remaining']}, "
+        assert row_remaining == BROKER_QTY, (
+            f"Test K: fallback INSERT qty_remaining={row_remaining}, "
             f"expected broker remaining={BROKER_QTY}"
         )
-        assert row_dict["status"] == "PARTIAL", (
-            f"Test K: fallback INSERT status={row_dict['status']!r}, "
+        assert row_status == "PARTIAL", (
+            f"Test K: fallback INSERT status={row_status!r}, "
             f"expected PARTIAL (remaining={BROKER_QTY} < full={FULL_QTY})"
         )
 

@@ -3689,6 +3689,10 @@ class _BrokerRepairIdentity(str):
         return instance
 
 
+class _BrokerRepairQuantityAuthorityContradiction(RuntimeError):
+    """Broker remainder exceeds the proven canonical ENTRY quantity."""
+
+
 class APExitEngine:
     """
     Manages all open positions with time-aware exit logic.
@@ -7744,6 +7748,36 @@ class APExitEngine:
             #                   evidence; caller keeps degraded owner)
             if not candidates:
                 return None
+            _broker_qty_for_authority = (
+                _broker_repair_positive_int(
+                    broker_position.get("quantity")
+                )
+                if isinstance(broker_position, dict)
+                else None
+            )
+            _candidate_entry_qtys = [
+                _broker_repair_positive_int(row.get("filled_qty"))
+                for row in candidates
+            ]
+            if (
+                _broker_qty_for_authority is not None
+                and _candidate_entry_qtys
+                and all(
+                    qty is not None and qty < _broker_qty_for_authority
+                    for qty in _candidate_entry_qtys
+                )
+            ):
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_ENTRY_QTY_AUTHORITY_CONTRADICTION "
+                    "client=%s mode=%s contract=%s broker_remaining_qty=%d "
+                    "candidate_entry_qtys=%s",
+                    self._email, normalized_mode, contract,
+                    _broker_qty_for_authority, _candidate_entry_qtys,
+                )
+                return {
+                    "_broker_repair_lookup_status":
+                    "QUANTITY_AUTHORITY_CONTRADICTION"
+                }
             if broker_position is not None and len(candidates) > 1:
                 narrowed = [
                     row for row in candidates
@@ -8805,6 +8839,12 @@ class APExitEngine:
                 )
                 return None
             if isinstance(lookup, dict) and lookup.get("_broker_repair_lookup_status"):
+                if lookup.get("_broker_repair_lookup_status") == (
+                    "QUANTITY_AUTHORITY_CONTRADICTION"
+                ):
+                    raise _BrokerRepairQuantityAuthorityContradiction(
+                        "broker_qty_exceeds_entry_qty"
+                    )
                 log.error(
                     "[exit_eng] BROKER_REPAIR_ENTRY_%s client=%s mode=%s contract=%s "
                     "— recovery held",
@@ -8889,7 +8929,9 @@ class APExitEngine:
                     "— contradictory quantity authority; fail closed",
                     self._email, contract, broker_remaining_qty, full_entry_qty,
                 )
-                return None
+                raise _BrokerRepairQuantityAuthorityContradiction(
+                    "broker_qty_exceeds_entry_qty"
+                )
             # Derive canonical status: OPEN when remaining equals full,
             # PARTIAL when current exposure is smaller than original entry.
             _recovery_status = (
@@ -9198,6 +9240,8 @@ class APExitEngine:
                     "filled_entry_order" if lookup else "generated_repair_uuid",
                 )
             return result
+        except _BrokerRepairQuantityAuthorityContradiction:
+            raise
         except Exception as _ue:
             log.error(
                 "[exit_eng] _upsert_broker_position_to_db %s failed: %s: %s",
@@ -9828,7 +9872,9 @@ class APExitEngine:
                                     "no DB mutation",
                                     self._email, sym, durable_full, bq,
                                 )
-                                return
+                                raise _BrokerRepairQuantityAuthorityContradiction(
+                                    "broker_repair_qty_authority_contradiction"
+                                )
                             with conn() as c:
                                 c.execute(
                                     """
@@ -9852,6 +9898,17 @@ class APExitEngine:
                             "broker_qty=%d db_repaired=true",
                             self._email, sym, db_qty_before, broker_qty,
                         )
+                    except _BrokerRepairQuantityAuthorityContradiction:
+                        repair_failed_syms.append(sym)
+                        self._broker_truth_hold_symbols.add(sym)
+                        log.error(
+                            "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                            "client=%s account=%s contract_symbol=%s "
+                            "reason=broker_repair_qty_authority_contradiction "
+                            "— no owner mutation permitted; degraded owner blocked",
+                            self._email, _account_id, sym,
+                        )
+                        continue
                     except Exception as _dre:
                         # Non-fatal — still load with broker qty even if DB repair fails
                         log.warning(
@@ -9870,6 +9927,17 @@ class APExitEngine:
                         prefer_qty_override=True,
                         expected_contract=sym,
                     )
+                    _qty_authority_reason = str(
+                        getattr(pos, "adoption_identity_quarantine_reason", "")
+                        or getattr(pos, "adoptionidentityquarantinereason", "")
+                        or ""
+                    ).strip()
+                    if _qty_authority_reason == (
+                        "broker_repair_qty_authority_contradiction"
+                    ):
+                        raise _BrokerRepairQuantityAuthorityContradiction(
+                            _qty_authority_reason
+                        )
                     self._install_canonical_owner_atomically(
                         pos, sym, account_id=_account_id
                     )
@@ -9877,6 +9945,17 @@ class APExitEngine:
                         pos, sym, _account_id,
                     )
                     loaded_db_syms.append(sym)
+                except _BrokerRepairQuantityAuthorityContradiction:
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=broker_repair_qty_authority_contradiction "
+                        "— no owner mutation permitted; degraded owner blocked",
+                        self._email, _account_id, sym,
+                    )
+                    continue
                 except Exception as _le:
                     log.warning(
                         "[exit_eng] DB row load failed for %s: %s: %s — trying upsert",
@@ -9954,6 +10033,20 @@ class APExitEngine:
                         pos, sym, _account_id,
                     )
                     repaired_syms.append(sym)              # confirmed DB row
+                except _BrokerRepairQuantityAuthorityContradiction:
+                    repair_failed_reason = (
+                        "broker_repair_qty_authority_contradiction"
+                    )
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=%s added_to_engine=false "
+                        "degraded_owner=blocked_by_quantity_authority",
+                        self._email, _account_id, sym, repair_failed_reason,
+                    )
+                    continue
                 except Exception as _re_err:
                     repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
                     log.error(
