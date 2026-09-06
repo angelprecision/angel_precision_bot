@@ -156,6 +156,18 @@ class TestRepairClosedPositionsWithRemainingQty(unittest.TestCase):
         broker_pos = _make_broker_pos("PG260620C00155000", qty=5)
         rec.broker.list_positions.return_value = [broker_pos]
         rec._seed_exit_engine_from_position = MagicMock()
+        canonical_row = _make_pos(
+            qty=7,
+            quantity_remaining=5,
+            status="PARTIAL",
+            contract="PG260620C00155000",
+            execution_mode="paper",
+            side="CALL",
+            local_order_id="entry-local-1",
+            broker_order_id="entry-broker-1",
+            signal_id="signal-1",
+        )
+        rec._find_db_position_by_id = MagicMock(return_value=canonical_row)
 
         written = {}
 
@@ -189,6 +201,9 @@ class TestRepairClosedPositionsWithRemainingQty(unittest.TestCase):
                            "quantity_remaining must be restored from broker")
         self.assertEqual(summary["broker_positions_hidden_by_closed_status_count"], 1)
         rec._seed_exit_engine_from_position.assert_called_once()
+        assert rec._seed_exit_engine_from_position.call_args.args[0] is canonical_row
+        assert rec._seed_exit_engine_from_position.call_args.args[0]["execution_mode"] == "paper"
+        assert rec._seed_exit_engine_from_position.call_args.args[0]["side"] == "CALL"
 
     def test_broker_unavailable_status_unchanged(self):
         """

@@ -3474,7 +3474,38 @@ class APBrokerReconciler:
             )
             if historical:
                 if str(historical.get("status") or "").upper() in DB_OPEN_POSITION_STATUSES:
-                    if not self._seed_exit_engine_from_position(historical):
+                    # A recovered ENTRY has a real order lineage; make sure
+                    # that lineage is present on the pre-existing import row
+                    # before the strict canonical installer runs.  A
+                    # genuinely broker-only import has no ENTRY proof and must
+                    # stay on the broker-truth atomic seed path, never an
+                    # invented ENTRY lookup.
+                    if import_ident.attributed:
+                        if not self._backfill_position_order_identity(
+                            str(historical.get("id") or historical.get("position_id") or ""),
+                            local_order_id=getattr(import_ident, "matched_local_order_id", None),
+                            broker_order_id=getattr(import_ident, "matched_broker_order_id", None),
+                        ):
+                            owner_ready = False
+                        else:
+                            refreshed = self._find_db_position_by_id(
+                                str(historical.get("id") or historical.get("position_id") or "")
+                            ) or historical
+                            owner_ready = self._seed_exit_engine_from_position(refreshed)
+                    else:
+                        owner_ready = self._seed_imported_position_owner(
+                            pos_id=str(historical.get("id") or historical.get("position_id") or ""),
+                            contract=contract,
+                            underlying=underlying,
+                            side=side,
+                            qty=qty,
+                            entry_px=entry_px,
+                            underlying_entry=underlying_entry,
+                            price_untrusted=price_untrusted,
+                            import_identity_record=import_ident,
+                            row=historical,
+                        )
+                    if not owner_ready:
                         self._record_exit_owner_install_failure(
                             summary,
                             contract=contract,
@@ -3518,6 +3549,34 @@ class APBrokerReconciler:
                 )
                 continue
 
+            # Keep this contract in the per-pass dedup set once the durable row
+            # exists, even if owner installation must HOLD and be retried on the
+            # next poll.  Import/repair success metrics are recorded only after
+            # the canonical owner postcondition is proven.
+            db_contracts.add(contract)
+
+            row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)
+            owner_ready = self._seed_imported_position_owner(
+                pos_id=str(pos_id or ""),
+                contract=contract,
+                underlying=underlying,
+                side=side,
+                qty=qty,
+                entry_px=entry_px,
+                underlying_entry=underlying_entry,
+                price_untrusted=price_untrusted,
+                import_identity_record=import_ident,
+                row=row,
+            )
+            if not owner_ready:
+                self._record_exit_owner_install_failure(
+                    summary,
+                    contract=contract,
+                    position_id=str(pos_id or ""),
+                    context="broker_imported_position",
+                )
+                continue
+
             self._record_recovered_position(
                 signal_id=str(pos_id or f"reconciled:{contract}"),
                 ticker=self._norm_underlying(underlying or contract),
@@ -3532,34 +3591,8 @@ class APBrokerReconciler:
                 broker_position=bp,
                 db_position_missing=True,
             )
-
             summary["positions_imported"] += 1
             summary["positions_corrected"] += 1
-            db_contracts.add(contract)
-
-            row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)
-            if row:
-                owner_ready = self._seed_exit_engine_from_position(row)
-            else:
-                seed_status = self._seed_exit_engine_from_import(
-                    pos_id=pos_id,
-                    contract=contract,
-                    underlying=underlying,
-                    side=side,
-                    qty=qty,
-                    entry_px=entry_px,
-                    underlying_entry=underlying_entry,
-                    price_untrusted=price_untrusted,
-                )
-                owner_ready = seed_status in {"seeded", "already_owned"}
-            if not owner_ready:
-                self._record_exit_owner_install_failure(
-                    summary,
-                    contract=contract,
-                    position_id=str(pos_id or ""),
-                    context="broker_imported_position",
-                )
-                continue
 
             msg = (
                 f"BROKER_POSITION_IMPORTED | {underlying or '?'} {side} | "
@@ -3574,6 +3607,45 @@ class APBrokerReconciler:
                 _funnel_r.inc("reconciler_imported_positions")
             except Exception:
                 pass
+
+    def _seed_imported_position_owner(
+        self,
+        *,
+        pos_id: str,
+        contract: str,
+        underlying: str,
+        side: str,
+        qty: int,
+        entry_px: float,
+        underlying_entry: float = 0.0,
+        price_untrusted: bool = False,
+        import_identity_record=None,
+        row: Optional[dict] = None,
+    ) -> bool:
+        """Install one imported owner using the proven identity available.
+
+        Recovered ENTRY lineage must go through the strict canonical position
+        path.  A broker-only import has no historical ENTRY authority, so it
+        uses the existing atomic broker-truth seed directly; this is not an
+        ENTRY fabrication and still retains the exit-engine's exact-domain
+        ownership fence.
+        """
+        if bool(getattr(import_identity_record, "attributed", False)):
+            if not row:
+                return False
+            return bool(self._seed_exit_engine_from_position(row))
+
+        seed_status = self._seed_exit_engine_from_import(
+            pos_id=str(pos_id or ""),
+            contract=contract,
+            underlying=underlying,
+            side=side,
+            qty=qty,
+            entry_px=entry_px,
+            underlying_entry=underlying_entry,
+            price_untrusted=price_untrusted,
+        )
+        return seed_status in {"seeded", "already_owned"}
 
     def _create_imported_position(
         self,
@@ -3628,6 +3700,12 @@ class APBrokerReconciler:
         imported_plan_id   = _ident.plan_id
         imported_signal_id = _ident.signal_id
         imported_pattern   = _ident.pattern
+        imported_local_order_id = str(
+            getattr(_ident, "matched_local_order_id", None) or ""
+        ).strip() or None
+        imported_broker_order_id = str(
+            getattr(_ident, "matched_broker_order_id", None) or ""
+        ).strip() or None
 
         if self.pm is not None:
             try:
@@ -3644,6 +3722,8 @@ class APBrokerReconciler:
                     pattern=imported_pattern,
                     stop_underlying=None,
                     target_underlying=None,
+                    local_order_id=imported_local_order_id,
+                    broker_order_id=imported_broker_order_id,
                     execution_mode=self.execution_mode,
                     historical_plan_idempotency=True,
                 )
@@ -3658,6 +3738,16 @@ class APBrokerReconciler:
                                 "[%s] underlying_entry backfill failed for imported pos %s: %s",
                                 self.client_id, pos_id, ue,
                             )
+                    if not self._backfill_position_order_identity(
+                        str(pos_id),
+                        local_order_id=imported_local_order_id,
+                        broker_order_id=imported_broker_order_id,
+                    ):
+                        log.critical(
+                            "[%s] imported position %s lacks recovered ENTRY order identity",
+                            self.client_id, pos_id,
+                        )
+                        return None
                     return str(pos_id)
                 return None
             except Exception as pm_err:
@@ -3702,10 +3792,11 @@ class APBrokerReconciler:
                         INSERT INTO positions (
                             id, client_id, underlying, contract, direction, qty, avg_fill,
                             entry_ts, status, plan_id, signal_id, pattern, tier, close_source,
-                            close_confidence, underlying_entry, execution_mode
+                            close_confidence, underlying_entry, execution_mode,
+                            local_order_id, broker_order_id
                         ) VALUES (
                             %s,%s,%s,%s,%s,%s,%s,
-                            %s,'OPEN',%s,%s,%s,'RECONCILED',%s,%s,%s,%s
+                            %s,'OPEN',%s,%s,%s,'RECONCILED',%s,%s,%s,%s,%s,%s
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING id
@@ -3726,6 +3817,8 @@ class APBrokerReconciler:
                             "BROKER_OPEN_PRICE_UNTRUSTED" if price_untrusted else "BROKER_OPEN",
                             float(underlying_entry) if underlying_entry > 0 else None,
                             self.execution_mode,
+                            imported_local_order_id,
+                            imported_broker_order_id,
                         ),
                     )
                     inserted = c.fetchone()
@@ -3734,7 +3827,18 @@ class APBrokerReconciler:
                     return str(inserted["id"])
 
             try:
-                return str(run_with_retry(_insert_full))
+                created_id = str(run_with_retry(_insert_full))
+                if not self._backfill_position_order_identity(
+                    created_id,
+                    local_order_id=imported_local_order_id,
+                    broker_order_id=imported_broker_order_id,
+                ):
+                    log.critical(
+                        "[%s] imported position %s lacks recovered ENTRY order identity",
+                        self.client_id, created_id,
+                    )
+                    return None
+                return created_id
             except Exception as full_err:
                 log.warning(
                     "[%s] exact-mode imported position insert failed for %s: %s — failing closed",
@@ -3746,6 +3850,78 @@ class APBrokerReconciler:
             log.error("[%s] SQL import failed for broker position %s: %s",
                       self.client_id, contract, sql_err)
             return None
+
+    def _backfill_position_order_identity(
+        self,
+        pos_id: str,
+        *,
+        local_order_id: Optional[str] = None,
+        broker_order_id: Optional[str] = None,
+    ) -> bool:
+        """Persist recovered ENTRY order IDs without overwriting conflicts.
+
+        ``orders.id`` is only the database row key; canonical ownership needs
+        the actual local/broker execution identifiers.  Fill only blank
+        position fields and verify the values returned by the same write.  A
+        missing row, schema failure, or conflicting nonblank value is a HOLD.
+        """
+        pos_id = str(pos_id or "").strip()
+        local_id = str(local_order_id or "").strip()
+        broker_id = str(broker_order_id or "").strip()
+        if not pos_id or not (local_id or broker_id):
+            return True
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _write() -> bool:
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE positions
+                        SET local_order_id = CASE
+                                WHEN NULLIF(BTRIM(COALESCE(local_order_id, '')), '') IS NULL
+                                THEN COALESCE(NULLIF(BTRIM(%s), ''), local_order_id)
+                                ELSE local_order_id
+                            END,
+                            broker_order_id = CASE
+                                WHEN NULLIF(BTRIM(COALESCE(broker_order_id, '')), '') IS NULL
+                                THEN COALESCE(NULLIF(BTRIM(%s), ''), broker_order_id)
+                                ELSE broker_order_id
+                            END
+                        WHERE id = %s AND client_id = %s
+                        RETURNING local_order_id, broker_order_id
+                        """,
+                        (local_id, broker_id, pos_id, self.client_id),
+                    )
+                    row = c.fetchone()
+                    if not row:
+                        return False
+
+                    def _value(key: str, index: int) -> str:
+                        try:
+                            if key in row:  # type: ignore[operator]
+                                return str(row[key] or "").strip()
+                        except (TypeError, AttributeError):
+                            pass
+                        try:
+                            return str(row[index] or "").strip()
+                        except (KeyError, IndexError, TypeError):
+                            return ""
+
+                    actual_local = _value("local_order_id", 0)
+                    actual_broker = _value("broker_order_id", 1)
+                    return (
+                        (not local_id or actual_local == local_id)
+                        and (not broker_id or actual_broker == broker_id)
+                    )
+
+            return bool(run_with_retry(_write))
+        except Exception as exc:
+            log.critical(
+                "[%s] BROKER_IMPORT_ORDER_IDENTITY_PERSIST_FAILED pos=%s error=%s",
+                self.client_id, pos_id, exc,
+            )
+            return False
 
     def _backfill_position_underlying_entry(self, pos_id: str, underlying_entry: float) -> None:
         """
@@ -3995,7 +4171,10 @@ class APBrokerReconciler:
         """Read and validate every exact identity-linked ENTRY candidate."""
         try:
             from ap.db import conn, run_with_retry
-            from ap.order_state_machine import _durable_execution_mode
+            from ap.order_state_machine import (
+                _durable_execution_mode,
+                _DURABLE_EXECUTION_MODE_SQL,
+            )
 
             def _fetch() -> list[dict]:
                 with conn() as c:
@@ -4016,7 +4195,7 @@ class APBrokerReconciler:
                                meta
                         FROM orders
                         WHERE client_id = %s
-                          AND execution_mode = %s
+                          AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                           AND kind = 'ENTRY'
                           AND status IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')
                           AND (
@@ -4135,7 +4314,10 @@ class APBrokerReconciler:
             return "MALFORMED", None
         try:
             from ap.db import conn, run_with_retry
-            from ap.order_state_machine import _durable_execution_mode
+            from ap.order_state_machine import (
+                _durable_execution_mode,
+                _DURABLE_EXECUTION_MODE_SQL,
+            )
 
             def _fetch() -> list:
                 with conn() as c:
@@ -4143,10 +4325,10 @@ class APBrokerReconciler:
                         """
                         SELECT client_id, kind, status, position_id, contract,
                                local_order_id, broker_order_id,
-                               fill_price, filled_qty, filled_ts, execution_mode
+                               fill_price, filled_qty, filled_ts, execution_mode, meta
                         FROM orders
                         WHERE client_id = %s
-                          AND execution_mode = %s
+                          AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                           AND kind = 'EXIT'
                           AND status IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')
                           AND position_id::text = %s
@@ -4168,6 +4350,15 @@ class APBrokerReconciler:
                 return "NO_EVIDENCE", None
 
             total_exited = 0
+            seen_exit_order_ids: set[tuple[str, str]] = set()
+            if len(rows) > 1 and all(
+                not str(row.get("local_order_id") or "").strip()
+                and not str(row.get("broker_order_id") or "").strip()
+                for row in rows
+            ):
+                # Multiple position-linked EXIT rows without any durable order
+                # identity cannot be distinguished from a duplicated read.
+                return "AMBIGUOUS", None
             for row in rows:
                 if (
                     str(row.get("client_id") or "").strip().lower()
@@ -4184,6 +4375,27 @@ class APBrokerReconciler:
                 fqty = _positive_finite_float(row.get("filled_qty"))
                 if fqty <= 0 or fqty != int(fqty):
                     return "MALFORMED", None
+                fill_price = _positive_finite_float(row.get("fill_price"))
+                filled_ts = row.get("filled_ts")
+                timestamp_valid = isinstance(filled_ts, datetime)
+                if isinstance(filled_ts, str) and filled_ts.strip():
+                    try:
+                        datetime.fromisoformat(filled_ts.strip().replace("Z", "+00:00"))
+                        timestamp_valid = True
+                    except ValueError:
+                        timestamp_valid = False
+                if fill_price <= 0 or not timestamp_valid:
+                    return "MALFORMED", None
+                local_exit_id = str(row.get("local_order_id") or "").strip()
+                broker_exit_id = str(row.get("broker_order_id") or "").strip()
+                exit_identity = (local_exit_id, broker_exit_id)
+                if exit_identity in seen_exit_order_ids or any(
+                    existing_local == local_exit_id and local_exit_id
+                    or existing_broker == broker_exit_id and broker_exit_id
+                    for existing_local, existing_broker in seen_exit_order_ids
+                ):
+                    return "AMBIGUOUS", None
+                seen_exit_order_ids.add(exit_identity)
                 total_exited += int(fqty)
 
             if total_exited == expected_exited_qty:
@@ -5350,11 +5562,25 @@ class APBrokerReconciler:
                             self.client_id, pos_id, contract,
                             rem_qty, broker_qty, restore_status, restore_remaining,
                         )
-                        # Re-seed the exit engine so this position gets managed again.
-                        restored_position = dict(row) | {
-                            "status": restore_status,
-                            "quantity_remaining": restore_remaining,
-                        }
+                        # Re-read the canonical row after the UPDATE.  The scan
+                        # projection intentionally omits durable mode, side,
+                        # order IDs, and other owner metadata; passing it to
+                        # the strict installer would manufacture a same-cycle
+                        # ownership failure.  Never seed from that projection.
+                        restored_position = self._find_db_position_by_id(str(pos_id or ""))
+                        if restored_position is None:
+                            log.critical(
+                                "[%s] P0-PARTIAL-CLOSE-REPAIR canonical reread failed "
+                                "pos=%s contract=%s — owner install held",
+                                self.client_id, pos_id, contract,
+                            )
+                            self._record_exit_owner_install_failure(
+                                summary,
+                                contract=contract,
+                                position_id=str(pos_id or ""),
+                                context="closed_partial_restore_reread",
+                            )
+                            continue
                         if not self._seed_exit_engine_from_position(restored_position):
                             self._record_exit_owner_install_failure(
                                 summary,

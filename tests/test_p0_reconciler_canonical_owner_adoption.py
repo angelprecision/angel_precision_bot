@@ -673,12 +673,52 @@ def test_entry_evidence_lookup_is_exactly_domain_fenced(monkeypatch):
         "143201293",
     )
     assert "client_id = %s" in cursor.sql
-    assert "execution_mode = %s" in cursor.sql
+    assert "NULLIF(TRIM(execution_mode), '')" in cursor.sql
+    assert "meta->>'execution_mode'" in cursor.sql
     assert "position_id::text = %s" in cursor.sql
     assert "local_order_id = %s" in cursor.sql
     assert "broker_order_id = %s" in cursor.sql
     assert "filled_qty" not in cursor.sql.split("FROM orders", 1)[1]
     assert "LIMIT 2" in cursor.sql
+
+
+def test_entry_evidence_accepts_durable_metadata_mode_fallback(monkeypatch):
+    import ap.db as db
+
+    row = {
+        "client_id": CLIENT,
+        "kind": "ENTRY",
+        "status": "FILLED",
+        "local_order_id": "entry-local-1",
+        "broker_order_id": "143201293",
+        "signal_id": "signal-1",
+        "canonical_signal_id": "canonical-signal-1",
+        "fill_price": 1.30,
+        "filled_qty": 1,
+        "filled_ts": "2026-08-25T14:31:00+00:00",
+        "execution_mode": "",
+        "position_id": POSITION_ID,
+        "contract": CONTRACT,
+        "meta": {"execution_mode": "live"},
+    }
+    cursor = _EvidenceCursor([row])
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = rec.APBrokerReconciler._filled_entry_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        local_order_id="entry-local-1",
+        broker_order_id="143201293",
+        signal_id="signal-1",
+        canonical_signal_id="canonical-signal-1",
+    )
+
+    assert status == "PROVEN"
+    assert evidence == row
 
 
 @pytest.mark.parametrize(
@@ -920,6 +960,95 @@ def test_entry_evidence_lookup_rejects_ambiguous_exact_rows(monkeypatch):
         contract=CONTRACT,
         position_id=POSITION_ID,
         execution_mode="live",
+    )
+
+    assert status == "AMBIGUOUS"
+    assert evidence is None
+
+
+def _partial_exit_row(**overrides):
+    row = {
+        "client_id": CLIENT,
+        "kind": "EXIT",
+        "status": "FILLED",
+        "position_id": POSITION_ID,
+        "contract": CONTRACT,
+        "local_order_id": "exit-local-1",
+        "broker_order_id": "exit-broker-1",
+        "fill_price": 0.90,
+        "filled_qty": 1,
+        "filled_ts": "2026-08-25T15:01:00+00:00",
+        "execution_mode": "live",
+        "meta": {},
+    }
+    row.update(overrides)
+    return row
+
+
+def test_partial_exit_evidence_accepts_durable_metadata_mode_fallback(monkeypatch):
+    import ap.db as db
+
+    row = _partial_exit_row(execution_mode="", meta={"execution_mode": "live"})
+    cursor = _EvidenceCursor([row])
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = rec.APBrokerReconciler._partial_exit_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        expected_exited_qty=1,
+    )
+
+    assert status == "PROVEN"
+    assert evidence == row
+    assert "meta->>'execution_mode'" in cursor.sql
+    assert cursor.params == (CLIENT, "live", POSITION_ID, CONTRACT)
+
+
+@pytest.mark.parametrize("field", ["fill_price", "filled_ts"])
+def test_partial_exit_evidence_rejects_malformed_fill_truth(monkeypatch, field):
+    import ap.db as db
+
+    row = _partial_exit_row(**{field: 0 if field == "fill_price" else "not-a-timestamp"})
+    cursor = _EvidenceCursor([row])
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = rec.APBrokerReconciler._partial_exit_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        expected_exited_qty=1,
+    )
+
+    assert status == "MALFORMED"
+    assert evidence is None
+
+
+def test_partial_exit_evidence_rejects_duplicate_order_identity(monkeypatch):
+    import ap.db as db
+
+    first = _partial_exit_row()
+    duplicate = _partial_exit_row(
+        broker_order_id="exit-broker-2",
+        filled_ts="2026-08-25T15:02:00+00:00",
+    )
+    cursor = _EvidenceCursor([first, duplicate])
+    monkeypatch.setattr(db, "conn", lambda: cursor)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    reconciler = _reconciler(_ExitEngine())
+
+    status, evidence = rec.APBrokerReconciler._partial_exit_evidence_for_canonical_position(
+        reconciler,
+        contract=CONTRACT,
+        position_id=POSITION_ID,
+        execution_mode="live",
+        expected_exited_qty=2,
     )
 
     assert status == "AMBIGUOUS"
@@ -1592,3 +1721,29 @@ def test_broker_live_position_surfaces_owner_install_failure():
 
     assert summary["positions_alerted"] == 1
     assert "reconciler_exit_owner_install_failed" in summary["errors"]
+
+
+def test_unattributed_import_uses_broker_truth_seed_without_entry_fabrication():
+    engine = _ExitEngine()
+    reconciler = _reconciler(engine)
+    strict_calls = []
+    seed_calls = []
+    reconciler._seed_exit_engine_from_position = lambda _row: strict_calls.append(_row) or pytest.fail(
+        "unattributed broker-only import must not require ENTRY adoption"
+    )
+    reconciler._seed_exit_engine_from_import = lambda **kwargs: (
+        seed_calls.append(kwargs) or "seeded"
+    )
+    identity = SimpleNamespace(attributed=False)
+
+    assert reconciler._seed_imported_position_owner(
+        pos_id=POSITION_ID,
+        contract=CONTRACT,
+        underlying="NOW",
+        side="PUT",
+        qty=1,
+        entry_px=1.30,
+        import_identity_record=identity,
+    ) is True
+    assert strict_calls == []
+    assert seed_calls[0]["pos_id"] == POSITION_ID

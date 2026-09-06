@@ -44,7 +44,10 @@ def production_db(monkeypatch):
                 signal_id TEXT,
                 underlying TEXT,
                 contract TEXT,
+                option_symbol TEXT,
+                ticker TEXT,
                 direction TEXT,
+                side TEXT,
                 qty INTEGER,
                 quantity_remaining INTEGER,
                 avg_fill NUMERIC,
@@ -77,10 +80,28 @@ def production_db(monkeypatch):
                 id TEXT PRIMARY KEY,
                 client_id TEXT,
                 contract TEXT,
+                position_id TEXT,
                 kind TEXT,
                 signal_id TEXT,
                 status TEXT,
-                created_ts TIMESTAMPTZ
+                created_ts TIMESTAMPTZ,
+                fill_price NUMERIC,
+                filled_qty INTEGER,
+                filled_ts TIMESTAMPTZ,
+                local_order_id TEXT,
+                broker_order_id TEXT,
+                execution_mode TEXT,
+                meta JSONB DEFAULT '{}'::jsonb
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE ap_signals (
+                signal_id TEXT,
+                client_email TEXT,
+                raw_payload JSONB,
+                signal_payload JSONB
             )
             """
         )
@@ -170,6 +191,36 @@ def _poll(reconciler, positions):
         summary=summary,
     )
     return summary
+
+
+def _owner_reconciler(client_id: str, mode: str):
+    """Build the real import/owner seam without broker mutation authority."""
+    import threading
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._email = client_id
+    engine._lock = threading.RLock()
+    engine._positions = []
+    engine._positions_by_id = {}
+
+    reconciler = APBrokerReconciler.__new__(APBrokerReconciler)
+    reconciler.broker = NoMutationBroker()
+    reconciler.client_id = client_id
+    reconciler.execution_mode = mode
+    reconciler.pm = None  # exercise the production SQL import fallback
+    reconciler.exit_engine = engine
+    reconciler._alert_fn = lambda _message: None
+    reconciler._alert = lambda _message: None
+    reconciler._record_recovered_position = lambda **_payload: None
+    reconciler._record_position_reseeded = lambda **_payload: None
+    reconciler._record_reconciler_rejection = lambda **_payload: None
+    reconciler._report_health_error = lambda *_args, **_kwargs: None
+    reconciler._heartbeat = lambda *_args, **_kwargs: None
+    reconciler._derive_underlying_entry_from_broker_position = (
+        lambda *_args, **_kwargs: 0.0
+    )
+    return reconciler, engine
 
 
 def _count(connection, client_id: str | None = None) -> int:
@@ -404,3 +455,137 @@ def test_zero_same_mode_candidates_no_mutation(production_db):
         d.get("reason_code") == "BROKER_IMPORT_EXPIRED_CONTRACT_QUARANTINED"
         for d in diagnostics
     ), "Quarantine diagnostic must be emitted even when no DB row is closed"
+
+
+def test_broker_only_restart_import_recovers_entry_identity_and_owner(production_db):
+    """A broker-open restart import persists ENTRY IDs and installs one owner."""
+    client_id = "restart@example.com"
+    mode = "live"
+    contract = _future_contract("NOW", "P", "00122000")
+    signal_id = "signal-restart-546"
+    local_id = "entry-local-restart-546"
+    broker_id = "entry-broker-restart-546"
+
+    with production_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO orders (id, client_id, contract, kind, signal_id, status, "
+            "created_ts, local_order_id, broker_order_id, execution_mode, meta) "
+            "VALUES (%s,%s,%s,'ENTRY',%s,'FILLED',NOW(),%s,%s,%s,%s::jsonb)",
+            (
+                "order-restart-546", client_id, contract, signal_id,
+                local_id, broker_id, mode, '{"execution_mode":"live"}',
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO ap_signals (signal_id, client_email, raw_payload, signal_payload) "
+            "VALUES (%s,%s,%s::jsonb,%s::jsonb)",
+            (signal_id, client_id, '{"pattern":"2-3"}', '{}'),
+        )
+
+    broker_position = {
+        "symbol": contract,
+        "underlying": "NOW",
+        "quantity": 4,
+        "cost_basis": 244.0,
+        "position_id": "broker-position-restart-546",
+    }
+    first, first_engine = _owner_reconciler(client_id, mode)
+    first_summary = _poll(first, [broker_position])
+
+    assert first_summary["positions_imported"] == 1
+    assert len(first_engine.active_positions()) == 1
+    first_owner = first_engine.active_positions()[0]
+    with production_db.cursor() as cursor:
+        cursor.execute(
+            "SELECT id, local_order_id, broker_order_id, signal_id, pattern "
+            "FROM positions WHERE client_id=%s", (client_id,)
+        )
+        position_id, stored_local, stored_broker, stored_signal, stored_pattern = cursor.fetchone()
+    assert first_owner.position_id == position_id
+    assert (stored_local, stored_broker) == (local_id, broker_id)
+    assert (stored_signal, stored_pattern) == (signal_id, "2-3")
+
+    # A fresh process/engine converges from the durable row without another
+    # import row or any broker submit/cancel authority.
+    second, second_engine = _owner_reconciler(client_id, mode)
+    second_summary = _poll(second, [broker_position])
+    assert second_summary["positions_import_idempotent"] == 1
+    assert len(second_engine.active_positions()) == 1
+    assert second_engine.active_positions()[0].position_id == position_id
+    assert _count(production_db, client_id) == 1
+
+
+def test_closed_partial_restore_rereads_full_row_and_preserves_quantity(production_db):
+    """Closed qty=2/rem=1 + broker qty=1 restores and seeds (2,1) same-cycle."""
+    import threading
+    from ap_exit_engine import APExitEngine
+
+    client_id = "partial-restart@example.com"
+    mode = "live"
+    contract = _future_contract("NOW", "P", "00123000")
+    position_id = "partial-position-546"
+    with production_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO positions (id, client_id, execution_mode, plan_id, signal_id, "
+            "underlying, contract, direction, qty, quantity_remaining, avg_fill, "
+            "entry_price, status, entry_ts, created_at, updated_at, close_source, "
+            "local_order_id, broker_order_id) VALUES "
+            "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'CLOSED',NOW(),NOW(),NOW(),%s,%s,%s)",
+            (
+                position_id, client_id, mode, "plan-partial-546", "signal-partial-546",
+                "NOW", contract, "PUT", 2, 1, 1.30, 1.30,
+                "old-close", "entry-local-partial-546", "entry-broker-partial-546",
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO orders (id, client_id, contract, position_id, kind, signal_id, "
+            "status, created_ts, local_order_id, broker_order_id, execution_mode, "
+            "meta) VALUES (%s,%s,%s,%s,'EXIT',%s,'FILLED',NOW(),%s,%s,%s,%s::jsonb)",
+            (
+                "exit-order-partial-546", client_id, contract, position_id,
+                "signal-partial-546", "exit-local-partial-546",
+                "exit-broker-partial-546", mode, '{"execution_mode":"live"}',
+            ),
+        )
+        cursor.execute(
+            "UPDATE orders SET fill_price=1.10, filled_qty=1, "
+            "filled_ts=NOW() WHERE id=%s", ("exit-order-partial-546",)
+        )
+
+    class _Broker(NoMutationBroker):
+        def list_positions(self):
+            return [{"symbol": contract, "underlying": "NOW", "quantity": 1}]
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._email = client_id
+    engine._lock = threading.RLock()
+    engine._positions = []
+    engine._positions_by_id = {}
+    reconciler = APBrokerReconciler.__new__(APBrokerReconciler)
+    reconciler.broker = _Broker()
+    reconciler.client_id = client_id
+    reconciler.execution_mode = mode
+    reconciler.pm = None
+    reconciler.exit_engine = engine
+    reconciler._alert_fn = lambda _message: None
+    reconciler._alert = lambda _message: None
+    reconciler._record_recovered_position = lambda **_payload: None
+    reconciler._record_position_reseeded = lambda **_payload: None
+    reconciler._record_reconciler_rejection = lambda **_payload: None
+    reconciler._report_health_error = lambda *_args, **_kwargs: None
+    reconciler._heartbeat = lambda *_args, **_kwargs: None
+
+    summary = _empty_summary(client_id)
+    reconciler._repair_closed_positions_with_remaining_qty(summary)
+
+    assert len(engine.active_positions()) == 1
+    owner = engine.active_positions()[0]
+    assert owner.position_id == position_id
+    assert owner.quantity == 2
+    assert owner.quantity_remaining == 1
+    with production_db.cursor() as cursor:
+        cursor.execute(
+            "SELECT status, quantity_remaining FROM positions WHERE id=%s",
+            (position_id,),
+        )
+        assert cursor.fetchone() == ("PARTIAL", 1)

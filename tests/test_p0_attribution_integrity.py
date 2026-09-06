@@ -74,12 +74,19 @@ def _wire(monkeypatch, script):
 
 def test_t1_recovery_returns_real_lineage(monkeypatch):
     cur = _wire(monkeypatch, [
-        {"order_id": "ord-123", "order_signal_id": "3f6a9c1e-1111-2222-3333-444455556666", "order_status": "FILLED"},
+        {
+            "order_id": "ord-123",
+            "order_signal_id": "3f6a9c1e-1111-2222-3333-444455556666",
+            "order_status": "FILLED",
+            "entry_local_order_id": "entry-local-123",
+            "entry_broker_order_id": "entry-broker-123",
+        },
         {"pattern": "2-3"},
     ])
     ident = import_identity(
         contract="GOOGL260710C00360000",
         client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
     )
     assert ident.attributed is True
     assert ident.signal_id == "3f6a9c1e-1111-2222-3333-444455556666"
@@ -87,6 +94,8 @@ def test_t1_recovery_returns_real_lineage(monkeypatch):
     assert ident.attribution_source == "recovered"
     assert ident.matched_order_id == "ord-123"
     assert ident.matched_order_status == "FILLED"
+    assert ident.matched_local_order_id == "entry-local-123"
+    assert ident.matched_broker_order_id == "entry-broker-123"
     assert ident.plan_id.startswith("reconciled:GOOGL260710C00360000:")  # provenance
 
 
@@ -177,6 +186,22 @@ def test_t5_sql_shape(monkeypatch):
     assert sig_params[1] == "jasoncosby1@gmail.com"
 
 
+def test_recovered_order_identity_is_optional_for_legacy_fixture_shape(monkeypatch):
+    """Legacy tuple fixtures remain readable when ID columns are absent."""
+    _wire(monkeypatch, [
+        ("ord-legacy", "dddd1111-2222-3333-4444-555566667777", "FILLED"),
+        ("1-2_2D",),
+    ])
+    lineage = recover_lineage(
+        contract="AMD260710C00150000",
+        client_id="legacy@example.com",
+        execution_mode="live",
+    )
+    assert lineage is not None
+    assert "entry_local_order_id" not in lineage
+    assert "entry_broker_order_id" not in lineage
+
+
 def test_dict_row_pattern_lookup_uses_alias(monkeypatch):
     cur = _wire(monkeypatch, [
         {
@@ -250,3 +275,49 @@ def test_reconciler_imports_with_patch():
     assert "from ap.attribution_integrity import import_identity" in src
     assert 'pattern="BROKER_IMPORT_PRICE_UNTRUSTED"' not in src  # fabrication removed
     assert "imported_pattern" in src
+
+
+def test_imported_position_pm_path_carries_recovered_order_identity(monkeypatch):
+    from ap_reconciler import APBrokerReconciler
+
+    class _PositionManager:
+        def __init__(self):
+            self.kwargs = None
+
+        def open_position(self, **kwargs):
+            self.kwargs = kwargs
+            return "position-recovered-1"
+
+    manager = _PositionManager()
+    reconciler = APBrokerReconciler.__new__(APBrokerReconciler)
+    reconciler.client_id = "client@example.com"
+    reconciler.execution_mode = "live"
+    reconciler.pm = manager
+    backfills = []
+    reconciler._backfill_position_order_identity = lambda *args, **kwargs: (
+        backfills.append((args, kwargs)) or True
+    )
+    ident = types.SimpleNamespace(
+        identity_valid=True,
+        plan_id="reconciled:NOW260710C00122000:fingerprint",
+        signal_id="signal-1",
+        pattern="2-3",
+        matched_local_order_id="entry-local-1",
+        matched_broker_order_id="entry-broker-1",
+    )
+
+    result = reconciler._create_imported_position(
+        contract="NOW260710C00122000",
+        underlying="NOW",
+        side="CALL",
+        qty=1,
+        entry_px=1.25,
+        broker_position={},
+        import_identity_record=ident,
+    )
+
+    assert result == "position-recovered-1"
+    assert manager.kwargs["local_order_id"] == "entry-local-1"
+    assert manager.kwargs["broker_order_id"] == "entry-broker-1"
+    assert backfills[0][1]["local_order_id"] == "entry-local-1"
+    assert backfills[0][1]["broker_order_id"] == "entry-broker-1"

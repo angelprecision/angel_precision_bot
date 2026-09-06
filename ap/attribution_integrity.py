@@ -81,6 +81,11 @@ class ImportIdentity:
     durable_fingerprint: str = ""
     identity_valid: bool = True
     identity_reason: str = ""
+    # The orders.id value is only a row key.  Preserve the actual durable
+    # ENTRY identifiers as well so a broker-only restart import can hand the
+    # identity through to positions and the canonical owner installer.
+    matched_local_order_id: Optional[str] = None
+    matched_broker_order_id: Optional[str] = None
 
     def to_log(self) -> str:
         return (
@@ -118,12 +123,14 @@ def recover_lineage(
     contract: str,
     client_id: str,
     lookback_days: int = LOOKBACK_DAYS_DEFAULT,
+    execution_mode: str = "",
 ) -> Optional[dict[str, Any]]:
     """Find the true (signal_id, pattern) for a broker-open contract.
 
     Match: newest ENTRY order for the same client + contract whose signal_id
     is real (not 'reconciled:*'), FILLED ranked above other statuses, within
-    the lookback. Pattern joined from ap_signals via the composite
+    the lookback. When supplied, execution_mode is resolved from the durable
+    order column/metadata. Pattern joined from ap_signals via the composite
     (signal_id, client_email) identity (#260); ap_signals.signal_id is uuid,
     compared ::text so legacy string ids no-op instead of raising.
 
@@ -137,22 +144,26 @@ def recover_lineage(
         def _q() -> Optional[dict[str, Any]]:
             with conn() as c:
                 c.execute(
-                    """
+                    f"""
                     SELECT
-                      o.id        AS order_id,
-                      o.signal_id AS order_signal_id,
-                      o.status    AS order_status
+                      o.id              AS order_id,
+                      o.signal_id       AS order_signal_id,
+                      o.status          AS order_status,
+                      o.local_order_id  AS entry_local_order_id,
+                      o.broker_order_id AS entry_broker_order_id
                     FROM orders o
                     WHERE o.client_id = %s
                       AND o.contract = %s
                       AND upper(o.kind) = 'ENTRY'
                       AND o.signal_id IS NOT NULL
                       AND o.signal_id NOT LIKE %s
+                      {mode_clause}
                       AND o.created_ts > now() - (%s || ' days')::interval
                     ORDER BY (o.status = 'FILLED') DESC, o.created_ts DESC
                     LIMIT 1
                     """,
-                    (client_id, contract, FABRICATED_PREFIX + "%", str(int(lookback_days))),
+                    (client_id, contract, FABRICATED_PREFIX + "%", *mode_params,
+                     str(int(lookback_days))),
                 )
                 row = c.fetchone()
                 if not row:
@@ -160,6 +171,12 @@ def recover_lineage(
                 order_id = str(_row_get(row, "order_id", 0) or "")
                 order_signal_id = str(_row_get(row, "order_signal_id", 1) or "")
                 order_status = str(_row_get(row, "order_status", 2) or "")
+                local_order_id = str(
+                    _row_get(row, "entry_local_order_id", 3) or ""
+                ).strip()
+                broker_order_id = str(
+                    _row_get(row, "entry_broker_order_id", 4) or ""
+                ).strip()
                 signal_id = canonical_signal_id_for_lookup(order_signal_id)
                 if not signal_id:
                     return None
@@ -188,13 +205,33 @@ def recover_lineage(
                         "has no pattern — not recovering", order_id, signal_id,
                     )
                     return None
-                return {
+                lineage = {
                     "signal_id": signal_id,
                     "pattern": pattern,
                     "order_id": order_id,
                     "order_status": order_status,
                     "order_signal_id": order_signal_id,
                 }
+                # Keep the historical return shape stable for callers/tests
+                # whose order fixture predates these columns.  Production rows
+                # with recovered IDs carry them explicitly.
+                if local_order_id:
+                    lineage["entry_local_order_id"] = local_order_id
+                if broker_order_id:
+                    lineage["entry_broker_order_id"] = broker_order_id
+                return lineage
+
+        # A mode is part of durable order identity.  When it is known, use the
+        # same normalized column/metadata resolver as the rest of the order
+        # truth paths; malformed or contradictory rows cannot donate lineage.
+        mode_clause = ""
+        mode_params: tuple[str, ...] = ()
+        normalized_mode = str(execution_mode or "").strip().lower()
+        if normalized_mode in {"live", "paper"}:
+            from ap.order_state_machine import _DURABLE_EXECUTION_MODE_SQL
+
+            mode_clause = f"AND {_DURABLE_EXECUTION_MODE_SQL}"
+            mode_params = (normalized_mode,)
 
         return run_with_retry(_q)
     except Exception as exc:
@@ -231,7 +268,10 @@ def import_identity(
 
     try:
         lineage = recover_lineage(
-            contract=contract, client_id=client_id, lookback_days=lookback_days
+            contract=contract,
+            client_id=client_id,
+            lookback_days=lookback_days,
+            execution_mode=execution_mode,
         )
     except Exception:  # defense in depth; recover_lineage already never raises
         lineage = None
@@ -293,6 +333,8 @@ def import_identity(
             ),
             matched_order_id=lineage.get("order_id"),
             matched_order_status=lineage.get("order_status"),
+            matched_local_order_id=lineage.get("entry_local_order_id"),
+            matched_broker_order_id=lineage.get("entry_broker_order_id"),
             durable_fingerprint=fingerprint,
             identity_valid=identity_valid,
             identity_reason=identity_reason,
