@@ -4274,6 +4274,216 @@ def test_pr588_quantity_authority_contradiction_never_installs_degraded_owner(db
     assert contract in eng._broker_truth_hold_symbols
 
 
+@_skip_if_no_mod
+def test_pr588_ambiguous_short_entries_keep_degraded_owner(caplog):
+    """Ambiguous ENTRY candidates must not become quantity contradictions.
+
+    Two filled ENTRY candidates at one contract each with broker remainder two
+    are unresolved provenance.  Canonical insertion stays blocked, while the
+    existing #585 degraded owner remains behavior-active for the broker-open
+    position.
+    """
+    eng = _pr558_new_engine(email="pr588-ambiguous@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+
+    contract = "TSLA260919C00300000"
+    entry_rows = [
+        {
+            "id": "entry-ambiguous-1",
+            "client_id": eng._email,
+            "position_id": "position-ambiguous-1",
+            "kind": "ENTRY",
+            "status": "FILLED",
+            "contract": contract,
+            "execution_mode": "live",
+            "filled_qty": 1,
+            "fill_price": 3.00,
+            "filled_ts": "2026-09-01T13:00:00Z",
+        },
+        {
+            "id": "entry-ambiguous-2",
+            "client_id": eng._email,
+            "position_id": "position-ambiguous-2",
+            "kind": "ENTRY",
+            "status": "FILLED",
+            "contract": contract,
+            "execution_mode": "live",
+            "filled_qty": 1,
+            "fill_price": 3.00,
+            "filled_ts": "2026-09-01T13:01:00Z",
+        },
+    ]
+    executed_sql = []
+
+    class _Cur:
+        def execute(self, sql, params=()):
+            executed_sql.append(str(sql))
+            return self
+
+        def fetchall(self):
+            return list(entry_rows)
+
+        def fetchone(self):
+            return None
+
+        @property
+        def rowcount(self):
+            return 0
+
+    @contextmanager
+    def _conn():
+        yield _Cur()
+
+    fake_db = types.SimpleNamespace(
+        conn=_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    prior_db = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_db
+
+    broker_mutations = []
+
+    class _Broker:
+        account_id = "acct-pr588-ambiguous"
+        mode = "live"
+
+        def list_positions(self):
+            return [{
+                "symbol": contract,
+                "quantity": 2,
+                "cost_basis": 600.0,
+                "date_acquired": "2026-09-01",
+            }]
+
+        def submit_order(self, *args, **kwargs):
+            broker_mutations.append(("submit", args, kwargs))
+
+        def cancel_order(self, *args, **kwargs):
+            broker_mutations.append(("cancel", args, kwargs))
+
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: None
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+    eng._hydrate_pending_exit_identity_for_broker_recovery = (
+        lambda *_args, **_kwargs: "UNAVAILABLE"
+    )
+
+    try:
+        with caplog.at_level("ERROR"):
+            result = eng._broker_position_precheck()
+    finally:
+        if prior_db is not None:
+            sys.modules["ap.db"] = prior_db
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert result is False
+    assert "BROKER_REPAIR_ENTRY_EVIDENCE_UNRESOLVED" in caplog.text
+    assert "QUANTITY_AUTHORITY_CONTRADICTION" not in caplog.text
+    assert not any("INSERT INTO positions" in sql for sql in executed_sql)
+    degraded = [
+        pos for pos in eng._positions
+        if getattr(pos, "broker_repair_degraded", False)
+    ]
+    assert len(degraded) == 1
+    assert degraded[0].quantity == 2
+    assert degraded[0].quantity_remaining == 2
+    assert not broker_mutations
+
+
+@_skip_if_no_mod
+def test_pr588_zero_canonical_qty_is_hold_without_mutation():
+    """A durable qty=0 row must not be repaired from broker remainder.
+
+    The stale quantity-repair UPDATE, canonical owner installation, degraded
+    fallback, and broker submit/cancel paths must all remain untouched.
+    """
+    eng = _pr558_new_engine(email="pr588-zero-canonical@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+
+    contract = "TSLA260919C00300000"
+    db_row = {
+        "id": "canonical-zero-qty",
+        "client_id": eng._email,
+        "contract": contract,
+        "option_symbol": contract,
+        "underlying": "TSLA",
+        "side": "CALL",
+        "direction": "CALL",
+        "qty": 0,
+        "quantity_remaining": 0,
+        "entry_price": 3.00,
+        "avg_fill": 3.00,
+        "entry_ts": None,
+        "status": "OPEN",
+        "execution_mode": "live",
+    }
+    db_mutations = []
+    broker_mutations = []
+
+    class _Broker:
+        account_id = "acct-pr588-zero-canonical"
+        mode = "live"
+
+        def list_positions(self):
+            return [{
+                "symbol": contract,
+                "quantity": 1,
+                "cost_basis": 300.0,
+                "date_acquired": "2026-09-01",
+            }]
+
+        def submit_order(self, *args, **kwargs):
+            broker_mutations.append(("submit", args, kwargs))
+
+        def cancel_order(self, *args, **kwargs):
+            broker_mutations.append(("cancel", args, kwargs))
+
+    eng.broker = _Broker()
+    eng._load_db_position_row = lambda _sym: db_row
+    eng._fetch_broker_quote = lambda _sym: {
+        "mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0,
+    }
+    eng._upsert_broker_position_to_db = lambda *_args, **_kwargs: pytest.fail(
+        "invalid durable canonical qty must not fall through to upsert"
+    )
+    eng._install_or_refresh_degraded_broker_truth_owner = (
+        lambda **_kwargs: pytest.fail(
+            "invalid durable canonical qty must not install a degraded owner"
+        )
+    )
+
+    class _DbSentinel:
+        def __init__(self):
+            self.conn = None
+
+        def run_with_retry(self, fn, **kwargs):
+            db_mutations.append("run_with_retry")
+            return fn()
+
+    prior_db = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = _DbSentinel()
+    try:
+        result = eng._broker_position_precheck()
+    finally:
+        if prior_db is not None:
+            sys.modules["ap.db"] = prior_db
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert result is False
+    assert eng._positions == []
+    assert contract in eng._broker_truth_hold_symbols
+    assert db_row["qty"] == 0
+    assert db_row["quantity_remaining"] == 0
+    assert not db_mutations
+    assert not broker_mutations
+
+
 # ── Test G: degraded-to-canonical convergence preserves 2/1 ──────────────────
 
 @_skip_if_no_mod
