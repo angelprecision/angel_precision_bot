@@ -1551,6 +1551,13 @@ class ManagedPosition:
     broker_repair_degraded: bool = False
     broker_repair_degraded_reason: str = ""
     broker_repair_degraded_account_id: str = ""
+    # A DB-seeded canonical owner has durable quantity, but its current
+    # remaining exposure is not fresh until the broker precheck validates it
+    # and, when necessary, persists the exact remainder.  This flag is
+    # intentionally behavior-blocking: a restart must never submit from a
+    # stale positive quantity_remaining while broker truth is unavailable.
+    broker_repair_quantity_unverified: bool = False
+    broker_repair_quantity_unverified_reason: str = ""
     # Risk-only broker repair reference.  This is intentionally separate from
     # canonical entry_price: it may support protective option P&L decisions
     # while durable ENTRY provenance remains unresolved.  It must never feed
@@ -3689,6 +3696,14 @@ class _BrokerRepairIdentity(str):
         return instance
 
 
+class _BrokerRepairQuantityAuthorityContradiction(RuntimeError):
+    """Broker remainder exceeds the proven canonical ENTRY quantity."""
+
+
+class _BrokerRepairCanonicalQuantityUnproven(RuntimeError):
+    """Durable canonical full quantity is missing, zero, or malformed."""
+
+
 class APExitEngine:
     """
     Manages all open positions with time-aware exit logic.
@@ -3716,6 +3731,11 @@ class APExitEngine:
         # They remain behavior-active for monitoring, but this cycle must not
         # manufacture an exit mutation from unproven flatness.
         self._broker_truth_hold_symbols: set[str] = set()
+        # A failed authoritative snapshot is not permission to continue from
+        # restart-durable quantity.  DB-seeded owners carry their own
+        # broker_repair_quantity_unverified flag and remain HOLDed until a
+        # later fresh snapshot proves/persists current exposure.
+        self._broker_truth_snapshot_unavailable = False
         # Restart recovery must distinguish "no active EXIT" from an
         # unavailable/ambiguous durable lookup.  The latter is a per-owner
         # fail-closed HOLD until a later hydration attempt proves the state.
@@ -6793,6 +6813,36 @@ class APExitEngine:
         """Centralized gate for every path that can submit an exit order."""
         if pos.closed or int(pos.quantity_remaining or 0) <= 0:
             return False
+        if getattr(pos, "broker_repair_quantity_unverified", False):
+            _quantity_hold_reason = (
+                getattr(pos, "broker_repair_quantity_unverified_reason", "")
+                or "restart_requires_fresh_broker_quantity"
+            )
+            log.warning(
+                "[%s] EXIT_BROKER_TRUTH_QUANTITY_HOLD "
+                "client=%s contract_symbol=%s position_id=%s reason=%s "
+                "— central submit gate blocked exit",
+                getattr(pos, "ticker", "?"),
+                self._email,
+                getattr(pos, "option_symbol", ""),
+                getattr(pos, "position_id", ""),
+                _quantity_hold_reason,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="HOLD",
+                reason_code="EXIT_BROKER_TRUTH_QUANTITY_HOLD",
+                explanation=(
+                    "Exit suppressed because the durable remaining quantity has "
+                    "not been reconciled against fresh broker truth."
+                ),
+                stage="exit_submission",
+                extra_inputs={
+                    "reason": _quantity_hold_reason,
+                    "allow_inflight_override": allow_inflight_override,
+                },
+            )
+            return False
         if _is_adoption_identity_quarantined(pos):
             log.error(
                 "[%s] ADOPTION IDENTITY QUARANTINE BLOCK | pos=%s contract=%s reason=%s",
@@ -7360,6 +7410,15 @@ class APExitEngine:
                         mp.quantity_remaining = min(_qty_remaining, mp.quantity) if mp.quantity > 0 else _qty_remaining
                     else:
                         mp.quantity_remaining = mp.quantity
+                    # The durable remainder is only a restart hint.  It is not
+                    # current broker exposure until the authoritative broker
+                    # precheck validates it in this process.  In particular,
+                    # a stale 2/2 row must not reach canonical EXIT submit as
+                    # qty=2 after a restart when broker truth is unavailable.
+                    mp.broker_repair_quantity_unverified = True
+                    mp.broker_repair_quantity_unverified_reason = (
+                        "restart_requires_fresh_broker_quantity"
+                    )
                     log.debug(
                         "seed_from_db: %s original_qty=%d qty_remaining=%d scale_outs=%d",
                         mp.ticker, mp.quantity, mp.quantity_remaining, mp.scale_outs_done,
@@ -7683,15 +7742,37 @@ class APExitEngine:
         return detail["mode"]
 
     def _find_exact_filled_entry_order(
-        self, sym: str, mode: str, broker_position: Optional[dict] = None
+        self,
+        sym: str,
+        mode: str,
+        broker_position: Optional[dict] = None,
+        expected_position_id: str = "",
     ) -> dict | None:
-        """Return one exact filled ENTRY row, or a fail-closed lookup marker."""
+        """Return one exact filled ENTRY row, or a fail-closed lookup marker.
+
+        ``expected_position_id`` is required by the existing-canonical-row
+        repair path.  A historical ENTRY can repair a collapsed ``qty`` only
+        when it belongs to this exact durable position; client/mode/OCC alone
+        is not sufficient provenance.
+        """
         contract = str(sym or "").strip().upper()
+        expected_position_id = str(expected_position_id or "").strip()
+        try:
+            from ap.exit_safety import _normalize_contract as _normalize_entry_contract
+            contract = _normalize_entry_contract(contract)
+        except Exception:
+            pass
         normalized_mode = str(mode or "").strip().lower()
         if not self._email or not contract or normalized_mode not in {"live", "paper"}:
             return {"_broker_repair_lookup_status": "UNAVAILABLE"}
         try:
             from ap.db import conn, run_with_retry
+
+            _position_filter = ""
+            _query_params = [self._email, normalized_mode, contract]
+            if expected_position_id:
+                _position_filter = "\n                          AND position_id::text = %s"
+                _query_params.append(expected_position_id)
 
             def _query():
                 with conn() as c:
@@ -7705,11 +7786,12 @@ class APExitEngine:
                           AND UPPER(TRIM(COALESCE(kind, ''))) = 'ENTRY'
                           AND UPPER(TRIM(COALESCE(status, ''))) IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED')
                           AND COALESCE(filled_qty, 0) > 0
+                        """ + _position_filter + """
                         ORDER BY filled_ts DESC NULLS LAST,
                                  updated_ts DESC NULLS LAST,
                                  created_ts DESC NULLS LAST
                         """,
-                        (self._email, normalized_mode, contract),
+                        tuple(_query_params),
                     )
                     return [dict(row) for row in (c.fetchall() or [])]
 
@@ -7719,6 +7801,11 @@ class APExitEngine:
                 if isinstance(row, dict)
                 and str(row.get("client_id") or "").strip() == str(self._email).strip()
                 and str(row.get("contract") or "").strip().upper() == contract
+                and (
+                    not expected_position_id
+                    or str(row.get("position_id") or "").strip()
+                    == expected_position_id
+                )
                 and str(row.get("kind") or "").strip().upper() == "ENTRY"
                 and str(row.get("status") or "").strip().upper() in {"FILLED", "PARTIAL_FILL", "PARTIALLY_FILLED"}
                 and str(row.get("execution_mode") or "").strip().lower() == normalized_mode
@@ -7776,6 +7863,36 @@ class APExitEngine:
                     self._email, normalized_mode, contract, len(candidates),
                 )
                 return {"_broker_repair_lookup_status": "AMBIGUOUS"}
+            # Only one exact ENTRY candidate is proven enough to establish
+            # quantity authority.  Never apply this shortcut to an ambiguous
+            # candidate set: two smaller historical fills are unresolved
+            # provenance, not a quantity contradiction.
+            _broker_qty_for_authority = (
+                _broker_repair_positive_int(
+                    broker_position.get("quantity")
+                )
+                if isinstance(broker_position, dict)
+                else None
+            )
+            _unique_entry_qty = _broker_repair_positive_int(
+                candidates[0].get("filled_qty")
+            )
+            if (
+                _broker_qty_for_authority is not None
+                and _unique_entry_qty is not None
+                and _unique_entry_qty < _broker_qty_for_authority
+            ):
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_ENTRY_QTY_AUTHORITY_CONTRADICTION "
+                    "client=%s mode=%s contract=%s broker_remaining_qty=%d "
+                    "candidate_entry_qty=%d",
+                    self._email, normalized_mode, contract,
+                    _broker_qty_for_authority, _unique_entry_qty,
+                )
+                return {
+                    "_broker_repair_lookup_status":
+                    "QUANTITY_AUTHORITY_CONTRADICTION"
+                }
             if broker_position is not None and not _broker_repair_order_matches(
                 candidates[0], broker_position
             ):
@@ -8755,13 +8872,15 @@ class APExitEngine:
 
         broker_position = bp if isinstance(bp, dict) else {}
         contract = str(sym or "").strip().upper()
-        qty = _broker_repair_positive_int(broker_position.get("quantity"))
+        # #588: broker_remaining_qty = current broker exposure.
+        # full_entry_qty is derived from the proven ENTRY order after lookup.
+        broker_remaining_qty = _broker_repair_positive_int(broker_position.get("quantity"))
         cost_basis = _broker_repair_cost_basis(broker_position)
         raw_entry_ts = _broker_repair_entry_timestamp(broker_position)
         if (
             not self._email
             or not contract
-            or qty is None
+            or broker_remaining_qty is None
             or cost_basis is None
             or cost_basis <= 0
             or (
@@ -8803,6 +8922,12 @@ class APExitEngine:
                 )
                 return None
             if isinstance(lookup, dict) and lookup.get("_broker_repair_lookup_status"):
+                if lookup.get("_broker_repair_lookup_status") == (
+                    "QUANTITY_AUTHORITY_CONTRADICTION"
+                ):
+                    raise _BrokerRepairQuantityAuthorityContradiction(
+                        "broker_qty_exceeds_entry_qty"
+                    )
                 log.error(
                     "[exit_eng] BROKER_REPAIR_ENTRY_%s client=%s mode=%s contract=%s "
                     "— recovery held",
@@ -8821,7 +8946,7 @@ class APExitEngine:
                 )
                 return None
 
-            entry_px = round(cost_basis / qty / 100.0, 6)
+            entry_px = round(cost_basis / broker_remaining_qty / 100.0, 6)
             order_fill = _broker_repair_float(
                 order.get("fill_price") or order.get("avg_fill") or order.get("price")
             )
@@ -8865,6 +8990,37 @@ class APExitEngine:
                 )
                 return None
 
+            # ── #588: Separate full entry quantity from broker current exposure ──
+            # The proven ENTRY order is the authoritative source for original fill qty.
+            # Broker truth is authoritative only for CURRENT remaining exposure.
+            full_entry_qty = _broker_repair_positive_int(order.get("filled_qty"))
+            if full_entry_qty is None or full_entry_qty <= 0:
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s "
+                    "reason=entry_filled_qty_unproven full_entry_qty=%s",
+                    self._email, contract, order.get("filled_qty"),
+                )
+                return None
+            if broker_remaining_qty > full_entry_qty:
+                # Contradictory authority: broker reports MORE open contracts than
+                # the original ENTRY ever filled.  Fail closed — never fabricate
+                # a larger canonical position from broker remainder alone.
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s "
+                    "reason=broker_qty_exceeds_entry_qty "
+                    "broker_remaining_qty=%d full_entry_qty=%d "
+                    "— contradictory quantity authority; fail closed",
+                    self._email, contract, broker_remaining_qty, full_entry_qty,
+                )
+                raise _BrokerRepairQuantityAuthorityContradiction(
+                    "broker_qty_exceeds_entry_qty"
+                )
+            # Derive canonical status: OPEN when remaining equals full,
+            # PARTIAL when current exposure is smaller than original entry.
+            _recovery_status = (
+                "OPEN" if broker_remaining_qty == full_entry_qty else "PARTIAL"
+            )
+
             underlying_entry, entry_geometry_bad = _broker_repair_historical_value(
                 order, meta, keys=_BROKER_REPAIR_ENTRY_GEOMETRY_KEYS
             )
@@ -8896,14 +9052,14 @@ class APExitEngine:
                 "execution_mode": _mode,
                 "side": side,
                 "direction": side,
-                "qty": qty,
-                "quantity_remaining": qty,
+                "qty": full_entry_qty,                  # #588: canonical full entry qty
+                "quantity_remaining": broker_remaining_qty,  # #588: broker current exposure
                 "entry_price": entry_px,
                 "avg_fill": entry_px,
                 "underlying_entry": underlying_entry,
                 "stop_underlying": underlying_stop,
                 "target_underlying": underlying_target,
-                "status": "OPEN",
+                "status": _recovery_status,                  # #588: OPEN or PARTIAL
                 "entry_ts": entry_ts,
                 "signal_id": signal_id,
                 "local_order_id": local_order_id,
@@ -9007,6 +9163,9 @@ class APExitEngine:
                     c.execute(f"SAVEPOINT {_sp}")
                     _extended_ok = False
                     try:
+                        # #588: qty=full_entry_qty (canonical original),
+                        # quantity_remaining=broker_remaining_qty (current exposure),
+                        # status derived as OPEN/PARTIAL.
                         c.execute(
                             """
                             INSERT INTO positions (
@@ -9025,7 +9184,7 @@ class APExitEngine:
                                 %s, %s,
                                 %s, %s,
                                 %s, %s, %s,
-                                'OPEN', %s, %s,
+                                %s, %s, %s,
                                 %s, %s, NOW()
                             )
                             ON CONFLICT DO NOTHING
@@ -9034,10 +9193,11 @@ class APExitEngine:
                             (
                                 position_id, self._email, repair_row["underlying"],
                                 contract, contract, _mode,
-                                side, side, qty, qty,
+                                side, side,
+                                full_entry_qty, broker_remaining_qty,  # #588: split authority
                                 entry_px, entry_px,
                                 underlying_entry, underlying_stop, underlying_target,
-                                entry_ts, signal_id,
+                                _recovery_status, entry_ts, signal_id,  # #588: derived status
                                 local_order_id, broker_order_id,
                             ),
                         )
@@ -9064,6 +9224,8 @@ class APExitEngine:
                             "rollback client=%s mode=%s contract=%s err=%s",
                             self._email, _mode, contract, _insert_exc,
                         )
+                        # #588 fallback INSERT must have identical quantity semantics
+                        # to the extended INSERT: qty=full_entry_qty, remaining=broker.
                         c.execute(
                             """
                             INSERT INTO positions (
@@ -9079,7 +9241,7 @@ class APExitEngine:
                                 %s, %s,
                                 %s, %s,
                                 %s, %s,
-                                'OPEN', %s, NOW()
+                                %s, %s, NOW()
                             )
                             ON CONFLICT DO NOTHING
                             RETURNING id
@@ -9087,9 +9249,10 @@ class APExitEngine:
                             (
                                 position_id, self._email, repair_row["underlying"],
                                 contract, contract, _mode,
-                                side, side, qty, qty,
+                                side, side,
+                                full_entry_qty, broker_remaining_qty,  # #588: split authority
                                 entry_px, entry_px,
-                                entry_ts,
+                                _recovery_status, entry_ts,            # #588: derived status
                             ),
                         )
                     # Consume the INSERT ... RETURNING result before releasing
@@ -9160,6 +9323,8 @@ class APExitEngine:
                     "filled_entry_order" if lookup else "generated_repair_uuid",
                 )
             return result
+        except _BrokerRepairQuantityAuthorityContradiction:
+            raise
         except Exception as _ue:
             log.error(
                 "[exit_eng] _upsert_broker_position_to_db %s failed: %s: %s",
@@ -9174,6 +9339,7 @@ class APExitEngine:
         *,
         prefer_qty_override: bool = False,
         expected_contract: str = "",
+        require_canonical_full_qty: bool = False,
     ) -> "ManagedPosition":
         """
         Build a ManagedPosition from a DB row (or minimal broker data dict).
@@ -9186,6 +9352,12 @@ class APExitEngine:
             When qty_override > 0, broker qty wins over stale DB quantity_remaining.
             Stale quantity_remaining=0 is overridden by broker truth.
             Only used inside _broker_position_precheck().
+
+        require_canonical_full_qty=True:
+            The row is durable canonical authority for broker recovery.  Its
+            original full ``qty`` must be a strictly positive integral value;
+            broker remainder is never a fallback for missing/invalid durable
+            quantity.
         """
         _row_contract = str(row.get("contract") or "").strip().upper()
         _row_option = str(row.get("option_symbol") or "").strip().upper()
@@ -9223,6 +9395,17 @@ class APExitEngine:
             # is available; never let the short legacy value become the exit
             # owner identity.
             sym = _row_option or _row_contract
+        _canonical_full_qty = None
+        if (
+            require_canonical_full_qty
+            and prefer_qty_override
+            and _broker_repair_positive_int(qty_override) is not None
+        ):
+            _canonical_full_qty = _broker_repair_positive_int(row.get("qty"))
+            if _canonical_full_qty is None:
+                raise _BrokerRepairCanonicalQuantityUnproven(
+                    "broker_repair_canonical_qty_unproven"
+                )
         ticker    = str(row.get("underlying") or self._underlying_from_occ(sym))
         side_raw  = str(row.get("side") or row.get("direction") or "").upper()
         side      = side_raw if side_raw in ("CALL", "PUT") else self._parse_occ_side(sym)
@@ -9311,17 +9494,61 @@ class APExitEngine:
                 "is proven by DB row or account configuration",
                 self._email, sym, pos_id or "unknown",
             )
-        # Final broker-truth enforcement: if prefer_qty_override is active,
-        # ensure both quantity fields match broker qty regardless of constructor defaults.
+        # ── #588 QUANTITY AUTHORITY FIX ──────────────────────────────────────
+        # In broker-truth mode, the canonical full entry quantity comes from
+        # the durable row's qty field (proven by the original ENTRY order).
+        # Broker truth (qty_override) is authoritative for CURRENT REMAINING
+        # exposure only — it must never overwrite the original entry size.
+        #
+        # Required invariant (broker-open recovery):
+        #   0 < quantity_remaining <= quantity
+        #   quantity              = full original entry qty (durable authority)
+        #   quantity_remaining    = fresh exact broker current exposure
         if prefer_qty_override and qty_override and int(qty_override) > 0:
-            mp.quantity            = int(qty_override)
-            mp.quantity_remaining  = int(qty_override)
-            if _db_qty_before != int(qty_override):
-                log.info(
-                    "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIRED_IN_MEMORY "
-                    "sym=%s db_qty_before=%d broker_qty=%d loaded_qty=%d",
-                    sym, _db_qty_before, int(qty_override), mp.quantity_remaining,
+            _broker_rem  = int(qty_override)
+            # A canonical durable row must prove its full entry quantity.  The
+            # broker remainder is never allowed to manufacture that authority.
+            # The fallback remains for the existing non-canonical/degraded
+            # runtime path, which does not set require_canonical_full_qty.
+            _db_full_qty = (
+                _canonical_full_qty
+                if require_canonical_full_qty
+                else int(row.get("qty") or qty_override)
+            )
+            if _broker_rem > _db_full_qty:
+                # Contradictory authority: broker reports MORE open contracts
+                # than the durable canonical entry proves were ever filled.
+                # Quarantine this owner — never expand full qty to satisfy broker.
+                _mark_adoption_identity_quarantined(
+                    mp, "broker_repair_qty_authority_contradiction",
                 )
+                log.critical(
+                    "[exit_eng] BROKER_REPAIR_QTY_AUTHORITY_CONTRADICTION "
+                    "client=%s contract=%s broker_remaining_qty=%d "
+                    "db_full_entry_qty=%d "
+                    "— broker remainder exceeds proven entry quantity; "
+                    "owner quarantined, no broker mutation permitted",
+                    self._email, sym, _broker_rem, _db_full_qty,
+                )
+                # Set both fields so the quarantined owner remains readable for
+                # diagnostics, but behavioral authority is blocked by the flag.
+                mp.quantity           = _db_full_qty
+                mp.quantity_remaining = _broker_rem
+            else:
+                # Valid: broker_remaining_qty <= full_entry_qty.
+                # Canonical full quantity = proven durable entry qty.
+                # Current remaining quantity = fresh broker exposure.
+                mp.quantity           = _db_full_qty
+                mp.quantity_remaining = _broker_rem
+                if _db_qty_before != _broker_rem or int(row.get("qty") or 0) != _db_full_qty:
+                    log.info(
+                        "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIRED_IN_MEMORY "
+                        "sym=%s db_full_entry_qty=%d broker_remaining_qty=%d "
+                        "db_qty_remaining_before=%d loaded_quantity=%d "
+                        "loaded_quantity_remaining=%d",
+                        sym, _db_full_qty, _broker_rem,
+                        _db_qty_before, mp.quantity, mp.quantity_remaining,
+                    )
         return mp
 
     def _fetch_broker_quote(self, sym: str) -> dict:
@@ -9406,6 +9633,354 @@ class APExitEngine:
                 return value
         return ""
 
+    def _broker_repair_existing_full_qty(
+        self,
+        db_row: dict,
+        sym: str,
+        broker_position: dict,
+        broker_qty: int,
+        mode: str,
+    ) -> int:
+        """Resolve full-entry quantity for an already durable owner.
+
+        ``positions.qty`` is the canonical full-entry authority.  The one
+        deliberate exception is a legacy collapsed row: an exact, unique,
+        fill-proven ENTRY tied to this exact position id may restore a larger
+        full quantity.  No broker remainder, client-wide order, or ambiguous
+        history can expand the canonical size.
+        """
+        canonical_full_qty = _broker_repair_positive_int(db_row.get("qty"))
+        if canonical_full_qty is None:
+            raise _BrokerRepairCanonicalQuantityUnproven(
+                "broker_repair_canonical_qty_unproven"
+            )
+        if broker_qty < canonical_full_qty:
+            return canonical_full_qty
+
+        position_id = str(db_row.get("id") or "").strip()
+        if not position_id:
+            raise _BrokerRepairCanonicalQuantityUnproven(
+                "broker_repair_position_id_unproven"
+            )
+        lookup = self._find_exact_filled_entry_order(
+            sym,
+            mode,
+            broker_position,
+            expected_position_id=position_id,
+        )
+        if isinstance(lookup, dict) and lookup.get("_broker_repair_lookup_status"):
+            status = str(lookup.get("_broker_repair_lookup_status") or "").strip()
+            # An unavailable historical lookup cannot invalidate an already
+            # durable full quantity when fresh broker remainder agrees with
+            # it.  It may prevent legacy-quantity expansion, but it must not
+            # turn the safe equal-quantity case into a broker-only fallback.
+            if status == "UNAVAILABLE" and broker_qty == canonical_full_qty:
+                return canonical_full_qty
+            if broker_qty > canonical_full_qty:
+                raise _BrokerRepairQuantityAuthorityContradiction(
+                    "broker_repair_qty_authority_contradiction"
+                )
+            raise _BrokerRepairCanonicalQuantityUnproven(
+                f"broker_repair_entry_provenance_{status.lower()}"
+            )
+        if lookup is None:
+            if broker_qty > canonical_full_qty:
+                raise _BrokerRepairQuantityAuthorityContradiction(
+                    "broker_repair_qty_authority_contradiction"
+                )
+            # No exact ENTRY can safely expand this already-canonical row.
+            # The durable qty remains authoritative when it agrees with the
+            # broker remainder; absence is not permission to guess a larger
+            # historical fill.
+            return canonical_full_qty
+
+        entry_full_qty = _broker_repair_positive_int(lookup.get("filled_qty"))
+        if entry_full_qty is None or entry_full_qty < canonical_full_qty:
+            raise _BrokerRepairCanonicalQuantityUnproven(
+                "broker_repair_entry_qty_conflicts_with_durable_qty"
+            )
+        if broker_qty > entry_full_qty:
+            raise _BrokerRepairQuantityAuthorityContradiction(
+                "broker_repair_qty_authority_contradiction"
+            )
+        return entry_full_qty
+
+    def _reconcile_existing_broker_position_row(
+        self,
+        db_row: dict,
+        sym: str,
+        broker_position: dict,
+        broker_qty: int,
+        *,
+        mode: Optional[str] = None,
+        position: Optional["ManagedPosition"] = None,
+    ) -> tuple[int, bool]:
+        """Persist broker remaining quantity without losing full-entry truth.
+
+        Returns ``(full_qty, durable_proof)``.  A failed update raises after
+        marking a supplied owner unverified, so callers cannot accidentally
+        continue to canonical submit from stale durable quantity.
+        """
+        _mode = str(mode or self._resolved_execution_mode() or "").strip().lower()
+        if _mode not in {"live", "paper"}:
+            raise _BrokerRepairCanonicalQuantityUnproven(
+                "broker_repair_execution_mode_unproven"
+            )
+        _broker_qty = _broker_repair_positive_int(broker_qty)
+        if _broker_qty is None:
+            raise _BrokerRepairCanonicalQuantityUnproven(
+                "broker_repair_broker_qty_unproven"
+            )
+        _full_qty = self._broker_repair_existing_full_qty(
+            db_row, sym, broker_position, _broker_qty, _mode,
+        )
+        _initial_canonical_full_qty = _broker_repair_positive_int(db_row.get("qty"))
+        _legacy_full_qty_expansion_proven = (
+            _initial_canonical_full_qty is not None
+            and _full_qty > _initial_canonical_full_qty
+        )
+        _db_remaining_raw = db_row.get("quantity_remaining")
+        try:
+            if _db_remaining_raw in (None, ""):
+                _db_remaining = 0
+            elif isinstance(_db_remaining_raw, bool):
+                raise ValueError("boolean quantity_remaining")
+            else:
+                _db_remaining_numeric = float(_db_remaining_raw)
+                if (
+                    not math.isfinite(_db_remaining_numeric)
+                    or not _db_remaining_numeric.is_integer()
+                ):
+                    raise ValueError("non-integral quantity_remaining")
+                _db_remaining = int(_db_remaining_numeric)
+            if _db_remaining < 0 or _db_remaining > _full_qty:
+                raise ValueError("contradictory durable quantity_remaining")
+        except (TypeError, ValueError, OverflowError):
+            raise _BrokerRepairCanonicalQuantityUnproven(
+                "broker_repair_durable_remaining_contradiction"
+            )
+        _derived_status = "OPEN" if _broker_qty == _full_qty else "PARTIAL"
+        _status_before = str(db_row.get("status") or "").strip().upper()
+        _db_full_before = db_row.get("qty")
+        position_id = str(db_row.get("id") or "").strip()
+        if not position_id:
+            raise _BrokerRepairCanonicalQuantityUnproven(
+                "broker_repair_position_id_unproven"
+            )
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _lock_and_reconcile():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT id, client_id, contract, option_symbol,
+                               execution_mode, qty, quantity_remaining, status
+                        FROM positions
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                          AND (
+                            UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                            OR UPPER(TRIM(COALESCE(option_symbol, ''))) = UPPER(TRIM(%s))
+                          )
+                        FOR UPDATE
+                        """,
+                        (position_id, self._email, _mode, sym, sym),
+                    )
+                    _locked_raw = c.fetchone()
+                    if _locked_raw is None:
+                        raise RuntimeError(
+                            "broker_repair_existing_position_lock_not_applied"
+                        )
+                    if not isinstance(_locked_raw, dict):
+                        try:
+                            _locked_row = dict(_locked_raw)
+                        except Exception as _row_err:
+                            raise RuntimeError(
+                                "broker_repair_locked_position_row_unreadable"
+                            ) from _row_err
+                    else:
+                        _locked_row = dict(_locked_raw)
+
+                    _locked_full_qty = _broker_repair_positive_int(
+                        _locked_row.get("qty")
+                    )
+                    if _locked_full_qty is None:
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_locked_canonical_qty_changed"
+                        )
+                    if _locked_full_qty != _full_qty and not (
+                        _legacy_full_qty_expansion_proven
+                        and _locked_full_qty == _initial_canonical_full_qty
+                    ):
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_locked_canonical_qty_changed"
+                        )
+                    try:
+                        _locked_remaining_raw = _locked_row.get(
+                            "quantity_remaining"
+                        )
+                        if _locked_remaining_raw in (None, ""):
+                            _locked_remaining = 0
+                        elif isinstance(_locked_remaining_raw, bool):
+                            raise ValueError("boolean quantity_remaining")
+                        else:
+                            _locked_remaining_numeric = float(
+                                _locked_remaining_raw
+                            )
+                            if (
+                                not math.isfinite(_locked_remaining_numeric)
+                                or not _locked_remaining_numeric.is_integer()
+                            ):
+                                raise ValueError(
+                                    "non-integral quantity_remaining"
+                                )
+                            _locked_remaining = int(_locked_remaining_numeric)
+                        if _locked_remaining < 0 or _locked_remaining > _full_qty:
+                            raise ValueError(
+                                "contradictory durable quantity_remaining"
+                            )
+                    except (TypeError, ValueError, OverflowError):
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_locked_durable_remaining_contradiction"
+                        )
+                    try:
+                        from ap.exit_safety import (
+                            is_valid_exact_occ_contract as _occ_valid,
+                        )
+                    except Exception:
+                        _occ_valid = lambda value: bool(  # noqa: E731
+                            re.fullmatch(
+                                r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}",
+                                str(value or "").strip().upper(),
+                            )
+                        )
+                    _locked_contract = str(
+                        _locked_row.get("contract") or ""
+                    ).strip().upper()
+                    _locked_option = str(
+                        _locked_row.get("option_symbol") or ""
+                    ).strip().upper()
+                    _locked_exact_contracts = {
+                        value
+                        for value in (_locked_contract, _locked_option)
+                        if _occ_valid(value)
+                    }
+                    _expected_contract = str(sym or "").strip().upper()
+                    if (
+                        len(_locked_exact_contracts) > 1
+                        or (
+                            _locked_exact_contracts
+                            and _expected_contract not in _locked_exact_contracts
+                        )
+                        or (
+                            not _locked_exact_contracts
+                            and _expected_contract
+                            not in {_locked_contract, _locked_option}
+                        )
+                    ):
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_locked_occ_identity_unproven"
+                        )
+                    _locked_status = str(
+                        _locked_row.get("status") or ""
+                    ).strip().upper()
+                    if _locked_status not in {
+                        "OPEN", "CLOSING", "PARTIAL", "ACTIVE",
+                    }:
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_locked_lifecycle_unproven"
+                        )
+
+                    # The locked durable lifecycle is current authority.  A
+                    # pending-exit lifecycle must survive quantity repair; the
+                    # broker remainder alone cannot turn CLOSING back into
+                    # OPEN/PARTIAL across a crash boundary.
+                    _locked_desired_status = (
+                        _locked_status
+                        if _locked_status in {"CLOSING", "ACTIVE"}
+                        else _derived_status
+                    )
+                    _locked_needs_update = (
+                        _locked_remaining != _broker_qty
+                        or _locked_full_qty != _full_qty
+                        or _locked_status != _locked_desired_status
+                    )
+                    if _locked_needs_update:
+                        c.execute(
+                            """
+                            UPDATE positions
+                            SET qty = %s,
+                                quantity_remaining = %s,
+                                status = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                              AND client_id = %s
+                              AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                              AND (
+                                UPPER(TRIM(COALESCE(contract, ''))) = UPPER(TRIM(%s))
+                                OR UPPER(TRIM(COALESCE(option_symbol, ''))) = UPPER(TRIM(%s))
+                              )
+                            """,
+                            (
+                                _full_qty,
+                                _broker_qty,
+                                _locked_desired_status,
+                                position_id,
+                                self._email,
+                                _mode,
+                                sym,
+                                sym,
+                            ),
+                        )
+                        if getattr(c, "rowcount", 1) == 0:
+                            raise RuntimeError(
+                                "broker_repair_existing_position_update_not_applied"
+                            )
+                    return _locked_status, _locked_desired_status, _locked_needs_update
+
+            # The lifecycle reread is mandatory even when the initial
+            # quantity projection already matches broker truth.  A row can
+            # become CLOSING/ACTIVE between the initial load and owner
+            # reconstruction; reconstructing from the stale projection would
+            # erase that lifecycle authority and permit duplicate EXIT work.
+            _status_before, _desired_status, _needs_update = run_with_retry(
+                _lock_and_reconcile
+            )
+        except Exception:
+            if position is not None:
+                position.broker_repair_quantity_unverified = True
+                position.broker_repair_quantity_unverified_reason = (
+                    "broker_repair_existing_position_update_failed"
+                )
+            raise
+        db_row["qty"] = _full_qty
+        db_row["quantity_remaining"] = _broker_qty
+        db_row["status"] = _desired_status
+
+        if position is not None:
+            position.quantity = _full_qty
+            position.quantity_remaining = _broker_qty
+            position.broker_repair_quantity_unverified = False
+            position.broker_repair_quantity_unverified_reason = ""
+        if _needs_update:
+            log.info(
+                "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_RECONCILED "
+                "client=%s contract_symbol=%s full_qty=%d broker_qty=%d "
+                "prior_db_qty=%s prior_db_remaining=%s prior_status=%s "
+                "status=%s",
+                self._email,
+                sym,
+                _full_qty,
+                _broker_qty,
+                _db_full_before,
+                _db_remaining,
+                _status_before,
+                _desired_status,
+            )
+        return _full_qty, True
+
     def _broker_position_precheck(self) -> bool:
         """
         Before every exit cycle: fetch broker positions and repair/load any
@@ -9419,12 +9994,14 @@ class APExitEngine:
           - EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE logged on broker fetch failure.
           - EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED logged on repair failure.
           - Already-tracked engine positions are never duplicated.
-          - Broker qty wins over stale DB quantity_remaining=0 (PR#P0-exit-broker-truth).
+          - Fresh broker qty reconciles any durable remaining mismatch without
+            changing canonical full qty except through exact ENTRY proof.
           - Quote failure never blocks position loading (quote_status=QUOTE_UNAVAILABLE).
           - source column never written — production schema may not have it.
         """
         _account_id = self._broker_account_id()
         self._broker_truth_hold_symbols = set()
+        self._broker_truth_snapshot_unavailable = False
 
         _broker_has_position_source = bool(
             self.broker
@@ -9455,6 +10032,7 @@ class APExitEngine:
                 )
             broker_positions = _broker_truth.get("positions") or []
         except Exception as _bp_err:
+            self._broker_truth_snapshot_unavailable = True
             log.error(
                 "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                 "client=%s account=%s error=%s error_type=%s "
@@ -9472,6 +10050,7 @@ class APExitEngine:
         broker_account_mismatch_symbols = set()
         for broker_position in broker_positions:
             if not isinstance(broker_position, dict):
+                self._broker_truth_snapshot_unavailable = True
                 log.error(
                     "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                     "client=%s account=%s reason=malformed_position_row",
@@ -9531,6 +10110,7 @@ class APExitEngine:
                 or numeric_qty is None
                 or not numeric_qty.is_integer()
             ):
+                self._broker_truth_snapshot_unavailable = True
                 log.error(
                     "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                     "client=%s account=%s symbol=%s reason=malformed_quantity",
@@ -9538,6 +10118,7 @@ class APExitEngine:
                 )
                 return False
             if numeric_qty and numeric_qty > 0 and not symbol:
+                self._broker_truth_snapshot_unavailable = True
                 log.error(
                     "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                     "client=%s account=%s reason=positive_position_missing_symbol",
@@ -9545,6 +10126,7 @@ class APExitEngine:
                 )
                 return False
             if not symbol:
+                self._broker_truth_snapshot_unavailable = True
                 log.error(
                     "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                     "client=%s account=%s reason=position_identity_missing",
@@ -9552,6 +10134,7 @@ class APExitEngine:
                 )
                 return False
             if symbol in broker_observed_map:
+                self._broker_truth_snapshot_unavailable = True
                 log.error(
                     "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                     "client=%s account=%s symbol=%s reason=duplicate_position_rows",
@@ -9580,6 +10163,7 @@ class APExitEngine:
         broker_zero_unknown_syms = set()
         degraded_retry_syms = set()
         unresolved_degraded_syms = set()
+        canonical_reconcile_failed_syms = set()
         for tracked_pos in active_engine_positions:
             tracked_sym = str(
                 getattr(tracked_pos, "option_symbol", "") or ""
@@ -9598,12 +10182,15 @@ class APExitEngine:
                 continue
             observed = broker_observed_map.get(tracked_sym)
             if observed is None:
-                if getattr(tracked_pos, "broker_repair_degraded", False):
+                if (
+                    getattr(tracked_pos, "broker_repair_degraded", False)
+                    or getattr(tracked_pos, "broker_repair_quantity_unverified", False)
+                ):
                     # Omission is not durable proof that a previously
-                    # broker-open degraded owner is flat.  Keep monitoring
-                    # and keep readiness fail-closed until fresh truth
-                    # either confirms the position or a separate lifecycle
-                    # reconciler proves closure.
+                    # broker-open owner is flat.  Keep monitoring and keep
+                    # readiness fail-closed until fresh truth either confirms
+                    # the position or a separate lifecycle reconciler proves
+                    # closure.
                     unresolved_degraded_syms.add(tracked_sym)
                     self._broker_truth_hold_symbols.add(tracked_sym)
                 continue
@@ -9640,6 +10227,72 @@ class APExitEngine:
                     "client=%s account=%s contract_symbol=%s qty=%d",
                     self._email, _account_id, tracked_sym, observed_qty_int,
                 )
+            elif (
+                getattr(tracked_pos, "broker_repair_quantity_unverified", False)
+                or observed_qty_int
+                != int(getattr(tracked_pos, "quantity_remaining", 0) or 0)
+            ):
+                # A restarted canonical owner is not allowed to rely on its
+                # durable remainder until this exact broker observation has
+                # been reconciled back into the same client/mode/OCC row.
+                db_row = self._load_db_position_row(tracked_sym)
+                if (
+                    not isinstance(db_row, dict)
+                    or db_row.get("_broker_repair_lookup_status")
+                ):
+                    canonical_reconcile_failed_syms.add(tracked_sym)
+                    self._broker_truth_hold_symbols.add(tracked_sym)
+                    tracked_pos.broker_repair_quantity_unverified = True
+                    tracked_pos.broker_repair_quantity_unverified_reason = (
+                        "broker_repair_existing_row_unavailable"
+                    )
+                    log.error(
+                        "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_RECONCILE_HOLD "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=canonical_row_unavailable",
+                        self._email, _account_id, tracked_sym,
+                    )
+                    continue
+                try:
+                    self._reconcile_existing_broker_position_row(
+                        db_row,
+                        tracked_sym,
+                        observed,
+                        observed_qty_int,
+                        mode=self._resolved_execution_mode(),
+                        position=tracked_pos,
+                    )
+                except (
+                    _BrokerRepairCanonicalQuantityUnproven,
+                    _BrokerRepairQuantityAuthorityContradiction,
+                ) as _qty_err:
+                    canonical_reconcile_failed_syms.add(tracked_sym)
+                    self._broker_truth_hold_symbols.add(tracked_sym)
+                    tracked_pos.broker_repair_quantity_unverified = True
+                    tracked_pos.broker_repair_quantity_unverified_reason = str(
+                        _qty_err
+                    )
+                    log.error(
+                        "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_RECONCILE_HOLD "
+                        "client=%s account=%s contract_symbol=%s reason=%s",
+                        self._email, _account_id, tracked_sym, _qty_err,
+                    )
+                except Exception as _qty_db_err:
+                    canonical_reconcile_failed_syms.add(tracked_sym)
+                    self._broker_truth_hold_symbols.add(tracked_sym)
+                    tracked_pos.broker_repair_quantity_unverified = True
+                    tracked_pos.broker_repair_quantity_unverified_reason = (
+                        "broker_repair_existing_position_update_failed"
+                    )
+                    log.error(
+                        "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_RECONCILE_HOLD "
+                        "client=%s account=%s contract_symbol=%s reason=%s:%s",
+                        self._email,
+                        _account_id,
+                        tracked_sym,
+                        type(_qty_db_err).__name__,
+                        _qty_db_err,
+                    )
 
         missing_from_engine = broker_syms - engine_syms
 
@@ -9663,12 +10316,17 @@ class APExitEngine:
                 "client=%s account=%s broker_position_count=%d "
                 "engine_position_count=%d missing_from_engine=0 "
                 "all_broker_positions_tracked=true broker_zero_unknown=%s "
-                "unresolved_degraded=%s",
+                "unresolved_degraded=%s canonical_reconcile_failed=%s",
                 self._email, _account_id, len(broker_syms), len(engine_syms),
                 sorted(broker_zero_unknown_syms),
                 sorted(unresolved_degraded_syms),
+                sorted(canonical_reconcile_failed_syms),
             )
-            return not broker_zero_unknown_syms and not unresolved_degraded_syms
+            return (
+                not broker_zero_unknown_syms
+                and not unresolved_degraded_syms
+                and not canonical_reconcile_failed_syms
+            )
 
         # ── 3. Repair / load each missing position ────────────────────────────
         repaired_syms               = []   # DB insert/re-query confirmed real id
@@ -9722,6 +10380,20 @@ class APExitEngine:
             if db_row:
                 db_seen          = True
                 db_status_before = db_row.get("status")
+                canonical_full_qty = _broker_repair_positive_int(
+                    db_row.get("qty")
+                )
+                if canonical_full_qty is None:
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=broker_repair_canonical_qty_unproven "
+                        "durable_qty=%s — no DB mutation or owner mutation permitted",
+                        self._email, _account_id, sym, db_row.get("qty"),
+                    )
+                    continue
                 db_qty_before    = int(db_row.get("quantity_remaining") or 0)
                 log.info(
                     "[exit_eng] EXIT_BROKER_POSITION_DB_ROW_FOUND "
@@ -9729,41 +10401,61 @@ class APExitEngine:
                     "db_qty_before=%d broker_qty=%d",
                     self._email, sym, db_status_before, db_qty_before, broker_qty,
                 )
-                # Repair stale quantity_remaining=0 in DB before loading into engine
-                if db_qty_before == 0 and broker_qty > 0:
-                    try:
-                        from ap.db import conn, run_with_retry
-                        def _repair_qty(pid=str(db_row.get("id") or ""), bq=broker_qty):
-                            with conn() as c:
-                                c.execute(
-                                    """
-                                    UPDATE positions
-                                    SET quantity_remaining = %s,
-                                        qty               = GREATEST(COALESCE(qty, 0), %s),
-                                        status            = 'OPEN',
-                                        updated_at        = NOW()
-                                    WHERE id = %s AND client_id = %s
-                                    """,
-                                    (bq, bq, pid, self._email),
-                                )
-                        run_with_retry(_repair_qty)
-                        db_repaired = True
-                        log.info(
-                            "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIRED "
-                            "client=%s contract_symbol=%s db_qty_before=%d "
-                            "broker_qty=%d db_repaired=true",
-                            self._email, sym, db_qty_before, broker_qty,
+                # Reconcile every durable mismatch, not only the historical
+                # zero-remainder shape.  The helper can also repair a legacy
+                # collapsed qty when one exact position-linked ENTRY proves a
+                # larger full fill.  A DB write failure leaves the owner
+                # unverified so the action loop cannot submit from stale DB
+                # quantity after a process boundary.
+                try:
+                    _resolved_full_qty, db_repaired = (
+                        self._reconcile_existing_broker_position_row(
+                            db_row,
+                            sym,
+                            bp,
+                            broker_qty,
+                            mode=self._resolved_execution_mode(),
                         )
-                    except Exception as _dre:
-                        # Non-fatal — still load with broker qty even if DB repair fails
-                        log.warning(
-                            "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIR_FAILED "
-                            "client=%s contract_symbol=%s db_qty_before=%d "
-                            "broker_qty=%d error=%s: %s "
-                            "— loading with broker qty anyway",
-                            self._email, sym, db_qty_before, broker_qty,
-                            type(_dre).__name__, _dre,
-                        )
+                    )
+                    db_row["qty"] = _resolved_full_qty
+                    db_row["quantity_remaining"] = broker_qty
+                except _BrokerRepairQuantityAuthorityContradiction:
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=broker_repair_qty_authority_contradiction "
+                        "— no owner mutation permitted; degraded owner blocked",
+                        self._email, _account_id, sym,
+                    )
+                    continue
+                except _BrokerRepairCanonicalQuantityUnproven as _qty_unproven:
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s reason=%s "
+                        "— no owner mutation permitted",
+                        self._email, _account_id, sym, _qty_unproven,
+                    )
+                    continue
+                except Exception as _dre:
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_RECONCILE_FAILED "
+                        "client=%s contract_symbol=%s db_qty_before=%d "
+                        "broker_qty=%d error=%s: %s "
+                        "— loading broker remainder into an unverified HOLD owner",
+                        self._email, sym, db_qty_before, broker_qty,
+                        type(_dre).__name__, _dre,
+                    )
+                    # Do not fall through to upsert/degraded ownership: this
+                    # is an existing canonical row whose current remainder
+                    # could not be durably reconciled.  A later cycle may
+                    # retry with the same exact broker/DB identities.
+                    continue
                 try:
                     # Broker-truth mode: prefer_qty_override ensures stale qr=0 is overridden
                     pos = self._managed_position_from_row(
@@ -9771,7 +10463,19 @@ class APExitEngine:
                         qty_override=broker_qty,
                         prefer_qty_override=True,
                         expected_contract=sym,
+                        require_canonical_full_qty=True,
                     )
+                    _qty_authority_reason = str(
+                        getattr(pos, "adoption_identity_quarantine_reason", "")
+                        or getattr(pos, "adoptionidentityquarantinereason", "")
+                        or ""
+                    ).strip()
+                    if _qty_authority_reason == (
+                        "broker_repair_qty_authority_contradiction"
+                    ):
+                        raise _BrokerRepairQuantityAuthorityContradiction(
+                            _qty_authority_reason
+                        )
                     self._install_canonical_owner_atomically(
                         pos, sym, account_id=_account_id
                     )
@@ -9779,6 +10483,28 @@ class APExitEngine:
                         pos, sym, _account_id,
                     )
                     loaded_db_syms.append(sym)
+                except _BrokerRepairCanonicalQuantityUnproven:
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=broker_repair_canonical_qty_unproven "
+                        "— no owner mutation permitted; degraded owner blocked",
+                        self._email, _account_id, sym,
+                    )
+                    continue
+                except _BrokerRepairQuantityAuthorityContradiction:
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=broker_repair_qty_authority_contradiction "
+                        "— no owner mutation permitted; degraded owner blocked",
+                        self._email, _account_id, sym,
+                    )
+                    continue
                 except Exception as _le:
                     log.warning(
                         "[exit_eng] DB row load failed for %s: %s: %s — trying upsert",
@@ -9824,14 +10550,28 @@ class APExitEngine:
                     }
                     if isinstance(_repair_row, dict):
                         minimal_row.update(_repair_row)
+                    # #588: preserve canonical full entry qty from the confirmed
+                    # repair row (which now carries full_entry_qty in its qty field).
+                    # broker_qty is authoritative only for current remaining exposure.
+                    if not isinstance(_repair_row, dict):
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_canonical_qty_unproven"
+                        )
+                    _repaired_full_entry_qty = _broker_repair_positive_int(
+                        _repair_row.get("qty")
+                    )
+                    if _repaired_full_entry_qty is None:
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_canonical_qty_unproven"
+                        )
                     minimal_row.update(
                         {
                             "id": _pos_id,
                             "client_id": self._email,
                             "contract": sym,
                             "option_symbol": sym,
-                            "qty": broker_qty,
-                            "quantity_remaining": broker_qty,
+                            "qty": _repaired_full_entry_qty,     # #588: canonical full entry
+                            "quantity_remaining": broker_qty,     # #588: broker current exposure
                             "execution_mode": self._resolved_execution_mode(),
                         }
                     )
@@ -9840,6 +10580,7 @@ class APExitEngine:
                         qty_override=broker_qty,
                         prefer_qty_override=True,
                         expected_contract=sym,
+                        require_canonical_full_qty=True,
                     )
                     self._install_canonical_owner_atomically(
                         pos, sym, account_id=_account_id
@@ -9848,6 +10589,34 @@ class APExitEngine:
                         pos, sym, _account_id,
                     )
                     repaired_syms.append(sym)              # confirmed DB row
+                except _BrokerRepairCanonicalQuantityUnproven:
+                    repair_failed_reason = (
+                        "broker_repair_canonical_qty_unproven"
+                    )
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=%s added_to_engine=false "
+                        "degraded_owner=blocked_by_canonical_quantity",
+                        self._email, _account_id, sym, repair_failed_reason,
+                    )
+                    continue
+                except _BrokerRepairQuantityAuthorityContradiction:
+                    repair_failed_reason = (
+                        "broker_repair_qty_authority_contradiction"
+                    )
+                    repair_failed_syms.append(sym)
+                    self._broker_truth_hold_symbols.add(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s contract_symbol=%s "
+                        "reason=%s added_to_engine=false "
+                        "degraded_owner=blocked_by_quantity_authority",
+                        self._email, _account_id, sym, repair_failed_reason,
+                    )
+                    continue
                 except Exception as _re_err:
                     repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
                     log.error(
@@ -10018,7 +10787,8 @@ class APExitEngine:
             "client=%s account=%s broker_position_count=%d broker_symbols=%s "
             "engine_position_count=%d engine_symbols=%s missing_from_engine=%s "
             "loaded_from_db=%s repaired_from_broker=%s "
-            "repair_failed=%s broker_zero_unknown=%s unresolved_degraded=%s",
+            "repair_failed=%s broker_zero_unknown=%s unresolved_degraded=%s "
+            "canonical_reconcile_failed=%s",
             self._email, _account_id,
             len(broker_syms), sorted(broker_syms),
             len(engine_syms), sorted(engine_syms),
@@ -10026,12 +10796,14 @@ class APExitEngine:
             loaded_db_syms, repaired_syms,
             repair_failed_syms, sorted(broker_zero_unknown_syms),
             sorted(unresolved_degraded_syms),
+            sorted(canonical_reconcile_failed_syms),
         )
 
         return (
             len(repair_failed_syms) == 0
             and not broker_zero_unknown_syms
             and not unresolved_degraded_syms
+            and not canonical_reconcile_failed_syms
         )
 
     def _check_all_positions(self, now_et: Optional[datetime] = None):
@@ -10043,6 +10815,7 @@ class APExitEngine:
         try:
             self._broker_position_precheck()
         except Exception as _pce:
+            self._broker_truth_snapshot_unavailable = True
             log.warning("[exit_eng] _broker_position_precheck error (non-blocking): %s", _pce)
 
         # FIX-3: expired contract cleanup now runs inside self._lock.
@@ -10249,6 +11022,20 @@ class APExitEngine:
                         self._email,
                         str(getattr(pos, "option_symbol", "") or "").strip().upper(),
                         getattr(pos, "position_id", ""),
+                    )
+                    continue
+
+                if getattr(pos, "broker_repair_quantity_unverified", False):
+                    log.warning(
+                        "[exit_eng] EXIT_BROKER_TRUTH_QUANTITY_HOLD "
+                        "client=%s contract_symbol=%s position_id=%s reason=%s "
+                        "— no exit callback until fresh broker remainder is "
+                        "durably proven",
+                        self._email,
+                        str(getattr(pos, "option_symbol", "") or "").strip().upper(),
+                        getattr(pos, "position_id", ""),
+                        getattr(pos, "broker_repair_quantity_unverified_reason", "")
+                        or "restart_requires_fresh_broker_quantity",
                     )
                     continue
 
