@@ -9734,6 +9734,11 @@ class APExitEngine:
         _full_qty = self._broker_repair_existing_full_qty(
             db_row, sym, broker_position, _broker_qty, _mode,
         )
+        _initial_canonical_full_qty = _broker_repair_positive_int(db_row.get("qty"))
+        _legacy_full_qty_expansion_proven = (
+            _initial_canonical_full_qty is not None
+            and _full_qty > _initial_canonical_full_qty
+        )
         _db_remaining_raw = db_row.get("quantity_remaining")
         try:
             _db_remaining = int(_db_remaining_raw or 0)
@@ -9744,12 +9749,22 @@ class APExitEngine:
         _derived_status = "OPEN" if _broker_qty == _full_qty else "PARTIAL"
         _status_before = str(db_row.get("status") or "").strip().upper()
         _db_full_before = db_row.get("qty")
+        _initial_desired_status = (
+            _status_before
+            if _status_before in {"CLOSING", "ACTIVE"}
+            else _derived_status
+        )
         position_id = str(db_row.get("id") or "").strip()
         if not position_id:
             raise _BrokerRepairCanonicalQuantityUnproven(
                 "broker_repair_position_id_unproven"
             )
-        _needs_update = False
+        _initial_needs_update = (
+            _db_remaining != _broker_qty
+            or _broker_repair_positive_int(db_row.get("qty")) != _full_qty
+            or _status_before != _initial_desired_status
+        )
+        _needs_update = _initial_needs_update
         try:
             from ap.db import conn, run_with_retry
 
@@ -9789,7 +9804,14 @@ class APExitEngine:
                     _locked_full_qty = _broker_repair_positive_int(
                         _locked_row.get("qty")
                     )
-                    if _locked_full_qty is None or _locked_full_qty != _full_qty:
+                    if _locked_full_qty is None:
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_locked_canonical_qty_changed"
+                        )
+                    if _locked_full_qty != _full_qty and not (
+                        _legacy_full_qty_expansion_proven
+                        and _locked_full_qty == _initial_canonical_full_qty
+                    ):
                         raise _BrokerRepairCanonicalQuantityUnproven(
                             "broker_repair_locked_canonical_qty_changed"
                         )
@@ -9858,9 +9880,15 @@ class APExitEngine:
                             )
                     return _locked_status, _locked_desired_status, _locked_needs_update
 
-            _status_before, _desired_status, _needs_update = run_with_retry(
-                _lock_and_reconcile
-            )
+            if _initial_needs_update:
+                _status_before, _desired_status, _needs_update = run_with_retry(
+                    _lock_and_reconcile
+                )
+            else:
+                # No durable mutation is needed.  Avoid an unnecessary DB
+                # dependency for an already-reconciled row; when a repair is
+                # needed, the locked reread above is mandatory.
+                _desired_status = _initial_desired_status
         except Exception:
             if position is not None:
                 position.broker_repair_quantity_unverified = True

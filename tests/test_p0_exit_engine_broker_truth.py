@@ -1011,9 +1011,30 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
     # so the best-effort repair attempt doesn't raise ModuleNotFoundError.
     import sys, types
     _db_stub  = types.ModuleType("ap.db")
-    # run_with_retry calls f() — for DB repair, just silently skip
-    _db_stub.run_with_retry = lambda f: None
-    _db_stub.conn = MagicMock()
+    # Match the production DB wrapper: run the callback and return its proof.
+    # The locked reread is the current durable row authority.
+    class _RepairCursor:
+        rowcount = 1
+
+        def __init__(self):
+            self._sql = ""
+
+        def execute(self, sql, params=()):
+            self._sql = str(sql)
+            return self
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return dict(db_row) if "FOR UPDATE" in self._sql else None
+
+    @contextmanager
+    def _repair_conn():
+        yield _RepairCursor()
+
+    _db_stub.run_with_retry = lambda f: f()
+    _db_stub.conn = _repair_conn
     prior_db = sys.modules.get("ap.db")
     sys.modules["ap.db"] = _db_stub
     try:
