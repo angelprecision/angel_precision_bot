@@ -18,6 +18,67 @@ CONTRACT = "NOW260828P00122000"
 POSITION_ID = "2fe10f52-e459-4bc5-a57a-1a80e3618040"
 
 
+def _managed_owner(
+    position_id,
+    *,
+    client_id=CLIENT,
+    mode="live",
+    contract=CONTRACT,
+    quantity=1,
+    quantity_remaining=None,
+):
+    from ap_exit_engine import ManagedPosition
+
+    return ManagedPosition(
+        ticker="NOW",
+        option_symbol=contract,
+        side="PUT",
+        quantity=quantity,
+        entry_price=1.30,
+        underlying_entry=0.0,
+        underlying_target=120.0,
+        underlying_stop=130.0,
+        position_id=position_id,
+        client_id=client_id,
+        execution_mode=mode,
+        quantity_remaining=(
+            quantity if quantity_remaining is None else quantity_remaining
+        ),
+    )
+
+
+def _real_adoption_engine(*owners):
+    from ap_exit_engine import APExitEngine
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._email = CLIENT
+    engine._lock = threading.RLock()
+    engine._positions = list(owners)
+    engine._positions_by_id = {
+        owner.position_id: owner for owner in owners
+    }
+    return engine
+
+
+def _adopt_real_existing(engine):
+    return engine.adopt_canonical_position_identity(
+        contract=CONTRACT,
+        canonical_position_id=POSITION_ID,
+        local_order_id="entry-local-1",
+        broker_order_id="143201293",
+        signal_id="signal-1",
+        canonical_signal_id="canonical-signal-1",
+        entry_fill=1.30,
+        entry_ts=None,
+        execution_mode="live",
+        client_id=CLIENT,
+        underlying_entry=0.0,
+        underlying_entry_trusted=False,
+        quantity=1,
+        quantity_remaining=1,
+    )
+
+
 def _owner(
     position_id,
     *,
@@ -1418,6 +1479,96 @@ def test_real_exit_engine_rejects_canonical_quantity_overrun_before_cleanup():
         POSITION_ID: canonical,
         "broker-repair-stale": repair,
     }
+
+
+def test_real_canonical_adoption_ignores_foreign_client_same_occ():
+    """A same-OCC owner in another client is outside this adoption domain."""
+    canonical = _managed_owner(POSITION_ID)
+    repair = _managed_owner("broker-repair-target")
+    foreign = _managed_owner("foreign-client-owner", client_id="other@example.com")
+    foreign_identity = (
+        foreign.position_id,
+        foreign.client_id,
+        foreign.execution_mode,
+        foreign.option_symbol,
+    )
+    engine = _real_adoption_engine(canonical, repair, foreign)
+
+    result = _adopt_real_existing(engine)
+
+    assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+    assert engine._positions == [canonical, foreign]
+    assert foreign in engine._positions_by_id.values()
+    assert (
+        foreign.position_id,
+        foreign.client_id,
+        foreign.execution_mode,
+        foreign.option_symbol,
+    ) == foreign_identity
+
+
+def test_real_canonical_adoption_ignores_foreign_mode_same_occ():
+    """A PAPER owner cannot veto or join a LIVE canonical collapse."""
+    canonical = _managed_owner(POSITION_ID)
+    repair = _managed_owner("broker-repair-target")
+    foreign = _managed_owner("paper-owner", mode="paper")
+    foreign_identity = (
+        foreign.position_id,
+        foreign.client_id,
+        foreign.execution_mode,
+        foreign.option_symbol,
+    )
+    engine = _real_adoption_engine(canonical, repair, foreign)
+
+    result = _adopt_real_existing(engine)
+
+    assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+    assert engine._positions == [canonical, foreign]
+    assert (
+        foreign.position_id,
+        foreign.client_id,
+        foreign.execution_mode,
+        foreign.option_symbol,
+    ) == foreign_identity
+
+
+def test_real_canonical_adoption_retains_foreign_repair_identity():
+    """A proven foreign repair is retained and never converted into this owner."""
+    canonical = _managed_owner(POSITION_ID)
+    foreign = _managed_owner(
+        "broker-repair-foreign", client_id="other@example.com"
+    )
+    foreign_identity = (
+        foreign.position_id,
+        foreign.client_id,
+        foreign.execution_mode,
+        foreign.option_symbol,
+    )
+    engine = _real_adoption_engine(canonical, foreign)
+
+    result = _adopt_real_existing(engine)
+
+    assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+    assert foreign in engine._positions
+    assert (
+        foreign.position_id,
+        foreign.client_id,
+        foreign.execution_mode,
+        foreign.option_symbol,
+    ) == foreign_identity
+
+
+def test_real_canonical_adoption_rejects_same_domain_duplicate():
+    """Two active owners in one client/mode/OCC domain still fail closed."""
+    canonical = _managed_owner(POSITION_ID)
+    duplicate = _managed_owner("same-domain-duplicate")
+    engine = _real_adoption_engine(canonical, duplicate)
+
+    result = _adopt_real_existing(engine)
+
+    assert result.disposition == "RETRY_REPAIR_IDENTITY_UNPROVEN"
+    assert result.reason == "active_count=2"
+    assert engine._positions == [canonical, duplicate]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

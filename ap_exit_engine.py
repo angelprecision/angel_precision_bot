@@ -4078,8 +4078,9 @@ class APExitEngine:
                         reason="canonical_quantity_conflict",
                     )
                 # Merge every active broker-repair for this exact client/mode/contract
-                # into canonical. Unknown-client, foreign-client, blank-mode, or
-                # wrong-mode repairs stay quarantined and cannot donate quote authority.
+                # into canonical. Proven foreign client/mode domains are unrelated
+                # state: leave them untouched. Only incomplete identity is
+                # quarantined and retained as a retry blocker.
                 _repairs_to_remove = []
                 _identity_unproven_repairs = []
                 for p in self._positions:
@@ -4090,14 +4091,18 @@ class APExitEngine:
                     if getattr(p, "closed", False):
                         continue
                     _rp_cli = str(getattr(p, "client_id", "") or "").strip().lower()
-                    if not _client or _rp_cli != _client:
+                    if _client and _rp_cli and _rp_cli != _client:
+                        continue
+                    if not _client or not _rp_cli:
                         _mark_adoption_identity_quarantined(
                             p, f"repair_client={_rp_cli!r} canonical_client={_client!r}",
                         )
                         _identity_unproven_repairs.append(p)
                         continue
                     _rp_mode = str(getattr(p, "execution_mode", "") or "").strip().lower()
-                    if _rp_mode not in {"live", "paper"} or _rp_mode != _norm_canonical:
+                    if _rp_mode in {"live", "paper"} and _rp_mode != _norm_canonical:
+                        continue
+                    if _rp_mode not in {"live", "paper"}:
                         _mark_adoption_identity_quarantined(
                             p, f"repair_mode={_rp_mode!r} canonical_mode={_norm_canonical!r}",
                         )
@@ -4187,22 +4192,27 @@ class APExitEngine:
                 _clear_broker_repair_degraded_metadata(_existing_canon)
                 _reclassify_hard_ref_for_entry(_existing_canon)
 
-                # Assert exactly one nonclosed active object for this contract.
-                _active_for_contract = [
+                # Assert exactly one nonclosed active object in this exact
+                # ownership domain.  A matching OCC in another client or
+                # execution mode is a separate owner and must not make this
+                # canonical collapse fail (or be removed/mutated).
+                _active_for_domain = [
                     p for p in self._positions
                     if str(getattr(p, "option_symbol", "") or "").upper().strip() == _contract
                     and not getattr(p, "closed", False)
+                    and str(getattr(p, "client_id", "") or "").strip().lower() == _client
+                    and str(getattr(p, "execution_mode", "") or "").strip().lower() == _norm_canonical
                 ]
-                if len(_active_for_contract) != 1:
+                if len(_active_for_domain) != 1:
                     log.critical(
                         "[exit_eng] CANONICAL_COLLAPSE_INVARIANT_VIOLATED | "
-                        "contract=%s active_count=%d — expected exactly 1",
-                        _contract, len(_active_for_contract),
+                        "contract=%s client=%s mode=%s active_count=%d — expected exactly 1",
+                        _contract, _client, _norm_canonical, len(_active_for_domain),
                     )
                     return CanonicalAdoptionResult(
                         disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
                         adopted=False, safe_to_seed=False, retryable=True,
-                        reason=f"active_count={len(_active_for_contract)}",
+                        reason=f"active_count={len(_active_for_domain)}",
                     )
 
                 if _identity_unproven_repairs:
