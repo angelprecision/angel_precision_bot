@@ -515,6 +515,7 @@ def _postgres_positions_table(monkeypatch):
             position_id TEXT,
             kind TEXT,
             status TEXT,
+            qty INTEGER,
             contract TEXT,
             execution_mode TEXT,
             filled_qty INTEGER,
@@ -1008,16 +1009,19 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
     # ap.db is imported inside the DB repair path — stub it in sys.modules
     # so the best-effort repair attempt doesn't raise ModuleNotFoundError.
     import sys, types
-    _ap_stub  = types.ModuleType("ap")
     _db_stub  = types.ModuleType("ap.db")
     # run_with_retry calls f() — for DB repair, just silently skip
     _db_stub.run_with_retry = lambda f: None
     _db_stub.conn = MagicMock()
-    _ap_stub.db   = _db_stub
-    sys.modules.setdefault("ap",    _ap_stub)
-    sys.modules.setdefault("ap.db", _db_stub)
-
-    result = eng._broker_position_precheck()
+    prior_db = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = _db_stub
+    try:
+        result = eng._broker_position_precheck()
+    finally:
+        if prior_db is not None:
+            sys.modules["ap.db"] = prior_db
+        else:
+            sys.modules.pop("ap.db", None)
 
     # Assertions
     assert result is True, (
