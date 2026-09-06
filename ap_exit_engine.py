@@ -8755,13 +8755,15 @@ class APExitEngine:
 
         broker_position = bp if isinstance(bp, dict) else {}
         contract = str(sym or "").strip().upper()
-        qty = _broker_repair_positive_int(broker_position.get("quantity"))
+        # #588: broker_remaining_qty = current broker exposure.
+        # full_entry_qty is derived from the proven ENTRY order after lookup.
+        broker_remaining_qty = _broker_repair_positive_int(broker_position.get("quantity"))
         cost_basis = _broker_repair_cost_basis(broker_position)
         raw_entry_ts = _broker_repair_entry_timestamp(broker_position)
         if (
             not self._email
             or not contract
-            or qty is None
+            or broker_remaining_qty is None
             or cost_basis is None
             or cost_basis <= 0
             or (
@@ -8821,7 +8823,7 @@ class APExitEngine:
                 )
                 return None
 
-            entry_px = round(cost_basis / qty / 100.0, 6)
+            entry_px = round(cost_basis / broker_remaining_qty / 100.0, 6)
             order_fill = _broker_repair_float(
                 order.get("fill_price") or order.get("avg_fill") or order.get("price")
             )
@@ -8865,6 +8867,35 @@ class APExitEngine:
                 )
                 return None
 
+            # ── #588: Separate full entry quantity from broker current exposure ──
+            # The proven ENTRY order is the authoritative source for original fill qty.
+            # Broker truth is authoritative only for CURRENT remaining exposure.
+            full_entry_qty = _broker_repair_positive_int(order.get("filled_qty"))
+            if full_entry_qty is None or full_entry_qty <= 0:
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s "
+                    "reason=entry_filled_qty_unproven full_entry_qty=%s",
+                    self._email, contract, order.get("filled_qty"),
+                )
+                return None
+            if broker_remaining_qty > full_entry_qty:
+                # Contradictory authority: broker reports MORE open contracts than
+                # the original ENTRY ever filled.  Fail closed — never fabricate
+                # a larger canonical position from broker remainder alone.
+                log.error(
+                    "[exit_eng] BROKER_REPAIR_INSERT_BLOCKED client=%s contract=%s "
+                    "reason=broker_qty_exceeds_entry_qty "
+                    "broker_remaining_qty=%d full_entry_qty=%d "
+                    "— contradictory quantity authority; fail closed",
+                    self._email, contract, broker_remaining_qty, full_entry_qty,
+                )
+                return None
+            # Derive canonical status: OPEN when remaining equals full,
+            # PARTIAL when current exposure is smaller than original entry.
+            _recovery_status = (
+                "OPEN" if broker_remaining_qty == full_entry_qty else "PARTIAL"
+            )
+
             underlying_entry, entry_geometry_bad = _broker_repair_historical_value(
                 order, meta, keys=_BROKER_REPAIR_ENTRY_GEOMETRY_KEYS
             )
@@ -8896,14 +8927,14 @@ class APExitEngine:
                 "execution_mode": _mode,
                 "side": side,
                 "direction": side,
-                "qty": qty,
-                "quantity_remaining": qty,
+                "qty": full_entry_qty,                  # #588: canonical full entry qty
+                "quantity_remaining": broker_remaining_qty,  # #588: broker current exposure
                 "entry_price": entry_px,
                 "avg_fill": entry_px,
                 "underlying_entry": underlying_entry,
                 "stop_underlying": underlying_stop,
                 "target_underlying": underlying_target,
-                "status": "OPEN",
+                "status": _recovery_status,                  # #588: OPEN or PARTIAL
                 "entry_ts": entry_ts,
                 "signal_id": signal_id,
                 "local_order_id": local_order_id,
@@ -9007,6 +9038,9 @@ class APExitEngine:
                     c.execute(f"SAVEPOINT {_sp}")
                     _extended_ok = False
                     try:
+                        # #588: qty=full_entry_qty (canonical original),
+                        # quantity_remaining=broker_remaining_qty (current exposure),
+                        # status derived as OPEN/PARTIAL.
                         c.execute(
                             """
                             INSERT INTO positions (
@@ -9025,7 +9059,7 @@ class APExitEngine:
                                 %s, %s,
                                 %s, %s,
                                 %s, %s, %s,
-                                'OPEN', %s, %s,
+                                %s, %s, %s,
                                 %s, %s, NOW()
                             )
                             ON CONFLICT DO NOTHING
@@ -9034,10 +9068,11 @@ class APExitEngine:
                             (
                                 position_id, self._email, repair_row["underlying"],
                                 contract, contract, _mode,
-                                side, side, qty, qty,
+                                side, side,
+                                full_entry_qty, broker_remaining_qty,  # #588: split authority
                                 entry_px, entry_px,
                                 underlying_entry, underlying_stop, underlying_target,
-                                entry_ts, signal_id,
+                                _recovery_status, entry_ts, signal_id,  # #588: derived status
                                 local_order_id, broker_order_id,
                             ),
                         )
@@ -9064,6 +9099,8 @@ class APExitEngine:
                             "rollback client=%s mode=%s contract=%s err=%s",
                             self._email, _mode, contract, _insert_exc,
                         )
+                        # #588 fallback INSERT must have identical quantity semantics
+                        # to the extended INSERT: qty=full_entry_qty, remaining=broker.
                         c.execute(
                             """
                             INSERT INTO positions (
@@ -9079,7 +9116,7 @@ class APExitEngine:
                                 %s, %s,
                                 %s, %s,
                                 %s, %s,
-                                'OPEN', %s, NOW()
+                                %s, %s, NOW()
                             )
                             ON CONFLICT DO NOTHING
                             RETURNING id
@@ -9087,9 +9124,10 @@ class APExitEngine:
                             (
                                 position_id, self._email, repair_row["underlying"],
                                 contract, contract, _mode,
-                                side, side, qty, qty,
+                                side, side,
+                                full_entry_qty, broker_remaining_qty,  # #588: split authority
                                 entry_px, entry_px,
-                                entry_ts,
+                                _recovery_status, entry_ts,            # #588: derived status
                             ),
                         )
                     # Consume the INSERT ... RETURNING result before releasing
@@ -9311,17 +9349,55 @@ class APExitEngine:
                 "is proven by DB row or account configuration",
                 self._email, sym, pos_id or "unknown",
             )
-        # Final broker-truth enforcement: if prefer_qty_override is active,
-        # ensure both quantity fields match broker qty regardless of constructor defaults.
+        # ── #588 QUANTITY AUTHORITY FIX ──────────────────────────────────────
+        # In broker-truth mode, the canonical full entry quantity comes from
+        # the durable row's qty field (proven by the original ENTRY order).
+        # Broker truth (qty_override) is authoritative for CURRENT REMAINING
+        # exposure only — it must never overwrite the original entry size.
+        #
+        # Required invariant (broker-open recovery):
+        #   0 < quantity_remaining <= quantity
+        #   quantity              = full original entry qty (durable authority)
+        #   quantity_remaining    = fresh exact broker current exposure
         if prefer_qty_override and qty_override and int(qty_override) > 0:
-            mp.quantity            = int(qty_override)
-            mp.quantity_remaining  = int(qty_override)
-            if _db_qty_before != int(qty_override):
-                log.info(
-                    "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIRED_IN_MEMORY "
-                    "sym=%s db_qty_before=%d broker_qty=%d loaded_qty=%d",
-                    sym, _db_qty_before, int(qty_override), mp.quantity_remaining,
+            _broker_rem  = int(qty_override)
+            # Prefer canonical full qty from the durable row; fall back to
+            # broker_rem only when the row carries no qty (degraded owner).
+            _db_full_qty = int(row.get("qty") or qty_override)
+            if _broker_rem > _db_full_qty:
+                # Contradictory authority: broker reports MORE open contracts
+                # than the durable canonical entry proves were ever filled.
+                # Quarantine this owner — never expand full qty to satisfy broker.
+                _mark_adoption_identity_quarantined(
+                    mp, "broker_repair_qty_authority_contradiction",
                 )
+                log.critical(
+                    "[exit_eng] BROKER_REPAIR_QTY_AUTHORITY_CONTRADICTION "
+                    "client=%s contract=%s broker_remaining_qty=%d "
+                    "db_full_entry_qty=%d "
+                    "— broker remainder exceeds proven entry quantity; "
+                    "owner quarantined, no broker mutation permitted",
+                    self._email, sym, _broker_rem, _db_full_qty,
+                )
+                # Set both fields so the quarantined owner remains readable for
+                # diagnostics, but behavioral authority is blocked by the flag.
+                mp.quantity           = _db_full_qty
+                mp.quantity_remaining = _broker_rem
+            else:
+                # Valid: broker_remaining_qty <= full_entry_qty.
+                # Canonical full quantity = proven durable entry qty.
+                # Current remaining quantity = fresh broker exposure.
+                mp.quantity           = _db_full_qty
+                mp.quantity_remaining = _broker_rem
+                if _db_qty_before != _broker_rem or int(row.get("qty") or 0) != _db_full_qty:
+                    log.info(
+                        "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIRED_IN_MEMORY "
+                        "sym=%s db_full_entry_qty=%d broker_remaining_qty=%d "
+                        "db_qty_remaining_before=%d loaded_quantity=%d "
+                        "loaded_quantity_remaining=%d",
+                        sym, _db_full_qty, _broker_rem,
+                        _db_qty_before, mp.quantity, mp.quantity_remaining,
+                    )
         return mp
 
     def _fetch_broker_quote(self, sym: str) -> dict:
@@ -9733,18 +9809,40 @@ class APExitEngine:
                 if db_qty_before == 0 and broker_qty > 0:
                     try:
                         from ap.db import conn, run_with_retry
-                        def _repair_qty(pid=str(db_row.get("id") or ""), bq=broker_qty):
+                        # #588: broker truth may repair quantity_remaining.
+                        # It must NOT collapse or expand canonical qty.
+                        # Fail closed if broker exceeds durable canonical qty.
+                        def _repair_qty(
+                            pid=str(db_row.get("id") or ""),
+                            bq=broker_qty,
+                            durable_full=int(db_row.get("qty") or 0),
+                        ):
+                            if durable_full > 0 and bq > durable_full:
+                                # Contradictory authority: broker reports MORE than
+                                # proven durable entry qty. Never expand qty.
+                                log.error(
+                                    "[exit_eng] BROKER_REPAIR_DB_QTY_STALE_BLOCKED "
+                                    "client=%s contract=%s durable_qty=%d "
+                                    "broker_qty=%d "
+                                    "— broker remainder exceeds durable entry qty; "
+                                    "no DB mutation",
+                                    self._email, sym, durable_full, bq,
+                                )
+                                return
                             with conn() as c:
                                 c.execute(
                                     """
                                     UPDATE positions
                                     SET quantity_remaining = %s,
-                                        qty               = GREATEST(COALESCE(qty, 0), %s),
-                                        status            = 'OPEN',
-                                        updated_at        = NOW()
+                                        status = CASE
+                                            WHEN COALESCE(qty, 0) > %s THEN 'PARTIAL'
+                                            WHEN COALESCE(qty, 0) = %s THEN 'OPEN'
+                                            ELSE status
+                                        END,
+                                        updated_at = NOW()
                                     WHERE id = %s AND client_id = %s
                                     """,
-                                    (bq, bq, pid, self._email),
+                                    (bq, bq, bq, pid, self._email),
                                 )
                         run_with_retry(_repair_qty)
                         db_repaired = True
@@ -9824,14 +9922,22 @@ class APExitEngine:
                     }
                     if isinstance(_repair_row, dict):
                         minimal_row.update(_repair_row)
+                    # #588: preserve canonical full entry qty from the confirmed
+                    # repair row (which now carries full_entry_qty in its qty field).
+                    # broker_qty is authoritative only for current remaining exposure.
+                    _repaired_full_entry_qty = (
+                        int(_repair_row.get("qty") or broker_qty)
+                        if isinstance(_repair_row, dict) and _repair_row.get("qty")
+                        else broker_qty
+                    )
                     minimal_row.update(
                         {
                             "id": _pos_id,
                             "client_id": self._email,
                             "contract": sym,
                             "option_symbol": sym,
-                            "qty": broker_qty,
-                            "quantity_remaining": broker_qty,
+                            "qty": _repaired_full_entry_qty,     # #588: canonical full entry
+                            "quantity_remaining": broker_qty,     # #588: broker current exposure
                             "execution_mode": self._resolved_execution_mode(),
                         }
                     )
