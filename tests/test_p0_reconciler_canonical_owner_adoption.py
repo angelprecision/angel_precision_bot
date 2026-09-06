@@ -1815,6 +1815,49 @@ def test_broker_only_reconciled_row_verifies_existing_owner_without_entry_lookup
     assert broker.calls == ["list_positions"]
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"meta": {"execution_mode": "paper"}},
+        {"direction": "CALL"},
+        {"plan_id": "ordinary-plan"},
+        {"tier": "B"},
+        {"local_order_id": "   ", "entry_local_order_id": "real-entry-id"},
+    ],
+    ids=[
+        "mode-contradiction",
+        "direction-occ-conflict",
+        "non-reconciled-plan",
+        "non-reconciled-tier",
+        "secondary-entry-alias",
+    ],
+)
+def test_invalid_broker_only_durable_identity_keeps_strict_path(overrides):
+    engine = _ExitEngine(owners=[_owner(POSITION_ID)])
+    reconciler = _reconciler(engine)
+    strict_calls = []
+    reconciler._seed_exit_engine_from_position = (
+        lambda row: strict_calls.append(row) or False
+    )
+    reconciler._canonical_owner_postcondition = lambda **_kwargs: pytest.fail(
+        "invalid durable identity must not use broker-only owner shortcut"
+    )
+    row_overrides = {
+        "tier": "RECONCILED",
+        "plan_id": "reconciled:broker-only",
+        "local_order_id": "",
+        "broker_order_id": "",
+    }
+    row_overrides.update(overrides)
+    row = _position(**row_overrides)
+
+    summary = _run_existing_position_reconcile(reconciler, row)
+
+    assert strict_calls == [row]
+    assert summary["positions_alerted"] == 1
+    assert "reconciler_exit_owner_install_failed" in summary["errors"]
+
+
 def test_broker_only_reconciled_row_without_owner_surfaces_failure():
     reconciler = _reconciler(_ExitEngine())
     reconciler._seed_exit_engine_from_position = lambda _row: pytest.fail(

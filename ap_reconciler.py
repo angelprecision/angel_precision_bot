@@ -3225,19 +3225,62 @@ class APBrokerReconciler:
                 # rebuild, reseed, or consult broker economics here.
                 import_provenance = str(pos.get("tier") or "").strip().upper()
                 import_plan_id = str(pos.get("plan_id") or "").strip().lower()
-                local_order_id = str(
-                    pos.get("local_order_id") or pos.get("entry_local_order_id") or ""
-                ).strip()
-                broker_order_id = str(
-                    pos.get("broker_order_id") or pos.get("entry_broker_order_id") or ""
-                ).strip()
+                local_order_id, local_order_ok = self._canonical_nonblank_value(
+                    pos, "local_order_id", "entry_local_order_id"
+                )
+                broker_order_id, broker_order_ok = self._canonical_nonblank_value(
+                    pos, "broker_order_id", "entry_broker_order_id"
+                )
+                durable_position_mode = None
+                if import_provenance == "RECONCILED" and import_plan_id.startswith(
+                    "reconciled:"
+                ):
+                    try:
+                        from ap.order_state_machine import _durable_execution_mode
+
+                        durable_position_mode = _durable_execution_mode(pos)
+                    except Exception:
+                        durable_position_mode = None
+                side, side_ok = self._canonical_nonblank_value(
+                    pos, "direction", "side"
+                )
+                side = side.upper()
+                placeholder_ids = {
+                    "", "0", "none", "null", "n/a", "na", "unknown", "pending"
+                }
+                position_id_value, position_id_alias_ok = self._canonical_nonblank_value(
+                    pos, "id", "position_id"
+                )
+                position_id_valid = (
+                    position_id_alias_ok
+                    and position_id_value.lower() not in placeholder_ids
+                    and position_id_value == str(pos_id or "").strip()
+                )
+                position_client = str(pos.get("client_id") or "").strip().lower()
+                expected_client = str(self.client_id or "").strip().lower()
+                exact_occ = bool(
+                    re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract)
+                )
+                occ_match = _OCC_CP_RE.search(contract)
+                occ_side = (
+                    "CALL" if occ_match and occ_match.group(1) == "C"
+                    else "PUT" if occ_match else ""
+                )
                 broker_import_without_entry_identity = (
-                    (
-                        import_provenance == "RECONCILED"
-                        or import_plan_id.startswith("reconciled:")
-                    )
+                    import_provenance == "RECONCILED"
+                    and import_plan_id.startswith("reconciled:")
+                    and local_order_ok
+                    and broker_order_ok
                     and not local_order_id
                     and not broker_order_id
+                    and durable_position_mode == position_execution_mode
+                    and position_id_valid
+                    and expected_client
+                    and position_client == expected_client
+                    and exact_occ
+                    and side_ok
+                    and side in {"CALL", "PUT"}
+                    and side == occ_side
                 )
                 if broker_import_without_entry_identity:
                     owner_ready = self._canonical_owner_postcondition(
