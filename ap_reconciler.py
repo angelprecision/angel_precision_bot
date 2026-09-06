@@ -3217,50 +3217,8 @@ class APBrokerReconciler:
                     )
                     summary["positions_alerted"] += 1
 
-                # A broker-import row may have been created without any
-                # historical ENTRY. On a fresh process it must regain the
-                # same broker-truth owner it had on first import; routing every
-                # DB row through the strict canonical ENTRY path would turn a
-                # legitimate broker-only row into NO_EVIDENCE/HOLD forever.
-                if self._is_reconciled_import_position(pos):
-                    from ap.attribution_integrity import import_identity
-
-                    import_ident = import_identity(
-                        contract=contract,
-                        client_id=self.client_id,
-                        execution_mode=self.execution_mode or "",
-                        broker_position=broker_pos,
-                        broker_quantity=broker_qty,
-                        broker_cost_basis=self._safe_float(
-                            broker_pos.get("cost_basis"), 0.0
-                        ),
-                        price_untrusted=bool(pos.get("price_untrusted")),
-                    )
-                    owner_entry_px = self._broker_position_entry_price(broker_pos)
-                    if owner_entry_px <= 0:
-                        owner_entry_px = entry_px if entry_px > 0 else 0.01
-                    owner_ready = (
-                        import_ident.identity_valid
-                        and self._seed_imported_position_owner(
-                            pos_id=str(pos_id or ""),
-                            contract=contract,
-                            underlying=underlying,
-                            side=self._broker_position_side(broker_pos),
-                            qty=broker_qty,
-                            entry_px=owner_entry_px,
-                            underlying_entry=self._safe_float(
-                                pos.get("underlying_entry"), 0.0
-                            ),
-                            price_untrusted=bool(pos.get("price_untrusted")),
-                            import_identity_record=import_ident,
-                            row=pos,
-                        )
-                    )
-                else:
-                    # Normal lifecycle positions retain the strict canonical
-                    # ENTRY/adoption path and its existing provenance rules.
-                    owner_ready = self._seed_exit_engine_from_position(pos)
-                if not owner_ready:
+                # Belt-and-suspenders: make sure exit engine is tracking this DB-open position.
+                if not self._seed_exit_engine_from_position(pos):
                     self._record_exit_owner_install_failure(
                         summary,
                         contract=contract,
@@ -3701,15 +3659,6 @@ class APBrokerReconciler:
             price_untrusted=price_untrusted,
         )
         return seed_status in {"seeded", "already_owned"}
-
-    @staticmethod
-    def _is_reconciled_import_position(row: Optional[dict]) -> bool:
-        """Identify rows created by the broker-import materialization path."""
-        if not isinstance(row, dict):
-            return False
-        plan_id = str(row.get("plan_id") or "").strip().lower()
-        tier = str(row.get("tier") or "").strip().upper()
-        return plan_id.startswith("reconciled:") or tier == "RECONCILED"
 
     def _create_imported_position(
         self,
