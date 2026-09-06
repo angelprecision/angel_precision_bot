@@ -1198,7 +1198,7 @@ class TestCanonicalPlusRepairCollapse:
         assert engine.active_positions() == []
 
     def test_broker_precheck_with_only_quarantined_repair_installs_broker_owner(self):
-        from ap_exit_engine import APExitEngine
+        from ap_exit_engine import APExitEngine, _BrokerRepairIdentity
 
         class _Broker:
             account_id = "acct-1"
@@ -1222,7 +1222,17 @@ class TestCanonicalPlusRepairCollapse:
         engine._positions = [repair]
         engine._positions_by_id[repair.position_id] = repair
         engine._load_db_position_row = lambda sym: None
-        engine._upsert_broker_position_to_db = lambda sym, bp: "canon-from-broker"
+        engine._upsert_broker_position_to_db = lambda sym, bp: _BrokerRepairIdentity(
+            "canon-from-broker",
+            {
+                "id": "canon-from-broker",
+                "contract": _CONTRACT,
+                "option_symbol": _CONTRACT,
+                "execution_mode": "live",
+                "qty": 1,
+                "quantity_remaining": 1,
+            },
+        )
         engine._fetch_broker_quote = lambda sym: {
             "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
         }

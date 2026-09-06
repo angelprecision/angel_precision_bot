@@ -10058,18 +10058,14 @@ class APExitEngine:
                     # #588: preserve canonical full entry qty from the confirmed
                     # repair row (which now carries full_entry_qty in its qty field).
                     # broker_qty is authoritative only for current remaining exposure.
-                    _repair_row_proves_canonical_qty = isinstance(
-                        _repair_row, dict
+                    if not isinstance(_repair_row, dict):
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_canonical_qty_unproven"
+                        )
+                    _repaired_full_entry_qty = _broker_repair_positive_int(
+                        _repair_row.get("qty")
                     )
-                    _repaired_full_entry_qty = (
-                        _broker_repair_positive_int(_repair_row.get("qty"))
-                        if _repair_row_proves_canonical_qty
-                        else broker_qty
-                    )
-                    if (
-                        _repair_row_proves_canonical_qty
-                        and _repaired_full_entry_qty is None
-                    ):
+                    if _repaired_full_entry_qty is None:
                         raise _BrokerRepairCanonicalQuantityUnproven(
                             "broker_repair_canonical_qty_unproven"
                         )
@@ -10089,7 +10085,7 @@ class APExitEngine:
                         qty_override=broker_qty,
                         prefer_qty_override=True,
                         expected_contract=sym,
-                        require_canonical_full_qty=_repair_row_proves_canonical_qty,
+                        require_canonical_full_qty=True,
                     )
                     self._install_canonical_owner_atomically(
                         pos, sym, account_id=_account_id
