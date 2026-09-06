@@ -4523,7 +4523,8 @@ class APExitEngine:
 
         Returns:
             (True,  "seeded")        — position was new; added successfully.
-            (False, "already_owned") — a canonical owner already exists; no-op.
+            (False, "already_owned") — canonical owner exists and ID index agrees; no-op.
+            (False, "owner_index_conflict") — canonical list owner exists but ID index is missing/stale.
             (False, "degraded_owner_present") — a degraded owner appeared; retry adoption.
             (False, "owner_conflict") — another exact-domain owner exists; HOLD.
             (False, "seed_failed")   — add_position did not register the exact owner.
@@ -4586,7 +4587,9 @@ class APExitEngine:
             ):
                 return "degraded_owner_present"
             if existing_id == _pos_id:
-                return "already_owned"
+                if self._positions_by_id.get(_pos_id) is existing:
+                    return "already_owned"
+                return "owner_index_conflict"
             return "owner_conflict"
 
         with self._lock:
