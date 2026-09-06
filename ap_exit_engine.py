@@ -9741,30 +9741,32 @@ class APExitEngine:
         )
         _db_remaining_raw = db_row.get("quantity_remaining")
         try:
-            _db_remaining = int(_db_remaining_raw or 0)
-        except (TypeError, ValueError):
+            if _db_remaining_raw in (None, ""):
+                _db_remaining = 0
+            elif isinstance(_db_remaining_raw, bool):
+                raise ValueError("boolean quantity_remaining")
+            else:
+                _db_remaining_numeric = float(_db_remaining_raw)
+                if (
+                    not math.isfinite(_db_remaining_numeric)
+                    or not _db_remaining_numeric.is_integer()
+                ):
+                    raise ValueError("non-integral quantity_remaining")
+                _db_remaining = int(_db_remaining_numeric)
+            if _db_remaining < 0 or _db_remaining > _full_qty:
+                raise ValueError("contradictory durable quantity_remaining")
+        except (TypeError, ValueError, OverflowError):
             raise _BrokerRepairCanonicalQuantityUnproven(
-                "broker_repair_quantity_remaining_unproven"
+                "broker_repair_durable_remaining_contradiction"
             )
         _derived_status = "OPEN" if _broker_qty == _full_qty else "PARTIAL"
         _status_before = str(db_row.get("status") or "").strip().upper()
         _db_full_before = db_row.get("qty")
-        _initial_desired_status = (
-            _status_before
-            if _status_before in {"CLOSING", "ACTIVE"}
-            else _derived_status
-        )
         position_id = str(db_row.get("id") or "").strip()
         if not position_id:
             raise _BrokerRepairCanonicalQuantityUnproven(
                 "broker_repair_position_id_unproven"
             )
-        _initial_needs_update = (
-            _db_remaining != _broker_qty
-            or _broker_repair_positive_int(db_row.get("qty")) != _full_qty
-            or _status_before != _initial_desired_status
-        )
-        _needs_update = _initial_needs_update
         try:
             from ap.db import conn, run_with_retry
 
@@ -9816,12 +9818,70 @@ class APExitEngine:
                             "broker_repair_locked_canonical_qty_changed"
                         )
                     try:
-                        _locked_remaining = int(
-                            _locked_row.get("quantity_remaining") or 0
+                        _locked_remaining_raw = _locked_row.get(
+                            "quantity_remaining"
                         )
-                    except (TypeError, ValueError):
+                        if _locked_remaining_raw in (None, ""):
+                            _locked_remaining = 0
+                        elif isinstance(_locked_remaining_raw, bool):
+                            raise ValueError("boolean quantity_remaining")
+                        else:
+                            _locked_remaining_numeric = float(
+                                _locked_remaining_raw
+                            )
+                            if (
+                                not math.isfinite(_locked_remaining_numeric)
+                                or not _locked_remaining_numeric.is_integer()
+                            ):
+                                raise ValueError(
+                                    "non-integral quantity_remaining"
+                                )
+                            _locked_remaining = int(_locked_remaining_numeric)
+                        if _locked_remaining < 0 or _locked_remaining > _full_qty:
+                            raise ValueError(
+                                "contradictory durable quantity_remaining"
+                            )
+                    except (TypeError, ValueError, OverflowError):
                         raise _BrokerRepairCanonicalQuantityUnproven(
-                            "broker_repair_locked_quantity_remaining_unproven"
+                            "broker_repair_locked_durable_remaining_contradiction"
+                        )
+                    try:
+                        from ap.exit_safety import (
+                            is_valid_exact_occ_contract as _occ_valid,
+                        )
+                    except Exception:
+                        _occ_valid = lambda value: bool(  # noqa: E731
+                            re.fullmatch(
+                                r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}",
+                                str(value or "").strip().upper(),
+                            )
+                        )
+                    _locked_contract = str(
+                        _locked_row.get("contract") or ""
+                    ).strip().upper()
+                    _locked_option = str(
+                        _locked_row.get("option_symbol") or ""
+                    ).strip().upper()
+                    _locked_exact_contracts = {
+                        value
+                        for value in (_locked_contract, _locked_option)
+                        if _occ_valid(value)
+                    }
+                    _expected_contract = str(sym or "").strip().upper()
+                    if (
+                        len(_locked_exact_contracts) > 1
+                        or (
+                            _locked_exact_contracts
+                            and _expected_contract not in _locked_exact_contracts
+                        )
+                        or (
+                            not _locked_exact_contracts
+                            and _expected_contract
+                            not in {_locked_contract, _locked_option}
+                        )
+                    ):
+                        raise _BrokerRepairCanonicalQuantityUnproven(
+                            "broker_repair_locked_occ_identity_unproven"
                         )
                     _locked_status = str(
                         _locked_row.get("status") or ""
@@ -9880,15 +9940,14 @@ class APExitEngine:
                             )
                     return _locked_status, _locked_desired_status, _locked_needs_update
 
-            if _initial_needs_update:
-                _status_before, _desired_status, _needs_update = run_with_retry(
-                    _lock_and_reconcile
-                )
-            else:
-                # No durable mutation is needed.  Avoid an unnecessary DB
-                # dependency for an already-reconciled row; when a repair is
-                # needed, the locked reread above is mandatory.
-                _desired_status = _initial_desired_status
+            # The lifecycle reread is mandatory even when the initial
+            # quantity projection already matches broker truth.  A row can
+            # become CLOSING/ACTIVE between the initial load and owner
+            # reconstruction; reconstructing from the stale projection would
+            # erase that lifecycle authority and permit duplicate EXIT work.
+            _status_before, _desired_status, _needs_update = run_with_retry(
+                _lock_and_reconcile
+            )
         except Exception:
             if position is not None:
                 position.broker_repair_quantity_unverified = True

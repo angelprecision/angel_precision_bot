@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1088,6 +1089,7 @@ class TestCanonicalPlusRepairCollapse:
 
         db_row = {
             "id": "canon-recovered",
+            "client_id": _CLIENT,
             "contract": _CONTRACT,
             "option_symbol": _CONTRACT,
             "underlying": _TICKER,
@@ -1105,7 +1107,44 @@ class TestCanonicalPlusRepairCollapse:
         }
 
         assert engine.active_positions() == []
-        assert engine._broker_position_precheck() is True
+        class _Cursor:
+            rowcount = 1
+
+            def __init__(self):
+                self._sql = ""
+
+            def execute(self, sql, params=()):
+                self._sql = str(sql)
+                return self
+
+            def fetchall(self):
+                # No exact ENTRY lookup is needed when durable full qty
+                # already agrees with fresh broker truth; hydration also
+                # sees no active EXIT rows.
+                return []
+
+            def fetchone(self):
+                if "FOR UPDATE" in self._sql:
+                    return dict(db_row)
+                return None
+
+        @contextmanager
+        def _conn():
+            yield _Cursor()
+
+        fake_db = SimpleNamespace(
+            conn=_conn,
+            run_with_retry=lambda fn, **_kwargs: fn(),
+        )
+        prior_db = sys.modules.get("ap.db")
+        sys.modules["ap.db"] = fake_db
+        try:
+            assert engine._broker_position_precheck() is True
+        finally:
+            if prior_db is not None:
+                sys.modules["ap.db"] = prior_db
+            else:
+                sys.modules.pop("ap.db", None)
 
         canonical = engine._positions_by_id["canon-recovered"]
         assert canonical.position_id == "canon-recovered"

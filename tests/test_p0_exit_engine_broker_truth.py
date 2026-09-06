@@ -2427,7 +2427,7 @@ def test_pr558_blocker2_multi_candidate_narrowed_by_broker_returns_survivor():
 # ─── PR #558 amendment — remaining 14 tests from Angel's 23-mandatory list ────
 
 
-def _pr558_fake_db_with_rows(rows):
+def _pr558_fake_db_with_rows(rows, *, position_row=None):
     """Shared fake-DB scaffold for _find_exact_filled_entry_order tests.
     Returns (fake_db_module, restore_callable).  Caller uses:
         fake, restore = _pr558_fake_db_with_rows(rows)
@@ -2436,11 +2436,19 @@ def _pr558_fake_db_with_rows(rows):
     """
     from contextlib import contextmanager
     class _Cur:
+        rowcount = 1
+
+        def __init__(self):
+            self._sql = ""
+
         def execute(self, sql, params=()):
+            self._sql = str(sql)
             return self
         def fetchall(self):
             return list(rows)
         def fetchone(self):
+            if position_row is not None and "FOR UPDATE" in self._sql:
+                return dict(position_row)
             return rows[0] if rows else None
     @contextmanager
     def fake_conn():
@@ -3027,7 +3035,9 @@ def test_pr558_blocker1_test23_crash_restart_convergence_same_canonical_identity
         "submitted_ts": "2026-08-01T13:01:01Z",
         "updated_ts": "2026-08-01T13:01:02Z",
     }
-    fake, restore = _pr558_fake_db_with_rows([pending_exit_row])
+    fake, restore = _pr558_fake_db_with_rows(
+        [pending_exit_row], position_row=canonical_row,
+    )
     sys.modules["ap.db"] = fake
     try:
         assert eng_after._broker_position_precheck() is True
@@ -3247,10 +3257,20 @@ def test_pr558_blocker1_restart_hydration_failure_holds_canonical_owner():
     eng_after._fetch_broker_quote = empty_quote
 
     class _FailingCursor:
-        def execute(self, *_args, **_kwargs):
+        rowcount = 1
+
+        def __init__(self):
+            self._sql = ""
+
+        def execute(self, sql, *_args, **_kwargs):
+            self._sql = str(sql)
+            if "FOR UPDATE" in self._sql:
+                return self
             raise RuntimeError("temporary orders lookup outage")
 
         def fetchone(self):
+            if "FOR UPDATE" in self._sql:
+                return dict(canonical_row)
             return None
 
     @contextmanager
@@ -4963,6 +4983,224 @@ def test_pr588_locked_lifecycle_wins_when_row_changes_before_reread():
     assert db_row["status"] == "CLOSING"
     updates = [params for sql, params in executed if "UPDATE positions" in sql]
     assert updates and updates[0][2] == "CLOSING"
+
+
+@pytest.mark.parametrize("locked_status", ["CLOSING", "ACTIVE"])
+@_skip_if_no_mod
+def test_pr588_noop_quantity_reread_preserves_locked_lifecycle(locked_status):
+    """Even a quantity no-op must reread lifecycle under FOR UPDATE."""
+    eng = _pr558_new_engine(email="pr588-noop-lifecycle@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+
+    contract = "IWM260919C00230000"
+    db_row = {
+        "id": "pr588-noop-lifecycle-row",
+        "client_id": eng._email,
+        "contract": contract,
+        "option_symbol": contract,
+        "qty": 2,
+        "quantity_remaining": 2,
+        "status": "OPEN",  # initial projection already matches broker qty
+        "execution_mode": "live",
+    }
+    locked_row = dict(db_row, status=locked_status)
+    executed = []
+
+    class _Cur:
+        rowcount = 1
+
+        def __init__(self):
+            self._sql = ""
+
+        def execute(self, sql, params=()):
+            self._sql = str(sql)
+            executed.append((self._sql, params))
+            return self
+
+        def fetchall(self):
+            # No exact ENTRY is needed when durable full qty already agrees
+            # with fresh broker truth.
+            return []
+
+        def fetchone(self):
+            if "FOR UPDATE" in self._sql:
+                return dict(locked_row)
+            return None
+
+    @contextmanager
+    def _conn():
+        yield _Cur()
+
+    fake_db = types.SimpleNamespace(
+        conn=_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_db
+    try:
+        full_qty, durable_proof = eng._reconcile_existing_broker_position_row(
+            db_row,
+            contract,
+            {"contract": contract, "quantity": 2},
+            2,
+            mode="live",
+        )
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert (full_qty, durable_proof) == (2, True)
+    assert db_row["status"] == locked_status
+    assert any("FOR UPDATE" in sql for sql, _params in executed)
+    assert not any("UPDATE positions" in sql for sql, _params in executed)
+
+
+@_skip_if_no_mod
+def test_pr588_contradictory_existing_remaining_holds_before_mutation():
+    """Durable remaining quantity above canonical full qty is a HOLD."""
+    eng = _pr558_new_engine(email="pr588-remaining-contradiction@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+
+    contract = "SPY260919C00600000"
+    db_row = {
+        "id": "pr588-remaining-contradiction-row",
+        "client_id": eng._email,
+        "contract": contract,
+        "option_symbol": contract,
+        "qty": 2,
+        "quantity_remaining": 3,  # impossible durable state
+        "status": "OPEN",
+        "execution_mode": "live",
+    }
+    executed = []
+
+    class _Cur:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            executed.append((str(sql), params))
+            return self
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            pytest.fail("contradictory durable quantity must fail before lock")
+
+    @contextmanager
+    def _conn():
+        yield _Cur()
+
+    fake_db = types.SimpleNamespace(
+        conn=_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_db
+    contradiction = getattr(
+        _EE_MOD, "_BrokerRepairCanonicalQuantityUnproven", None,
+    )
+    try:
+        with pytest.raises(
+            contradiction,
+            match="broker_repair_durable_remaining_contradiction",
+        ):
+            eng._reconcile_existing_broker_position_row(
+                db_row,
+                contract,
+                {"contract": contract, "quantity": 1},
+                1,
+                mode="live",
+            )
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert db_row["qty"] == 2
+    assert db_row["quantity_remaining"] == 3
+    assert not any("UPDATE positions" in sql for sql, _params in executed)
+
+
+@_skip_if_no_mod
+def test_pr588_locked_occ_identity_contradiction_holds_before_update():
+    """A locked row with two exact OCC identities cannot be reconciled."""
+    eng = _pr558_new_engine(email="pr588-occ-contradiction@example.com")
+    if eng is None:
+        pytest.skip("APExitEngine not importable")
+
+    contract = "SPY260919C00600000"
+    wrong_contract = "SPY260919P00600000"
+    db_row = {
+        "id": "pr588-occ-contradiction-row",
+        "client_id": eng._email,
+        "contract": contract,
+        "option_symbol": contract,
+        "qty": 2,
+        "quantity_remaining": 2,
+        "status": "OPEN",
+        "execution_mode": "live",
+    }
+    locked_row = dict(db_row, option_symbol=wrong_contract)
+    executed = []
+
+    class _Cur:
+        rowcount = 1
+
+        def __init__(self):
+            self._sql = ""
+
+        def execute(self, sql, params=()):
+            self._sql = str(sql)
+            executed.append((self._sql, params))
+            return self
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            if "FOR UPDATE" in self._sql:
+                return dict(locked_row)
+            return None
+
+    @contextmanager
+    def _conn():
+        yield _Cur()
+
+    fake_db = types.SimpleNamespace(
+        conn=_conn,
+        run_with_retry=lambda fn, **_: fn(),
+    )
+    prior = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_db
+    contradiction = getattr(
+        _EE_MOD, "_BrokerRepairCanonicalQuantityUnproven", None,
+    )
+    try:
+        with pytest.raises(
+            contradiction,
+            match="broker_repair_locked_occ_identity_unproven",
+        ):
+            eng._reconcile_existing_broker_position_row(
+                db_row,
+                contract,
+                {"contract": contract, "quantity": 1},
+                1,
+                mode="live",
+            )
+    finally:
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert db_row["quantity_remaining"] == 2
+    assert not any("UPDATE positions" in sql for sql, _params in executed)
 
 
 @_skip_if_no_mod
