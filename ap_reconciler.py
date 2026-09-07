@@ -85,6 +85,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 log = logging.getLogger("ap.reconciler")
@@ -175,6 +176,47 @@ BROKER_TO_OSM = {
 # OCC option symbology: root(variable) + YYMMDD(6) + C|P(1) + 8-digit strike.
 # Anchored to end-of-string so it cannot match a P inside the root ticker.
 _OCC_CP_RE = re.compile(r'([CP])\d{8}$')
+
+# Broker-position truth is an authority input, not a best-effort convenience
+# read.  Keep the state on the fetched value so a successful empty snapshot
+# cannot be confused with an unavailable or malformed snapshot downstream.
+BROKER_POSITIONS_AVAILABLE_OPEN = "AVAILABLE_OPEN"
+BROKER_POSITIONS_AVAILABLE_EMPTY = "AVAILABLE_EMPTY"
+BROKER_POSITIONS_UNAVAILABLE = "UNAVAILABLE"
+BROKER_POSITIONS_MALFORMED = "MALFORMED"
+BROKER_POSITIONS_AMBIGUOUS = "AMBIGUOUS"
+
+
+class BrokerPositionSnapshotError(ValueError):
+    """Raised when a broker-position snapshot cannot establish authority."""
+
+    def __init__(self, message: str, *, state: str = BROKER_POSITIONS_MALFORMED):
+        super().__init__(message)
+        self.state = state
+
+
+class BrokerPositionSnapshot(list[dict]):
+    """List-compatible broker snapshot carrying its authority classification."""
+
+    def __init__(
+        self,
+        rows=(),
+        *,
+        state: str,
+        reason: str = "",
+        source: str = "",
+    ):
+        super().__init__(rows)
+        self.state = state
+        self.reason = str(reason or "")
+        self.source = str(source or "")
+
+    @property
+    def is_available(self) -> bool:
+        return self.state in {
+            BROKER_POSITIONS_AVAILABLE_OPEN,
+            BROKER_POSITIONS_AVAILABLE_EMPTY,
+        }
 
 
 def _positive_finite_float(value) -> float:
@@ -2444,18 +2486,32 @@ class APBrokerReconciler:
             broker_open_syms = set()
             broker_truth_ok  = False
             if buckets["current_live"] or buckets["manual_review"]:
-                try:
-                    if self.broker and hasattr(self.broker, "list_positions"):
-                        for bp in (self.broker.list_positions() or []):
-                            sym = str(bp.get("symbol") or "").upper()
-                            if sym:
-                                broker_open_syms.add(sym)
-                        broker_truth_ok = True
-                except Exception as _bpe:
-                    log.warning(
-                        "[%s] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE backfill: %s — "
-                        "created positions will be OPEN unmanaged=True",
-                        self.client_id, _bpe,
+                broker_snapshot = self._coerce_broker_position_snapshot(
+                    self._safe_get_broker_positions()
+                )
+                if broker_snapshot.is_available:
+                    for bp in broker_snapshot:
+                        contract, _contract_reason = (
+                            self._broker_position_contract_result(bp)
+                        )
+                        quantity = self._broker_position_qty(bp)
+                        if contract and quantity is not None and quantity > 0:
+                            broker_open_syms.add(contract.upper())
+                    broker_truth_ok = True
+                else:
+                    log.error(
+                        "[%s] backfill broker truth HOLD: state=%s source=%s "
+                        "reason=%s — no current-live orphan mutation permitted",
+                        self.client_id,
+                        broker_snapshot.state,
+                        broker_snapshot.source,
+                        broker_snapshot.reason,
+                    )
+                    self._alert(
+                        f"RECONCILER_BROKER_POSITION_TRUTH_HOLD | "
+                        f"client={self.client_id} mode={getattr(self, 'execution_mode', '') or 'unknown'} "
+                        f"context=missing_position_link_backfill state={broker_snapshot.state} "
+                        f"reason={broker_snapshot.reason or 'unknown'}"
                     )
 
             # ── Process counters ─────────────────────────────────────────────
@@ -2555,6 +2611,17 @@ class APBrokerReconciler:
 
             # ── 4. current_live — full P0 repair ─────────────────────────────
             for o in buckets["current_live"]:
+                if not broker_truth_ok:
+                    failed += 1
+                    orphan_backfill_failed_current_live += 1
+                    log.error(
+                        "[%s] filled_order_missing_position_p0 HOLD "
+                        "order=%s execution_mode=live reason=broker_position_truth_%s",
+                        self.client_id,
+                        o.get("local_order_id") if isinstance(o, dict) else None,
+                        str(getattr(broker_snapshot, "state", "unknown")).lower(),
+                    )
+                    continue
                 raw_contract = (
                     o.get("option_symbol")
                     or o.get("contract")
@@ -2923,37 +2990,412 @@ class APBrokerReconciler:
         except Exception:
             return float(default)
 
-    def _safe_get_broker_positions(self) -> list[dict]:
-        """Fetch broker positions; return [] on error."""
+    @staticmethod
+    def _strict_integral_quantity(value) -> tuple[Optional[int], str]:
+        """Parse a broker quantity without changing its sign or precision."""
+        if value is None:
+            return None, "missing"
+        if isinstance(value, bool):
+            return None, "boolean"
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None, "blank"
         try:
-            result = self.broker.list_positions()
-            if result is None:
-                return []
-            if isinstance(result, list):
-                return [dict(x) for x in result if isinstance(x, dict)]
-            if isinstance(result, dict):
-                # Tradier: {"positions": {"position": [...]}} or {"positions": []}
-                inner = result.get("positions") or result.get("data") or result.get("results")
-                if isinstance(inner, list):
-                    return [dict(x) for x in inner if isinstance(x, dict)]
-                if isinstance(inner, dict):
-                    pos = inner.get("position")
-                    if isinstance(pos, list):
-                        return [dict(x) for x in pos if isinstance(x, dict)]
-                    if isinstance(pos, dict):
-                        return [pos]
-            return []
-        except Exception as e:
-            log.error("[%s] Broker list_positions failed: %s", self.client_id, e)
-            return []
+            parsed = Decimal(str(value))
+        except Exception:
+            return None, "malformed"
+        if not parsed.is_finite():
+            return None, "non_finite"
+        if parsed != parsed.to_integral_value():
+            return None, "fractional"
+        return int(parsed), "ok"
+
+    @staticmethod
+    def _position_records(bp: dict) -> list[dict]:
+        records = [bp]
+        raw = bp.get("raw") if isinstance(bp, dict) else None
+        if isinstance(raw, dict) and raw is not bp:
+            records.append(raw)
+        return records
+
+    @classmethod
+    def _position_alias_values(cls, bp: dict, keys: tuple[str, ...]) -> list[str]:
+        values: list[str] = []
+        for record in cls._position_records(bp):
+            for key in keys:
+                if key not in record or record.get(key) is None:
+                    continue
+                value = str(record.get(key)).strip()
+                if value:
+                    values.append(value)
+        return values
+
+    def _broker_position_qty_result(self, bp: dict) -> tuple[Optional[int], str]:
+        """Return a strict long-position quantity and its rejection reason."""
+        if not isinstance(bp, dict):
+            return None, "row_not_object"
+
+        quantities: list[tuple[str, int]] = []
+        saw_alias = False
+        for record in self._position_records(bp):
+            for key in ("quantity", "qty", "long_quantity", "short_quantity"):
+                if key not in record:
+                    continue
+                saw_alias = True
+                parsed, reason = self._strict_integral_quantity(record.get(key))
+                if parsed is None:
+                    return None, f"{key}_{reason}"
+                quantities.append((key, parsed))
+
+        if not saw_alias or not quantities:
+            return None, "missing"
+
+        long_values = [value for key, value in quantities if key != "short_quantity"]
+        short_values = [value for key, value in quantities if key == "short_quantity"]
+
+        # A short dimension is never a positive-long authority.  A non-zero
+        # short value also conflicts with any long quantity, including zero.
+        if any(value != 0 for value in short_values):
+            return None, "short_direction"
+        if long_values and len(set(long_values)) != 1:
+            return None, "contradictory_aliases"
+        if not long_values:
+            # An explicit short_quantity=0 is an explicit flat value, not a
+            # missing value, and is safe only as non-open truth.
+            return 0, "ok"
+
+        quantity = long_values[0]
+        if quantity < 0:
+            return None, "negative"
+
+        direction_values = self._position_alias_values(
+            bp, ("side", "direction", "position_type", "position_side")
+        )
+        direction_text = " ".join(direction_values).lower()
+        if (
+            re.search(r"\bshort\b", direction_text)
+            or "sell_to_open" in direction_text
+            or "short_call" in direction_text
+            or "short_put" in direction_text
+        ):
+            return None, "short_direction"
+        return quantity, "ok"
+
+    def _broker_position_qty(self, bp: dict) -> Optional[int]:
+        """Strict broker quantity authority; invalid truth returns ``None``."""
+        quantity, _reason = self._broker_position_qty_result(bp)
+        return quantity
+
+    def _broker_position_contract_result(self, bp: dict) -> tuple[str, str]:
+        """Resolve contract aliases without truthy-value or identity loss."""
+        if not isinstance(bp, dict):
+            return "", "row_not_object"
+
+        values: list[str] = []
+        for record in self._position_records(bp):
+            for key in ("symbol", "option_symbol", "contract", "instrument"):
+                if key not in record:
+                    continue
+                raw = record.get(key)
+                # Nullable alias columns are common on durable position rows;
+                # a proven non-null alias remains authoritative.  A blank
+                # non-null alias is malformed rather than silently ignored.
+                if raw is None:
+                    continue
+                if not str(raw).strip():
+                    return "", f"{key}_missing"
+                value = self._norm_contract(raw)
+                if not re.fullmatch(r"[A-Z0-9.]{1,32}", value):
+                    return "", f"{key}_malformed"
+                # A numeric symbol is an OCC-like value and must prove the
+                # complete OCC geometry before it can be used as identity.
+                if any(char.isdigit() for char in value) and not re.fullmatch(
+                    r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", value
+                ):
+                    return "", f"{key}_malformed"
+                values.append(value)
+
+        if not values:
+            return "", "missing"
+        if len(set(values)) != 1:
+            return "", "contradictory_aliases"
+        return values[0], "ok"
 
     def _broker_position_contract(self, bp: dict) -> str:
-        return self._norm_contract(
-            bp.get("symbol")
-            or bp.get("option_symbol")
-            or bp.get("contract")
-            or bp.get("instrument")
-            or ""
+        contract, _reason = self._broker_position_contract_result(bp)
+        return contract
+
+    def _broker_account_id(self) -> str:
+        broker = getattr(self, "broker", None)
+        candidates = (
+            getattr(broker, "account_id", None),
+            getattr(getattr(broker, "cfg", None), "account_id", None),
+            getattr(broker, "_account_id", None),
+        )
+        for value in candidates:
+            if isinstance(value, bool) or value is None:
+                continue
+            text = str(value).strip().lower()
+            if text and text != "none" and "mock" not in text:
+                return text
+        return ""
+
+    def _broker_position_row_result(
+        self, bp: dict
+    ) -> tuple[str, Optional[int], str]:
+        """Validate row identity, mode, direction, and quantity atomically."""
+        contract, contract_reason = self._broker_position_contract_result(bp)
+        if not contract:
+            return "", None, f"contract_{contract_reason}"
+
+        quantity, quantity_reason = self._broker_position_qty_result(bp)
+        if quantity is None:
+            return contract, None, f"quantity_{quantity_reason}"
+
+        client_values = {
+            value.strip().lower()
+            for value in self._position_alias_values(bp, ("client_id",))
+        }
+        expected_client = str(self.client_id or "").strip().lower()
+        if len(client_values) > 1 or (
+            client_values and (not expected_client or client_values != {expected_client})
+        ):
+            return contract, None, "client_identity"
+
+        account_values = {
+            value.strip().lower()
+            for value in self._position_alias_values(
+                bp, ("account_id", "account", "account_number")
+            )
+        }
+        expected_account = self._broker_account_id()
+        if len(account_values) > 1 or (
+            account_values and (not expected_account or account_values != {expected_account})
+        ):
+            return contract, None, "account_identity"
+
+        mode_values = {
+            value.strip().lower()
+            for value in self._position_alias_values(bp, ("execution_mode", "mode"))
+        }
+        normalized_mode = {
+            _normalize_execution_mode(value) for value in mode_values
+        }
+        expected_mode = _normalize_execution_mode(
+            getattr(self, "execution_mode", None)
+        )
+        if len(normalized_mode) > 1 or None in normalized_mode:
+            return contract, None, "execution_mode"
+        if normalized_mode and (
+            expected_mode is None or normalized_mode != {expected_mode}
+        ):
+            return contract, None, "execution_mode_mismatch"
+
+        if re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract):
+            occ_match = _OCC_CP_RE.search(contract)
+            expected_side = (
+                "CALL" if occ_match and occ_match.group(1) == "C" else "PUT"
+            )
+            direction_values = self._position_alias_values(
+                bp, ("side", "direction", "position_type", "position_side")
+            )
+            normalized_directions = {
+                value.strip().upper() for value in direction_values
+            }
+            if any(
+                "SHORT" in value or "SELL_TO_OPEN" in value
+                for value in normalized_directions
+            ):
+                return contract, None, "short_direction"
+            option_sides = {
+                value for value in normalized_directions if value in {"CALL", "PUT"}
+            }
+            if option_sides and option_sides != {expected_side}:
+                return contract, None, "option_side_mismatch"
+
+        return contract, quantity, "ok"
+
+    def _broker_position_rows_from_result(self, result) -> list[dict]:
+        """Unwrap only complete, documented position response shapes."""
+        if isinstance(result, list):
+            rows = result
+        elif isinstance(result, dict):
+            if any(
+                result.get(key) not in (None, "", [], {})
+                for key in ("error", "errors", "message")
+            ):
+                raise BrokerPositionSnapshotError("broker position error payload")
+            if str(result.get("status") or "").strip().lower() in {
+                "error", "failed", "failure", "unavailable",
+            }:
+                raise BrokerPositionSnapshotError("broker position error status")
+            if "positions" not in result:
+                raise BrokerPositionSnapshotError("broker positions envelope missing")
+            positions = result.get("positions")
+            if positions is None or positions == "null":
+                return []
+            if isinstance(positions, list):
+                rows = positions
+            elif isinstance(positions, dict):
+                if not positions or "position" not in positions:
+                    raise BrokerPositionSnapshotError(
+                        "broker positions container incomplete"
+                    )
+                rows = positions.get("position")
+                if rows is None or rows == "null":
+                    return []
+                if isinstance(rows, dict):
+                    rows = [rows]
+            else:
+                raise BrokerPositionSnapshotError("broker positions node malformed")
+        else:
+            raise BrokerPositionSnapshotError("broker positions result malformed")
+
+        if not isinstance(rows, list):
+            raise BrokerPositionSnapshotError("broker position rows malformed")
+        return rows
+
+    def _validated_broker_position_snapshot(
+        self, result, *, source: str = ""
+    ) -> BrokerPositionSnapshot:
+        rows = self._broker_position_rows_from_result(result)
+        validated: list[dict] = []
+        seen_contracts: set[str] = set()
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise BrokerPositionSnapshotError(
+                    f"broker position row {index} is not an object"
+                )
+            contract, quantity, reason = self._broker_position_row_result(row)
+            if quantity is None:
+                raise BrokerPositionSnapshotError(
+                    f"broker position row {index} rejected: {reason}"
+                )
+            if contract in seen_contracts:
+                raise BrokerPositionSnapshotError(
+                    f"duplicate broker position contract: {contract}",
+                    state=BROKER_POSITIONS_AMBIGUOUS,
+                )
+            seen_contracts.add(contract)
+            validated.append(dict(row))
+
+        state = (
+            BROKER_POSITIONS_AVAILABLE_OPEN
+            if any((self._broker_position_qty(row) or 0) > 0 for row in validated)
+            else BROKER_POSITIONS_AVAILABLE_EMPTY
+        )
+        return BrokerPositionSnapshot(validated, state=state, source=source)
+
+    @staticmethod
+    def _configured_mock_callable(candidate) -> bool:
+        """Recognize explicitly configured test doubles without trusting defaults."""
+        if not callable(candidate):
+            return False
+        if candidate.__class__.__module__ != "unittest.mock":
+            return True
+        if getattr(candidate, "_mock_side_effect", None) is not None:
+            return True
+        return (
+            getattr(candidate, "_mock_return_value", None).__class__.__module__
+            != "unittest.mock"
+        )
+
+    def _broker_position_reader(self):
+        broker = getattr(self, "broker", None)
+        strict_declared = getattr(type(broker), "list_positions_strict", None)
+        if callable(strict_declared):
+            return getattr(broker, "list_positions_strict"), "broker.list_positions_strict"
+
+        strict_candidate = getattr(broker, "list_positions_strict", None)
+        if self._configured_mock_callable(strict_candidate):
+            return strict_candidate, "broker.list_positions_strict"
+
+        legacy = getattr(broker, "list_positions", None)
+        if callable(legacy):
+            return legacy, "broker.list_positions"
+        return None, "broker.positions"
+
+    def _safe_get_broker_positions(self) -> BrokerPositionSnapshot:
+        """Fetch broker truth while preserving unavailable versus valid empty."""
+        reader, source = self._broker_position_reader()
+        if reader is None:
+            return BrokerPositionSnapshot(
+                state=BROKER_POSITIONS_UNAVAILABLE,
+                reason="reader_missing",
+                source=source,
+            )
+        try:
+            result = reader()
+        except Exception as exc:
+            log.error("[%s] %s failed: %s", self.client_id, source, exc)
+            return BrokerPositionSnapshot(
+                state=BROKER_POSITIONS_UNAVAILABLE,
+                reason=f"{type(exc).__name__}:{exc}",
+                source=source,
+            )
+        if result is None:
+            return BrokerPositionSnapshot(
+                state=BROKER_POSITIONS_UNAVAILABLE,
+                reason="result_none",
+                source=source,
+            )
+        if isinstance(result, BrokerPositionSnapshot):
+            return result
+        try:
+            return self._validated_broker_position_snapshot(result, source=source)
+        except BrokerPositionSnapshotError as exc:
+            log.error(
+                "[%s] %s rejected broker position truth: %s",
+                self.client_id,
+                source,
+                exc,
+            )
+            return BrokerPositionSnapshot(
+                state=exc.state,
+                reason=str(exc),
+                source=source,
+            )
+
+    def _coerce_broker_position_snapshot(self, value) -> BrokerPositionSnapshot:
+        """Normalize legacy test seams without weakening production validation."""
+        if isinstance(value, BrokerPositionSnapshot):
+            return value
+        try:
+            return self._validated_broker_position_snapshot(
+                value, source="injected.broker_positions"
+            )
+        except BrokerPositionSnapshotError as exc:
+            return BrokerPositionSnapshot(
+                state=exc.state,
+                reason=str(exc),
+                source="injected.broker_positions",
+            )
+
+    def _record_broker_snapshot_hold(
+        self, summary: dict, snapshot: BrokerPositionSnapshot, *, context: str
+    ) -> None:
+        reason_code = {
+            BROKER_POSITIONS_UNAVAILABLE: "broker_positions_unavailable",
+            BROKER_POSITIONS_MALFORMED: "broker_positions_malformed",
+            BROKER_POSITIONS_AMBIGUOUS: "broker_positions_ambiguous",
+        }.get(snapshot.state, "broker_positions_unknown")
+        if reason_code not in summary.setdefault("errors", []):
+            summary["errors"].append(reason_code)
+        summary["positions_alerted"] = int(summary.get("positions_alerted", 0)) + 1
+        log.error(
+            "[%s] RECONCILER_BROKER_POSITION_TRUTH_HOLD | context=%s "
+            "state=%s source=%s reason=%s",
+            self.client_id,
+            context,
+            snapshot.state,
+            snapshot.source,
+            snapshot.reason,
+        )
+        self._alert(
+            f"RECONCILER_BROKER_POSITION_TRUTH_HOLD | client={self.client_id} "
+            f"mode={getattr(self, 'execution_mode', None) or 'unknown'} context={context} "
+            f"state={snapshot.state} reason={snapshot.reason or 'unknown'}"
         )
 
     def _broker_position_underlying(self, bp: dict) -> str:
@@ -2979,19 +3421,6 @@ class APBrokerReconciler:
             or c_sym
         )
 
-    def _broker_position_qty(self, bp: dict) -> int:
-        raw = (
-            bp.get("quantity")
-            or bp.get("qty")
-            or bp.get("long_quantity")
-            or bp.get("short_quantity")
-            or 0
-        )
-        try:
-            return abs(int(float(raw)))
-        except Exception:
-            return 0
-
     def _broker_position_entry_price(self, bp: dict) -> float:
         """
         Conservative entry-price extraction. Tradier-like responses often include
@@ -3011,7 +3440,7 @@ class APBrokerReconciler:
         try:
             qty        = self._broker_position_qty(bp)
             cost_basis = float(bp.get("cost_basis") or bp.get("costbasis") or 0)
-            if qty > 0 and cost_basis > 0:
+            if qty is not None and qty > 0 and cost_basis > 0:
                 return abs(cost_basis) / qty / 100.0
         except Exception:
             pass
@@ -3139,7 +3568,18 @@ class APBrokerReconciler:
         summary.setdefault("positions_corrected", 0)
         summary.setdefault("positions_imported", 0)
 
-        broker_positions = self._safe_get_broker_positions()
+        broker_snapshot = self._coerce_broker_position_snapshot(
+            self._safe_get_broker_positions()
+        )
+        if not broker_snapshot.is_available:
+            # An unavailable or malformed snapshot cannot prove either broker
+            # flatness or broker ownership.  Do not enter ghost-close or import
+            # paths with an empty list produced by a failed read.
+            self._record_broker_snapshot_hold(
+                summary, broker_snapshot, context="position_reconcile"
+            )
+            return
+        broker_positions = broker_snapshot
         broker_by_contract:   dict[str, dict]       = {}
         broker_by_underlying: dict[str, list[dict]] = {}
 
@@ -3147,7 +3587,7 @@ class APBrokerReconciler:
             c_sym = self._broker_position_contract(bp)
             u_sym = self._broker_position_underlying(bp)
             qty   = self._broker_position_qty(bp)
-            if qty <= 0:
+            if qty is None or qty <= 0:
                 continue
             if c_sym:
                 broker_by_contract[c_sym] = bp
@@ -3210,6 +3650,12 @@ class APBrokerReconciler:
             if broker_pos is not None:
                 self._ghost_tracker.pop(contract, None)
                 broker_qty = self._broker_position_qty(broker_pos)
+                if broker_qty is None:
+                    # The fetched snapshot validator should make this
+                    # unreachable.  Keep the mutation caller fail-closed if a
+                    # custom broker seam bypasses that validation.
+                    summary["positions_alerted"] += 1
+                    continue
                 if broker_qty != db_qty and db_qty > 0:
                     log.warning(
                         "[%s] POSITION_QTY_MISMATCH | %s | DB=%d broker=%d",
@@ -3396,7 +3842,7 @@ class APBrokerReconciler:
                 continue
 
             qty = self._broker_position_qty(bp)
-            if qty <= 0:
+            if qty is None or qty <= 0:
                 continue
 
             from zoneinfo import ZoneInfo as _ZoneInfo
@@ -5583,7 +6029,7 @@ class APBrokerReconciler:
                         """
                         SELECT id, contract, option_symbol, underlying, ticker,
                                qty, quantity_remaining, avg_fill, entry_price,
-                               close_source, client_id
+                               close_source, client_id, execution_mode
                         FROM   positions
                         WHERE  client_id           = %s
                           AND  UPPER(status)        = 'CLOSED'
@@ -5612,34 +6058,76 @@ class APBrokerReconciler:
             )
 
             # ── Step 2: fetch broker truth once ──────────────────────────────
+            # The strict reader carries availability separately from its
+            # list-compatible rows.  An adapter exception must never become an
+            # authoritative empty map.
+            broker_snapshot = self._coerce_broker_position_snapshot(
+                self._safe_get_broker_positions()
+            )
             broker_open_by_contract: dict[str, int] = {}
-            broker_truth_available  = False
-            try:
-                if self.broker and hasattr(self.broker, "list_positions"):
-                    bp_list = self.broker.list_positions() or []
-                    for bp in bp_list:
-                        sym = self._norm_contract(
-                            str(bp.get("symbol") or bp.get("contract") or "")
-                        )
-                        qty = self._broker_position_qty(bp)
-                        if sym and qty > 0:
-                            broker_open_by_contract[sym] = qty
-                    broker_truth_available = True
-            except Exception as _bpe:
-                log.warning(
-                    "[%s] P0-PARTIAL-CLOSE-REPAIR broker fetch failed: %s — "
-                    "flagging rows for manual review without changing status",
-                    self.client_id, _bpe,
+            broker_truth_available = broker_snapshot.is_available
+            if broker_truth_available:
+                for bp in broker_snapshot:
+                    sym = self._broker_position_contract(bp)
+                    qty = self._broker_position_qty(bp)
+                    if sym and qty is not None and qty > 0:
+                        broker_open_by_contract[sym] = qty
+            else:
+                self._record_broker_snapshot_hold(
+                    summary, broker_snapshot, context="closed_position_repair"
                 )
 
             # ── Step 3: per-row repair ────────────────────────────────────────
             for row in bad_rows:
                 pos_id     = row.get("id")
-                contract   = self._norm_contract(
-                    row.get("contract") or row.get("option_symbol") or ""
-                )
+                contract, contract_reason = self._broker_position_contract_result(row)
                 rem_qty    = int(row.get("quantity_remaining") or 0)
                 full_qty   = int(row.get("qty") or rem_qty)
+
+                expected_client = str(self.client_id or "").strip().lower()
+                row_client = str(row.get("client_id") or "").strip().lower()
+                expected_mode = _normalize_execution_mode(
+                    getattr(self, "execution_mode", None)
+                )
+                row_mode = _normalize_execution_mode(row.get("execution_mode"))
+                if (
+                    not contract
+                    or not re.fullmatch(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract)
+                    or contract_reason != "ok"
+                    or not expected_client
+                    or row_client != expected_client
+                    or expected_mode is None
+                    or row_mode != expected_mode
+                ):
+                    reason = (
+                        "contract_identity"
+                        if not contract
+                        or not re.fullmatch(
+                            r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}", contract
+                        )
+                        or contract_reason != "ok"
+                        else "client_or_mode_identity"
+                    )
+                    if reason not in summary.setdefault("errors", []):
+                        summary["errors"].append(
+                            "closed_repair_identity_unproven"
+                        )
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted", 0)
+                    ) + 1
+                    log.error(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR HOLD | pos=%s "
+                        "contract=%s reason=%s row_client=%s row_mode=%s "
+                        "expected_mode=%s",
+                        self.client_id,
+                        pos_id,
+                        contract or "?",
+                        reason,
+                        row_client or "?",
+                        row.get("execution_mode") or "?",
+                        expected_mode or "?",
+                    )
+                    continue
 
                 if not broker_truth_available:
                     # Cannot verify — flag for operator, do not touch status
@@ -5672,9 +6160,10 @@ class APBrokerReconciler:
                                        updated_at         = NOW()
                                 WHERE  id         = %s
                                   AND  client_id  = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                                   AND  UPPER(status) = 'CLOSED'
                                 """,
-                                (st, rq, pid, self.client_id),
+                                (st, rq, pid, self.client_id, expected_mode),
                             )
                             return c.rowcount
 
@@ -5728,19 +6217,33 @@ class APBrokerReconciler:
                                        updated_at         = NOW()
                                 WHERE  id        = %s
                                   AND  client_id = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                                   AND  UPPER(status) = 'CLOSED'
                                 """,
-                                (pid, self.client_id),
+                                (pid, self.client_id, expected_mode),
                             )
                             return c.rowcount
 
-                    run_with_retry(_flatten)
-                    log.info(
-                        "[%s] P0-PARTIAL-CLOSE-REPAIR FLATTEN | "
-                        "pos=%s contract=%s | broker is flat, setting "
-                        "quantity_remaining=0, close_source=CLOSED_REPAIR",
-                        self.client_id, pos_id, contract,
-                    )
+                    updated = run_with_retry(_flatten)
+                    if updated:
+                        log.info(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR FLATTEN | "
+                            "pos=%s contract=%s | broker is flat, setting "
+                            "quantity_remaining=0, close_source=CLOSED_REPAIR",
+                            self.client_id, pos_id, contract,
+                        )
+                    else:
+                        if "closed_repair_update_failed" not in summary.setdefault(
+                            "errors", []
+                        ):
+                            summary["errors"].append("closed_repair_update_failed")
+                        log.error(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR FLATTEN HOLD | "
+                            "pos=%s contract=%s | durable update affected 0 rows",
+                            self.client_id,
+                            pos_id,
+                            contract,
+                        )
 
         except Exception as exc:
             log.error(

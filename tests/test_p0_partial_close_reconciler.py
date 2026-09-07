@@ -70,6 +70,7 @@ def _make_pos(
         "entry_price":       entry_price,
         "exit_price":        exit_price,
         "client_id":         client_id,
+        "execution_mode":    kw.get("execution_mode", "paper"),
         "side":              side,
         "direction":         side,
         "local_order_id":    kw.get("local_order_id", ""),

@@ -196,6 +196,7 @@ jobs:
             tests/test_p0_expired_broker_import_idempotency.py \
             tests/test_p0_attribution_integrity.py \
             tests/test_p0_partial_close_reconciler.py \
+            tests/test_p0_strict_broker_position_truth.py \
             tests/test_p0_broker_confirmed_daily_trade_count.py \
             tests/test_p0_schema_attestation_and_migration_runner.py \
             tests/test_p0_position_execution_mode_schema.py \

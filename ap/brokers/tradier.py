@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import math
+import re
 import requests
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional, Dict, Any, List
 
 from ap.broker import BrokerAdapter, BrokerOrderResponse, normalize_status
@@ -482,28 +485,114 @@ class TradierBroker(BrokerAdapter):
     def _list_positions(self, *, strict: bool) -> list:
         try:
             resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
-            positions = resp.get("positions", {})
-            if not positions or positions == "null":
-                return []
-            pos_list = positions.get("position", [])
-            if isinstance(pos_list, dict):
-                pos_list = [pos_list]
-            result = []
-            for p in pos_list:
-                result.append({
-                    "symbol":     p.get("symbol", ""),
-                    "quantity":   float(p.get("quantity", 0)),
-                    "cost_basis": float(p.get("cost_basis", 0)),
-                    "side":       (lambda sym: (
-                        "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
-                        "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
-                        "CALL" if "C" in sym else "PUT"
-                    ))(str(p.get("symbol", ""))),
-                    "raw":        p,
-                })
-            return result
+            return self._normalize_positions_payload(resp)
         except Exception as e:
             log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
             if strict:
                 raise
             return []
+
+    @staticmethod
+    def _strict_integral_quantity(value) -> int:
+        """Preserve broker direction and reject non-integral authority."""
+        if value is None or isinstance(value, bool):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        try:
+            parsed = Decimal(str(value))
+        except Exception as exc:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED") from exc
+        if not parsed.is_finite() or parsed != parsed.to_integral_value():
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        return int(parsed)
+
+    @staticmethod
+    def _strict_optional_float(value) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, bool):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        try:
+            parsed = float(value)
+        except Exception as exc:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED") from exc
+        if not math.isfinite(parsed):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        return parsed
+
+    @staticmethod
+    def _normalize_positions_payload(payload: Any) -> list[dict]:
+        """Normalize a complete Tradier positions envelope or raise."""
+        if not isinstance(payload, dict) or "positions" not in payload:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if any(
+            payload.get(key) not in (None, "", [], {})
+            for key in ("error", "errors", "message")
+        ):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if str(payload.get("status") or "").strip().lower() in {
+            "error", "failed", "failure", "unavailable",
+        }:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        positions = payload.get("positions")
+        if positions is None or positions == "null":
+            return []
+        if not isinstance(positions, dict) or not positions:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if any(
+            positions.get(key) not in (None, "", [], {})
+            for key in ("error", "errors", "message")
+        ):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if str(positions.get("status") or "").strip().lower() in {
+            "error", "failed", "failure", "unavailable",
+        }:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        rows = positions.get("position")
+        if rows is None or rows == "null":
+            return []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        normalized: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            raw_symbol = row.get("symbol")
+            if not isinstance(raw_symbol, str):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            symbol = raw_symbol.strip().upper()
+            if not symbol or not re.fullmatch(r"[A-Z0-9.]{1,32}", symbol):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            if "quantity" not in row:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            quantity = TradierBroker._strict_integral_quantity(row.get("quantity"))
+            if quantity < 0:
+                # Preserve the signed value in the parser, but do not expose
+                # short exposure as a valid long-position authority.
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            cost_basis = TradierBroker._strict_optional_float(row.get("cost_basis"))
+            occ_match = re.fullmatch(
+                r"[A-Z0-9.]{1,6}\d{6}([CP])\d{8}", symbol
+            )
+            side = (
+                "CALL" if occ_match and occ_match.group(1) == "C"
+                else "PUT" if occ_match else ""
+            )
+            normalized.append({
+                "symbol": symbol,
+                "quantity": quantity,
+                "cost_basis": cost_basis,
+                "side": side,
+                "raw": dict(row),
+            })
+        return normalized
