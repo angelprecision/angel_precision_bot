@@ -19,6 +19,27 @@ BLOCKER FIXES (PR #328 amendment):
   B4: registry proof requires 6-way identity + state + dedup; structured result
   B5: terminalize rereads order and verifies terminal status before counting
   B6: watch() failure → terminalize OR unresolved, never both
+
+── PR #580 — recovery-provenance contract (2026-09-04) ─────────────────
+This module is the sole caller responsible for proving that a watcher
+being reconstructed is the exact durable owner eligible for reattachment.
+It calls ap_entry_watcher.APEntryWatcher.watch(recovery_rearm=True), which:
+
+  1. runs recovery_trigger_evidence_identity_is_proven() to gate on
+     exact 6-way identity (canonical_signal_id, client_id, execution_mode,
+     signal_id, local_order_id, trigger_crossed_at provenance),
+  2. stamps signal_dict["__recovery_rearm"] = True as the private
+     recovery-provenance marker,
+  3. hands the signal_dict to add_signal(), which — and only if the
+     marker is present — invokes _restore_recovered_watcher_lifecycle()
+     to restore in-memory lifecycle ownership via the existing
+     ap_lifecycle API (NONE -> ADOPTED -> WATCHING). The bridge never
+     writes TRIGGER_READY; the normal poll path does that legally on
+     confirmed breach against current market truth.
+
+Ordinary (non-recovery) admissions do not carry the marker and are
+not touched by the bridge. See:
+  docs/pr_specs/p0_post_outage_trigger_lifecycle_convergence_20260904.md
 """
 
 from __future__ import annotations

@@ -44,6 +44,7 @@ try:
         LEDGER as _EW_LEDGER,
         SignalState as _EW_SS,
         LifecycleOwner as _EW_LO,
+        signal_adopted,
         signal_watching,
         signal_invalidated,
         signal_cancelled,
@@ -3044,6 +3045,145 @@ class APEntryWatcher:
         """Return whether legacy same-side arbitration applies."""
         return True
 
+    # ─────────────────────────────────────────────────────────────────────
+    # PR #580 — Recovery lifecycle restoration bridge
+    #
+    # Owns exactly ONE defect class: a durable PENDING_TRIGGER watcher
+    # that survives / reappears after a DB or process outage, with valid
+    # recovery/reattach authority, but whose in-memory ap_lifecycle
+    # ledger has no state for the recovered signal. On confirmed breach
+    # the watcher attempts NONE -> TRIGGER_READY, which is (correctly)
+    # illegal, so _current_state stays NONE, on_trigger fires anyway,
+    # downstream fails, and the WATCHER_TRIGGER_CALLBACK_ATTEMPT loops
+    # (September 4 2026 Jason LIVE PEP replay).
+    #
+    # This bridge restores in-memory lifecycle ownership BEFORE the
+    # watcher becomes behavior-active in the poll loop, using the
+    # existing lifecycle API — NONE -> ADOPTED -> WATCHING. It never
+    # writes TRIGGER_READY; the normal poll path does that legally
+    # when current market truth confirms breach.
+    #
+    # It runs only when signal["__recovery_rearm"] is True — a marker
+    # placed by watch() AFTER recovery_trigger_evidence_identity_is_proven()
+    # has already verified exact durable identity (spec §8 binding rule:
+    # "Do not make an unverified plan capable of requesting lifecycle
+    # restoration"). Ordinary new admissions are untouched.
+    #
+    # It does not add broker submit/cancel authority. It does not add
+    # any durable retry counter. It does not weaken LEGAL_TRANSITIONS.
+    # See docs/pr_specs/p0_post_outage_trigger_lifecycle_convergence_20260904.md
+    # ─────────────────────────────────────────────────────────────────────
+    def _restore_recovered_watcher_lifecycle(self, watched) -> tuple[bool, str]:
+        """Restore in-memory lifecycle for a proven-recovery watcher.
+
+        Returns ``(ok, reason_code)``. ``ok=False`` means HOLD — the
+        caller must un-register the watcher and refuse admission.
+        """
+        # If the lifecycle module isn't importable, this seam is a no-op.
+        # The watcher runs standalone in that mode by pre-existing design
+        # (_ew_record already swallows the same import failure); recovery
+        # bridging cannot be stricter than that base contract without
+        # gating production on a non-critical helper.
+        if not _EW_LIFECYCLE_OK:
+            return True, "recovery_lifecycle_module_unavailable_soft_ok"
+
+        signal_id = str((getattr(watched, "signal", {}) or {}).get("signal_id") or "").strip()
+        ticker = str(getattr(watched, "ticker", "") or "").strip()
+        if not signal_id or not ticker:
+            # Cannot make a per-signal lifecycle claim without exact
+            # identity. Refuse rather than fabricate.
+            return False, "recovery_lifecycle_missing_signal_identity"
+
+        try:
+            current = _EW_LEDGER.current_state(signal_id)
+        except Exception:
+            # Never crash the watcher on a lifecycle read failure. HOLD
+            # is the safe choice: we cannot prove admission is legal.
+            return False, "recovery_lifecycle_read_failed"
+
+        # ── Terminal / superseded / incompatible states — HOLD ────────
+        #
+        # §6: contradictory or terminal in-memory state (POSITION_OPENED,
+        # POSITION_RESEEDED, REMOVED, INVALIDATED, EXPIRED, REJECTED,
+        # CANCELLED, ERROR) — do not register a second behavior-active
+        # watcher; do not invoke callback; do not broker submit/cancel.
+        #
+        # §16 broker-ready negative control: if a downstream owner
+        # already holds authority (ENTRY_SUBMITTED means execution has
+        # taken over from the watcher), do NOT re-fire the watcher
+        # callback. Route to the existing recovery owner instead.
+        #
+        # LOADED_BY_OSM and REVALIDATING both represent another owner
+        # already actively working the signal — HOLD out of respect for
+        # that ownership.
+        _TERMINAL_OR_SUPERSEDED = {
+            _EW_SS.POSITION_OPENED,
+            _EW_SS.POSITION_RESEEDED,
+            _EW_SS.RECOVERED_POSITION,
+            _EW_SS.INVALIDATED,
+            _EW_SS.EXPIRED,
+            _EW_SS.CANCELLED,
+            _EW_SS.REJECTED,
+            _EW_SS.REMOVED,
+            _EW_SS.ERROR,
+            _EW_SS.ENTRY_SUBMITTED,
+            _EW_SS.TRIGGER_READY,      # a prior owner already advanced past WATCHING
+            _EW_SS.LOADED_BY_OSM,
+            _EW_SS.REVALIDATING,
+            _EW_SS.EVALUATING,
+            _EW_SS.REGISTERED,
+        }
+        if current in _TERMINAL_OR_SUPERSEDED:
+            return False, f"recovery_lifecycle_hold_state_{current.value}"
+
+        # ── Idempotent: already WATCHING ──────────────────────────────
+        if current == _EW_SS.WATCHING:
+            return True, "recovery_lifecycle_idempotent_watching"
+
+        # ── ADOPTED → WATCHING (single legal transition) ──────────────
+        if current == _EW_SS.ADOPTED:
+            try:
+                signal_watching(
+                    signal_id, ticker, _EW_LO.WATCHER,
+                    reason="restored_to_watching_after_restart",
+                )
+            except Exception:
+                return False, "recovery_lifecycle_adopted_to_watching_raised"
+            if _EW_LEDGER.current_state(signal_id) != _EW_SS.WATCHING:
+                return False, "recovery_lifecycle_adopted_to_watching_not_applied"
+            return True, "recovery_lifecycle_adopted_to_watching"
+
+        # ── NONE → ADOPTED → WATCHING (full restoration) ──────────────
+        if current is None:
+            try:
+                signal_adopted(
+                    signal_id, ticker,
+                    reason="restart_recovery_loaded_existing_signal",
+                )
+            except Exception:
+                return False, "recovery_lifecycle_adopt_raised"
+            if _EW_LEDGER.current_state(signal_id) != _EW_SS.ADOPTED:
+                return False, "recovery_lifecycle_adopt_not_applied"
+            try:
+                signal_watching(
+                    signal_id, ticker, _EW_LO.WATCHER,
+                    reason="restored_to_watching_after_restart",
+                )
+            except Exception:
+                return False, "recovery_lifecycle_watching_raised"
+            if _EW_LEDGER.current_state(signal_id) != _EW_SS.WATCHING:
+                return False, "recovery_lifecycle_watching_not_applied"
+            return True, "recovery_lifecycle_none_to_watching"
+
+        # ── PERSISTED / CREATED / anything else new ───────────────────
+        #
+        # PERSISTED and CREATED both legitimately allow WATCHING per
+        # LEGAL_TRANSITIONS, but a recovery-rearm admission observing
+        # either is unexpected — the recovery classifier normally
+        # reattaches to the durable row, not a mid-arm state. Refuse
+        # rather than silently coerce the state machine.
+        return False, f"recovery_lifecycle_hold_unexpected_state_{current.value}"
+
     def add_signal(
         self, signal: dict, *, registration_provenance_out: Optional[dict] = None,
     ) -> bool:
@@ -3513,6 +3653,61 @@ class APEntryWatcher:
                 self._dedup_set.add(dedup_key)
 
             self._pending.append(watched)
+
+            # ── PR #580: recovery lifecycle restoration bridge ────────
+            # Run BEFORE provenance is committed so a HOLD outcome
+            # cleanly un-registers without leaving created_by_this_call
+            # asserted for a watcher that never actually stays.
+            # Only fires when watch() has stamped __recovery_rearm=True
+            # after recovery_trigger_evidence_identity_is_proven()
+            # already verified exact durable identity. Ordinary new
+            # admissions skip this branch entirely.
+            if bool((getattr(watched, "signal", {}) or {}).get("__recovery_rearm")):
+                _rlok, _rlreason = self._restore_recovered_watcher_lifecycle(watched)
+                if not _rlok:
+                    # HOLD — remove the just-registered watcher.
+                    try:
+                        self._pending.remove(watched)
+                    except ValueError:
+                        pass
+                    if dedup_key:
+                        self._dedup_set.discard(dedup_key)
+                    try:
+                        _hold_audit = self._build_watcher_audit_payload(
+                            watched,
+                            trigger_type="recovery_lifecycle_hold",
+                            reason_code=_rlreason,
+                            raw_reason=_rlreason,
+                            extra={
+                                "signal_id":  watched.signal.get("signal_id"),
+                                "dedup_key":  dedup_key,
+                            },
+                        )
+                        self._persist_watcher_audit(
+                            watched.signal.get("local_order_id"),
+                            _hold_audit,
+                        )
+                    except Exception:
+                        # Audit write is best-effort; HOLD stands
+                        # regardless of persistence outcome.
+                        pass
+                    self._last_reject_reason = _rlreason
+                    log.critical(
+                        "[%s] RECOVERY_LIFECYCLE_HOLD signal_id=%s "
+                        "local_order_id=%s reason=%s",
+                        watched.ticker,
+                        watched.signal.get("signal_id"),
+                        watched.signal.get("local_order_id"),
+                        _rlreason,
+                    )
+                    # Explicit provenance reset — a HOLD is not a
+                    # created registration, even though we briefly
+                    # appended to _pending inside the same lock.
+                    if registration_provenance_out is not None:
+                        registration_provenance_out["created_by_this_call"] = False
+                        registration_provenance_out["registration_token"] = None
+                    return False
+
             # PR #421 final amendment (P0-1): this is the exact, sole
             # point a new WatchedSignal registration is committed to the
             # registry. Provenance must be set here, from the object this

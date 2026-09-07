@@ -2,9 +2,65 @@
 
 ## STATUS
 
-**SPEC ONLY / HARD HOLD. DO NOT MERGE OR DEPLOY.**
+**WIP IMPLEMENTATION / HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
-Base: `main@d3c61850df709fe4c399196b9c509f28c9af2a8a`
+Base after rebase: `main@eb1fdefd8fb35effd1752a8a4de50147c06b066b`
+Original spec base: `main@d3c61850df709fe4c399196b9c509f28c9af2a8a`
+
+Dependencies (§STATUS binding order):
+- PR #568 (deferred selector/materialization retry authority): **not merged** (draft, unstable)
+- PR #569 (fresh market truth / late watcher recovery): **not merged** (draft)
+
+Implementation on this branch is preparatory only, per explicit override.
+Before merge:
+1. #568 and #569 must be finalized, audited, and merged separately.
+2. This branch must be rebased onto post-#568/#569 `main`.
+3. The PEP fail-first replay in `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`
+   must be re-run against the rebased head. If #568/#569 already
+   eliminate the defect at that point, this PR closes as obsolete/no-code.
+4. Full P0 regression must pass at the exact rebased HEAD SHA.
+
+## Implementation summary
+
+Production files touched:
+- `ap_entry_watcher.py`: adds `signal_adopted` import, adds
+  `_restore_recovered_watcher_lifecycle()` helper, wires it into
+  `add_signal()` after `_pending.append()` but before provenance is
+  committed. Guarded by `signal["__recovery_rearm"]` — ordinary new
+  admissions untouched. No public API change; watcher shim preserved.
+- `ap/pending_trigger_restart_recovery.py`: docstring only — documents
+  the recovery-provenance contract with the new bridge.
+
+Supporting files:
+- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`: 15
+  tests. Fail-first replay for the PEP class, lifecycle restoration
+  matrix (NONE/ADOPTED/WATCHING/terminal), non-recovery-guard, identity
+  gate refusal, `NONE→TRIGGER_READY` invariant.
+- `.github/workflows/p0_regression.yml`: adds the new test to the P0
+  suite.
+
+Files NOT touched (§4/§5 binding):
+- `ap_lifecycle.py`, `ap/order_monitor.py`, `ap/preopen_readiness.py`,
+  `ap_overnight_reeval.py`, `ap/order_state_machine.py`,
+  `ap/selector_retry_policy.py`, `ap_execution_core.py`,
+  `ap/exposure_gate.py`, contract selector, scanner, sizing, scoring,
+  exit engine, reconciler, broker adapters, proof_trades, queue,
+  schema. Zero new broker submit/cancel authority. No durable retry
+  counter added.
+
+Adjacent regression status (against implementation on current main):
+- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`: 15/15 pass
+- `tests/test_p0_watcher_mvp_hardening.py`: pass
+- `tests/test_p0_watcher_recovery_execution_ownership.py`: pass
+- `tests/test_p0_watcher_rollback_exact_registration_identity.py`: pass
+- `tests/test_p0_pending_trigger_restart_recovery.py`: pass
+- `tests/test_p0_watcher_shim_api_parity.py`: pass
+- `tests/test_p0_watcher_invalidation_ownership.py`: pass
+- `tests/test_p0_watcher_breach_continuity_bounded_gap.py`: pass
+- `tests/test_p0_watcher_conflict_cancellation_proof.py`: pass
+- `tests/test_p0_pending_trigger_lifecycle_integrity.py`: 4 pre-existing
+  failures on current main, NOT caused by this patch (verified by
+  stash-and-rerun against unpatched HEAD).
 
 This PR owns one failure class:
 
