@@ -102,11 +102,11 @@ _RR_GENERATION_FIELD = "restart_rearm_generation"
 _RR_CLOSED_AT        = "restart_rearm_closed_at"
 _RR_CLOSE_REASON     = "restart_rearm_close_reason"
 
-# Late-attachment market truth may be unavailable for a bounded number of
-# durable lease generations.  The generation is persisted in orders.meta so a
-# process restart cannot reset the total allowance.
+# Late-attachment market truth may be unavailable across multiple durable
+# lease generations.  The generation is persisted in orders.meta so a process
+# restart cannot reset the diagnostic/cadence state.  It is never a finite
+# strategy-authority budget: data/infra unavailability remains RETRY/HOLD.
 _LATE_REARM_MAX_GENERATIONS = 3
-_LATE_REARM_EXPIRED_REASON = "late_attachment_market_truth_expired"
 
 _RETRY_MATERIALIZATION = "MATERIALIZATION_RETRY"
 _RETRY_RESTART_REARM  = "RESTART_REARM_RETRY"
@@ -839,9 +839,10 @@ class PendingTriggerRestartRecovery:
             )
 
         # An expired/exhausted lease is not watcher authority.  The exact
-        # late-policy path may create one fresh bounded generation, but this
+        # late-policy path creates one fresh bounded retry lease, but this
         # cycle performs no watcher mutation; the renewed next_at is consumed
-        # by a later normal monitor tick.
+        # by a later normal monitor tick.  Retry exhaustion is infrastructure
+        # state, never a market-terminal decision.
         if _late_policy and (now > deadline or attempt >= max_attempts):
             return self._enter_restart_rearm_retry(
                 local_oid,
@@ -1297,8 +1298,8 @@ class PendingTriggerRestartRecovery:
             _attempts = 1
             first_failed_at = None
         # A proven late market-data HOLD is not setup invalidity.  Start a new
-        # bounded lease generation instead of converting retry exhaustion into
-        # a permanent trade decision.  Ordinary restart retries retain their
+        # bounded retry lease instead of converting retry exhaustion into a
+        # permanent trade decision.  Ordinary restart retries retain their
         # existing terminal exhaustion behavior.
         if _attempts > _max and _late_policy:
             _attempts = 1
@@ -1345,22 +1346,13 @@ class PendingTriggerRestartRecovery:
             )
 
         if _late_policy and _roll_generation:
-            _next_generation = _generation + 1
-            if _next_generation > _LATE_REARM_MAX_GENERATIONS:
-                return self._terminalize_with_reason(
-                    local_oid,
-                    row,
-                    _LATE_REARM_EXPIRED_REASON,
-                    meta_patch={
-                        _RR_STATUS_FIELD: "CLOSED",
-                        _RR_CLOSE_REASON: _LATE_REARM_EXPIRED_REASON,
-                        _RR_GENERATION_FIELD: _generation,
-                        _RR_NEXT_AT_FIELD: None,
-                        _RR_DEADLINE_FIELD: None,
-                        "restart_rearm_exhausted_generation": _generation,
-                    },
-                )
-            _generation = _next_generation
+            # The generation cap is diagnostic/cadence state only.  Once the
+            # cap is reached, keep the durable generation at the cap and start
+            # another bounded HOLD lease; no retry count can reject the setup.
+            _generation = min(
+                _generation + 1,
+                _LATE_REARM_MAX_GENERATIONS,
+            )
         _next_dt = min(_now + timedelta(seconds=_delay), _deadline_dt)
         _next = _next_dt.isoformat()
         _deadline = _deadline_dt.isoformat()

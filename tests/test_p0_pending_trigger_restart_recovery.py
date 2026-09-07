@@ -3416,7 +3416,7 @@ class TestLateMarketValidityRecovery:
         assert datetime.fromisoformat(final_meta[_RR_DEADLINE_FIELD]) > datetime.now(timezone.utc)
         assert osm.cancel_calls == []
 
-    def test_final_late_generation_expires_to_named_terminal_without_broker_mutation(self):
+    def test_final_late_generation_continues_retry_without_terminalizing(self):
         expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
         row = _canonical_late_retry_row(
             local_order_id="late-final-generation",
@@ -3432,22 +3432,19 @@ class TestLateMarketValidityRecovery:
 
         persisted = osm.get_order(row["local_order_id"])
         meta = persisted["meta"]
-        assert outcome == _RowOutcome.TERMINALIZED
-        assert persisted["status"] == "CANCELED"
-        assert persisted["last_error"] == "late_attachment_market_truth_expired"
-        assert meta[_RR_STATUS_FIELD] == "CLOSED"
-        assert meta[_RR_CLOSE_REASON] == "late_attachment_market_truth_expired"
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert persisted["status"] == "PENDING_TRIGGER"
+        assert not persisted.get("last_error")
+        assert meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert meta[_RR_ATTEMPT_FIELD] == 1
         assert meta[_RR_GENERATION_FIELD] == _LATE_REARM_MAX_GENERATIONS
-        assert meta[_RR_NEXT_AT_FIELD] is None
-        assert meta[_RR_DEADLINE_FIELD] is None
-        assert meta["restart_rearm_exhausted_generation"] == _LATE_REARM_MAX_GENERATIONS
+        assert datetime.fromisoformat(meta[_RR_NEXT_AT_FIELD]) > datetime.now(timezone.utc)
+        assert datetime.fromisoformat(meta[_RR_DEADLINE_FIELD]) > datetime.now(timezone.utc)
         assert watcher.watch_calls == 0
-        assert osm.cancel_calls == [
-            (row["local_order_id"], "late_attachment_market_truth_expired")
-        ]
+        assert osm.cancel_calls == []
         _assert_no_broker_mutation(rec.broker)
 
-    def test_restart_preserves_late_generation_and_cannot_reset_total_authority(self):
+    def test_restart_preserves_late_retry_after_generation_cap(self):
         expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
         expired_dt = datetime.fromisoformat(expired)
         row = _canonical_late_retry_row(
@@ -3501,11 +3498,163 @@ class TestLateMarketValidityRecovery:
             watcher=_MonitorWatcher(watch_returns=False),
             quote_result=None,
         )
-        assert rec_three.recover_one_row(row_three) == _RowOutcome.TERMINALIZED
+        assert rec_three.recover_one_row(row_three) == _RowOutcome.RETRY_OWNED
         final = osm.get_order(row["local_order_id"])
+        assert final["status"] == "PENDING_TRIGGER"
         assert final["meta"][_RR_GENERATION_FIELD] == 3
-        assert final["last_error"] == "late_attachment_market_truth_expired"
-        assert len(osm.cancel_calls) == 1
+        assert final["meta"][_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert final["meta"][_RR_ATTEMPT_FIELD] == 1
+        assert datetime.fromisoformat(final["meta"][_RR_DEADLINE_FIELD]) > datetime.now(timezone.utc)
+        assert osm.cancel_calls == []
+
+        # A fresh post-open truth pass may arrive after the capped generation;
+        # the same durable identity must still reach exactly one watcher.
+        final = _force_late_retry_attempt_due(final)
+        watcher_four = _MonitorWatcher(watch_returns=True)
+        rec_four, _ = _make_recovery(
+            final,
+            osm=osm,
+            watcher=watcher_four,
+            quote_result=None,
+        )
+        assert rec_four.recover_one_row(final) == _RowOutcome.WATCHER_OWNED
+        attached = osm.get_order(row["local_order_id"])
+        assert attached["local_order_id"] == row["local_order_id"]
+        assert attached["signal_id"] == row["signal_id"]
+        assert attached["client_id"] == row["client_id"]
+        assert attached["execution_mode"] == row["execution_mode"]
+        assert attached["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert attached["meta"][_RR_NEXT_AT_FIELD] is None
+        assert attached["meta"][_RR_DEADLINE_FIELD] is None
+        assert watcher_four.watch_calls == 1
+        assert osm.cancel_calls == []
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_prolonged_market_truth_outage_survives_generation_cap_then_recovers(self, mode):
+        row = _canonical_late_retry_row(
+            local_order_id="late-prolonged-outage",
+            signal_id="late-signal-prolonged-outage",
+            mode=mode,
+            attempt=6,
+            generation=1,
+        )
+        row["canonical_signal_id"] = "late-canonical-prolonged-outage"
+        row["meta"]["canonical_signal_id"] = row["canonical_signal_id"]
+        watcher = _SequenceWatcher([False, False, False, False, True])
+        rec, osm = _make_recovery(
+            row,
+            watcher=watcher,
+            mode=mode,
+            quote_result=None,
+        )
+        identity = {
+            key: row[key]
+            for key in ("local_order_id", "signal_id", "client_id", "execution_mode")
+        }
+        identity["canonical_signal_id"] = row["canonical_signal_id"]
+
+        # A canonical watcher pass can remain unavailable inside a lease;
+        # it renews RETRY/HOLD without changing identity or broker authority.
+        current = _force_late_retry_attempt_due(
+            osm.get_order(row["local_order_id"])
+        )
+        assert rec.recover_one_row(current) == _RowOutcome.RETRY_OWNED
+        assert current["meta"][_RR_GENERATION_FIELD] == 1
+        assert current["meta"][_RR_ATTEMPT_FIELD] == 2
+        assert osm.cancel_calls == []
+
+        # Expired/exhausted leases then roll through generations 2, 3, and
+        # the capped diagnostic generation 3. Each renewed lease gets another
+        # canonical truth pass before the eventual valid recovery.
+        observed_generations = []
+        for expected_generation in (2, 3, 3):
+            current = _force_late_retry_due(osm.get_order(row["local_order_id"]))
+            assert rec.recover_one_row(current) == _RowOutcome.RETRY_OWNED
+            observed_generations.append(current["meta"][_RR_GENERATION_FIELD])
+            assert current["meta"][_RR_STATUS_FIELD] == "RETRY_PENDING"
+            assert current["meta"][_RR_ATTEMPT_FIELD] == 1
+            assert osm.cancel_calls == []
+
+            current = _force_late_retry_attempt_due(
+                osm.get_order(row["local_order_id"])
+            )
+            assert rec.recover_one_row(current) == _RowOutcome.RETRY_OWNED
+            assert current["meta"][_RR_GENERATION_FIELD] == expected_generation
+            assert current["meta"][_RR_ATTEMPT_FIELD] == 2
+            assert osm.cancel_calls == []
+        assert observed_generations == [2, 3, 3]
+
+        current = _force_late_retry_attempt_due(
+            osm.get_order(row["local_order_id"])
+        )
+        assert rec.recover_one_row(current) == _RowOutcome.WATCHER_OWNED
+
+        final = osm.get_order(row["local_order_id"])
+        assert {key: final[key] for key in identity if key in final} == {
+            key: value for key, value in identity.items() if key in final
+        }
+        assert final["meta"]["canonical_signal_id"] == identity["canonical_signal_id"]
+        assert final["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert final["meta"][_RR_NEXT_AT_FIELD] is None
+        assert final["meta"][_RR_DEADLINE_FIELD] is None
+        assert watcher.watch_calls == 5
+        assert len(watcher._pending) == 1
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_prolonged_market_truth_outage_then_canonical_terminal(self):
+        row = _canonical_late_retry_row(
+            local_order_id="late-prolonged-terminal",
+            signal_id="late-signal-prolonged-terminal",
+            attempt=6,
+            generation=1,
+        )
+        osm = _MockOSM()
+        osm.seed(row)
+
+        class _TerminalAfterOutageWatcher(_SequenceWatcher):
+            def watch(self, plan, local_order_id, **kwargs):
+                if len(self._outcomes) == 1:
+                    osm._rows[local_order_id]["status"] = "EXPIRED"
+                    osm._rows[local_order_id]["last_error"] = (
+                        "target_already_complete_terminal"
+                    )
+                return super().watch(plan, local_order_id, **kwargs)
+
+        watcher = _TerminalAfterOutageWatcher([False, False, False, False, False])
+        rec, _ = _make_recovery(
+            row,
+            osm=osm,
+            watcher=watcher,
+            quote_result=None,
+        )
+
+        current = _force_late_retry_attempt_due(
+            osm.get_order(row["local_order_id"])
+        )
+        assert rec.recover_one_row(current) == _RowOutcome.RETRY_OWNED
+
+        for expected_generation in (2, 3, 3):
+            current = _force_late_retry_due(osm.get_order(row["local_order_id"]))
+            assert rec.recover_one_row(current) == _RowOutcome.RETRY_OWNED
+            assert current["meta"][_RR_GENERATION_FIELD] == expected_generation
+            current = _force_late_retry_attempt_due(
+                osm.get_order(row["local_order_id"])
+            )
+            assert rec.recover_one_row(current) == _RowOutcome.RETRY_OWNED
+
+        current = _force_late_retry_attempt_due(
+            osm.get_order(row["local_order_id"])
+        )
+        assert rec.recover_one_row(current) == _RowOutcome.TERMINALIZED
+        final = osm.get_order(row["local_order_id"])
+        assert final["status"] == "EXPIRED"
+        assert final["last_error"] == "target_already_complete_terminal"
+        assert final["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert watcher.watch_calls == 5
+        assert watcher._pending == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
 
     @pytest.mark.parametrize("malformation", ["missing", "string", "zero", "too_high", "bool"])
     def test_malformed_or_missing_late_generation_cannot_grant_extra_attempts(self, malformation):
@@ -3700,6 +3849,20 @@ class _MonitorWatcher(_MockWatcher):
         return super().watch(*args, **kwargs)
 
 
+class _SequenceWatcher(_MonitorWatcher):
+    """Return a scripted market-truth outcome for repeated recovery passes."""
+
+    def __init__(self, outcomes):
+        super().__init__(watch_returns=True)
+        self._outcomes = list(outcomes)
+
+    def watch(self, *args, **kwargs):
+        assert self._outcomes, "unexpected watcher registration"
+        self.watch_calls += 1
+        self._watch_returns = bool(self._outcomes.pop(0))
+        return _MockWatcher.watch(self, *args, **kwargs)
+
+
 def _canonical_late_retry_row(
     *,
     local_order_id="late-monitor-1",
@@ -3736,6 +3899,36 @@ def _canonical_late_retry_row(
             _RR_GENERATION_FIELD: generation,
         },
     )
+
+
+def _force_late_retry_due(row, *, attempt=6):
+    """Make the current retry lease due without changing durable identity."""
+    now = datetime.now(timezone.utc)
+    expired = (now - timedelta(seconds=30)).isoformat()
+    meta = row["meta"]
+    meta[_RR_STATUS_FIELD] = "RETRY_PENDING"
+    meta[_RR_ATTEMPT_FIELD] = attempt
+    meta[_RR_NEXT_AT_FIELD] = expired
+    meta[_RR_DEADLINE_FIELD] = expired
+    meta[_RR_FIRST_FAILED_AT] = (now - timedelta(seconds=90)).isoformat()
+    meta["restart_rearm_last_failed_at"] = (now - timedelta(seconds=60)).isoformat()
+    return row
+
+
+def _force_late_retry_attempt_due(row):
+    """Make a renewed lease due while preserving its future deadline."""
+    now = datetime.now(timezone.utc)
+    meta = row["meta"]
+    meta[_RR_STATUS_FIELD] = "RETRY_PENDING"
+    meta[_RR_ATTEMPT_FIELD] = 1
+    meta[_RR_NEXT_AT_FIELD] = (now - timedelta(seconds=30)).isoformat()
+    # Keep the lease internally coherent for the production verifier: the
+    # renewed deadline remains future-bounded, but is close enough to the
+    # fresh failure timestamp to satisfy the existing retry horizon.
+    meta[_RR_FIRST_FAILED_AT] = (now - timedelta(seconds=90)).isoformat()
+    meta["restart_rearm_last_failed_at"] = (now - timedelta(seconds=60)).isoformat()
+    meta[_RR_DEADLINE_FIELD] = (now + timedelta(seconds=60)).isoformat()
+    return row
 
 
 def _monitor_for_retry(row, watcher, *, monitor_client=None, monitor_mode=None):
@@ -4149,6 +4342,67 @@ class TestPR569OrderMonitorRetryLiveness:
         assert final_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
         assert final_meta[_RR_ATTEMPT_FIELD] == 1
         assert datetime.fromisoformat(final_meta[_RR_DEADLINE_FIELD]) > datetime.now(timezone.utc)
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_order_monitor_preserves_prolonged_outage_then_rearms_once(self, mode):
+        row = _canonical_late_retry_row(
+            local_order_id="late-monitor-prolonged-outage",
+            signal_id="late-monitor-signal-prolonged-outage",
+            mode=mode,
+            attempt=6,
+            generation=1,
+        )
+        watcher = _SequenceWatcher([False, False, False, False, True])
+        monitor, osm, broker = _monitor_for_retry(
+            row,
+            watcher,
+            monitor_mode=mode,
+        )
+
+        current = _force_late_retry_attempt_due(
+            osm.get_order(row["local_order_id"])
+        )
+        _run_young_pending_monitor(monitor, current)
+        final_meta = osm.get_order(row["local_order_id"])["meta"]
+        assert final_meta[_RR_GENERATION_FIELD] == 1
+        assert final_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert final_meta[_RR_ATTEMPT_FIELD] == 2
+        assert osm.cancel_calls == []
+
+        observed_generations = []
+        for expected_generation in (2, 3, 3):
+            current = _force_late_retry_due(osm.get_order(row["local_order_id"]))
+            _run_young_pending_monitor(monitor, current)
+            final_meta = osm.get_order(row["local_order_id"])["meta"]
+            observed_generations.append(final_meta[_RR_GENERATION_FIELD])
+            assert final_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+            assert final_meta[_RR_ATTEMPT_FIELD] == 1
+            assert osm.cancel_calls == []
+
+            current = _force_late_retry_attempt_due(
+                osm.get_order(row["local_order_id"])
+            )
+            _run_young_pending_monitor(monitor, current)
+            final_meta = osm.get_order(row["local_order_id"])["meta"]
+            assert final_meta[_RR_GENERATION_FIELD] == expected_generation
+            assert final_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+            assert final_meta[_RR_ATTEMPT_FIELD] == 2
+            assert osm.cancel_calls == []
+        assert observed_generations == [2, 3, 3]
+
+        current = _force_late_retry_attempt_due(
+            osm.get_order(row["local_order_id"])
+        )
+        _run_young_pending_monitor(monitor, current)
+
+        final = osm.get_order(row["local_order_id"])
+        assert final["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert final["meta"][_RR_NEXT_AT_FIELD] is None
+        assert final["meta"][_RR_DEADLINE_FIELD] is None
+        assert watcher.watch_calls == 5
+        assert len(watcher._pending) == 1
         assert osm.cancel_calls == []
         _assert_no_broker_mutation(broker)
 
