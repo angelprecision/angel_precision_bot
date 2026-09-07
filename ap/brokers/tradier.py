@@ -555,16 +555,17 @@ class TradierBroker(BrokerAdapter):
 
     @staticmethod
     def _strict_validate_envelope(value: dict) -> None:
-        failure_statuses = {"error", "failed", "failure", "unavailable"}
+        successful_statuses = {"ok", "success", "successful"}
         for key, raw_value in value.items():
             normalized_key = str(key).strip().lower()
             if normalized_key in {"error", "errors", "message"}:
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
-            if (
-                normalized_key == "status"
-                and str(raw_value or "").strip().lower() in failure_statuses
-            ):
-                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            if normalized_key == "status":
+                if (
+                    not isinstance(raw_value, str)
+                    or raw_value.strip().lower() not in successful_statuses
+                ):
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
 
     @classmethod
     def _strict_position_quantity(cls, row: dict) -> int:
@@ -579,6 +580,8 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
 
         if not values or len(set(values)) != 1:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if values[0] <= 0:
             raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
 
         for key in ("side", "position_type", "direction"):

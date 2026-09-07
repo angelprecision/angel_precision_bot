@@ -40,13 +40,13 @@ def _tradier(*, payload=None, error=None) -> TradierBroker:
     return broker
 
 
-def _reconciler(broker) -> APBrokerReconciler:
+def _reconciler(broker, *, execution_mode="live") -> APBrokerReconciler:
     return APBrokerReconciler(
         broker=broker,
         client_id=CLIENT,
         osm=MagicMock(),
         pm=MagicMock(),
-        execution_mode="live",
+        execution_mode=execution_mode,
     )
 
 
@@ -93,6 +93,7 @@ def postgres_closed_row(monkeypatch):
                 close_source        TEXT,
                 client_id           TEXT,
                 status              TEXT,
+                execution_mode      TEXT,
                 entry_ts            TIMESTAMPTZ,
                 updated_at          TIMESTAMPTZ
             )
@@ -136,6 +137,7 @@ def postgres_closed_row(monkeypatch):
             "close_source": "LEGACY_CLOSE",
             "client_id": CLIENT,
             "status": "CLOSED",
+            "execution_mode": "live",
         }
         row.update(overrides)
         with connection.cursor() as cursor:
@@ -144,11 +146,12 @@ def postgres_closed_row(monkeypatch):
                 INSERT INTO positions (
                     id, contract, option_symbol, underlying, ticker, qty,
                     quantity_remaining, avg_fill, entry_price, close_source,
-                    client_id, status
+                    client_id, status, execution_mode
                 ) VALUES (
                     %(id)s, %(contract)s, %(option_symbol)s, %(underlying)s,
                     %(ticker)s, %(qty)s, %(quantity_remaining)s, %(avg_fill)s,
-                    %(entry_price)s, %(close_source)s, %(client_id)s, %(status)s
+                    %(entry_price)s, %(close_source)s, %(client_id)s, %(status)s,
+                    %(execution_mode)s
                 )
                 """,
                 row,
@@ -192,6 +195,8 @@ def test_strict_positions_reader_propagates_transport_failure():
         {"status": "failed", "positions": {"position": []}},
         {"status": "failure", "positions": {"position": []}},
         {"status": "unavailable", "positions": {"position": []}},
+        {"status": {"code": 500}, "positions": {"position": []}},
+        {"status": "unknown", "positions": {"position": []}},
         {"positions": {}},
         {"positions": {"status": "ok"}},
         {"positions": {"metadata": "x"}},
@@ -199,11 +204,14 @@ def test_strict_positions_reader_propagates_transport_failure():
         {"positions": {"position": [], "errors": ["unavailable"]}},
         {"positions": {"position": [], "message": "unavailable"}},
         {"positions": {"position": [], "status": "error"}},
+        {"positions": {"position": [], "status": {"code": 500}}},
+        {"positions": {"position": [], "status": "unknown"}},
         {"positions": {"position": [None]}},
         {"positions": {"position": ["row"]}},
         {"positions": {"position": [{"quantity": 1}]}},
         {"positions": {"position": [{"symbol": "", "quantity": 1}]}},
         {"positions": {"position": [{"symbol": CONTRACT}]}},
+        {"positions": {"position": [{"symbol": CONTRACT, "quantity": 0}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": -1}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1.5}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": True}]}},
@@ -227,6 +235,9 @@ def test_strict_positions_reader_rejects_unusable_payloads(payload):
 def test_strict_positions_reader_accepts_only_documented_empty_and_valid_long():
     assert _tradier(payload={"positions": "null"}).list_positions_strict() == []
     assert _tradier(payload={"positions": {"position": []}}).list_positions_strict() == []
+    assert _tradier(
+        payload={"positions": {"status": "ok", "position": []}}
+    ).list_positions_strict() == []
 
     rows = _tradier(
         payload={
@@ -288,8 +299,11 @@ def test_postgres_transport_failure_leaves_closed_row_unchanged(
     "payload",
     [
         {"positions": {"status": "ok"}},
+        {"positions": {"status": {"code": 500}, "position": []}},
+        {"positions": {"status": "unknown", "position": []}},
         {"positions": {"position": [], "error": "unavailable"}},
         {"positions": {"position": [None]}},
+        {"positions": {"position": [{"symbol": CONTRACT, "quantity": 0}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": -1}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1.5}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": True}]}},
@@ -317,9 +331,12 @@ def test_postgres_malformed_truth_leaves_closed_row_unchanged(
     _assert_no_broker_mutations(broker)
 
 
-def test_postgres_valid_long_preserves_existing_restore_behavior(postgres_closed_row):
+@pytest.mark.parametrize("mode", ["live", "paper"])
+def test_postgres_valid_long_preserves_existing_restore_behavior(
+    postgres_closed_row, mode
+):
     insert, read, _executed_sql = postgres_closed_row
-    insert(qty=10, quantity_remaining=2)
+    insert(qty=10, quantity_remaining=2, execution_mode=mode)
     broker = _tradier(
         payload={
             "positions": {
@@ -327,7 +344,7 @@ def test_postgres_valid_long_preserves_existing_restore_behavior(postgres_closed
             }
         }
     )
-    rec = _reconciler(broker)
+    rec = _reconciler(broker, execution_mode=mode)
     rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
     rec._seed_exit_engine_from_position = MagicMock(return_value=True)
 
@@ -340,13 +357,14 @@ def test_postgres_valid_long_preserves_existing_restore_behavior(postgres_closed
     }
 
 
+@pytest.mark.parametrize("mode", ["live", "paper"])
 def test_postgres_authoritative_empty_preserves_existing_flatten_behavior(
-    postgres_closed_row,
+    postgres_closed_row, mode
 ):
     insert, read, _executed_sql = postgres_closed_row
-    insert()
+    insert(execution_mode=mode)
     broker = _tradier(payload={"positions": {"position": []}})
-    rec = _reconciler(broker)
+    rec = _reconciler(broker, execution_mode=mode)
 
     rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
 
@@ -355,3 +373,54 @@ def test_postgres_authoritative_empty_preserves_existing_flatten_behavior(
         "quantity_remaining": 0,
         "close_source": "CLOSED_REPAIR",
     }
+
+
+@pytest.mark.parametrize(
+    ("reconciler_mode", "row_mode"),
+    [("live", "paper"), ("paper", "live")],
+)
+def test_postgres_execution_mode_mismatch_does_not_mutate_closed_row(
+    postgres_closed_row, reconciler_mode, row_mode
+):
+    insert, read, executed_sql = postgres_closed_row
+    insert(execution_mode=row_mode)
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [{"symbol": CONTRACT, "quantity": 5}]
+            }
+        }
+    )
+    rec = _reconciler(broker, execution_mode=reconciler_mode)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+@pytest.mark.parametrize("row_mode", [None, ""])
+def test_postgres_unproven_execution_mode_does_not_mutate_closed_row(
+    postgres_closed_row, row_mode
+):
+    insert, read, executed_sql = postgres_closed_row
+    insert(execution_mode=row_mode)
+    broker = _tradier(payload={"positions": {"position": []}})
+    rec = _reconciler(broker, execution_mode="live")
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)

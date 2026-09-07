@@ -5587,7 +5587,7 @@ class APBrokerReconciler:
                 if not parsed.is_finite() or parsed != parsed.to_integral_value():
                     raise ValueError("closed_repair_broker_position_malformed")
                 quantity = int(parsed)
-                if quantity < 0:
+                if quantity <= 0:
                     raise ValueError("closed_repair_broker_position_malformed")
                 values.append(quantity)
 
@@ -5676,6 +5676,17 @@ class APBrokerReconciler:
         try:
             from ap.db import conn, run_with_retry
 
+            repair_mode = _normalize_execution_mode(self.execution_mode)
+            if repair_mode is None:
+                summary.setdefault("errors", []).append(
+                    "closed_repair_execution_mode_unproven"
+                )
+                log.error(
+                    "[%s] P0-PARTIAL-CLOSE-REPAIR blocked: execution_mode is unproven",
+                    self.client_id,
+                )
+                return
+
             # ── Step 1: find all CLOSED rows with quantity_remaining > 0 ──────
             def _scan():
                 with conn() as c:
@@ -5683,15 +5694,16 @@ class APBrokerReconciler:
                         """
                         SELECT id, contract, option_symbol, underlying, ticker,
                                qty, quantity_remaining, avg_fill, entry_price,
-                               close_source, client_id
+                               close_source, client_id, execution_mode
                         FROM   positions
                         WHERE  client_id           = %s
+                          AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                           AND  UPPER(status)        = 'CLOSED'
                           AND  COALESCE(quantity_remaining, 0) > 0
                         ORDER  BY entry_ts DESC NULLS LAST
                         LIMIT  100
                         """,
-                        (self.client_id,),
+                        (self.client_id, repair_mode),
                     )
                     return [dict(r) for r in c.fetchall()]
 
@@ -5759,7 +5771,12 @@ class APBrokerReconciler:
                     restore_status = "PARTIAL" if full_qty > rem_qty else "OPEN"
                     restore_remaining = min(broker_qty, rem_qty)  # trust broker qty
 
-                    def _restore(pid=pos_id, st=restore_status, rq=restore_remaining):
+                    def _restore(
+                        pid=pos_id,
+                        st=restore_status,
+                        rq=restore_remaining,
+                        mode=repair_mode,
+                    ):
                         with conn() as c:
                             c.execute(
                                 """
@@ -5770,9 +5787,10 @@ class APBrokerReconciler:
                                        updated_at         = NOW()
                                 WHERE  id         = %s
                                   AND  client_id  = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                                   AND  UPPER(status) = 'CLOSED'
                                 """,
-                                (st, rq, pid, self.client_id),
+                                (st, rq, pid, self.client_id, mode),
                             )
                             return c.rowcount
 
@@ -5816,7 +5834,7 @@ class APBrokerReconciler:
                             )
                 else:
                     # Broker is flat — fix the DB row (zero remaining, stay CLOSED)
-                    def _flatten(pid=pos_id):
+                    def _flatten(pid=pos_id, mode=repair_mode):
                         with conn() as c:
                             c.execute(
                                 """
@@ -5826,9 +5844,10 @@ class APBrokerReconciler:
                                        updated_at         = NOW()
                                 WHERE  id        = %s
                                   AND  client_id = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                                   AND  UPPER(status) = 'CLOSED'
                                 """,
-                                (pid, self.client_id),
+                                (pid, self.client_id, mode),
                             )
                             return c.rowcount
 
