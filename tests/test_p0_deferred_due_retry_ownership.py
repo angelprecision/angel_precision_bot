@@ -51,6 +51,12 @@ LOCAL_ORDER_ID = "oid-due-retry-1"
 SIGNAL_ID = "sig-due-retry-1"
 
 
+@pytest.fixture(autouse=True)
+def _open_retry_cutoff_for_deterministic_tests(monkeypatch):
+    """Keep lifecycle tests independent of the wall clock's ET cutoff."""
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2742,6 +2748,57 @@ def test_pr568_backoff_clip_noop_when_no_deadline_present():
             _os_local.environ["VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS"] = prior_step1
 
 
+def test_pr568_resume_uses_earliest_durable_deadline_before_claim():
+    """A later first alias cannot hide an already-expired earlier alias."""
+    core = _core()
+    row = _row()
+    now = datetime.now(timezone.utc)
+    row["meta"].update({
+        "absolute_entry_deadline": _iso(now + timedelta(minutes=10)),
+        "retry_deadline": _iso(now - timedelta(seconds=1)),
+        "deferred_retry_deadline": _iso(now + timedelta(minutes=5)),
+    })
+    core.order_state_machine.get_order.return_value = row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-earliest-deadline",
+    )
+
+    assert result["reason_code"] == "RETRY_DEADLINE_EXHAUSTED"
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+    core._on_entry_trigger.assert_not_called()
+    core.broker.submit_order.assert_not_called()
+    core.broker.cancel_order.assert_not_called()
+
+
+def test_pr568_resume_rejects_malformed_secondary_deadline_before_claim():
+    """A malformed non-empty alias is not bypassed by a valid first alias."""
+    core = _core()
+    row = _row()
+    now = datetime.now(timezone.utc)
+    row["meta"].update({
+        "absolute_entry_deadline": _iso(now + timedelta(minutes=10)),
+        "retry_deadline": "not-a-timestamp",
+    })
+    core.order_state_machine.get_order.return_value = row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-malformed-deadline",
+    )
+
+    assert result["reason_code"] == "RETRY_INVALID_DEADLINE"
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+    core._on_entry_trigger.assert_not_called()
+    core.broker.submit_order.assert_not_called()
+    core.broker.cancel_order.assert_not_called()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Second-round blocker tests from reviewer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3080,6 +3137,14 @@ def test_phase_one_restart_cas_preserves_attempt_and_requires_broker_fences(
         "recovery_submit_fenced",
     ):
         assert broker_fence in sql
+    for reason_alias in (
+        "meta->>'retry_reason'",
+        "meta->>'materialization_reason'",
+        "meta->>'deferred_retry_reason_code'",
+        "meta->'materialization_selector_failure'->>'reason_code'",
+        "meta->'selector_failure'->>'reason_code'",
+    ):
+        assert f"UPPER(BTRIM({reason_alias})) = %s" in sql
 
     wrong_mode = "paper" if execution_mode == "live" else "live"
     assert not osm.recover_stale_market_truth_pending_retry(

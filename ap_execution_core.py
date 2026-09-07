@@ -154,6 +154,9 @@ from ap.selector_retry_policy import (
     is_retryable_selector_reason as _is_retryable_selector_reason,  # noqa: F401 – re-exported
     is_operational_request_budget_reason as _is_operational_request_budget_reason,
     deferred_retry_count_exhaustion_applies as _deferred_retry_count_exhaustion_applies,
+    compute_retry_backoff_seconds as _compute_retry_backoff_seconds,
+    resolve_deferred_retry_deadline as _resolve_deferred_retry_deadline,
+    resolve_deferred_retry_reason as _resolve_deferred_retry_reason,
 )
 # NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is NOT in RETRYABLE_BREACH_SELECTOR_REASONS.
 # It is the DTE-ladder aggregation reason and may reflect structural quality
@@ -3300,13 +3303,17 @@ class APExecutionCore:
             _selector_failure_meta = meta.get("selector_failure")
         if not isinstance(_selector_failure_meta, dict):
             _selector_failure_meta = {}
-        _durable_retry_reason = str(
-            meta.get("retry_reason")
-            or meta.get("materialization_reason")
-            or meta.get("deferred_retry_reason_code")
-            or _selector_failure_meta.get("reason_code")
-            or ""
-        ).strip()
+        _durable_retry_reason, _durable_reason_error = _resolve_deferred_retry_reason(
+            meta,
+            selector_failure=_selector_failure_meta,
+        )
+        if _durable_reason_error:
+            return _term(
+                "RETRY_INVALID_REASON_AUTHORITY",
+                status="ERROR",
+                reason_error=_durable_reason_error,
+            )
+        _durable_retry_reason = _durable_retry_reason or ""
         # A due retry owns the row before doing work, but it has not earned the
         # next selector-attempt identity. Fresh market truth must pass first.
         # This is unconditional for due retries: selector_calls=0 means the
@@ -3471,39 +3478,31 @@ class APExecutionCore:
         if durable_due_at > _now:
             return {**_base, "disposition": "NOT_DUE", "reason_code": "RETRY_NOT_DUE"}
 
-        # ── Blocker §5: enforce absolute_entry_deadline before ANY claim ──
-        # An expired deadline must terminalize the row here — before the CAS,
-        # before selector work, before _on_entry_trigger. Downstream LIVE
-        # gates may provide partial defense, but the lifecycle consumer must
-        # honor its own durable deadline. PAPER retries of stale setups must
-        # also be blocked.
-        _deadline_raw = (
-            meta.get("absolute_entry_deadline")
-            or meta.get("retry_deadline")
-            or meta.get("deferred_retry_deadline")
+        # ── Blocker §5: enforce the effective deadline before ANY claim ──
+        # All durable deadline aliases and the ET cutoff are one authority.
+        # The shared resolver parses every non-empty alias and returns their
+        # earliest value; malformed durable truth fails closed before selector
+        # or broker work. This same value is reused by the schedule closure
+        # below so a ladder cannot write a retry past the stricter deadline.
+        _deadline_dt, _deadline_error = _resolve_deferred_retry_deadline(
+            meta,
+            now=_now,
         )
-        _deadline_dt: "datetime | None" = None
-        if _deadline_raw:
-            try:
-                _deadline_dt = datetime.fromisoformat(str(_deadline_raw))
-                if _deadline_dt.tzinfo is None:
-                    _deadline_dt = _deadline_dt.replace(tzinfo=timezone.utc)
-                if _now >= _deadline_dt:
-                    return _term(
-                        "RETRY_DEADLINE_EXHAUSTED",
-                        status="EXPIRED",
-                        attempt=_expected_attempt,
-                        max_attempts=max_attempts,
-                    )
-            except Exception:
-                # Unparseable deadline — fail closed: treat as expired
-                # rather than silently allowing a potentially stale retry.
-                return _term(
-                    "RETRY_INVALID_DEADLINE",
-                    status="EXPIRED",
-                    attempt=_expected_attempt,
-                    max_attempts=max_attempts,
-                )
+        if _deadline_error:
+            return _term(
+                "RETRY_INVALID_DEADLINE",
+                status="EXPIRED",
+                attempt=_expected_attempt,
+                max_attempts=max_attempts,
+                deadline_error=_deadline_error,
+            )
+        if _deadline_dt is not None and _now >= _deadline_dt:
+            return _term(
+                "RETRY_DEADLINE_EXHAUSTED",
+                status="EXPIRED",
+                attempt=_expected_attempt,
+                max_attempts=max_attempts,
+            )
 
         # ── Policy fields: required from the durable row — no silent defaults ─
         # score, tier, and timeframe affect expiration/playbook selection,
@@ -3908,8 +3907,14 @@ class APExecutionCore:
                 _base["attempt"] = after_attempt
             if after_generation >= int(_base.get("generation") or 0):
                 _base["generation"] = after_generation
-        except (AttributeError, TypeError, ValueError):
-            pass
+        except (AttributeError, TypeError, ValueError) as _after_meta_exc:
+            log.warning(
+                "[%s] deferred retry post-callback metadata hydration "
+                "unavailable order=%s error=%s",
+                self.client_id,
+                local_order_id,
+                _after_meta_exc,
+            )
 
         if after.get("broker_order_id") and after_status in {
             "SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"
@@ -6248,13 +6253,70 @@ class APExecutionCore:
                                 "disposition": "KEEP_WATCHER",
                                 "reason_code": "MATERIALIZATION_CONFIG_CONFLICT",
                             }
-                        _truth_delay = _positive_int_env_config(
+                        _truth_deadline_row = (
+                            _pv_row
+                            if isinstance(_pv_row, dict)
+                            else (_cursor_row if isinstance(_cursor_row, dict) else {})
+                        )
+                        _truth_deadline_meta = (
+                            _truth_deadline_row.get("meta") or {}
+                            if isinstance(_truth_deadline_row, dict)
+                            else {}
+                        )
+                        if isinstance(_truth_deadline_meta, str):
+                            try:
+                                _truth_deadline_meta = json.loads(_truth_deadline_meta)
+                            except Exception:
+                                _truth_deadline_meta = {}
+                        if not isinstance(_truth_deadline_meta, dict):
+                            _truth_deadline_meta = {}
+                        _truth_now = datetime.now(timezone.utc)
+                        _truth_deadline, _truth_deadline_error = (
+                            _resolve_deferred_retry_deadline(
+                                _truth_deadline_meta,
+                                now=_truth_now,
+                            )
+                        )
+                        if _truth_deadline_error:
+                            return _terminalize_deferred_breach_failure(
+                                "RETRY_INVALID_DEADLINE",
+                                extra_meta={
+                                    "deadline_error": _truth_deadline_error,
+                                    "selector_calls": 0,
+                                    "broker_post_count": 0,
+                                },
+                            )
+                        _truth_delay_base = _positive_int_env_config(
                             "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
                         )
-                        _truth_next = (
-                            datetime.now(timezone.utc)
-                            + timedelta(seconds=_truth_delay)
-                        ).isoformat()
+                        _truth_delay = max(
+                            int(_truth_delay_base),
+                            _compute_retry_backoff_seconds(
+                                _selector_attempt_number,
+                                str(_truth_result.reason_code or ""),
+                                cfg={
+                                    "validity_bound_retry_backoff_step1_seconds":
+                                    _truth_delay_base,
+                                },
+                            ),
+                        )
+                        _truth_candidate_next = _truth_now + timedelta(
+                            seconds=_truth_delay
+                        )
+                        if (
+                            _truth_deadline is not None
+                            and _truth_candidate_next >= _truth_deadline
+                        ):
+                            return _terminalize_deferred_breach_failure(
+                                "RETRY_DEADLINE_WOULD_EXHAUST",
+                                extra_meta={
+                                    "deadline": _truth_deadline.isoformat(),
+                                    "delay_seconds": _truth_delay,
+                                    "selector_calls": 0,
+                                    "broker_post_count": 0,
+                                },
+                            )
+                        _truth_next = _truth_candidate_next.isoformat()
                         _schedule_truth = getattr(
                             self.order_state_machine,
                             "schedule_deferred_materialization_retry",
@@ -6413,8 +6475,19 @@ class APExecutionCore:
                                     "RETRY_REASON_UNPROVEN"
                                 ),
                             }
-                        _advance_delay = _positive_int_env_config(
+                        _advance_delay_base = _positive_int_env_config(
                             "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
+                        )
+                        _advance_delay = max(
+                            int(_advance_delay_base),
+                            _compute_retry_backoff_seconds(
+                                _current_attempt,
+                                _advance_reason,
+                                cfg={
+                                    "validity_bound_retry_backoff_step1_seconds":
+                                    _advance_delay_base,
+                                },
+                            ),
                         )
                         try:
                             _advance_max_attempts = max(
@@ -6428,10 +6501,58 @@ class APExecutionCore:
                             )
                         except (TypeError, ValueError):
                             _advance_max_attempts = _current_attempt
-                        _advance_next = (
-                            datetime.now(timezone.utc)
-                            + timedelta(seconds=_advance_delay)
-                        ).isoformat()
+                        _advance_deadline_row = (
+                            _pv_row
+                            if isinstance(_pv_row, dict)
+                            else (_cursor_row if isinstance(_cursor_row, dict) else {})
+                        )
+                        _advance_deadline_meta = (
+                            _advance_deadline_row.get("meta") or {}
+                            if isinstance(_advance_deadline_row, dict)
+                            else {}
+                        )
+                        if isinstance(_advance_deadline_meta, str):
+                            try:
+                                _advance_deadline_meta = json.loads(
+                                    _advance_deadline_meta
+                                )
+                            except Exception:
+                                _advance_deadline_meta = {}
+                        if not isinstance(_advance_deadline_meta, dict):
+                            _advance_deadline_meta = {}
+                        _advance_now = datetime.now(timezone.utc)
+                        _advance_deadline, _advance_deadline_error = (
+                            _resolve_deferred_retry_deadline(
+                                _advance_deadline_meta,
+                                now=_advance_now,
+                            )
+                        )
+                        if _advance_deadline_error:
+                            return _terminalize_deferred_breach_failure(
+                                "RETRY_INVALID_DEADLINE",
+                                extra_meta={
+                                    "deadline_error": _advance_deadline_error,
+                                    "selector_calls": 0,
+                                    "broker_post_count": 0,
+                                },
+                            )
+                        _advance_candidate_next = _advance_now + timedelta(
+                            seconds=_advance_delay
+                        )
+                        if (
+                            _advance_deadline is not None
+                            and _advance_candidate_next >= _advance_deadline
+                        ):
+                            return _terminalize_deferred_breach_failure(
+                                "RETRY_DEADLINE_WOULD_EXHAUST",
+                                extra_meta={
+                                    "deadline": _advance_deadline.isoformat(),
+                                    "delay_seconds": _advance_delay,
+                                    "selector_calls": 0,
+                                    "broker_post_count": 0,
+                                },
+                            )
+                        _advance_next = _advance_candidate_next.isoformat()
                         _advance_schedule = getattr(
                             self.order_state_machine,
                             "schedule_deferred_materialization_retry",
@@ -6508,8 +6629,14 @@ class APExecutionCore:
                         _selector_request_context.recovery_attempt_number = (
                             _next_attempt
                         )
-                    except Exception:
-                        pass
+                    except Exception as _attempt_context_exc:
+                        log.warning(
+                            "[%s] deferred retry selector attempt context "
+                            "update unavailable order=%s error=%s",
+                            ticker,
+                            queue_local_order_id,
+                            _attempt_context_exc,
+                        )
                     sig.update({
                         "retry_attempt": _next_attempt,
                         "materialization_retry_attempt": _next_attempt,

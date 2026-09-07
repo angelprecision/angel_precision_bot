@@ -4175,11 +4175,32 @@ class APOrderStateMachine:
                       AND COALESCE(meta->>'recovery_submit_owner','') = ''
                       AND COALESCE(meta->>'recovery_submit_lease_until','') = ''
                       AND COALESCE((meta->>'recovery_submit_fenced')::boolean, false) = false
+                      AND (
+                            NULLIF(BTRIM(meta->>'retry_reason'), '') IS NULL
+                            OR UPPER(BTRIM(meta->>'retry_reason')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->>'materialization_reason'), '') IS NULL
+                            OR UPPER(BTRIM(meta->>'materialization_reason')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->>'deferred_retry_reason_code'), '') IS NULL
+                            OR UPPER(BTRIM(meta->>'deferred_retry_reason_code')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->'materialization_selector_failure'->>'reason_code'), '') IS NULL
+                            OR UPPER(BTRIM(meta->'materialization_selector_failure'->>'reason_code')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->'selector_failure'->>'reason_code'), '') IS NULL
+                            OR UPPER(BTRIM(meta->'selector_failure'->>'reason_code')) = %s
+                          )
                       AND COALESCE(
-                            NULLIF(meta->>'retry_reason',''),
-                            NULLIF(meta->>'materialization_reason',''),
-                            NULLIF(meta->>'deferred_retry_reason_code',''),
-                            NULLIF(meta->'materialization_selector_failure'->>'reason_code',''),
+                            NULLIF(UPPER(BTRIM(meta->>'retry_reason')), ''),
+                            NULLIF(UPPER(BTRIM(meta->>'materialization_reason')), ''),
+                            NULLIF(UPPER(BTRIM(meta->>'deferred_retry_reason_code')), ''),
+                            NULLIF(UPPER(BTRIM(meta->'materialization_selector_failure'->>'reason_code')), ''),
+                            NULLIF(UPPER(BTRIM(meta->'selector_failure'->>'reason_code')), ''),
                             ''
                           ) = %s
                       AND COALESCE(meta->>'materialization_outcome','') IN (
@@ -4200,6 +4221,11 @@ class APOrderStateMachine:
                         attempt,
                         attempt,
                         attempt,
+                        _reason,
+                        _reason,
+                        _reason,
+                        _reason,
+                        _reason,
                         _reason,
                     ),
                 )

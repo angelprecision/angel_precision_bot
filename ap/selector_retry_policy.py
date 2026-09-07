@@ -64,6 +64,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from typing import NamedTuple
+from zoneinfo import ZoneInfo
 
 
 class SelectorRetryPolicy(NamedTuple):
@@ -1005,6 +1006,143 @@ def resolve_deferred_materialization_max_attempts() -> int:
     if deferred_value is not None:
         return deferred_value
     return _DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_DEFAULT
+
+
+_DEFERRED_RETRY_DEADLINE_FIELDS = (
+    "absolute_entry_deadline",
+    "retry_deadline",
+    "deferred_retry_deadline",
+)
+_DEFERRED_RETRY_REASON_FIELDS = (
+    "retry_reason",
+    "materialization_reason",
+    "deferred_retry_reason_code",
+)
+_DEFERRED_RETRY_CUTOFF_ENV = "BREACH_SELECTOR_RETRY_CUTOFF_ET"
+_DEFERRED_RETRY_CUTOFF_DEFAULT_HHMM = 1530
+_DEFERRED_RETRY_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def _parse_deferred_retry_timestamp(raw) -> datetime | None:
+    """Parse one durable retry timestamp without manufacturing a value."""
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        value = datetime.fromisoformat(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if value.tzinfo is None:
+        # Preserve the existing durable-row compatibility rule. The value is
+        # still required to be parseable; no current time is substituted.
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def resolve_deferred_retry_deadline(
+    meta: dict | None,
+    *,
+    now: datetime | None = None,
+) -> tuple[datetime | None, str | None]:
+    """Return the effective deferred-entry retry deadline.
+
+    Every non-empty durable deadline alias is an authority input. All aliases
+    must parse, and the earliest valid durable deadline wins. The configured
+    ET cutoff is included in the same minimum so runtime retry consumption and
+    restart recovery cannot disagree about the last legal retry time.
+
+    Returns ``(deadline, None)`` on valid input and
+    ``(None, error_code)`` when a non-empty durable timestamp or cutoff is
+    malformed. Callers must fail closed on the error form.
+    """
+    if not isinstance(meta, dict):
+        return None, "INVALID_RETRY_DEADLINE_METADATA"
+
+    current = now if now is not None else datetime.now(timezone.utc)
+    if not isinstance(current, datetime):
+        return None, "INVALID_RETRY_DEADLINE_NOW"
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+
+    candidates: list[datetime] = []
+    for field in _DEFERRED_RETRY_DEADLINE_FIELDS:
+        raw = meta.get(field)
+        if raw is None or not str(raw).strip():
+            continue
+        parsed = _parse_deferred_retry_timestamp(raw)
+        if parsed is None:
+            return None, f"INVALID_RETRY_DEADLINE:{field}"
+        candidates.append(parsed)
+
+    cutoff_raw = os.getenv(
+        _DEFERRED_RETRY_CUTOFF_ENV,
+        str(_DEFERRED_RETRY_CUTOFF_DEFAULT_HHMM),
+    )
+    if cutoff_raw is None or not str(cutoff_raw).strip():
+        cutoff = _DEFERRED_RETRY_CUTOFF_DEFAULT_HHMM
+    else:
+        try:
+            cutoff = int(str(cutoff_raw).strip())
+        except (TypeError, ValueError, OverflowError):
+            return None, "INVALID_RETRY_CUTOFF"
+    if cutoff < 0 or cutoff > 2359 or cutoff % 100 >= 60:
+        return None, "INVALID_RETRY_CUTOFF"
+
+    current_et = current.astimezone(_DEFERRED_RETRY_TIMEZONE)
+    cutoff_et = current_et.replace(
+        hour=cutoff // 100,
+        minute=cutoff % 100,
+        second=0,
+        microsecond=0,
+    )
+    candidates.append(cutoff_et.astimezone(timezone.utc))
+    return min(candidates), None
+
+
+def resolve_deferred_retry_reason(
+    meta: dict | None,
+    *,
+    selector_failure: dict | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve durable retry reason aliases without choosing a winner.
+
+    The retry lifecycle has several historical read surfaces. A corrupted row
+    may carry different non-empty reason values on those surfaces. Such a row
+    is not safe to classify by first-truthy precedence, so conflicting values
+    return an error and callers must leave it unresolved.
+    """
+    if not isinstance(meta, dict):
+        return None, "INVALID_RETRY_REASON_METADATA"
+
+    values: dict[str, list[str]] = {}
+
+    def _record(label: str, raw) -> None:
+        if raw is None or not str(raw).strip():
+            return
+        normalized = str(raw).strip().upper()
+        values.setdefault(normalized, []).append(label)
+
+    for field in _DEFERRED_RETRY_REASON_FIELDS:
+        _record(field, meta.get(field))
+    for container_name in ("materialization_selector_failure", "selector_failure"):
+        container = meta.get(container_name)
+        if isinstance(container, dict):
+            _record(f"{container_name}.reason_code", container.get("reason_code"))
+
+    if isinstance(selector_failure, dict):
+        _record("selector_failure.reason_code", selector_failure.get("reason_code"))
+
+    if not values:
+        return None, None
+    if len(values) > 1:
+        fields = ",".join(
+            label for labels in values.values() for label in labels
+        )
+        return None, f"CONFLICTING_RETRY_REASON_AUTHORITY:{fields}"
+    return next(iter(values)), None
 
 
 def _utc_iso(now=None) -> str:

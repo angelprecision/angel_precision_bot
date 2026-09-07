@@ -1734,6 +1734,20 @@ class TestPhaseOneCrashRecovery:
         osm.recover_stale_market_truth_pending_retry.assert_called_once()
         assert osm.cancel_calls == []
 
+    def test_conflicting_retry_reason_aliases_are_unresolved(self, monkeypatch):
+        """A phase-one row with split reason authorities must not be recovered."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(reason="DIRECT_QUOTE_ZERO_BID_ASK")
+        row["meta"]["materialization_reason"] = "OI_TOO_LOW"
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.phase_one_recovery_calls == []
+        assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
     # ── PR #568 amendment §2 — backoff deadline clip ──────────────────────────
     # Binding invariant: the bounded-backoff ladder must NOT schedule
     # next_retry_at past the absolute entry deadline. When the ladder would

@@ -47,6 +47,8 @@ from ap.selector_retry_policy import (
     deferred_retry_count_exhaustion_applies,
     is_validity_bound_deferred_retry_reason,
     resolve_deferred_materialization_max_attempts,
+    resolve_deferred_retry_deadline,
+    resolve_deferred_retry_reason,
 )
 
 log = get_logger("ap.pending_trigger_restart_recovery")
@@ -981,71 +983,35 @@ class PendingTriggerRestartRecovery:
         if trigger_dt is None:
             return False
         eastern = ZoneInfo("America/New_York")
-        now_et = datetime.now(eastern)
+        now_utc = datetime.now(timezone.utc)
+        now_et = now_utc.astimezone(eastern)
         if trigger_dt.astimezone(eastern).date() != now_et.date():
             return False
 
-        deadline_raw = (
-            meta.get("absolute_entry_deadline")
-            or meta.get("retry_deadline")
-            or meta.get("deferred_retry_deadline")
+        deadline, deadline_error = resolve_deferred_retry_deadline(
+            meta,
+            now=now_utc,
         )
-        if deadline_raw:
-            deadline = _parse_iso(deadline_raw)
-            if deadline is None or datetime.now(timezone.utc) >= deadline:
-                return False
-        try:
-            cutoff = int(
-                str(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "1530")).strip()
-            )
-        except (TypeError, ValueError):
+        if deadline_error or deadline is None or now_utc >= deadline:
             return False
-        if cutoff < 0 or cutoff > 2359 or cutoff % 100 >= 60:
-            return False
-        return now_et.hour * 100 + now_et.minute < cutoff
+        return True
 
     def _retry_entry_deadline(self, row: dict) -> "datetime | None":
-        """Return the earliest applicable retry-deadline for this row, or None.
+        """Return the effective retry deadline, failing closed on bad metadata.
 
         Used by the phase-one bounded-backoff clip (PR #568 amendment §2) to
         refuse writing a ``next_retry_at`` that would land past the entry
         cutoff. Combines the durable absolute deadline (if any) with the
-        BREACH_SELECTOR_RETRY_CUTOFF_ET wall-clock ceiling so callers only
-        need one comparison. Returns ``None`` only when no deadline is
-        parseable — the caller must not treat that as "safe to schedule
-        forever"; the ordinary lifecycle fences still apply.
+        BREACH_SELECTOR_RETRY_CUTOFF_ET wall-clock ceiling through the shared
+        authority resolver so callers only need one comparison. A malformed
+        non-empty durable alias or cutoff raises ``ValueError``; callers must
+        leave the row unresolved rather than schedule from ambiguous truth.
         """
         meta = _extract_meta(row)
-        candidates: list = []
-
-        deadline_raw = (
-            meta.get("absolute_entry_deadline")
-            or meta.get("retry_deadline")
-            or meta.get("deferred_retry_deadline")
-        )
-        if deadline_raw:
-            parsed = _parse_iso(deadline_raw)
-            if parsed is not None:
-                candidates.append(parsed)
-
-        try:
-            cutoff = int(
-                str(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "1530")).strip()
-            )
-        except (TypeError, ValueError):
-            cutoff = None
-        if cutoff is not None and 0 <= cutoff <= 2359 and cutoff % 100 < 60:
-            eastern = ZoneInfo("America/New_York")
-            now_et = datetime.now(eastern)
-            cutoff_dt_et = now_et.replace(
-                hour=cutoff // 100,
-                minute=cutoff % 100,
-                second=0,
-                microsecond=0,
-            )
-            candidates.append(cutoff_dt_et.astimezone(timezone.utc))
-
-        return min(candidates) if candidates else None
+        deadline, deadline_error = resolve_deferred_retry_deadline(meta)
+        if deadline_error:
+            raise ValueError(deadline_error)
+        return deadline
 
     def _recover_stale_market_truth_pending(
         self, row: dict, local_oid: str
@@ -1093,14 +1059,22 @@ class PendingTriggerRestartRecovery:
 
         selector_failure = meta.get("materialization_selector_failure")
         if not isinstance(selector_failure, dict):
+            selector_failure = meta.get("selector_failure")
+        if not isinstance(selector_failure, dict):
             return _RowOutcome.UNRESOLVED
-        reason = str(
-            meta.get("retry_reason")
-            or meta.get("materialization_reason")
-            or meta.get("deferred_retry_reason_code")
-            or selector_failure.get("reason_code")
-            or ""
-        ).strip().upper()
+        reason, reason_error = resolve_deferred_retry_reason(
+            meta,
+            selector_failure=selector_failure,
+        )
+        if reason_error:
+            log.warning(
+                "RESTART_PHASE_ONE_RETRY_REASON_AUTHORITY_CONFLICT "
+                "local=%s error=%s -- leaving row unresolved.",
+                local_oid,
+                reason_error,
+            )
+            return _RowOutcome.UNRESOLVED
+        reason = reason or ""
         if not reason or not (
             is_validity_bound_deferred_retry_reason(reason)
             or not deferred_retry_count_exhaustion_applies(
@@ -1158,7 +1132,16 @@ class PendingTriggerRestartRecovery:
         # past" case introduced by the ladder. Leave the row UNRESOLVED
         # so the ordinary lifecycle (deadline / EOD cutoff) terminates it
         # on the next poll instead of writing a doomed retry.
-        _deadline_dt = self._retry_entry_deadline(row)
+        try:
+            _deadline_dt = self._retry_entry_deadline(row)
+        except ValueError as _deadline_exc:
+            log.warning(
+                "RESTART_PHASE_ONE_RETRY_DEADLINE_AUTHORITY_INVALID "
+                "local=%s error=%s -- leaving row unresolved.",
+                local_oid,
+                _deadline_exc,
+            )
+            return _RowOutcome.UNRESOLVED
         if _deadline_dt is not None and _candidate_next_dt >= _deadline_dt:
             return _RowOutcome.UNRESOLVED
         next_retry_at = _candidate_next_dt.isoformat()
@@ -1473,14 +1456,16 @@ class PendingTriggerRestartRecovery:
         next_at      = str(meta.get(_MAT_NEXT_RETRY_AT) or "").strip()
         _selector_failure = meta.get("materialization_selector_failure")
         if not isinstance(_selector_failure, dict):
+            _selector_failure = meta.get("selector_failure")
+        if not isinstance(_selector_failure, dict):
             _selector_failure = {}
-        reason       = str(
-            meta.get(_MAT_REASON_FIELD)
-            or meta.get("retry_reason")
-            or meta.get("deferred_retry_reason_code")
-            or _selector_failure.get("reason_code")
-            or ""
-        ).strip()
+        reason, reason_error = resolve_deferred_retry_reason(
+            meta,
+            selector_failure=_selector_failure,
+        )
+        if reason_error:
+            return None
+        reason = reason or ""
         last_fail    = str(meta.get(_MAT_LAST_FAILURE_FIELD) or "").strip()
         try:
             attempts = int(meta.get(_MAT_ATTEMPTS_FIELD))

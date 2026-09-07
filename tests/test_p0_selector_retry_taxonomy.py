@@ -14,6 +14,8 @@ Proves that:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 import ap.selector_retry_policy as policy_mod
@@ -1102,3 +1104,71 @@ def test_bounded_backoff_reflects_base_delay_config_override():
         cfg={"validity_bound_retry_backoff_step1_seconds": 20},
     )
     assert delay_next >= delay
+
+
+def test_deferred_retry_deadline_uses_earliest_durable_alias(monkeypatch):
+    """Every populated deadline alias participates in the effective minimum."""
+    from ap.selector_retry_policy import resolve_deferred_retry_deadline
+
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    now = datetime(2026, 9, 6, 18, 0, tzinfo=timezone.utc)
+    deadline, error = resolve_deferred_retry_deadline(
+        {
+            "absolute_entry_deadline": "2026-09-06T18:20:00+00:00",
+            "retry_deadline": "2026-09-06T18:10:00+00:00",
+            "deferred_retry_deadline": "2026-09-06T18:15:00+00:00",
+        },
+        now=now,
+    )
+
+    assert error is None
+    assert deadline == datetime(2026, 9, 6, 18, 10, tzinfo=timezone.utc)
+
+
+def test_deferred_retry_deadline_rejects_malformed_nonempty_alias(monkeypatch):
+    """A malformed secondary alias cannot be hidden by a valid first alias."""
+    from ap.selector_retry_policy import resolve_deferred_retry_deadline
+
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    deadline, error = resolve_deferred_retry_deadline(
+        {
+            "absolute_entry_deadline": "2026-09-06T18:20:00+00:00",
+            "retry_deadline": "not-a-timestamp",
+        },
+        now=datetime(2026, 9, 6, 18, 0, tzinfo=timezone.utc),
+    )
+
+    assert deadline is None
+    assert error == "INVALID_RETRY_DEADLINE:retry_deadline"
+
+
+def test_deferred_retry_reason_rejects_conflicting_aliases():
+    """Restart recovery must not classify a row by first-truthy precedence."""
+    from ap.selector_retry_policy import resolve_deferred_retry_reason
+
+    reason, error = resolve_deferred_retry_reason(
+        {
+            "retry_reason": "CHAIN_FETCH_FAILED",
+            "materialization_reason": "OI_TOO_LOW",
+        }
+    )
+
+    assert reason is None
+    assert error is not None
+    assert error.startswith("CONFLICTING_RETRY_REASON_AUTHORITY:")
+
+
+def test_deferred_retry_reason_accepts_case_only_alias_duplicates():
+    from ap.selector_retry_policy import resolve_deferred_retry_reason
+
+    reason, error = resolve_deferred_retry_reason(
+        {
+            "retry_reason": "chain_fetch_failed",
+            "materialization_reason": "CHAIN_FETCH_FAILED",
+            "materialization_selector_failure": {
+                "reason_code": "Chain_Fetch_Failed",
+            },
+        }
+    )
+
+    assert (reason, error) == ("CHAIN_FETCH_FAILED", None)
