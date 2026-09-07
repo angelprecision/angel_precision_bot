@@ -418,7 +418,7 @@ def test_completed_owned_retry_is_consumed_same_process_before_5400_seconds(monk
         datetime.now(timezone.utc) - timedelta(seconds=1)
     ).isoformat()
     row["meta"]["restart_rearm_deadline"] = (
-        datetime.now(timezone.utc) + timedelta(minutes=3)
+        datetime.now(timezone.utc) + timedelta(minutes=1)
     ).isoformat()
     row["created_ts"] = (
         datetime.now(timezone.utc) - timedelta(seconds=35)
