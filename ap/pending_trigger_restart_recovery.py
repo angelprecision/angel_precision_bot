@@ -1237,8 +1237,13 @@ class PendingTriggerRestartRecovery:
 
         _now = datetime.now(timezone.utc)
         _roll_generation = bool(new_generation and _late_policy)
+        _first_failed_arg = (
+            first_failed_at
+            if isinstance(first_failed_at, str) and first_failed_at.strip()
+            else None
+        )
         _existing_late_lease = _late_policy and (
-            first_failed_at is not None
+            _first_failed_arg is not None
             or prior_attempt is not None
             or prior_generation is not None
             or any(
@@ -1259,8 +1264,8 @@ class PendingTriggerRestartRecovery:
         )
         if _existing_late_lease:
             _first_failed_raw = (
-                first_failed_at
-                if first_failed_at is not None
+                _first_failed_arg
+                if _first_failed_arg is not None
                 else _meta.get(_RR_FIRST_FAILED_AT)
             )
             _last_failed_raw = _meta.get(_RR_LAST_FAILED_AT)
