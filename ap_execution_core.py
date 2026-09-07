@@ -3897,15 +3897,20 @@ class APExecutionCore:
             and str(
                 _callback_result.get("reason_code") or ""
             ).strip().upper()
-            == (
-                "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
-                "RETRY_REASON_AUTHORITY_CONFLICT"
-            )
+            in {
+                (
+                    "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
+                    "RETRY_REASON_AUTHORITY_CONFLICT"
+                ),
+                (
+                    "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
+                    "STRICT_CAS_LOST"
+                ),
+            }
         ):
             # The canonical callback refused to schedule after a lost second
-            # CAS because the in-memory reason authorities disagreed. Preserve
-            # that unresolved result; the generic no-durable-outcome fallback
-            # below must not turn it into a retry write.
+            # CAS. Preserve that unresolved result; the generic no-durable-
+            # outcome fallback below must not turn it into a retry write.
             return {
                 **_base,
                 **_callback_result,
@@ -6464,193 +6469,32 @@ class APExecutionCore:
                         )
                         _advance_ok = False
                     if not _advance_ok:
-                        # A lost second CAS still ran zero selector calls. Put
-                        # the exact phase-one owner back into RETRY_WAIT at N;
-                        # never strand it for generic STUCK terminalization.
-                        _advance_plan_meta = getattr(
-                            approved_plan, "metadata", None
+                        # A failed strict second CAS is evidence that durable
+                        # phase-one authority may have changed.  Do not fall
+                        # through to schedule_deferred_materialization_retry:
+                        # that CAS intentionally proves a weaker state and
+                        # could regress a concurrent N+1 claim back to N.
+                        # Leave the durable row untouched; lease-expiry phase-
+                        # one recovery is the next authority.
+                        log.critical(
+                            "[%s] MATERIALIZATION_ATTEMPT_ADVANCE_CAS_LOST "
+                            "order=%s generation=%s attempt=%s -- retaining "
+                            "without retry write",
+                            ticker,
+                            queue_local_order_id,
+                            _current_generation,
+                            _current_attempt,
                         )
-                        if not isinstance(_advance_plan_meta, dict):
-                            _advance_plan_meta = {}
-                        _advance_failure = _advance_plan_meta.get(
-                            "materialization_selector_failure"
-                        )
-                        if not isinstance(_advance_failure, dict):
-                            _advance_failure = {}
-                        _advance_reason, _advance_reason_error = (
-                            _resolve_deferred_retry_reason(
-                                _advance_plan_meta,
-                                selector_failure=_advance_failure,
-                            )
-                        )
-                        if _advance_reason_error:
-                            return {
-                                "disposition": "KEEP_WATCHER",
-                                "reason_code": (
-                                    "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
-                                    "RETRY_REASON_AUTHORITY_CONFLICT"
-                                ),
-                                "reason_error": _advance_reason_error,
-                                "selector_calls": 0,
-                                "broker_post_count": 0,
-                            }
-                        _advance_reason = str(_advance_reason or "").strip().upper()
-                        if not _advance_reason or not (
-                            _is_retryable_selector_reason(_advance_reason)
-                            or not _deferred_retry_count_exhaustion_applies(
-                                _advance_reason,
-                                selector_failure=_advance_failure,
-                            )
-                        ):
-                            return {
-                                "disposition": "RETRY_SCHEDULE_FAILED",
-                                "reason_code": (
-                                    "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
-                                    "RETRY_REASON_UNPROVEN"
-                                ),
-                            }
-                        _advance_delay_base = _positive_int_env_config(
-                            "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
-                        )
-                        _advance_delay = max(
-                            int(_advance_delay_base),
-                            _compute_retry_backoff_seconds(
-                                _current_attempt,
-                                _advance_reason,
-                                cfg={
-                                    "validity_bound_retry_backoff_step1_seconds":
-                                    _advance_delay_base,
-                                },
-                            ),
-                        )
-                        try:
-                            _advance_max_attempts = max(
-                                _current_attempt,
-                                int(
-                                    _advance_plan_meta.get(
-                                        "retry_max_attempts", _current_attempt
-                                    )
-                                    or _current_attempt
-                                ),
-                            )
-                        except (TypeError, ValueError):
-                            _advance_max_attempts = _current_attempt
-                        _advance_deadline_row = (
-                            _pv_row
-                            if isinstance(_pv_row, dict)
-                            else (_cursor_row if isinstance(_cursor_row, dict) else {})
-                        )
-                        _advance_deadline_meta = (
-                            _advance_deadline_row.get("meta") or {}
-                            if isinstance(_advance_deadline_row, dict)
-                            else {}
-                        )
-                        if isinstance(_advance_deadline_meta, str):
-                            try:
-                                _advance_deadline_meta = json.loads(
-                                    _advance_deadline_meta
-                                )
-                            except Exception:
-                                _advance_deadline_meta = {}
-                        if not isinstance(_advance_deadline_meta, dict):
-                            _advance_deadline_meta = {}
-                        _advance_now = datetime.now(timezone.utc)
-                        _advance_deadline, _advance_deadline_error = (
-                            _resolve_deferred_retry_deadline(
-                                _advance_deadline_meta,
-                                now=_advance_now,
-                            )
-                        )
-                        if _advance_deadline_error:
-                            return _terminalize_deferred_breach_failure(
-                                "RETRY_INVALID_DEADLINE",
-                                extra_meta={
-                                    "deadline_error": _advance_deadline_error,
-                                    "selector_calls": 0,
-                                    "broker_post_count": 0,
-                                },
-                            )
-                        _advance_candidate_next = _advance_now + timedelta(
-                            seconds=_advance_delay
-                        )
-                        if (
-                            _advance_deadline is not None
-                            and _advance_candidate_next >= _advance_deadline
-                        ):
-                            return _terminalize_deferred_breach_failure(
-                                "RETRY_DEADLINE_WOULD_EXHAUST",
-                                extra_meta={
-                                    "deadline": _advance_deadline.isoformat(),
-                                    "delay_seconds": _advance_delay,
-                                    "selector_calls": 0,
-                                    "broker_post_count": 0,
-                                },
-                            )
-                        _advance_next = _advance_candidate_next.isoformat()
-                        _advance_schedule = getattr(
-                            self.order_state_machine,
-                            "schedule_deferred_materialization_retry",
-                            None,
-                        )
-                        _advance_schedule_meta = _build_deferred_retry_schedule_meta(
-                            reason_code=_advance_reason,
-                            selector_audit=_advance_failure,
-                            attempt=_current_attempt,
-                            max_attempts=_advance_max_attempts,
-                            delay_seconds=_advance_delay,
-                            client_id=str(_breach_client_id or ""),
-                            execution_mode=_mat_exec_mode,
-                            local_order_id=str(queue_local_order_id or ""),
-                            signal_id=str(
-                                getattr(approved_plan, "signal_id", "") or ""
-                            ),
-                        )
-                        try:
-                            _advance_scheduled = bool(
-                                callable(_advance_schedule)
-                                and _advance_schedule(
-                                    str(queue_local_order_id or ""),
-                                    owner=_mat_owner,
-                                    generation=_current_generation,
-                                    reason_code=_advance_reason,
-                                    attempt=_current_attempt,
-                                    max_attempts=_advance_max_attempts,
-                                    next_retry_at=_advance_next,
-                                    selector_failure={
-                                        **_advance_failure,
-                                        **_advance_schedule_meta,
-                                        "materialization_market_truth_pending": True,
-                                        "selector_calls": 0,
-                                        "broker_post_count": 0,
-                                    },
-                                    signal_id=str(
-                                        getattr(approved_plan, "signal_id", "") or ""
-                                    ),
-                                    execution_mode=_mat_exec_mode,
-                                    selector_recovery_cursor=(
-                                        _selector_recovery_cursor
-                                        if _cursor_enabled
-                                        else None
-                                    ),
-                                )
-                            )
-                        except Exception as _schedule_exc:
-                            log.critical(
-                                "[%s] MATERIALIZATION_ATTEMPT_ADVANCE_RETRY_WRITE_FAILED "
-                                "order=%s error=%s",
-                                ticker,
-                                queue_local_order_id,
-                                _schedule_exc,
-                            )
-                            _advance_scheduled = False
                         return {
-                            "disposition": (
-                                "RETRY_WAIT"
-                                if _advance_scheduled
-                                else "RETRY_SCHEDULE_FAILED"
+                            "disposition": "KEEP_WATCHER",
+                            "reason_code": (
+                                "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
+                                "STRICT_CAS_LOST"
                             ),
-                            "reason_code": "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED",
-                            "next_retry_at": _advance_next,
+                            "attempt": _current_attempt,
+                            "generation": _current_generation,
+                            "selector_calls": 0,
+                            "broker_post_count": 0,
                         }
                     _selector_attempt_number = _next_attempt
                     _mat_generation = _next_generation

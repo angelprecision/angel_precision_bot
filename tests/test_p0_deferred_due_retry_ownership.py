@@ -1877,19 +1877,22 @@ def test_12_recovery_never_calls_broker_directly():
         "advance_succeeds",
         "second_cas_deadline_seconds",
         "conflicting_reason_aliases",
+        "concurrent_durable_advance",
     ),
     [
-        ("DEFERRED:RTX", True, None, False),
-        ("DEFERRED:RTX", False, None, False),
-        ("DEFERRED:RTX", False, 5, False),
-        ("DEFERRED:RTX", False, None, True),
-        ("RTX260117C00129000", True, None, False),
+        ("DEFERRED:RTX", True, None, False, False),
+        ("DEFERRED:RTX", False, None, False, False),
+        ("DEFERRED:RTX", False, 5, False, False),
+        ("DEFERRED:RTX", False, None, True, False),
+        ("DEFERRED:RTX", False, None, False, True),
+        ("RTX260117C00129000", True, None, False, False),
     ],
     ids=[
         "placeholder_contract",
-        "second_cas_failure",
-        "second_cas_deadline_clip",
+        "second_cas_failure_retained",
+        "second_cas_failure_deadline_retained",
         "second_cas_conflicting_reason_authority",
+        "second_cas_concurrent_advance_retained",
         "stale_real_contract",
     ],
 )
@@ -1899,6 +1902,7 @@ def test_spec_acceptance_two_phase_claim_seam(
     advance_succeeds,
     second_cas_deadline_seconds,
     conflicting_reason_aliases,
+    concurrent_durable_advance,
 ):
     """Real seam test: resume_deferred_materialization_retry → real _on_entry_trigger
     deferred path → selector mock → durable copyback → canonical submit seam.
@@ -2040,6 +2044,7 @@ def test_spec_acceptance_two_phase_claim_seam(
         def __init__(self):
             self.row = before_row
             self.terminal_calls = []
+            self.schedule_calls = []
 
         def get_order(self, oid):
             return self.row
@@ -2050,6 +2055,16 @@ def test_spec_acceptance_two_phase_claim_seam(
                 assert kw["generation"] == kw["new_generation"] == 2
                 assert kw["retry_attempt"] == 2
                 assert kw["advance_retry_attempt"] is True
+                if concurrent_durable_advance:
+                    # Simulate another worker winning the real durable CAS
+                    # between market truth and this stale worker's CAS.
+                    self.row["meta"].update({
+                        "materialization_market_truth_pending": False,
+                        "retry_attempt": 2,
+                        "breach_attempt_count": 2,
+                        "materialization_attempts": 2,
+                    })
+                    return False
                 if not advance_succeeds:
                     return False
                 self.row["meta"].update({
@@ -2085,6 +2100,35 @@ def test_spec_acceptance_two_phase_claim_seam(
             return True
 
         def schedule_deferred_materialization_retry(self, oid, **kw):
+            self.schedule_calls.append(dict(kw))
+            meta = self.row["meta"]
+            # Production-faithful phase-one CAS seam: a stale fallback must
+            # not be able to rewrite a concurrent N+1 MATERIALIZING claim.
+            if not (
+                self.row.get("client_id") == CLIENT_ID
+                and self.row.get("signal_id") == SIGNAL_ID
+                and self.row.get("execution_mode") == "paper"
+                and self.row.get("status") == "PENDING_TRIGGER"
+                and not self.row.get("broker_order_id")
+                and not self.row.get("submitted_ts")
+                and not meta.get("submit_intent_at")
+                and not meta.get("broker_submit_key")
+                and not meta.get("broker_submit_payload_hash")
+                and not meta.get("recovery_submit_owner")
+                and not meta.get("recovery_submit_lease_until")
+                and meta.get("lifecycle_state") == "MATERIALIZING"
+                and meta.get("materialization_status") == "RUNNING"
+                and meta.get("materialization_in_flight") is True
+                and meta.get("materialization_market_truth_pending") is True
+                and meta.get("materialization_owner") == kw["owner"]
+                and meta.get("current_owner") == kw["owner"]
+                and meta.get("watcher_token") == kw["owner"]
+                and meta.get("materialization_generation") == kw["generation"]
+                and meta.get("retry_attempt") == kw["attempt"]
+                and meta.get("breach_attempt_count") == kw["attempt"]
+                and meta.get("materialization_attempts") == kw["attempt"]
+            ):
+                return False
             retry_schedules.append(kw)
             self.row["meta"].update({
                 "lifecycle_state": "RETRY_WAIT",
@@ -2298,16 +2342,33 @@ def test_spec_acceptance_two_phase_claim_seam(
         assert _FakeSelector.select_count == 0
         assert copyback_calls == []
         assert submit_calls == []
+        if concurrent_durable_advance:
+            assert retry_schedules == []
+            assert osm.schedule_calls == []
+            assert result["disposition"] == "KEEP_WATCHER"
+            assert result["reason_code"] == (
+                "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:STRICT_CAS_LOST"
+            )
+            assert [
+                osm.row["meta"].get(key)
+                for key in (
+                    "retry_attempt",
+                    "breach_attempt_count",
+                    "materialization_attempts",
+                )
+            ] == [2, 2, 2]
+            assert osm.row["meta"]["materialization_market_truth_pending"] is False
+            assert osm.terminal_calls == []
+            core.broker.submit_order.assert_not_called()
+            core.broker.cancel_order.assert_not_called()
+            return
         if conflicting_reason_aliases:
             assert retry_schedules == []
+            assert osm.schedule_calls == []
             assert canonical_backoff.call_count == 0
             assert result["disposition"] == "KEEP_WATCHER"
             assert result["reason_code"] == (
-                "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
-                "RETRY_REASON_AUTHORITY_CONFLICT"
-            )
-            assert result["reason_error"].startswith(
-                "CONFLICTING_RETRY_REASON_AUTHORITY:"
+                "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:STRICT_CAS_LOST"
             )
             assert [
                 osm.row["meta"].get(key)
@@ -2323,26 +2384,14 @@ def test_spec_acceptance_two_phase_claim_seam(
             core.broker.cancel_order.assert_not_called()
             return
         else:
-            assert canonical_backoff.call_count >= 1
-        if second_cas_deadline_seconds is not None:
             assert retry_schedules == []
-            assert result["reason_code"] == "RETRY_DEADLINE_WOULD_EXHAUST"
-            assert result["disposition"] == "TERMINAL_ALREADY_DURABLE"
-            assert result["terminal_status"] == "EXPIRED"
-        else:
-            assert len(retry_schedules) == 1
-            schedule = retry_schedules[0]
-            assert schedule["attempt"] == 1
-            assert schedule["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
-            assert schedule["selector_failure"]["selector_calls"] == 0
-            assert schedule["selector_failure"][
-                "materialization_market_truth_pending"
-            ] is True
-            assert schedule["selector_failure"][
-                "deferred_retry_delay_seconds"
-            ] == 37
-            assert deadline_resolver.call_count >= 2
-            assert result["disposition"] == "RETRY_WAIT"
+            assert osm.schedule_calls == []
+            assert canonical_backoff.call_count == 0
+            assert result["disposition"] == "KEEP_WATCHER"
+            assert result["reason_code"] == (
+                "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:STRICT_CAS_LOST"
+            )
+            assert osm.terminal_calls == []
         core.broker.submit_order.assert_not_called()
         core.broker.cancel_order.assert_not_called()
         return
