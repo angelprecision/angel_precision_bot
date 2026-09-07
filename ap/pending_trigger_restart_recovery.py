@@ -1321,7 +1321,12 @@ class PendingTriggerRestartRecovery:
                 _meta.get(_RR_LAST_FAILED_AT),
                 sorted(_meta.keys()),
             )
-        if _late_policy and _existing_late_lease and _first_failed_dt is None:
+        if (
+            _late_policy
+            and _existing_late_lease
+            and _first_failed_dt is None
+            and not _roll_generation
+        ):
             self._mark_failure(local_oid, "retry_verification:timestamps")
             log.critical(
                 "RESTART_RECOVERY_LATE_REARM_FIRST_FAILED_AT_INVALID "
