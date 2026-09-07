@@ -111,7 +111,7 @@ class _OSM:
     def get_order(self, local_order_id: str) -> dict:
         return dict(self.rows.get(local_order_id) or {})
 
-    def update_order_meta(self, local_order_id: str, patch: dict) -> bool:
+    def update_order_meta(self, local_order_id: str, patch: dict, **_kwargs) -> bool:
         if self.fail_meta_update or local_order_id not in self.rows:
             return False
         self.rows[local_order_id]["meta"].update(dict(patch or {}))
