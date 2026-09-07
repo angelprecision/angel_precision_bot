@@ -3449,6 +3449,7 @@ class TestLateMarketValidityRecovery:
 
     def test_restart_preserves_late_generation_and_cannot_reset_total_authority(self):
         expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        expired_dt = datetime.fromisoformat(expired)
         row = _canonical_late_retry_row(
             local_order_id="late-restart-generation",
             next_at=expired,
@@ -3466,6 +3467,12 @@ class TestLateMarketValidityRecovery:
         assert osm.get_order(row["local_order_id"])["meta"][_RR_GENERATION_FIELD] == 2
 
         row_two = osm.get_order(row["local_order_id"])
+        row_two["meta"][_RR_FIRST_FAILED_AT] = (
+            expired_dt - timedelta(seconds=2)
+        ).isoformat()
+        row_two["meta"]["restart_rearm_last_failed_at"] = (
+            expired_dt - timedelta(seconds=1)
+        ).isoformat()
         row_two["meta"][_RR_NEXT_AT_FIELD] = expired
         row_two["meta"][_RR_DEADLINE_FIELD] = expired
         row_two["meta"][_RR_ATTEMPT_FIELD] = 6
@@ -3479,6 +3486,12 @@ class TestLateMarketValidityRecovery:
         assert osm.get_order(row["local_order_id"])["meta"][_RR_GENERATION_FIELD] == 3
 
         row_three = osm.get_order(row["local_order_id"])
+        row_three["meta"][_RR_FIRST_FAILED_AT] = (
+            expired_dt - timedelta(seconds=2)
+        ).isoformat()
+        row_three["meta"]["restart_rearm_last_failed_at"] = (
+            expired_dt - timedelta(seconds=1)
+        ).isoformat()
         row_three["meta"][_RR_NEXT_AT_FIELD] = expired
         row_three["meta"][_RR_DEADLINE_FIELD] = expired
         row_three["meta"][_RR_ATTEMPT_FIELD] = 6
