@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from contextlib import contextmanager
 from unittest.mock import MagicMock
@@ -80,12 +81,50 @@ def test_reconciler_quantity_authority_is_strict(row, expected):
     assert quantity == expected
 
 
-def test_reconciler_rejects_short_direction_even_with_positive_quantity():
+@pytest.mark.parametrize("side", ["short", "SELL TO OPEN", "SELL-TO-OPEN", "SELLTOOPEN"])
+def test_reconciler_rejects_short_direction_even_with_positive_quantity(side):
     quantity, reason = _reconciler()._broker_position_qty_result(
-        {"quantity": 1, "side": "short"}
+        {"quantity": 1, "side": side}
     )
     assert quantity is None
     assert reason == "short_direction"
+
+
+def test_reconciler_ignores_equity_rows_for_option_import():
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": "AAPL", "quantity": 1, "cost_basis": "207.01"}
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    snapshot = rec._safe_get_broker_positions()
+    assert snapshot.is_available
+
+    rec._create_imported_position = MagicMock(
+        side_effect=AssertionError("equity row must not be imported as an option")
+    )
+    summary = _empty_summary(CLIENT)
+    rec._import_broker_positions_missing_from_db(
+        broker_positions=snapshot,
+        db_contracts=set(),
+        summary=summary,
+    )
+
+    rec._create_imported_position.assert_not_called()
+    assert summary["positions_imported"] == 0
+
+
+def test_orphan_backfill_fences_mode_and_broker_quantity_before_direct_sql():
+    source = inspect.getsource(APBrokerReconciler._backfill_missing_position_links)
+    assert "broker_open_qty_by_contract" in source
+    assert "filled_order_broker_quantity_conflict" in source
+    assert "_normalize_execution_mode(o.get(\"execution_mode\"))" in source
+    assert "status, unmanaged, execution_mode" in source
+    assert "COALESCE(execution_mode,'')" in source
 
 
 def test_tradier_non_strict_error_still_collapses_but_strict_seam_raises():
@@ -395,6 +434,34 @@ def test_postgres_authoritative_qty_replaces_stale_remainder_without_undercount(
         "close_source": "PARTIAL_CLOSE_REPAIR",
         "status": "PARTIAL",
     }
+
+
+def test_postgres_broker_qty_above_durable_full_qty_holds_row(postgres_positions):
+    insert, read = postgres_positions
+    insert(qty=3, quantity_remaining=2)
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 5, "cost_basis": "155.0"}
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    seed = MagicMock(return_value=True)
+    rec._seed_exit_engine_from_position = seed
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    assert read() == {
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+        "status": "CLOSED",
+    }
+    assert "closed_repair_broker_quantity_conflict" in summary["errors"]
+    seed.assert_not_called()
 
 
 def test_postgres_retry_after_unavailable_snapshot_rechecks_authority(

@@ -176,6 +176,12 @@ BROKER_TO_OSM = {
 # OCC option symbology: root(variable) + YYMMDD(6) + C|P(1) + 8-digit strike.
 # Anchored to end-of-string so it cannot match a P inside the root ticker.
 _OCC_CP_RE = re.compile(r'([CP])\d{8}$')
+_OCC_OPTION_RE = re.compile(r"[A-Z0-9.]{1,6}\d{6}[CP]\d{8}")
+
+
+def _is_occ_option_contract(value) -> bool:
+    """Return whether a symbol proves the complete OCC option geometry."""
+    return bool(_OCC_OPTION_RE.fullmatch(str(value or "").strip().upper()))
 
 # Broker-position truth is an authority input, not a best-effort convenience
 # read.  Keep the state on the fetched value so a successful empty snapshot
@@ -2484,6 +2490,7 @@ class APBrokerReconciler:
 
             # ── Broker truth (only needed for current_live + manual_review) ───
             broker_open_syms = set()
+            broker_open_qty_by_contract = {}
             broker_truth_ok  = False
             if buckets["current_live"] or buckets["manual_review"]:
                 broker_snapshot = self._coerce_broker_position_snapshot(
@@ -2495,8 +2502,14 @@ class APBrokerReconciler:
                             self._broker_position_contract_result(bp)
                         )
                         quantity = self._broker_position_qty(bp)
-                        if contract and quantity is not None and quantity > 0:
-                            broker_open_syms.add(contract.upper())
+                        if (
+                            _is_occ_option_contract(contract)
+                            and quantity is not None
+                            and quantity > 0
+                        ):
+                            contract = contract.upper()
+                            broker_open_syms.add(contract)
+                            broker_open_qty_by_contract[contract] = quantity
                     broker_truth_ok = True
                 else:
                     log.error(
@@ -2631,9 +2644,25 @@ class APBrokerReconciler:
                 contract = self._norm_contract(raw_contract)
                 local_id  = str(o.get("local_order_id")  or "")
                 broker_id = str(o.get("broker_order_id") or "")
-                if not contract:
+                if not contract or not _is_occ_option_contract(contract):
                     failed += 1
                     orphan_backfill_failed_current_live += 1
+                    continue
+                expected_mode = _normalize_execution_mode(o.get("execution_mode"))
+                if expected_mode is None:
+                    failed += 1
+                    orphan_backfill_failed_current_live += 1
+                    summary.setdefault("errors", []).append(
+                        "orphan_backfill_execution_mode_unproven"
+                    )
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted", 0)
+                    ) + 1
+                    log.error(
+                        "[%s] filled_order_missing_position_p0 HOLD "
+                        "order=%s contract=%s reason=orphan_backfill_execution_mode_unproven",
+                        self.client_id, local_id, contract,
+                    )
                     continue
 
                 try:
@@ -2658,6 +2687,32 @@ class APBrokerReconciler:
                         close_src         = "REPAIR_FROM_FILLED_ORDER" if broker_holds else "BROKER_MANUAL_CLOSE_IMPORT"
                         close_confidence  = "HIGH"
                         exit_reason       = None if broker_holds else "manual_or_external_close_unpriced"
+
+                        if broker_holds:
+                            broker_qty = broker_open_qty_by_contract.get(contract.upper())
+                            if broker_qty != qty:
+                                failed += 1
+                                orphan_backfill_failed_current_live += 1
+                                summary.setdefault("errors", []).append(
+                                    "filled_order_broker_quantity_conflict"
+                                )
+                                summary["positions_alerted"] = int(
+                                    summary.get("positions_alerted", 0)
+                                ) + 1
+                                log.error(
+                                    "[%s] filled_order_missing_position_p0 HOLD "
+                                    "order=%s contract=%s filled_qty=%s "
+                                    "broker_qty=%s reason=filled_order_broker_quantity_conflict",
+                                    self.client_id, local_id, contract, qty, broker_qty,
+                                )
+                                self._alert(
+                                    f"MANUAL_REVIEW_REQUIRED | "
+                                    f"reason=filled_order_broker_quantity_conflict "
+                                    f"client={self.client_id} order={local_id} "
+                                    f"contract={contract} execution_mode=live "
+                                    f"filled_qty={qty} broker_qty={broker_qty}"
+                                )
+                                continue
                     else:
                         broker_holds      = None
                         repair_status     = "OPEN"
@@ -2698,7 +2753,8 @@ class APBrokerReconciler:
                                     s=side, q=qty, qr=qty_remaining_val,
                                     px=entry_px, ts=filled_ts,
                                     b=broker_id, li=local_id,
-                                    cs=close_src, cc=close_confidence):
+                                    cs=close_src, cc=close_confidence,
+                                    em=expected_mode):
                             with conn() as cur:
                                 cur.execute(
                                     """
@@ -2709,7 +2765,7 @@ class APBrokerReconciler:
                                         qty, quantity_remaining,
                                         avg_fill, entry_price,
                                         entry_ts, created_at, updated_at,
-                                        status, unmanaged,
+                                        status, unmanaged, execution_mode,
                                         close_source, close_confidence,
                                         local_order_id, broker_order_id
                                     ) VALUES (
@@ -2717,13 +2773,14 @@ class APBrokerReconciler:
                                         %s, %s, %s, %s,
                                         COALESCE(%s::timestamptz, NOW()),
                                         NOW(), NOW(),
-                                        'OPEN', TRUE, %s, %s, %s, %s
+                                        'OPEN', TRUE, %s, %s, %s, %s, %s
                                     )
                                     ON CONFLICT (id) DO NOTHING
                                     RETURNING id
                                     """,
                                     (pid, self.client_id, u, c, c, s, s,
-                                     q, qr, px, px, ts, cs, cc, li, b),
+                                     q, qr, px, px, ts, em,
+                                     cs, cc, li, b),
                                 )
                                 row = cur.fetchone()
                                 # row may be RealDictRow (dict-like), tuple, or None.
@@ -2738,7 +2795,8 @@ class APBrokerReconciler:
 
                     try:
                         def _patch(pid=pos_id, st=repair_status, qr=qty_remaining_val,
-                                   cs=close_src, cc=close_confidence, er=exit_reason):
+                                   cs=close_src, cc=close_confidence, er=exit_reason,
+                                   em=expected_mode):
                             with conn() as cur:
                                 cur.execute(
                                     """
@@ -2748,8 +2806,9 @@ class APBrokerReconciler:
                                         close_confidence=%s, exit_reason=%s,
                                         updated_at=NOW()
                                     WHERE id=%s AND client_id=%s
+                                      AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s
                                     """,
-                                    (st, qr, cs, cc, er, pid, self.client_id),
+                                    (st, qr, cs, cc, er, pid, self.client_id, em),
                                 )
                         run_with_retry(_patch)
                     except Exception as _pe:
@@ -3073,11 +3132,13 @@ class APBrokerReconciler:
             bp, ("side", "direction", "position_type", "position_side")
         )
         direction_text = " ".join(direction_values).lower()
+        direction_compact = re.sub(r"[^a-z0-9]", "", direction_text)
         if (
             re.search(r"\bshort\b", direction_text)
             or "sell_to_open" in direction_text
             or "short_call" in direction_text
             or "short_put" in direction_text
+            or "selltoopen" in direction_compact
         ):
             return None, "short_direction"
         return quantity, "ok"
@@ -3203,9 +3264,15 @@ class APBrokerReconciler:
             normalized_directions = {
                 value.strip().upper() for value in direction_values
             }
-            if any(
-                "SHORT" in value or "SELL_TO_OPEN" in value
+            compact_directions = {
+                re.sub(r"[^A-Z0-9]", "", value)
                 for value in normalized_directions
+            }
+            if any(
+                "SHORT" in value
+                or "SELL_TO_OPEN" in value
+                or "SELLTOOPEN" in value
+                for value in normalized_directions | compact_directions
             ):
                 return contract, None, "short_direction"
             option_sides = {
@@ -3587,7 +3654,11 @@ class APBrokerReconciler:
             c_sym = self._broker_position_contract(bp)
             u_sym = self._broker_position_underlying(bp)
             qty   = self._broker_position_qty(bp)
-            if qty is None or qty <= 0:
+            if (
+                qty is None
+                or qty <= 0
+                or not _is_occ_option_contract(c_sym)
+            ):
                 continue
             if c_sym:
                 broker_by_contract[c_sym] = bp
@@ -3838,7 +3909,7 @@ class APBrokerReconciler:
         contracts_present_before_poll = set(db_contracts)
         for bp in broker_positions:
             contract = self._broker_position_contract(bp)
-            if not contract:
+            if not contract or not _is_occ_option_contract(contract):
                 continue
 
             qty = self._broker_position_qty(bp)
@@ -6070,7 +6141,11 @@ class APBrokerReconciler:
                 for bp in broker_snapshot:
                     sym = self._broker_position_contract(bp)
                     qty = self._broker_position_qty(bp)
-                    if sym and qty is not None and qty > 0:
+                    if (
+                        _is_occ_option_contract(sym)
+                        and qty is not None
+                        and qty > 0
+                    ):
                         broker_open_by_contract[sym] = qty
             else:
                 self._record_broker_snapshot_hold(
@@ -6145,8 +6220,30 @@ class APBrokerReconciler:
                 broker_qty = broker_open_by_contract.get(contract, 0)
 
                 if broker_qty > 0:
+                    if broker_qty > full_qty:
+                        summary.setdefault("errors", []).append(
+                            "closed_repair_broker_quantity_conflict"
+                        )
+                        summary["positions_alerted"] = int(
+                            summary.get("positions_alerted", 0)
+                        ) + 1
+                        log.error(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR HOLD | pos=%s "
+                            "contract=%s full_qty=%d durable_remaining=%d "
+                            "broker_qty=%d reason=closed_repair_broker_quantity_conflict",
+                            self.client_id, pos_id, contract, full_qty, rem_qty,
+                            broker_qty,
+                        )
+                        self._alert(
+                            f"RECONCILER_BROKER_QUANTITY_CONFLICT | "
+                            f"client={self.client_id} mode={expected_mode} "
+                            f"position_id={pos_id} contract={contract} "
+                            f"full_qty={full_qty} broker_qty={broker_qty}"
+                        )
+                        continue
+
                     # Broker still holds this contract — restore to managed status
-                    restore_status = "PARTIAL" if full_qty > rem_qty else "OPEN"
+                    restore_status = "OPEN" if broker_qty == full_qty else "PARTIAL"
                     # The strict broker snapshot is the authoritative current
                     # exposure.  The durable remainder may be stale (it is the
                     # reason this repair path ran), so never cap confirmed live
