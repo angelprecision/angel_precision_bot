@@ -87,6 +87,7 @@ class _MockOSM:
     def __init__(self, *, cancel_returns=True, cancel_raises=None, get_order_status="CANCELED"):
         self.cancel_calls: list = []
         self.meta_writes:  list = []
+        self.conditional_meta_calls: list = []
         self._cancel_returns = cancel_returns
         self._cancel_raises  = cancel_raises
         self._get_order_status = get_order_status
@@ -115,7 +116,54 @@ class _MockOSM:
         r.setdefault("execution_mode", "paper")
         return r
 
-    def update_order_meta(self, oid: str, patch: dict) -> bool:
+    def update_order_meta(self, oid: str, patch: dict, **kwargs) -> bool:
+        if kwargs:
+            self.conditional_meta_calls.append((oid, dict(kwargs)))
+            row = self._rows.get(oid)
+            if not isinstance(row, dict):
+                return False
+            expected_status = kwargs.get("expected_status")
+            if expected_status is not None and str(row.get("status") or "").upper() != str(expected_status).upper():
+                return False
+            expected_mode = kwargs.get("expected_execution_mode")
+            if expected_mode is not None and str(row.get("execution_mode") or "").lower() != str(expected_mode).lower():
+                return False
+            expected_signal = kwargs.get("expected_signal_id")
+            if expected_signal is not None and str(row.get("signal_id") or "") != str(expected_signal):
+                return False
+            if kwargs.get("expected_no_broker_handoff"):
+                row_meta = row.get("meta") or {}
+                if not isinstance(row_meta, dict):
+                    return False
+                if row.get("broker_order_id") or row.get("submitted_ts"):
+                    return False
+                if any(str(row_meta.get(key) or "").strip() for key in (
+                    "submit_intent_at",
+                    "broker_submit_key",
+                    "broker_submit_payload_hash",
+                )):
+                    return False
+                nested_meta = row_meta.get("materialization")
+                if nested_meta is not None and not isinstance(nested_meta, dict):
+                    return False
+                if isinstance(nested_meta, dict) and any(
+                    str(nested_meta.get(key) or "").strip() for key in (
+                        "submit_intent_at",
+                        "broker_submit_key",
+                        "broker_submit_payload_hash",
+                    )
+                ):
+                    return False
+                ready = row_meta.get("broker_ready")
+                nested_ready = (
+                    nested_meta.get("broker_ready")
+                    if isinstance(nested_meta, dict)
+                    else None
+                )
+                if ready not in (None, False, "", "false", "0"):
+                    return False
+                if nested_ready not in (None, False, "", "false", "0"):
+                    return False
         self.meta_writes.append((oid, dict(patch)))
         row = self._rows.setdefault(oid, {})
         meta = row.get("meta") or {}
@@ -3516,6 +3564,70 @@ class TestLateMarketValidityRecovery:
         _assert_no_broker_mutation(rec.broker)
 
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            (_RR_FIRST_FAILED_AT, None),
+            (_RR_FIRST_FAILED_AT, "not-a-time"),
+            ("restart_rearm_last_failed_at", None),
+            ("restart_rearm_last_failed_at", "not-a-time"),
+        ],
+    )
+    def test_late_retry_invalid_failure_timestamps_hold_without_extension(self, field, value):
+        row = _canonical_late_retry_row(
+            local_order_id=f"late-invalid-timestamp-{field}-{value}",
+            next_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+            deadline=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        )
+        if value is None:
+            row["meta"].pop(field, None)
+        else:
+            row["meta"][field] = value
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_late_retry_deadline_cannot_exceed_original_failure_window(self):
+        now = datetime.now(timezone.utc)
+        row = _canonical_late_retry_row(
+            local_order_id="late-deadline-extended",
+            next_at=(now - timedelta(seconds=1)).isoformat(),
+            deadline=(now + timedelta(minutes=5)).isoformat(),
+        )
+        rec, osm = _make_recovery(row, watcher=_MonitorWatcher(watch_returns=True), quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+
+    def test_restart_rearm_lease_write_uses_conditional_identity_and_handoff_cas(self):
+        row = _row(
+            local_order_id="cas-retry",
+            meta={
+                "trigger_price": 450.0,
+                "late_attachment_policy_eligible": True,
+            },
+        )
+        rec, osm = _make_recovery(row, watcher=_MonitorWatcher(watch_returns=False), quote_result=None)
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert osm.conditional_meta_calls
+        _, kwargs = osm.conditional_meta_calls[-1]
+        assert kwargs["expected_status"] == "PENDING_TRIGGER"
+        assert kwargs["expected_execution_mode"] == "paper"
+        assert kwargs["expected_signal_id"] == row["signal_id"]
+        assert kwargs["expected_no_broker_handoff"] is True
+
 class _MonitorWatcher(_MockWatcher):
     def __init__(self, *, watch_returns=True, ownership_raises=False):
         super().__init__(watch_returns=watch_returns)
@@ -3566,6 +3678,7 @@ def _canonical_late_retry_row(
             _RR_NEXT_AT_FIELD: next_at or (now - timedelta(seconds=1)).isoformat(),
             _RR_DEADLINE_FIELD: deadline or (now + timedelta(minutes=3)).isoformat(),
             "restart_rearm_first_failed_at": (now - timedelta(seconds=31)).isoformat(),
+            "restart_rearm_last_failed_at": (now - timedelta(seconds=1)).isoformat(),
             _RR_CLIENT_FIELD: client_id.lower(),
             _RR_MODE_FIELD: mode.lower(),
             _RR_GENERATION_FIELD: generation,
@@ -3859,6 +3972,32 @@ class TestPR569OrderMonitorRetryLiveness:
         assert osm.cancel_calls == []
         _assert_no_broker_mutation(broker)
 
+    def test_final_durable_rearm_boundary_blocks_handoff_before_watch(self):
+        row = _row(local_order_id="final-boundary")
+        watcher = _MonitorWatcher(watch_returns=True)
+
+        class _HandoffOSM(_MockOSM):
+            def get_order(self, oid):
+                result = super().get_order(oid)
+                if result is not None:
+                    result["broker_order_id"] = "broker-race"
+                return result
+
+        osm = _HandoffOSM()
+        rec, _ = _make_recovery(
+            row,
+            osm=osm,
+            watcher=watcher,
+            quote_result=False,
+        )
+
+        outcome = rec._rearm_and_verify(row, row["local_order_id"])
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [
@@ -4022,3 +4161,53 @@ def test_pr569_no_clock_terminal_authority_survives():
     source = inspect.getsource(ov) + inspect.getsource(ptr)
     assert "PREOPEN_OWNERSHIP_DEADLINE_MISSED" not in source
     assert "09:29:30" not in source
+
+def test_malformed_restart_retry_marker_suppresses_legacy_monitor_fallthrough(monkeypatch):
+    row = _canonical_late_retry_row()
+    row["meta"][_RR_STATUS_FIELD] = None
+    watcher = _MonitorWatcher(watch_returns=True)
+    monitor, osm, broker = _monitor_for_retry(row, watcher)
+    hydration_calls = []
+    monkeypatch.setattr(
+        monitor,
+        "_maybe_hydrate_deferred_order",
+        lambda *args, **kwargs: hydration_calls.append(True) or {"attempted": False},
+    )
+
+    _run_young_pending_monitor(monitor, row)
+
+    assert hydration_calls == []
+    assert watcher.watch_calls == 0
+    assert osm.cancel_calls == []
+    _assert_no_broker_mutation(broker)
+
+
+def test_recognized_restart_retry_exception_suppresses_legacy_monitor_fallthrough(monkeypatch):
+    row = _canonical_late_retry_row()
+    watcher = _MonitorWatcher(watch_returns=True)
+    monitor, osm, broker = _monitor_for_retry(row, watcher)
+    hydration_calls = []
+    monkeypatch.setattr(
+        monitor,
+        "_maybe_hydrate_deferred_order",
+        lambda *args, **kwargs: hydration_calls.append(True) or {"attempted": False},
+    )
+
+    from ap.pending_trigger_restart_recovery import PendingTriggerRestartRecovery
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("recovery engine unavailable")
+
+    monkeypatch.setattr(
+        PendingTriggerRestartRecovery,
+        "consume_canonical_restart_rearm_retry",
+        _raise,
+    )
+
+    _run_young_pending_monitor(monitor, row)
+
+    assert hydration_calls == []
+    assert watcher.watch_calls == 0
+    assert osm.cancel_calls == []
+    _assert_no_broker_mutation(broker)
+
