@@ -2457,12 +2457,23 @@ class ClientRunner(threading.Thread):
                 )
 
             retryable_deferred = int(result.get("retryable_deferred", 0) or 0)
+            retry_owned = int(result.get("retry_owned", 0) or 0)
             unresolved = int(result.get("unresolved", 0) or 0)
-            if bool(result.get("completed")) and (retryable_deferred > 0 or unresolved > 0):
-                result["result_class"] = "RETRYABLE_PARTIAL_DEFERRED"
+            if bool(result.get("completed")) and (
+                retryable_deferred > 0 or unresolved > 0 or retry_owned > 0
+            ):
+                result["result_class"] = (
+                    "RETRYABLE_MARKET_TRUTH_PENDING"
+                    if retry_owned > 0 and retryable_deferred == 0 and unresolved == 0
+                    else "RETRYABLE_PARTIAL_DEFERRED"
+                )
                 result["completed"] = False
                 result["retryable"] = True
-                result["retry_reason"] = "retryable_rows_remain"
+                result["retry_reason"] = (
+                    "retry_owned_rows_remain"
+                    if retry_owned > 0
+                    else "retryable_rows_remain"
+                )
 
             result["attempt_count"] = self._overnight_reeval_attempt_count
             result["attempt_source"] = source

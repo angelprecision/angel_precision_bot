@@ -69,6 +69,49 @@ def _requires_regular_session_market_truth(now_et: datetime) -> bool:
     return current >= _REGULAR_SESSION_MARKET_TRUTH_START_ET
 
 
+def _reset_stale_restart_rearm_metadata(metadata: dict, session_key: str) -> dict:
+    """Replace prior-session retry authority while preserving order identity."""
+    if not isinstance(metadata, dict):
+        metadata = {}
+    out = dict(metadata)
+    retry_fields = (
+        "restart_rearm_status",
+        "restart_rearm_owner",
+        "restart_rearm_reason",
+        "restart_rearm_attempt",
+        "restart_rearm_next_at",
+        "restart_rearm_deadline",
+        "restart_rearm_first_failed_at",
+        "restart_rearm_last_failed_at",
+        "restart_rearm_client_id",
+        "restart_rearm_execution_mode",
+        "restart_rearm_generation",
+        "restart_rearm_session_key",
+    )
+    if not any(field in out for field in retry_fields):
+        return out
+    out.update({
+        "restart_rearm_status": "CLOSED",
+        "restart_rearm_owner": "",
+        "restart_rearm_reason": "",
+        "restart_rearm_attempt": None,
+        "restart_rearm_next_at": None,
+        "restart_rearm_deadline": None,
+        "restart_rearm_first_failed_at": None,
+        "restart_rearm_last_failed_at": None,
+        "restart_rearm_client_id": None,
+        "restart_rearm_execution_mode": None,
+        "restart_rearm_generation": None,
+        # Keep both session surfaces deterministic.  The old lease is closed;
+        # this value is only a current-session diagnostic mirror.
+        "restart_rearm_session_key": str(session_key or "").strip(),
+        "restart_rearm_closed_at": datetime.now(timezone.utc).isoformat(),
+        "restart_rearm_close_reason": "overnight_reeval_session_rollover",
+        "restart_recovery_late_boundary": "overnight_retry_rollover",
+    })
+    return out
+
+
 def _watcher_ownership_boundary(
     *,
     client_id: str,
@@ -1922,10 +1965,14 @@ def _classify_overnight_reeval_result(result: dict) -> dict:
         retryable = True
         retry_reason = "unresolved_rows"
     elif retry_owned > 0:
-        result_class = "COMPLETED_WITH_OWNED_RETRIES"
-        completed = True
-        retryable = False
-        retry_reason = None
+        # RETRY_PENDING is durable recovery ownership, not a completed
+        # overnight decision and not watcher ownership.  Fresh market truth
+        # is still required before the lifecycle can enter the normal
+        # watcher/materializer path.
+        result_class = "RETRYABLE_MARKET_TRUTH_PENDING"
+        completed = False
+        retryable = True
+        retry_reason = "retry_owned_rows_remain"
     elif fetched == 0:
         result_class = "COMPLETED_NO_WORK"
         completed = True
@@ -2368,6 +2415,84 @@ def run_overnight_reeval(
                     if not isinstance(_ord_meta, dict):
                         _ord_meta = {}
 
+                    # A current-session overnight re-evaluation is the
+                    # legitimate owner that replaces any prior-session retry
+                    # lease.  Close that lease through the same exact CAS used
+                    # by restart recovery before writing current-session
+                    # reattach metadata; otherwise Friday retry fields can
+                    # conflict with Monday's session key and strand the row.
+                    _retry_meta_fields = (
+                        "restart_rearm_status",
+                        "restart_rearm_owner",
+                        "restart_rearm_reason",
+                        "restart_rearm_attempt",
+                        "restart_rearm_next_at",
+                        "restart_rearm_deadline",
+                        "restart_rearm_first_failed_at",
+                        "restart_rearm_last_failed_at",
+                        "restart_rearm_client_id",
+                        "restart_rearm_execution_mode",
+                        "restart_rearm_generation",
+                        "restart_rearm_session_key",
+                    )
+                    if any(field in _ord_meta for field in _retry_meta_fields):
+                        try:
+                            from ap.pending_trigger_restart_recovery import (
+                                PendingTriggerRestartRecovery,
+                            )
+
+                            _roll_recovery = PendingTriggerRestartRecovery(
+                                client_id=client_id,
+                                execution_mode=_reattach_mode,
+                                osm=order_state_machine,
+                                entry_watcher=entry_watcher,
+                                broker=None,
+                                caller_source="ap_overnight_reeval.session_rollover",
+                            )
+                            _rolled = _roll_recovery._roll_overnight_retry_lease(
+                                _existing_oid,
+                                _existing_ord,
+                                reason="overnight_reeval_session_rollover",
+                            )
+                        except Exception as _roll_exc:
+                            log.critical(
+                                "[%s] overnight_reeval: retry lease rollover failed "
+                                "signal=%s local_order_id=%s: %s",
+                                ticker,
+                                signal_id,
+                                _existing_oid,
+                                _roll_exc,
+                            )
+                            _rolled = False
+                        if not _rolled:
+                            log.critical(
+                                "[%s] overnight_reeval: refusing REATTACH_WATCHER "
+                                "without exact retry rollover CAS signal=%s "
+                                "local_order_id=%s",
+                                ticker,
+                                signal_id,
+                                _existing_oid,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+                        _fresh_order = getattr(order_state_machine, "get_order", None)
+                        try:
+                            _fresh_order = _fresh_order(_existing_oid) if callable(_fresh_order) else None
+                        except Exception:
+                            _fresh_order = None
+                        if isinstance(_fresh_order, dict):
+                            _existing_ord = _fresh_order
+                            _ord_meta = _existing_ord.get("meta") or {}
+                            if isinstance(_ord_meta, str):
+                                try:
+                                    import json as _json
+                                    _ord_meta = _json.loads(_ord_meta)
+                                except Exception:
+                                    _ord_meta = {}
+                            if not isinstance(_ord_meta, dict):
+                                _ord_meta = {}
+
                     # Metadata merge: existing FIRST, canonical values LAST
                     # so proven session/mode/client/canonical always win over
                     # any stale or blank stored metadata.
@@ -2386,6 +2511,10 @@ def run_overnight_reeval(
                         # seam and opts in to the late-attachment classifier.
                         "late_attachment_policy_eligible":  True,
                     }
+                    _reattach_metadata = _reset_stale_restart_rearm_metadata(
+                        _reattach_metadata,
+                        session_key,
+                    )
 
                     import types as _types_mod
                     _reattach_plan = _types_mod.SimpleNamespace(

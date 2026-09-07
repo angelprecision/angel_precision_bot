@@ -3326,8 +3326,12 @@ class TestLateMarketValidityRecovery:
         assert "late_attachment_entry_cutoff" in osm.cancel_calls[0][1]
         _assert_no_broker_mutation(rec.broker)
 
-    def test_late_retry_from_prior_session_is_terminalized_by_session_authority(self):
+    def test_overnight_late_retry_from_prior_session_rolls_without_terminalizing(self):
         row = _canonical_late_retry_row(local_order_id="late-prior-session")
+        row["contract"] = "DEFERRED:SPY"
+        row["meta"]["overnight"] = True
+        row["canonical_signal_id"] = "canonical-late-prior-session"
+        row["meta"]["canonical_signal_id"] = row["canonical_signal_id"]
         row["meta"]["overnight_reeval_session_key"] = (
             _now_et().date() - timedelta(days=1)
         ).isoformat()
@@ -3337,10 +3341,166 @@ class TestLateMarketValidityRecovery:
 
         outcome = rec.recover_one_row(row)
 
-        assert outcome == _RowOutcome.TERMINALIZED
+        assert outcome == _RowOutcome.UNRESOLVED
         assert watcher.watch_calls == 0
-        assert "late_attachment_session_expired" in osm.cancel_calls[0][1]
+        persisted = osm.get_order(row["local_order_id"])
+        assert persisted["status"] == "PENDING_TRIGGER"
+        assert persisted["local_order_id"] == row["local_order_id"]
+        assert persisted["signal_id"] == row["signal_id"]
+        assert persisted["canonical_signal_id"] == row["canonical_signal_id"]
+        assert persisted["client_id"] == row["client_id"]
+        assert persisted["execution_mode"] == row["execution_mode"]
+        assert persisted["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert persisted["meta"][_RR_SESSION_FIELD] == _now_et().date().isoformat()
+        assert persisted["meta"][_RR_ATTEMPT_FIELD] is None
+        assert persisted["meta"][_RR_OWNER_FIELD] == ""
+        assert persisted["meta"][_RR_NEXT_AT_FIELD] is None
+        assert osm.cancel_calls == []
         _assert_no_broker_mutation(rec.broker)
+
+    def test_overnight_cutoff_rolls_retry_without_terminalizing(self):
+        row = _canonical_late_retry_row(local_order_id="overnight-cutoff-hold")
+        row["contract"] = "DEFERRED:SPY"
+        row["meta"]["overnight"] = True
+
+        class _CutoffWatcher(_MonitorWatcher):
+            def _is_past_entry_cutoff_now(self):
+                return True
+
+        watcher = _CutoffWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        assert osm.cancel_calls == []
+        persisted = osm.get_order(row["local_order_id"])
+        assert persisted["status"] == "PENDING_TRIGGER"
+        assert persisted["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert persisted["meta"][_RR_CLOSE_REASON] == "overnight_retry_entry_cutoff_rollover"
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_overnight_retry_session_conflict_rolls_deterministically(self):
+        row = _canonical_late_retry_row(local_order_id="overnight-session-conflict")
+        row["contract"] = "DEFERRED:SPY"
+        row["meta"]["overnight"] = True
+        row["canonical_signal_id"] = "canonical-overnight-session-conflict"
+        row["meta"]["canonical_signal_id"] = row["canonical_signal_id"]
+        row["meta"]["overnight_reeval_session_key"] = _now_et().date().isoformat()
+        row["meta"][_RR_SESSION_FIELD] = (
+            _now_et().date() - timedelta(days=3)
+        ).isoformat()
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        assert osm.cancel_calls == []
+        persisted = osm.get_order(row["local_order_id"])
+        assert persisted["status"] == "PENDING_TRIGGER"
+        assert persisted["local_order_id"] == row["local_order_id"]
+        assert persisted["signal_id"] == row["signal_id"]
+        assert persisted["canonical_signal_id"] == row["canonical_signal_id"]
+        assert persisted["client_id"] == row["client_id"]
+        assert persisted["execution_mode"] == row["execution_mode"]
+        current_session = _now_et().date().isoformat()
+        assert persisted["meta"][_RR_SESSION_FIELD] == current_session
+        assert persisted["meta"]["overnight_reeval_session_key"] == current_session
+        assert persisted["meta"][_RR_CLOSE_REASON] == "overnight_retry_session_conflict"
+        assert persisted["meta"][_RR_ATTEMPT_FIELD] is None
+        _assert_no_broker_mutation(rec.broker)
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_overnight_session_rollover_preserves_paper_live_identity(self, mode):
+        row = _canonical_late_retry_row(
+            local_order_id=f"overnight-rollover-{mode}",
+            mode=mode,
+        )
+        row["contract"] = "DEFERRED:SPY"
+        row["meta"]["overnight"] = True
+        row["canonical_signal_id"] = f"canonical-{mode}"
+        row["meta"]["canonical_signal_id"] = row["canonical_signal_id"]
+        prior_session = (_now_et().date() - timedelta(days=1)).isoformat()
+        row["meta"]["overnight_reeval_session_key"] = prior_session
+        row["meta"][_RR_SESSION_FIELD] = prior_session
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(
+            row,
+            watcher=watcher,
+            mode=mode,
+            client_id=row["client_id"],
+            quote_result=None,
+        )
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        assert osm.cancel_calls == []
+        persisted = osm.get_order(row["local_order_id"])
+        assert persisted["status"] == "PENDING_TRIGGER"
+        assert persisted["local_order_id"] == row["local_order_id"]
+        assert persisted["signal_id"] == row["signal_id"]
+        assert persisted["canonical_signal_id"] == row["canonical_signal_id"]
+        assert persisted["client_id"] == row["client_id"]
+        assert persisted["execution_mode"] == mode
+        assert persisted["meta"][_RR_MODE_FIELD] is None
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_overnight_rollover_restart_can_recover_same_identity_once(self):
+        row = _canonical_late_retry_row(local_order_id="overnight-restart-parity")
+        row["contract"] = "DEFERRED:SPY"
+        row["meta"]["overnight"] = True
+        row["canonical_signal_id"] = "canonical-overnight-restart-parity"
+        row["meta"]["canonical_signal_id"] = row["canonical_signal_id"]
+        row["meta"][_RR_SESSION_FIELD] = (
+            _now_et().date() - timedelta(days=1)
+        ).isoformat()
+        row["meta"]["overnight_reeval_session_key"] = row["meta"][_RR_SESSION_FIELD]
+        watcher_one = _MonitorWatcher(watch_returns=True)
+        rec_one, osm = _make_recovery(row, watcher=watcher_one, quote_result=None)
+
+        first = rec_one.recover_one_row(row)
+        assert first == _RowOutcome.UNRESOLVED
+        assert watcher_one.watch_calls == 0
+        assert osm.cancel_calls == []
+
+        recovered_row = osm.get_order(row["local_order_id"])
+        watcher_two = _MonitorWatcher(watch_returns=True)
+        rec_two = PendingTriggerRestartRecovery(
+            client_id=row["client_id"],
+            execution_mode=row["execution_mode"],
+            osm=osm,
+            entry_watcher=watcher_two,
+            broker=MagicMock(),
+            quote_check_fn=lambda *_args: False,
+        )
+        assert _late_attachment_policy_eligible(recovered_row) is True
+        assert _build_plan(recovered_row) is not None
+        assert rec_two._verify_durable_rearm_boundary(
+            recovered_row,
+            row["local_order_id"],
+        ) is not None
+        assert rec_two._late_ownership_boundary(
+            recovered_row,
+            row["local_order_id"],
+        ) == "LATE_MARKET_TRUTH"
+        second = rec_two.recover_one_row(recovered_row)
+
+        assert second == _RowOutcome.WATCHER_OWNED
+        assert watcher_two.watch_calls == 1
+        assert len(watcher_two._pending) == 1
+        watched = watcher_two._pending[0].signal
+        assert watched["local_order_id"] == row["local_order_id"]
+        assert watched["signal_id"] == row["signal_id"]
+        assert watched["client_id"] == row["client_id"]
+        assert watched["execution_mode"] == row["execution_mode"]
+        assert osm.get_order(row["local_order_id"])["canonical_signal_id"] == row["canonical_signal_id"]
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec_two.broker)
 
     def test_post_open_through_trigger_routes_to_canonical_watcher_policy(self, monkeypatch):
         r = _row(meta={

@@ -127,6 +127,24 @@ def _late_retry_session_status(row: dict) -> str:
         return "INVALID"
     return "CURRENT" if parsed == current else "EXPIRED"
 
+
+def _is_overnight_or_deferred_row(row: dict) -> bool:
+    """Reuse the monitor's existing overnight/deferred classification.
+
+    The monitor owns the production definition of cross-session inventory.
+    This lazy call avoids an import cycle while making retry/session expiry
+    use the same authority instead of inventing a second eligibility rule.
+    Any unavailable or malformed classifier is fail-closed as ordinary
+    intraday inventory; it never grants rollover protection by accident.
+    """
+    try:
+        from ap.order_monitor import APOrderMonitor
+
+        classified = APOrderMonitor._is_overnight_or_deferred_row(None, row)
+        return bool(classified[0]) if isinstance(classified, tuple) else False
+    except Exception:
+        return False
+
 # ── Per-row outcome constants (Blocker 2) ─────────────────────────────────────
 
 class _RowOutcome:
@@ -317,6 +335,7 @@ class PendingTriggerRestartRecovery:
     def _late_ownership_boundary(self, row: dict, local_oid: str) -> Optional[str]:
         """Resolve the clock/session boundary immediately before ``watch()``."""
         session_status = _late_retry_session_status(row)
+        overnight_or_deferred = _is_overnight_or_deferred_row(row)
         has_retry_state = any(
             field in _extract_meta(row)
             for field in (
@@ -330,8 +349,10 @@ class PendingTriggerRestartRecovery:
             )
         )
         if session_status == "EXPIRED" and has_retry_state:
-            return "SESSION_EXPIRED"
+            return "OVERNIGHT_RETRY_ROLLOVER" if overnight_or_deferred else "SESSION_EXPIRED"
         if session_status == "INVALID" and has_retry_state:
+            if overnight_or_deferred:
+                return "OVERNIGHT_RETRY_ROLLOVER"
             self._mark_failure(local_oid, "retry_verification:late_session")
             return None
 
@@ -341,7 +362,7 @@ class PendingTriggerRestartRecovery:
 
         cutoff_state = self._entry_cutoff_state()
         if cutoff_state is True:
-            return "ENTRY_CUTOFF_EXPIRED"
+            return "OVERNIGHT_ENTRY_CUTOFF" if overnight_or_deferred else "ENTRY_CUTOFF_EXPIRED"
         if cutoff_state is None:
             self._mark_failure(local_oid, "late_entry_cutoff_authority_unproven")
             return None
@@ -353,6 +374,111 @@ class PendingTriggerRestartRecovery:
             session_status,
         )
         return "LATE_MARKET_TRUTH"
+
+    def _roll_overnight_retry_lease(
+        self,
+        local_oid: str,
+        row: dict,
+        *,
+        reason: str,
+    ) -> bool:
+        """Close stale retry ownership without changing the order lifecycle.
+
+        Session/date and retry cadence are infrastructure authority only.  A
+        rollover CAS may clear the old lease, but it must leave the exact
+        PENDING_TRIGGER row available for the next overnight reevaluation.
+        """
+        meta = _extract_meta(row)
+        expected_state = _restart_rearm_expected_state(meta)
+        has_retry_state = any(
+            value is not None
+            and not (isinstance(value, str) and not value.strip())
+            for value in expected_state.values()
+        )
+        if not has_retry_state:
+            return True
+
+        current_session = _now_et().date().isoformat()
+        patch = {
+            _RR_STATUS_FIELD: "CLOSED",
+            _RR_OWNER_FIELD: "",
+            _RR_REASON_FIELD: "",
+            _RR_ATTEMPT_FIELD: None,
+            _RR_NEXT_AT_FIELD: None,
+            _RR_DEADLINE_FIELD: None,
+            _RR_FIRST_FAILED_AT: None,
+            _RR_LAST_FAILED_AT: None,
+            _RR_CLIENT_FIELD: None,
+            _RR_MODE_FIELD: None,
+            _RR_GENERATION_FIELD: None,
+            _RR_SESSION_FIELD: current_session,
+            "overnight_reeval_session_key": current_session,
+            _RR_CLOSED_AT: _now_iso(),
+            _RR_CLOSE_REASON: reason,
+            "restart_recovery_late_boundary": "overnight_retry_rollover",
+        }
+        ok = self._safe_meta_update(
+            local_oid,
+            patch,
+            expected_status="PENDING_TRIGGER",
+            expected_execution_mode=self.execution_mode,
+            expected_signal_id=str(row.get("signal_id") or "").strip(),
+            expected_no_broker_handoff=True,
+            expected_restart_rearm_state=expected_state,
+        )
+        if not ok:
+            self._mark_failure(local_oid, "retry_rollover_cas_failed")
+            log.critical(
+                "RESTART_RECOVERY_OVERNIGHT_RETRY_ROLLOVER_UNRESOLVED "
+                "local=%s — exact retry lease CAS did not win",
+                local_oid,
+            )
+            return False
+
+        get_fn = getattr(self.osm, "get_order", None)
+        if not callable(get_fn):
+            return False
+        try:
+            reread = get_fn(local_oid)
+        except Exception:
+            return False
+        if not isinstance(reread, dict):
+            return False
+        if (
+            str(reread.get("status") or "").strip().upper() != "PENDING_TRIGGER"
+            or str(reread.get("local_order_id") or "").strip() != local_oid
+            or str(reread.get("client_id") or "").strip().lower() != self.client_id.lower()
+            or str(reread.get("execution_mode") or "").strip().lower() != self.execution_mode
+            or str(reread.get("signal_id") or "").strip()
+            != str(row.get("signal_id") or "").strip()
+            or has_broker_handoff_evidence(reread)
+        ):
+            return False
+        reread_meta = _extract_meta(reread)
+        if str(reread_meta.get(_RR_STATUS_FIELD) or "").strip().upper() != "CLOSED":
+            return False
+        if (
+            reread_meta.get(_RR_SESSION_FIELD) != current_session
+            or reread_meta.get("overnight_reeval_session_key") != current_session
+        ):
+            return False
+        if any(
+            reread_meta.get(field) not in (None, "")
+            for field in (
+                _RR_OWNER_FIELD,
+                _RR_REASON_FIELD,
+                _RR_ATTEMPT_FIELD,
+                _RR_NEXT_AT_FIELD,
+                _RR_DEADLINE_FIELD,
+                _RR_FIRST_FAILED_AT,
+                _RR_LAST_FAILED_AT,
+                _RR_CLIENT_FIELD,
+                _RR_MODE_FIELD,
+                _RR_GENERATION_FIELD,
+            )
+        ):
+            return False
+        return True
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -977,9 +1103,17 @@ class PendingTriggerRestartRecovery:
 
     def _handle_restart_rearm_retry(self, row, local_oid, live_quote_abt, plan_builder_fn) -> str:
         _late_policy = _late_attachment_policy_eligible(row)
+        _overnight_or_deferred = _is_overnight_or_deferred_row(row)
         if _late_policy:
             _session_status = _late_retry_session_status(row)
             if _session_status == "EXPIRED":
+                if _overnight_or_deferred:
+                    self._roll_overnight_retry_lease(
+                        local_oid,
+                        row,
+                        reason="overnight_retry_session_rollover",
+                    )
+                    return _RowOutcome.UNRESOLVED
                 return self._terminalize_with_reason(
                     local_oid,
                     row,
@@ -990,6 +1124,13 @@ class PendingTriggerRestartRecovery:
                     },
                 )
             if _session_status == "INVALID":
+                if _overnight_or_deferred:
+                    self._roll_overnight_retry_lease(
+                        local_oid,
+                        row,
+                        reason="overnight_retry_session_conflict",
+                    )
+                    return _RowOutcome.UNRESOLVED
                 self._mark_failure(local_oid, "retry_verification:late_session")
                 return _RowOutcome.UNRESOLVED
 
@@ -1019,6 +1160,13 @@ class PendingTriggerRestartRecovery:
         if _late_policy:
             _cutoff_state = self._entry_cutoff_state()
             if _cutoff_state is True:
+                if _overnight_or_deferred:
+                    self._roll_overnight_retry_lease(
+                        local_oid,
+                        row,
+                        reason="overnight_retry_entry_cutoff_rollover",
+                    )
+                    return _RowOutcome.UNRESOLVED
                 return self._terminalize_with_reason(
                     local_oid,
                     row,
@@ -1271,6 +1419,22 @@ class PendingTriggerRestartRecovery:
                         _RR_CLOSE_REASON: "late_attachment_session_expired",
                     },
                 )
+            if _late_boundary == "OVERNIGHT_RETRY_ROLLOVER":
+                if not self._roll_overnight_retry_lease(
+                    local_oid,
+                    row,
+                    reason="overnight_retry_session_rollover",
+                ):
+                    return _RowOutcome.UNRESOLVED
+                return _RowOutcome.UNRESOLVED
+            if _late_boundary == "OVERNIGHT_ENTRY_CUTOFF":
+                if not self._roll_overnight_retry_lease(
+                    local_oid,
+                    row,
+                    reason="overnight_retry_entry_cutoff_rollover",
+                ):
+                    return _RowOutcome.UNRESOLVED
+                return _RowOutcome.UNRESOLVED
             if _late_boundary == "ENTRY_CUTOFF_EXPIRED":
                 return self._terminalize_with_reason(
                     local_oid,
@@ -1540,7 +1704,19 @@ class PendingTriggerRestartRecovery:
         _session_key = None
         if _late_policy:
             if _existing_late_lease:
-                if _late_retry_session_status(row) != "CURRENT":
+                _session_status = _late_retry_session_status(row)
+                if _session_status != "CURRENT":
+                    if _is_overnight_or_deferred_row(row):
+                        self._roll_overnight_retry_lease(
+                            local_oid,
+                            row,
+                            reason=(
+                                "overnight_retry_session_conflict"
+                                if _session_status == "INVALID"
+                                else "overnight_retry_session_rollover"
+                            ),
+                        )
+                        return _RowOutcome.UNRESOLVED
                     self._mark_failure(local_oid, "retry_verification:late_session")
                     log.critical(
                         "RESTART_RECOVERY_LATE_REARM_SESSION_UNPROVEN "

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import ap.preopen_readiness as pr
 
@@ -326,7 +327,7 @@ def test_pending_trigger_without_watcher_is_degraded(monkeypatch):
     assert result["details"]["pending_trigger_without_watcher"][0]["local_order_id"] == "L-1"
 
 
-def test_exact_restart_rearm_retry_owner_does_not_block_unrelated_live_entries(monkeypatch):
+def test_exact_restart_rearm_retry_owner_blocks_live_until_watcher_or_terminal(monkeypatch):
     _stub_common(monkeypatch, client_state={
         "stale_processing_ids": [],
         "watching_orphans": [],
@@ -334,6 +335,8 @@ def test_exact_restart_rearm_retry_owner_does_not_block_unrelated_live_entries(m
         "watching_count": 0,
     })
     runner = _Runner(mode="live", watcher=_Watcher(set()))
+    broker = MagicMock()
+    runner.core.broker = broker
     now_utc = datetime.now(timezone.utc)
     row = {
         "local_order_id": "L-1",
@@ -363,9 +366,18 @@ def test_exact_restart_rearm_retry_owner_does_not_block_unrelated_live_entries(m
         "jason@example.com", "live", dry_run=True, runner=runner
     )
 
-    assert result["status"] == "OK"
-    assert "pending_trigger_without_watcher_ownership" not in result["errors"]
-    assert result["details"]["pending_trigger_without_watcher"] == []
+    assert result["status"] == "BLOCKED"
+    assert "pending_trigger_without_watcher_ownership" in result["errors"]
+    assert result["details"]["pending_trigger_retry_owned"] == [{
+        "local_order_id": "L-1",
+        "signal_id": "sig-1",
+    }]
+    assert result["details"]["pending_trigger_ownerless"] == []
+    assert result["details"]["pending_trigger_without_watcher"] == result["details"]["pending_trigger_retry_owned"]
+    assert row["meta"]["restart_rearm_status"] == "RETRY_PENDING"
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+    broker.replace_order.assert_not_called()
 
 
 def test_preopen_readiness_rejects_every_broker_handoff_marker(monkeypatch):
@@ -571,7 +583,25 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
         "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
         "watching_count": 1,
     })
-    runner = _Runner(mode="live")
+    runner = _Runner(
+        mode="live",
+        watcher=_ExactWatcher(
+            local_order_id="L-1",
+            signal_id="sig-1",
+            client_id="jason@example.com",
+            execution_mode="live",
+        ),
+    )
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: {
+            "local_order_id": "L-1",
+            "signal_id": "sig-1",
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "status": "PENDING_TRIGGER",
+            "meta": {},
+        } if oid == "L-1" else None
+    )
     runner._last_overnight_reeval_date = None
     monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
     status, details = pr._overnight_status(
@@ -618,7 +648,7 @@ def test_overnight_status_ignores_legacy_last_reeval_date(monkeypatch):
         now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
     )
     assert status == "missing"
-    assert details["source"] == "watching_or_pending_trigger_present_without_overnight_success"
+    assert details["source"] == "pending_trigger_without_watcher_ownership"
 
 
 def test_startup_handoff_success_does_not_count_as_post_overnight_success(monkeypatch):
@@ -647,7 +677,7 @@ def test_startup_handoff_success_does_not_count_as_post_overnight_success(monkey
         now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
     )
     assert status == "missing"
-    assert details["source"] == "watching_or_pending_trigger_present_without_overnight_success"
+    assert details["source"] == "pending_trigger_without_watcher_ownership"
 
 
 def test_health_summary_exposes_preopen_status(monkeypatch):

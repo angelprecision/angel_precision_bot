@@ -54,6 +54,8 @@ def _result(**overrides):
         "fresh_armed": 0,
         "fetched": 125,
         "stalled": True,
+        "retry_owned": 0,
+        "unresolved": 0,
         "result_class": "RETRYABLE_ALL_DEFERRED",
         "completed": False,
         "retryable": True,
@@ -140,6 +142,38 @@ def test_first_all_deferred_stall_schedules_retry_and_skips_post_handoff(monkeyp
     assert runner._overnight_reeval_next_retry_at is not None
     assert runner.post_calls == []
     assert len(calls) == 1
+
+
+def test_client_runner_retry_owned_is_not_success_or_post_handoff(monkeypatch):
+    """ClientRunner must keep recovery ownership incomplete until truth resolves."""
+    monkeypatch.setattr(
+        ov,
+        "run_overnight_reeval",
+        lambda **kwargs: _result(
+            retry_owned=1,
+            skipped=1,
+            stalled=False,
+            completed=True,
+            retryable=False,
+            retry_reason=None,
+            result_class="COMPLETED_WITH_OWNED_RETRIES",
+        ),
+    )
+    runner = _runner()
+
+    result = runner.run_overnight_reeval_attempt(
+        now_et=_dt(9, 31),
+        source="scheduler",
+    )
+
+    assert result["result_class"] == "RETRYABLE_MARKET_TRUTH_PENDING"
+    assert result["completed"] is False
+    assert result["retryable"] is True
+    assert result["retry_reason"] == "retry_owned_rows_remain"
+    assert runner._overnight_reeval_success_date is None
+    assert runner.post_calls == []
+    assert runner._overnight_reeval_next_retry_at is not None
+    assert runner.persisted_locks[-1]["result"]["completed"] is False
 
 
 def test_premarket_9am_attempt_retries_on_interval_not_post_open(monkeypatch):

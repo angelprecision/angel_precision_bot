@@ -369,8 +369,9 @@ def test_092929_slow_boundary_routes_to_market_truth_after_open(monkeypatch):
 
     assert state.result["armed"] == 0
     assert state.result["retry_owned"] == 1
-    assert state.result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
-    assert state.result["completed"] is True
+    assert state.result["result_class"] == "RETRYABLE_MARKET_TRUTH_PENDING"
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
     retry_row = state.osm.rows["local-1"]
     assert retry_row["local_order_id"] == "local-1"
     assert retry_row["signal_id"] == "slow-boundary"
@@ -482,8 +483,9 @@ def test_post_open_missing_quote_gets_durable_retry_owner(monkeypatch):
     )
 
     assert state.result["retry_owned"] == 1
-    assert state.result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
-    assert state.result["completed"] is True
+    assert state.result["result_class"] == "RETRYABLE_MARKET_TRUTH_PENDING"
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
     assert [oid for _plan, oid in state.watcher.calls] == ["local-1"]
     assert state.watcher._pending == []
     assert state.osm.rows["local-1"]["meta"]["restart_rearm_status"] == "RETRY_PENDING"
@@ -492,7 +494,7 @@ def test_post_open_missing_quote_gets_durable_retry_owner(monkeypatch):
     state.broker.cancel_order.assert_not_called()
 
 
-def test_completed_owned_retry_is_consumed_same_process_before_5400_seconds(monkeypatch):
+def test_retry_owned_recovery_is_consumed_same_process_before_5400_seconds(monkeypatch):
     from datetime import timedelta, timezone
 
     from ap.order_monitor import APOrderMonitor
@@ -506,9 +508,9 @@ def test_completed_owned_retry_is_consumed_same_process_before_5400_seconds(monk
         watch_returns=False,
     )
 
-    assert state.result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
-    assert state.result["completed"] is True
-    assert state.result["retryable"] is False
+    assert state.result["result_class"] == "RETRYABLE_MARKET_TRUTH_PENDING"
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
     assert state.watcher._pending == []
 
     row = state.osm.rows["local-1"]
@@ -597,7 +599,7 @@ def test_owned_retry_does_not_hide_unresolved_inventory(monkeypatch):
         pending,
         client_id="jose@example.com",
         execution_mode="live",
-    ) == [pending[1]]
+    ) == pending
     state.broker.submit_order.assert_not_called()
     state.broker.cancel_order.assert_not_called()
     state.broker.replace_order.assert_not_called()

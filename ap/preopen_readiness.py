@@ -464,16 +464,25 @@ def _query_client_state(client_id: str) -> dict:
     }
 
 
-def _pending_trigger_without_watcher(
+def _pending_trigger_ownership(
     runner,
     pending_rows: list[dict],
     *,
     client_id: str = "",
     execution_mode: str = "",
-) -> list[dict]:
+) -> dict[str, list[dict]]:
+    """Classify pending rows by the exact durable owner they prove.
+
+    A retry lease is recovery ownership only.  It keeps the lifecycle alive
+    while fresh market truth is unavailable, but it does not mean an in-memory
+    APEntryWatcher owns the breach callback.  Readiness therefore keeps retry
+    owned rows in the same blocking set as genuinely ownerless rows.
+    """
     entry_watcher = getattr(getattr(runner, "core", None), "entry_watcher", None)
+    classes = {"watcher_owned": [], "retry_owned": [], "ownerless": []}
     if entry_watcher is None or not hasattr(entry_watcher, "has_order"):
-        return list(pending_rows or [])
+        classes["ownerless"].extend(pending_rows or [])
+        return classes
 
     # A bounded restart-rearm retry is active ownership, not an ownerless
     # lifecycle.  Reuse the canonical verifier so readiness accepts it only
@@ -496,12 +505,11 @@ def _pending_trigger_without_watcher(
             )
         except Exception:
             retry_owner = None
-    out = []
     for row in pending_rows or []:
         local_order_id = str(row.get("local_order_id") or "").strip()
         signal_id = str(row.get("signal_id") or "").strip()
         if not local_order_id or not signal_id or retry_owner is None:
-            out.append(row)
+            classes["ownerless"].append(row)
             continue
         try:
             # Never let local_order_id-only has_order() satisfy readiness.
@@ -514,6 +522,7 @@ def _pending_trigger_without_watcher(
                 )
                 is not None
             ):
+                classes["watcher_owned"].append(row)
                 continue
             if (
                 retry_owner.prove_restart_rearm_retry_owner(
@@ -522,6 +531,7 @@ def _pending_trigger_without_watcher(
                 )
                 is not None
             ):
+                classes["retry_owned"].append(row)
                 continue
         except Exception as exc:
             log.warning(
@@ -529,8 +539,30 @@ def _pending_trigger_without_watcher(
                 local_order_id,
                 exc,
             )
-        out.append(row)
-    return out
+        classes["ownerless"].append(row)
+    return classes
+
+
+def _pending_trigger_without_watcher(
+    runner,
+    pending_rows: list[dict],
+    *,
+    client_id: str = "",
+    execution_mode: str = "",
+) -> list[dict]:
+    """Return every pending row without exact watcher ownership.
+
+    This compatibility wrapper deliberately includes exact retry-owned rows:
+    retry ownership is not watcher ownership and must remain readiness
+    blocking for LIVE.
+    """
+    classes = _pending_trigger_ownership(
+        runner,
+        pending_rows,
+        client_id=client_id,
+        execution_mode=execution_mode,
+    )
+    return classes["retry_owned"] + classes["ownerless"]
 
 
 def _overnight_status(
@@ -543,6 +575,20 @@ def _overnight_status(
     stage: str = "",
     now: datetime | None = None,
 ) -> tuple[str, dict]:
+    pending_rows = client_state.get("pending_trigger_rows") or []
+    if pending_rows:
+        ownership = _pending_trigger_ownership(
+            runner,
+            pending_rows,
+            client_id=client_id,
+            execution_mode=execution_mode,
+        )
+        if ownership["retry_owned"] or ownership["ownerless"]:
+            return "missing", {
+                "source": "pending_trigger_without_watcher_ownership",
+                "retry_owned": ownership["retry_owned"],
+                "ownerless": ownership["ownerless"],
+            }
     if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
         return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
     success_date = getattr(runner, "_overnight_reeval_success_date", None)
@@ -683,12 +729,16 @@ def run_preopen_autonomous_readiness(
     if client_state.get("watching_orphans"):
         errors.append("watching_rows_missing_orders_recommend_new_rescue")
 
-    unowned_pending = _pending_trigger_without_watcher(
+    pending_ownership = _pending_trigger_ownership(
         runner,
         client_state.get("pending_trigger_rows") or [],
         client_id=client_id,
         execution_mode=mode,
     )
+    unowned_pending = pending_ownership["retry_owned"] + pending_ownership["ownerless"]
+    details["pending_trigger_watcher_owned"] = pending_ownership["watcher_owned"]
+    details["pending_trigger_retry_owned"] = pending_ownership["retry_owned"]
+    details["pending_trigger_ownerless"] = pending_ownership["ownerless"]
     details["pending_trigger_without_watcher"] = unowned_pending
     if unowned_pending:
         errors.append("pending_trigger_without_watcher_ownership")
