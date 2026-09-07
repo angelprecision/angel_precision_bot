@@ -476,7 +476,8 @@ def _pending_trigger_ownership(
     A retry lease is recovery ownership only.  It keeps the lifecycle alive
     while fresh market truth is unavailable, but it does not mean an in-memory
     APEntryWatcher owns the breach callback.  Readiness therefore keeps retry
-    owned rows in the same blocking set as genuinely ownerless rows.
+    owned rows distinct from both executable watcher ownership and genuinely
+    ownerless rows.  The caller decides whether each class is account-blocking.
     """
     entry_watcher = getattr(getattr(runner, "core", None), "entry_watcher", None)
     classes = {"watcher_owned": [], "retry_owned": [], "ownerless": []}
@@ -550,11 +551,12 @@ def _pending_trigger_without_watcher(
     client_id: str = "",
     execution_mode: str = "",
 ) -> list[dict]:
-    """Return every pending row without exact watcher ownership.
+    """Return pending rows that lack any exact durable ownership.
 
-    This compatibility wrapper deliberately includes exact retry-owned rows:
-    retry ownership is not watcher ownership and must remain readiness
-    blocking for LIVE.
+    Exact retry ownership is deliberately excluded.  It is not executable
+    watcher ownership, but it is valid row-level recovery ownership and must
+    not freeze unrelated LIVE entries.  The full three-way classification is
+    retained by :func:`_pending_trigger_ownership` and the readiness details.
     """
     classes = _pending_trigger_ownership(
         runner,
@@ -562,7 +564,7 @@ def _pending_trigger_without_watcher(
         client_id=client_id,
         execution_mode=execution_mode,
     )
-    return classes["retry_owned"] + classes["ownerless"]
+    return classes["ownerless"]
 
 
 def _overnight_status(
@@ -583,11 +585,17 @@ def _overnight_status(
             client_id=client_id,
             execution_mode=execution_mode,
         )
-        if ownership["retry_owned"] or ownership["ownerless"]:
+        if ownership["ownerless"]:
             return "missing", {
                 "source": "pending_trigger_without_watcher_ownership",
                 "retry_owned": ownership["retry_owned"],
                 "ownerless": ownership["ownerless"],
+            }
+        if ownership["retry_owned"]:
+            return "pending", {
+                "source": "pending_trigger_retry_owned",
+                "retry_owned": ownership["retry_owned"],
+                "ownerless": [],
             }
     if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
         return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
@@ -735,7 +743,10 @@ def run_preopen_autonomous_readiness(
         client_id=client_id,
         execution_mode=mode,
     )
-    unowned_pending = pending_ownership["retry_owned"] + pending_ownership["ownerless"]
+    # Exact retry ownership is a row-level hold, not account-level evidence
+    # that LIVE readiness is unsafe.  Only rows with no proven watcher or
+    # canonical retry owner remain in the fatal ownership set.
+    unowned_pending = pending_ownership["ownerless"]
     details["pending_trigger_watcher_owned"] = pending_ownership["watcher_owned"]
     details["pending_trigger_retry_owned"] = pending_ownership["retry_owned"]
     details["pending_trigger_ownerless"] = pending_ownership["ownerless"]
@@ -764,7 +775,10 @@ def run_preopen_autonomous_readiness(
         now=now,
     )
     if overnight_state == "pending":
-        warnings.append("overnight_reeval_pending_startup")
+        if overnight_details.get("source") == "pending_trigger_retry_owned":
+            warnings.append("overnight_reeval_retryable")
+        else:
+            warnings.append("overnight_reeval_pending_startup")
     elif overnight_state == "missing":
         if mode == "live" or _after_929_et(now):
             errors.append("overnight_reeval_missing")

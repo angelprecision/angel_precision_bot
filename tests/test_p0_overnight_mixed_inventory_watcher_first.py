@@ -599,7 +599,9 @@ def test_owned_retry_does_not_hide_unresolved_inventory(monkeypatch):
         pending,
         client_id="jose@example.com",
         execution_mode="live",
-    ) == pending
+    ) == [
+        {"local_order_id": "local-2", "signal_id": "unresolved"},
+    ]
     state.broker.submit_order.assert_not_called()
     state.broker.cancel_order.assert_not_called()
     state.broker.replace_order.assert_not_called()

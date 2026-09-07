@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,12 @@ class _Evt:
 
     def is_set(self) -> bool:
         return self._value
+
+    def set(self) -> None:
+        self._value = True
+
+    def clear(self) -> None:
+        self._value = False
 
 
 class _Thread:
@@ -58,6 +65,27 @@ class _ExactWatcher(_Watcher):
             )
         ]
         self._dedup_set = {signal_id}
+
+
+class _MultiExactWatcher(_Watcher):
+    """Minimal registry-shaped watcher for mixed watcher/retry readiness."""
+
+    def __init__(self, rows):
+        super().__init__({row["local_order_id"] for row in rows})
+        self._pending = [
+            SimpleNamespace(
+                signal={
+                    "local_order_id": row["local_order_id"],
+                    "signal_id": row["signal_id"],
+                    "client_id": row["client_id"],
+                    "execution_mode": row["execution_mode"],
+                },
+                state="PENDING",
+                _ownership_quarantine=False,
+            )
+            for row in rows
+        ]
+        self._dedup_set = {row["signal_id"] for row in rows}
 
 
 class _Runner:
@@ -327,7 +355,7 @@ def test_pending_trigger_without_watcher_is_degraded(monkeypatch):
     assert result["details"]["pending_trigger_without_watcher"][0]["local_order_id"] == "L-1"
 
 
-def test_exact_restart_rearm_retry_owner_blocks_live_until_watcher_or_terminal(monkeypatch):
+def test_exact_restart_rearm_retry_owner_is_row_hold_not_live_block(monkeypatch):
     _stub_common(monkeypatch, client_state={
         "stale_processing_ids": [],
         "watching_orphans": [],
@@ -366,18 +394,113 @@ def test_exact_restart_rearm_retry_owner_blocks_live_until_watcher_or_terminal(m
         "jason@example.com", "live", dry_run=True, runner=runner
     )
 
-    assert result["status"] == "BLOCKED"
-    assert "pending_trigger_without_watcher_ownership" in result["errors"]
+    assert result["status"] == "OK"
+    assert result["ok"] is True
+    assert "pending_trigger_without_watcher_ownership" not in result["errors"]
     assert result["details"]["pending_trigger_retry_owned"] == [{
         "local_order_id": "L-1",
         "signal_id": "sig-1",
     }]
     assert result["details"]["pending_trigger_ownerless"] == []
-    assert result["details"]["pending_trigger_without_watcher"] == result["details"]["pending_trigger_retry_owned"]
+    assert result["details"]["pending_trigger_without_watcher"] == []
+    assert result["details"]["overnight_reeval"]["status"] == "pending"
+    assert result["details"]["overnight_reeval"]["source"] == "pending_trigger_retry_owned"
+    assert "overnight_reeval_retryable" in result["warnings"]
     assert row["meta"]["restart_rearm_status"] == "RETRY_PENDING"
     broker.submit_order.assert_not_called()
     broker.cancel_order.assert_not_called()
     broker.replace_order.assert_not_called()
+
+
+def test_mixed_exact_watcher_and_retry_owner_keeps_live_tradeflow_available(monkeypatch):
+    """A retry-owned row is held individually while a healthy watcher remains usable."""
+    watcher_row = {
+        "local_order_id": "L-watcher",
+        "signal_id": "sig-watcher",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {},
+    }
+    now_utc = datetime.now(timezone.utc)
+    retry_row = {
+        "local_order_id": "L-retry",
+        "signal_id": "sig-retry",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {
+            "restart_rearm_status": "RETRY_PENDING",
+            "restart_rearm_owner": "restart_rearm:jason@example.com:live:L-retry",
+            "restart_rearm_reason": "regular_session_market_truth_not_yet_available",
+            "restart_rearm_attempt": 1,
+            "restart_rearm_next_at": (now_utc + timedelta(seconds=30)).isoformat(),
+            "restart_rearm_deadline": (now_utc + timedelta(minutes=1)).isoformat(),
+            "restart_rearm_first_failed_at": (now_utc - timedelta(minutes=2)).isoformat(),
+            "restart_rearm_last_failed_at": (now_utc - timedelta(seconds=1)).isoformat(),
+            "restart_rearm_client_id": "jason@example.com",
+            "restart_rearm_execution_mode": "live",
+            "restart_rearm_generation": 1,
+            "late_attachment_policy_eligible": True,
+        },
+    }
+    rows_by_id = {
+        row["local_order_id"]: row for row in (watcher_row, retry_row)
+    }
+    runner = _Runner(
+        mode="live",
+        watcher=_MultiExactWatcher([watcher_row]),
+    )
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(rows_by_id[oid]) if oid in rows_by_id else None
+    )
+    runner.core.broker = MagicMock()
+    _stub_common(monkeypatch, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [
+            {"local_order_id": watcher_row["local_order_id"], "signal_id": watcher_row["signal_id"]},
+            {"local_order_id": retry_row["local_order_id"], "signal_id": retry_row["signal_id"]},
+        ],
+        "watching_count": 1,
+    })
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner
+    )
+
+    assert result["status"] == "OK"
+    assert result["ok"] is True
+    assert result["errors"] == []
+    assert [row["local_order_id"] for row in result["details"]["pending_trigger_watcher_owned"]] == ["L-watcher"]
+    assert [row["local_order_id"] for row in result["details"]["pending_trigger_retry_owned"]] == ["L-retry"]
+    assert result["details"]["pending_trigger_ownerless"] == []
+    assert result["details"]["pending_trigger_without_watcher"] == []
+
+    # Exercise the actual ClientRunner readiness interpretation as well: an
+    # account with only valid watcher/retry ownership stays entry-available.
+    from client_runner import ClientRunner
+
+    live_runner = object.__new__(ClientRunner)
+    live_runner.email = "jason@example.com"
+    live_runner.mode = "LIVE"
+    live_runner._degraded_lock = threading.Lock()
+    live_runner.degraded_reasons = set()
+    live_runner.degraded = _Evt(False)
+    live_runner.entries_allowed = _Evt(True)
+    live_runner.failed = _Evt(False)
+    live_runner.stopping = _Evt(False)
+    live_runner._set_entry_permission = live_runner.entries_allowed.set
+    enforced = ClientRunner._enforce_post_overnight_readiness.__get__(
+        live_runner, ClientRunner
+    )(result, context="mixed_retry_readiness")
+    assert enforced["status"] == "OK"
+    assert live_runner.entries_allowed.is_set() is True
+    assert live_runner.degraded.is_set() is False
+    assert live_runner.degraded_reasons == set()
+    runner.core.broker.submit_order.assert_not_called()
+    runner.core.broker.cancel_order.assert_not_called()
+    runner.core.broker.replace_order.assert_not_called()
 
 
 def test_preopen_readiness_rejects_every_broker_handoff_marker(monkeypatch):
