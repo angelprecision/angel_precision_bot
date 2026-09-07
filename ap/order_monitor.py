@@ -1138,12 +1138,14 @@ class APOrderMonitor:
         if contract.upper().startswith("DEFERRED:"):
             return True, f"deferred_contract={contract}"
 
-        # Evidence 2: meta.contract_deferred
-        if meta.get("contract_deferred"):
+        # Evidence 2: meta.contract_deferred — exact boolean authority only.
+        # Strings, integers, containers, and other truthy values must never
+        # grant cross-session overnight/deferred preservation.
+        if meta.get("contract_deferred") is True:
             return True, "meta.contract_deferred=True"
 
-        # Evidence 3: meta.overnight
-        if meta.get("overnight"):
+        # Evidence 3: meta.overnight — exact boolean authority only.
+        if meta.get("overnight") is True:
             return True, "meta.overnight=True"
 
         # Evidence 4: meta.queue_status overnight/open-recheck variants
@@ -1252,8 +1254,8 @@ class APOrderMonitor:
         if contract.upper().startswith("DEFERRED:"):
             return True, f"deferred_contract={contract}"
 
-        # Evidence 6: meta.contract_deferred = True
-        if meta.get("contract_deferred"):
+        # Evidence 6: meta.contract_deferred = True (exact boolean only)
+        if meta.get("contract_deferred") is True:
             return True, "contract_deferred=True"
 
         return False, "no_watcher_evidence_found"

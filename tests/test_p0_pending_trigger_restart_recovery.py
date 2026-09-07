@@ -3358,6 +3358,31 @@ class TestLateMarketValidityRecovery:
         assert osm.cancel_calls == []
         _assert_no_broker_mutation(rec.broker)
 
+    @pytest.mark.parametrize("field", ["overnight", "contract_deferred"])
+    def test_malformed_cross_session_boolean_does_not_authorize_rollover(self, field):
+        """Only exact boolean True may preserve an ordinary row cross-session."""
+        row = _canonical_late_retry_row(
+            local_order_id=f"malformed-{field}-prior-session",
+        )
+        row["meta"][field] = "false"
+        row["meta"][_RR_SESSION_FIELD] = (
+            _now_et().date() - timedelta(days=1)
+        ).isoformat()
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        assert rec._late_ownership_boundary(
+            row,
+            row["local_order_id"],
+        ) == "SESSION_EXPIRED"
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert watcher.watch_calls == 0
+        assert osm.get_order(row["local_order_id"])["status"] == "CANCELED"
+        assert "late_attachment_session_expired" in osm.cancel_calls[0][1]
+        _assert_no_broker_mutation(rec.broker)
+
     def test_overnight_cutoff_rolls_retry_without_terminalizing(self):
         row = _canonical_late_retry_row(local_order_id="overnight-cutoff-hold")
         row["contract"] = "DEFERRED:SPY"

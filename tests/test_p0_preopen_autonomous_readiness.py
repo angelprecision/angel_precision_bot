@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 import ap.preopen_readiness as pr
 
 
@@ -125,7 +127,7 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     monkeypatch.setattr(
         pr,
         "_query_client_state",
-        lambda client_id: client_state or {
+        lambda client_id, execution_mode: client_state or {
             "stale_processing_ids": [],
             "watching_orphans": [],
             "pending_trigger_rows": [],
@@ -136,6 +138,158 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     monkeypatch.setattr(pr, "_pod_mode", lambda: "live")
     monkeypatch.setattr(pr, "_after_929_et", lambda now=None: True)
     return writes
+
+
+class _ModeScopedReadinessConnection:
+    """Small driver-faithful cursor for the real readiness SQL seam."""
+
+    def __init__(self, pending_rows):
+        self.pending_rows = list(pending_rows)
+        self.calls = []
+        self._result = []
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql, params=()):
+        normalized_sql = " ".join(str(sql).split()).lower()
+        params = tuple(params or ())
+        self.calls.append((normalized_sql, params))
+        if "from orders" in normalized_sql and "pending_trigger" in normalized_sql:
+            assert len(params) == 3
+            requested_client, requested_mode, _cutoff = params
+            self._result = [
+                (row["local_order_id"], row["signal_id"])
+                for row in self.pending_rows
+                if row["client_id"] == requested_client
+                and row["execution_mode"] == requested_mode
+            ]
+        elif "count(*)" in normalized_sql:
+            self._result = [(0,)]
+        else:
+            self._result = []
+
+    def fetchall(self):
+        return list(self._result)
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
+
+
+def _mode_inventory_row(local_order_id, signal_id, execution_mode):
+    return {
+        "local_order_id": local_order_id,
+        "signal_id": signal_id,
+        "client_id": "jason@example.com",
+        "execution_mode": execution_mode,
+    }
+
+
+def test_pending_trigger_inventory_is_mode_scoped_at_sql_boundary(monkeypatch):
+    """The real readiness query returns only the requested client/mode rows."""
+    import ap.db as db
+
+    db_conn = _ModeScopedReadinessConnection([
+        _mode_inventory_row("L-live", "sig-live", "live"),
+        _mode_inventory_row("L-paper", "sig-paper", "paper"),
+    ])
+    monkeypatch.setattr(db, "conn", db_conn)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+
+    live_state = pr._query_client_state("jason@example.com", "LIVE")
+    paper_state = pr._query_client_state("jason@example.com", "PAPER")
+
+    assert live_state["pending_trigger_rows"] == [{
+        "local_order_id": "L-live",
+        "signal_id": "sig-live",
+    }]
+    assert paper_state["pending_trigger_rows"] == [{
+        "local_order_id": "L-paper",
+        "signal_id": "sig-paper",
+    }]
+    pending_calls = [
+        (sql, params)
+        for sql, params in db_conn.calls
+        if "from orders" in sql and "pending_trigger" in sql
+    ]
+    assert len(pending_calls) == 2
+    assert all("execution_mode" in sql for sql, _params in pending_calls)
+    assert [params[1] for _sql, params in pending_calls] == ["live", "paper"]
+
+
+def test_paper_ownerless_pending_trigger_cannot_block_live_readiness(monkeypatch):
+    """A malformed PAPER row is absent before LIVE ownership classification."""
+    import ap.db as db
+
+    live_row = {
+        **_mode_inventory_row("L-live", "sig-live", "live"),
+        "status": "PENDING_TRIGGER",
+        "meta": {},
+    }
+    paper_row = {
+        **_mode_inventory_row("L-paper", "sig-paper", "paper"),
+        "status": "PENDING_TRIGGER",
+        "meta": {"restart_rearm_status": "not-a-valid-lease"},
+    }
+    db_conn = _ModeScopedReadinessConnection([live_row, paper_row])
+    monkeypatch.setattr(db, "conn", db_conn)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **_kwargs: None)
+    monkeypatch.setattr(pr, "_morning_handoff_success_exists", lambda *args, **kwargs: True)
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: False)
+    monkeypatch.setattr(pr, "_trading_date", lambda now=None: "2026-06-22")
+    monkeypatch.setattr(pr, "_pod_mode", lambda: "live")
+
+    runner = _Runner(
+        mode="live",
+        watcher=_ExactWatcher(
+            local_order_id="L-live",
+            signal_id="sig-live",
+            client_id="jason@example.com",
+            execution_mode="live",
+        ),
+    )
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(live_row) if oid == "L-live" else None
+    )
+    runner._overnight_reeval_success_date = "2026-06-22"
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        dry_run=True,
+        runner=runner,
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+
+    assert result["status"] == "OK"
+    assert result["details"]["pending_trigger_watcher_owned"] == [{
+        "local_order_id": "L-live",
+        "signal_id": "sig-live",
+    }]
+    assert result["details"]["pending_trigger_ownerless"] == []
+    assert result["details"]["client_state"]["pending_trigger_rows"] == [{
+        "local_order_id": "L-live",
+        "signal_id": "sig-live",
+    }]
+
+
+def test_readiness_inventory_rejects_invalid_mode_before_database_query(monkeypatch):
+    """The query seam cannot be used without an exact runner mode."""
+    import ap.db as db
+
+    def _unexpected_database_open():
+        raise AssertionError("invalid readiness mode must not open the database")
+
+    monkeypatch.setattr(db, "conn", _unexpected_database_open)
+    with pytest.raises(ValueError, match="execution_mode"):
+        pr._query_client_state("jason@example.com", "staging")
 
 
 def test_all_green_readiness(monkeypatch):

@@ -367,8 +367,19 @@ def _post_overnight_reeval_success_exists(client_id: str, execution_mode: str, t
     return False
 
 
-def _query_client_state(client_id: str) -> dict:
+def _query_client_state(client_id: str, execution_mode: str) -> dict:
+    """Load readiness inventory for one exact client/mode authority.
+
+    ``orders.execution_mode`` is the durable mode fence for PENDING_TRIGGER
+    ownership.  The caller must supply a normalized runner mode so a PAPER
+    row can never enter the LIVE ownership proof (or vice versa).
+    """
     from ap.db import conn, run_with_retry
+
+    client_id = str(client_id or "").strip()
+    execution_mode = _normalize_mode(execution_mode)
+    if not client_id or execution_mode not in {"live", "paper"}:
+        raise ValueError("client_id and execution_mode are required for readiness inventory")
 
     now_utc = datetime.now(timezone.utc)
     processing_cutoff = now_utc - timedelta(minutes=PROCESSING_STALE_MINUTES)
@@ -420,6 +431,7 @@ def _query_client_state(client_id: str) -> dict:
                 SELECT local_order_id, signal_id
                 FROM orders
                 WHERE client_id = %s
+                  AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                   AND kind = 'ENTRY'
                   AND status = 'PENDING_TRIGGER'
                   AND created_ts >= %s
@@ -428,7 +440,7 @@ def _query_client_state(client_id: str) -> dict:
                   AND filled_ts IS NULL
                 ORDER BY created_ts
                 """,
-                (client_id, pending_cutoff),
+                (client_id, execution_mode, pending_cutoff),
             )
             pending_trigger = []
             for row in (c.fetchall() or []):
@@ -728,7 +740,7 @@ def run_preopen_autonomous_readiness(
     if selector_identity["quote_source"] == "unknown" or not selector_identity["tradier_base_url"]:
         errors.append("selector_quote_identity_unresolved")
 
-    client_state = _query_client_state(client_id)
+    client_state = _query_client_state(client_id, mode)
     details["client_state"] = client_state
 
     if client_state.get("stale_processing_ids"):
