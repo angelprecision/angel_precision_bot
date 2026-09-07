@@ -41,6 +41,7 @@ from ap.pending_trigger_restart_recovery import (
     _RR_ATTEMPT_FIELD,
     _RR_NEXT_AT_FIELD,
     _RR_DEADLINE_FIELD,
+    _RR_FIRST_FAILED_AT,
     _RR_CLIENT_FIELD,
     _RR_MODE_FIELD,
     _RR_GENERATION_FIELD,
