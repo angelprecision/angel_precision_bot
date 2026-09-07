@@ -4878,14 +4878,14 @@ def test_real_postgres_expected_no_broker_handoff_cas_fence(monkeypatch):
             )
             assert accepted is expected, label
             persisted = _read(local_order_id)
-            assert persisted[0] == "PENDING_TRIGGER"
-            assert persisted[1] == client_id
-            assert persisted[2] == mode
-            assert persisted[3] == signal_id
+            assert persisted["status"] == "PENDING_TRIGGER"
+            assert persisted["client_id"] == client_id
+            assert persisted["execution_mode"] == mode
+            assert persisted["signal_id"] == signal_id
             if expected:
-                assert persisted[4]["cas_probe"] == label
+                assert persisted["meta"]["cas_probe"] == label
             else:
-                assert "cas_probe" not in persisted[4]
+                assert "cas_probe" not in persisted["meta"]
 
         identity_cases = [
             ("broker_order_id", {"broker_order_id": "broker-sql"}, {}),
@@ -4902,15 +4902,15 @@ def test_real_postgres_expected_no_broker_handoff_cas_fence(monkeypatch):
         for label, fields, row_kwargs in identity_cases:
             local_order_id = f"identity-{label}-{uuid.uuid4().hex}"
             _insert(local_order_id, meta={}, **fields, **row_kwargs)
-            assert osm.update_order_meta(
-                local_order_id,
-                {"cas_probe": label},
+        assert osm.update_order_meta(
+            local_order_id,
+            {"cas_probe": label},
                 expected_status="PENDING_TRIGGER",
                 expected_execution_mode=mode,
                 expected_signal_id=signal_id,
                 expected_no_broker_handoff=True,
             ) is False
-        assert "cas_probe" not in _read(local_order_id)[4]
+        assert "cas_probe" not in _read(local_order_id)["meta"]
 
         local_order_id = f"malformed-meta-{uuid.uuid4().hex}"
         _insert(local_order_id, meta=["not-an-object"])
@@ -4922,7 +4922,7 @@ def test_real_postgres_expected_no_broker_handoff_cas_fence(monkeypatch):
             expected_signal_id=signal_id,
             expected_no_broker_handoff=True,
         ) is False
-        assert "cas_probe" not in _read(local_order_id)[4]
+        assert "cas_probe" not in _read(local_order_id)["meta"]
 
         local_order_id = f"implicit-status-{uuid.uuid4().hex}"
         _insert(local_order_id, row_status="CREATED", meta={})
@@ -4933,7 +4933,7 @@ def test_real_postgres_expected_no_broker_handoff_cas_fence(monkeypatch):
             expected_signal_id=signal_id,
             expected_no_broker_handoff=True,
         ) is False
-        assert "cas_probe" not in _read(local_order_id)[4]
+        assert "cas_probe" not in _read(local_order_id)["meta"]
     finally:
         try:
             with admin.cursor() as cursor:
