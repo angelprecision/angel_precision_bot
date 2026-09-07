@@ -6147,7 +6147,11 @@ class APBrokerReconciler:
                 if broker_qty > 0:
                     # Broker still holds this contract — restore to managed status
                     restore_status = "PARTIAL" if full_qty > rem_qty else "OPEN"
-                    restore_remaining = min(broker_qty, rem_qty)  # trust broker qty
+                    # The strict broker snapshot is the authoritative current
+                    # exposure.  The durable remainder may be stale (it is the
+                    # reason this repair path ran), so never cap confirmed live
+                    # quantity by that stale value and undercount exposure.
+                    restore_remaining = broker_qty
 
                     def _restore(pid=pos_id, st=restore_status, rq=restore_remaining):
                         with conn() as c:

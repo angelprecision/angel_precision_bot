@@ -159,6 +159,39 @@ def test_reconciler_snapshot_distinguishes_empty_from_adapter_failure():
     assert open_snapshot.is_available
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("account_id", "WRONG-ACCOUNT"),
+        ("client_id", "other@example.com"),
+        ("execution_mode", "paper"),
+    ],
+)
+def test_reconciler_holds_snapshot_with_identity_mismatch(field, value):
+    row = {"symbol": CONTRACT, "quantity": 1, field: value}
+    snapshot = _reconciler(
+        _tradier(payload={"positions": {"position": [row]}})
+    )._safe_get_broker_positions()
+
+    assert snapshot.state == BROKER_POSITIONS_MALFORMED
+    assert not snapshot.is_available
+
+
+def test_reconciler_reclassifies_retry_after_prior_unavailable_snapshot():
+    broker = _tradier(error=RuntimeError("positions down"))
+    rec = _reconciler(broker)
+
+    first = rec._safe_get_broker_positions()
+    assert first.state == BROKER_POSITIONS_UNAVAILABLE
+
+    broker._get = lambda _path: {"positions": {"position": []}}
+    second = rec._safe_get_broker_positions()
+
+    assert second.state == BROKER_POSITIONS_AVAILABLE_EMPTY
+    assert second.is_available
+    assert second == []
+
+
 def test_unavailable_snapshot_holds_before_reconcile_mutation():
     rec = _reconciler(_tradier(error=RuntimeError("transport down")))
     rec._get_open_db_positions = lambda: pytest.fail(
@@ -297,6 +330,9 @@ def test_postgres_adapter_failure_leaves_closed_row_unchanged(postgres_positions
     insert, read = postgres_positions
     insert()
     broker = _tradier(error=RuntimeError("Tradier transport unavailable"))
+    # Prove the historical public adapter shape really collapses the error to
+    # [], then exercise the strict production repair seam on the same broker.
+    assert broker.list_positions() == []
     rec = _reconciler(broker)
     summary = _empty_summary(CLIENT)
 
@@ -309,6 +345,126 @@ def test_postgres_adapter_failure_leaves_closed_row_unchanged(postgres_positions
     }
     assert "broker_positions_unavailable" in summary["errors"]
     assert summary["broker_positions_hidden_by_closed_status_count"] == 1
+
+
+def test_postgres_authoritative_open_qty_one_restores_open_row(postgres_positions):
+    insert, read = postgres_positions
+    insert(qty=1, quantity_remaining=1)
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 1, "cost_basis": "155.0"}
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._seed_exit_engine_from_position = lambda _row: True
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "quantity_remaining": 1,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+        "status": "OPEN",
+    }
+
+
+def test_postgres_authoritative_qty_replaces_stale_remainder_without_undercount(
+    postgres_positions,
+):
+    insert, read = postgres_positions
+    insert(qty=10, quantity_remaining=2)
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 5, "cost_basis": "155.0"}
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._seed_exit_engine_from_position = lambda _row: True
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "quantity_remaining": 5,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+        "status": "PARTIAL",
+    }
+
+
+def test_postgres_retry_after_unavailable_snapshot_rechecks_authority(
+    postgres_positions,
+):
+    insert, read = postgres_positions
+    insert()
+    broker = _tradier(error=RuntimeError("Tradier transport unavailable"))
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+    assert read()["status"] == "CLOSED"
+
+    broker._get = lambda _path: {"positions": {"position": []}}
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "quantity_remaining": 0,
+        "close_source": "CLOSED_REPAIR",
+        "status": "CLOSED",
+    }
+
+
+def test_closed_repair_update_failure_is_fail_closed(monkeypatch):
+    bad_row = {
+        "id": "position-pr591",
+        "contract": CONTRACT,
+        "option_symbol": CONTRACT,
+        "underlying": "AAPL",
+        "ticker": "AAPL",
+        "qty": 3,
+        "quantity_remaining": 2,
+        "client_id": CLIENT,
+        "status": "CLOSED",
+        "execution_mode": "live",
+    }
+
+    class _Cursor:
+        rowcount = 0
+
+        def __init__(self):
+            self._rows = []
+
+        def execute(self, sql, _params=None):
+            if "SELECT" in " ".join(sql.split()).upper():
+                self._rows = [bad_row]
+
+        def fetchall(self):
+            return self._rows
+
+    cursor = _Cursor()
+
+    @contextmanager
+    def _conn():
+        yield cursor
+
+    import ap.db as db_module
+
+    monkeypatch.setattr(db_module, "conn", _conn)
+    monkeypatch.setattr(db_module, "run_with_retry", lambda fn: fn())
+    rec = _reconciler(
+        _tradier(payload={"positions": {"position": []}})
+    )
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    assert "closed_repair_update_failed" in summary["errors"]
+    assert bad_row["quantity_remaining"] == 2
+    assert bad_row["status"] == "CLOSED"
 
 
 def test_postgres_authoritative_empty_snapshot_still_repairs_flat_row(postgres_positions):
