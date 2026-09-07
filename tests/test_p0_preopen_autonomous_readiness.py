@@ -741,5 +741,3 @@ def test_exact_registry_identity_satisfies_readiness(monkeypatch):
         client_id="jason@example.com",
         execution_mode="live",
     ) == []
-
-

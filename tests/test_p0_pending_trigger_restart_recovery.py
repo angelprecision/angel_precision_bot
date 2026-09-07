@@ -3610,6 +3610,42 @@ class TestLateMarketValidityRecovery:
         assert osm.cancel_calls == []
         _assert_no_broker_mutation(rec.broker)
 
+    @pytest.mark.parametrize(
+        ("first_offset", "last_offset"),
+        [
+            (10, 20),   # both failure timestamps are in the future
+            (-10, 10),  # only the last failure timestamp is in the future
+            (-10, 90),  # the last failure timestamp exceeds the lease deadline
+        ],
+    )
+    def test_late_retry_future_or_out_of_window_failure_timestamps_hold(
+        self, first_offset, last_offset
+    ):
+        now = datetime.now(timezone.utc)
+        row = _canonical_late_retry_row(
+            local_order_id=f"late-future-timestamp-{first_offset}-{last_offset}",
+            next_at=(now + timedelta(seconds=30)).isoformat(),
+            deadline=(now + timedelta(seconds=60)).isoformat(),
+        )
+        row["meta"][_RR_FIRST_FAILED_AT] = (
+            now + timedelta(seconds=first_offset)
+        ).isoformat()
+        row["meta"]["restart_rearm_last_failed_at"] = (
+            now + timedelta(seconds=last_offset)
+        ).isoformat()
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        assert rec.prove_restart_rearm_retry_owner(
+            row["local_order_id"],
+            expected_signal_id=row["signal_id"],
+        ) is None
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
     def test_late_retry_deadline_cannot_exceed_original_failure_window(self):
         now = datetime.now(timezone.utc)
         row = _canonical_late_retry_row(
@@ -3759,6 +3795,34 @@ class TestPR569OrderMonitorRetryLiveness:
         final_meta = osm.get_order(row["local_order_id"])["meta"]
         assert final_meta[_RR_STATUS_FIELD] == "CLOSED"
         assert final_meta[_RR_CLOSE_REASON] == "watcher_owned"
+        assert final_meta[_RR_NEXT_AT_FIELD] is None
+        assert final_meta[_RR_DEADLINE_FIELD] is None
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(broker)
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_closed_late_retry_rearms_after_restart_without_retry_marker(self, mode):
+        row = _canonical_late_retry_row(mode=mode)
+        watcher = _MonitorWatcher(watch_returns=True)
+        monitor, osm, broker = _monitor_for_retry(row, watcher)
+
+        _run_young_pending_monitor(monitor, row)
+        closed = osm.get_order(row["local_order_id"])
+
+        restart_watcher = _MonitorWatcher(watch_returns=True)
+        recovery, _ = _make_recovery(
+            closed,
+            osm=osm,
+            watcher=restart_watcher,
+            mode=mode,
+            quote_result=None,
+        )
+        summary = recovery.recover_all([closed])
+
+        assert summary["watchers_rearmed"] == 1
+        assert summary["ownerless_rows_remaining"] == 0
+        assert summary["unresolved_cleanup_failures"] == 0
+        assert restart_watcher.watch_calls == 1
         assert osm.cancel_calls == []
         _assert_no_broker_mutation(broker)
 
@@ -4226,4 +4290,3 @@ def test_recognized_restart_retry_exception_suppresses_legacy_monitor_fallthroug
     assert watcher.watch_calls == 0
     assert osm.cancel_calls == []
     _assert_no_broker_mutation(broker)
-

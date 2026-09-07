@@ -865,6 +865,8 @@ class PendingTriggerRestartRecovery:
             if outcome in (_RowOutcome.WATCHER_OWNED, _RowOutcome.TERMINALIZED):
                 self._safe_meta_update(local_oid, {
                     _RR_STATUS_FIELD: "CLOSED",
+                    _RR_NEXT_AT_FIELD: None,
+                    _RR_DEADLINE_FIELD: None,
                     _RR_CLOSED_AT: _now_iso(),
                     _RR_CLOSE_REASON: (
                         "watcher_owned"
@@ -888,6 +890,8 @@ class PendingTriggerRestartRecovery:
             if outcome in (_RowOutcome.WATCHER_OWNED, _RowOutcome.TERMINALIZED):
                 self._safe_meta_update(local_oid, {
                     _RR_STATUS_FIELD: "CLOSED",
+                    _RR_NEXT_AT_FIELD: None,
+                    _RR_DEADLINE_FIELD: None,
                     _RR_CLOSED_AT: _now_iso(),
                     _RR_CLOSE_REASON: (
                         "watcher_owned"
@@ -2167,6 +2171,7 @@ class PendingTriggerRestartRecovery:
         )
         next_dt = _parse_retry_iso(next_at)
         deadline_dt = _parse_retry_iso(deadline)
+        now = datetime.now(timezone.utc)
         if _late_attachment_policy_eligible(reread):
             first_failed_dt = _parse_retry_iso(first_failed_at)
             last_failed_dt = _parse_retry_iso(last_failed_at)
@@ -2179,6 +2184,8 @@ class PendingTriggerRestartRecovery:
                 or deadline_dt < first_failed_dt
                 or deadline_dt > first_failed_dt + timedelta(seconds=retry_deadline_secs)
                 or next_dt < first_failed_dt
+                or first_failed_dt > now
+                or last_failed_dt > now
             ):
                 return None
         if restart_status != "RETRY_PENDING":
@@ -2189,7 +2196,6 @@ class PendingTriggerRestartRecovery:
             return None
         if next_dt is None or deadline_dt is None or next_dt > deadline_dt:
             return None
-        now = datetime.now(timezone.utc)
         if (
             _late_policy
             and deadline_dt > now + timedelta(seconds=retry_deadline_secs)
