@@ -3308,11 +3308,12 @@ class APExecutionCore:
             selector_failure=_selector_failure_meta,
         )
         if _durable_reason_error:
-            return _term(
-                "RETRY_INVALID_REASON_AUTHORITY",
-                status="ERROR",
-                reason_error=_durable_reason_error,
-            )
+            return {
+                **_base,
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "RETRY_INVALID_REASON_AUTHORITY",
+                "reason_error": _durable_reason_error,
+            }
         _durable_retry_reason = _durable_retry_reason or ""
         # A due retry owns the row before doing work, but it has not earned the
         # next selector-attempt identity. Fresh market truth must pass first.
@@ -3886,6 +3887,30 @@ class APExecutionCore:
                 "expected_generation": _callback_result.get(
                     "expected_generation"
                 ),
+            }
+
+        if (
+            isinstance(_callback_result, dict)
+            and str(
+                _callback_result.get("disposition") or ""
+            ).strip().upper() == "KEEP_WATCHER"
+            and str(
+                _callback_result.get("reason_code") or ""
+            ).strip().upper()
+            == (
+                "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
+                "RETRY_REASON_AUTHORITY_CONFLICT"
+            )
+        ):
+            # The canonical callback refused to schedule after a lost second
+            # CAS because the in-memory reason authorities disagreed. Preserve
+            # that unresolved result; the generic no-durable-outcome fallback
+            # below must not turn it into a retry write.
+            return {
+                **_base,
+                **_callback_result,
+                "generation": _new_generation,
+                "attempt": _callback_attempt,
             }
 
         # ── Re-read to determine outcome ─────────────────────────────
@@ -6452,15 +6477,24 @@ class APExecutionCore:
                         )
                         if not isinstance(_advance_failure, dict):
                             _advance_failure = {}
-                        _advance_reason = str(
-                            _advance_plan_meta.get("retry_reason")
-                            or _advance_plan_meta.get("materialization_reason")
-                            or _advance_plan_meta.get(
-                                "deferred_retry_reason_code"
+                        _advance_reason, _advance_reason_error = (
+                            _resolve_deferred_retry_reason(
+                                _advance_plan_meta,
+                                selector_failure=_advance_failure,
                             )
-                            or _advance_failure.get("reason_code")
-                            or ""
-                        ).strip().upper()
+                        )
+                        if _advance_reason_error:
+                            return {
+                                "disposition": "KEEP_WATCHER",
+                                "reason_code": (
+                                    "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
+                                    "RETRY_REASON_AUTHORITY_CONFLICT"
+                                ),
+                                "reason_error": _advance_reason_error,
+                                "selector_calls": 0,
+                                "broker_post_count": 0,
+                            }
+                        _advance_reason = str(_advance_reason or "").strip().upper()
                         if not _advance_reason or not (
                             _is_retryable_selector_reason(_advance_reason)
                             or not _deferred_retry_count_exhaustion_applies(

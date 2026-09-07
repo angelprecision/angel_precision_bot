@@ -612,6 +612,70 @@ def test_8_exhausted_retry_returns_terminal_and_does_not_call_broker(
     assert not core.broker.method_calls
 
 
+def test_reason_authority_conflict_due_retry_is_retained_without_side_effects():
+    """A due RETRY_WAIT row with conflicting reason aliases stays unresolved.
+
+    The startup consumer must not turn the shared resolver's conflict into a
+    fenced terminal CAS, claim the row, run the selector, or touch the broker.
+    """
+    from unittest.mock import patch
+
+    from ap import db as db_mod
+
+    core = _core()
+    row = _row()
+    row["meta"].update({
+        "retry_reason": "CHAIN_FETCH_FAILED",
+        "materialization_reason": "OI_TOO_LOW",
+    })
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.terminalize_deferred_retry_if_unchanged = (
+        MagicMock(return_value=True)
+    )
+
+    direct_result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-conflicting-reason",
+    )
+    assert direct_result["disposition"] == "KEEP_WATCHER"
+    assert direct_result["reason_code"] == "RETRY_INVALID_REASON_AUTHORITY"
+    assert direct_result["reason_error"].startswith(
+        "CONFLICTING_RETRY_REASON_AUTHORITY:"
+    )
+
+    recovery = _recovery(core, None)
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchall(self):
+            return [row]
+
+    class _Conn:
+        def __enter__(self):
+            return _Cursor()
+
+        def __exit__(self, *args):
+            return False
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        recovery._recover_deferred_breach_lifecycles(result)
+
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+    core._on_entry_trigger.assert_not_called()
+    core.order_state_machine.terminalize_deferred_retry_if_unchanged.assert_not_called()
+    assert not core.broker.method_calls
+    assert row["status"] == "PENDING_TRIGGER"
+    assert row["meta"]["lifecycle_state"] == "RETRY_WAIT"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST 9 — Mode isolation: PAPER recovery never touches LIVE rows
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1808,22 +1872,33 @@ def test_12_recovery_never_calls_broker_directly():
 
 
 @pytest.mark.parametrize(
-    ("starting_contract", "advance_succeeds", "second_cas_deadline_seconds"),
+    (
+        "starting_contract",
+        "advance_succeeds",
+        "second_cas_deadline_seconds",
+        "conflicting_reason_aliases",
+    ),
     [
-        ("DEFERRED:RTX", True, None),
-        ("DEFERRED:RTX", False, None),
-        ("DEFERRED:RTX", False, 5),
-        ("RTX260117C00129000", True, None),
+        ("DEFERRED:RTX", True, None, False),
+        ("DEFERRED:RTX", False, None, False),
+        ("DEFERRED:RTX", False, 5, False),
+        ("DEFERRED:RTX", False, None, True),
+        ("RTX260117C00129000", True, None, False),
     ],
     ids=[
         "placeholder_contract",
         "second_cas_failure",
         "second_cas_deadline_clip",
+        "second_cas_conflicting_reason_authority",
         "stale_real_contract",
     ],
 )
 def test_spec_acceptance_two_phase_claim_seam(
-    monkeypatch, starting_contract, advance_succeeds, second_cas_deadline_seconds
+    monkeypatch,
+    starting_contract,
+    advance_succeeds,
+    second_cas_deadline_seconds,
+    conflicting_reason_aliases,
 ):
     """Real seam test: resume_deferred_materialization_retry → real _on_entry_trigger
     deferred path → selector mock → durable copyback → canonical submit seam.
@@ -1964,6 +2039,7 @@ def test_spec_acceptance_two_phase_claim_seam(
 
         def __init__(self):
             self.row = before_row
+            self.terminal_calls = []
 
         def get_order(self, oid):
             return self.row
@@ -1985,8 +2061,15 @@ def test_spec_acceptance_two_phase_claim_seam(
                 return True
             assert kw["retry_attempt"] == 1
             assert kw["advance_retry_attempt"] is False
+            if conflicting_reason_aliases:
+                # The initial RETRY_WAIT row has one valid reason. Once
+                # phase-one ownership is claimed, reproduce stale in-memory
+                # aliases disagreeing at the second-CAS boundary.
+                before_meta["retry_reason"] = "CHAIN_FETCH_FAILED"
             self.row = dict(after_claim_row)
             self.row["meta"] = dict(after_claim_row["meta"])
+            if conflicting_reason_aliases:
+                self.row["meta"]["retry_reason"] = "CHAIN_FETCH_FAILED"
             return True
 
         def update_order_meta(self, oid, patch):
@@ -2025,6 +2108,7 @@ def test_spec_acceptance_two_phase_claim_seam(
             return True
 
         def terminalize_materialization_retry(self, oid, **kw):
+            self.terminal_calls.append(("materialization", kw))
             self.row["status"] = str(
                 kw.get("terminal_status") or "EXPIRED"
             ).upper()
@@ -2038,6 +2122,7 @@ def test_spec_acceptance_two_phase_claim_seam(
             return True
 
         def terminalize_deferred_breach(self, oid, **kw):
+            self.terminal_calls.append(("breach", kw))
             return True
 
         def submit_existing_entry(self, *a, **kw):
@@ -2213,7 +2298,32 @@ def test_spec_acceptance_two_phase_claim_seam(
         assert _FakeSelector.select_count == 0
         assert copyback_calls == []
         assert submit_calls == []
-        assert canonical_backoff.call_count >= 1
+        if conflicting_reason_aliases:
+            assert retry_schedules == []
+            assert canonical_backoff.call_count == 0
+            assert result["disposition"] == "KEEP_WATCHER"
+            assert result["reason_code"] == (
+                "MATERIALIZATION_ATTEMPT_ADVANCE_FAILED:"
+                "RETRY_REASON_AUTHORITY_CONFLICT"
+            )
+            assert result["reason_error"].startswith(
+                "CONFLICTING_RETRY_REASON_AUTHORITY:"
+            )
+            assert [
+                osm.row["meta"].get(key)
+                for key in (
+                    "retry_attempt",
+                    "breach_attempt_count",
+                    "materialization_attempts",
+                )
+            ] == [1, 1, 1]
+            assert osm.row["meta"]["materialization_market_truth_pending"] is True
+            assert osm.terminal_calls == []
+            core.broker.submit_order.assert_not_called()
+            core.broker.cancel_order.assert_not_called()
+            return
+        else:
+            assert canonical_backoff.call_count >= 1
         if second_cas_deadline_seconds is not None:
             assert retry_schedules == []
             assert result["reason_code"] == "RETRY_DEADLINE_WOULD_EXHAUST"
