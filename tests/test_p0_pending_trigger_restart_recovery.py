@@ -3677,7 +3677,7 @@ def _canonical_late_retry_row(
             _RR_REASON_FIELD: "late_attachment_market_truth_unavailable_or_unresolved",
             _RR_ATTEMPT_FIELD: attempt,
             _RR_NEXT_AT_FIELD: next_at or (now - timedelta(seconds=1)).isoformat(),
-            _RR_DEADLINE_FIELD: deadline or (now + timedelta(minutes=3)).isoformat(),
+            _RR_DEADLINE_FIELD: deadline or (now + timedelta(minutes=2)).isoformat(),
             "restart_rearm_first_failed_at": (now - timedelta(seconds=31)).isoformat(),
             "restart_rearm_last_failed_at": (now - timedelta(seconds=1)).isoformat(),
             _RR_CLIENT_FIELD: client_id.lower(),
