@@ -2722,10 +2722,13 @@ class APOrderStateMachine:
         signal_id: str,
         execution_mode: str,
         # P0 AMENDMENT (fix/deferred-retry-due-execution-p0 blocker §5):
-        # Advance retry_attempt atomically with generation so the durable row
-        # always shows the correct attempt count for the in-flight claim, even
-        # if the process crashes between claim and schedule_deferred_materialization_retry.
+        # Normal materialization claims advance retry_attempt atomically with
+        # generation. A market-truth-only retry claim deliberately preserves
+        # the current attempt; the selector attempt is advanced only after
+        # fresh market truth passes.
         retry_attempt: int | None = None,
+        advance_retry_attempt: bool = True,
+        advance_after_market_truth: bool = False,
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
 
@@ -2797,7 +2800,9 @@ class APOrderStateMachine:
             "materialization_claimed_at": _now,
             "materialization_lease_until": str(lease_until or ""),
             "materialization_started_at": _now,
-            "selector_started_at": _now,
+            # A market-truth-only ownership lease has not started selector
+            # work; leave this marker empty until the post-truth claim.
+            "selector_started_at": _now if advance_retry_attempt else "",
             "trigger_crossed_at": str(trigger_crossed_at or _now),
             "breach_received_at": _now,
             "trigger_price": float(trigger_price or 0),
@@ -2807,7 +2812,26 @@ class APOrderStateMachine:
             "client_id": self.client_id,
             "execution_mode": _mode,
             "broker_ready": False,
+            # A true value means this ownership claim has not yet earned a
+            # selector-attempt identity. Only the post-truth CAS clears it.
+            "materialization_market_truth_pending": not advance_retry_attempt,
         }
+        if not isinstance(advance_retry_attempt, bool) or not isinstance(
+            advance_after_market_truth, bool
+        ):
+            return False
+        if (
+            (not advance_retry_attempt and retry_attempt is None)
+            or (
+                advance_after_market_truth
+                and (not advance_retry_attempt or retry_attempt is None)
+            )
+        ):
+            return False
+        if advance_after_market_truth:
+            # This is not a new ownership claim: keep the already-fenced
+            # generation and advance only the selector-attempt identity.
+            _expected_previous_generation = _new_generation
         # P0 AMENDMENT (fix/p0-attempt-mirror-atomic-advance-20260827,
         # post-audit blocker §3-§5): ``retry_attempt``, ``breach_attempt_count``,
         # and ``materialization_attempts`` are one durable selector-attempt
@@ -2846,19 +2870,27 @@ class APOrderStateMachine:
             if isinstance(retry_attempt, bool) or not isinstance(retry_attempt, int):
                 return False
             _ra = retry_attempt
-            if _ra < 1:
+            if (advance_retry_attempt and _ra < 1) or (
+                not advance_retry_attempt and _ra < 0
+            ):
                 return False
-            _patch["retry_attempt"] = _ra
-            # DIAGNOSTIC ONLY (issue #536). retry_attempt_in_flight is written
-            # for operator observability. ``retry_attempt``,
-            # ``breach_attempt_count``, and ``materialization_attempts`` are the
-            # canonical authority — do NOT treat retry_attempt_in_flight as a
-            # fourth authority field or CAS-fence it. Direction reversal also
-            # resets it to zero.
-            _patch["retry_attempt_in_flight"] = _ra
-            _patch["breach_attempt_count"] = _ra
-            _patch["materialization_attempts"] = _ra
-            _prev_attempt = _ra - 1
+            if advance_retry_attempt:
+                _patch["retry_attempt"] = _ra
+                # DIAGNOSTIC ONLY (issue #536). retry_attempt_in_flight is written
+                # for operator observability. ``retry_attempt``,
+                # ``breach_attempt_count``, and ``materialization_attempts`` are the
+                # canonical authority — do NOT treat retry_attempt_in_flight as a
+                # fourth authority field or CAS-fence it. Direction reversal also
+                # resets it to zero.
+                _patch["retry_attempt_in_flight"] = _ra
+                _patch["breach_attempt_count"] = _ra
+                _patch["materialization_attempts"] = _ra
+                _prev_attempt = _ra - 1
+            else:
+                # Ownership-only retry claim: prove the existing N/N/N mirrors
+                # without writing them. The next selector identity is committed
+                # by the post-truth fenced claim after truth.
+                _prev_attempt = _ra
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
         except Exception:
@@ -2890,6 +2922,29 @@ class APOrderStateMachine:
             with conn() as c:
                 _attempt_predicate = ""
                 _attempt_params: list = []
+                if advance_after_market_truth:
+                    # The second phase is still one fenced claim seam, but it
+                    # may run only for the exact owner holding a live,
+                    # market-truth-pending MATERIALIZING lease.
+                    _lifecycle_predicate = """
+                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                      AND COALESCE(meta->>'materialization_status','') = 'RUNNING'
+                      AND COALESCE(meta->>'materialization_in_flight','') = 'true'
+                      AND COALESCE(meta->>'materialization_market_truth_pending','') = 'true'
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE(meta->>'current_owner','') = %s
+                      AND COALESCE(meta->>'watcher_token','') = %s
+                      AND NULLIF(COALESCE(meta->>'materialization_lease_until',''), '')::timestamptz >= %s
+                    """
+                    _lifecycle_params = [_owner, _owner, _owner, _now]
+                else:
+                    _lifecycle_predicate = """
+                      AND (
+                            COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
+                         OR COALESCE(meta->>'materialization_lease_until','') < %s
+                      )
+                    """
+                    _lifecycle_params = [_now]
                 if _prev_attempt is None:
                     # Caller did not pass ``retry_attempt``. This is the
                     # initial-materialization path (first-time claim for a
@@ -2932,15 +2987,17 @@ class APOrderStateMachine:
                       AND signal_id = %s
                       AND """ + _DURABLE_EXECUTION_MODE_SQL + """
                       AND COALESCE((meta->>'broker_ready')::boolean, false) = false
-                      AND (
-                            COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
-                         OR COALESCE(meta->>'materialization_lease_until','') < %s
-                      )
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                      AND COALESCE(meta->>'broker_submit_key','') = ''
+                      AND COALESCE(meta->>'broker_submit_payload_hash','') = ''
+                      AND COALESCE(meta->>'recovery_submit_owner','') = ''
+                    """ + _lifecycle_predicate + """
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                     """ + _attempt_predicate,
                     (
                         _patch_json, local_order_id, self.client_id,
-                        _signal_id, _mode, _now, _expected_previous_generation,
+                        _signal_id, _mode, *_lifecycle_params,
+                        _expected_previous_generation,
                         *_attempt_params,
                     ),
                 )
@@ -3844,9 +3901,11 @@ class APOrderStateMachine:
         ).strip().upper()
         try:
             _generation = max(1, int(generation or 1))
-            _attempt = max(1, int(attempt or 1))
-            _max_attempts = max(_attempt, int(max_attempts or _attempt))
+            _attempt = int(attempt)
+            _max_attempts = max(1, _attempt, int(max_attempts or _attempt))
         except (TypeError, ValueError):
+            return False
+        if _attempt < 0:
             return False
         if (
             not _owner
@@ -3885,6 +3944,17 @@ class APOrderStateMachine:
             "materialization_detail": _detail,
             "entry_path": _entry_path,
         })
+        _market_truth_outcome = str(
+            _selector_failure.get("market_truth_outcome") or ""
+        ).strip().upper()
+        if not _market_truth_outcome:
+            _nested_market_truth_audit = _selector_failure.get(
+                "last_breach_selector_audit"
+            )
+            if isinstance(_nested_market_truth_audit, dict):
+                _market_truth_outcome = str(
+                    _nested_market_truth_audit.get("market_truth_outcome") or ""
+                ).strip().upper()
 
         _now = now_utc_iso()
         _patch = {
@@ -3913,6 +3983,10 @@ class APOrderStateMachine:
             "entry_path": _entry_path,
             "materialization_selector_failure": _selector_failure,
             "broker_ready": False,
+            "materialization_market_truth_pending": (
+                _selector_failure.get("materialization_market_truth_pending") is True
+                or _market_truth_outcome == "HOLD_MARKET_TRUTH_UNAVAILABLE"
+            ),
         }
         if isinstance(selector_recovery_cursor, dict):
             _patch["selector_recovery_cursor_v1"] = selector_recovery_cursor
@@ -3936,6 +4010,10 @@ class APOrderStateMachine:
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                      AND COALESCE(meta->>'broker_submit_key','') = ''
+                      AND COALESCE(meta->>'broker_submit_payload_hash','') = ''
+                      AND COALESCE(meta->>'recovery_submit_owner','') = ''
                       AND COALESCE(meta->>'materialization_owner','') = %s
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
@@ -3958,6 +4036,209 @@ class APOrderStateMachine:
             log.warning(
                 "[%s] schedule_deferred_materialization_retry failed order=%s: %s",
                 self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def recover_stale_market_truth_pending_retry(
+        self,
+        local_order_id: str,
+        *,
+        expected_owner: str,
+        generation: int,
+        attempt: int,
+        max_attempts: int,
+        signal_id: str,
+        execution_mode: str,
+        reason_code: str,
+        next_retry_at: str,
+        selector_failure: dict,
+    ) -> bool:
+        """Return an expired phase-one claim to RETRY_WAIT without a new attempt.
+
+        This CAS is intentionally narrower than ordinary stale-trigger recovery.
+        It can only release the exact LIVE/PAPER owner of a market-truth-pending claim
+        with coherent N/N/N attempt mirrors and zero broker/submit evidence.
+        Generation and attempt are preserved; no replacement owner is installed.
+        """
+        import json as _json_local
+
+        _owner = str(expected_owner or "").strip()
+        _signal = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        _reason = str(reason_code or "").strip().upper()
+        _next = str(next_retry_at or "").strip()
+        if (
+            not _owner
+            or not _signal
+            or _mode not in {"live", "paper"}
+            or not _reason
+            or not _next
+            or not isinstance(selector_failure, dict)
+        ):
+            return False
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (
+            generation,
+            attempt,
+            max_attempts,
+        )):
+            return False
+        if generation < 1 or attempt < 1 or max_attempts < attempt:
+            return False
+
+        _failure = dict(selector_failure)
+        _expected_outcome = (
+            "RETRY_LATER_SELECTOR_BUDGET"
+            if _reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+            else "RETRY_LATER_DATA_UNAVAILABLE"
+        )
+        _failure.update({
+            "reason_code": _reason,
+            "materialization_outcome": _expected_outcome,
+            "materialization_detail": _reason,
+            "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+            "materialization_market_truth_pending": True,
+            "selector_calls": 0,
+            "broker_post_count": 0,
+        })
+        _now = now_utc_iso()
+        _patch = {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "materialization_lease_until": "",
+            "watcher_token": "",
+            "current_owner": "",
+            "retry_owner": "",
+            "recovery_ownership": "",
+            "recovery_owner": "",
+            "materialization_generation": generation,
+            "retry_attempt": attempt,
+            "breach_attempt_count": attempt,
+            "materialization_attempts": attempt,
+            "retry_max_attempts": max_attempts,
+            "retry_reason": _reason,
+            "materialization_reason": _reason,
+            "next_retry_at": _next,
+            "materialization_next_retry_at": _next,
+            "retry_scheduled_at": _now,
+            "materialization_last_failure_at": _now,
+            "materialization_outcome": _expected_outcome,
+            "materialization_detail": _reason,
+            "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+            "materialization_selector_failure": _failure,
+            "materialization_market_truth_pending": True,
+            "broker_ready": False,
+        }
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        _strict_mirror = (
+            "(meta->>'{field}' IS NOT NULL "
+            "AND meta->>'{field}' ~ '^[0-9]+$' "
+            "AND (meta->>'{field}')::int = %s)"
+        )
+
+        def _recover():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND signal_id = %s
+                      AND """ + _DURABLE_EXECUTION_MODE_SQL + """
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE((meta->>'broker_ready')::boolean, false) = false
+                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                      AND COALESCE(meta->>'materialization_status','') = 'RUNNING'
+                      AND COALESCE(meta->>'materialization_in_flight','') = 'true'
+                      AND COALESCE(meta->>'materialization_market_truth_pending','') = 'true'
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE(meta->>'current_owner','') = %s
+                      AND COALESCE(meta->>'watcher_token','') = %s
+                      AND NULLIF(COALESCE(meta->>'materialization_lease_until',''), '')::timestamptz < NOW()
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND """ + _strict_mirror.format(field="retry_attempt") + """
+                      AND """ + _strict_mirror.format(field="breach_attempt_count") + """
+                      AND """ + _strict_mirror.format(field="materialization_attempts") + """
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                      AND COALESCE(meta->>'broker_submit_key','') = ''
+                      AND COALESCE(meta->>'broker_submit_payload_hash','') = ''
+                      AND COALESCE(meta->>'recovery_submit_owner','') = ''
+                      AND COALESCE(meta->>'recovery_submit_lease_until','') = ''
+                      AND COALESCE((meta->>'recovery_submit_fenced')::boolean, false) = false
+                      AND (
+                            NULLIF(BTRIM(meta->>'retry_reason'), '') IS NULL
+                            OR UPPER(BTRIM(meta->>'retry_reason')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->>'materialization_reason'), '') IS NULL
+                            OR UPPER(BTRIM(meta->>'materialization_reason')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->>'deferred_retry_reason_code'), '') IS NULL
+                            OR UPPER(BTRIM(meta->>'deferred_retry_reason_code')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->'materialization_selector_failure'->>'reason_code'), '') IS NULL
+                            OR UPPER(BTRIM(meta->'materialization_selector_failure'->>'reason_code')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->'selector_failure'->>'reason_code'), '') IS NULL
+                            OR UPPER(BTRIM(meta->'selector_failure'->>'reason_code')) = %s
+                          )
+                      AND COALESCE(
+                            NULLIF(UPPER(BTRIM(meta->>'retry_reason')), ''),
+                            NULLIF(UPPER(BTRIM(meta->>'materialization_reason')), ''),
+                            NULLIF(UPPER(BTRIM(meta->>'deferred_retry_reason_code')), ''),
+                            NULLIF(UPPER(BTRIM(meta->'materialization_selector_failure'->>'reason_code')), ''),
+                            NULLIF(UPPER(BTRIM(meta->'selector_failure'->>'reason_code')), ''),
+                            ''
+                          ) = %s
+                      AND COALESCE(meta->>'materialization_outcome','') IN (
+                            'RETRY_LATER_DATA_UNAVAILABLE',
+                            'RETRY_LATER_SELECTOR_BUDGET'
+                          )
+                    """,
+                    (
+                        _patch_json,
+                        local_order_id,
+                        self.client_id,
+                        _signal,
+                        _mode,
+                        _owner,
+                        _owner,
+                        _owner,
+                        generation,
+                        attempt,
+                        attempt,
+                        attempt,
+                        _reason,
+                        _reason,
+                        _reason,
+                        _reason,
+                        _reason,
+                        _reason,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_recover) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] recover_stale_market_truth_pending_retry failed order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
             )
             return False
 

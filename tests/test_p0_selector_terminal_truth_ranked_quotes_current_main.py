@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1278,11 +1278,98 @@ def test_execution_core_duplicate_liquidity_conflict_schedules_one_durable_retry
     assert broker.cancel_order.call_count == 0
 
 
+def test_execution_core_selector_retry_uses_bounded_backoff_ladder(monkeypatch):
+    """The ordinary selector-failure producer uses the canonical ladder."""
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "8")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", "8")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP2_SECONDS", "15")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP3_SECONDS", "30")
+    monkeypatch.setenv("VALIDITY_BOUND_RETRY_BACKOFF_CAP_SECONDS", "60")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setattr(APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+
+    broker = _ChainFailureBroker(
+        [],
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=100.0,
+    )
+    selector = _actual_selector(broker, execution_mode="LIVE")
+    core = _execution_core(selector, broker, execution_mode="LIVE")
+    plan = _execution_plan(breach_attempt_count=2)
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: plan,
+    )
+
+    result = core._on_entry_trigger(_execution_watched("LIVE"))
+
+    assert result["disposition"] == "RETRY_WAIT"
+    schedule_call = core.order_state_machine.schedule_deferred_materialization_retry.call_args
+    assert schedule_call.kwargs["attempt"] == 3
+    assert schedule_call.kwargs["selector_failure"][
+        "deferred_retry_delay_seconds"
+    ] == 30
+    core.order_state_machine.terminalize_deferred_breach.assert_not_called()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+
+
+def test_execution_core_selector_retry_clips_at_absolute_entry_deadline(monkeypatch):
+    """A ladder delay that crosses the durable deadline never writes RETRY_WAIT."""
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "8")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setattr(APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+
+    broker = _ChainFailureBroker(
+        [],
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=100.0,
+    )
+    selector = _actual_selector(broker, execution_mode="LIVE")
+    core = _execution_core(selector, broker, execution_mode="LIVE")
+    durable_row = core.order_state_machine.get_order("local-pr408-execution-core")
+    durable_row["meta"]["absolute_entry_deadline"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=20)
+    ).isoformat()
+    plan = _execution_plan(breach_attempt_count=4)
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: plan,
+    )
+
+    result = core._on_entry_trigger(_execution_watched("LIVE"))
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["reason_code"] == "RETRY_DEADLINE_WOULD_EXHAUST"
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_not_called()
+    core.order_state_machine.terminalize_deferred_breach.assert_called_once()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("breach_attempt_count", "expected_disposition"),
-    [(0, "RETRY_WAIT"), (5, "TERMINAL_DURABLE")],
+    [(0, "RETRY_WAIT"), (5, "RETRY_WAIT")],
 )
-def test_execution_core_real_selector_failure_retries_or_terminalizes_with_truth_fields(
+def test_execution_core_real_selector_failure_remains_validity_bound_with_truth_fields(
     monkeypatch,
     breach_attempt_count,
     expected_disposition,
@@ -1373,7 +1460,7 @@ def test_execution_core_real_selector_failure_retries_or_terminalizes_with_truth
         core.order_state_machine.expire_pending_entry.assert_not_called()
 
 
-def test_execution_core_real_selector_provider_failure_terminalizes_without_fake_failure_payload(
+def test_execution_core_real_selector_provider_failure_remains_validity_bound_without_fake_failure_payload(
     monkeypatch,
 ):
     monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
@@ -1404,21 +1491,18 @@ def test_execution_core_real_selector_provider_failure_terminalizes_without_fake
 
     result = core._on_entry_trigger(_execution_watched("LIVE"))
 
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] == "RETRY_WAIT"
     assert selector.get_last_failure()["reason_code"] == "CHAIN_PROVIDER_ERROR"
-    terminal_updates = [
-        call.args[1]
-        for call in core.order_state_machine.update_order_meta.call_args_list
-        if "last_breach_selector_audit" in call.args[1]
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()
+    selector_failure = core.order_state_machine.schedule_deferred_materialization_retry.call_args.kwargs[
+        "selector_failure"
     ]
-    assert terminal_updates
-    selector_failure = terminal_updates[-1]["last_breach_selector_audit"]
     assert selector_failure["canonical_selector_reason"] == "CHAIN_PROVIDER_ERROR"
     assert selector_failure["last_observed_selector_reason"] == "CHAIN_PROVIDER_ERROR"
     assert selector_failure["selector_terminal_reason"] == "CHAIN_PROVIDER_ERROR"
     assert selector_failure["operational_reason"] is None
+    core.order_state_machine.terminalize_deferred_breach.assert_not_called()
     thread_factory.return_value.start.assert_not_called()
-    core.order_state_machine.terminalize_deferred_breach.assert_called_once()
     core.order_state_machine.expire_pending_entry.assert_not_called()
     broker.submit_order.assert_not_called()
     broker.cancel_order.assert_not_called()
