@@ -190,6 +190,8 @@ def _run_harness(
     recovery_quote: tuple[float, float] | None = (100.0, 100.1),
     watch_returns: bool = True,
 ):
+    import ap.pending_trigger_restart_recovery as ptr
+
     run_now = now_et or FIXED_ET
     counters = {"prior": [], "snapshot": []}
 
@@ -270,6 +272,10 @@ def _run_harness(
         return next(clock_iter, clock_fallback)
 
     monkeypatch.setattr(ov, "_et_now", _clock_now)
+    # The full P0 collection can reload ap_overnight_reeval before this test
+    # runs. Patch the live restart-recovery module directly as well so the
+    # simulated clock cannot fall back to CI wall time across module reloads.
+    monkeypatch.setattr(ptr, "_now_et", _clock_now)
     monkeypatch.setattr(ov, "_OVERNIGHT_SNAPSHOT_FAIL_CLOSED", False)
     monkeypatch.setattr(ov, "_fetch_watching_signals", lambda _client_id: list(jobs))
     monkeypatch.setattr(
