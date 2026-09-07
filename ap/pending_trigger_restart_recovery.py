@@ -32,6 +32,11 @@ from zoneinfo import ZoneInfo
 
 from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.logger import get_logger
+from ap.manual_close_reconciliation import (
+    ORDERS_AVAILABLE_COMPLETE,
+    ORDERS_AVAILABLE_EMPTY,
+    fetch_all_current_session_orders,
+)
 from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
@@ -903,68 +908,33 @@ class PendingTriggerRestartRecovery:
     def _load_authoritative_broker_order_tags(self) -> tuple[str, set[str]]:
         """Return a complete current-session Tradier tag snapshot or UNKNOWN.
 
-        Absence is authority only through the raw paginated endpoint. The
-        broker's capped list_orders fallback is deliberately not used here.
+        Reuse the canonical current-session order authority. Only its
+        COMPLETE or EMPTY states can prove that the exact submit tag is
+        absent; malformed, unavailable, and incomplete states remain UNKNOWN.
         """
         if self._broker_order_tags_snapshot is not None:
             return self._broker_order_tags_snapshot
 
-        raw_get = getattr(self.broker, "_get", None)
-        cfg = getattr(self.broker, "cfg", None)
-        account_id = str(getattr(cfg, "account_id", "") or "").strip()
-        if not callable(raw_get) or not account_id:
-            self._broker_order_tags_snapshot = ("UNKNOWN", set())
-            return self._broker_order_tags_snapshot
-
-        tags: set[str] = set()
-        seen_full_pages: set[tuple[tuple[str, str], ...]] = set()
-        limit = 500
         try:
-            for page in range(1, 51):
-                payload = raw_get(
-                    f"/v1/accounts/{account_id}/orders?includeTags=true"
-                    f"&page={page}&limit={limit}"
+            orders_state, orders = fetch_all_current_session_orders(self.broker)
+            if orders_state not in {
+                ORDERS_AVAILABLE_COMPLETE,
+                ORDERS_AVAILABLE_EMPTY,
+            }:
+                raise ValueError(
+                    f"BROKER_ORDERS_TRUTH_{str(orders_state or 'UNKNOWN').upper()}"
                 )
-                if not isinstance(payload, dict) or "orders" not in payload:
-                    raise ValueError("BROKER_ORDERS_PAGE_MALFORMED")
-                node = payload.get("orders")
-                if node is None or node == "null":
-                    rows: list[dict] = []
-                elif isinstance(node, list):
-                    rows = node
-                elif isinstance(node, dict):
-                    raw_rows = node.get("order")
-                    if raw_rows is None or raw_rows == "null":
-                        rows = []
-                    elif isinstance(raw_rows, dict):
-                        rows = [raw_rows]
-                    elif isinstance(raw_rows, list):
-                        rows = raw_rows
-                    else:
-                        raise ValueError("BROKER_ORDERS_ROWS_MALFORMED")
-                else:
-                    raise ValueError("BROKER_ORDERS_NODE_MALFORMED")
-                if any(not isinstance(order, dict) for order in rows):
-                    raise ValueError("BROKER_ORDER_ROW_MALFORMED")
-                for order in rows:
-                    tag = str(order.get("tag") or "").strip()
-                    if tag:
-                        tags.add(tag)
-                if len(rows) < limit:
-                    self._broker_order_tags_snapshot = ("AVAILABLE", tags)
-                    return self._broker_order_tags_snapshot
-
-                signature = tuple(
-                    (
-                        str(order.get("id") or order.get("order_id") or ""),
-                        str(order.get("tag") or ""),
-                    )
-                    for order in rows
-                )
-                if signature in seen_full_pages:
-                    raise ValueError("BROKER_ORDERS_PAGINATION_STALLED")
-                seen_full_pages.add(signature)
-            raise ValueError("BROKER_ORDERS_PAGINATION_INCOMPLETE")
+            if not isinstance(orders, list) or any(
+                not isinstance(order, dict) for order in orders
+            ):
+                raise ValueError("BROKER_ORDERS_RESULT_MALFORMED")
+            tags = {
+                str(order.get("tag") or "").strip()
+                for order in orders
+                if str(order.get("tag") or "").strip()
+            }
+            self._broker_order_tags_snapshot = (orders_state, tags)
+            return self._broker_order_tags_snapshot
         except Exception as exc:
             log.critical(
                 "RESTART_PHASE_ONE_BROKER_TAG_LOOKUP_UNKNOWN client=%s mode=%s "
@@ -1108,7 +1078,10 @@ class PendingTriggerRestartRecovery:
 
         broker_status, broker_tags = self._load_authoritative_broker_order_tags()
         exact_tag = canonical_broker_submit_key(local_oid)
-        if broker_status != "AVAILABLE" or exact_tag in broker_tags:
+        if broker_status not in {
+            ORDERS_AVAILABLE_COMPLETE,
+            ORDERS_AVAILABLE_EMPTY,
+        } or exact_tag in broker_tags:
             self._mark_failure(
                 local_oid,
                 "phase_one_broker_order_found"

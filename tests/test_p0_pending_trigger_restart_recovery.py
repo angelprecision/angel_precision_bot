@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import uuid
 import os
+from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Optional
@@ -1492,7 +1493,9 @@ class TestAmendment10Required:
 class _AuthoritativeOrdersBroker:
     def __init__(self, pages=None, error=None, *, account_id="acct-live"):
         self.cfg = SimpleNamespace(account_id=account_id)
-        self.pages = pages or {1: {"orders": "null"}}
+        self.pages = pages if pages is not None else {
+            1: {"orders": {"order": []}}
+        }
         self.error = error
         self.paths = []
         self.submit_order = MagicMock()
@@ -1503,7 +1506,7 @@ class _AuthoritativeOrdersBroker:
         if self.error:
             raise self.error
         page = int(path.split("page=")[1].split("&")[0])
-        return self.pages.get(page, {"orders": "null"})
+        return self.pages.get(page, {"orders": {"order": []}})
 
 
 def _phase_one_crash_row(
@@ -1632,6 +1635,7 @@ class TestPhaseOneCrashRecovery:
             broker = _AuthoritativeOrdersBroker({
                 1: {"orders": {"order": {
                     "id": "broker-1",
+                    "status": "open",
                     "tag": canonical_broker_submit_key(row["local_order_id"]),
                 }}}
             }, account_id=account_id)
@@ -1670,13 +1674,18 @@ class TestPhaseOneCrashRecovery:
         monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
         row = _phase_one_crash_row()
         page_one = [
-            {"id": f"other-{index}", "tag": f"other:{index}"}
+            {
+                "id": f"other-{index}",
+                "status": "open",
+                "tag": f"other:{index}",
+            }
             for index in range(500)
         ]
         broker = _AuthoritativeOrdersBroker({
             1: {"orders": {"order": page_one}},
             2: {"orders": {"order": {
                 "id": "exact",
+                "status": "open",
                 "tag": canonical_broker_submit_key(row["local_order_id"]),
             }}},
         })
@@ -1685,6 +1694,97 @@ class TestPhaseOneCrashRecovery:
         assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
         assert len(broker.paths) == 2
         assert osm.phase_one_recovery_calls == []
+
+    @pytest.mark.parametrize(
+        "broker_shape",
+        [
+            ("orders_none", {"orders": None}),
+            ("orders_string_null", {"orders": "null"}),
+            ("orders_node_missing_order", {"orders": {}}),
+            ("orders_empty_object", {"orders": {"order": {}}}),
+            (
+                "orders_unrecognized_row",
+                {"orders": {"order": [{"some": "unrecognized"}]}},
+            ),
+            (
+                "orders_row_missing_status",
+                {"orders": {"order": [{"id": "row-1", "tag": "other"}]}},
+            ),
+            (
+                "orders_row_missing_id",
+                {"orders": {"order": [{"status": "open", "tag": "other"}]}},
+            ),
+            (
+                "orders_non_dict_row",
+                {"orders": {"order": ["unrecognized"]}},
+            ),
+            (
+                "orders_rows_wrong_type",
+                {"orders": {"order": "not-a-list"}},
+            ),
+            ("missing_orders", {}),
+            ("transport_error", None),
+            ("unavailable", None),
+            ("pagination_stalled", None),
+        ],
+        ids=[
+            "orders_none",
+            "orders_string_null",
+            "orders_node_missing_order",
+            "orders_empty_object",
+            "orders_unrecognized_row",
+            "orders_row_missing_status",
+            "orders_row_missing_id",
+            "orders_non_dict_row",
+            "orders_rows_wrong_type",
+            "missing_orders",
+            "transport_error",
+            "unavailable",
+            "pagination_stalled",
+        ],
+    )
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
+    def test_malformed_or_incomplete_order_truth_never_recovers(
+        self, monkeypatch, broker_shape, execution_mode
+    ):
+        """Malformed or incomplete broker truth cannot prove exact-tag absence."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(execution_mode=execution_mode)
+        before_meta = deepcopy(row["meta"])
+        account_id = f"acct-{execution_mode}"
+        shape, payload = broker_shape
+        if shape == "transport_error":
+            broker = _AuthoritativeOrdersBroker(
+                error=RuntimeError("transport down"), account_id=account_id
+            )
+        elif shape == "unavailable":
+            broker = _AuthoritativeOrdersBroker(account_id="")
+        elif shape == "pagination_stalled":
+            page = [
+                {
+                    "id": f"stalled-{index}",
+                    "status": "open",
+                    "tag": f"other:{index}",
+                }
+                for index in range(500)
+            ]
+            broker = _AuthoritativeOrdersBroker({
+                1: {"orders": {"order": page}},
+                2: {"orders": {"order": list(page)}},
+            }, account_id=account_id)
+        else:
+            broker = _AuthoritativeOrdersBroker(
+                {1: payload}, account_id=account_id
+            )
+        rec, osm = _phase_one_recovery(row, broker)
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.phase_one_recovery_calls == []
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+        assert osm._rows[row["local_order_id"]]["meta"] == before_meta
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
 
     @pytest.mark.parametrize(
         "reason",
