@@ -7162,7 +7162,7 @@ class APExecutionCore:
                             "disposition": "KEEP_WATCHER",
                             "reason_code": "MATERIALIZATION_CONFIG_CONFLICT",
                         }
-                    _RETRY_DELAY_A = _positive_int_env_config(
+                    _RETRY_DELAY_BASE_A = _positive_int_env_config(
                         "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
                     )
                     # P0 (2026-07-02): cutoff default moved 945 → 1530. See
@@ -7183,6 +7183,86 @@ class APExecutionCore:
                     )
 
                     if _decision_a["action"] == "retry_schedule":
+                        # Use the same bounded cadence and effective deadline
+                        # authority as due-retry recovery.  This direct
+                        # selector-failure producer must not reintroduce a
+                        # fixed-delay retry lane that can write past an
+                        # absolute durable entry deadline.
+                        _retry_deadline_row_a = (
+                            _pv_row
+                            if isinstance(_pv_row, dict)
+                            else (_cursor_row if isinstance(_cursor_row, dict) else {})
+                        )
+                        _retry_deadline_meta_a = (
+                            _retry_deadline_row_a.get("meta") or {}
+                            if isinstance(_retry_deadline_row_a, dict)
+                            else {}
+                        )
+                        if isinstance(_retry_deadline_meta_a, str):
+                            try:
+                                _retry_deadline_meta_a = json.loads(
+                                    _retry_deadline_meta_a
+                                )
+                            except Exception:
+                                _retry_deadline_meta_a = {}
+                        if not isinstance(_retry_deadline_meta_a, dict):
+                            _retry_deadline_meta_a = {}
+                        _retry_now_a = datetime.now(timezone.utc)
+                        (
+                            _retry_deadline_a,
+                            _retry_deadline_error_a,
+                        ) = _resolve_deferred_retry_deadline(
+                            _retry_deadline_meta_a,
+                            now=_retry_now_a,
+                        )
+                        if _retry_deadline_error_a:
+                            return _terminalize_deferred_breach_failure(
+                                "RETRY_INVALID_DEADLINE",
+                                extra_meta={
+                                    "deadline_error": _retry_deadline_error_a,
+                                    "selector_calls": 1,
+                                    "broker_post_count": 0,
+                                },
+                            )
+                        if (
+                            _retry_deadline_a is not None
+                            and _retry_now_a >= _retry_deadline_a
+                        ):
+                            return _terminalize_deferred_breach_failure(
+                                "RETRY_DEADLINE_EXHAUSTED",
+                                extra_meta={
+                                    "deadline": _retry_deadline_a.isoformat(),
+                                    "selector_calls": 1,
+                                    "broker_post_count": 0,
+                                },
+                            )
+                        _RETRY_DELAY_A = max(
+                            int(_RETRY_DELAY_BASE_A),
+                            _compute_retry_backoff_seconds(
+                                _this_attempt_a,
+                                _obs_rc_a,
+                                cfg={
+                                    "validity_bound_retry_backoff_step1_seconds":
+                                    _RETRY_DELAY_BASE_A,
+                                },
+                            ),
+                        )
+                        _retry_candidate_next_a = _retry_now_a + timedelta(
+                            seconds=int(_RETRY_DELAY_A)
+                        )
+                        if (
+                            _retry_deadline_a is not None
+                            and _retry_candidate_next_a >= _retry_deadline_a
+                        ):
+                            return _terminalize_deferred_breach_failure(
+                                "RETRY_DEADLINE_WOULD_EXHAUST",
+                                extra_meta={
+                                    "deadline": _retry_deadline_a.isoformat(),
+                                    "delay_seconds": int(_RETRY_DELAY_A),
+                                    "selector_calls": 1,
+                                    "broker_post_count": 0,
+                                },
+                            )
                         log.warning(
                             "[%s] DEFERRED_BREACH_SELECTOR_RETRYABLE "
                             "attempt=%d/%d reason=%s delay=%ds cutoff=%d now=%d — rearming",
@@ -7209,10 +7289,7 @@ class APExecutionCore:
                         # The watcher remains the runnable owner in this process;
                         # startup recovery consumes the same next_retry_at after a
                         # restart.  There is no thread-only scheduler or sleep.
-                        _next_retry_at_a = (
-                            datetime.now(timezone.utc)
-                            + timedelta(seconds=int(_RETRY_DELAY_A))
-                        ).isoformat()
+                        _next_retry_at_a = _retry_candidate_next_a.isoformat()
                         _schedule_retry = getattr(
                             self.order_state_machine,
                             "schedule_deferred_materialization_retry",
