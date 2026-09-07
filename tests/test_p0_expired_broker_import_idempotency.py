@@ -556,6 +556,9 @@ def test_closed_partial_restore_rereads_full_row_and_preserves_quantity(producti
         def list_positions(self):
             return [{"symbol": contract, "underlying": "NOW", "quantity": 1}]
 
+        def list_positions_strict(self):
+            return self.list_positions()
+
     engine = APExitEngine.__new__(APExitEngine)
     engine._email = client_id
     engine._lock = threading.RLock()

@@ -85,6 +85,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 log = logging.getLogger("ap.reconciler")
@@ -5554,6 +5555,105 @@ class APBrokerReconciler:
     # P0-PARTIAL-CLOSE: broker-truth repair for CLOSED rows with remaining qty
     # ──────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _closed_repair_position_qty(bp: dict) -> int:
+        """Read one strict-repair quantity without lossy normalization."""
+        if not isinstance(bp, dict):
+            raise ValueError("closed_repair_broker_position_malformed")
+
+        records = [bp]
+        raw = bp.get("raw")
+        if isinstance(raw, dict):
+            records.append(raw)
+
+        values: list[int] = []
+        for record in records:
+            for key in ("quantity", "qty", "long_quantity"):
+                if key not in record:
+                    continue
+                value = record[key]
+                if value is None or isinstance(value, bool):
+                    raise ValueError("closed_repair_broker_position_malformed")
+                if isinstance(value, str):
+                    value = value.strip()
+                    if not value:
+                        raise ValueError("closed_repair_broker_position_malformed")
+                try:
+                    parsed = Decimal(str(value))
+                except Exception as exc:
+                    raise ValueError(
+                        "closed_repair_broker_position_malformed"
+                    ) from exc
+                if not parsed.is_finite() or parsed != parsed.to_integral_value():
+                    raise ValueError("closed_repair_broker_position_malformed")
+                quantity = int(parsed)
+                if quantity < 0:
+                    raise ValueError("closed_repair_broker_position_malformed")
+                values.append(quantity)
+
+            if "short_quantity" in record:
+                value = record["short_quantity"]
+                if value is None or isinstance(value, bool):
+                    raise ValueError("closed_repair_broker_position_malformed")
+                try:
+                    short_quantity = Decimal(str(value))
+                except Exception as exc:
+                    raise ValueError(
+                        "closed_repair_broker_position_malformed"
+                    ) from exc
+                if (
+                    not short_quantity.is_finite()
+                    or short_quantity != short_quantity.to_integral_value()
+                    or int(short_quantity) != 0
+                ):
+                    raise ValueError("closed_repair_broker_position_malformed")
+
+            for key in ("side", "position_type", "direction"):
+                if key not in record or record[key] in (None, ""):
+                    continue
+                if not isinstance(record[key], str):
+                    raise ValueError("closed_repair_broker_position_malformed")
+                direction = (
+                    record[key]
+                    .strip()
+                    .lower()
+                    .replace("_", " ")
+                    .replace("-", " ")
+                )
+                if "short" in direction or direction in {"sell to open", "selltoopen"}:
+                    raise ValueError("closed_repair_broker_position_malformed")
+
+        if not values or len(set(values)) != 1:
+            raise ValueError("closed_repair_broker_position_malformed")
+        return values[0]
+
+    def _closed_repair_broker_quantities(self) -> dict[str, int]:
+        """Build exact contract quantities from the strict broker-read seam."""
+        strict_reader = getattr(self.broker, "list_positions_strict", None)
+        if not callable(strict_reader):
+            raise RuntimeError("closed_repair_strict_positions_reader_missing")
+
+        rows = strict_reader()
+        if not isinstance(rows, list):
+            raise ValueError("closed_repair_broker_snapshot_malformed")
+
+        quantities: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("closed_repair_broker_position_malformed")
+            raw_contract = row.get("symbol")
+            if raw_contract in (None, ""):
+                raw_contract = row.get("option_symbol") or row.get("contract")
+            if not isinstance(raw_contract, str) or not raw_contract.strip():
+                raise ValueError("closed_repair_broker_position_malformed")
+            contract = self._norm_contract(raw_contract)
+            if not re.fullmatch(r"[A-Z0-9.]{1,32}", contract):
+                raise ValueError("closed_repair_broker_position_malformed")
+            if contract in quantities:
+                raise ValueError("closed_repair_broker_snapshot_ambiguous")
+            quantities[contract] = self._closed_repair_position_qty(row)
+        return quantities
+
     def _repair_closed_positions_with_remaining_qty(self, summary: dict) -> None:
         """
         P0-PARTIAL-CLOSE repair pass.
@@ -5615,17 +5715,15 @@ class APBrokerReconciler:
             broker_open_by_contract: dict[str, int] = {}
             broker_truth_available  = False
             try:
-                if self.broker and hasattr(self.broker, "list_positions"):
-                    bp_list = self.broker.list_positions() or []
-                    for bp in bp_list:
-                        sym = self._norm_contract(
-                            str(bp.get("symbol") or bp.get("contract") or "")
-                        )
-                        qty = self._broker_position_qty(bp)
-                        if sym and qty > 0:
-                            broker_open_by_contract[sym] = qty
-                    broker_truth_available = True
+                broker_open_by_contract = self._closed_repair_broker_quantities()
+                broker_truth_available = True
             except Exception as _bpe:
+                error_code = (
+                    "closed_repair_broker_positions_malformed"
+                    if isinstance(_bpe, ValueError)
+                    else "closed_repair_broker_positions_unavailable"
+                )
+                summary.setdefault("errors", []).append(error_code)
                 log.warning(
                     "[%s] P0-PARTIAL-CLOSE-REPAIR broker fetch failed: %s — "
                     "flagging rows for manual review without changing status",

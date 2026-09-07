@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import math
+import re
 import requests
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional, Dict, Any, List
 
 from ap.broker import BrokerAdapter, BrokerOrderResponse, normalize_status
@@ -476,12 +479,18 @@ class TradierBroker(BrokerAdapter):
         return self._list_positions(strict=False)
 
     def list_positions_strict(self) -> list:
-        """Return positions, raising when broker truth is unavailable."""
+        """Return normalized positions, raising on unavailable or malformed truth."""
         return self._list_positions(strict=True)
 
     def _list_positions(self, *, strict: bool) -> list:
         try:
             resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
+            if strict:
+                return self._normalize_strict_positions_payload(resp)
+
+            # Keep this legacy path unchanged for unrelated callers.  It is
+            # intentionally forgiving because existing consumers depend on an
+            # empty list for an unavailable positions read.
             positions = resp.get("positions", {})
             if not positions or positions == "null":
                 return []
@@ -507,3 +516,135 @@ class TradierBroker(BrokerAdapter):
             if strict:
                 raise
             return []
+
+    @staticmethod
+    def _strict_integral_quantity(value: Any) -> int:
+        """Parse a broker quantity without changing its signed meaning."""
+        if value is None or isinstance(value, bool):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        try:
+            parsed = Decimal(str(value))
+        except Exception as exc:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED") from exc
+        if not parsed.is_finite() or parsed != parsed.to_integral_value():
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        quantity = int(parsed)
+        if quantity < 0:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        return quantity
+
+    @staticmethod
+    def _strict_optional_float(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, bool):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        try:
+            parsed = float(value)
+        except Exception as exc:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED") from exc
+        if not math.isfinite(parsed):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        return parsed
+
+    @staticmethod
+    def _strict_validate_envelope(value: dict) -> None:
+        failure_statuses = {"error", "failed", "failure", "unavailable"}
+        for key, raw_value in value.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key in {"error", "errors", "message"}:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            if (
+                normalized_key == "status"
+                and str(raw_value or "").strip().lower() in failure_statuses
+            ):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+    @classmethod
+    def _strict_position_quantity(cls, row: dict) -> int:
+        values: list[int] = []
+        for key in ("quantity", "qty", "long_quantity"):
+            if key in row:
+                values.append(cls._strict_integral_quantity(row[key]))
+
+        if "short_quantity" in row:
+            short_quantity = cls._strict_integral_quantity(row["short_quantity"])
+            if short_quantity != 0:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        if not values or len(set(values)) != 1:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        for key in ("side", "position_type", "direction"):
+            if key not in row or row[key] in (None, ""):
+                continue
+            if not isinstance(row[key], str):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            direction = row[key].strip().lower().replace("_", " ").replace("-", " ")
+            if "short" in direction or direction in {"sell to open", "selltoopen"}:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        return values[0]
+
+    @classmethod
+    def _normalize_strict_positions_payload(cls, payload: Any) -> list[dict]:
+        """Normalize one complete positions response or raise fail-closed."""
+        if not isinstance(payload, dict) or "positions" not in payload:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        cls._strict_validate_envelope(payload)
+
+        positions = payload["positions"]
+        if positions is None or positions == "null":
+            return []
+        if not isinstance(positions, dict) or not positions:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        cls._strict_validate_envelope(positions)
+        if "position" not in positions:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        rows = positions["position"]
+        if rows is None or rows == "null":
+            return []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        normalized: list[dict] = []
+        seen_symbols: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            raw_symbol = row.get("symbol")
+            if not isinstance(raw_symbol, str):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            symbol = raw_symbol.strip().upper()
+            if (
+                not symbol
+                or not re.fullmatch(r"[A-Z0-9.]{1,32}", symbol)
+                or symbol in seen_symbols
+            ):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            seen_symbols.add(symbol)
+
+            quantity = cls._strict_position_quantity(row)
+            cost_basis = cls._strict_optional_float(row.get("cost_basis"))
+            match = re.search(r"([CP])\d{8}$", symbol)
+            side = (
+                "CALL" if match and match.group(1) == "C"
+                else "PUT" if match else ""
+            )
+            normalized.append({
+                "symbol": symbol,
+                "quantity": quantity,
+                "cost_basis": cost_basis,
+                "side": side,
+                "raw": dict(row),
+            })
+        return normalized
