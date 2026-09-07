@@ -499,21 +499,26 @@ def _pending_trigger_without_watcher(
     out = []
     for row in pending_rows or []:
         local_order_id = str(row.get("local_order_id") or "").strip()
-        if not local_order_id:
+        signal_id = str(row.get("signal_id") or "").strip()
+        if not local_order_id or not signal_id or retry_owner is None:
             out.append(row)
             continue
         try:
-            if entry_watcher.has_order(local_order_id):
-                continue
-        except Exception:
-            out.append(row)
-            continue
-        try:
+            # Never let local_order_id-only has_order() satisfy readiness.
+            # The canonical recovery engine proves durable client/mode/signal
+            # identity, lifecycle state, registry state, and dedup ownership.
             if (
-                retry_owner is not None
-                and retry_owner.prove_restart_rearm_retry_owner(
+                retry_owner.prove_registered_watcher_owner(
                     local_order_id,
-                    expected_signal_id=str(row.get("signal_id") or "").strip(),
+                    expected_signal_id=signal_id,
+                )
+                is not None
+            ):
+                continue
+            if (
+                retry_owner.prove_restart_rearm_retry_owner(
+                    local_order_id,
+                    expected_signal_id=signal_id,
                 )
                 is not None
             ):
