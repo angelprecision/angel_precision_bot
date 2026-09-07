@@ -1309,18 +1309,6 @@ class PendingTriggerRestartRecovery:
             )
 
         _first_failed_dt = _parse_retry_iso(first_failed_at) if first_failed_at is not None else None
-        if _late_policy:
-            log.critical(
-                "DEBUG_LATE_REARM_INPUT local=%s late=%r existing=%r arg=%r "
-                "first_meta=%r last_meta=%r keys=%s",
-                local_oid,
-                _late_policy,
-                _existing_late_lease,
-                first_failed_at,
-                _meta.get(_RR_FIRST_FAILED_AT),
-                _meta.get(_RR_LAST_FAILED_AT),
-                sorted(_meta.keys()),
-            )
         if (
             _late_policy
             and _existing_late_lease
@@ -2061,15 +2049,12 @@ class PendingTriggerRestartRecovery:
         """Prove bounded pre-breach restart-rearm retry ownership."""
         get_fn = getattr(self.osm, "get_order", None)
         if not callable(get_fn):
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2043, local_oid)
             return None
         try:
             reread = get_fn(local_oid)
         except Exception:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2048, local_oid)
             return None
         if not isinstance(reread, dict):
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2051, local_oid)
             return None
 
         status = str(reread.get("status") or "").strip().upper()
@@ -2078,26 +2063,19 @@ class PendingTriggerRestartRecovery:
         rr_mode = str(reread.get("execution_mode") or "").strip().lower()
         rr_signal_id = str(reread.get("signal_id") or "").strip()
         if status != "PENDING_TRIGGER":
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2060, local_oid)
             return None
         if rr_oid != local_oid:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2063, local_oid)
             return None
         if rr_client != self.client_id.lower():
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2066, local_oid)
             return None
         if self.execution_mode not in {"live", "paper"}:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2069, local_oid)
             return None
         if rr_mode not in {"live", "paper"} or rr_mode != self.execution_mode:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2072, local_oid)
             return None
         if not rr_signal_id or not expected_signal_id or rr_signal_id != expected_signal_id:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2075, local_oid)
             return None
         _late_policy = _late_attachment_policy_eligible(reread)
         if require_late_policy and not _late_policy:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2079, local_oid)
             return None
         if any(
             value is not None
@@ -2107,10 +2085,8 @@ class PendingTriggerRestartRecovery:
                 reread.get("submitted_ts"),
             )
         ):
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2089, local_oid)
             return None
         if is_active_materialization_in_flight(reread):
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2092, local_oid)
             return None
         # A late-attachment candidate may already have exact trigger-crossing
         # evidence: that is why it needs fresh market truth before a watcher can
@@ -2121,7 +2097,6 @@ class PendingTriggerRestartRecovery:
             _has_trigger_or_submit_evidence(reread)
             and not _late_policy
         ):
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2103, local_oid)
             return None
 
         meta = _extract_meta(reread)
@@ -2146,13 +2121,11 @@ class PendingTriggerRestartRecovery:
                 rr_mode_meta_raw,
             )
         ):
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2128, local_oid)
             return None
         if _late_attachment_policy_eligible(reread) and not all(
             isinstance(value, str) and value.strip()
             for value in (first_failed_at_raw, last_failed_at_raw)
         ):
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2134, local_oid)
             return None
         restart_status = restart_status_raw.strip().upper()
         owner = owner_raw.strip()
@@ -2173,7 +2146,6 @@ class PendingTriggerRestartRecovery:
         rr_mode_meta = rr_mode_meta_raw.strip().lower()
         attempt_raw = meta.get(_RR_ATTEMPT_FIELD)
         if type(attempt_raw) is not int:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2155, local_oid)
             return None
         attempt = attempt_raw
         generation = None
@@ -2183,13 +2155,11 @@ class PendingTriggerRestartRecovery:
                 type(generation_raw) is not int
                 or not 1 <= generation_raw <= _LATE_REARM_MAX_GENERATIONS
             ):
-                log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2165, local_oid)
                 return None
             generation = generation_raw
         if _RR_ATTEMPT_FIELD in reread:
             top_attempt = reread.get(_RR_ATTEMPT_FIELD)
             if type(top_attempt) is not int or top_attempt != attempt:
-                log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2171, local_oid)
                 return None
         max_attempts = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
         retry_deadline_secs = _env_int(
@@ -2210,29 +2180,14 @@ class PendingTriggerRestartRecovery:
                 or deadline_dt > first_failed_dt + timedelta(seconds=retry_deadline_secs)
                 or next_dt < first_failed_dt
             ):
-                log.critical(
-                    "RESTART_RECOVERY_LATE_REARM_TIMESTAMP_PROOF_FAILED "
-                    "local=%s first=%r last=%r next=%r deadline=%r window=%ss",
-                    local_oid,
-                    first_failed_at,
-                    last_failed_at,
-                    next_at,
-                    deadline,
-                    retry_deadline_secs,
-                )
-                log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2202, local_oid)
                 return None
         if restart_status != "RETRY_PENDING":
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2205, local_oid)
             return None
         if not owner or not reason:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2208, local_oid)
             return None
         if attempt < 1 or attempt > max_attempts:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2211, local_oid)
             return None
         if next_dt is None or deadline_dt is None or next_dt > deadline_dt:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2214, local_oid)
             return None
         now = datetime.now(timezone.utc)
         if (
@@ -2243,31 +2198,23 @@ class PendingTriggerRestartRecovery:
             # bounded recovery window.  Without this horizon check a
             # malformed future lease can hide an ownerless PENDING_TRIGGER
             # from readiness and make the monitor skip it indefinitely.
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2225, local_oid)
             return None
         if not allow_expired and now > deadline_dt:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2228, local_oid)
             return None
         if rr_client_meta != self.client_id.lower() or rr_mode_meta != self.execution_mode:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2231, local_oid)
             return None
         canonical_owner = (
             f"restart_rearm:{self.client_id}:{self.execution_mode}:{local_oid}"
         )
         if owner != canonical_owner:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2237, local_oid)
             return None
         if expected_owner is not None and owner != expected_owner:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2240, local_oid)
             return None
         if expected_next_at is not None and next_at != expected_next_at:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2243, local_oid)
             return None
         if expected_deadline is not None and deadline != expected_deadline:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2246, local_oid)
             return None
         if expected_generation is not None and generation != expected_generation:
-            log.critical("RESTART_RECOVERY_RETRY_PROOF_REJECT line=%s local=%s", 2249, local_oid)
             return None
         return {
             "local_order_id": local_oid,
