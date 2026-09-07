@@ -414,6 +414,12 @@ def test_completed_owned_retry_is_consumed_same_process_before_5400_seconds(monk
     assert state.watcher._pending == []
 
     row = state.osm.rows["local-1"]
+    row["meta"]["restart_rearm_first_failed_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=2)
+    ).isoformat()
+    row["meta"]["restart_rearm_last_failed_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
     row["meta"]["restart_rearm_next_at"] = (
         datetime.now(timezone.utc) - timedelta(seconds=1)
     ).isoformat()
