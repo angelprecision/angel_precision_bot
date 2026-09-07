@@ -3073,26 +3073,140 @@ class APEntryWatcher:
     # any durable retry counter. It does not weaken LEGAL_TRANSITIONS.
     # See docs/pr_specs/p0_post_outage_trigger_lifecycle_convergence_20260904.md
     # ─────────────────────────────────────────────────────────────────────
+    # ── Broker handoff evidence check (Correction 1 / PR #580 amendment) ────
+    @staticmethod
+    def _recovery_has_broker_handoff_evidence(sig: dict, meta: dict) -> bool:
+        """Return True if any durable evidence indicates the broker already
+        handled or is handling this order.
+
+        Evidence list mirrors has_broker_handoff_evidence() in
+        ap.pending_trigger_classifier and the PR #580 amendment §1 list.
+        This duplicate is intentional: it avoids importing the classifier
+        (which pulls psycopg2 at module init) inside the lifecycle bridge.
+        """
+        # Top-level broker fields
+        if sig.get("broker_order_id") or sig.get("submitted_ts"):
+            return True
+        # Meta broker-intent markers
+        for _k in (
+            "broker_ready",
+            "submit_intent_at",
+            "broker_submit_key",
+            "broker_submit_payload_hash",
+            "recovery_submit_owner",
+            "recovery_submit_fenced",
+            "recovery_submit_lease_until",
+        ):
+            if meta.get(_k):
+                return True
+        # Durable watcher_audit trigger_ready
+        _wa = meta.get("watcher_audit")
+        if isinstance(_wa, dict) and str(_wa.get("reason_code") or "") == "trigger_ready":
+            return True
+        # Active materialization ownership/proof
+        if meta.get("materialization_owner") and meta.get("materialization_in_flight"):
+            return True
+        return False
+
     def _restore_recovered_watcher_lifecycle(self, watched) -> tuple[bool, str]:
         """Restore in-memory lifecycle for a proven-recovery watcher.
 
         Returns ``(ok, reason_code)``. ``ok=False`` means HOLD — the
-        caller must un-register the watcher and refuse admission.
-        """
-        # If the lifecycle module isn't importable, this seam is a no-op.
-        # The watcher runs standalone in that mode by pre-existing design
-        # (_ew_record already swallows the same import failure); recovery
-        # bridging cannot be stricter than that base contract without
-        # gating production on a non-critical helper.
-        if not _EW_LIFECYCLE_OK:
-            return True, "recovery_lifecycle_module_unavailable_soft_ok"
+        caller must refuse admission; no watcher is registered, no
+        dedup entry added, no broker state mutated.
 
-        signal_id = str((getattr(watched, "signal", {}) or {}).get("signal_id") or "").strip()
-        ticker = str(getattr(watched, "ticker", "") or "").strip()
+        Correction 3 (PR #580 amendment): lifecycle import failure is
+        now HOLD, not soft success. A recovery bridge that cannot read
+        lifecycle state cannot determine whether admission is safe.
+
+        Correction 2: full durable identity is validated before any
+        lifecycle write. No UUID fallback, no mode fallback, no default
+        side. Blank/whitespace/zero/negative values are refused.
+
+        Correction 1: broker handoff evidence is checked from the
+        signal dict / metadata before any lifecycle mutation.
+        """
+        # Correction 3: lifecycle module unavailable → HOLD, not soft pass.
+        # A recovery bridge that cannot read lifecycle state cannot determine
+        # whether admission is safe. Ordinary (non-recovery) admissions are
+        # unaffected — they do not call this function.
+        if not _EW_LIFECYCLE_OK:
+            return False, "recovery_lifecycle_unavailable_hold"
+
+        # ── Full durable identity validation (Correction 2) ──────────────
+        #
+        # All identity fields come from the signal dict column values.
+        # No metadata fallback is used for required fields; a blank column
+        # value is a data-integrity failure → HOLD. execution_mode is
+        # NOT lowercased: the durable row always stores it lowercase
+        # ("live"/"paper"); any other form means the row is corrupt.
+        sig = getattr(watched, "signal", {}) or {}
+        _raw_meta = sig.get("metadata") or sig.get("meta") or {}
+        if isinstance(_raw_meta, str):
+            try:
+                import json as _json
+                _raw_meta = _json.loads(_raw_meta)
+            except Exception:
+                _raw_meta = {}
+        meta: dict = _raw_meta if isinstance(_raw_meta, dict) else {}
+
+        def _blank(v) -> bool:
+            return v is None or not str(v).strip()
+
+        signal_id = str(sig.get("signal_id") or "").strip()
+        ticker = str(getattr(watched, "ticker", "") or sig.get("ticker") or "").strip()
+        # Column-only: explicit "" → HOLD (no metadata fallback for required fields)
+        canonical_signal_id = str(sig.get("canonical_signal_id") or "").strip()
+        _col_client = sig.get("client_id")
+        client_id = "" if _blank(_col_client) else str(_col_client).strip()
+        # execution_mode: no .lower(); durable value must already be "live"/"paper"
+        _col_mode = sig.get("execution_mode")
+        execution_mode = "" if _blank(_col_mode) else str(_col_mode).strip()
+        local_order_id = str(sig.get("local_order_id") or "").strip()
+        side = str(
+            getattr(watched, "side", "")
+            or sig.get("side")
+            or sig.get("direction")
+            or ""
+        ).strip().upper()
+
+        # Required non-empty column fields — no UUID fallback, no mode fallback,
+        # no default side. Any gap is HOLD.
         if not signal_id or not ticker:
-            # Cannot make a per-signal lifecycle claim without exact
-            # identity. Refuse rather than fabricate.
             return False, "recovery_lifecycle_missing_signal_identity"
+        if not client_id:
+            return False, "recovery_lifecycle_missing_client_id"
+        if execution_mode not in ("live", "paper"):
+            return False, "recovery_lifecycle_invalid_execution_mode"
+        if not local_order_id:
+            return False, "recovery_lifecycle_missing_local_order_id"
+        if not canonical_signal_id:
+            return False, "recovery_lifecycle_missing_canonical_signal_id"
+        if side not in ("CALL", "PUT"):
+            return False, "recovery_lifecycle_invalid_side"
+
+        # Materialization generation: reject zero/negative if explicitly present
+        _gen_raw = sig.get("materialization_generation") or meta.get("materialization_generation")
+        if _gen_raw is not None and not isinstance(_gen_raw, bool):
+            try:
+                _gen_int = int(_gen_raw)
+                if _gen_int < 0:
+                    return False, "recovery_lifecycle_negative_generation"
+                # Zero generation is ambiguous — reject
+                if _gen_int == 0:
+                    return False, "recovery_lifecycle_zero_generation"
+            except (TypeError, ValueError):
+                return False, "recovery_lifecycle_malformed_generation"
+
+        # ── Broker handoff evidence check (Correction 1) ──────────────────
+        #
+        # If any durable evidence proves the broker already owns or has
+        # touched this order, recovery must HOLD immediately — before any
+        # lifecycle write, before any watcher registration, before any
+        # callback. The broker-intent reconciler (when available) is the
+        # only authority that may resolve such ambiguity.
+        if self._recovery_has_broker_handoff_evidence(sig, meta):
+            return False, "recovery_lifecycle_hold_broker_handoff_evidence"
 
         try:
             current = _EW_LEDGER.current_state(signal_id)
@@ -3649,29 +3763,26 @@ class APEntryWatcher:
                     )
                     return False
 
-            if dedup_key:
-                self._dedup_set.add(dedup_key)
-
-            self._pending.append(watched)
-
-            # ── PR #580: recovery lifecycle restoration bridge ────────
-            # Run BEFORE provenance is committed so a HOLD outcome
-            # cleanly un-registers without leaving created_by_this_call
-            # asserted for a watcher that never actually stays.
+            # ── PR #580 amendment: recovery lifecycle restoration bridge ─────
+            # Correction 4 (atomic preferred order):
+            #   1. validate identity           ─┐ all done inside
+            #   2. validate broker handoff     ─┘ _restore_recovered_watcher_lifecycle()
+            #   3. restore lifecycle ownership  ─ same function
+            #   4. register watcher (below)    ← happens ONLY after (1-3) pass
+            #
+            # This guard runs BEFORE _pending.append() and _dedup_set.add()
+            # so a HOLD leaves the registry completely clean — no rollback
+            # is needed, no partial admission can remain.
+            #
             # Only fires when watch() has stamped __recovery_rearm=True
-            # after recovery_trigger_evidence_identity_is_proven()
-            # already verified exact durable identity. Ordinary new
-            # admissions skip this branch entirely.
+            # after recovery_trigger_evidence_identity_is_proven() already
+            # verified exact durable identity. Ordinary new admissions do
+            # not carry the marker and are completely untouched.
             if bool((getattr(watched, "signal", {}) or {}).get("__recovery_rearm")):
                 _rlok, _rlreason = self._restore_recovered_watcher_lifecycle(watched)
                 if not _rlok:
-                    # HOLD — remove the just-registered watcher.
-                    try:
-                        self._pending.remove(watched)
-                    except ValueError:
-                        pass
-                    if dedup_key:
-                        self._dedup_set.discard(dedup_key)
+                    # HOLD — watcher is NOT yet in _pending or _dedup_set;
+                    # no rollback required. Emit best-effort audit and refuse.
                     try:
                         _hold_audit = self._build_watcher_audit_payload(
                             watched,
@@ -3688,8 +3799,7 @@ class APEntryWatcher:
                             _hold_audit,
                         )
                     except Exception:
-                        # Audit write is best-effort; HOLD stands
-                        # regardless of persistence outcome.
+                        # Audit write is best-effort; HOLD stands regardless.
                         pass
                     self._last_reject_reason = _rlreason
                     log.critical(
@@ -3700,13 +3810,19 @@ class APEntryWatcher:
                         watched.signal.get("local_order_id"),
                         _rlreason,
                     )
-                    # Explicit provenance reset — a HOLD is not a
-                    # created registration, even though we briefly
-                    # appended to _pending inside the same lock.
+                    # Provenance output is already reset at the top of add_signal().
+                    # Explicitly re-assert so any future refactor that moves this
+                    # block cannot silently inherit a stale True from an earlier
+                    # successful registration in the same lock.
                     if registration_provenance_out is not None:
                         registration_provenance_out["created_by_this_call"] = False
                         registration_provenance_out["registration_token"] = None
                     return False
+
+            if dedup_key:
+                self._dedup_set.add(dedup_key)
+
+            self._pending.append(watched)
 
             # PR #421 final amendment (P0-1): this is the exact, sole
             # point a new WatchedSignal registration is committed to the

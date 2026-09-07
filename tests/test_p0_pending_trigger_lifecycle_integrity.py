@@ -616,3 +616,377 @@ class TestBugA_LiveFailsClosed:
 
         core._cleanup_pending_entry_order.assert_called_once()
         assert watched.state != ew.WatchState.PENDING
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #580 amendment corrections — behavioral tests
+# (Corrections 1-4 per AMEND PR #580 IN PLACE — HARD HOLD REMAINS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPR580AmendmentCorrections:
+    """
+    Behavioral proof of the four corrections in the #580 amendment.
+
+    Correction 1: Broker handoff evidence → HOLD before any registration.
+    Correction 2: Recovery identity must fail closed on every gap.
+    Correction 3: Lifecycle import failure → HOLD (not soft success).
+    Correction 4: Lifecycle validation happens BEFORE _pending.append().
+    """
+
+    def _bare_watcher(self):
+        import ap_entry_watcher as ew
+        w = ew.APEntryWatcher(
+            broker=None,
+            order_state_machine=None,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        w._persist_watcher_audit = lambda *a, **kw: None
+        return ew, w
+
+    def _recovery_sig(self, **overrides):
+        import uuid
+        sid = str(uuid.uuid4())
+        base = {
+            "signal_id": sid,
+            "canonical_signal_id": sid,
+            "ticker": "AAPL",
+            "side": "CALL",
+            "score": 70.0,
+            "entry_price": 200.0,
+            "entry_trigger": 200.0,
+            "stop_price": 198.0,
+            "target_price": 205.0,
+            "plan_id": f"plan-{sid[:8]}",
+            "local_order_id": f"lo-{sid[:8]}",
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "watcher_token": "tok-test",
+            "materialization_generation": 1,
+            "contract_symbol": "DEFERRED:AAPL",
+            "pattern": "2-1-2",
+            "prior_day_high": 200.10,
+            "prior_day_low": 197.90,
+            "timeframe": "1h",
+            "strategy_type": "continuation",
+            "contract_deferred": False,
+            "trigger": {"entry": 200.0, "stop": 198.0, "pt1": 205.0},
+            "metadata": {
+                "canonical_signal_id": sid,
+                "client_id": "jason@example.com",
+                "execution_mode": "live",
+                "materialization_generation": 1,
+            },
+            "__recovery_rearm": True,
+        }
+        base.update(overrides)
+        return base
+
+    # ── Correction 3: lifecycle import failure → HOLD ─────────────────────
+
+    def test_c3_lifecycle_unavailable_is_hold_not_soft_ok(self):
+        """
+        Correction 3: _EW_LIFECYCLE_OK=False must return (False, ...) — HOLD,
+        not (True, 'soft_ok'). A bridge that cannot read lifecycle state cannot
+        determine whether admission is safe.
+
+        The shim imports the base module as '_ap_entry_watcher_base' in
+        sys.modules. _restore_recovered_watcher_lifecycle is defined in
+        the base module and reads _EW_LIFECYCLE_OK from the base module's
+        globals. We must patch the variable there, not on the shim.
+        """
+        import sys, ap_entry_watcher as ew
+        w = ew.APEntryWatcher(
+            broker=None, order_state_machine=None,
+            require_on_trigger=False, mode="LIVE",
+        )
+        w._persist_watcher_audit = lambda *a, **kw: None
+
+        sig = self._recovery_sig()
+        watched = ew.WatchedSignal(sig, overnight=False)
+
+        # The base module that owns _restore_recovered_watcher_lifecycle
+        # is loaded as '_ap_entry_watcher_base' by the shim's __init__.py.
+        # Fall back to ew itself for monolithic (non-shim) deployments.
+        _base_mod = sys.modules.get("_ap_entry_watcher_base", ew)
+        orig = getattr(_base_mod, "_EW_LIFECYCLE_OK", None)
+        try:
+            _base_mod._EW_LIFECYCLE_OK = False
+            ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+            assert ok is False, (
+                "Correction 3: lifecycle unavailable must be HOLD (False), "
+                f"got ok={ok!r} reason={reason!r}"
+            )
+            assert "unavailable" in reason or "hold" in reason, (
+                f"reason should indicate unavailability; got {reason!r}"
+            )
+        finally:
+            if orig is not None:
+                _base_mod._EW_LIFECYCLE_OK = orig
+
+    # ── Correction 2: identity validation ─────────────────────────────────
+
+    @pytest.mark.parametrize("field,value,expected_fragment", [
+        ("client_id", "", "missing_client_id"),
+        ("client_id", "   ", "missing_client_id"),
+        ("execution_mode", "paper_mode_typo", "invalid_execution_mode"),
+        ("execution_mode", "", "invalid_execution_mode"),
+        ("execution_mode", "LIVE", "invalid_execution_mode"),   # must be lowercase
+        ("local_order_id", "", "missing_local_order_id"),
+        ("canonical_signal_id", "", "missing_canonical_signal_id"),
+        ("side", "LONG", "invalid_side"),
+        ("side", "", "invalid_side"),
+    ])
+    def test_c2_identity_field_missing_or_invalid_is_hold(
+        self, field, value, expected_fragment
+    ):
+        """
+        Correction 2: every required identity field must be present and valid.
+        Missing, blank, or malformed → HOLD. No UUID fallback, no mode
+        fallback, no default side.
+
+        For the side="" case WatchedSignal itself raises ValueError (the shim
+        validates side at construction time). We test that case via a mock
+        watched object that bypasses WatchedSignal's own guard so we can prove
+        the bridge's identity check is independent.
+        """
+        import ap_entry_watcher as ew, types
+        _, w = self._bare_watcher()
+
+        sig = self._recovery_sig()
+        # Apply the override directly to the signal dict (and metadata)
+        sig[field] = value
+        if field in sig.get("metadata", {}):
+            sig["metadata"][field] = value
+
+        # WatchedSignal raises ValueError for invalid/blank side.
+        # Use a lightweight mock for that case to keep the test in scope.
+        if field == "side" and not value:
+            watched = types.SimpleNamespace(
+                signal=sig,
+                ticker=sig.get("ticker", "AAPL"),
+                side=value,
+            )
+        else:
+            watched = ew.WatchedSignal(sig, overnight=False)
+            # For side, also zero out the WatchedSignal attribute
+            if field == "side":
+                watched.side = value
+
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False, (
+            f"Identity field {field!r}={value!r} must HOLD; got ok={ok!r} reason={reason!r}"
+        )
+        assert expected_fragment in reason, (
+            f"reason {reason!r} should contain {expected_fragment!r}"
+        )
+
+    def test_c2_negative_generation_is_hold(self):
+        """Correction 2: negative materialization_generation must HOLD."""
+        import ap_entry_watcher as ew
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig(materialization_generation=-1)
+        sig["metadata"]["materialization_generation"] = -1
+        watched = ew.WatchedSignal(sig, overnight=False)
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False
+        assert "generation" in reason
+
+    def test_c2_zero_generation_is_hold(self):
+        """Correction 2: zero materialization_generation must HOLD (ambiguous)."""
+        import ap_entry_watcher as ew
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig(materialization_generation=0)
+        sig["metadata"]["materialization_generation"] = 0
+        watched = ew.WatchedSignal(sig, overnight=False)
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False
+        assert "generation" in reason
+
+    def test_c2_live_and_paper_modes_both_admitted(self):
+        """Correction 2: exactly 'live' and 'paper' (lowercase) are admitted."""
+        import ap_entry_watcher as ew, ap_lifecycle as L, uuid
+        for mode in ("live", "paper"):
+            with L.LEDGER._entry_lock:
+                L.LEDGER._current_state.clear()
+            _, w = self._bare_watcher()
+            sid = str(uuid.uuid4())
+            sig = self._recovery_sig(
+                signal_id=sid, canonical_signal_id=sid,
+                local_order_id=f"lo-{sid[:8]}", execution_mode=mode,
+            )
+            sig["metadata"]["execution_mode"] = mode
+            watched = ew.WatchedSignal(sig, overnight=False)
+            ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+            assert ok is True, (
+                f"execution_mode={mode!r} should be admitted; got ok={ok!r} reason={reason!r}"
+            )
+
+    # ── Correction 1: broker handoff evidence → HOLD ──────────────────────
+
+    @pytest.mark.parametrize("evidence_key,evidence_value", [
+        ("broker_order_id", "TRD-12345"),
+        ("submitted_ts", "2026-09-04T14:00:00+00:00"),
+    ])
+    def test_c1_top_level_broker_fields_are_hold(self, evidence_key, evidence_value):
+        """Correction 1: top-level broker_order_id / submitted_ts → HOLD."""
+        import ap_entry_watcher as ew
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig[evidence_key] = evidence_value
+        watched = ew.WatchedSignal(sig, overnight=False)
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False
+        assert "broker_handoff" in reason or "hold" in reason
+
+    @pytest.mark.parametrize("meta_key,meta_value", [
+        ("submit_intent_at", "2026-09-04T14:00:00+00:00"),
+        ("broker_submit_key", "ap:lo-abc123"),
+        ("broker_submit_payload_hash", "sha256:abc"),
+        ("broker_ready", True),
+        ("recovery_submit_owner", "recovery:jason:live:lo-abc"),
+    ])
+    def test_c1_meta_broker_evidence_is_hold(self, meta_key, meta_value):
+        """Correction 1: meta broker-intent fields → HOLD."""
+        import ap_entry_watcher as ew
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig["metadata"][meta_key] = meta_value
+        watched = ew.WatchedSignal(sig, overnight=False)
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False
+        assert "broker_handoff" in reason or "hold" in reason
+
+    def test_c1_watcher_audit_trigger_ready_is_hold(self):
+        """
+        Correction 1: durable watcher_audit.reason_code == 'trigger_ready' →
+        HOLD. This is a durable lifecycle fact that the broker already
+        received a trigger-ready callback — recovery must not re-register.
+        """
+        import ap_entry_watcher as ew
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig["metadata"]["watcher_audit"] = {"reason_code": "trigger_ready"}
+        watched = ew.WatchedSignal(sig, overnight=False)
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False
+        assert "broker_handoff" in reason or "hold" in reason
+
+    # ── Correction 4: lifecycle restored BEFORE _pending.append() ─────────
+
+    def test_c4_hold_leaves_pending_empty(self):
+        """
+        Correction 4: HOLD must never leave the watcher in _pending.
+        Previously the code appended first then rolled back; the amendment
+        requires validation → lifecycle → register (if ok).
+
+        Uses execution_mode="INVALID" to trigger HOLD: execution_mode is
+        normalized from the signal column directly (no metadata fallback)
+        and "INVALID" is not in {"live","paper"}, so it HOLDs before registration.
+        """
+        import ap_entry_watcher as ew, ap_lifecycle as L
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        _, w = self._bare_watcher()
+        # execution_mode="invalid_mode" is not "live"/"paper" → identity HOLD
+        sig = self._recovery_sig()
+        sig["execution_mode"] = "INVALID_MODE"
+        sig["metadata"]["execution_mode"] = "INVALID_MODE"
+        ok = w.add_signal(sig)
+        assert ok is False
+        assert len(w._pending) == 0, (
+            "HOLD must not leave watcher in _pending regardless of ordering"
+        )
+
+    def test_c4_hold_via_broker_evidence_leaves_pending_empty(self):
+        """
+        Correction 4 + Correction 1: broker handoff HOLD must leave
+        _pending completely clean.
+        """
+        import ap_entry_watcher as ew, ap_lifecycle as L
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig["broker_order_id"] = "TRD-HOLD-TEST"
+        ok = w.add_signal(sig)
+        assert ok is False
+        assert len(w._pending) == 0
+        # LEDGER must also be untouched: no lifecycle write for a HOLD
+        sid = sig["signal_id"]
+        state = L.LEDGER.current_state(sid)
+        assert state is None, (
+            f"Broker handoff HOLD must not write lifecycle state; got {state!r}"
+        )
+
+    def test_c4_zero_broker_calls_on_every_hold_path(self):
+        """
+        Zero broker calls on every HOLD path — no submit, cancel, replace,
+        or position mutation. add_signal() itself never calls broker;
+        this proves the recovery bridge does not introduce a new call site.
+        """
+        import ap_entry_watcher as ew, ap_lifecycle as L
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        from unittest.mock import MagicMock
+        broker_spy = MagicMock()
+        w = ew.APEntryWatcher(
+            broker=broker_spy,
+            order_state_machine=None,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        w._persist_watcher_audit = lambda *a, **kw: None
+        # Trigger three different HOLD reasons
+        for sig in [
+            self._recovery_sig(client_id=""),                   # missing identity
+            {**self._recovery_sig(), "broker_order_id": "X"},   # broker handoff
+            self._recovery_sig(execution_mode="INVALID"),       # bad mode
+        ]:
+            w.add_signal(sig)
+        # broker_spy must never have been called
+        assert not broker_spy.called, (
+            f"Broker was called during HOLD: {broker_spy.call_args_list}"
+        )
+
+    def test_c4_successful_recovery_reaches_watching(self):
+        """
+        Positive control: a clean recovery signal (no HOLD reasons) must
+        reach lifecycle state WATCHING and be registered in _pending.
+        """
+        import ap_entry_watcher as ew, ap_lifecycle as L, uuid
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        _, w = self._bare_watcher()
+        sid = str(uuid.uuid4())
+        sig = self._recovery_sig(
+            signal_id=sid, canonical_signal_id=sid,
+            local_order_id=f"lo-{sid[:8]}",
+        )
+        ok = w.add_signal(sig)
+        assert ok is True
+        assert len(w._pending) == 1
+        assert L.LEDGER.current_state(sid) == L.SignalState.WATCHING
+
+    def test_c4_duplicate_recovery_invocation_is_idempotent(self):
+        """
+        Duplicate recovery invocation (same signal_id, same local_order_id)
+        must be idempotent: the dedup guard prevents re-registration, no
+        second behavior-active watcher, state stays WATCHING.
+        """
+        import ap_entry_watcher as ew, ap_lifecycle as L, uuid
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        _, w = self._bare_watcher()
+        sid = str(uuid.uuid4())
+        sig = self._recovery_sig(
+            signal_id=sid, canonical_signal_id=sid,
+            local_order_id=f"lo-{sid[:8]}",
+        )
+        ok1 = w.add_signal(sig)
+        ok2 = w.add_signal(dict(sig))   # second call, same identity
+        assert ok1 is True
+        # Second call is blocked by dedup — no second watcher registered
+        assert len(w._pending) == 1, "duplicate recovery must not add second watcher"
+        # Lifecycle state must remain stable
+        assert L.LEDGER.current_state(sid) == L.SignalState.WATCHING

@@ -2,10 +2,11 @@
 
 ## STATUS
 
-**WIP IMPLEMENTATION / HARD HOLD. DO NOT MERGE OR DEPLOY.**
+**AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
-Base after rebase: `main@eb1fdefd8fb35effd1752a8a4de50147c06b066b`
-Original spec base: `main@d3c61850df709fe4c399196b9c509f28c9af2a8a`
+Base: `09d30cff2f418e81c1a9bcec734f14f9f82a9a93`
+Head before amendment: `9fb3165fcc472aaa86bfdecc1c615df257c4beac`
+Amendment applied: 2026-09-07
 
 Dependencies (§STATUS binding order):
 - PR #568 (deferred selector/materialization retry authority): **not merged** (draft, unstable)
@@ -20,14 +21,63 @@ Before merge:
    eliminate the defect at that point, this PR closes as obsolete/no-code.
 4. Full P0 regression must pass at the exact rebased HEAD SHA.
 
+## AMEND PR #580 IN PLACE — Corrections applied 2026-09-07
+
+Five P0-class corrections applied surgically to `ap_entry_watcher.py` per
+the amendment specification. Scope boundary unchanged.
+
+### Correction 1 — Broker handoff must block recovery before watcher admission
+
+`_restore_recovered_watcher_lifecycle()` now runs
+`_recovery_has_broker_handoff_evidence(sig, meta)` before any lifecycle write.
+Evidence list: `broker_order_id`, `submitted_ts`, `meta.broker_ready`,
+`meta.submit_intent_at`, `meta.broker_submit_key`,
+`meta.broker_submit_payload_hash`, `meta.recovery_submit_owner`,
+`meta.recovery_submit_fenced`, `meta.recovery_submit_lease_until`,
+`watcher_audit.reason_code == "trigger_ready"`, and active
+materialization ownership (`materialization_owner` + `materialization_in_flight`).
+Any evidence → HOLD; return before any watcher registration, lifecycle write,
+callback, or broker mutation.
+
+### Correction 2 — Recovery identity must fail closed
+
+`_restore_recovered_watcher_lifecycle()` now validates the full durable
+identity from column values only — no metadata fallback for blank columns,
+no UUID fabrication, no mode fallback, no default side. Validated:
+`signal_id`, `ticker`, `client_id`, `execution_mode` (exactly `"live"` or
+`"paper"`, case-sensitive, no normalization), `local_order_id`,
+`canonical_signal_id`, `side` (exactly `"CALL"` or `"PUT"`),
+and `materialization_generation` (zero/negative rejected).
+Any gap → HOLD.
+
+### Correction 3 — Lifecycle import failure must fail closed
+
+`_EW_LIFECYCLE_OK == False` path changed from soft success
+`(True, "recovery_lifecycle_module_unavailable_soft_ok")` to HOLD
+`(False, "recovery_lifecycle_unavailable_hold")`. A bridge that cannot
+read lifecycle state cannot determine whether admission is safe.
+
+### Correction 4 — Lifecycle restoration is now atomic (validate before register)
+
+The recovery lifecycle validation block in `add_signal()` now runs
+**before** `_pending.append()` and `_dedup_set.add()`. Preferred order:
+1. validate identity, 2. validate broker handoff, 3. restore lifecycle,
+4. register watcher. A HOLD now leaves the registry completely clean with
+no rollback needed.
+
+### Correction 5 — Retry ownership preserved
+
+No changes made to `#568`/`#569` selector or materializer retry counters.
+`WATCHING → TRIGGER_READY` remains legal per existing `LEGAL_TRANSITIONS`.
+Recovery never creates a second broker submission attempt.
+
 ## Implementation summary
 
 Production files touched:
-- `ap_entry_watcher.py`: adds `signal_adopted` import, adds
-  `_restore_recovered_watcher_lifecycle()` helper, wires it into
-  `add_signal()` after `_pending.append()` but before provenance is
-  committed. Guarded by `signal["__recovery_rearm"]` — ordinary new
-  admissions untouched. No public API change; watcher shim preserved.
+- `ap_entry_watcher.py`: `_restore_recovered_watcher_lifecycle()` fully
+  hardened (Corrections 1-4). New static method `_recovery_has_broker_handoff_evidence()`.
+  `add_signal()` reordered: validate → lifecycle → register.
+  Guarded by `signal["__recovery_rearm"]` — ordinary new admissions untouched.
 - `ap/pending_trigger_restart_recovery.py`: docstring only — documents
   the recovery-provenance contract with the new bridge.
 
