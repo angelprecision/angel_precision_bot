@@ -16,6 +16,10 @@ from ap.logger import get_logger
 
 log = get_logger("ap.brokers.tradier")
 
+_STRICT_PADDED_OCC_RE = re.compile(
+    r"^([A-Z0-9.]{1,6})\s+(\d{6}[CP]\d{8})$"
+)
+
 
 @dataclass(frozen=True)
 class TradierConfig:
@@ -628,6 +632,9 @@ class TradierBroker(BrokerAdapter):
             if not isinstance(raw_symbol, str):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
             symbol = raw_symbol.strip().upper()
+            padded = _STRICT_PADDED_OCC_RE.fullmatch(symbol)
+            if padded:
+                symbol = f"{padded.group(1)}{padded.group(2)}"
             if (
                 not symbol
                 or not re.fullmatch(r"[A-Z0-9.]{1,32}", symbol)

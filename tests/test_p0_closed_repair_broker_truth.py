@@ -18,6 +18,8 @@ from ap_reconciler import APBrokerReconciler, _empty_summary
 CLIENT = "pr594@example.com"
 ACCOUNT = "PR594-ACCOUNT"
 CONTRACT = "AAPL260620C00155000"
+PADDED_CONTRACT = "GS  260717C00465000"
+PADDED_COMPACT_CONTRACT = "GS260717C00465000"
 
 
 def _tradier(*, payload=None, error=None) -> TradierBroker:
@@ -266,6 +268,16 @@ def test_strict_positions_reader_accepts_only_documented_empty_and_valid_long():
         }
     ]
 
+    padded_rows = _tradier(
+        payload={
+            "positions": {
+                "position": [{"symbol": PADDED_CONTRACT, "quantity": 1}]
+            }
+        }
+    ).list_positions_strict()
+    assert padded_rows[0]["symbol"] == PADDED_COMPACT_CONTRACT
+    assert padded_rows[0]["raw"]["symbol"] == PADDED_CONTRACT
+
 
 @pytest.mark.parametrize(
     "error",
@@ -345,6 +357,34 @@ def test_postgres_valid_long_preserves_existing_restore_behavior(
         }
     )
     rec = _reconciler(broker, execution_mode=mode)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+
+
+def test_postgres_padded_occ_preserves_existing_restore_behavior(postgres_closed_row):
+    insert, read, _executed_sql = postgres_closed_row
+    insert(
+        contract=PADDED_COMPACT_CONTRACT,
+        option_symbol=PADDED_COMPACT_CONTRACT,
+        underlying="GS",
+        ticker="GS",
+    )
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [{"symbol": PADDED_CONTRACT, "quantity": 5}]
+            }
+        }
+    )
+    rec = _reconciler(broker)
     rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
     rec._seed_exit_engine_from_position = MagicMock(return_value=True)
 
