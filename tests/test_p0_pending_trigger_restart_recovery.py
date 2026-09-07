@@ -1690,6 +1690,227 @@ class TestPhaseOneCrashRecovery:
         "reason",
         [
             "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        ],
+    )
+    def test_count_bounded_retryable_data_recovers_at_same_attempt_below_max(
+        self, monkeypatch, reason
+    ):
+        """A phase-one crash cannot spend N or terminalize while N < max."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        row = _phase_one_crash_row(reason)
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert len(osm.phase_one_recovery_calls) == 1
+        kwargs = osm.phase_one_recovery_calls[0][1]
+        assert kwargs["attempt"] == 3
+        assert kwargs["max_attempts"] == 5
+        assert [row["meta"][key] for key in (
+            "retry_attempt", "breach_attempt_count", "materialization_attempts"
+        )] == [3, 3, 3]
+        assert row["meta"]["lifecycle_state"] == "RETRY_WAIT"
+        assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        ],
+    )
+    def test_count_bounded_retryable_data_at_max_stays_terminal(
+        self, monkeypatch, reason
+    ):
+        """Count-bounded retryable data still terminalizes at N >= max."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        row = _phase_one_crash_row(reason)
+        row["meta"].update({
+            "retry_attempt": 5,
+            "breach_attempt_count": 5,
+            "materialization_attempts": 5,
+            "retry_max_attempts": 5,
+        })
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert osm.phase_one_recovery_calls == []
+        assert len(osm.cancel_calls) == 1
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_validity_bound_phase_one_retry_ignores_telemetry_max(self, monkeypatch):
+        """Validity-bound data truth remains recoverable beyond numeric max."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        row = _phase_one_crash_row("DIRECT_QUOTE_ZERO_BID_ASK")
+        row["meta"].update({
+            "retry_attempt": 6,
+            "breach_attempt_count": 6,
+            "materialization_attempts": 6,
+            "retry_max_attempts": 5,
+        })
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert len(osm.phase_one_recovery_calls) == 1
+        kwargs = osm.phase_one_recovery_calls[0][1]
+        assert kwargs["attempt"] == 6
+        assert kwargs["max_attempts"] == 6
+        assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_recovered_count_bounded_retry_runs_fresh_selector_once(
+        self, monkeypatch
+    ):
+        """Phase-one recovery at N is followed by exactly one fresh N+1 pass."""
+        import ap_execution_core as core_mod
+
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        row = _phase_one_crash_row("DUPLICATE_QUOTE_CONFLICT_UNRESOLVED")
+        row.update({
+            "plan_id": "plan-phase-one-restart",
+            "symbol": "SPY",
+            "score": 80.0,
+            "tier": "A",
+            "timeframe": "1d",
+            "pattern": "3-1-2",
+            "stop_underlying": 447.0,
+            "target_underlying": 455.0,
+            "qty": 1,
+            "limit_price": 0.01,
+            "reserved_cost": 0.0,
+        })
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        assert rec.recover_one_row(row) == _RowOutcome.RETRY_OWNED
+        assert [row["meta"][key] for key in (
+            "retry_attempt", "breach_attempt_count", "materialization_attempts"
+        )] == [3, 3, 3]
+        row["meta"]["materialization_next_retry_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+        row["meta"]["next_retry_at"] = row["meta"]["materialization_next_retry_at"]
+
+        claim_calls = []
+        fresh_truth_checks = []
+        selector_calls = []
+
+        def _claim(_oid, **kwargs):
+            claim_calls.append(dict(kwargs))
+            meta = osm._rows[_oid]["meta"]
+            if kwargs.get("advance_after_market_truth"):
+                assert kwargs["retry_attempt"] == 4
+                meta.update({
+                    "lifecycle_state": "MATERIALIZING",
+                    "materialization_status": "RUNNING",
+                    "materialization_in_flight": False,
+                    "materialization_market_truth_pending": False,
+                    "materialization_generation": kwargs["new_generation"],
+                    "retry_attempt": 4,
+                    "breach_attempt_count": 4,
+                    "materialization_attempts": 4,
+                    "broker_ready": True,
+                })
+            else:
+                assert kwargs["retry_attempt"] == 3
+                meta.update({
+                    "lifecycle_state": "MATERIALIZING",
+                    "materialization_status": "RUNNING",
+                    "materialization_in_flight": True,
+                    "materialization_market_truth_pending": True,
+                    "materialization_owner": kwargs["owner"],
+                    "current_owner": kwargs["owner"],
+                    "watcher_token": kwargs["owner"],
+                    "materialization_generation": kwargs["new_generation"],
+                    "broker_ready": False,
+                })
+            return True
+
+        osm.claim_deferred_materialization = _claim
+
+        def _selector_callback(watched):
+            selector_calls.append(watched)
+            signal = watched.signal
+            fresh_truth_checks.append(signal.get(
+                "_recovery_pre_claimed_market_truth_required"
+            ))
+            assert signal["retry_attempt"] == 3
+            assert _claim(
+                row["local_order_id"],
+                owner=signal["owner"],
+                generation=signal["materialization_generation"],
+                new_generation=signal["materialization_generation"],
+                retry_attempt=4,
+                advance_retry_attempt=True,
+                advance_after_market_truth=True,
+                signal_id=row["signal_id"],
+                execution_mode="live",
+                lease_until=(datetime.now(timezone.utc) + timedelta(
+                    seconds=120
+                )).isoformat(),
+            )
+
+        core = SimpleNamespace(
+            client_id="client@test.com",
+            email="client@test.com",
+            execution_mode="live",
+            mode="LIVE",
+            paper=False,
+            order_state_machine=osm,
+            broker=MagicMock(),
+        )
+        core._on_entry_trigger = _selector_callback
+        core.resume_deferred_materialization_retry = (
+            core_mod.APExecutionCore
+            .resume_deferred_materialization_retry.__get__(core, type(core))
+        )
+
+        result = core.resume_deferred_materialization_retry(
+            local_order_id=row["local_order_id"],
+            expected_generation=7,
+            expected_retry_attempt=4,
+            owner="recovery_retry:client@test.com:phase-one-live-order:4",
+        )
+
+        assert result["disposition"] == "BROKER_READY"
+        assert result["attempt"] == 4
+        assert fresh_truth_checks == [True]
+        assert len(selector_calls) == 1
+        assert len(claim_calls) == 2
+        assert claim_calls[0]["retry_attempt"] == 3
+        assert claim_calls[0]["advance_retry_attempt"] is False
+        assert claim_calls[1]["retry_attempt"] == 4
+        assert claim_calls[1]["advance_retry_attempt"] is True
+        assert [row["meta"][key] for key in (
+            "retry_attempt", "breach_attempt_count", "materialization_attempts"
+        )] == [4, 4, 4]
+        assert core.broker.submit_order.called is False
+        assert core.broker.cancel_order.called is False
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
             "OI_TOO_LOW",
             "UNKNOWN_PHASE_ONE_REASON",
         ],

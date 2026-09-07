@@ -26,11 +26,19 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
+import pytest
+
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 import ap.order_state_machine as osm_mod
 from ap.order_state_machine import APOrderStateMachine
 from ap_execution_core import _reset_direction_reversal_runtime_state
+
+
+@pytest.fixture(autouse=True)
+def _open_deferred_retry_cutoff_for_lifecycle_tests(monkeypatch):
+    """Keep direction-reversal lifecycle tests inside the retry window."""
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
 
 
 def test_runtime_reset_archives_trigger_and_clears_attempt_state_uninterrupted_watcher():

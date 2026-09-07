@@ -45,6 +45,7 @@ from ap.pending_trigger_classifier import (
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
     deferred_retry_count_exhaustion_applies,
+    is_retryable_selector_reason,
     is_validity_bound_deferred_retry_reason,
     resolve_deferred_materialization_max_attempts,
     resolve_deferred_retry_deadline,
@@ -1075,13 +1076,24 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
         reason = reason or ""
-        if not reason or not (
-            is_validity_bound_deferred_retry_reason(reason)
-            or not deferred_retry_count_exhaustion_applies(
-                reason, selector_failure=selector_failure
-            )
-        ):
+        if not reason:
             return None
+
+        # A phase-one claim records the selector attempt that was already
+        # earned.  Count-bounded RETRYABLE_DATA reasons may recover that claim
+        # only when another selector attempt remains; otherwise the existing
+        # STUCK_TRIGGER_READY terminal path is the count-exhausted authority.
+        # Validity-bound reasons and proven retryable aggregate reasons retain
+        # their existing cutoff/deadline authority instead of this numeric
+        # ceiling.
+        _validity_bound = is_validity_bound_deferred_retry_reason(reason)
+        _count_exhaustion_applies = deferred_retry_count_exhaustion_applies(
+            reason, selector_failure=selector_failure
+        )
+        max_attempts: Optional[int] = None
+        if not _validity_bound and _count_exhaustion_applies:
+            if not is_retryable_selector_reason(reason):
+                return None
 
         if any(str(meta.get(field) or "").strip() for field in (
             "submit_intent_at",
@@ -1105,10 +1117,14 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
 
-        try:
-            max_attempts = resolve_deferred_materialization_max_attempts()
-        except DeferredMaterializationConfigConflict:
-            return _RowOutcome.UNRESOLVED
+        if max_attempts is None:
+            try:
+                max_attempts = resolve_deferred_materialization_max_attempts()
+            except DeferredMaterializationConfigConflict:
+                return _RowOutcome.UNRESOLVED
+        if not _validity_bound and _count_exhaustion_applies:
+            if attempt >= max_attempts:
+                return None
         max_attempts = max(max_attempts, attempt)
         # PR #568 amendment §2: bounded stepped backoff, not a fixed 8s.
         # Recovery inherits the same per-attempt cadence so a crashed +

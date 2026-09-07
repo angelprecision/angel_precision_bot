@@ -59,6 +59,12 @@ from ap_execution_core import APExecutionCore
 from ap_recovery import APStartupRecovery
 
 
+@pytest.fixture(autouse=True)
+def _open_deferred_retry_cutoff_for_lifecycle_tests(monkeypatch):
+    """Keep restart-handoff lifecycle tests inside the retry window."""
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared identity constants
 # ─────────────────────────────────────────────────────────────────────────────
