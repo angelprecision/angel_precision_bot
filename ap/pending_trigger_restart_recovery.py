@@ -2170,6 +2170,16 @@ class PendingTriggerRestartRecovery:
                 or deadline_dt > first_failed_dt + timedelta(seconds=retry_deadline_secs)
                 or next_dt < first_failed_dt
             ):
+                log.critical(
+                    "RESTART_RECOVERY_LATE_REARM_TIMESTAMP_PROOF_FAILED "
+                    "local=%s first=%r last=%r next=%r deadline=%r window=%ss",
+                    local_oid,
+                    first_failed_at,
+                    last_failed_at,
+                    next_at,
+                    deadline,
+                    retry_deadline_secs,
+                )
                 return None
         if restart_status != "RETRY_PENDING":
             return None
