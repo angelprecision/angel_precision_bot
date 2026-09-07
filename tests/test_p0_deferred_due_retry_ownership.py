@@ -2152,6 +2152,19 @@ def test_spec_acceptance_two_phase_claim_seam(
     core.intelligence_context = MagicMock()
     core.intelligence_context.is_enabled.return_value = False
 
+    if not advance_succeeds:
+        canonical_backoff = MagicMock(return_value=37)
+        monkeypatch.setattr(
+            core_mod, "_compute_retry_backoff_seconds", canonical_backoff
+        )
+        effective_deadline = now + timedelta(hours=1)
+        deadline_resolver = MagicMock(
+            return_value=(effective_deadline, None)
+        )
+        monkeypatch.setattr(
+            core_mod, "_resolve_deferred_retry_deadline", deadline_resolver
+        )
+
     owner_label = f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3"
     started = time.perf_counter()
     result = core.resume_deferred_materialization_retry(
@@ -2184,6 +2197,11 @@ def test_spec_acceptance_two_phase_claim_seam(
         assert schedule["selector_failure"][
             "materialization_market_truth_pending"
         ] is True
+        assert schedule["selector_failure"][
+            "deferred_retry_delay_seconds"
+        ] == 37
+        assert canonical_backoff.call_count >= 1
+        assert deadline_resolver.call_count >= 2
         assert result["disposition"] == "RETRY_WAIT"
         core.broker.submit_order.assert_not_called()
         core.broker.cancel_order.assert_not_called()
