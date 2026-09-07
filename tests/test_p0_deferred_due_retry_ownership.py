@@ -2878,6 +2878,69 @@ def test_pr568_backoff_clip_terminates_when_ladder_would_pass_deadline():
             _os_local.environ["VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS"] = prior_step1
 
 
+@pytest.mark.parametrize(
+    ("elapsed_seconds", "deadline_seconds", "expected_reason"),
+    [
+        (15, 10, "RETRY_DEADLINE_EXHAUSTED"),
+        (6, 12, "RETRY_DEADLINE_WOULD_EXHAUST"),
+    ],
+    ids=["callback-passes-deadline", "fresh-backoff-passes-deadline"],
+)
+def test_pr568_backoff_rechecks_deadline_after_callback_elapsed(
+    monkeypatch, elapsed_seconds, deadline_seconds, expected_reason
+):
+    """A slow callback must not schedule from the stale entry timestamp.
+
+    Both cases would pass the existing entry-time clip: the first would write
+    a retry whose timestamp is already in the past, and the second would write
+    a retry that lands after the deadline. The scheduling seam must re-check
+    the effective deadline with the current clock and avoid the durable write.
+    """
+    import ap_execution_core as core_mod
+
+    monkeypatch.delenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", raising=False)
+    monkeypatch.delenv("VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", raising=False)
+
+    start = datetime.now(timezone.utc)
+    row = _row(retry_attempt=1)
+    row["meta"]["absolute_entry_deadline"] = _iso(
+        start + timedelta(seconds=deadline_seconds)
+    )
+
+    core = _core()
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+    core._on_entry_trigger.side_effect = RuntimeError("slow callback")
+    core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+    clock_calls = {"count": 0}
+    real_datetime = datetime
+
+    class _SteppingDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            clock_calls["count"] += 1
+            if clock_calls["count"] == 1:
+                return start
+            return start + timedelta(seconds=elapsed_seconds)
+
+    monkeypatch.setattr(core_mod, "datetime", _SteppingDatetime)
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-fresh-clock",
+    )
+
+    assert clock_calls["count"] >= 2
+    assert result["disposition"] == "TERMINAL_REQUIRED"
+    assert result["reason_code"] == expected_reason
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_not_called()
+    core.broker.submit_order.assert_not_called()
+    core.broker.cancel_order.assert_not_called()
+
+
 def test_pr568_backoff_still_schedules_when_deadline_is_comfortably_out():
     """Sanity: the clip is scoped — with deadline hours away, RETRY_WAIT works.
 

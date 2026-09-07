@@ -3483,8 +3483,9 @@ class APExecutionCore:
         # All durable deadline aliases and the ET cutoff are one authority.
         # The shared resolver parses every non-empty alias and returns their
         # earliest value; malformed durable truth fails closed before selector
-        # or broker work. This same value is reused by the schedule closure
-        # below so a ladder cannot write a retry past the stricter deadline.
+        # or broker work. The schedule closure re-resolves this authority at
+        # the actual write decision so slow selector work cannot use a stale
+        # clock to write a retry past the stricter deadline.
         _deadline_dt, _deadline_error = _resolve_deferred_retry_deadline(
             meta,
             now=_now,
@@ -3596,6 +3597,32 @@ class APExecutionCore:
             so recovery can retain ownership and re-attempt on the next pass.
             Recovery must never treat a failed schedule as durably owned.
             """
+            # The canonical callback may spend meaningful time after the
+            # pre-claim deadline check. Use one fresh timestamp for the
+            # actual schedule decision so a slow callback cannot write a
+            # stale or already-expired RETRY_WAIT.
+            _schedule_now = datetime.now(timezone.utc)
+            _schedule_deadline_dt, _schedule_deadline_error = (
+                _resolve_deferred_retry_deadline(meta, now=_schedule_now)
+            )
+            if _schedule_deadline_error:
+                return _term(
+                    "RETRY_INVALID_DEADLINE",
+                    status="EXPIRED",
+                    attempt=_callback_attempt,
+                    max_attempts=max_attempts,
+                    deadline_error=_schedule_deadline_error,
+                )
+            if (
+                _schedule_deadline_dt is not None
+                and _schedule_now >= _schedule_deadline_dt
+            ):
+                return _term(
+                    "RETRY_DEADLINE_EXHAUSTED",
+                    status="EXPIRED",
+                    attempt=_callback_attempt,
+                    max_attempts=max_attempts,
+                )
             # Bounded stepped backoff per (attempt, reason). Never below the
             # configured base floor; never above the ladder cap. See
             # ap/selector_retry_policy.compute_retry_backoff_seconds.
@@ -3607,7 +3634,7 @@ class APExecutionCore:
                     cfg={"validity_bound_retry_backoff_step1_seconds": _retry_delay_base},
                 ),
             )
-            _candidate_next = _now + timedelta(seconds=_retry_delay)
+            _candidate_next = _schedule_now + timedelta(seconds=_retry_delay)
             # PR #568 amendment §2: the backoff must not push next_retry_at
             # past the absolute entry deadline. Writing a doomed row would
             # violate the amendment's cadence contract, waste a scheduler
@@ -3615,7 +3642,10 @@ class APExecutionCore:
             # pre-CAS deadline check above already handles the "now past
             # deadline" case; this handles the "backoff would step past
             # deadline" case that the ladder introduces.
-            if _deadline_dt is not None and _candidate_next >= _deadline_dt:
+            if (
+                _schedule_deadline_dt is not None
+                and _candidate_next >= _schedule_deadline_dt
+            ):
                 return _term(
                     "RETRY_DEADLINE_WOULD_EXHAUST",
                     status="EXPIRED",
@@ -3637,7 +3667,7 @@ class APExecutionCore:
                         execution_mode=row_mode,
                         local_order_id=local_order_id,
                         signal_id=signal_id,
-                        now=_now,
+                        now=_schedule_now,
                     )
                     _ok = bool(_schedule(
                         local_order_id,
