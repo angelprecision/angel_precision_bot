@@ -1808,16 +1808,22 @@ def test_12_recovery_never_calls_broker_directly():
 
 
 @pytest.mark.parametrize(
-    ("starting_contract", "advance_succeeds"),
+    ("starting_contract", "advance_succeeds", "second_cas_deadline_seconds"),
     [
-        ("DEFERRED:RTX", True),
-        ("DEFERRED:RTX", False),
-        ("RTX260117C00129000", True),
+        ("DEFERRED:RTX", True, None),
+        ("DEFERRED:RTX", False, None),
+        ("DEFERRED:RTX", False, 5),
+        ("RTX260117C00129000", True, None),
     ],
-    ids=["placeholder_contract", "second_cas_failure", "stale_real_contract"],
+    ids=[
+        "placeholder_contract",
+        "second_cas_failure",
+        "second_cas_deadline_clip",
+        "stale_real_contract",
+    ],
 )
 def test_spec_acceptance_two_phase_claim_seam(
-    monkeypatch, starting_contract, advance_succeeds
+    monkeypatch, starting_contract, advance_succeeds, second_cas_deadline_seconds
 ):
     """Real seam test: resume_deferred_materialization_retry → real _on_entry_trigger
     deferred path → selector mock → durable copyback → canonical submit seam.
@@ -1878,6 +1884,10 @@ def test_spec_acceptance_two_phase_claim_seam(
             "last_ranked_index_by_expiration": {},
         },
     }
+    if second_cas_deadline_seconds is not None:
+        before_meta["absolute_entry_deadline"] = _iso(
+            now + timedelta(seconds=second_cas_deadline_seconds)
+        )
     before_row = {
         "local_order_id": LOCAL_ORDER_ID,
         "client_id": CLIENT_ID,
@@ -2011,6 +2021,19 @@ def test_spec_acceptance_two_phase_claim_seam(
                     "selector_failure"
                 ].get("materialization_market_truth_pending") is True,
                 "broker_ready": False,
+            })
+            return True
+
+        def terminalize_materialization_retry(self, oid, **kw):
+            self.row["status"] = str(
+                kw.get("terminal_status") or "EXPIRED"
+            ).upper()
+            self.row["last_error"] = kw.get("reason")
+            self.row.setdefault("meta", {}).update({
+                "lifecycle_state": self.row["status"],
+                "materialization_status": "FAILED_TERMINAL",
+                "materialization_in_flight": False,
+                "materialization_market_truth_pending": False,
             })
             return True
 
@@ -2157,13 +2180,14 @@ def test_spec_acceptance_two_phase_claim_seam(
         monkeypatch.setattr(
             core_mod, "_compute_retry_backoff_seconds", canonical_backoff
         )
-        effective_deadline = now + timedelta(hours=1)
-        deadline_resolver = MagicMock(
-            return_value=(effective_deadline, None)
-        )
-        monkeypatch.setattr(
-            core_mod, "_resolve_deferred_retry_deadline", deadline_resolver
-        )
+        if second_cas_deadline_seconds is None:
+            effective_deadline = now + timedelta(hours=1)
+            deadline_resolver = MagicMock(
+                return_value=(effective_deadline, None)
+            )
+            monkeypatch.setattr(
+                core_mod, "_resolve_deferred_retry_deadline", deadline_resolver
+            )
 
     owner_label = f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3"
     started = time.perf_counter()
@@ -2189,20 +2213,26 @@ def test_spec_acceptance_two_phase_claim_seam(
         assert _FakeSelector.select_count == 0
         assert copyback_calls == []
         assert submit_calls == []
-        assert len(retry_schedules) == 1
-        schedule = retry_schedules[0]
-        assert schedule["attempt"] == 1
-        assert schedule["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
-        assert schedule["selector_failure"]["selector_calls"] == 0
-        assert schedule["selector_failure"][
-            "materialization_market_truth_pending"
-        ] is True
-        assert schedule["selector_failure"][
-            "deferred_retry_delay_seconds"
-        ] == 37
         assert canonical_backoff.call_count >= 1
-        assert deadline_resolver.call_count >= 2
-        assert result["disposition"] == "RETRY_WAIT"
+        if second_cas_deadline_seconds is not None:
+            assert retry_schedules == []
+            assert result["reason_code"] == "RETRY_DEADLINE_WOULD_EXHAUST"
+            assert result["disposition"] == "TERMINAL_ALREADY_DURABLE"
+            assert result["terminal_status"] == "EXPIRED"
+        else:
+            assert len(retry_schedules) == 1
+            schedule = retry_schedules[0]
+            assert schedule["attempt"] == 1
+            assert schedule["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+            assert schedule["selector_failure"]["selector_calls"] == 0
+            assert schedule["selector_failure"][
+                "materialization_market_truth_pending"
+            ] is True
+            assert schedule["selector_failure"][
+                "deferred_retry_delay_seconds"
+            ] == 37
+            assert deadline_resolver.call_count >= 2
+            assert result["disposition"] == "RETRY_WAIT"
         core.broker.submit_order.assert_not_called()
         core.broker.cancel_order.assert_not_called()
         return
