@@ -369,18 +369,25 @@ def test_postgres_valid_long_preserves_existing_restore_behavior(
     }
 
 
-def test_postgres_padded_occ_preserves_existing_restore_behavior(postgres_closed_row):
+@pytest.mark.parametrize(
+    "broker_contract",
+    [PADDED_CONTRACT, PADDED_COMPACT_CONTRACT],
+    ids=["padded-broker", "compact-broker"],
+)
+def test_postgres_padded_db_occ_preserves_restore_behavior(
+    postgres_closed_row, broker_contract
+):
     insert, read, _executed_sql = postgres_closed_row
     insert(
-        contract=PADDED_COMPACT_CONTRACT,
-        option_symbol=PADDED_COMPACT_CONTRACT,
+        contract=PADDED_CONTRACT,
+        option_symbol=PADDED_CONTRACT,
         underlying="GS",
         ticker="GS",
     )
     broker = _tradier(
         payload={
             "positions": {
-                "position": [{"symbol": PADDED_CONTRACT, "quantity": 5}]
+                "position": [{"symbol": broker_contract, "quantity": 5}]
             }
         }
     )
@@ -395,6 +402,40 @@ def test_postgres_padded_occ_preserves_existing_restore_behavior(postgres_closed
         "quantity_remaining": 2,
         "close_source": "PARTIAL_CLOSE_REPAIR",
     }
+
+
+def test_postgres_duplicate_padded_and_compact_broker_rows_hold_safely(
+    postgres_closed_row,
+):
+    insert, read, executed_sql = postgres_closed_row
+    insert(
+        contract=PADDED_CONTRACT,
+        option_symbol=PADDED_CONTRACT,
+        underlying="GS",
+        ticker="GS",
+    )
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": PADDED_CONTRACT, "quantity": 5},
+                    {"symbol": PADDED_COMPACT_CONTRACT, "quantity": 5},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
 
 
 @pytest.mark.parametrize("mode", ["live", "paper"])

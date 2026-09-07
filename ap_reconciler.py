@@ -5675,6 +5675,7 @@ class APBrokerReconciler:
         """
         try:
             from ap.db import conn, run_with_retry
+            from ap.exit_safety import _normalize_contract
 
             repair_mode = _normalize_execution_mode(self.execution_mode)
             if repair_mode is None:
@@ -5710,6 +5711,14 @@ class APBrokerReconciler:
             bad_rows = run_with_retry(_scan) or []
             if not bad_rows:
                 return
+
+            # The strict Tradier reader canonicalizes padded OCC roots to the
+            # same compact identity used by exit safety.  Canonicalize the
+            # durable DB contract before taking the broker snapshot so a
+            # padded DB row cannot look broker-flat by representation alone.
+            for row in bad_rows:
+                raw_contract = row.get("contract") or row.get("option_symbol") or ""
+                row["contract"] = _normalize_contract(raw_contract)
 
             count = len(bad_rows)
             summary["closed_positions_with_remaining_qty_count"] = \
