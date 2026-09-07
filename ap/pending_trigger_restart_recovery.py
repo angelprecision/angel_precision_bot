@@ -1309,6 +1309,18 @@ class PendingTriggerRestartRecovery:
             )
 
         _first_failed_dt = _parse_retry_iso(first_failed_at) if first_failed_at is not None else None
+        if _late_policy:
+            log.critical(
+                "DEBUG_LATE_REARM_INPUT local=%s late=%r existing=%r arg=%r "
+                "first_meta=%r last_meta=%r keys=%s",
+                local_oid,
+                _late_policy,
+                _existing_late_lease,
+                first_failed_at,
+                _meta.get(_RR_FIRST_FAILED_AT),
+                _meta.get(_RR_LAST_FAILED_AT),
+                sorted(_meta.keys()),
+            )
         if _late_policy and _existing_late_lease and _first_failed_dt is None:
             self._mark_failure(local_oid, "retry_verification:timestamps")
             log.critical(
