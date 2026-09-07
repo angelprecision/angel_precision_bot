@@ -862,7 +862,7 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
             return None
         return dict(_ptr_store["row"])
 
-    def _ptr_update_order_meta(order_id, patch):
+    def _ptr_update_order_meta(order_id, patch, **_kwargs):
         if str(order_id) != LOCAL_ORDER_ID:
             return False
         _ptr_store["row"]["meta"] = {
@@ -922,7 +922,7 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
             return None
         return dict(_ptr_store_no_quote["row"])
 
-    def _ptr_update_order_meta_no_quote(order_id, patch):
+    def _ptr_update_order_meta_no_quote(order_id, patch, **_kwargs):
         if str(order_id) != LOCAL_ORDER_ID:
             return False
         _ptr_store_no_quote["row"]["meta"] = {
