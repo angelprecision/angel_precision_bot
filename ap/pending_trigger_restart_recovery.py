@@ -238,6 +238,45 @@ class PendingTriggerRestartRecovery:
             require_late_policy=True,
         )
 
+    def prove_registered_watcher_owner(
+        self,
+        local_oid: str,
+        *,
+        expected_signal_id: str,
+    ) -> Optional[dict]:
+        """Prove exact durable and registry watcher ownership read-only.
+
+        Readiness must not treat a local_order_id-only watcher hit as ownership;
+        the durable client, execution mode, signal, lifecycle, and registry
+        identity all have to agree.
+        """
+        local_oid = str(local_oid or "").strip()
+        expected_signal_id = str(expected_signal_id or "").strip()
+        if not local_oid or not expected_signal_id:
+            return None
+        get_fn = getattr(self.osm, "get_order", None)
+        if not callable(get_fn):
+            return None
+        try:
+            reread = get_fn(local_oid)
+        except Exception:
+            return None
+        if not isinstance(reread, dict):
+            return None
+        if str(reread.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return None
+        if str(reread.get("local_order_id") or "").strip() != local_oid:
+            return None
+        if str(reread.get("signal_id") or "").strip() != expected_signal_id:
+            return None
+        if str(reread.get("client_id") or "").strip().lower() != self.client_id.lower():
+            return None
+        if str(reread.get("execution_mode") or "").strip().lower() != self.execution_mode:
+            return None
+        if has_broker_handoff_evidence(reread):
+            return None
+        return self._verify_registry_ownership(local_oid, reread)
+
     def consume_canonical_restart_rearm_retry(
         self,
         local_oid: str,
@@ -869,6 +908,63 @@ class PendingTriggerRestartRecovery:
 
     # ── Rearm + post-registration verification ────────────────────────────────
 
+    def _verify_durable_rearm_boundary(
+        self,
+        row: dict,
+        local_oid: str,
+    ) -> Optional[dict]:
+        """Re-read the durable row at the watcher-registration boundary.
+
+        The earlier classification read is not authority to install a watcher:
+        status, identity, broker handoff, and (when present) the bounded retry
+        lease must still be valid after plan construction and immediately
+        before watch().
+        """
+        get_fn = getattr(self.osm, "get_order", None)
+        if not callable(get_fn):
+            return None
+        try:
+            reread = get_fn(local_oid)
+        except Exception:
+            return None
+        if not isinstance(reread, dict):
+            return None
+        if str(reread.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return None
+        if str(reread.get("local_order_id") or "").strip() != local_oid:
+            return None
+        if str(reread.get("client_id") or "").strip().lower() != self.client_id.lower():
+            return None
+        if str(reread.get("execution_mode") or "").strip().lower() != self.execution_mode:
+            return None
+        expected_signal_id = str(row.get("signal_id") or "").strip()
+        if not expected_signal_id or str(reread.get("signal_id") or "").strip() != expected_signal_id:
+            return None
+        if has_broker_handoff_evidence(reread):
+            return None
+        for field in ("broker_order_id", "submitted_ts"):
+            value = reread.get(field)
+            if value is not None and not (isinstance(value, str) and not value.strip()):
+                return None
+
+        meta = _extract_meta(reread)
+        retry_status = str(meta.get(_RR_STATUS_FIELD) or "").strip().upper()
+        if retry_status == "RETRY_PENDING":
+            late_policy = _late_attachment_policy_eligible(reread)
+            proof = self._verify_restart_rearm_retry_ownership(
+                local_oid,
+                reread,
+                expected_signal_id=expected_signal_id,
+                require_late_policy=late_policy,
+            )
+            if proof is None:
+                return None
+        elif retry_status and retry_status != "CLOSED":
+            # Any unrecognised durable retry state is ambiguous at the
+            # external-registration boundary. Do not install a watcher.
+            return None
+        return reread
+
     def _rearm_and_verify(self, row: dict, local_oid: str, *, plan_builder_fn=None) -> str:
         """
         Call watch() once, then verify actual registry ownership.
@@ -924,6 +1020,17 @@ class PendingTriggerRestartRecovery:
                     local_oid,
                 )
                 return _RowOutcome.UNRESOLVED
+
+        _durable_boundary = self._verify_durable_rearm_boundary(row, local_oid)
+        if _durable_boundary is None:
+            self._mark_failure(local_oid, "durable_rearm_boundary_unproven")
+            log.critical(
+                "RESTART_RECOVERY_DURABLE_REARM_BOUNDARY_UNPROVEN "
+                "local=%s — watcher not called",
+                local_oid,
+            )
+            return _RowOutcome.UNRESOLVED
+        row = _durable_boundary
 
         try:
             _provenance = {
@@ -1055,6 +1162,15 @@ class PendingTriggerRestartRecovery:
 
         _late_policy = _late_attachment_policy_eligible(row)
         _meta = _extract_meta(row)
+        _signal_id = str(row.get("signal_id") or "").strip()
+        if not _signal_id:
+            self._mark_failure(local_oid, "identity:missing_signal_id")
+            log.critical(
+                "RESTART_RECOVERY_RESTART_REARM_MISSING_SIGNAL_ID local=%s "
+                "— preserving row",
+                local_oid,
+            )
+            return _RowOutcome.UNRESOLVED
         _generation = None
         if _late_policy:
             _raw_generation = _meta.get(_RR_GENERATION_FIELD)
@@ -1101,6 +1217,7 @@ class PendingTriggerRestartRecovery:
                     _RR_NEXT_AT_FIELD,
                     _RR_DEADLINE_FIELD,
                     _RR_FIRST_FAILED_AT,
+                    _RR_LAST_FAILED_AT,
                     _RR_CLIENT_FIELD,
                     _RR_MODE_FIELD,
                 )
@@ -1118,12 +1235,55 @@ class PendingTriggerRestartRecovery:
             else:
                 _generation = 1
 
+        _now = datetime.now(timezone.utc)
+        _roll_generation = bool(new_generation and _late_policy)
+        _existing_late_lease = _late_policy and (
+            first_failed_at is not None
+            or prior_attempt is not None
+            or prior_generation is not None
+            or any(
+                field in _meta
+                for field in (
+                    _RR_STATUS_FIELD,
+                    _RR_OWNER_FIELD,
+                    _RR_REASON_FIELD,
+                    _RR_ATTEMPT_FIELD,
+                    _RR_NEXT_AT_FIELD,
+                    _RR_DEADLINE_FIELD,
+                    _RR_FIRST_FAILED_AT,
+                    _RR_LAST_FAILED_AT,
+                    _RR_CLIENT_FIELD,
+                    _RR_MODE_FIELD,
+                )
+            )
+        )
+        if _existing_late_lease:
+            _first_failed_raw = (
+                first_failed_at
+                if first_failed_at is not None
+                else _meta.get(_RR_FIRST_FAILED_AT)
+            )
+            _last_failed_raw = _meta.get(_RR_LAST_FAILED_AT)
+            _first_failed_dt = _parse_retry_iso(_first_failed_raw)
+            _last_failed_dt = _parse_retry_iso(_last_failed_raw)
+            if (
+                _first_failed_dt is None
+                or _last_failed_dt is None
+                or _last_failed_dt < _first_failed_dt
+            ):
+                self._mark_failure(local_oid, "retry_verification:timestamps")
+                log.critical(
+                    "RESTART_RECOVERY_LATE_REARM_TIMESTAMPS_UNPROVEN "
+                    "local=%s — preserving original retry authority",
+                    local_oid,
+                )
+                return _RowOutcome.UNRESOLVED
+            first_failed_at = _first_failed_raw
+
         _delay = _env_int("RESTART_REARM_RETRY_DELAY_SECONDS", 30)
         _deadline_secs = _env_int("RESTART_REARM_RETRY_DEADLINE_SECONDS", 180)
         _max = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
-        _now = datetime.now(timezone.utc)
         _attempts = int(prior_attempt if prior_attempt is not None else (_meta.get(_RR_ATTEMPT_FIELD) or 0)) + 1
-        _roll_generation = bool(new_generation and _late_policy)
         if _roll_generation:
             _attempts = 1
             first_failed_at = None
@@ -1143,9 +1303,18 @@ class PendingTriggerRestartRecovery:
                 meta_patch={"restart_rearm_exhausted_attempt": _attempts},
             )
 
+        _first_failed_dt = _parse_retry_iso(first_failed_at) if first_failed_at is not None else None
+        if _late_policy and _existing_late_lease and _first_failed_dt is None:
+            self._mark_failure(local_oid, "retry_verification:timestamps")
+            log.critical(
+                "RESTART_RECOVERY_LATE_REARM_FIRST_FAILED_AT_INVALID "
+                "local=%s — refusing to extend retry authority",
+                local_oid,
+            )
+            return _RowOutcome.UNRESOLVED
         _deadline_dt = (
-            _parse_iso(first_failed_at) + timedelta(seconds=_deadline_secs)
-            if first_failed_at and _parse_iso(first_failed_at) is not None
+            _first_failed_dt + timedelta(seconds=_deadline_secs)
+            if _first_failed_dt is not None
             else _now + timedelta(seconds=_deadline_secs)
         )
         if _deadline_dt <= _now and _late_policy:
@@ -1199,7 +1368,14 @@ class PendingTriggerRestartRecovery:
         }
         if _late_policy:
             _patch[_RR_GENERATION_FIELD] = _generation
-        if not self._safe_meta_update(local_oid, _patch):
+        if not self._safe_meta_update(
+            local_oid,
+            _patch,
+            expected_status="PENDING_TRIGGER",
+            expected_execution_mode=self.execution_mode,
+            expected_signal_id=_signal_id,
+            expected_no_broker_handoff=True,
+        ):
             self._mark_failure(local_oid, "restart_rearm_retry_write_failed")
             return _RowOutcome.UNRESOLVED
 
@@ -1920,6 +2096,7 @@ class PendingTriggerRestartRecovery:
         next_at_raw = meta.get(_RR_NEXT_AT_FIELD)
         deadline_raw = meta.get(_RR_DEADLINE_FIELD)
         first_failed_at_raw = meta.get(_RR_FIRST_FAILED_AT)
+        last_failed_at_raw = meta.get(_RR_LAST_FAILED_AT)
         rr_client_meta_raw = meta.get(_RR_CLIENT_FIELD)
         rr_mode_meta_raw = meta.get(_RR_MODE_FIELD)
         if not all(
@@ -1935,6 +2112,11 @@ class PendingTriggerRestartRecovery:
             )
         ):
             return None
+        if _late_attachment_policy_eligible(reread) and not all(
+            isinstance(value, str) and value.strip()
+            for value in (first_failed_at_raw, last_failed_at_raw)
+        ):
+            return None
         restart_status = restart_status_raw.strip().upper()
         owner = owner_raw.strip()
         reason = reason_raw.strip()
@@ -1943,6 +2125,11 @@ class PendingTriggerRestartRecovery:
         first_failed_at = (
             first_failed_at_raw.strip()
             if isinstance(first_failed_at_raw, str)
+            else ""
+        )
+        last_failed_at = (
+            last_failed_at_raw.strip()
+            if isinstance(last_failed_at_raw, str)
             else ""
         )
         rr_client_meta = rr_client_meta_raw.strip().lower()
@@ -1970,6 +2157,20 @@ class PendingTriggerRestartRecovery:
         )
         next_dt = _parse_retry_iso(next_at)
         deadline_dt = _parse_retry_iso(deadline)
+        if _late_attachment_policy_eligible(reread):
+            first_failed_dt = _parse_retry_iso(first_failed_at)
+            last_failed_dt = _parse_retry_iso(last_failed_at)
+            if (
+                first_failed_dt is None
+                or last_failed_dt is None
+                or deadline_dt is None
+                or next_dt is None
+                or last_failed_dt < first_failed_dt
+                or deadline_dt < first_failed_dt
+                or deadline_dt > first_failed_dt + timedelta(seconds=retry_deadline_secs)
+                or next_dt < first_failed_dt
+            ):
+                return None
         if restart_status != "RETRY_PENDING":
             return None
         if not owner or not reason:
@@ -2016,6 +2217,7 @@ class PendingTriggerRestartRecovery:
             "restart_rearm_deadline": deadline,
             "restart_rearm_deadline_dt": deadline_dt,
             "restart_rearm_first_failed_at": first_failed_at,
+            "restart_rearm_last_failed_at": last_failed_at,
             "restart_rearm_generation": generation,
         }
 
@@ -2193,12 +2395,42 @@ class PendingTriggerRestartRecovery:
 
     # ── Meta update helper ────────────────────────────────────────────────────
 
-    def _safe_meta_update(self, local_oid: str, patch: dict) -> bool:
+    def _safe_meta_update(
+        self,
+        local_oid: str,
+        patch: dict,
+        *,
+        expected_status: Optional[str] = None,
+        expected_execution_mode: Optional[str] = None,
+        expected_signal_id: Optional[str] = None,
+        expected_no_broker_handoff: bool = False,
+    ) -> bool:
         fn = getattr(self.osm, "update_order_meta", None)
         if not callable(fn):
             return False
+        kwargs = {}
+        if expected_status is not None:
+            kwargs["expected_status"] = expected_status
+        if expected_execution_mode is not None:
+            kwargs["expected_execution_mode"] = expected_execution_mode
+        if expected_signal_id is not None:
+            kwargs["expected_signal_id"] = expected_signal_id
+        if expected_no_broker_handoff:
+            kwargs["expected_no_broker_handoff"] = True
         try:
-            return bool(fn(local_oid, patch))
+            # A conditional lease write must not fall back to an unfenced
+            # legacy signature. If the OSM cannot prove the CAS, fail closed.
+            return bool(fn(local_oid, patch, **kwargs)) if kwargs else bool(fn(local_oid, patch))
+        except TypeError as exc:
+            if kwargs:
+                log.critical(
+                    "RESTART_RECOVERY conditional meta write unsupported local=%s: %s",
+                    local_oid,
+                    exc,
+                )
+            else:
+                log.warning("RESTART_RECOVERY meta write failed local=%s: %s", local_oid, exc)
+            return False
         except Exception as exc:
             log.warning("RESTART_RECOVERY meta write failed local=%s: %s", local_oid, exc)
             return False
