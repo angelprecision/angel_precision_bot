@@ -34,6 +34,31 @@ class _Watcher:
         return local_order_id in self._owned
 
 
+class _ExactWatcher(_Watcher):
+    def __init__(
+        self,
+        *,
+        local_order_id: str,
+        signal_id: str,
+        client_id: str,
+        execution_mode: str,
+    ):
+        super().__init__({local_order_id})
+        self._pending = [
+            SimpleNamespace(
+                signal={
+                    "local_order_id": local_order_id,
+                    "signal_id": signal_id,
+                    "client_id": client_id,
+                    "execution_mode": execution_mode,
+                },
+                state="PENDING",
+                _ownership_quarantine=False,
+            )
+        ]
+        self._dedup_set = {signal_id}
+
+
 class _Runner:
     def __init__(self, *, mode: str = "live", watcher=None):
         self.email = "runner@example.com"
@@ -130,7 +155,25 @@ def test_live_startup_with_watching_rows_does_not_degrade_for_missing_overnight(
         "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
         "watching_count": 1,
     })
-    runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
+    runner = _Runner(
+        mode="live",
+        watcher=_ExactWatcher(
+            local_order_id="L-1",
+            signal_id="sig-1",
+            client_id="jason@example.com",
+            execution_mode="live",
+        ),
+    )
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: {
+            "local_order_id": "L-1",
+            "signal_id": "sig-1",
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "status": "PENDING_TRIGGER",
+            "meta": {},
+        } if oid == "L-1" else None
+    )
     runner._last_overnight_reeval_date = None
 
     result = pr.run_preopen_autonomous_readiness(
@@ -154,7 +197,25 @@ def test_startup_stage_with_watching_rows_before_due_is_pending_not_missing(monk
         "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
         "watching_count": 1,
     })
-    runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
+    runner = _Runner(
+        mode="live",
+        watcher=_ExactWatcher(
+            local_order_id="L-1",
+            signal_id="sig-1",
+            client_id="jason@example.com",
+            execution_mode="live",
+        ),
+    )
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: {
+            "local_order_id": "L-1",
+            "signal_id": "sig-1",
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "status": "PENDING_TRIGGER",
+            "meta": {},
+        } if oid == "L-1" else None
+    )
     runner._last_overnight_reeval_date = None
 
     result = pr.run_preopen_autonomous_readiness(
@@ -176,7 +237,25 @@ def test_post_due_missing_overnight_is_reported(monkeypatch):
         "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
         "watching_count": 1,
     })
-    runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
+    runner = _Runner(
+        mode="live",
+        watcher=_ExactWatcher(
+            local_order_id="L-1",
+            signal_id="sig-1",
+            client_id="jason@example.com",
+            execution_mode="live",
+        ),
+    )
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: {
+            "local_order_id": "L-1",
+            "signal_id": "sig-1",
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "status": "PENDING_TRIGGER",
+            "meta": {},
+        } if oid == "L-1" else None
+    )
     runner._last_overnight_reeval_date = None
 
     result = pr.run_preopen_autonomous_readiness(
@@ -605,3 +684,58 @@ def test_source_wires_runner_endpoint_and_health():
     assert '"preopen_readiness":  get_preopen_readiness_health()' in health_src
     assert 'get_morning_handoff_health()' in health_src
     assert 'preopen_readiness.get("enforcement_active")' in app_src
+
+def test_local_order_id_only_watcher_does_not_satisfy_readiness(monkeypatch):
+    runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
+    row = {
+        "local_order_id": "L-1",
+        "signal_id": "sig-1",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {},
+    }
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(row) if oid == "L-1" else None
+    )
+
+    unowned = pr._pending_trigger_without_watcher(
+        runner,
+        [row],
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+
+    assert unowned == [row]
+
+
+def test_exact_registry_identity_satisfies_readiness(monkeypatch):
+    runner = _Runner(
+        mode="live",
+        watcher=_ExactWatcher(
+            local_order_id="L-1",
+            signal_id="sig-1",
+            client_id="jason@example.com",
+            execution_mode="live",
+        ),
+    )
+    row = {
+        "local_order_id": "L-1",
+        "signal_id": "sig-1",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {},
+    }
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(row) if oid == "L-1" else None
+    )
+
+    assert pr._pending_trigger_without_watcher(
+        runner,
+        [row],
+        client_id="jason@example.com",
+        execution_mode="live",
+    ) == []
+
+
