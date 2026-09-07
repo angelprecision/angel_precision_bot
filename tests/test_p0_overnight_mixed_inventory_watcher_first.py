@@ -128,6 +128,10 @@ class _Watcher:
         self._dedup_set: set[str] = set()
         self._watch_returns = watch_returns
 
+    def _is_past_entry_cutoff_now(self) -> bool:
+        """Expose the production cutoff authority while using the fixed test clock."""
+        return False
+
     def has_order(self, local_order_id: str) -> bool:
         return any(
             str(getattr(item, "signal", {}).get("local_order_id") or "")
