@@ -2184,9 +2184,9 @@ class APOrderStateMachine:
         cancellation if the proven winner identity changes between the read
         and the metadata write.  expected_no_broker_handoff additionally
         requires the row to remain PENDING_TRIGGER with no broker-order,
-        submit-intent, broker-submit, or broker-ready evidence. Ordinary
-        callers retain the historical local-order/client scoped merge
-        semantics.
+        submit-intent, broker-submit, broker-ready, or authoritative broker
+        ownership evidence. Ordinary callers retain the historical
+        local-order/client scoped merge semantics.
 
         Returns True only when Postgres confirms rowcount > 0 (the row exists
         and was updated).  Returns False on not-found, CAS miss, or write error;
@@ -2218,12 +2218,26 @@ class APOrderStateMachine:
                     _params.append(str(expected_signal_id).strip())
                 if expected_no_broker_handoff:
                     _sql += (
+                        " AND UPPER(BTRIM(COALESCE(status, ''))) = 'PENDING_TRIGGER'"
+                        " AND jsonb_typeof(COALESCE(meta, '{}'::jsonb)) = 'object'"
+                        " AND (NOT (COALESCE(meta, '{}'::jsonb) ? 'materialization')"
+                        "      OR jsonb_typeof(meta->'materialization') = 'object')"
                         " AND COALESCE(NULLIF(BTRIM(COALESCE(broker_order_id, '')), ''), '') = ''"
                         " AND submitted_ts IS NULL"
+                        " AND UPPER(BTRIM(COALESCE(meta->>'lifecycle_state', '')))"
+                        "     NOT IN ('SUBMITTING', 'SUBMITTED')"
+                        " AND LOWER(BTRIM(COALESCE(meta->>'current_owner', '')))"
+                        "     NOT LIKE 'broker_submit:%'"
+                        " AND NULLIF(BTRIM(COALESCE(meta->>'recovery_submit_owner', '')), '') IS NULL"
                         " AND NULLIF(BTRIM(COALESCE(meta->>'submit_intent_at', '')), '') IS NULL"
                         " AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_key', '')), '') IS NULL"
                         " AND NULLIF(BTRIM(COALESCE(meta->>'broker_submit_payload_hash', '')), '') IS NULL"
                         " AND LOWER(BTRIM(COALESCE(meta->>'broker_ready', 'false'))) IN ('false', '0', '')"
+                        " AND UPPER(BTRIM(COALESCE(meta->'materialization'->>'lifecycle_state', '')))"
+                        "     NOT IN ('SUBMITTING', 'SUBMITTED')"
+                        " AND LOWER(BTRIM(COALESCE(meta->'materialization'->>'current_owner', '')))"
+                        "     NOT LIKE 'broker_submit:%'"
+                        " AND NULLIF(BTRIM(COALESCE(meta->'materialization'->>'recovery_submit_owner', '')), '') IS NULL"
                         " AND NULLIF(BTRIM(COALESCE(meta->'materialization'->>'submit_intent_at', '')), '') IS NULL"
                         " AND NULLIF(BTRIM(COALESCE(meta->'materialization'->>'broker_submit_key', '')), '') IS NULL"
                         " AND NULLIF(BTRIM(COALESCE(meta->'materialization'->>'broker_submit_payload_hash', '')), '') IS NULL"

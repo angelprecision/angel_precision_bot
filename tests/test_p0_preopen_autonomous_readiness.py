@@ -368,6 +368,54 @@ def test_exact_restart_rearm_retry_owner_does_not_block_unrelated_live_entries(m
     assert result["details"]["pending_trigger_without_watcher"] == []
 
 
+def test_preopen_readiness_rejects_every_broker_handoff_marker(monkeypatch):
+    """Readiness accepts only exact watcher/retry ownership, never handoff truth."""
+    markers = [
+        {"lifecycle_state": "SUBMITTING"},
+        {"lifecycle_state": "SUBMITTED"},
+        {"current_owner": "broker_submit:readiness-race"},
+        {"recovery_submit_owner": "recovery:readiness-race"},
+        {"materialization": {"lifecycle_state": "SUBMITTING"}},
+        {"materialization": {"current_owner": "broker_submit:readiness-race"}},
+        {"materialization": {"recovery_submit_owner": "recovery:readiness-race"}},
+        {"broker_ready": True},
+        {"submit_intent_at": "2026-09-07T16:00:00+00:00"},
+        {"broker_submit_key": "readiness-submit-key"},
+        {"broker_submit_payload_hash": "readiness-payload-hash"},
+    ]
+
+    for index, marker in enumerate(markers):
+        runner = _Runner(mode="live", watcher=_Watcher(set()))
+        local_order_id = f"L-marker-{index}"
+        signal_id = f"sig-marker-{index}"
+        row = {
+            "local_order_id": local_order_id,
+            "signal_id": signal_id,
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "status": "PENDING_TRIGGER",
+            "meta": dict(marker),
+        }
+        if index == len(markers) - 2:
+            row["broker_order_id"] = "broker-readiness"
+        if index == len(markers) - 1:
+            row["submitted_ts"] = "2026-09-07T16:00:00+00:00"
+        runner.order_state_machine = SimpleNamespace(
+            get_order=lambda oid, durable=row: dict(durable)
+            if oid == durable["local_order_id"]
+            else None
+        )
+
+        pending = [{"local_order_id": local_order_id, "signal_id": signal_id}]
+        unowned = pr._pending_trigger_without_watcher(
+            runner,
+            pending,
+            client_id="jason@example.com",
+            execution_mode="live",
+        )
+        assert unowned == pending, marker
+
+
 def test_future_restart_rearm_lease_remains_unowned_for_readiness(monkeypatch):
     runner = _Runner(mode="live", watcher=_Watcher(set()))
     now_utc = datetime.now(timezone.utc)

@@ -54,16 +54,102 @@ if TYPE_CHECKING:
 # e.g. a Friday signal is valid Monday morning = 3 days
 OVERNIGHT_SIGNAL_MAX_AGE_DAYS = int(os.getenv("OVERNIGHT_SIGNAL_MAX_AGE_DAYS", "4"))
 
-# Before the regular session opens, exact overnight lifecycles may establish
-# watcher ownership normally.  Registration itself does not synchronously
-# submit an order.  At/after the open, a first-time/recovered owner must route
-# through the canonical fresh-market-truth classifier.
+# PR #569 amendment: this supersedes the former absolute ownerless pre-open
+# terminal deadline for late recovery.  Before the regular session opens,
+# exact overnight lifecycles may establish watcher ownership normally.
+# Registration itself does not synchronously submit an order.  At/after the
+# open, a first-time/recovered owner must route through the canonical fresh-
+# market-truth classifier; the final boundary clock sample is routing/liveness
+# authority only and cannot turn unavailable truth into strategy rejection.
 _REGULAR_SESSION_MARKET_TRUTH_START_ET = dt_time(9, 30)
 
 
 def _requires_regular_session_market_truth(now_et: datetime) -> bool:
     current = now_et.time().replace(tzinfo=None)
     return current >= _REGULAR_SESSION_MARKET_TRUTH_START_ET
+
+
+def _watcher_ownership_boundary(
+    *,
+    client_id: str,
+    execution_mode: str,
+    local_order_id: str,
+    signal_id: str,
+    order_state_machine,
+    entry_watcher,
+    plan=None,
+) -> str:
+    """Resolve the exact durable/runtime authority immediately before watch().
+
+    The caller's earlier clock check is only routing context.  This boundary
+    rereads the durable row after all preceding database work, proves the
+    identity/status/handoff fence, and then samples the current ET time.  A
+    proven exact watcher is preserved regardless of the clock; an ownerless
+    row that reaches 09:30 must use the canonical market-truth recovery path.
+    """
+    get_order = getattr(order_state_machine, "get_order", None)
+    if not callable(get_order):
+        return "UNRESOLVED"
+    try:
+        row = get_order(str(local_order_id or "").strip())
+    except Exception:
+        return "UNRESOLVED"
+    if not isinstance(row, dict):
+        return "UNRESOLVED"
+
+    expected_local = str(local_order_id or "").strip()
+    expected_signal = str(signal_id or "").strip()
+    expected_client = str(client_id or "").strip().lower()
+    expected_mode = str(execution_mode or "").strip().lower()
+    if (
+        str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER"
+        or str(row.get("local_order_id") or "").strip() != expected_local
+        or str(row.get("signal_id") or "").strip() != expected_signal
+        or str(row.get("client_id") or "").strip().lower() != expected_client
+        or str(row.get("execution_mode") or "").strip().lower() != expected_mode
+    ):
+        return "UNRESOLVED"
+
+    try:
+        from ap.pending_trigger_classifier import has_broker_handoff_evidence
+
+        if has_broker_handoff_evidence(row):
+            return "UNRESOLVED"
+    except Exception:
+        return "UNRESOLVED"
+
+    for field in ("broker_order_id", "submitted_ts"):
+        value = row.get(field)
+        if value is not None and not (isinstance(value, str) and not value.strip()):
+            return "UNRESOLVED"
+
+    # Do not let a local_order_id-only hit establish ownership.  Reuse the
+    # canonical six-way proof used by readiness/restart recovery when a
+    # runtime watcher claims this exact row.
+    has_order = getattr(entry_watcher, "has_order", None)
+    if callable(has_order):
+        try:
+            if bool(has_order(expected_local)):
+                from ap.pending_trigger_restart_recovery import (
+                    PendingTriggerRestartRecovery,
+                )
+
+                proof = PendingTriggerRestartRecovery(
+                    client_id=client_id,
+                    execution_mode=execution_mode,
+                    osm=order_state_machine,
+                    entry_watcher=entry_watcher,
+                    broker=None,
+                    caller_source="ap_overnight_reeval.watcher_ownership_boundary",
+                ).prove_registered_watcher_owner(
+                    expected_local,
+                    expected_signal_id=expected_signal,
+                )
+                return "WATCHER_OWNED" if proof is not None else "UNRESOLVED"
+        except Exception:
+            return "UNRESOLVED"
+
+    return "LATE" if _requires_regular_session_market_truth(_et_now()) else "PREOPEN"
 
 
 def _establish_regular_session_truth_retry_owner(
@@ -2360,6 +2446,28 @@ def run_overnight_reeval(
                         continue
 
                     if _already_owned:
+                        _owned_boundary = _watcher_ownership_boundary(
+                            client_id=client_id,
+                            execution_mode=_reattach_mode,
+                            local_order_id=_existing_oid,
+                            signal_id=_reattach_signal_id,
+                            order_state_machine=order_state_machine,
+                            entry_watcher=entry_watcher,
+                            plan=_reattach_plan,
+                        )
+                        if _owned_boundary != "WATCHER_OWNED":
+                            log.critical(
+                                "[%s] REATTACH_WATCHER existing runtime owner "
+                                "failed exact boundary proof signal=%s local_order_id=%s "
+                                "boundary=%s — preserving row",
+                                ticker,
+                                signal_id,
+                                _existing_oid,
+                                _owned_boundary,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
                         log.info(
                             "[%s] REATTACH_WATCHER watcher already owns local_order_id=%s "
                             "— skipping second watch() call; retrying durable proof only",
@@ -2376,7 +2484,14 @@ def run_overnight_reeval(
                             try:
                                 _late_meta_ok = bool(
                                     callable(_meta_update)
-                                    and _meta_update(_existing_oid, _reattach_metadata)
+                                    and _meta_update(
+                                        _existing_oid,
+                                        _reattach_metadata,
+                                        expected_status="PENDING_TRIGGER",
+                                        expected_execution_mode=_reattach_mode,
+                                        expected_signal_id=_reattach_signal_id,
+                                        expected_no_broker_handoff=True,
+                                    )
                                 )
                             except Exception:
                                 _late_meta_ok = False
@@ -2468,6 +2583,87 @@ def run_overnight_reeval(
                             result["skipped"] = result.get("skipped", 0) + 1
                             result["retryable_deferred"] += 1
                             continue
+                        if not _late_terminalized and not _reattach_armed:
+                            # The pre-open check above may have happened before
+                            # slow ledger/DB work.  Re-read durable identity and
+                            # current time at the actual watch() boundary.
+                            _ownership_boundary = _watcher_ownership_boundary(
+                                client_id=client_id,
+                                execution_mode=_reattach_mode,
+                                local_order_id=_existing_oid,
+                                signal_id=_reattach_signal_id,
+                                order_state_machine=order_state_machine,
+                                entry_watcher=entry_watcher,
+                                plan=_reattach_plan,
+                            )
+                            if _ownership_boundary == "LATE":
+                                _meta_update = getattr(
+                                    order_state_machine, "update_order_meta", None
+                                )
+                                try:
+                                    _late_meta_ok = bool(
+                                        callable(_meta_update)
+                                        and _meta_update(
+                                            _existing_oid,
+                                            _reattach_metadata,
+                                            expected_status="PENDING_TRIGGER",
+                                            expected_execution_mode=_reattach_mode,
+                                            expected_signal_id=_reattach_signal_id,
+                                            expected_no_broker_handoff=True,
+                                        )
+                                    )
+                                except Exception:
+                                    _late_meta_ok = False
+                                _late_owner = (
+                                    _establish_regular_session_truth_retry_owner(
+                                        client_id=client_id,
+                                        execution_mode=_reattach_mode,
+                                        local_order_id=_existing_oid,
+                                        order_state_machine=order_state_machine,
+                                        entry_watcher=entry_watcher,
+                                        broker=broker,
+                                        plan=_reattach_plan,
+                                    )
+                                    if _late_meta_ok
+                                    else "UNRESOLVED"
+                                )
+                                if _late_owner == "RETRY_OWNED":
+                                    result["skipped"] = result.get("skipped", 0) + 1
+                                    result["retry_owned"] += 1
+                                    result["market_truth_deferred"] += 1
+                                    continue
+                                if _late_owner == "WATCHER_OWNED":
+                                    _reattach_armed = True
+                                elif _late_owner == "TERMINALIZED":
+                                    _late_terminalized = True
+                                else:
+                                    log.critical(
+                                        "[%s] REATTACH_WATCHER final boundary "
+                                        "could not prove market-truth ownership "
+                                        "signal=%s local_order_id=%s",
+                                        ticker,
+                                        signal_id,
+                                        _existing_oid,
+                                    )
+                                    result["skipped"] = result.get("skipped", 0) + 1
+                                    result["retryable_deferred"] += 1
+                                    continue
+                            elif _ownership_boundary == "WATCHER_OWNED":
+                                _reattach_armed = True
+                            elif _ownership_boundary != "PREOPEN":
+                                log.critical(
+                                    "[%s] REATTACH_WATCHER final ownership "
+                                    "boundary unresolved signal=%s local_order_id=%s "
+                                    "boundary=%s",
+                                    ticker,
+                                    signal_id,
+                                    _existing_oid,
+                                    _ownership_boundary,
+                                )
+                                result["skipped"] = result.get("skipped", 0) + 1
+                                result["retryable_deferred"] += 1
+                                continue
+
                         if not _late_terminalized and not _reattach_armed:
                             try:
                                 _reattach_armed = entry_watcher.watch(
@@ -3399,7 +3595,20 @@ def run_overnight_reeval(
             _contract_sym = str(getattr(decision.plan, "contract_symbol", "") or "")
             _arm_label    = _contract_sym if _contract_sym else "DEFERRED_AT_BREACH"
             try:
-                if _requires_regular_session_market_truth(_et_now()):
+                # The first time check above is not watcher authority.  Resolve
+                # the durable row and current clock again at the actual
+                # registration boundary so slow DB work cannot carry a
+                # 09:29:29 decision across the 09:30 ET policy boundary.
+                _ownership_boundary = _watcher_ownership_boundary(
+                    client_id=client_id,
+                    execution_mode=_execution_mode,
+                    local_order_id=local_order_id,
+                    signal_id=signal_id,
+                    order_state_machine=order_state_machine,
+                    entry_watcher=entry_watcher,
+                    plan=decision.plan,
+                )
+                if _ownership_boundary == "LATE":
                     _late_owner = _establish_regular_session_truth_retry_owner(
                         client_id=client_id,
                         execution_mode=_execution_mode,
@@ -3441,8 +3650,19 @@ def run_overnight_reeval(
                         result["retryable_deferred"] += 1
                         continue
                     armed = True
-                else:
+                elif _ownership_boundary == "WATCHER_OWNED":
+                    armed = True
+                elif _ownership_boundary == "PREOPEN":
                     armed = entry_watcher.watch(decision.plan, local_order_id)
+                else:
+                    log.critical(
+                        "[%s] NEW watcher ownership boundary unresolved "
+                        "signal=%s local_order_id=%s — watcher not called",
+                        ticker, signal_id, local_order_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
+                    continue
                 if armed:
                     try:
                         from ap.intelligence_context_handoff import enqueue_preopen_context_best_effort

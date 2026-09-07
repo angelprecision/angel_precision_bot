@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import sys
 import types
+import os
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from zoneinfo import ZoneInfo
+
+os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 import ap_overnight_reeval as ov
 
@@ -179,6 +182,7 @@ def _run_harness(
     client_id: str = "jose@example.com",
     execution_mode: str = "PAPER",
     now_et: datetime | None = None,
+    now_et_sequence: list[datetime] | None = None,
     recovery_quote: tuple[float, float] | None = (100.0, 100.1),
     watch_returns: bool = True,
 ):
@@ -254,7 +258,14 @@ def _run_harness(
     waiting: list[tuple[object, str, str]] = []
     armed_rows: list[tuple[object, str, str]] = []
     duplicate_signal_ids = duplicate_signal_ids or set()
-    monkeypatch.setattr(ov, "_et_now", lambda: run_now)
+    clock_values = list(now_et_sequence or [run_now])
+    clock_fallback = clock_values[-1]
+    clock_iter = iter(clock_values)
+
+    def _clock_now():
+        return next(clock_iter, clock_fallback)
+
+    monkeypatch.setattr(ov, "_et_now", _clock_now)
     monkeypatch.setattr(ov, "_OVERNIGHT_SNAPSHOT_FAIL_CLOSED", False)
     monkeypatch.setattr(ov, "_fetch_watching_signals", lambda _client_id: list(jobs))
     monkeypatch.setattr(
@@ -329,6 +340,83 @@ def test_092945_exact_new_lifecycle_installs_watcher_before_open(monkeypatch):
     assert len(state.watcher._pending) == 1
     state.broker.submit_order.assert_not_called()
     state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_092929_slow_boundary_routes_to_market_truth_after_open(monkeypatch):
+    before_open = datetime(2026, 7, 22, 9, 29, 29, tzinfo=ZoneInfo("America/New_York"))
+    at_boundary = datetime(2026, 7, 22, 9, 30, 1, tzinfo=ZoneInfo("America/New_York"))
+    state = _run_harness(
+        monkeypatch,
+        [_job("slow-boundary", _signal("slow-boundary", "NFLX"))],
+        execution_mode="LIVE",
+        now_et=before_open,
+        now_et_sequence=[before_open, at_boundary],
+        recovery_quote=None,
+        watch_returns=False,
+    )
+
+    assert state.result["armed"] == 0
+    assert state.result["retry_owned"] == 1
+    assert state.result["result_class"] == "COMPLETED_WITH_OWNED_RETRIES"
+    assert state.result["completed"] is True
+    retry_row = state.osm.rows["local-1"]
+    assert retry_row["local_order_id"] == "local-1"
+    assert retry_row["signal_id"] == "slow-boundary"
+    assert retry_row["client_id"] == "jose@example.com"
+    assert retry_row["execution_mode"] == "live"
+    assert retry_row["meta"]["restart_rearm_status"] == "RETRY_PENDING"
+    assert state.watcher._pending == []
+    state.broker.submit_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_post_open_legacy_osm_signature_cannot_grant_retry_or_watcher_authority(monkeypatch):
+    class _LegacyOSM(_OSM):
+        def update_order_meta(self, local_order_id: str, patch: dict) -> bool:
+            return super().update_order_meta(local_order_id, patch)
+
+    state = _run_harness(
+        monkeypatch,
+        [_job("legacy-cas", _signal("legacy-cas", "NFLX"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+        osm=_LegacyOSM(),
+    )
+
+    assert state.result["retry_owned"] == 0
+    assert state.result["retryable_deferred"] == 1
+    assert state.osm.rows["local-1"]["meta"].get("restart_rearm_status") is None
+    assert state.watcher._pending == []
+    state.broker.submit_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_post_open_valid_truth_preserves_exact_identity_and_installs_once(monkeypatch):
+    signal_id = "late-valid-identity"
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-valid-identity", _signal(signal_id, "C"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=(100.0, 100.1),
+    )
+
+    assert len(state.watcher.calls) == 1
+    plan, local_order_id = state.watcher.calls[0]
+    assert local_order_id == "local-1"
+    assert plan.signal_id == signal_id
+    assert plan.client_id == "jose@example.com"
+    assert plan.execution_mode == "live"
+    assert state.osm.rows[local_order_id]["signal_id"] == signal_id
+    assert state.osm.rows[local_order_id]["client_id"] == "jose@example.com"
+    assert state.osm.rows[local_order_id]["execution_mode"] == "live"
+    state.broker.submit_order.assert_not_called()
     state.broker.cancel_order.assert_not_called()
     state.broker.replace_order.assert_not_called()
 
@@ -452,6 +540,55 @@ def test_completed_owned_retry_is_consumed_same_process_before_5400_seconds(monk
     assert row["meta"]["restart_rearm_close_reason"] == "watcher_owned"
     state.broker.submit_order.assert_not_called()
     state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_owned_retry_does_not_hide_unresolved_inventory(monkeypatch):
+    class _OneRowRetryCASFailure(_OSM):
+        def update_order_meta(self, local_order_id: str, patch: dict, **kwargs) -> bool:
+            if local_order_id == "local-2" and kwargs.get("expected_no_broker_handoff"):
+                return False
+            return super().update_order_meta(local_order_id, patch, **kwargs)
+
+    state = _run_harness(
+        monkeypatch,
+        [
+            _job("retry-owned", _signal("retry-owned", "NFLX")),
+            _job("unresolved", _signal("unresolved", "BMY")),
+        ],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+        osm=_OneRowRetryCASFailure(),
+    )
+
+    assert state.result["retry_owned"] == 1
+    assert state.result["retryable_deferred"] == 1
+    assert state.result["result_class"] == "RETRYABLE_ALL_DEFERRED"
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
+    assert state.osm.rows["local-1"]["meta"]["restart_rearm_status"] == "RETRY_PENDING"
+    assert state.osm.rows["local-2"]["meta"].get("restart_rearm_status") is None
+
+    import ap.preopen_readiness as readiness
+
+    runner = SimpleNamespace(
+        core=SimpleNamespace(entry_watcher=state.watcher),
+        order_state_machine=state.osm,
+    )
+    pending = [
+        {"local_order_id": "local-1", "signal_id": "retry-owned"},
+        {"local_order_id": "local-2", "signal_id": "unresolved"},
+    ]
+    assert readiness._pending_trigger_without_watcher(
+        runner,
+        pending,
+        client_id="jose@example.com",
+        execution_mode="live",
+    ) == [pending[1]]
+    state.broker.submit_order.assert_not_called()
     state.broker.cancel_order.assert_not_called()
     state.broker.replace_order.assert_not_called()
 

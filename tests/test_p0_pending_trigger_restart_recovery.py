@@ -136,8 +136,32 @@ class _MockOSM:
                 row_meta = row.get("meta") or {}
                 if not isinstance(row_meta, dict):
                     return False
-                if row.get("broker_order_id") or row.get("submitted_ts"):
+                if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
                     return False
+
+                def _present(value):
+                    return value is not None and not (
+                        isinstance(value, str) and not value.strip()
+                    )
+
+                if _present(row.get("broker_order_id")) or _present(row.get("submitted_ts")):
+                    return False
+                for surface in (row_meta, row_meta.get("materialization")):
+                    if surface is None:
+                        continue
+                    if not isinstance(surface, dict):
+                        return False
+                    if str(surface.get("lifecycle_state") or "").strip().upper() in {
+                        "SUBMITTING",
+                        "SUBMITTED",
+                    }:
+                        return False
+                    if str(surface.get("current_owner") or "").strip().lower().startswith(
+                        "broker_submit:"
+                    ):
+                        return False
+                    if _present(surface.get("recovery_submit_owner")):
+                        return False
                 if any(str(row_meta.get(key) or "").strip() for key in (
                     "submit_intent_at",
                     "broker_submit_key",
@@ -2526,7 +2550,7 @@ class TestMaterializationInFlightFence:
 
     # ── Negative control 3: lifecycle_state missing / wrong ──────────────────
 
-    @pytest.mark.parametrize("bad_state", ["", None, "PENDING_TRIGGER", "SUBMITTED"])
+    @pytest.mark.parametrize("bad_state", ["", None, "PENDING_TRIGGER"])
     def test_nc3_wrong_lifecycle_state_not_protected(self, bad_state):
         """lifecycle_state != MATERIALIZING → not protected."""
         meta = _inflight_meta(lifecycle_state=bad_state or "")
@@ -2535,6 +2559,16 @@ class TestMaterializationInFlightFence:
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
         assert outcome == _RowOutcome.TERMINALIZED, f"bad_state={bad_state!r} got {outcome}"
+
+    def test_submitted_lifecycle_state_is_held_as_broker_ambiguous(self):
+        """A submitted marker is downstream authority, never cleanup authority."""
+        meta = _inflight_meta(lifecycle_state="SUBMITTED")
+        row = _tmo_row(meta=meta)
+        rec, osm = self._live_recovery(row)
+        outcome = rec.recover_one_row(row)
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
 
     # ── Negative control 4: materialization_status missing ───────────────────
 
@@ -4544,3 +4578,365 @@ def test_recognized_restart_retry_exception_suppresses_legacy_monitor_fallthroug
     assert watcher.watch_calls == 0
     assert osm.cancel_calls == []
     _assert_no_broker_mutation(broker)
+
+
+@pytest.mark.parametrize(
+    ("marker_kind", "marker_value"),
+    [
+        ("lifecycle_state", "SUBMITTING"),
+        ("lifecycle_state", "SUBMITTED"),
+        ("current_owner", "broker_submit:race-1"),
+        ("recovery_submit_owner", "recovery-submit:race-1"),
+        ("nested_lifecycle_state", "SUBMITTING"),
+        ("nested_lifecycle_state", "SUBMITTED"),
+        ("nested_current_owner", "broker_submit:race-2"),
+        ("nested_recovery_submit_owner", "recovery-submit:race-2"),
+        ("broker_order_id", "broker-1"),
+        ("submitted_ts", "2026-09-07T16:00:00+00:00"),
+        ("broker_ready", True),
+        ("submit_intent_at", "2026-09-07T16:00:00+00:00"),
+        ("broker_submit_key", "submit-key"),
+        ("broker_submit_payload_hash", "payload-hash"),
+        ("malformed_materialization", "not-an-object"),
+    ],
+)
+def test_every_broker_handoff_marker_blocks_read_side_retry_and_money_path(
+    marker_kind, marker_value
+):
+    """Every authoritative handoff marker is HOLD, never retry authority."""
+    from ap.pending_trigger_classifier import has_broker_handoff_evidence
+
+    row = _canonical_late_retry_row(
+        local_order_id=f"marker-{marker_kind}-{str(marker_value).lower()}",
+    )
+    nested = marker_kind.startswith("nested_")
+    if marker_kind in {"broker_order_id", "submitted_ts"}:
+        row[marker_kind] = marker_value
+    elif marker_kind == "malformed_materialization":
+        row["meta"]["materialization"] = marker_value
+    elif nested:
+        row["meta"]["materialization"] = {
+            marker_kind.removeprefix("nested_"): marker_value
+        }
+    else:
+        row["meta"][marker_kind] = marker_value
+
+    assert has_broker_handoff_evidence(row) is True
+    watcher = _MonitorWatcher(watch_returns=True)
+    rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+    assert rec.prove_restart_rearm_retry_owner(
+        row["local_order_id"], expected_signal_id=row["signal_id"]
+    ) is None
+    assert rec.consume_canonical_restart_rearm_retry(
+        row["local_order_id"], expected_signal_id=row["signal_id"]
+    ) is None
+    outcome = rec.recover_one_row(row)
+    assert outcome in {_RowOutcome.UNRESOLVED, _RowOutcome.SKIPPED}
+    assert watcher.watch_calls == 0
+    assert osm.meta_writes == []
+    assert osm.cancel_calls == []
+    _assert_no_broker_mutation(rec.broker)
+
+
+def test_clean_retry_row_passes_read_handoff_fence_and_exact_watcher_proof():
+    """Positive control: blank handoff fields do not suppress exact ownership."""
+    from ap.pending_trigger_classifier import has_broker_handoff_evidence
+
+    row = _canonical_late_retry_row(local_order_id="marker-clean")
+    watcher = _MonitorWatcher(watch_returns=True)
+    plan = _build_plan(row)
+    assert watcher.watch(plan, row["local_order_id"], recovery_rearm=True)
+    rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+    assert has_broker_handoff_evidence(row) is False
+    proof = rec.prove_registered_watcher_owner(
+        row["local_order_id"], expected_signal_id=row["signal_id"]
+    )
+    assert proof is not None
+    assert proof["local_order_id"] == row["local_order_id"]
+    assert proof["signal_id"] == row["signal_id"]
+    assert proof["client_id"] == row["client_id"]
+    assert proof["execution_mode"] == row["execution_mode"]
+    assert osm.meta_writes == []
+    assert osm.cancel_calls == []
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"lifecycle_state": "SUBMITTING"},
+        {"current_owner": "broker_submit:cas-race"},
+        {"recovery_submit_owner": "recovery-submit:cas-race"},
+        {"materialization": {"lifecycle_state": "SUBMITTING"}},
+        {"materialization": {"current_owner": "broker_submit:cas-race"}},
+        {"materialization": {"recovery_submit_owner": "recovery-submit:cas-race"}},
+        {"broker_ready": True},
+        {"submit_intent_at": "2026-09-07T16:00:00+00:00"},
+        {"broker_submit_key": "cas-submit-key"},
+        {"broker_submit_payload_hash": "cas-payload-hash"},
+    ],
+)
+def test_mock_conditional_handoff_cas_rejects_marker_without_mutation(marker):
+    """The test double models the production rowcount-zero CAS contract."""
+    row = _row(local_order_id=f"cas-marker-{uuid.uuid4()}", meta={"trigger_price": 450.0})
+    row["meta"].update(deepcopy(marker))
+    osm = _MockOSM()
+    osm.seed(row)
+
+    assert osm.update_order_meta(
+        row["local_order_id"],
+        {"cas_probe": True},
+        expected_status="PENDING_TRIGGER",
+        expected_execution_mode=row["execution_mode"],
+        expected_signal_id=row["signal_id"],
+        expected_no_broker_handoff=True,
+    ) is False
+    assert osm.meta_writes == []
+    assert osm.get_order(row["local_order_id"])["meta"].get("cas_probe") is None
+
+
+def test_mock_conditional_handoff_cas_accepts_blank_pending_trigger():
+    row = _row(local_order_id="cas-clean", meta={"trigger_price": 450.0})
+    osm = _MockOSM()
+    osm.seed(row)
+
+    assert osm.update_order_meta(
+        row["local_order_id"],
+        {"cas_probe": True},
+        expected_status="PENDING_TRIGGER",
+        expected_execution_mode=row["execution_mode"],
+        expected_signal_id=row["signal_id"],
+        expected_no_broker_handoff=True,
+    ) is True
+    assert osm.get_order(row["local_order_id"])["meta"]["cas_probe"] is True
+
+
+def test_osm_sql_write_failure_returns_no_lease_without_fallback(monkeypatch):
+    from ap.order_state_machine import APOrderStateMachine
+
+    class _BrokenConnection:
+        def __enter__(self):
+            raise RuntimeError("simulated CAS write outage")
+
+        def __exit__(self, *_args):
+            return False
+
+    method_globals = APOrderStateMachine.update_order_meta.__globals__
+    monkeypatch.setitem(method_globals, "conn", lambda: _BrokenConnection())
+    monkeypatch.setitem(method_globals, "run_with_retry", lambda fn, *a, **k: fn())
+
+    assert APOrderStateMachine("cas-client@example.com").update_order_meta(
+        "cas-write-error",
+        {"cas_probe": True},
+        expected_status="PENDING_TRIGGER",
+        expected_execution_mode="paper",
+        expected_signal_id="cas-signal",
+        expected_no_broker_handoff=True,
+    ) is False
+
+
+def test_real_postgres_expected_no_broker_handoff_cas_fence(monkeypatch):
+    """Exercise the exact JSONB/rowcount fence through psycopg2 and Postgres."""
+    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+    if not database_url:
+        pytest.skip("disposable PostgreSQL URL not configured")
+
+    psycopg2 = pytest.importorskip("psycopg2")
+    extras = pytest.importorskip("psycopg2.extras")
+    from contextlib import contextmanager
+    import json
+
+    from ap.order_state_machine import APOrderStateMachine
+
+    schema = f"pr569_cas_{uuid.uuid4().hex}"
+    client_id = "cas-client@example.com"
+    mode = "paper"
+    signal_id = "cas-signal"
+
+    @contextmanager
+    def _pg_conn():
+        connection = psycopg2.connect(database_url)
+        cursor = connection.cursor(cursor_factory=extras.RealDictCursor)
+        try:
+            cursor.execute(f'SET search_path TO "{schema}"')
+            yield cursor
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
+
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(
+                f"""
+                CREATE TABLE "{schema}".orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    broker_order_id TEXT,
+                    submitted_ts TIMESTAMPTZ,
+                    execution_mode TEXT NOT NULL,
+                    signal_id TEXT,
+                    meta JSONB,
+                    updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+
+        method_globals = APOrderStateMachine.update_order_meta.__globals__
+        monkeypatch.setitem(method_globals, "conn", _pg_conn)
+        monkeypatch.setitem(method_globals, "run_with_retry", lambda fn, *a, **k: fn())
+        osm = APOrderStateMachine(client_id)
+
+        marker_cases = [
+            ("blank", {}, True),
+            ("lifecycle_state", {"lifecycle_state": "SUBMITTING"}, False),
+            ("lifecycle_submitted", {"lifecycle_state": "SUBMITTED"}, False),
+            ("current_owner", {"current_owner": "broker_submit:sql-race"}, False),
+            ("recovery_owner", {"recovery_submit_owner": "recovery:sql-race"}, False),
+            (
+                "nested_lifecycle_state",
+                {"materialization": {"lifecycle_state": "SUBMITTING"}},
+                False,
+            ),
+            (
+                "nested_lifecycle_submitted",
+                {"materialization": {"lifecycle_state": "SUBMITTED"}},
+                False,
+            ),
+            (
+                "nested_current_owner",
+                {"materialization": {"current_owner": "broker_submit:sql-race"}},
+                False,
+            ),
+            (
+                "nested_recovery_owner",
+                {"materialization": {"recovery_submit_owner": "recovery:sql-race"}},
+                False,
+            ),
+            ("broker_ready", {"broker_ready": True}, False),
+            ("submit_intent", {"submit_intent_at": "2026-09-07T16:00:00+00:00"}, False),
+            ("submit_key", {"broker_submit_key": "sql-submit-key"}, False),
+            ("payload_hash", {"broker_submit_payload_hash": "sql-payload-hash"}, False),
+            (
+                "malformed_materialization",
+                {"materialization": "not-an-object"},
+                False,
+            ),
+        ]
+
+        def _insert(local_order_id, *, row_client=client_id, row_mode=mode,
+                    row_signal=signal_id, row_status="PENDING_TRIGGER", meta=None,
+                    broker_order_id=None, submitted_ts=None):
+            with _pg_conn() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO orders (
+                        local_order_id, client_id, kind, status, broker_order_id,
+                        submitted_ts, execution_mode, signal_id, meta
+                    ) VALUES (%s, %s, 'ENTRY', %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        local_order_id,
+                        row_client,
+                        row_status,
+                        broker_order_id,
+                        submitted_ts,
+                        row_mode,
+                        row_signal,
+                        json.dumps({} if meta is None else meta),
+                    ),
+                )
+
+        def _read(local_order_id):
+            with _pg_conn() as cursor:
+                cursor.execute(
+                    "SELECT status, client_id, execution_mode, signal_id, meta "
+                    "FROM orders WHERE local_order_id=%s",
+                    (local_order_id,),
+                )
+                return cursor.fetchone()
+
+        for label, marker, expected in marker_cases:
+            local_order_id = f"marker-{label}-{uuid.uuid4().hex}"
+            _insert(local_order_id, meta=marker)
+            accepted = osm.update_order_meta(
+                local_order_id,
+                {"cas_probe": label},
+                expected_status="PENDING_TRIGGER",
+                expected_execution_mode=mode,
+                expected_signal_id=signal_id,
+                expected_no_broker_handoff=True,
+            )
+            assert accepted is expected, label
+            persisted = _read(local_order_id)
+            assert persisted[0] == "PENDING_TRIGGER"
+            assert persisted[1] == client_id
+            assert persisted[2] == mode
+            assert persisted[3] == signal_id
+            if expected:
+                assert persisted[4]["cas_probe"] == label
+            else:
+                assert "cas_probe" not in persisted[4]
+
+        identity_cases = [
+            ("broker_order_id", {"broker_order_id": "broker-sql"}, {}),
+            (
+                "submitted_ts",
+                {"submitted_ts": "2026-09-07T16:00:00+00:00"},
+                {},
+            ),
+            ("client_mismatch", {}, {"row_client": "other@example.com"}),
+            ("mode_mismatch", {}, {"row_mode": "live"}),
+            ("signal_mismatch", {}, {"row_signal": "other-signal"}),
+            ("status_mismatch", {}, {"row_status": "CREATED"}),
+        ]
+        for label, fields, row_kwargs in identity_cases:
+            local_order_id = f"identity-{label}-{uuid.uuid4().hex}"
+            _insert(local_order_id, meta={}, **fields, **row_kwargs)
+            assert osm.update_order_meta(
+                local_order_id,
+                {"cas_probe": label},
+                expected_status="PENDING_TRIGGER",
+                expected_execution_mode=mode,
+                expected_signal_id=signal_id,
+                expected_no_broker_handoff=True,
+            ) is False
+        assert "cas_probe" not in _read(local_order_id)[4]
+
+        local_order_id = f"malformed-meta-{uuid.uuid4().hex}"
+        _insert(local_order_id, meta=["not-an-object"])
+        assert osm.update_order_meta(
+            local_order_id,
+            {"cas_probe": "malformed-meta"},
+            expected_status="PENDING_TRIGGER",
+            expected_execution_mode=mode,
+            expected_signal_id=signal_id,
+            expected_no_broker_handoff=True,
+        ) is False
+        assert "cas_probe" not in _read(local_order_id)[4]
+
+        local_order_id = f"implicit-status-{uuid.uuid4().hex}"
+        _insert(local_order_id, row_status="CREATED", meta={})
+        assert osm.update_order_meta(
+            local_order_id,
+            {"cas_probe": "implicit-status"},
+            expected_execution_mode=mode,
+            expected_signal_id=signal_id,
+            expected_no_broker_handoff=True,
+        ) is False
+        assert "cas_probe" not in _read(local_order_id)[4]
+    finally:
+        try:
+            with admin.cursor() as cursor:
+                cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            admin.close()

@@ -29,12 +29,15 @@ from __future__ import annotations
 
 import sys
 import types
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+
+os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 import ap_overnight_reeval as ov
 
@@ -517,7 +520,10 @@ def test_pre_watch_fence_failure_never_calls_watcher_or_replaces_order(monkeypat
         contract_selector=SimpleNamespace(select=selector_select),
         order_state_machine=SimpleNamespace(
             create_entry_order=osm_create,
-            get_order=lambda _oid: {"local_order_id": _oid, "status": "PENDING_TRIGGER"},
+            get_order=lambda _oid: {
+                **_pending_trigger_order_row(),
+                "local_order_id": _oid,
+            },
         ),
         entry_watcher=SimpleNamespace(has_order=lambda _oid: False, watch=watcher_watch),
         force=True,
@@ -761,7 +767,10 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
         contract_selector=SimpleNamespace(select=selector_select),
         order_state_machine=SimpleNamespace(
             create_entry_order=osm_create,
-            get_order=lambda _oid: {"local_order_id": _oid, "status": "PENDING_TRIGGER"},
+            get_order=lambda _oid: {
+                **_pending_trigger_order_row(),
+                "local_order_id": _oid,
+            },
         ),
         entry_watcher=SimpleNamespace(has_order=lambda _oid: False, watch=watcher_watch),
         force=True,
@@ -793,7 +802,10 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
         contract_selector=SimpleNamespace(select=selector_select),
         order_state_machine=SimpleNamespace(
             create_entry_order=osm_create,
-            get_order=lambda _oid: {"local_order_id": _oid, "status": "PENDING_TRIGGER"},
+            get_order=lambda _oid: {
+                **_pending_trigger_order_row(),
+                "local_order_id": _oid,
+            },
         ),
         entry_watcher=SimpleNamespace(has_order=lambda _oid: False, watch=second_watcher_watch),
         force=True,
@@ -890,6 +902,12 @@ def _run_one_attempt(
         cancel_order=MagicMock(), replace_order=MagicMock(),
         get_prior_day_levels=lambda _t: {"prior_day_high": 502, "prior_day_low": 498},
     )
+    _owned_signal = {
+        "local_order_id": EXISTING_LOCAL_OID,
+        "signal_id": "sig-reattach-integration",
+        "client_id": "jose@example.com",
+        "execution_mode": "paper",
+    }
     entry_watcher = SimpleNamespace(
         # Real reattach precheck path uses has_order; return False so the
         # caller invokes watch() which we stub to True. In production the
@@ -897,6 +915,16 @@ def _run_one_attempt(
         # calls originate from the reeval outer flow.
         has_order=lambda _oid: watcher_already_owns,
         watch=MagicMock(return_value=True),
+        _pending=(
+            [SimpleNamespace(
+                signal=dict(_owned_signal),
+                state="PENDING",
+                _ownership_quarantine=False,
+            )]
+            if watcher_already_owns
+            else []
+        ),
+        _dedup_set={"sig-reattach-integration"} if watcher_already_owns else set(),
     )
 
     result = ov.run_overnight_reeval(
@@ -907,7 +935,10 @@ def _run_one_attempt(
         contract_selector=SimpleNamespace(select=selector_select),
         order_state_machine=SimpleNamespace(
             create_entry_order=osm_create,
-            get_order=lambda _oid: {"local_order_id": _oid, "status": "PENDING_TRIGGER"},
+            get_order=lambda _oid: {
+                **_pending_trigger_order_row(),
+                "local_order_id": _oid,
+            },
         ),
         entry_watcher=entry_watcher,
         force=True,

@@ -422,6 +422,18 @@ class PendingTriggerRestartRecovery:
         if watcher_owned is not True and not _evidence_proven:
             return _reject_unproven_trigger_evidence()
 
+        # Preserve the classifier's existing downstream-lifecycle behavior for
+        # rows whose broker identity is already materialized.  This is a
+        # resolved/non-retryable row, not permission to renew late ownership;
+        # the read-side handoff predicate below still fences every retry and
+        # watcher proof carrying the same evidence.
+        if any(
+            value is not None
+            and not (isinstance(value, str) and not value.strip())
+            for value in (row.get("broker_order_id"), row.get("submitted_ts"))
+        ):
+            return _RowOutcome.SKIPPED
+
         # A contradictory broker-ready or submit marker is not permission to
         # classify the row as a zombie.  The broker may have accepted an
         # order before the durable identity write completed.  Hold this row
