@@ -973,8 +973,18 @@ def _run_shared_ap_signals_harness(
 
         def create_entry_order(self, plan, **kwargs):
             if osm_create:
-                return osm_create(plan, **kwargs)
-            return "local-1"
+                local_order_id = osm_create(plan, **kwargs)
+            else:
+                local_order_id = "local-1"
+            durable = _order_row(
+                str(local_order_id),
+                "PENDING_TRIGGER",
+                canonical_signal_id=canonical,
+            )
+            durable["signal_id"] = signal_id
+            durable["canonical_signal_id"] = canonical
+            self.rows[str(local_order_id)] = durable
+            return local_order_id
 
         def get_order(self, local_order_id):
             return dict(self.rows.get(local_order_id) or {
