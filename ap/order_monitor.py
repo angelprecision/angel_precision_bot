@@ -1265,22 +1265,48 @@ class APOrderMonitor:
     ) -> bool:
         """Consume an exact #569 late retry on the normal monitor cadence.
 
-        Returns True only when ``PendingTriggerRestartRecovery`` recognizes
-        the durable row as its canonical late-policy retry shape.  True means
-        the engine handled the row (including not-due, retry renewal,
-        terminal market truth, exact existing ownership, or fail-closed
-        unresolved).  False grants no new authority and leaves the ordinary
-        age/hydration/watchdog behavior unchanged.
+        Returns True for every durable restart-rearm marker that must
+        remain under canonical recovery authority, including malformed or
+        unresolved markers. True means the legacy hydration/age-cleanup path
+        must not receive the row. False is reserved for rows with no active
+        restart-rearm marker.
         """
         if not isinstance(order, dict):
             return False
         retry_meta = _coerce_meta(order)
+        retry_status_present = "restart_rearm_status" in retry_meta
         retry_status = retry_meta.get("restart_rearm_status")
-        if (
-            not isinstance(retry_status, str)
-            or retry_status.strip().upper() != "RETRY_PENDING"
-        ):
+        if not retry_status_present:
             return False
+        if retry_status is None or (
+            isinstance(retry_status, str) and not retry_status.strip()
+        ):
+            log.critical(
+                "[%s] RESTART_REARM_MONITOR_MALFORMED_STATUS local=%s "
+                "— legacy cleanup suppressed",
+                self.client_id,
+                local_order_id,
+            )
+            return True
+        if not isinstance(retry_status, str):
+            log.critical(
+                "[%s] RESTART_REARM_MONITOR_MALFORMED_STATUS local=%s "
+                "— legacy cleanup suppressed",
+                self.client_id,
+                local_order_id,
+            )
+            return True
+        if retry_status.strip().upper() == "CLOSED":
+            return False
+        if retry_status.strip().upper() != "RETRY_PENDING":
+            log.critical(
+                "[%s] RESTART_REARM_MONITOR_UNKNOWN_STATUS local=%s status=%r "
+                "— legacy cleanup suppressed",
+                self.client_id,
+                local_order_id,
+                retry_status,
+            )
+            return True
         local_order_id = str(local_order_id or "").strip()
         row_local_id = order.get("local_order_id")
         signal_id = order.get("signal_id")
@@ -1291,7 +1317,13 @@ class APOrderMonitor:
             or not isinstance(signal_id, str)
             or not signal_id.strip()
         ):
-            return False
+            log.critical(
+                "[%s] RESTART_REARM_MONITOR_IDENTITY_UNPROVEN local=%s "
+                "— legacy cleanup suppressed",
+                self.client_id,
+                local_order_id,
+            )
+            return True
 
         # Only an explicitly wired LIVE/PAPER monitor receives retry-consumer
         # authority.  The monitor's historical display/policy fallback to LIVE
@@ -1300,7 +1332,13 @@ class APOrderMonitor:
             getattr(self, "_pending_trigger_recovery_mode", "") or ""
         ).strip().lower()
         if execution_mode not in {"live", "paper"}:
-            return False
+            log.critical(
+                "[%s] RESTART_REARM_MONITOR_MODE_UNPROVEN local=%s "
+                "— legacy cleanup suppressed",
+                self.client_id,
+                local_order_id,
+            )
+            return True
 
         try:
             from ap.pending_trigger_restart_recovery import (
@@ -1322,17 +1360,23 @@ class APOrderMonitor:
                 expected_signal_id=signal_id.strip(),
             )
         except Exception as exc:
-            log.error(
+            log.critical(
                 "[%s] RESTART_REARM_MONITOR_CONSUMER_ERROR local=%s error=%s "
-                "— failed closed",
+                "— legacy cleanup suppressed",
                 self.client_id,
                 local_order_id,
                 exc,
             )
-            return False
+            return True
 
         if outcome is None:
-            return False
+            log.critical(
+                "[%s] RESTART_REARM_MONITOR_UNRECOGNIZED local=%s "
+                "— legacy cleanup suppressed",
+                self.client_id,
+                local_order_id,
+            )
+            return True
         log.info(
             "[%s] RESTART_REARM_MONITOR_CONSUMED local=%s signal_id=%s "
             "mode=%s outcome=%s",
