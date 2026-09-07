@@ -3357,6 +3357,10 @@ def run_overnight_reeval(
                 "pre_market_selector_failure": None,
                 "pre_market_selector_reason_code": None,
                 "contract_selection_deferred_to": "breach_time",
+                # Exact session authority for late-market-truth recovery.
+                # Retry leases may survive data unavailability within this
+                # session, but they must not be renewed into a later session.
+                "overnight_reeval_session_key": session_key,
                 # PR #388 Blocker 1: only PR#388 seams opt in to the
                 # late-attachment continuation/reset classifier. Ordinary
                 # intraday/direct arms keep committed-main's strict

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time, date
 from types import SimpleNamespace
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -38,6 +38,8 @@ from ap.manual_close_reconciliation import (
     fetch_all_current_session_orders,
 )
 from ap_entry_watcher import (
+    EOD_CUTOFF_HOUR,
+    EOD_CUTOFF_MIN,
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
 )
@@ -58,6 +60,72 @@ from ap.selector_retry_policy import (
 )
 
 log = get_logger("ap.pending_trigger_restart_recovery")
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _now_et() -> datetime:
+    # Keep restart recovery on the same ET clock seam as overnight reevaluation
+    # when that module is loaded (and therefore testable without wall-clock
+    # drift). The direct clock is the production fallback during import/startup.
+    try:
+        from ap_overnight_reeval import _et_now
+        return _et_now()
+    except Exception:
+        return datetime.now(_ET)
+
+
+def _requires_regular_session_market_truth(now_et: datetime) -> bool:
+    return now_et.time().replace(tzinfo=None) >= _REGULAR_SESSION_MARKET_TRUTH_START_ET
+
+
+def _restart_rearm_expected_state(meta: dict) -> dict:
+    """Return the exact prior retry snapshot used by the lease CAS."""
+    return {field: meta.get(field) for field in _RESTART_REARM_CAS_FIELDS}
+
+
+def _late_retry_session_status(row: dict) -> str:
+    """Return CURRENT, EXPIRED, or INVALID for a late retry session fence.
+
+    Overnight reevaluation already persists ``overnight_reeval_session_key``.
+    The retry writer mirrors that exact session into its own metadata so a
+    retry lease cannot cross into a later trading session. Existing retry rows
+    without the mirror can use their durable first-failure timestamp as a
+    backwards-compatible session proof; malformed or missing proof remains
+    unresolved rather than granting new retry authority.
+    """
+    meta = _extract_meta(row)
+    explicit_values = []
+    for field in ("overnight_reeval_session_key", _RR_SESSION_FIELD):
+        if field in meta:
+            value = meta.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return "INVALID"
+            explicit_values.append(value.strip())
+    if explicit_values and len(set(explicit_values)) != 1:
+        return "INVALID"
+
+    raw_session = explicit_values[0] if explicit_values else None
+    if raw_session is None:
+        raw_first_failed = meta.get(_RR_FIRST_FAILED_AT)
+        if not isinstance(raw_first_failed, str) or not raw_first_failed.strip():
+            return "INVALID"
+        try:
+            first_failed = datetime.fromisoformat(raw_first_failed.strip())
+            if first_failed.tzinfo is None:
+                return "INVALID"
+            raw_session = first_failed.astimezone(_ET).date().isoformat()
+        except (TypeError, ValueError, OverflowError):
+            return "INVALID"
+
+    try:
+        parsed = date.fromisoformat(raw_session)
+    except (TypeError, ValueError):
+        return "INVALID"
+    current = _now_et().date()
+    if parsed > current:
+        return "INVALID"
+    return "CURRENT" if parsed == current else "EXPIRED"
 
 # ── Per-row outcome constants (Blocker 2) ─────────────────────────────────────
 
@@ -99,6 +167,7 @@ _RR_LAST_FAILED_AT   = "restart_rearm_last_failed_at"
 _RR_CLIENT_FIELD     = "restart_rearm_client_id"
 _RR_MODE_FIELD       = "restart_rearm_execution_mode"
 _RR_GENERATION_FIELD = "restart_rearm_generation"
+_RR_SESSION_FIELD    = "restart_rearm_session_key"
 _RR_CLOSED_AT        = "restart_rearm_closed_at"
 _RR_CLOSE_REASON     = "restart_rearm_close_reason"
 
@@ -107,6 +176,29 @@ _RR_CLOSE_REASON     = "restart_rearm_close_reason"
 # restart cannot reset the diagnostic/cadence state.  It is never a finite
 # strategy-authority budget: data/infra unavailability remains RETRY/HOLD.
 _LATE_REARM_MAX_GENERATIONS = 3
+
+# PR #569 amendment: this supersedes the former absolute ownerless pre-open
+# deadline. It is sampled only after the durable row is reread at the actual
+# watcher-registration boundary. At/after 09:30 ET the canonical watcher
+# fresh-market-truth classifier owns the decision.
+_REGULAR_SESSION_MARKET_TRUTH_START_ET = dt_time(9, 30)
+
+# One atomic snapshot for every restart-rearm lease write. The update must
+# compare all prior retry fields, not merely identity/no-broker predicates.
+_RESTART_REARM_CAS_FIELDS = (
+    _RR_STATUS_FIELD,
+    _RR_OWNER_FIELD,
+    _RR_REASON_FIELD,
+    _RR_ATTEMPT_FIELD,
+    _RR_NEXT_AT_FIELD,
+    _RR_DEADLINE_FIELD,
+    _RR_FIRST_FAILED_AT,
+    _RR_LAST_FAILED_AT,
+    _RR_CLIENT_FIELD,
+    _RR_MODE_FIELD,
+    _RR_GENERATION_FIELD,
+    _RR_SESSION_FIELD,
+)
 
 _RETRY_MATERIALIZATION = "MATERIALIZATION_RETRY"
 _RETRY_RESTART_REARM  = "RESTART_REARM_RETRY"
@@ -191,6 +283,76 @@ class PendingTriggerRestartRecovery:
         # existed and I looked it up."
         self.last_watcher_registered_by_this_attempt: bool = False
         self.last_registration_token: Optional[str] = None
+
+    def _entry_cutoff_state(self) -> Optional[bool]:
+        """Read the existing APEntryWatcher entry-cutoff authority.
+
+        A missing or malformed cutoff helper is unknown authority. Recovery
+        must not install a late watcher on that basis, and it must not invent
+        a replacement cutoff.
+        """
+        fn = getattr(self.entry_watcher, "_is_past_entry_cutoff_now", None)
+        if callable(fn):
+            try:
+                value = fn()
+            except Exception:
+                return None
+            return value if type(value) is bool else None
+
+        # Minimal startup/test watcher adapters may not expose the method, but
+        # the canonical APEntryWatcher cutoff constants are still the existing
+        # session-validity authority. Never invent a second cutoff here.
+        try:
+            now_et = _now_et()
+            return (
+                now_et.hour > EOD_CUTOFF_HOUR
+                or (
+                    now_et.hour == EOD_CUTOFF_HOUR
+                    and now_et.minute >= EOD_CUTOFF_MIN
+                )
+            )
+        except Exception:
+            return None
+
+    def _late_ownership_boundary(self, row: dict, local_oid: str) -> Optional[str]:
+        """Resolve the clock/session boundary immediately before ``watch()``."""
+        session_status = _late_retry_session_status(row)
+        has_retry_state = any(
+            field in _extract_meta(row)
+            for field in (
+                _RR_STATUS_FIELD,
+                _RR_OWNER_FIELD,
+                _RR_ATTEMPT_FIELD,
+                _RR_NEXT_AT_FIELD,
+                _RR_DEADLINE_FIELD,
+                _RR_FIRST_FAILED_AT,
+                _RR_LAST_FAILED_AT,
+            )
+        )
+        if session_status == "EXPIRED" and has_retry_state:
+            return "SESSION_EXPIRED"
+        if session_status == "INVALID" and has_retry_state:
+            self._mark_failure(local_oid, "retry_verification:late_session")
+            return None
+
+        now_et = _now_et()
+        if not _requires_regular_session_market_truth(now_et):
+            return "PREOPEN"
+
+        cutoff_state = self._entry_cutoff_state()
+        if cutoff_state is True:
+            return "ENTRY_CUTOFF_EXPIRED"
+        if cutoff_state is None:
+            self._mark_failure(local_oid, "late_entry_cutoff_authority_unproven")
+            return None
+        log.info(
+            "RESTART_RECOVERY_LATE_MARKET_TRUTH_BOUNDARY local=%s now_et=%s "
+            "session=%s — canonical watcher classifier required",
+            local_oid,
+            now_et.isoformat(),
+            session_status,
+        )
+        return "LATE_MARKET_TRUTH"
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -814,6 +976,23 @@ class PendingTriggerRestartRecovery:
         return _RowOutcome.UNRESOLVED
 
     def _handle_restart_rearm_retry(self, row, local_oid, live_quote_abt, plan_builder_fn) -> str:
+        _late_policy = _late_attachment_policy_eligible(row)
+        if _late_policy:
+            _session_status = _late_retry_session_status(row)
+            if _session_status == "EXPIRED":
+                return self._terminalize_with_reason(
+                    local_oid,
+                    row,
+                    "late_attachment_session_expired",
+                    meta_patch={
+                        "restart_recovery_late_boundary": "session_expired",
+                        _RR_CLOSE_REASON: "late_attachment_session_expired",
+                    },
+                )
+            if _session_status == "INVALID":
+                self._mark_failure(local_oid, "retry_verification:late_session")
+                return _RowOutcome.UNRESOLVED
+
         proof = self._verify_restart_rearm_retry_ownership(
             local_oid,
             row,
@@ -834,11 +1013,29 @@ class PendingTriggerRestartRecovery:
             generation = int(generation)
         max_attempts = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
 
+        # The watcher’s existing entry cutoff is the only terminal authority
+        # for an otherwise unresolved late setup.  Generation/attempt limits
+        # remain diagnostic cadence only and never become strategy rejection.
+        if _late_policy:
+            _cutoff_state = self._entry_cutoff_state()
+            if _cutoff_state is True:
+                return self._terminalize_with_reason(
+                    local_oid,
+                    row,
+                    "late_attachment_entry_cutoff",
+                    meta_patch={
+                        "restart_recovery_late_boundary": "entry_cutoff",
+                        _RR_CLOSE_REASON: "late_attachment_entry_cutoff",
+                    },
+                )
+            if _cutoff_state is None:
+                self._mark_failure(local_oid, "late_entry_cutoff_authority_unproven")
+                return _RowOutcome.UNRESOLVED
+
         if now < next_at:
             self._mark_retry_subtype(local_oid, _RETRY_RESTART_REARM)
             return _RowOutcome.RETRY_OWNED
 
-        _late_policy = _late_attachment_policy_eligible(row)
         if (now > deadline or attempt >= max_attempts) and not _late_policy:
             return self._terminalize_with_reason(
                 local_oid,
@@ -1049,6 +1246,42 @@ class PendingTriggerRestartRecovery:
             return _RowOutcome.UNRESOLVED
         row = _durable_boundary
 
+        # This is the restart/startup equivalent of the overnight reeval
+        # ownership boundary.  The earlier classifier read and any plan/DB
+        # work do not authorize a late first-time watcher.  Reread state has
+        # now passed the durable fence; sample the clock here, immediately
+        # before the external watcher mutation.  At/after 09:30, watch() is
+        # still allowed only as the canonical fresh-market-truth classifier.
+        if _late_attachment_policy_eligible(row):
+            _late_boundary = self._late_ownership_boundary(row, local_oid)
+            if _late_boundary is None:
+                log.critical(
+                    "RESTART_RECOVERY_LATE_OWNERSHIP_BOUNDARY_UNPROVEN "
+                    "local=%s — watcher not called",
+                    local_oid,
+                )
+                return _RowOutcome.UNRESOLVED
+            if _late_boundary == "SESSION_EXPIRED":
+                return self._terminalize_with_reason(
+                    local_oid,
+                    row,
+                    "late_attachment_session_expired",
+                    meta_patch={
+                        "restart_recovery_late_boundary": "session_expired",
+                        _RR_CLOSE_REASON: "late_attachment_session_expired",
+                    },
+                )
+            if _late_boundary == "ENTRY_CUTOFF_EXPIRED":
+                return self._terminalize_with_reason(
+                    local_oid,
+                    row,
+                    "late_attachment_entry_cutoff",
+                    meta_patch={
+                        "restart_recovery_late_boundary": "entry_cutoff",
+                        _RR_CLOSE_REASON: "late_attachment_entry_cutoff",
+                    },
+                )
+
         try:
             _provenance = {
                 "created_by_this_call": False,
@@ -1180,6 +1413,7 @@ class PendingTriggerRestartRecovery:
         _late_policy = _late_attachment_policy_eligible(row)
         _meta = _extract_meta(row)
         _signal_id = str(row.get("signal_id") or "").strip()
+        _expected_retry_state = _restart_rearm_expected_state(_meta)
         if not _signal_id:
             self._mark_failure(local_oid, "identity:missing_signal_id")
             log.critical(
@@ -1276,6 +1510,7 @@ class PendingTriggerRestartRecovery:
                     _RR_LAST_FAILED_AT,
                     _RR_CLIENT_FIELD,
                     _RR_MODE_FIELD,
+                    _RR_SESSION_FIELD,
                 )
             )
         )
@@ -1301,6 +1536,34 @@ class PendingTriggerRestartRecovery:
                 )
                 return _RowOutcome.UNRESOLVED
             first_failed_at = _first_failed_raw
+
+        _session_key = None
+        if _late_policy:
+            if _existing_late_lease:
+                if _late_retry_session_status(row) != "CURRENT":
+                    self._mark_failure(local_oid, "retry_verification:late_session")
+                    log.critical(
+                        "RESTART_RECOVERY_LATE_REARM_SESSION_UNPROVEN "
+                        "local=%s — refusing to renew retry authority",
+                        local_oid,
+                    )
+                    return _RowOutcome.UNRESOLVED
+                _session_key = (
+                    _meta.get(_RR_SESSION_FIELD)
+                    or _meta.get("overnight_reeval_session_key")
+                )
+                if not isinstance(_session_key, str) or not _session_key.strip():
+                    try:
+                        _session_key = (
+                            datetime.fromisoformat(str(first_failed_at).strip())
+                            .astimezone(_ET)
+                            .date()
+                            .isoformat()
+                        )
+                    except (TypeError, ValueError, OverflowError, AttributeError):
+                        return _RowOutcome.UNRESOLVED
+            else:
+                _session_key = _now_et().date().isoformat()
 
         _delay = _env_int("RESTART_REARM_RETRY_DELAY_SECONDS", 30)
         _deadline_secs = _env_int("RESTART_REARM_RETRY_DEADLINE_SECONDS", 180)
@@ -1358,9 +1621,10 @@ class PendingTriggerRestartRecovery:
             )
 
         if _late_policy and _roll_generation:
-            # The generation cap is diagnostic/cadence state only.  Once the
+            # The generation cap is diagnostic/cadence state only. Once the
             # cap is reached, keep the durable generation at the cap and start
-            # another bounded HOLD lease; no retry count can reject the setup.
+            # another bounded HOLD lease while the canonical session/cutoff
+            # authority remains valid. No retry count can reject the setup.
             _generation = min(
                 _generation + 1,
                 _LATE_REARM_MAX_GENERATIONS,
@@ -1386,6 +1650,7 @@ class PendingTriggerRestartRecovery:
         }
         if _late_policy:
             _patch[_RR_GENERATION_FIELD] = _generation
+            _patch[_RR_SESSION_FIELD] = _session_key
         if not self._safe_meta_update(
             local_oid,
             _patch,
@@ -1393,6 +1658,7 @@ class PendingTriggerRestartRecovery:
             expected_execution_mode=self.execution_mode,
             expected_signal_id=_signal_id,
             expected_no_broker_handoff=True,
+            expected_restart_rearm_state=_expected_retry_state,
         ):
             self._mark_failure(local_oid, "restart_rearm_retry_write_failed")
             return _RowOutcome.UNRESOLVED
@@ -2085,6 +2351,8 @@ class PendingTriggerRestartRecovery:
         _late_policy = _late_attachment_policy_eligible(reread)
         if require_late_policy and not _late_policy:
             return None
+        if _late_policy and _late_retry_session_status(reread) != "CURRENT":
+            return None
         if any(
             value is not None
             and not (isinstance(value, str) and not value.strip())
@@ -2424,6 +2692,7 @@ class PendingTriggerRestartRecovery:
         expected_execution_mode: Optional[str] = None,
         expected_signal_id: Optional[str] = None,
         expected_no_broker_handoff: bool = False,
+        expected_restart_rearm_state: Optional[dict] = None,
     ) -> bool:
         fn = getattr(self.osm, "update_order_meta", None)
         if not callable(fn):
@@ -2437,6 +2706,8 @@ class PendingTriggerRestartRecovery:
             kwargs["expected_signal_id"] = expected_signal_id
         if expected_no_broker_handoff:
             kwargs["expected_no_broker_handoff"] = True
+        if expected_restart_rearm_state is not None:
+            kwargs["expected_restart_rearm_state"] = dict(expected_restart_rearm_state)
         try:
             # A conditional lease write must not fall back to an unfenced
             # legacy signature. If the OSM cannot prove the CAS, fail closed.

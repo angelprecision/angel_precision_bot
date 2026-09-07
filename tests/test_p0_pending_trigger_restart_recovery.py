@@ -45,8 +45,10 @@ from ap.pending_trigger_restart_recovery import (
     _RR_CLIENT_FIELD,
     _RR_MODE_FIELD,
     _RR_GENERATION_FIELD,
+    _RR_SESSION_FIELD,
     _RR_CLOSE_REASON,
     _LATE_REARM_MAX_GENERATIONS,
+    _now_et,
     _build_plan,
     _late_attachment_policy_eligible,
 )
@@ -189,6 +191,16 @@ class _MockOSM:
                     return False
                 if nested_ready not in (None, False, "", "false", "0"):
                     return False
+            expected_retry_state = kwargs.get("expected_restart_rearm_state")
+            if expected_retry_state is not None:
+                if not isinstance(expected_retry_state, dict):
+                    return False
+                row_meta = row.get("meta") or {}
+                if not isinstance(row_meta, dict):
+                    return False
+                for field, expected in expected_retry_state.items():
+                    if row_meta.get(field) != expected:
+                        return False
         self.meta_writes.append((oid, dict(patch)))
         row = self._rows.setdefault(oid, {})
         meta = row.get("meta") or {}
@@ -243,6 +255,12 @@ class _MockWatcher:
         self._pending:   list = []
         self._dedup_set: set  = set()
         self._watch_returns   = watch_returns
+
+    def _is_past_entry_cutoff_now(self) -> bool:
+        # Existing APEntryWatcher authority is injected explicitly in
+        # production. Test doubles default to an open entry window so tests
+        # exercise the market-truth/retry path rather than wall-clock state.
+        return False
 
     def watch(self, plan, local_order_id: str, *, recovery_rearm: bool = False,
               registration_provenance_out: dict | None = None) -> bool:
@@ -3210,6 +3228,120 @@ class TestWatcherOwnedWithInflight:
 
 
 class TestLateMarketValidityRecovery:
+    def test_restart_recovery_rechecks_clock_at_watcher_boundary(self, monkeypatch):
+        """A stale pre-open observation cannot authorize a post-open watch."""
+        import ap.pending_trigger_restart_recovery as ptr
+
+        precheck = datetime(2026, 9, 7, 9, 29, 29, tzinfo=timezone(timedelta(hours=-4)))
+        post_db = datetime(2026, 9, 7, 9, 30, 1, tzinfo=timezone(timedelta(hours=-4)))
+        assert ptr._requires_regular_session_market_truth(precheck) is False
+        monkeypatch.setattr(ptr, "_now_et", lambda: post_db)
+
+        row = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=False)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.WATCHER_OWNED
+        assert watcher.watch_calls == 1
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_post_open_truth_unavailable_persists_retry_owner(self, monkeypatch):
+        import ap.pending_trigger_restart_recovery as ptr
+
+        monkeypatch.setattr(
+            ptr,
+            "_now_et",
+            lambda: datetime(2026, 9, 7, 9, 31, tzinfo=timezone(timedelta(hours=-4))),
+        )
+        row = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+        watcher = _MonitorWatcher(watch_returns=False)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert watcher.watch_calls == 1
+        assert osm.get_order(row["local_order_id"])["meta"][_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_post_open_fresh_truth_installs_exactly_one_watcher(self, monkeypatch):
+        import ap.pending_trigger_restart_recovery as ptr
+
+        monkeypatch.setattr(
+            ptr,
+            "_now_et",
+            lambda: datetime(2026, 9, 7, 9, 31, tzinfo=timezone(timedelta(hours=-4))),
+        )
+        row = _row(meta={
+            "trigger_price": 450.0,
+            "late_attachment_policy_eligible": True,
+        })
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=False)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.WATCHER_OWNED
+        assert watcher.watch_calls == 1
+        assert len(watcher._pending) == 1
+        watched_signal = watcher._pending[0].signal
+        assert watched_signal["local_order_id"] == row["local_order_id"]
+        assert watched_signal["signal_id"] == row["signal_id"]
+        assert watched_signal["client_id"] == row["client_id"]
+        assert watched_signal["execution_mode"] == row["execution_mode"]
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_late_retry_cannot_cross_existing_entry_cutoff(self):
+        row = _canonical_late_retry_row(
+            local_order_id="late-cutoff-terminal",
+            next_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+            deadline=(datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            attempt=_LATE_REARM_MAX_GENERATIONS,
+            generation=_LATE_REARM_MAX_GENERATIONS,
+        )
+
+        class _CutoffWatcher(_MonitorWatcher):
+            def _is_past_entry_cutoff_now(self):
+                return True
+
+        watcher = _CutoffWatcher(watch_returns=False)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert watcher.watch_calls == 0
+        assert osm.cancel_calls
+        assert "late_attachment_entry_cutoff" in osm.cancel_calls[0][1]
+        _assert_no_broker_mutation(rec.broker)
+
+    def test_late_retry_from_prior_session_is_terminalized_by_session_authority(self):
+        row = _canonical_late_retry_row(local_order_id="late-prior-session")
+        row["meta"]["overnight_reeval_session_key"] = (
+            _now_et().date() - timedelta(days=1)
+        ).isoformat()
+        row["meta"][_RR_SESSION_FIELD] = row["meta"]["overnight_reeval_session_key"]
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(row, watcher=watcher, quote_result=None)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert watcher.watch_calls == 0
+        assert "late_attachment_session_expired" in osm.cancel_calls[0][1]
+        _assert_no_broker_mutation(rec.broker)
+
     def test_post_open_through_trigger_routes_to_canonical_watcher_policy(self, monkeypatch):
         r = _row(meta={
             "trigger_price": 450.0,
@@ -3862,6 +3994,55 @@ class TestLateMarketValidityRecovery:
         assert kwargs["expected_execution_mode"] == "paper"
         assert kwargs["expected_signal_id"] == row["signal_id"]
         assert kwargs["expected_no_broker_handoff"] is True
+        expected_state = kwargs["expected_restart_rearm_state"]
+        assert expected_state[_RR_STATUS_FIELD] is None
+        assert expected_state[_RR_ATTEMPT_FIELD] is None
+        assert expected_state[_RR_OWNER_FIELD] is None
+        assert expected_state[_RR_NEXT_AT_FIELD] is None
+
+    def test_two_retry_consumers_cannot_renew_one_stale_snapshot(self):
+        """The second writer must lose the retry-state CAS, not overwrite it."""
+        row = _row(
+            local_order_id="cas-concurrent-retry",
+            meta={
+                "trigger_price": 450.0,
+                "late_attachment_policy_eligible": True,
+            },
+        )
+        osm = _MockOSM()
+        osm.seed(row)
+        stale_snapshot = deepcopy(row)
+        rec_one, _ = _make_recovery(
+            row,
+            osm=osm,
+            watcher=_MonitorWatcher(watch_returns=False),
+            quote_result=None,
+        )
+        rec_two, _ = _make_recovery(
+            row,
+            osm=osm,
+            watcher=_MonitorWatcher(watch_returns=False),
+            quote_result=None,
+        )
+
+        first = rec_one._enter_restart_rearm_retry(
+            row["local_order_id"],
+            stale_snapshot,
+            reason="late_attachment_market_truth_unavailable_or_unresolved",
+        )
+        second = rec_two._enter_restart_rearm_retry(
+            row["local_order_id"],
+            stale_snapshot,
+            reason="late_attachment_market_truth_unavailable_or_unresolved",
+        )
+
+        assert first == _RowOutcome.RETRY_OWNED
+        assert second == _RowOutcome.UNRESOLVED
+        persisted = osm.get_order(row["local_order_id"])
+        assert persisted["meta"][_RR_ATTEMPT_FIELD] == 1
+        assert len(osm.meta_writes) == 1
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec_one.broker)
 
 class _MonitorWatcher(_MockWatcher):
     def __init__(self, *, watch_returns=True, ownership_raises=False):
@@ -3931,6 +4112,7 @@ def _canonical_late_retry_row(
             _RR_CLIENT_FIELD: client_id.lower(),
             _RR_MODE_FIELD: mode.lower(),
             _RR_GENERATION_FIELD: generation,
+            _RR_SESSION_FIELD: _now_et().date().isoformat(),
         },
     )
 
@@ -4521,15 +4703,6 @@ def test_single_exact_boolean_true_authority_is_eligible():
     }) is True
 
 
-def test_pr569_no_clock_terminal_authority_survives():
-    import inspect
-    import ap.pending_trigger_restart_recovery as ptr
-    import ap_overnight_reeval as ov
-
-    source = inspect.getsource(ov) + inspect.getsource(ptr)
-    assert "PREOPEN_OWNERSHIP_DEADLINE_MISSED" not in source
-    assert "09:29:30" not in source
-
 def test_malformed_restart_retry_marker_suppresses_legacy_monitor_fallthrough(monkeypatch):
     row = _canonical_late_retry_row()
     row["meta"][_RR_STATUS_FIELD] = None
@@ -4902,15 +5075,15 @@ def test_real_postgres_expected_no_broker_handoff_cas_fence(monkeypatch):
         for label, fields, row_kwargs in identity_cases:
             local_order_id = f"identity-{label}-{uuid.uuid4().hex}"
             _insert(local_order_id, meta={}, **fields, **row_kwargs)
-        assert osm.update_order_meta(
-            local_order_id,
-            {"cas_probe": label},
+            assert osm.update_order_meta(
+                local_order_id,
+                {"cas_probe": label},
                 expected_status="PENDING_TRIGGER",
                 expected_execution_mode=mode,
                 expected_signal_id=signal_id,
                 expected_no_broker_handoff=True,
-            ) is False
-        assert "cas_probe" not in _read(local_order_id)["meta"]
+            ) is False, label
+            assert "cas_probe" not in _read(local_order_id)["meta"]
 
         local_order_id = f"malformed-meta-{uuid.uuid4().hex}"
         _insert(local_order_id, meta=["not-an-object"])
@@ -4934,6 +5107,69 @@ def test_real_postgres_expected_no_broker_handoff_cas_fence(monkeypatch):
             expected_no_broker_handoff=True,
         ) is False
         assert "cas_probe" not in _read(local_order_id)["meta"]
+
+        # Real driver/PostgreSQL retry-lease CAS: the first consumer advances
+        # the exact prior snapshot; a second consumer presenting that stale
+        # snapshot must receive rowcount=0 and may not overwrite the lease.
+        retry_local_order_id = f"retry-cas-{uuid.uuid4().hex}"
+        now = datetime.now(timezone.utc)
+        retry_meta = {
+            "late_attachment_policy_eligible": True,
+            "restart_rearm_status": "RETRY_PENDING",
+            "restart_rearm_owner": f"restart_rearm:{client_id}:{mode}:{retry_local_order_id}",
+            "restart_rearm_reason": "late_attachment_market_truth_unavailable_or_unresolved",
+            "restart_rearm_attempt": 1,
+            "restart_rearm_next_at": (now - timedelta(seconds=1)).isoformat(),
+            "restart_rearm_deadline": (now + timedelta(seconds=60)).isoformat(),
+            "restart_rearm_first_failed_at": (now - timedelta(seconds=30)).isoformat(),
+            "restart_rearm_last_failed_at": (now - timedelta(seconds=1)).isoformat(),
+            "restart_rearm_client_id": client_id,
+            "restart_rearm_execution_mode": mode,
+            "restart_rearm_generation": 1,
+            "restart_rearm_session_key": _now_et().date().isoformat(),
+        }
+        _insert(retry_local_order_id, meta=retry_meta)
+        expected_retry_state = {
+            key: retry_meta.get(key)
+            for key in (
+                "restart_rearm_status",
+                "restart_rearm_owner",
+                "restart_rearm_reason",
+                "restart_rearm_attempt",
+                "restart_rearm_next_at",
+                "restart_rearm_deadline",
+                "restart_rearm_first_failed_at",
+                "restart_rearm_last_failed_at",
+                "restart_rearm_client_id",
+                "restart_rearm_execution_mode",
+                "restart_rearm_generation",
+                "restart_rearm_session_key",
+            )
+        }
+        advanced_patch = {
+            "restart_rearm_attempt": 2,
+            "restart_rearm_last_failed_at": now.isoformat(),
+        }
+        assert osm.update_order_meta(
+            retry_local_order_id,
+            advanced_patch,
+            expected_status="PENDING_TRIGGER",
+            expected_execution_mode=mode,
+            expected_signal_id=signal_id,
+            expected_no_broker_handoff=True,
+            expected_restart_rearm_state=expected_retry_state,
+        ) is True
+        assert osm.update_order_meta(
+            retry_local_order_id,
+            {"restart_rearm_attempt": 3},
+            expected_status="PENDING_TRIGGER",
+            expected_execution_mode=mode,
+            expected_signal_id=signal_id,
+            expected_no_broker_handoff=True,
+            expected_restart_rearm_state=expected_retry_state,
+        ) is False
+        persisted_retry = _read(retry_local_order_id)
+        assert persisted_retry["meta"]["restart_rearm_attempt"] == 2
     finally:
         try:
             with admin.cursor() as cursor:

@@ -2166,6 +2166,7 @@ class APOrderStateMachine:
         expected_execution_mode: str | None = None,
         expected_signal_id: str | None = None,
         expected_no_broker_handoff: bool = False,
+        expected_restart_rearm_state: dict | None = None,
     ) -> bool:
         """Merge *meta_patch* into orders.meta using a safe JSONB || merge.
 
@@ -2187,6 +2188,13 @@ class APOrderStateMachine:
         submit-intent, broker-submit, broker-ready, or authoritative broker
         ownership evidence. Ordinary callers retain the historical
         local-order/client scoped merge semantics.
+
+        ``expected_restart_rearm_state`` is the retry-owner CAS fence.  When
+        supplied, every field in the expected snapshot must still have the
+        exact same JSON value in ``orders.meta``.  This prevents two restart
+        consumers from both renewing the same lease from one stale read.
+        Missing and JSON ``null`` values compare equal because both represent
+        an absent prior retry field in the initial-claim shape.
 
         Returns True only when Postgres confirms rowcount > 0 (the row exists
         and was updated).  Returns False on not-found, CAS miss, or write error;
@@ -2216,6 +2224,27 @@ class APOrderStateMachine:
                 if expected_signal_id is not None:
                     _sql += " AND COALESCE(signal_id, '') = %s"
                     _params.append(str(expected_signal_id).strip())
+                if expected_restart_rearm_state is not None:
+                    if (
+                        not isinstance(expected_restart_rearm_state, dict)
+                        or not expected_restart_rearm_state
+                    ):
+                        return 0
+                    for _field, _expected_value in expected_restart_rearm_state.items():
+                        if not isinstance(_field, str) or not _field.strip():
+                            return 0
+                        try:
+                            _expected_json = _json_local.dumps(
+                                _expected_value,
+                                default=str,
+                            )
+                        except Exception:
+                            return 0
+                        _sql += (
+                            " AND COALESCE(COALESCE(meta, '{}'::jsonb)->%s, "
+                            "'null'::jsonb) = %s::jsonb"
+                        )
+                        _params.extend([_field, _expected_json])
                 if expected_no_broker_handoff:
                     _sql += (
                         " AND UPPER(BTRIM(COALESCE(status, ''))) = 'PENDING_TRIGGER'"
