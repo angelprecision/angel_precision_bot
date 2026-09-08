@@ -270,6 +270,16 @@ def test_json_null_position_member_preserves_complete_empty_authority():
     assert manual_mod._broker_position_contract_quantities(snapshot) == ({}, "")
 
 
+def test_position_envelope_missing_position_key_is_malformed():
+    snapshot = manual_mod.normalize_positions_payload(
+        {"positions": {"status": "ok"}}
+    )
+
+    assert snapshot.state == manual_mod.POSITIONS_MALFORMED
+    assert snapshot.rows == []
+    assert snapshot.reason == "broker_positions_node_malformed"
+
+
 def test_nested_error_position_envelope_is_malformed_not_empty_authority():
     snapshot = manual_mod.normalize_positions_payload(
         {"positions": {"position": [], "error": "unavailable"}}
@@ -343,6 +353,24 @@ def test_nested_error_snapshot_blocks_order_discovery_and_adoption(monkeypatch):
 def test_underlying_only_snapshot_blocks_order_discovery_and_adoption(monkeypatch):
     broker = _Broker(
         positions_payload=_payload([{"underlying": "AAPL", "quantity": 1}]),
+        orders=[_filled_exit()],
+    )
+    finalizer = MagicMock(return_value=True)
+    runner = _runner(broker, finalizer)
+    adopted = _install_scan(monkeypatch, finalizer)
+
+    manual_mod.detect_manual_closes(runner)
+
+    assert adopted == []
+    finalizer.assert_not_called()
+    assert len(broker.calls) == 1
+    assert "/positions" in broker.calls[0]
+    assert not any("/orders" in call for call in broker.calls)
+
+
+def test_missing_position_key_blocks_order_discovery_and_adoption(monkeypatch):
+    broker = _Broker(
+        positions_payload={"positions": {"status": "ok"}},
         orders=[_filled_exit()],
     )
     finalizer = MagicMock(return_value=True)

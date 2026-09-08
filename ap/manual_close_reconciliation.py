@@ -499,7 +499,13 @@ def normalize_positions_payload(payload: Any) -> BrokerPositionSnapshot:
             "broker_positions_node_malformed",
         )
 
-    rows = positions_node.get("position")
+    if "position" not in positions_node:
+        return BrokerPositionSnapshot(
+            POSITIONS_MALFORMED,
+            [],
+            "broker_positions_node_malformed",
+        )
+    rows = positions_node["position"]
     # Adapter contract: Tradier's empty-account response is represented by a
     # null positions node or a null position member.  Either is authoritative
     # empty only after the surrounding envelope has passed the error checks.
