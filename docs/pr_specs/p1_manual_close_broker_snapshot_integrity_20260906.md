@@ -2,7 +2,7 @@
 
 ## STATUS
 
-**IMPLEMENTATION PRESENT / HARD HOLD / DO NOT MERGE OR DEPLOY.**
+**IMPLEMENTATION PRESENT / MERGE REVIEW PENDING / DO NOT MERGE OR DEPLOY.**
 
 Base authority:
 
@@ -534,7 +534,7 @@ If a shared broker-position result type from #591 lands first and is correct for
 
 ## RELEASE GATE
 
-**HARD HOLD** until all are true:
+**MERGE REVIEW PENDING** until all are true:
 
 1. fail-first proves malformed/non-dict broker-position rows are silently dropped on current main;
 2. malformed/incomplete snapshots cannot become authoritative reduced lists;
