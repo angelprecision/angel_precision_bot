@@ -47,6 +47,7 @@ import os
 import types
 import uuid
 from typing import Optional
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -552,3 +553,231 @@ class TestIdentityMatrixRefusalPathways:
             },
         }
         assert w.recovery_trigger_evidence_identity_is_proven(row, local_oid) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  September 8 Jason LIVE production-shaped watch()/poll() regression
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSeptember8JasonLiveRecoveryRearm:
+    """Exercise the real recovery watch bridge with a durable OSM row.
+
+    This deliberately stops at watcher/lifecycle ownership. The fake OSM only
+    exposes a read of the canonical row plus recording mocks for broker-facing
+    methods; no selector, submit, cancel, position, or proof authority is
+    supplied by this regression.
+    """
+
+    client_id = "jasoncosby1@gmail.com"
+    execution_mode = "live"
+
+    @staticmethod
+    def _shape():
+        sid = str(uuid.uuid4())
+        canonical_sid = f"canonical:{sid}"
+        local_oid = f"tmo-recovery:{sid}"
+        metadata = {
+            "signal_id": sid,
+            "canonical_signal_id": canonical_sid,
+            "client_id": TestSeptember8JasonLiveRecoveryRearm.client_id,
+            "execution_mode": TestSeptember8JasonLiveRecoveryRearm.execution_mode,
+            "materialization_generation": 1,
+            "contract_deferred": True,
+        }
+        row = {
+            "status": "PENDING_TRIGGER",
+            "kind": "ENTRY",
+            "local_order_id": local_oid,
+            "signal_id": sid,
+            "canonical_signal_id": canonical_sid,
+            "client_id": TestSeptember8JasonLiveRecoveryRearm.client_id,
+            "execution_mode": TestSeptember8JasonLiveRecoveryRearm.execution_mode,
+            "broker_order_id": None,
+            "submitted_ts": None,
+            "meta": dict(metadata),
+        }
+        plan = types.SimpleNamespace(
+            signal_id=sid,
+            canonical_signal_id=canonical_sid,
+            ticker="TMO",
+            side="CALL",
+            score=80.0,
+            tier="A",
+            trigger_price=100.0,
+            entry_trigger=100.0,
+            stop_underlying=95.0,
+            target_underlying=110.0,
+            plan_id=f"plan:{sid}",
+            metadata=dict(metadata),
+            materialization_generation=1,
+            client_id=TestSeptember8JasonLiveRecoveryRearm.client_id,
+            execution_mode=TestSeptember8JasonLiveRecoveryRearm.execution_mode,
+            contract_symbol="DEFERRED:TMO",
+            pattern="2-1-2",
+            prior_day_high=100.1,
+            prior_day_low=94.9,
+            timeframe="5m",
+            strategy_type="continuation",
+        )
+        return sid, canonical_sid, local_oid, row, plan
+
+    @staticmethod
+    def _watcher(row):
+        import ap_entry_watcher as ew
+
+        class _OSM:
+            def __init__(self, durable_row):
+                self._durable_row = durable_row
+                self.get_order = MagicMock(side_effect=self._get_order)
+                self.cancel_pending_entry = MagicMock(return_value=True)
+                self.submit_existing_entry = MagicMock(return_value=True)
+                self.create_position = MagicMock(return_value=True)
+                self.create_proof_trade = MagicMock(return_value=True)
+
+            def _get_order(self, _local_order_id):
+                return dict(self._durable_row)
+
+        osm = _OSM(row)
+        broker = MagicMock()
+        broker.submit_order = MagicMock()
+        broker.cancel_order = MagicMock()
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=True,
+            mode="LIVE",
+        )
+        watcher._persist_watcher_audit = MagicMock()
+        watcher._persist_trigger_confirmation_authority = MagicMock(return_value=True)
+        watcher._is_regular_session_now = lambda: True
+        watcher._is_past_entry_cutoff_now = lambda: False
+        watcher._get_quote = lambda _ticker: {
+            "bid": 99.5,
+            "ask": 99.8,
+            "quote_age_ms": 1,
+        }
+        watcher._fetch_quotes = MagicMock(return_value={
+            "TMO": {"bid": 99.5, "ask": 100.1, "quote_age_ms": 1},
+        })
+        return watcher, osm, broker
+
+    def test_exact_recovery_restores_before_registration_and_triggers_legally(self):
+        import ap_lifecycle as L
+
+        sid, _canonical_sid, local_oid, row, plan = self._shape()
+        watcher, osm, broker = self._watcher(row)
+        registration_trace = []
+
+        class _TracedPending(list):
+            def append(self, watched):
+                registration_trace.append(
+                    ("behavior_active_registration", L.LEDGER.current_state(sid))
+                )
+                super().append(watched)
+
+        watcher._pending = _TracedPending()
+        assert L.LEDGER.current_state(sid) is None
+
+        # This is the production recovery call: the durable row is already
+        # PENDING_TRIGGER, while the fresh process ledger is empty.
+        assert watcher.watch(plan, local_oid, recovery_rearm=True) is True
+        assert L.LEDGER.current_state(sid) == L.SignalState.WATCHING
+        assert registration_trace == [
+            ("behavior_active_registration", L.SignalState.WATCHING),
+        ]
+        assert len(watcher._pending) == 1
+        assert watcher._dedup_set == {sid}
+
+        history = L.LEDGER.history(sid)
+        transitions = [(entry.from_state, entry.to_state) for entry in history]
+        assert (None, L.SignalState.ADOPTED) in transitions
+        assert (L.SignalState.ADOPTED, L.SignalState.WATCHING) in transitions
+        assert (None, L.SignalState.TRIGGER_READY) not in transitions
+        assert not any(
+            "ILLEGAL_TRANSITION" in str(entry.reason) for entry in history
+        )
+
+        # Restart/replay is idempotent: the exact same durable owner remains
+        # represented by one watcher and one dedup key.
+        assert watcher.watch(plan, local_oid, recovery_rearm=True) is True
+        assert len(watcher._pending) == 1
+        assert registration_trace == [
+            ("behavior_active_registration", L.SignalState.WATCHING),
+        ]
+
+        watcher.on_trigger = MagicMock(return_value={"disposition": "KEEP_WATCHER"})
+        watcher._poll_active_signals()
+        assert watcher.on_trigger.call_count == 0
+        watcher._poll_active_signals()
+        assert watcher.on_trigger.call_count == 1
+        assert L.LEDGER.current_state(sid) == L.SignalState.TRIGGER_READY
+        assert len(watcher._pending) == 1
+        assert watcher._dedup_set == {sid}
+        assert not any(
+            "ILLEGAL_TRANSITION" in str(entry.reason)
+            for entry in L.LEDGER.history(sid)
+        )
+
+        # Restoration and the retained callback made no broker or downstream
+        # mutation; this regression does not grant those authorities.
+        assert osm.cancel_pending_entry.call_count == 0
+        assert osm.submit_existing_entry.call_count == 0
+        assert osm.create_position.call_count == 0
+        assert osm.create_proof_trade.call_count == 0
+        assert broker.submit_order.call_count == 0
+        assert broker.cancel_order.call_count == 0
+
+    @pytest.mark.parametrize(
+        "field",
+        ["client_id", "execution_mode", "local_order_id", "signal_id", "canonical_signal_id"],
+    )
+    def test_exact_recovery_identity_mismatch_holds_without_registration(self, field):
+        import ap_lifecycle as L
+
+        sid, canonical_sid, local_oid, row, plan = self._shape()
+        wrong_value = {
+            "client_id": "another-client@example.com",
+            "execution_mode": "paper",
+            "local_order_id": f"wrong-order:{sid}",
+            "signal_id": f"wrong-signal:{sid}",
+            "canonical_signal_id": f"wrong-canonical:{sid}",
+        }[field]
+        if field == "local_order_id":
+            requested_local_oid = wrong_value
+        else:
+            requested_local_oid = local_oid
+            setattr(plan, field, wrong_value)
+            plan.metadata[field] = wrong_value
+            if field == "canonical_signal_id":
+                plan.canonical_signal_id = wrong_value
+            if field == "signal_id":
+                plan.signal_id = wrong_value
+        watcher, osm, broker = self._watcher(row)
+        watcher._is_regular_session_now = lambda: False
+
+        assert watcher.watch(plan, requested_local_oid, recovery_rearm=True) is False
+        assert L.LEDGER.current_state(sid) is None
+        assert watcher._pending == []
+        assert watcher._dedup_set == set()
+        assert "recovery_lifecycle" in watcher._last_reject_reason
+        assert osm.cancel_pending_entry.call_count == 0
+        assert osm.submit_existing_entry.call_count == 0
+        assert broker.submit_order.call_count == 0
+        assert broker.cancel_order.call_count == 0
+
+    def test_durable_broker_handoff_evidence_holds_before_lifecycle_restore(self):
+        import ap_lifecycle as L
+
+        sid, _canonical_sid, local_oid, row, plan = self._shape()
+        row["meta"]["submit_intent_at"] = "2026-09-08T16:00:00+00:00"
+        plan.metadata["submit_intent_at"] = row["meta"]["submit_intent_at"]
+        watcher, osm, broker = self._watcher(row)
+
+        assert watcher.watch(plan, local_oid, recovery_rearm=True) is False
+        assert L.LEDGER.current_state(sid) is None
+        assert watcher._pending == []
+        assert "broker_handoff" in watcher._last_reject_reason
+        assert osm.cancel_pending_entry.call_count == 0
+        assert osm.submit_existing_entry.call_count == 0
+        assert broker.submit_order.call_count == 0
+        assert broker.cancel_order.call_count == 0

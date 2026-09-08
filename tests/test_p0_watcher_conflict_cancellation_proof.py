@@ -1397,6 +1397,8 @@ def test_unproven_loser_cancellation_retries_after_deferred_hold():
 def test_recovery_rearm_coarms_healthy_prebreach_opposite_without_cancel():
     old = signal(signal_id="old", local_order_id="old-lo", side="PUT", score=70)
     new = signal(signal_id="new", local_order_id="new-lo", side="CALL", score=95)
+    # PR #580 recovery admission requires the exact canonical identity.
+    new["canonical_signal_id"] = "new"
     new["__recovery_rearm"] = True
     osm = FakeOSM(
         {"old-lo": row_for(old), "new-lo": row_for(new)},

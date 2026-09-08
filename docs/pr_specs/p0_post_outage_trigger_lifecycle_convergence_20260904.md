@@ -4,26 +4,28 @@
 
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
-Base: `09d30cff2f418e81c1a9bcec734f14f9f82a9a93`
-Head before amendment: `9fb3165fcc472aaa86bfdecc1c615df257c4beac`
-Amendment applied: 2026-09-07
+Base: `98eeaadae05f9e4e1db624703ec1e3cd758b732c`
+Head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
+Amendment applied: 2026-09-08
 
 Dependencies (§STATUS binding order):
-- PR #568 (deferred selector/materialization retry authority): **not merged** (draft, unstable)
-- PR #569 (fresh market truth / late watcher recovery): **not merged** (draft)
+- PR #568 (deferred selector/materialization retry authority): **merged** into
+  current main at `09d30cff2f418e81c1a9bcec734f14f9f82a9a93`
+- PR #569 (fresh market truth / late watcher recovery): **open/draft** and
+  remains a separate ownership boundary; it is not included in this amendment
 
 Implementation on this branch is preparatory only, per explicit override.
 Before merge:
-1. #568 and #569 must be finalized, audited, and merged separately.
-2. This branch must be rebased onto post-#568/#569 `main`.
-3. The PEP fail-first replay in `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`
-   must be re-run against the rebased head. If #568/#569 already
-   eliminate the defect at that point, this PR closes as obsolete/no-code.
-4. Full P0 regression must pass at the exact rebased HEAD SHA.
+1. #569 remains separately finalized and audited; no #569 code is copied here.
+2. This branch must remain based on the actual committed `main` SHA above.
+3. The PEP and September 8 Jason LIVE fail-first replays in
+   `tests/test_p0_post_outage_trigger_lifecycle_convergence.py` must pass
+   against the exact amended head.
+4. Full P0 regression must pass at the exact amended HEAD SHA.
 
-## AMEND PR #580 IN PLACE — Corrections applied 2026-09-07
+## AMEND PR #580 IN PLACE — Corrections applied 2026-09-08
 
-Five P0-class corrections applied surgically to `ap_entry_watcher.py` per
+Six P0-class corrections applied surgically to `ap_entry_watcher.py` per
 the amendment specification. Scope boundary unchanged.
 
 ### Correction 1 — Broker handoff must block recovery before watcher admission
@@ -50,6 +52,17 @@ no UUID fabrication, no mode fallback, no default side. Validated:
 and `materialization_generation` (zero/negative rejected).
 Any gap → HOLD.
 
+### Correction 6 — Recheck the exact durable row before recovery classification
+
+`watch(recovery_rearm=True)` now reloads the exact durable row and requires
+`status=PENDING_TRIGGER` plus one coherent
+`local_order_id`/`signal_id`/`canonical_signal_id`/`client_id`/
+`execution_mode` identity across the incoming plan, row columns, and row
+metadata. Conflicting or mismatched aliases, unavailable rows, and durable
+broker-handoff evidence HOLD before the shared classifier or watcher
+registration. This closes the plan-to-row identity gap without changing
+ordinary admissions or retry/terminal classifier precedence.
+
 ### Correction 3 — Lifecycle import failure must fail closed
 
 `_EW_LIFECYCLE_OK == False` path changed from soft success
@@ -75,17 +88,23 @@ Recovery never creates a second broker submission attempt.
 
 Production files touched:
 - `ap_entry_watcher.py`: `_restore_recovered_watcher_lifecycle()` fully
-  hardened (Corrections 1-4). New static method `_recovery_has_broker_handoff_evidence()`.
+  hardened (Corrections 1-4), plus the exact durable plan/row identity fence
+  in `watch()` (Correction 6). New static method
+  `_recovery_has_broker_handoff_evidence()`.
   `add_signal()` reordered: validate → lifecycle → register.
   Guarded by `signal["__recovery_rearm"]` — ordinary new admissions untouched.
 - `ap/pending_trigger_restart_recovery.py`: docstring only — documents
   the recovery-provenance contract with the new bridge.
 
 Supporting files:
-- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`: 15
-  tests. Fail-first replay for the PEP class, lifecycle restoration
-  matrix (NONE/ADOPTED/WATCHING/terminal), non-recovery-guard, identity
-  gate refusal, `NONE→TRIGGER_READY` invariant.
+- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`: 22
+  tests. Fail-first replay for the PEP class, exact September 8 Jason LIVE
+  `watch()`/poll trace, lifecycle restoration matrix
+  (NONE/ADOPTED/WATCHING/terminal), non-recovery guard, identity gate
+  refusal, `NONE→TRIGGER_READY` invariant, and zero broker mutation.
+- `tests/test_p0_pending_trigger_lifecycle_integrity.py::TestPR580AmendmentCorrections`:
+  26 focused amendment-correction tests; unrelated baseline tests in that
+  historical file are not part of this PR's gate.
 - `.github/workflows/p0_regression.yml`: adds the new test to the P0
   suite.
 
@@ -98,25 +117,24 @@ Files NOT touched (§4/§5 binding):
   schema. Zero new broker submit/cancel authority. No durable retry
   counter added.
 
-Adjacent regression status (against implementation on current main):
-- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`: 15/15 pass
-- `tests/test_p0_watcher_mvp_hardening.py`: pass
-- `tests/test_p0_watcher_recovery_execution_ownership.py`: pass
-- `tests/test_p0_watcher_rollback_exact_registration_identity.py`: pass
-- `tests/test_p0_pending_trigger_restart_recovery.py`: pass
-- `tests/test_p0_watcher_shim_api_parity.py`: pass
-- `tests/test_p0_watcher_invalidation_ownership.py`: pass
-- `tests/test_p0_watcher_breach_continuity_bounded_gap.py`: pass
-- `tests/test_p0_watcher_conflict_cancellation_proof.py`: pass
-- `tests/test_p0_pending_trigger_lifecycle_integrity.py`: 4 pre-existing
-  failures on current main, NOT caused by this patch (verified by
-  stash-and-rerun against unpatched HEAD).
+Focused status after this amendment:
+- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`: 22/22 pass
+- `tests/test_p0_pending_trigger_lifecycle_integrity.py::TestPR580AmendmentCorrections`:
+  26/26 pass
+- The full historical `tests/test_p0_pending_trigger_lifecycle_integrity.py`
+  file retains unrelated baseline failures on current main and is therefore
+  not used as the #580 gate target.
 
 This PR owns one failure class:
 
 > A valid deferred entry that regains watcher ownership after a database/readiness interruption must restore one coherent lifecycle authority and progress through the existing callback path. It must not loop forever on `NONE -> TRIGGER_READY`, reset callback attempt state, or terminalize a valid retry merely because restart reconstruction omitted lifecycle state.
 
 No strategy thresholds or broker semantics belong here.
+
+This PR does not modify `ap.pending_trigger_classifier` retry precedence or
+`_resolve_trigger_callback_disposition()` terminal-reason aliases. Those are
+the separate due-materialization-retry-liveness and terminal-watcher-
+convergence P0 ownership seams.
 
 ---
 

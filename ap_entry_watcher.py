@@ -2162,6 +2162,124 @@ class APEntryWatcher:
                 continue
         return {}
 
+    @staticmethod
+    def _recovery_identity_matches_durable_row(
+        signal: dict,
+        row: dict,
+        local_order_id: Optional[str],
+    ) -> tuple[bool, str]:
+        """Require one coherent recovery identity on plan and durable row.
+
+        This is the narrow bridge-side fence for PR #580. The upstream
+        recovery proof establishes that a row may be rearmed; this second
+        check makes sure the exact plan handed to ``watch()`` still names that
+        same PENDING_TRIGGER row before the classifier or lifecycle bridge can
+        run. Conflicting top-level/metadata aliases are HOLD, never a
+        best-effort merge.
+        """
+        if not isinstance(row, dict) or not row:
+            return False, "recovery_lifecycle_durable_row_unavailable"
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return False, "recovery_lifecycle_durable_row_not_pending_trigger"
+
+        def _metadata_sources(container: dict) -> tuple[list[dict], bool]:
+            sources: list[dict] = []
+            for key in ("metadata", "meta"):
+                if key not in container or container.get(key) is None:
+                    continue
+                raw = container.get(key)
+                if isinstance(raw, dict):
+                    sources.append(raw)
+                    continue
+                if isinstance(raw, str):
+                    if not raw.strip():
+                        continue
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        return [], False
+                    if not isinstance(parsed, dict):
+                        return [], False
+                    sources.append(parsed)
+                    continue
+                return [], False
+            return sources, True
+
+        signal_meta, signal_meta_ok = _metadata_sources(signal)
+        row_meta, row_meta_ok = _metadata_sources(row)
+        if not signal_meta_ok or not row_meta_ok:
+            return False, "recovery_lifecycle_malformed_durable_metadata"
+
+        def _coherent(
+            sources: list[dict],
+            aliases: tuple[str, ...],
+            field: str,
+            *,
+            lowercase: bool = False,
+        ) -> tuple[Optional[str], str]:
+            values: list[str] = []
+            for source in sources:
+                for alias in aliases:
+                    if alias not in source or source.get(alias) is None:
+                        continue
+                    raw = source.get(alias)
+                    if isinstance(raw, (bool, dict, list, tuple, set)):
+                        return None, f"recovery_lifecycle_malformed_{field}"
+                    value = str(raw).strip()
+                    if lowercase:
+                        value = value.lower()
+                    values.append(value)
+            if not values or not any(values):
+                return None, f"recovery_lifecycle_missing_{field}"
+            if any(not value for value in values) or len(set(values)) != 1:
+                return None, f"recovery_lifecycle_conflicting_{field}"
+            return values[0], ""
+
+        fields = (
+            ("local_order_id", ("local_order_id",), False),
+            ("signal_id", ("signal_id",), False),
+            ("canonical_signal_id", ("canonical_signal_id",), False),
+            ("client_id", ("client_id", "client_email"), True),
+            ("execution_mode", ("execution_mode", "mode"), True),
+        )
+        signal_sources = [signal, *signal_meta]
+        row_sources = [row, *row_meta]
+        incoming: dict[str, str] = {}
+        durable: dict[str, str] = {}
+        for field, aliases, lowercase in fields:
+            incoming_value, incoming_error = _coherent(
+                signal_sources, aliases, field, lowercase=lowercase,
+            )
+            if incoming_error:
+                return False, incoming_error
+            durable_value, durable_error = _coherent(
+                row_sources, aliases, field, lowercase=lowercase,
+            )
+            if durable_error:
+                return False, (
+                    "recovery_lifecycle_durable_"
+                    f"{durable_error.removeprefix('recovery_lifecycle_')}"
+                )
+            incoming[field] = incoming_value or ""
+            durable[field] = durable_value or ""
+
+        requested_local_order_id = str(local_order_id or "").strip()
+        if (
+            not requested_local_order_id
+            or incoming["local_order_id"] != requested_local_order_id
+        ):
+            return False, "recovery_lifecycle_identity_mismatch_local_order_id"
+        for field in (
+            "signal_id",
+            "canonical_signal_id",
+            "client_id",
+            "execution_mode",
+            "local_order_id",
+        ):
+            if incoming[field] != durable[field]:
+                return False, f"recovery_lifecycle_identity_mismatch_{field}"
+        return True, "recovery_lifecycle_durable_identity_proven"
+
     def _is_past_entry_cutoff_now(self) -> bool:
         try:
             now_et = datetime.now(ET)
@@ -4072,6 +4190,53 @@ class APEntryWatcher:
             signal_dict["__recovery_rearm"] = True
         if _materialization_resume:
             signal_dict["__materialization_resume"] = True
+
+        # PR #580: recovery lifecycle restoration may run only after the
+        # exact plan identity has been rechecked against the durable
+        # PENDING_TRIGGER row. This is deliberately before the shared
+        # classifier and before add_signal() can register behavior.
+        _recovery_row = {}
+        if _recovery_rearm and not _materialization_resume:
+            _recovery_row = self._load_order_row_for_recovery_rearm(local_order_id)
+            _identity_ok, _identity_reason = self._recovery_identity_matches_durable_row(
+                signal_dict, _recovery_row, local_order_id,
+            )
+            if not _identity_ok:
+                self._last_reject_reason = _identity_reason
+                log.critical(
+                    "[%s] RECOVERY_REARM_IDENTITY_HOLD local_order_id=%s reason=%s",
+                    ticker, local_order_id, _identity_reason,
+                )
+                try:
+                    self._persist_watcher_audit(local_order_id, {
+                        "reason_code": _identity_reason,
+                        "trigger_type": "recovery_rearm_identity_gate",
+                        "classification": "HOLD",
+                        "no_broker_mutation": True,
+                    })
+                except Exception:
+                    pass
+                return False
+            _row_meta = {}
+            for _row_meta_key in ("meta", "metadata"):
+                _raw_row_meta = _recovery_row.get(_row_meta_key)
+                if isinstance(_raw_row_meta, str):
+                    try:
+                        _raw_row_meta = json.loads(_raw_row_meta)
+                    except Exception:
+                        _raw_row_meta = {}
+                if isinstance(_raw_row_meta, dict):
+                    _row_meta.update(_raw_row_meta)
+            if self._recovery_has_broker_handoff_evidence(_recovery_row, _row_meta):
+                self._last_reject_reason = (
+                    "recovery_lifecycle_hold_broker_handoff_evidence"
+                )
+                log.critical(
+                    "[%s] RECOVERY_REARM_BROKER_HANDOFF_HOLD local_order_id=%s",
+                    ticker, local_order_id,
+                )
+                return False
+
         if _recovery_rearm and _materialization_resume:
             _plan_meta_for_adopt = getattr(plan, "metadata", None) or {}
             _adopt_fn = getattr(
@@ -4121,7 +4286,6 @@ class APEntryWatcher:
                     classify_pending_trigger_row,
                     is_safe_to_recovery_rearm,
                 )
-                _recovery_row = self._load_order_row_for_recovery_rearm(local_order_id)
                 _watcher_owned = self.has_order(local_order_id)
                 _past_entry_cutoff = self._is_past_entry_cutoff_now()
                 _already_through = None
