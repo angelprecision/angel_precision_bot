@@ -4,8 +4,10 @@
 
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
-Base: `98eeaadae05f9e4e1db624703ec1e3cd758b732c`
-Head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
+Base: `84d8d61278d45040d8a6830e58c0ac912d683ff2`
+Audited deployed main: `98eeaadae05f9e4e1db624703ec1e3cd758b732c`
+Original head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
+Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92bf4be`
 Amendment applied: 2026-09-08
 
 Dependencies (§STATUS binding order):
