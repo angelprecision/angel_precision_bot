@@ -6,6 +6,7 @@ import threading
 import time
 import types
 import datetime as _dt_module
+from copy import deepcopy
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -16,6 +17,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:
 
 import ap_overnight_reeval as ov
 import client_runner as cr
+import ap.preopen_readiness as readiness
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -183,6 +185,172 @@ def _durable_row(
             "ap_signals_status": "SUCCESS",
         },
     }
+
+
+def _parity_consumers(monkeypatch, row):
+    """Run the same durable row through readiness and restart hydration."""
+    today = _dt(9).date()
+    handoff = types.ModuleType("ap.morning_handoff")
+    handoff._load_handoff_run_lock = lambda **kwargs: deepcopy(row)
+    handoff._latest_handoff_rows = lambda trading_date: [deepcopy(row)]
+    monkeypatch.setitem(sys.modules, "ap.morning_handoff", handoff)
+
+    runner = _durable_runner()
+    runner._load_durable_overnight_reeval_state(today, refresh=True)
+    runner_success = runner._overnight_reeval_success_date == today
+
+    readiness_status, _ = readiness._overnight_status(
+        SimpleNamespace(),
+        {},
+        today.isoformat(),
+        client_id="jose@example.com",
+        execution_mode="live",
+        stage="manual",
+        now=_dt(9, 30),
+    )
+    readiness_success = readiness_status == "success"
+    return runner_success, readiness_success
+
+
+def _valid_durable_success_row():
+    return _durable_row(
+        status="success",
+        result_class="COMPLETED_WITH_DECISIONS",
+        completed=True,
+        retryable=False,
+        source_lookup_partial=False,
+        source_identity_conflict=False,
+        generation=7,
+        attempt_id="2026-07-23:7:valid-success",
+    )
+
+
+def test_runner_and_readiness_accept_the_same_valid_durable_success(monkeypatch):
+    runner_success, readiness_success = _parity_consumers(
+        monkeypatch,
+        _valid_durable_success_row(),
+    )
+
+    assert runner_success is True
+    assert readiness_success is True
+
+
+@pytest.mark.parametrize(
+    "case,mutate",
+    [
+        ("row_client_id_mismatch", lambda row: row.update(client_id="other@example.com")),
+        ("row_execution_mode_mismatch", lambda row: row.update(execution_mode="paper")),
+        ("row_trading_date_mismatch", lambda row: row.update(trading_date="2026-07-24")),
+        ("details_client_id_mismatch", lambda row: row["details"].update(client_id="other@example.com")),
+        ("details_execution_mode_mismatch", lambda row: row["details"].update(execution_mode="paper")),
+        ("details_trading_date_mismatch", lambda row: row["details"].update(trading_date="2026-07-24")),
+        ("missing_session_key", lambda row: row["details"].update(overnight_reeval_session_key=None)),
+        ("blank_session_key", lambda row: row["details"].update(overnight_reeval_session_key="")),
+        ("malformed_session_key", lambda row: row["details"].update(overnight_reeval_session_key="not-a-date")),
+        ("missing_attempt_id", lambda row: row["details"].update(attempt_id=None)),
+        ("zero_generation", lambda row: row["details"].update(attempt_generation=0)),
+        ("negative_generation", lambda row: row["details"].update(attempt_generation=-1)),
+        ("malformed_generation", lambda row: row["details"].update(attempt_generation="7")),
+        ("boolean_generation", lambda row: row["details"].update(attempt_generation=True)),
+        ("boolean_source_conflict", lambda row: row["details"].update(source_identity_conflict=True)),
+        (
+            "result_class_source_conflict",
+            lambda row: row["details"].update(
+                source_identity_conflict=False,
+                source_identity_conflicts=False,
+                result_class="SOURCE_IDENTITY_CONFLICT",
+            ),
+        ),
+        ("source_lookup_partial", lambda row: row["details"].update(source_lookup_partial=True)),
+        ("trade_queue_not_success", lambda row: row["details"].update(trade_queue_status="FAILED")),
+        ("ap_signals_not_success", lambda row: row["details"].update(ap_signals_status="UNKNOWN")),
+        ("completed_false", lambda row: row["details"].update(completed=False)),
+        ("retryable_true", lambda row: row["details"].update(retryable=True)),
+        ("missing_last_success_at", lambda row: row.update(last_success_at=None)),
+    ],
+)
+def test_runner_and_readiness_reject_the_same_malformed_or_incomplete_authority(
+    monkeypatch,
+    case,
+    mutate,
+):
+    row = _valid_durable_success_row()
+    mutate(row)
+
+    runner_success, readiness_success = _parity_consumers(monkeypatch, row)
+
+    assert runner_success is False, case
+    assert readiness_success is False, case
+
+
+@pytest.mark.parametrize(
+    "newer",
+    [
+        {
+            "status": "partial",
+            "result_class": "RETRYABLE_PARTIAL_SOURCE_INVENTORY",
+            "completed": False,
+            "retryable": True,
+            "source_lookup_partial": True,
+        },
+        {
+            "status": "failed",
+            "result_class": "RETRYABLE_EXCEPTION",
+            "completed": False,
+            "retryable": True,
+            "source_lookup_partial": False,
+        },
+        {
+            "status": "partial",
+            "result_class": "SOURCE_IDENTITY_CONFLICT",
+            "completed": False,
+            "retryable": False,
+            "source_lookup_partial": False,
+            "source_identity_conflict": True,
+        },
+    ],
+    ids=["newer-partial", "newer-failed", "newer-source-conflict"],
+)
+def test_newer_attempt_invalidates_older_success_for_both_consumers(monkeypatch, newer):
+    row = _durable_row(
+        generation=8,
+        attempt_id="2026-07-23:8:newer",
+        **newer,
+    )
+
+    runner_success, readiness_success = _parity_consumers(monkeypatch, row)
+
+    assert runner_success is False
+    assert readiness_success is False
+
+
+def test_restart_rejected_authority_does_not_return_already_completed(monkeypatch):
+    row = _valid_durable_success_row()
+    row["details"]["execution_mode"] = "paper"
+    row["details"]["attempt_generation"] = 1
+    row["details"]["attempt_count"] = 1
+    calls = []
+    handoff = types.ModuleType("ap.morning_handoff")
+    handoff._load_handoff_run_lock = lambda **kwargs: deepcopy(row)
+    handoff._claim_overnight_reeval_attempt = (
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "attempt_id": "2026-07-23:8:new-legitimate-attempt",
+            "attempt_generation": 8,
+            "attempt_count": 8,
+            "session_key": "2026-07-23",
+        }
+    )
+    monkeypatch.setitem(sys.modules, "ap.morning_handoff", handoff)
+    monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: _result())
+
+    runner = _durable_runner()
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9, 30), source="scheduler")
+
+    assert result["result_class"] != "ALREADY_COMPLETED"
+    assert result["attempt_performed"] is True
+    assert len(calls) == 1
+    assert runner._overnight_reeval_success_date is None
 
 
 def test_newly_constructed_runner_hydrates_latest_partial_after_prior_success(monkeypatch):

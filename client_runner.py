@@ -720,6 +720,7 @@ class ClientRunner(threading.Thread):
         self._overnight_reeval_attempt_count = 0
         self._overnight_reeval_attempt_generation = 0
         self._overnight_reeval_attempt_id = None
+        self._overnight_reeval_session_key = None
         self._overnight_reeval_durable_state_loaded_date = None
         self._overnight_reeval_durable_attempts_enabled = True
         self._overnight_reeval_durable_load_failed = False
@@ -1920,6 +1921,7 @@ class ClientRunner(threading.Thread):
             self._overnight_reeval_durable_load_failed = True
             # Never let a stale local success survive an authority outage.
             self._overnight_reeval_success_date = None
+            self._overnight_reeval_session_key = None
             return False
 
         self._overnight_reeval_durable_state_loaded_date = today
@@ -1927,15 +1929,33 @@ class ClientRunner(threading.Thread):
         if not isinstance(row, dict):
             self._overnight_reeval_attempt_generation = 0
             self._overnight_reeval_attempt_id = None
+            self._overnight_reeval_session_key = None
             self._overnight_reeval_success_date = None
             return True
 
-        details = row.get("details") or {}
-        if isinstance(details, str):
-            try:
-                details = json.loads(details)
-            except Exception:
-                details = {}
+        try:
+            from ap.preopen_readiness import _validate_durable_overnight_success
+
+            durable_success, authority = _validate_durable_overnight_success(
+                row,
+                client_id=str(self.email or "").strip(),
+                execution_mode=str(self.mode or "").strip().lower(),
+                trading_date=today.isoformat(),
+            )
+        except Exception as exc:
+            logger.critical(
+                "[%s] durable overnight authority validator failed date=%s: %s",
+                getattr(self, "email", ""), today, exc, exc_info=True,
+            )
+            durable_success = False
+            authority = {
+                "details": {},
+                "attempt_id": "",
+                "attempt_generation": 0,
+                "overnight_reeval_session_key": "",
+                "validation_errors": ("validator_failure",),
+            }
+        details = authority.get("details") if isinstance(authority, dict) else {}
         if not isinstance(details, dict):
             details = {}
 
@@ -1945,12 +1965,16 @@ class ClientRunner(threading.Thread):
             return value if value >= 0 else default
 
         self._overnight_reeval_attempt_generation = _positive_int(
-            details.get("attempt_generation"),
+            authority.get("attempt_generation") if isinstance(authority, dict) else 0,
         )
-        _attempt_id = details.get("attempt_id")
-        self._overnight_reeval_attempt_id = (
-            _attempt_id.strip() if isinstance(_attempt_id, str) and _attempt_id.strip() else None
+        _attempt_id = authority.get("attempt_id") if isinstance(authority, dict) else ""
+        self._overnight_reeval_attempt_id = _attempt_id or None
+        _session_key = (
+            authority.get("overnight_reeval_session_key")
+            if isinstance(authority, dict)
+            else ""
         )
+        self._overnight_reeval_session_key = _session_key or None
         self._overnight_reeval_attempt_count = _positive_int(
             details.get("attempt_count"),
         )
@@ -1970,20 +1994,6 @@ class ClientRunner(threading.Thread):
         self._overnight_reeval_next_retry_at = _parse_dt(details.get("next_retry_at"))
 
         status = str(row.get("status") or "").strip().lower()
-        durable_success = (
-            status == "success"
-            and details.get("completed") is True
-            and details.get("retryable") is False
-            and details.get("source_lookup_partial") is False
-            and not details.get("source_identity_conflict")
-            and not details.get("source_identity_conflicts")
-            and details.get("trade_queue_status") == "SUCCESS"
-            and details.get("ap_signals_status") == "SUCCESS"
-            and isinstance(row.get("last_success_at"), str)
-            and bool(row.get("last_success_at").strip())
-            and bool(self._overnight_reeval_attempt_id)
-            and self._overnight_reeval_attempt_generation > 0
-        )
         self._overnight_reeval_success_date = today if durable_success else None
         self._overnight_reeval_exhausted_date = (
             today
@@ -2006,6 +2016,7 @@ class ClientRunner(threading.Thread):
             self._overnight_reeval_attempt_id = (
                 f"local:{today.isoformat()}:{self._overnight_reeval_attempt_generation}:{uuid.uuid4().hex}"
             )
+            self._overnight_reeval_session_key = session_key
             return {
                 "attempt_id": self._overnight_reeval_attempt_id,
                 "attempt_generation": self._overnight_reeval_attempt_generation,
@@ -2024,6 +2035,7 @@ class ClientRunner(threading.Thread):
             self._overnight_reeval_attempt_id = str(claim["attempt_id"]).strip()
             self._overnight_reeval_attempt_generation = int(claim["attempt_generation"])
             self._overnight_reeval_attempt_count = int(claim["attempt_count"])
+            self._overnight_reeval_session_key = str(session_key or "").strip() or None
             self._overnight_reeval_success_date = None
             self._overnight_reeval_exhausted_date = None
             self._overnight_reeval_next_retry_at = None
@@ -2048,6 +2060,7 @@ class ClientRunner(threading.Thread):
         self._overnight_reeval_attempt_count = 0
         self._overnight_reeval_attempt_generation = 0
         self._overnight_reeval_attempt_id = None
+        self._overnight_reeval_session_key = None
         self._overnight_reeval_last_result_class = None
         self._overnight_reeval_last_retry_reason = None
         self._overnight_reeval_durable_state_loaded_date = None

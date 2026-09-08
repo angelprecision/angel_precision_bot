@@ -575,6 +575,144 @@ def _load_durable_overnight_attempt(
         return None, f"{type(exc).__name__}:{exc}"
 
 
+def _validate_durable_overnight_success(
+    row: dict | None,
+    *,
+    client_id: str,
+    execution_mode: str,
+    trading_date: str,
+) -> tuple[bool, dict]:
+    """Parse and validate the one durable overnight-success authority.
+
+    Both restart hydration and pre-open readiness must consume this exact
+    predicate.  A row is successful only when its columns and persisted
+    details independently prove the same client/mode/date attempt, session,
+    completion truth, source completeness, and conflict-free result.
+    """
+    errors: list[str] = []
+    parsed_details: dict = {}
+    if not isinstance(row, dict):
+        errors.append("durable_row_missing_or_malformed")
+    else:
+        raw_details = row.get("details")
+        if isinstance(raw_details, str):
+            try:
+                raw_details = json.loads(raw_details)
+            except Exception:
+                raw_details = None
+                errors.append("durable_details_malformed")
+        if isinstance(raw_details, dict):
+            parsed_details = dict(raw_details)
+        else:
+            if "durable_details_malformed" not in errors:
+                errors.append("durable_details_missing_or_malformed")
+
+    expected_client = str(client_id or "").strip()
+    expected_mode = _normalize_mode(execution_mode)
+    expected_date = str(trading_date or "").strip()
+    if not expected_client:
+        errors.append("expected_client_id_missing_or_malformed")
+    if not expected_mode:
+        errors.append("expected_execution_mode_missing_or_malformed")
+    if not expected_date:
+        errors.append("expected_trading_date_missing_or_malformed")
+
+    def _strict_text(value) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    row_client = _strict_text(row.get("client_id")) if isinstance(row, dict) else ""
+    row_mode = _normalize_mode(row.get("execution_mode")) if isinstance(row, dict) else ""
+    row_date = _strict_text(row.get("trading_date")) if isinstance(row, dict) else ""
+    row_stage = _strict_text(row.get("stage")).lower() if isinstance(row, dict) else ""
+    detail_client = _strict_text(parsed_details.get("client_id"))
+    detail_mode = _normalize_mode(parsed_details.get("execution_mode"))
+    detail_date = _strict_text(parsed_details.get("trading_date"))
+
+    if row_client != expected_client:
+        errors.append("row_client_id_mismatch")
+    if row_mode != expected_mode:
+        errors.append("row_execution_mode_mismatch")
+    if row_date != expected_date:
+        errors.append("row_trading_date_mismatch")
+    if row_stage != "overnight_reeval":
+        errors.append("row_stage_mismatch")
+    if detail_client != expected_client:
+        errors.append("details_client_id_mismatch")
+    if detail_mode != expected_mode:
+        errors.append("details_execution_mode_mismatch")
+    if detail_date != expected_date:
+        errors.append("details_trading_date_mismatch")
+
+    attempt_id = _strict_text(parsed_details.get("attempt_id"))
+    if not attempt_id:
+        errors.append("attempt_id_missing_or_malformed")
+
+    raw_generation = parsed_details.get("attempt_generation")
+    attempt_generation = (
+        raw_generation
+        if isinstance(raw_generation, int)
+        and not isinstance(raw_generation, bool)
+        and raw_generation > 0
+        else 0
+    )
+    if attempt_generation <= 0:
+        errors.append("attempt_generation_missing_or_invalid")
+
+    session_key = _strict_text(parsed_details.get("overnight_reeval_session_key"))
+    if not session_key:
+        errors.append("overnight_reeval_session_key_missing")
+    else:
+        try:
+            session_date = datetime.strptime(session_key, "%Y-%m-%d").date().isoformat()
+        except (TypeError, ValueError):
+            session_date = ""
+        if session_key != expected_date or session_date != expected_date:
+            errors.append("overnight_reeval_session_key_invalid")
+
+    last_success_at = _strict_text(row.get("last_success_at")) if isinstance(row, dict) else ""
+    if not last_success_at:
+        errors.append("last_success_at_missing_or_malformed")
+    else:
+        try:
+            datetime.fromisoformat(last_success_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            errors.append("last_success_at_missing_or_malformed")
+
+    source_identity_conflict = bool(
+        parsed_details.get("source_identity_conflict")
+        or parsed_details.get("source_identity_conflicts")
+        or str(parsed_details.get("result_class") or "").strip().upper()
+        == "SOURCE_IDENTITY_CONFLICT"
+    )
+    if source_identity_conflict:
+        errors.append("source_identity_conflict")
+
+    status = _strict_text(row.get("status")).lower() if isinstance(row, dict) else ""
+    if status != "success":
+        errors.append("status_not_success")
+    if parsed_details.get("completed") is not True:
+        errors.append("completed_not_true")
+    if parsed_details.get("retryable") is not False:
+        errors.append("retryable_not_false")
+    if parsed_details.get("source_lookup_partial") is not False:
+        errors.append("source_lookup_partial")
+    if parsed_details.get("trade_queue_status") != "SUCCESS":
+        errors.append("trade_queue_status_not_success")
+    if parsed_details.get("ap_signals_status") != "SUCCESS":
+        errors.append("ap_signals_status_not_success")
+
+    authority = {
+        "details": parsed_details,
+        "attempt_id": attempt_id,
+        "attempt_generation": attempt_generation,
+        "overnight_reeval_session_key": session_key,
+        "last_success_at": last_success_at,
+        "source_identity_conflict": source_identity_conflict,
+        "validation_errors": tuple(dict.fromkeys(errors)),
+    }
+    return not errors, authority
+
+
 def _overnight_status(
     runner,
     client_state: dict,
@@ -615,56 +753,17 @@ def _overnight_status(
             "durable_authority": "missing",
         }
 
-    details = row.get("details") if isinstance(row.get("details"), dict) else {}
-    row_client = row.get("client_id").strip() if isinstance(row.get("client_id"), str) else ""
-    row_mode = _normalize_mode(row.get("execution_mode"))
-    row_date = row.get("trading_date").strip()[:10] if isinstance(row.get("trading_date"), str) else ""
-    detail_client = details.get("client_id").strip() if isinstance(details.get("client_id"), str) else ""
-    detail_mode = _normalize_mode(details.get("execution_mode"))
-    detail_date = details.get("trading_date").strip()[:10] if isinstance(details.get("trading_date"), str) else ""
-    attempt_id = details.get("attempt_id").strip() if isinstance(details.get("attempt_id"), str) else ""
-    raw_attempt_generation = details.get("attempt_generation")
-    attempt_generation = (
-        raw_attempt_generation
-        if isinstance(raw_attempt_generation, int)
-        and not isinstance(raw_attempt_generation, bool)
-        and raw_attempt_generation > 0
-        else 0
+    durable_success, authority = _validate_durable_overnight_success(
+        row,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        trading_date=trading_date,
     )
-    session_key = (
-        details.get("overnight_reeval_session_key").strip()
-        if isinstance(details.get("overnight_reeval_session_key"), str)
-        else ""
-    )
-    source_conflict = bool(
-        details.get("source_identity_conflict")
-        or details.get("source_identity_conflicts")
-        or str(details.get("result_class") or "").strip().upper()
-        == "SOURCE_IDENTITY_CONFLICT"
-    )
-    authority_identity_ok = (
-        row_client == client_id
-        and row_mode == execution_mode
-        and row_date == trading_date
-        and detail_client == client_id
-        and detail_mode == execution_mode
-        and detail_date == trading_date
-        and bool(attempt_id)
-        and attempt_generation > 0
-        and bool(session_key)
-    )
-    durable_success = (
-        str(row.get("status") or "").strip().lower() == "success"
-        and isinstance(row.get("last_success_at"), str)
-        and bool(row.get("last_success_at").strip())
-        and authority_identity_ok
-        and details.get("completed") is True
-        and details.get("retryable") is False
-        and details.get("source_lookup_partial") is False
-        and not source_conflict
-        and details.get("trade_queue_status") == "SUCCESS"
-        and details.get("ap_signals_status") == "SUCCESS"
-    )
+    details = authority["details"]
+    attempt_id = authority["attempt_id"]
+    attempt_generation = authority["attempt_generation"]
+    session_key = authority["overnight_reeval_session_key"]
+    source_conflict = authority["source_identity_conflict"]
     diagnostic = {
         "source": "handoff_run_locks.overnight_reeval",
         "durable_authority": "valid_success" if durable_success else "unresolved",
@@ -677,6 +776,7 @@ def _overnight_status(
         "overnight_reeval_session_key": session_key or None,
         "source_lookup_partial": details.get("source_lookup_partial"),
         "source_identity_conflict": source_conflict,
+        "validation_errors": list(authority["validation_errors"]),
     }
     if durable_success:
         return "success", diagnostic
