@@ -81,6 +81,9 @@ POSITION_COMPLETE_STATES = frozenset(
         POSITIONS_AVAILABLE_COMPLETE_EMPTY,
     }
 )
+_POSITION_ERROR_STATUSES = frozenset(
+    {"error", "failed", "failure", "unavailable"}
+)
 VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 MANUAL_CLOSE_SIDES = frozenset(
     {"sell_to_close", "sell-to-close", "selltoclose", "stc"}
@@ -307,7 +310,18 @@ def _position_field_is_present(value: Any) -> bool:
     )
 
 
+def _position_envelope_has_error(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    status = str(value.get("status") or "").strip().lower()
+    return status in _POSITION_ERROR_STATUSES or any(
+        key in value and _position_field_is_present(value.get(key))
+        for key in ("error", "errors", "message", "reason")
+    )
+
+
 def _position_quantity(row: dict) -> int | None:
+    """Return one validated, signed, non-zero broker position quantity."""
     values: list[int] = []
     for key in _POSITION_QUANTITY_KEYS:
         if key not in row:
@@ -315,8 +329,16 @@ def _position_quantity(row: dict) -> int | None:
         raw_value = row.get(key)
         if not _position_field_is_present(raw_value):
             return None
-        quantity = positive_int(raw_value)
-        if quantity <= 0:
+        if isinstance(raw_value, bool):
+            return None
+        try:
+            numeric = float(raw_value)
+        except Exception:
+            return None
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            return None
+        quantity = int(numeric)
+        if quantity == 0:
             return None
         values.append(quantity)
     if not values or len(set(values)) != 1:
@@ -328,6 +350,7 @@ def _position_identity(row: dict) -> tuple[str, str, str]:
     """Return ``(kind, identity, reason)`` for one broker position row."""
     exact_contracts: list[str] = []
     non_option_symbols: list[str] = []
+    underlying_symbols: list[str] = []
     invalid_identity = False
 
     for key in _POSITION_OPTION_IDENTITY_KEYS:
@@ -355,7 +378,7 @@ def _position_identity(row: dict) -> tuple[str, str, str]:
             continue
         normalized = normalize_contract(row.get(key))
         if _POSITION_NON_OPTION_SYMBOL_RE.fullmatch(normalized):
-            non_option_symbols.append(normalized)
+            underlying_symbols.append(normalized)
         else:
             invalid_identity = True
 
@@ -367,7 +390,10 @@ def _position_identity(row: dict) -> tuple[str, str, str]:
     if exact_contracts:
         contract = exact_contracts[0]
         underlying = contract[:-15]
-        if any(symbol != underlying for symbol in non_option_symbols):
+        if any(
+            symbol != underlying
+            for symbol in (*non_option_symbols, *underlying_symbols)
+        ):
             return "ambiguous", "", "position_identity_underlying_conflict"
         return "option", contract, ""
 
@@ -380,10 +406,11 @@ def _position_identity(row: dict) -> tuple[str, str, str]:
         option_hint = True
     if option_hint:
         return "invalid", "", "option_row_missing_exact_occ_identity"
-    if len(set(non_option_symbols)) > 1:
+    all_non_option_symbols = [*non_option_symbols, *underlying_symbols]
+    if len(set(all_non_option_symbols)) > 1:
         return "ambiguous", "", "conflicting_non_option_identity"
     if not non_option_symbols:
-        return "invalid", "", "position_identity_missing"
+        return "invalid", "", "non_option_identity_missing"
     return "non_option", non_option_symbols[0], ""
 
 
@@ -404,6 +431,11 @@ def _normalize_position_rows(rows: Any) -> BrokerPositionSnapshot:
                 [],
                 f"position_row_{index}_not_mapping",
             )
+        kind, identity, reason = _position_identity(row)
+        if kind == "ambiguous":
+            return BrokerPositionSnapshot(POSITIONS_AMBIGUOUS, [], reason)
+        if kind != "option" and kind != "non_option":
+            return BrokerPositionSnapshot(POSITIONS_INCOMPLETE, [], reason)
         quantity = _position_quantity(row)
         if quantity is None:
             return BrokerPositionSnapshot(
@@ -411,11 +443,6 @@ def _normalize_position_rows(rows: Any) -> BrokerPositionSnapshot:
                 [],
                 f"position_row_{index}_quantity_invalid",
             )
-        kind, identity, reason = _position_identity(row)
-        if kind == "ambiguous":
-            return BrokerPositionSnapshot(POSITIONS_AMBIGUOUS, [], reason)
-        if kind != "option" and kind != "non_option":
-            return BrokerPositionSnapshot(POSITIONS_INCOMPLETE, [], reason)
         if kind == "option":
             if identity in option_contracts:
                 return BrokerPositionSnapshot(
@@ -443,10 +470,7 @@ def normalize_positions_payload(payload: Any) -> BrokerPositionSnapshot:
             [],
             "broker_positions_payload_malformed",
         )
-    if any(
-        key in payload and _position_field_is_present(payload.get(key))
-        for key in ("error", "errors", "message", "reason")
-    ):
+    if _position_envelope_has_error(payload):
         return BrokerPositionSnapshot(
             POSITIONS_MALFORMED,
             [],
@@ -462,20 +486,24 @@ def normalize_positions_payload(payload: Any) -> BrokerPositionSnapshot:
             [],
             "broker_positions_node_malformed",
         )
-    if any(
-        key in positions_node and _position_field_is_present(positions_node.get(key))
-        for key in ("error", "errors", "message", "reason")
-    ):
+    if _position_envelope_has_error(positions_node):
         return BrokerPositionSnapshot(
             POSITIONS_MALFORMED,
             [],
             "broker_positions_node_error",
         )
     if not positions_node:
-        return BrokerPositionSnapshot(POSITIONS_AVAILABLE_COMPLETE_EMPTY, [])
+        return BrokerPositionSnapshot(
+            POSITIONS_MALFORMED,
+            [],
+            "broker_positions_node_malformed",
+        )
 
     rows = positions_node.get("position")
-    if rows == "null":
+    # Adapter contract: Tradier's empty-account response is represented by a
+    # null positions node or a null position member.  Either is authoritative
+    # empty only after the surrounding envelope has passed the error checks.
+    if rows is None or rows == "null":
         return BrokerPositionSnapshot(POSITIONS_AVAILABLE_COMPLETE_EMPTY, [])
     if isinstance(rows, dict):
         rows = [rows]
@@ -536,12 +564,15 @@ def _broker_position_contract_quantities(
         if not isinstance(row, dict):
             return None, "normalized_position_row_not_mapping"
         contract = normalize_contract(row.get("symbol"))
-        quantity = positive_int(row.get("quantity"))
-        if not is_valid_occ_contract(contract) or quantity <= 0:
-            # Non-option rows were validated at the snapshot boundary and do
-            # not establish option-contract presence/absence.
-            if not is_valid_occ_contract(contract):
-                continue
+        # Non-option rows were validated at the snapshot boundary and do not
+        # establish option-contract presence/absence. Exact option rows use
+        # the same signed, non-zero quantity contract as normalization so a
+        # valid short position remains presence evidence without becoming a
+        # false absence.
+        if not is_valid_occ_contract(contract):
+            continue
+        quantity = _position_quantity(row)
+        if quantity is None:
             return None, "normalized_option_row_invalid"
         if contract in contract_quantities:
             return None, f"duplicate_exact_occ:{contract}"

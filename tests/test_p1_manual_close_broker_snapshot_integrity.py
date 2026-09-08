@@ -131,8 +131,9 @@ def test_valid_and_non_dict_rows_are_incomplete_not_a_reduced_complete_snapshot(
         None,
         [],
         {"positions": []},
+        {"positions": {}},
         {"positions": {"position": "malformed"}},
-        {"positions": {"position": None}},
+        {"status": "unavailable", "positions": None},
     ],
 )
 def test_malformed_position_envelopes_are_not_empty_authority(payload):
@@ -142,7 +143,7 @@ def test_malformed_position_envelopes_are_not_empty_authority(payload):
     assert snapshot.rows == []
 
 
-@pytest.mark.parametrize("quantity", [-1, 0, 1.5, True, float("nan"), math.inf, "bad"])
+@pytest.mark.parametrize("quantity", [0, 1.5, True, float("nan"), math.inf, "bad"])
 def test_invalid_option_quantity_invalidates_the_whole_snapshot(quantity):
     snapshot = manual_mod.normalize_positions_payload(
         _payload([{"symbol": CONTRACT, "quantity": quantity}])
@@ -150,6 +151,23 @@ def test_invalid_option_quantity_invalidates_the_whole_snapshot(quantity):
 
     assert snapshot.state == manual_mod.POSITIONS_INCOMPLETE
     assert snapshot.rows == []
+
+
+def test_signed_position_quantities_preserve_exact_presence_evidence():
+    snapshot = manual_mod.normalize_positions_payload(
+        _payload(
+            [
+                {"symbol": CONTRACT, "quantity": -1},
+                {"symbol": "MSFT", "quantity": -100},
+            ]
+        )
+    )
+
+    assert snapshot.state == manual_mod.POSITIONS_AVAILABLE_COMPLETE_NONEMPTY
+    assert [row["quantity"] for row in snapshot.rows] == [-1, -100]
+    quantities, reason = manual_mod._broker_position_contract_quantities(snapshot)
+    assert quantities == {CONTRACT: -1}
+    assert reason == ""
 
 
 def test_conflicting_quantity_aliases_invalidate_the_whole_snapshot():
@@ -168,6 +186,7 @@ def test_conflicting_quantity_aliases_invalidate_the_whole_snapshot():
         {"symbol": "not-an-occ-symbol", "quantity": 1},
         {"symbol": "AAPL", "side": "CALL", "quantity": 1},
         {"option_symbol": "", "quantity": 1},
+        {"underlying": "AAPL", "quantity": 1},
     ],
 )
 def test_weak_or_missing_option_identity_invalidates_the_whole_snapshot(row):
@@ -235,6 +254,16 @@ def test_documented_null_positions_payload_is_complete_empty_authority():
 
 def test_json_null_positions_node_preserves_complete_empty_authority():
     snapshot = manual_mod.normalize_positions_payload({"positions": None})
+
+    assert snapshot.state == manual_mod.POSITIONS_AVAILABLE_COMPLETE_EMPTY
+    assert snapshot.rows == []
+    assert manual_mod._broker_position_contract_quantities(snapshot) == ({}, "")
+
+
+def test_json_null_position_member_preserves_complete_empty_authority():
+    snapshot = manual_mod.normalize_positions_payload(
+        {"positions": {"position": None}}
+    )
 
     assert snapshot.state == manual_mod.POSITIONS_AVAILABLE_COMPLETE_EMPTY
     assert snapshot.rows == []
@@ -311,6 +340,24 @@ def test_nested_error_snapshot_blocks_order_discovery_and_adoption(monkeypatch):
     assert not any("/orders" in call for call in broker.calls)
 
 
+def test_underlying_only_snapshot_blocks_order_discovery_and_adoption(monkeypatch):
+    broker = _Broker(
+        positions_payload=_payload([{"underlying": "AAPL", "quantity": 1}]),
+        orders=[_filled_exit()],
+    )
+    finalizer = MagicMock(return_value=True)
+    runner = _runner(broker, finalizer)
+    adopted = _install_scan(monkeypatch, finalizer)
+
+    manual_mod.detect_manual_closes(runner)
+
+    assert adopted == []
+    finalizer.assert_not_called()
+    assert len(broker.calls) == 1
+    assert "/positions" in broker.calls[0]
+    assert not any("/orders" in call for call in broker.calls)
+
+
 def test_invalid_quantity_snapshot_cannot_be_rescued_by_exact_external_fill(monkeypatch):
     broker = _Broker(
         positions_payload=_payload(
@@ -354,6 +401,21 @@ def test_complete_empty_snapshot_and_exact_external_fill_use_existing_path(monke
 def test_well_formed_unrelated_stock_row_can_establish_option_absence(monkeypatch):
     broker = _Broker(
         positions_payload=_payload([{"symbol": "MSFT", "quantity": 20}]),
+        orders=[_filled_exit()],
+    )
+    finalizer = MagicMock(return_value=True)
+    runner = _runner(broker, finalizer)
+    adopted = _install_scan(monkeypatch, finalizer)
+
+    manual_mod.detect_manual_closes(runner)
+
+    assert len(adopted) == 1
+    finalizer.assert_called_once()
+
+
+def test_unrelated_short_stock_row_can_establish_option_absence(monkeypatch):
+    broker = _Broker(
+        positions_payload=_payload([{"symbol": "MSFT", "quantity": -100}]),
         orders=[_filled_exit()],
     )
     finalizer = MagicMock(return_value=True)

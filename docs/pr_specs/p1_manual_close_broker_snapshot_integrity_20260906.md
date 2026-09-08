@@ -2,7 +2,7 @@
 
 ## STATUS
 
-**SPEC ONLY / HARD HOLD / IMPLEMENTATION REQUIRED. DO NOT MERGE OR DEPLOY.**
+**IMPLEMENTATION PRESENT / HARD HOLD / DO NOT MERGE OR DEPLOY.**
 
 Base authority:
 
@@ -170,6 +170,11 @@ Do not represent all successful-return lists as equally authoritative if rows we
 
 Do not silently return a list that has forgotten whether input rows were malformed.
 
+The adapter compatibility contract treats `positions: null`, `positions: "null"`,
+and `positions: {"position": null}` / `{"position": "null"}` as explicit
+complete-empty responses only when the surrounding envelopes contain no error
+or failure status. A bare empty `positions` object remains malformed.
+
 ---
 
 ## EXACT POSITION ROW VALIDATION
@@ -195,10 +200,16 @@ Do not treat arbitrary non-empty symbol text as sufficient option identity.
 Reuse the strict `positive_int()` behavior where appropriate, but preserve the distinction between:
 
 ```text
-valid positive integral open option quantity
+valid non-zero integral signed quantity for an identified broker row
 explicit/valid zero under a documented broker flat-row contract, if such rows can exist
 invalid/malformed quantity
 ```
+
+Tradier uses positive quantities for long positions and negative quantities for
+short positions. Preserve either sign as presence evidence when the row has an
+explicit identity; the sign must not make an unrelated valid short row poison
+the complete account snapshot. Zero, fractional, boolean, non-finite, and
+malformed quantities remain invalid.
 
 Current list semantics generally omit flat positions; do not invent zero-row semantics without evidence.
 
@@ -219,6 +230,10 @@ Do not let last-write-wins map behavior or silent summation erase ambiguity with
 Audit actual production Tradier position shapes.
 
 If stock/equity rows can coexist with option rows, they may be ignored only if they are independently well-formed and their non-option identity is explicit. A malformed unknown row must not be ignored merely because the manual-close path hopes it is unrelated.
+
+An `underlying` field alone is not an explicit non-option identity. The row
+must provide a broker symbol/instrument identity, or an exact OCC option
+identity plus a matching underlying.
 
 The implementation must document how it distinguishes:
 
