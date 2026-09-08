@@ -504,8 +504,19 @@ class APMasterControl:
         except Exception as exc:
             log.warning("Canonical sector resolution failed for %r: %s", raw_symbol, exc)
             return None
-        normalized = str(resolved or "").strip().lower()
-        return normalized or None
+        if not isinstance(resolved, str):
+            return None
+        normalized = resolved.strip().lower()
+        if not normalized or normalized in {
+            "other",
+            "unknown",
+            "misc",
+            "unmapped",
+            "sector_unknown",
+            "sector_identity_unproven",
+        }:
+            return None
+        return normalized
 
     @staticmethod
     def _sector_telemetry(sector: Optional[str]) -> dict[str, Any]:
