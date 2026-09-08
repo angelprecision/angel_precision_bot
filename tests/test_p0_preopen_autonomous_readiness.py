@@ -119,7 +119,7 @@ class _Runner:
         return "tok"
 
 
-def _stub_common(monkeypatch, *, handoff=True, client_state=None):
+def _stub_common(monkeypatch, *, handoff=True, client_state=None, pod_mode="live"):
     writes = []
     monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **kwargs: writes.append(kwargs))
     monkeypatch.setattr(pr, "_morning_handoff_success_exists", lambda *args, **kwargs: handoff)
@@ -135,7 +135,7 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
         },
     )
     monkeypatch.setattr(pr, "_trading_date", lambda now=None: "2026-06-22")
-    monkeypatch.setattr(pr, "_pod_mode", lambda: "live")
+    monkeypatch.setattr(pr, "_pod_mode", lambda: pod_mode)
     monkeypatch.setattr(pr, "_after_929_et", lambda now=None: True)
     return writes
 
@@ -143,8 +143,10 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
 class _ModeScopedReadinessConnection:
     """Small driver-faithful cursor for the real readiness SQL seam."""
 
-    def __init__(self, pending_rows):
-        self.pending_rows = list(pending_rows)
+    def __init__(self, pending_rows=None, *, queue_rows=None, order_rows=None):
+        self.pending_rows = list(pending_rows or [])
+        self.queue_rows = list(queue_rows or [])
+        self.order_rows = list(self.pending_rows if order_rows is None else order_rows)
         self.calls = []
         self._result = []
 
@@ -161,7 +163,70 @@ class _ModeScopedReadinessConnection:
         normalized_sql = " ".join(str(sql).split()).lower()
         params = tuple(params or ())
         self.calls.append((normalized_sql, params))
-        if "from orders" in normalized_sql and "pending_trigger" in normalized_sql:
+
+        if "from trade_queue" in normalized_sql:
+            assert "->>'execution_mode'" in normalized_sql
+            assert "->>'mode'" in normalized_sql
+            requested_client = params[0]
+            queue_rows = [
+                row for row in self.queue_rows
+                if row.get("client_id") == requested_client
+            ]
+            if "status = 'processing'" in normalized_sql:
+                assert len(params) == 4
+                requested_mode = params[1]
+                cutoff = params[3]
+                self._result = [
+                    (row["id"],)
+                    for row in queue_rows
+                    if str(row.get("status") or "").upper() == "PROCESSING"
+                    and (row.get("started_ts") or row.get("created_ts")) < cutoff
+                    and _queue_payload_mode(row.get("payload")) == requested_mode
+                ]
+            elif "status = 'watching'" in normalized_sql and "not exists" in normalized_sql:
+                assert len(params) == 5
+                requested_mode = params[1]
+                cutoff = params[3]
+                correlation_mode = params[4]
+                assert correlation_mode == requested_mode
+                self._result = []
+                for row in queue_rows:
+                    if (
+                        str(row.get("status") or "").upper() != "WATCHING"
+                        or row.get("created_ts") >= cutoff
+                        or _queue_payload_mode(row.get("payload")) != requested_mode
+                    ):
+                        continue
+                    matching_order = any(
+                        order.get("client_id") == row.get("client_id")
+                        and (order.get("signal_id") or "") == (row.get("signal_id") or "")
+                        and str(order.get("kind") or "").upper() == "ENTRY"
+                        and str(order.get("execution_mode") or "").strip().lower() == correlation_mode
+                        for order in self.order_rows
+                    )
+                    if not matching_order:
+                        self._result.append((row["id"], row.get("signal_id")))
+            elif "status in ('processing', 'watching')" in normalized_sql:
+                assert len(params) == 1
+                self._result = [
+                    (row["id"],)
+                    for row in queue_rows
+                    if str(row.get("status") or "").upper() in {"PROCESSING", "WATCHING"}
+                    and _queue_payload_mode(row.get("payload")) is None
+                ]
+            elif "count(*)" in normalized_sql:
+                assert len(params) == 3
+                requested_mode = params[1]
+                self._result = [(
+                    sum(
+                        str(row.get("status") or "").upper() == "WATCHING"
+                        and _queue_payload_mode(row.get("payload")) == requested_mode
+                        for row in queue_rows
+                    ),
+                )]
+            else:
+                self._result = []
+        elif "from orders" in normalized_sql and "pending_trigger" in normalized_sql:
             assert len(params) == 3
             requested_client, requested_mode, _cutoff = params
             self._result = [
@@ -170,8 +235,6 @@ class _ModeScopedReadinessConnection:
                 if row["client_id"] == requested_client
                 and row["execution_mode"] == requested_mode
             ]
-        elif "count(*)" in normalized_sql:
-            self._result = [(0,)]
         else:
             self._result = []
 
@@ -180,6 +243,74 @@ class _ModeScopedReadinessConnection:
 
     def fetchone(self):
         return self._result[0] if self._result else None
+
+
+def _queue_payload_mode(payload):
+    """Mirror the queue payload authority used by production dispatch."""
+    if not isinstance(payload, dict):
+        return None
+    execution_mode = str(payload.get("execution_mode") or "").strip().lower()
+    mode = str(payload.get("mode") or "").strip().lower()
+    if execution_mode and mode and execution_mode != mode:
+        return None
+    selected = execution_mode or mode
+    return selected if selected in {"live", "paper"} else None
+
+
+def _queue_row(
+    row_id,
+    *,
+    status,
+    payload,
+    signal_id="sig-queue",
+    client_id="jason@example.com",
+    age_minutes=30,
+):
+    created_ts = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    return {
+        "id": row_id,
+        "client_id": client_id,
+        "signal_id": signal_id,
+        "status": status,
+        "payload": payload,
+        "created_ts": created_ts,
+        "started_ts": created_ts if status == "PROCESSING" else None,
+    }
+
+
+def _queue_order(*, client_id, signal_id, execution_mode, kind="ENTRY"):
+    return {
+        "client_id": client_id,
+        "signal_id": signal_id,
+        "execution_mode": execution_mode,
+        "kind": kind,
+    }
+
+
+def _install_readiness_db(monkeypatch, db_conn):
+    import ap.db as db
+
+    monkeypatch.setattr(db, "conn", db_conn)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+
+
+def _enforce_live_readiness(result):
+    from client_runner import ClientRunner
+
+    live_runner = object.__new__(ClientRunner)
+    live_runner.email = "jason@example.com"
+    live_runner.mode = "LIVE"
+    live_runner._degraded_lock = threading.Lock()
+    live_runner.degraded_reasons = set()
+    live_runner.degraded = _Evt(False)
+    live_runner.entries_allowed = _Evt(True)
+    live_runner.failed = _Evt(False)
+    live_runner.stopping = _Evt(False)
+    live_runner._set_entry_permission = live_runner.entries_allowed.set
+    enforced = ClientRunner._enforce_post_overnight_readiness.__get__(
+        live_runner, ClientRunner
+    )(result, context="mode_isolation")
+    return enforced, live_runner
 
 
 def _mode_inventory_row(local_order_id, signal_id, execution_mode):
@@ -221,6 +352,248 @@ def test_pending_trigger_inventory_is_mode_scoped_at_sql_boundary(monkeypatch):
     assert len(pending_calls) == 2
     assert all("execution_mode" in sql for sql, _params in pending_calls)
     assert [params[1] for _sql, params in pending_calls] == ["live", "paper"]
+
+
+def test_paper_queue_residue_does_not_block_live_or_inflate_live_watch_count(monkeypatch):
+    """PAPER stale/orphan queue state stays out of LIVE readiness authority."""
+    db_conn = _ModeScopedReadinessConnection(
+        queue_rows=[
+            _queue_row(
+                101,
+                status="PROCESSING",
+                payload={"execution_mode": "paper"},
+                signal_id="sig-paper-processing",
+            ),
+            _queue_row(
+                102,
+                status="WATCHING",
+                payload={"mode": "PAPER"},
+                signal_id="sig-paper-watching",
+            ),
+        ],
+        order_rows=[],
+    )
+    _install_readiness_db(monkeypatch, db_conn)
+
+    live_state = pr._query_client_state("jason@example.com", "LIVE")
+    paper_state = pr._query_client_state("jason@example.com", "PAPER")
+
+    assert live_state["stale_processing_ids"] == []
+    assert live_state["watching_orphans"] == []
+    assert live_state["watching_count"] == 0
+    assert paper_state["stale_processing_ids"] == [101]
+    assert paper_state["watching_orphans"] == [{"id": 102, "signal_id": "sig-paper-watching"}]
+    assert paper_state["watching_count"] == 1
+
+    runner = _Runner(mode="live")
+    runner.core.broker = MagicMock()
+    _stub_common(monkeypatch, client_state=live_state)
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner
+    )
+    assert result["status"] == "OK"
+    assert result["errors"] == []
+    enforced, live_runner = _enforce_live_readiness(result)
+    assert enforced["status"] == "OK"
+    assert live_runner.entries_allowed.is_set() is True
+    assert live_runner.degraded.is_set() is False
+    runner.core.broker.submit_order.assert_not_called()
+    runner.core.broker.cancel_order.assert_not_called()
+    runner.core.broker.replace_order.assert_not_called()
+
+
+def test_live_queue_residue_does_not_block_paper_readiness(monkeypatch):
+    """The mode fence is symmetric: LIVE queue state stays out of PAPER."""
+    db_conn = _ModeScopedReadinessConnection(
+        queue_rows=[
+            _queue_row(
+                201,
+                status="PROCESSING",
+                payload={"execution_mode": "LIVE"},
+                signal_id="sig-live-processing",
+            ),
+            _queue_row(
+                202,
+                status="WATCHING",
+                payload={"execution_mode": "live"},
+                signal_id="sig-live-watching",
+            ),
+        ],
+        order_rows=[],
+    )
+    _install_readiness_db(monkeypatch, db_conn)
+
+    live_state = pr._query_client_state("jason@example.com", "LIVE")
+    paper_state = pr._query_client_state("jason@example.com", "PAPER")
+
+    assert live_state["stale_processing_ids"] == [201]
+    assert live_state["watching_orphans"] == [{"id": 202, "signal_id": "sig-live-watching"}]
+    assert live_state["watching_count"] == 1
+    assert paper_state["stale_processing_ids"] == []
+    assert paper_state["watching_orphans"] == []
+    assert paper_state["watching_count"] == 0
+
+    _stub_common(monkeypatch, pod_mode="paper", client_state=paper_state)
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "paper", dry_run=True, runner=_Runner(mode="paper")
+    )
+    assert result["status"] == "OK"
+    assert result["errors"] == []
+
+
+def test_same_mode_queue_safety_remains_blocking(monkeypatch):
+    """Mode isolation must not hide stale or orphaned same-mode rows."""
+    db_conn = _ModeScopedReadinessConnection(
+        queue_rows=[
+            _queue_row(
+                301,
+                status="PROCESSING",
+                payload={"execution_mode": "live"},
+                signal_id="sig-live-processing",
+            ),
+            _queue_row(
+                302,
+                status="WATCHING",
+                payload={"execution_mode": "live"},
+                signal_id="sig-live-watching",
+            ),
+        ],
+        order_rows=[],
+    )
+    _install_readiness_db(monkeypatch, db_conn)
+    live_state = pr._query_client_state("jason@example.com", "LIVE")
+    assert live_state["stale_processing_ids"] == [301]
+    assert live_state["watching_orphans"] == [{"id": 302, "signal_id": "sig-live-watching"}]
+
+    _stub_common(monkeypatch, client_state=live_state)
+    runner = _Runner(mode="live")
+    runner._overnight_reeval_success_date = "2026-06-22"
+    runner.core.broker = MagicMock()
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner
+    )
+    assert result["status"] == "DEGRADED"
+    assert "stale_processing_rows" in result["errors"]
+    assert "watching_rows_missing_orders_recommend_new_rescue" in result["errors"]
+    enforced, live_runner = _enforce_live_readiness(result)
+    assert enforced["status"] == "ERROR"
+    assert live_runner.entries_allowed.is_set() is False
+    assert live_runner.degraded.is_set() is True
+    runner.core.broker.submit_order.assert_not_called()
+    runner.core.broker.cancel_order.assert_not_called()
+    runner.core.broker.replace_order.assert_not_called()
+
+
+def test_queue_order_orphan_correlation_is_execution_mode_fenced(monkeypatch):
+    """An order in the other mode cannot satisfy a queue orphan check."""
+    paper_queue = _queue_row(
+        401,
+        status="WATCHING",
+        payload={"execution_mode": "paper"},
+        signal_id="sig-shared",
+    )
+    live_queue = _queue_row(
+        402,
+        status="WATCHING",
+        payload={"execution_mode": "live"},
+        signal_id="sig-shared",
+    )
+
+    paper_db = _ModeScopedReadinessConnection(
+        queue_rows=[paper_queue],
+        order_rows=[_queue_order(
+            client_id="jason@example.com",
+            signal_id="sig-shared",
+            execution_mode="live",
+        )],
+    )
+    _install_readiness_db(monkeypatch, paper_db)
+    paper_state = pr._query_client_state("jason@example.com", "PAPER")
+    assert paper_state["watching_orphans"] == [{"id": 401, "signal_id": "sig-shared"}]
+
+    live_db = _ModeScopedReadinessConnection(
+        queue_rows=[live_queue],
+        order_rows=[_queue_order(
+            client_id="jason@example.com",
+            signal_id="sig-shared",
+            execution_mode="paper",
+        )],
+    )
+    _install_readiness_db(monkeypatch, live_db)
+    live_state = pr._query_client_state("jason@example.com", "LIVE")
+    assert live_state["watching_orphans"] == [{"id": 402, "signal_id": "sig-shared"}]
+
+    matching_paper_db = _ModeScopedReadinessConnection(
+        queue_rows=[paper_queue],
+        order_rows=[_queue_order(
+            client_id="jason@example.com",
+            signal_id="sig-shared",
+            execution_mode="paper",
+        )],
+    )
+    _install_readiness_db(monkeypatch, matching_paper_db)
+    assert pr._query_client_state("jason@example.com", "PAPER")["watching_orphans"] == []
+
+    matching_live_db = _ModeScopedReadinessConnection(
+        queue_rows=[live_queue],
+        order_rows=[_queue_order(
+            client_id="jason@example.com",
+            signal_id="sig-shared",
+            execution_mode="live",
+        )],
+    )
+    _install_readiness_db(monkeypatch, matching_live_db)
+    assert pr._query_client_state("jason@example.com", "LIVE")["watching_orphans"] == []
+
+    orphan_sql = [
+        sql for sql, _params in paper_db.calls
+        if "status = 'watching'" in sql and "not exists" in sql
+    ]
+    assert len(orphan_sql) == 1
+    assert "o.execution_mode" in orphan_sql[0]
+
+
+def test_unresolved_queue_mode_is_fail_closed_for_both_modes(monkeypatch):
+    """Missing, malformed, and conflicting payload modes never alias."""
+    bad_rows = [
+        _queue_row(501, status="PROCESSING", payload={}, signal_id="sig-missing"),
+        _queue_row(502, status="WATCHING", payload={"execution_mode": " "}, signal_id="sig-blank"),
+        _queue_row(503, status="PROCESSING", payload={"execution_mode": "sandbox"}, signal_id="sig-invalid"),
+        _queue_row(
+            504,
+            status="WATCHING",
+            payload={"execution_mode": "live", "mode": "paper"},
+            signal_id="sig-conflict",
+        ),
+    ]
+    db_conn = _ModeScopedReadinessConnection(queue_rows=bad_rows, order_rows=[])
+    _install_readiness_db(monkeypatch, db_conn)
+
+    live_state = pr._query_client_state("jason@example.com", "LIVE")
+    paper_state = pr._query_client_state("jason@example.com", "PAPER")
+    expected_bad_ids = [501, 502, 503, 504]
+    for state in (live_state, paper_state):
+        assert state["stale_processing_ids"] == []
+        assert state["watching_orphans"] == []
+        assert state["watching_count"] == 0
+        assert state["unresolved_execution_mode_queue_ids"] == expected_bad_ids
+
+    _stub_common(monkeypatch, client_state=live_state)
+    runner = _Runner(mode="live")
+    runner.core.broker = MagicMock()
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner
+    )
+    assert result["status"] == "DEGRADED"
+    assert "trade_queue_execution_mode_unresolved" in result["errors"]
+    assert result["details"]["client_state"]["unresolved_execution_mode_queue_ids"] == expected_bad_ids
+    enforced, live_runner = _enforce_live_readiness(result)
+    assert enforced["status"] == "ERROR"
+    assert live_runner.entries_allowed.is_set() is False
+    assert live_runner.degraded.is_set() is True
+    runner.core.broker.submit_order.assert_not_called()
+    runner.core.broker.cancel_order.assert_not_called()
+    runner.core.broker.replace_order.assert_not_called()
 
 
 def test_paper_ownerless_pending_trigger_cannot_block_live_readiness(monkeypatch):

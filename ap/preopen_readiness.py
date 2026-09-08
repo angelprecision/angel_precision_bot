@@ -36,6 +36,60 @@ def _normalize_mode(value: str | None) -> str:
     return str(value or "").strip().lower()
 
 
+def _queue_execution_mode_predicate(payload_expr: str) -> str:
+    """Return the durable trade_queue execution-mode fence for one payload.
+
+    Queue dispatch already treats ``payload.execution_mode`` as the canonical
+    field and ``payload.mode`` as its legacy alias.  Readiness must use the
+    same durable source, while also refusing a row whose two non-blank aliases
+    disagree.  The returned predicate has two mode parameters: one for the
+    canonical field and one for the legacy-only field.
+    """
+    return f"""
+    (
+        (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NOT NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'execution_mode', ''))) = %s
+            AND (
+                NULLIF(BTRIM(COALESCE({payload_expr}->>'mode', '')), '') IS NULL
+                OR LOWER(BTRIM(COALESCE({payload_expr}->>'mode', ''))) =
+                   LOWER(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')))
+            )
+        )
+        OR (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'mode', ''))) = %s
+        )
+    )
+    """
+
+
+def _queue_unresolved_execution_mode_predicate(payload_expr: str) -> str:
+    """Return the fail-closed predicate for an unresolvable queue mode."""
+    return f"""
+    (
+        (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NULL
+            AND NULLIF(BTRIM(COALESCE({payload_expr}->>'mode', '')), '') IS NULL
+        )
+        OR (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NOT NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'execution_mode', ''))) NOT IN ('live', 'paper')
+        )
+        OR (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'mode', '')), '') IS NOT NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'mode', ''))) NOT IN ('live', 'paper')
+        )
+        OR (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NOT NULL
+            AND NULLIF(BTRIM(COALESCE({payload_expr}->>'mode', '')), '') IS NOT NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'execution_mode', ''))) <>
+                LOWER(BTRIM(COALESCE({payload_expr}->>'mode', '')))
+        )
+    )
+    """
+
+
 def _nyse_is_trading_day(dt: datetime) -> bool:
     """Route through the canonical NYSE calendar in ap.flatline_alarm.
 
@@ -385,28 +439,32 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
     processing_cutoff = now_utc - timedelta(minutes=PROCESSING_STALE_MINUTES)
     watching_cutoff = now_utc - timedelta(minutes=WATCHING_ORPHAN_GRACE_MINUTES)
     pending_cutoff = now_utc - timedelta(hours=PENDING_TRIGGER_LOOKBACK_HOURS)
+    queue_mode_predicate = _queue_execution_mode_predicate("q.payload")
+    queue_unresolved_mode_predicate = _queue_unresolved_execution_mode_predicate("q.payload")
 
     def _load():
         with conn() as c:
             c.execute(
-                """
-                SELECT id
-                FROM trade_queue
-                WHERE client_id = %s
-                  AND status = 'PROCESSING'
-                  AND COALESCE(started_ts, created_ts) < %s
-                ORDER BY id
+                f"""
+                SELECT q.id
+                FROM trade_queue q
+                WHERE q.client_id = %s
+                  AND q.status = 'PROCESSING'
+                  AND {queue_mode_predicate}
+                  AND COALESCE(q.started_ts, q.created_ts) < %s
+                ORDER BY q.id
                 """,
-                (client_id, processing_cutoff),
+                (client_id, execution_mode, execution_mode, processing_cutoff),
             )
             stale_processing = [r[0] if not isinstance(r, dict) else r.get("id") for r in (c.fetchall() or [])]
 
             c.execute(
-                """
+                f"""
                 SELECT q.id, q.signal_id
                 FROM trade_queue q
                 WHERE q.client_id = %s
                   AND q.status = 'WATCHING'
+                  AND {queue_mode_predicate}
                   AND q.created_ts < %s
                   AND NOT EXISTS (
                       SELECT 1
@@ -414,10 +472,11 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
                       WHERE o.client_id = q.client_id
                         AND COALESCE(o.signal_id, '') = COALESCE(q.signal_id, '')
                         AND o.kind = 'ENTRY'
+                        AND LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s
                   )
                 ORDER BY q.id
                 """,
-                (client_id, watching_cutoff),
+                (client_id, execution_mode, execution_mode, watching_cutoff, execution_mode),
             )
             watching_orphans = []
             for row in (c.fetchall() or []):
@@ -425,6 +484,22 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
                     watching_orphans.append({"id": row.get("id"), "signal_id": row.get("signal_id")})
                 else:
                     watching_orphans.append({"id": row[0], "signal_id": row[1]})
+
+            c.execute(
+                f"""
+                SELECT q.id
+                FROM trade_queue q
+                WHERE q.client_id = %s
+                  AND q.status IN ('PROCESSING', 'WATCHING')
+                  AND {queue_unresolved_mode_predicate}
+                ORDER BY q.id
+                """,
+                (client_id,),
+            )
+            unresolved_execution_mode_queue_ids = [
+                r[0] if not isinstance(r, dict) else r.get("id")
+                for r in (c.fetchall() or [])
+            ]
 
             c.execute(
                 """
@@ -450,13 +525,14 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
                     pending_trigger.append({"local_order_id": row[0], "signal_id": row[1]})
 
             c.execute(
-                """
+                f"""
                 SELECT COUNT(*)::int AS n
-                FROM trade_queue
-                WHERE client_id = %s
-                  AND status = 'WATCHING'
+                FROM trade_queue q
+                WHERE q.client_id = %s
+                  AND q.status = 'WATCHING'
+                  AND {queue_mode_predicate}
                 """,
-                (client_id,),
+                (client_id, execution_mode, execution_mode),
             )
             watch_count_row = c.fetchone()
             watching_count = watch_count_row["n"] if isinstance(watch_count_row, dict) else (watch_count_row[0] if watch_count_row else 0)
@@ -464,6 +540,7 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
             return {
                 "stale_processing_ids": stale_processing,
                 "watching_orphans": watching_orphans,
+                "unresolved_execution_mode_queue_ids": unresolved_execution_mode_queue_ids,
                 "pending_trigger_rows": pending_trigger,
                 "watching_count": int(watching_count or 0),
             }
@@ -471,6 +548,7 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
     return run_with_retry(_load) or {
         "stale_processing_ids": [],
         "watching_orphans": [],
+        "unresolved_execution_mode_queue_ids": [],
         "pending_trigger_rows": [],
         "watching_count": 0,
     }
@@ -748,6 +826,9 @@ def run_preopen_autonomous_readiness(
 
     if client_state.get("watching_orphans"):
         errors.append("watching_rows_missing_orders_recommend_new_rescue")
+
+    if client_state.get("unresolved_execution_mode_queue_ids"):
+        errors.append("trade_queue_execution_mode_unresolved")
 
     pending_ownership = _pending_trigger_ownership(
         runner,
