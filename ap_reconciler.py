@@ -5556,6 +5556,37 @@ class APBrokerReconciler:
     # ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _closed_repair_validate_position_row(bp: dict) -> None:
+        """Reject error-bearing or unknown-status rows at the repair seam.
+
+        TradierBroker.list_positions_strict() validates provider rows before
+        returning them. The reconciler still enforces the same boundary for
+        strict adapters and test doubles so a non-Tradier implementation
+        cannot turn an error-bearing row into apparent broker presence or
+        absence.
+        """
+        if not isinstance(bp, dict):
+            raise ValueError("closed_repair_broker_position_malformed")
+
+        successful_statuses = {"ok", "success", "successful"}
+        records = [bp]
+        raw = bp.get("raw")
+        if isinstance(raw, dict):
+            records.append(raw)
+
+        for record in records:
+            for key, raw_value in record.items():
+                normalized_key = str(key).strip().lower()
+                if normalized_key in {"error", "errors", "message", "reason"}:
+                    raise ValueError("closed_repair_broker_position_malformed")
+                if normalized_key == "status":
+                    if (
+                        not isinstance(raw_value, str)
+                        or raw_value.strip().lower() not in successful_statuses
+                    ):
+                        raise ValueError("closed_repair_broker_position_malformed")
+
+    @staticmethod
     def _closed_repair_position_qty(bp: dict) -> int:
         """Read the already-normalized signed quantity from one strict-reader row.
 
@@ -5617,7 +5648,10 @@ class APBrokerReconciler:
         representation, duplicate lots, duplicate account data, or a
         malformed payload. CLOSED repair must not guess.
         """
-        from ap.exit_safety import is_valid_exact_occ_contract
+        from ap.exit_safety import (
+            _has_underlying_position_identity,
+            _iter_position_identity_values,
+        )
 
         strict_reader = getattr(self.broker, "list_positions_strict", None)
         if not callable(strict_reader):
@@ -5631,21 +5665,22 @@ class APBrokerReconciler:
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("closed_repair_broker_position_malformed")
-            raw_contract = row.get("symbol")
-            if raw_contract in (None, ""):
-                raw_contract = row.get("option_symbol") or row.get("contract")
-            if not isinstance(raw_contract, str) or not raw_contract.strip():
-                raise ValueError("closed_repair_broker_position_malformed")
-            contract = self._norm_contract(raw_contract)
-            if not re.fullmatch(r"[A-Z0-9.]{1,32}", contract):
+            self._closed_repair_validate_position_row(row)
+
+            identity_state, contract = _iter_position_identity_values(row)
+            if identity_state in {"invalid", "ambiguous"}:
+                raise ValueError("closed_repair_broker_snapshot_ambiguous")
+            if identity_state == "missing":
+                if not _has_underlying_position_identity(row):
+                    raise ValueError("closed_repair_broker_position_malformed")
+                # A well-formed equity/underlying row is a valid snapshot
+                # member but never exact OCC target authority.
+                self._closed_repair_position_qty(row)
+                continue
+            if identity_state != "valid":
                 raise ValueError("closed_repair_broker_position_malformed")
 
             qty = self._closed_repair_position_qty(row)
-
-            if not is_valid_exact_occ_contract(contract):
-                # Structurally valid snapshot member (e.g. an equity row) —
-                # never option-target authority. Do not add to the map.
-                continue
 
             if contract in quantities:
                 # Duplicate exact OCC identity — ambiguous no matter whether
@@ -5675,7 +5710,11 @@ class APBrokerReconciler:
         """
         try:
             from ap.db import conn, run_with_retry
-            from ap.exit_safety import _normalize_contract, is_valid_exact_occ_contract
+            from ap.exit_safety import (
+                _iter_position_identity_values,
+                _normalize_contract,
+                is_valid_exact_occ_contract,
+            )
 
             repair_mode = _normalize_execution_mode(self.execution_mode)
             if repair_mode is None:
@@ -5713,12 +5752,18 @@ class APBrokerReconciler:
                 return
 
             # The strict Tradier reader canonicalizes padded OCC roots to the
-            # same compact identity used by exit safety.  Canonicalize the
-            # durable DB contract before taking the broker snapshot so a
-            # padded DB row cannot look broker-flat by representation alone.
+            # same compact identity used by exit safety. Resolve every
+            # populated durable identity alias together before taking the
+            # broker snapshot: a conflicting contract/option_symbol pair is
+            # unproven and must not fall through to one truthy alias.
             for row in bad_rows:
-                raw_contract = row.get("contract") or row.get("option_symbol") or ""
-                row["contract"] = _normalize_contract(raw_contract)
+                identity_state, canonical_contract = _iter_position_identity_values(row)
+                row["_closed_repair_identity_state"] = identity_state
+                row["contract"] = (
+                    _normalize_contract(canonical_contract)
+                    if identity_state == "valid"
+                    else ""
+                )
 
             count = len(bad_rows)
             summary["closed_positions_with_remaining_qty_count"] = \
@@ -5754,9 +5799,8 @@ class APBrokerReconciler:
             # ── Step 3: per-row repair ────────────────────────────────────────
             for row in bad_rows:
                 pos_id     = row.get("id")
-                contract   = self._norm_contract(
-                    row.get("contract") or row.get("option_symbol") or ""
-                )
+                identity_state = row.get("_closed_repair_identity_state")
+                contract   = row.get("contract") if identity_state == "valid" else ""
                 rem_qty    = int(row.get("quantity_remaining") or 0)
                 full_qty   = int(row.get("qty") or rem_qty)
 
@@ -5765,7 +5809,10 @@ class APBrokerReconciler:
                 # A generic underlying ticker (e.g. an equity symbol) is never
                 # option lifecycle authority and must never be treated as a
                 # fallback target identity.
-                if not is_valid_exact_occ_contract(contract):
+                if (
+                    identity_state != "valid"
+                    or not is_valid_exact_occ_contract(contract)
+                ):
                     log.error(
                         "[%s] P0-PARTIAL-CLOSE-REPAIR TARGET-IDENTITY-UNPROVEN | "
                         "pos=%s contract=%r | durable target does not resolve to "

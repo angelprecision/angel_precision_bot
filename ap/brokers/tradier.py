@@ -20,6 +20,7 @@ _STRICT_PADDED_OCC_RE = re.compile(
     r"^([A-Z0-9.]{1,6})\s+(\d{6}[CP]\d{8})$"
 )
 _STRICT_OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
+_STRICT_UNDERLYING_RE = re.compile(r"^[A-Z0-9.]{1,6}$")
 
 
 @dataclass(frozen=True)
@@ -560,7 +561,7 @@ class TradierBroker(BrokerAdapter):
         successful_statuses = {"ok", "success", "successful"}
         for key, raw_value in value.items():
             normalized_key = str(key).strip().lower()
-            if normalized_key in {"error", "errors", "message"}:
+            if normalized_key in {"error", "errors", "message", "reason"}:
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
             if normalized_key == "status":
                 if (
@@ -656,6 +657,12 @@ class TradierBroker(BrokerAdapter):
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            # A position row is part of the authoritative snapshot, not an
+            # opaque payload to preserve while trusting its quantity. Apply
+            # the same error/status checks at row level so an error-bearing or
+            # unknown-status row cannot authorize RESTORE or disappear into a
+            # reduced position map.
+            cls._strict_validate_envelope(row)
             raw_symbol = row.get("symbol")
             if not isinstance(raw_symbol, str):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
@@ -663,7 +670,10 @@ class TradierBroker(BrokerAdapter):
             padded = _STRICT_PADDED_OCC_RE.fullmatch(symbol)
             if padded:
                 symbol = f"{padded.group(1)}{padded.group(2)}"
-            if not symbol or not re.fullmatch(r"[A-Z0-9.]{1,32}", symbol):
+            if not symbol or not (
+                _STRICT_OCC_RE.fullmatch(symbol)
+                or _STRICT_UNDERLYING_RE.fullmatch(symbol)
+            ):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
 
             quantity = cls._strict_position_quantity(row)

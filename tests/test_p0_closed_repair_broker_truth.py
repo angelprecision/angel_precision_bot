@@ -193,6 +193,7 @@ def test_strict_positions_reader_propagates_transport_failure():
         {},
         {"error": "unavailable"},
         {"message": "unavailable"},
+        {"reason": "unavailable", "positions": {"position": []}},
         {"status": "error", "positions": {"position": []}},
         {"status": "failed", "positions": {"position": []}},
         {"status": "failure", "positions": {"position": []}},
@@ -205,6 +206,7 @@ def test_strict_positions_reader_propagates_transport_failure():
         {"positions": {"position": [], "error": "unavailable"}},
         {"positions": {"position": [], "errors": ["unavailable"]}},
         {"positions": {"position": [], "message": "unavailable"}},
+        {"positions": {"position": [], "reason": "unavailable"}},
         {"positions": {"position": [], "status": "error"}},
         {"positions": {"position": [], "status": {"code": 500}}},
         {"positions": {"position": [], "status": "unknown"}},
@@ -227,6 +229,9 @@ def test_strict_positions_reader_propagates_transport_failure():
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": -1, "side": "long"}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "side": "short", "position_type": "long"}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "cost_basis": "nan"}]}},
+        {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "error": "unavailable"}]}},
+        {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "status": "unknown"}]}},
+        {"positions": {"position": [{"symbol": "AAPL260620X00155000", "quantity": 1}]}},
         {"positions": {"position": [
             {"symbol": CONTRACT, "quantity": 5},
             {"symbol": CONTRACT, "quantity": 5},
@@ -318,9 +323,12 @@ def test_postgres_transport_failure_leaves_closed_row_unchanged(
         {"positions": {"status": {"code": 500}, "position": []}},
         {"positions": {"status": "unknown", "position": []}},
         {"positions": {"position": [], "error": "unavailable"}},
+        {"positions": {"position": [], "reason": "unavailable"}},
         {"positions": {"position": [None]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 0}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": -1}]}},
+        {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "error": "unavailable"}]}},
+        {"positions": {"position": [{"symbol": "AAPL260620X00155000", "quantity": 1}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1.5}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": True}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "short_quantity": 1}]}},
@@ -871,6 +879,20 @@ def test_closed_repair_position_qty_requires_normalized_quantity_key():
             APBrokerReconciler._closed_repair_position_qty(bad_row)
 
 
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"symbol": CONTRACT, "quantity": 5, "error": "unavailable"},
+        {"symbol": CONTRACT, "quantity": 5, "reason": "unknown"},
+        {"symbol": CONTRACT, "quantity": 5, "status": "unknown"},
+        {"symbol": CONTRACT, "quantity": 5, "raw": {"status": "error"}},
+    ],
+)
+def test_closed_repair_rejects_error_bearing_strict_adapter_rows(row):
+    with pytest.raises(ValueError, match="closed_repair_broker_position_malformed"):
+        APBrokerReconciler._closed_repair_validate_position_row(row)
+
+
 def _stub_broker(rows) -> MagicMock:
     """A bare strict-position-reader double that bypasses TradierBroker
     entirely — used to prove the reconciler enforces its own invariants
@@ -912,6 +934,34 @@ def test_postgres_duplicate_exact_occ_without_raw_evidence_holds_safely(
     _assert_no_broker_mutations(broker)
 
 
+def test_postgres_conflicting_broker_identity_aliases_hold_safely(
+    postgres_closed_row,
+):
+    insert, read, executed_sql = postgres_closed_row
+    insert()
+    broker = _stub_broker(
+        [
+            {
+                "symbol": CONTRACT,
+                "option_symbol": "MSFT260620P00300000",
+                "quantity": 5,
+            }
+        ]
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
 def test_postgres_generic_ticker_durable_target_identity_unproven_holds(
     postgres_closed_row,
 ):
@@ -921,6 +971,42 @@ def test_postgres_generic_ticker_durable_target_identity_unproven_holds(
     insert(contract="AAPL", option_symbol="AAPL", underlying="AAPL", ticker="AAPL")
     broker = _tradier(
         payload={"positions": {"position": [{"symbol": "AAPL", "quantity": 100}]}}
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_conflicting_durable_identity_aliases_hold_safely(
+    postgres_closed_row,
+):
+    """A CLOSED row with two different option identities is unproven.
+
+    The repair path must not select the first truthy alias and mutate the row
+    against broker truth for only one of those identities.
+    """
+    insert, read, executed_sql = postgres_closed_row
+    insert(
+        contract=CONTRACT,
+        option_symbol="MSFT260620P00300000",
+        underlying="AAPL",
+        ticker="AAPL",
+    )
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [{"symbol": CONTRACT, "quantity": 5}]
+            }
+        }
     )
     rec = _reconciler(broker)
 
