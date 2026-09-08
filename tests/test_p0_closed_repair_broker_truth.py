@@ -408,6 +408,35 @@ def test_postgres_padded_db_occ_preserves_restore_behavior(
     }
 
 
+def test_postgres_compact_db_occ_matches_padded_broker_row(postgres_closed_row):
+    """Required matrix H: compact durable target + padded broker OCC —
+    exact identity match still restores (the padded/compact pairing above
+    only ever varied the broker side; this covers the DB side too)."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert(
+        contract=PADDED_COMPACT_CONTRACT,
+        option_symbol=PADDED_COMPACT_CONTRACT,
+        underlying="GS",
+        ticker="GS",
+    )
+    broker = _tradier(
+        payload={
+            "positions": {"position": [{"symbol": PADDED_CONTRACT, "quantity": 5}]}
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+
+
 def test_postgres_duplicate_padded_and_compact_rows_with_identical_qty_holds_safely(
     postgres_closed_row,
 ):
@@ -918,6 +947,40 @@ def test_postgres_exact_occ_target_absent_flattens_despite_unrelated_equity(
     insert()
     broker = _tradier(
         payload={"positions": {"position": [{"symbol": "AAPL", "quantity": 100}]}}
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 0,
+        "close_source": "CLOSED_REPAIR",
+    }
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_exact_occ_target_absent_flattens_despite_unrelated_short_option(
+    postgres_closed_row,
+):
+    """Required matrix E: target absent, unrelated negative option present —
+    the unrelated short must not poison the snapshot, and absence inference
+    for the (different) target OCC remains valid since the snapshot is
+    otherwise complete and unambiguous, so FLATTEN proceeds."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {
+                        "symbol": "MSFT260620P00300000",
+                        "quantity": 2,
+                        "side": "short",
+                    }
+                ]
+            }
+        }
     )
     rec = _reconciler(broker)
 
