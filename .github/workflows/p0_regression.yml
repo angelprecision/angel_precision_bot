@@ -147,6 +147,10 @@ env:
     tests/test_p0_manual_rescue_restart_guard_bypass.py
 
 jobs:
+  # JOB A — EXACT HEAD.
+  # Tests the PR's submitted head commit exactly as authored, independent
+  # of whatever GitHub's synthetic merge computation produces. This is the
+  # job that has always run here.
   p0-tests:
     runs-on: ubuntu-latest
     services:
@@ -228,12 +232,16 @@ jobs:
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           MANUAL_CLOSE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
-          python -m pytest ${P0_TEST_INVENTORY} -v --tb=short --color=yes
+          # Canonical test inventory lives in one file so this job and the
+          # merge-ref job below can never silently drift apart. See
+          # .github/workflows/p0_test_manifest.txt.
+          python -m pytest $(tr '\n' ' ' < .github/workflows/p0_test_manifest.txt) \
+            -v --tb=short --color=yes
 
       - name: Summary
         if: always()
         run: |
-          echo "P0 regression suite complete"
+          echo "P0 regression suite (exact head) complete"
 
 
   p0-merge-ref-tests:
@@ -258,12 +266,25 @@ jobs:
         with:
           # Test GitHub's synthetic pull_request merge ref.
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
 
-      - name: Assert checked out commit
+      - name: Assert checked out commit is the current merge ref
         run: |
-          expected="${{ github.sha }}"
           actual="$(git rev-parse HEAD)"
+          echo "checked out: $actual"
+          expected="${{ github.sha }}"
           test "$actual" = "$expected"
+          expected_head="${{ github.event.pull_request.head.sha }}"
+          parent_words="$(git rev-list --parents -n 1 HEAD | wc -w)"
+          if [ "$parent_words" -lt 3 ]; then
+            echo "expected a 2-parent synthetic merge commit for a pull_request event, got $((parent_words - 1)) parent(s)"
+            exit 1
+          fi
+          parent1="$(git rev-parse HEAD^1)"
+          parent2="$(git rev-parse HEAD^2)"
+          echo "merge parent 1 (base tip at merge time): $parent1"
+          echo "merge parent 2 (PR head):                $parent2"
+          test "$parent2" = "$expected_head"
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -318,7 +339,12 @@ jobs:
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           MANUAL_CLOSE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
-          python -m pytest ${P0_TEST_INVENTORY} -v --tb=short --color=yes
+          # Same canonical inventory as Job A — see
+          # .github/workflows/p0_test_manifest.txt. Never list tests
+          # inline here; that is exactly the drift this job exists to
+          # prevent.
+          python -m pytest $(tr '\n' ' ' < .github/workflows/p0_test_manifest.txt) \
+            -v --tb=short --color=yes
 
       - name: Summary
         if: always()
