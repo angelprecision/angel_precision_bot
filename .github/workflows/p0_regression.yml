@@ -266,6 +266,10 @@ jobs:
         with:
           # Test GitHub's synthetic pull_request merge ref.
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          # actions/checkout's default fetch-depth: 1 shallow-fetches only
+          # the merge commit itself, which strips parent-commit metadata —
+          # `git rev-parse HEAD^2` cannot resolve in that state. Full depth
+          # is required for the parent assertion below to work at all.
           fetch-depth: 0
 
       - name: Assert checked out commit is the current merge ref
