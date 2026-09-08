@@ -134,7 +134,7 @@ def test_live_missing_overnight_reeval_returns_blocked(monkeypatch):
     monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **kw: None)
     monkeypatch.setattr(pr, "_morning_handoff_success_exists",
                         lambda cid, mode, td: True)  # handoff OK
-    monkeypatch.setattr(pr, "_query_client_state", lambda cid: {
+    monkeypatch.setattr(pr, "_query_client_state", lambda cid, mode: {
         "stale_processing_ids": [],
         "watching_orphans": [],
         "pending_trigger_rows": [],
@@ -174,7 +174,7 @@ def test_live_pending_trigger_without_watcher_returns_blocked(monkeypatch):
     monkeypatch.setattr(pr, "_resolve_runner", lambda cid: runner)
     monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **kw: None)
     monkeypatch.setattr(pr, "_morning_handoff_success_exists", lambda cid, mode, td: True)
-    monkeypatch.setattr(pr, "_query_client_state", lambda cid: {
+    monkeypatch.setattr(pr, "_query_client_state", lambda cid, mode: {
         "stale_processing_ids": [],
         "watching_orphans": [],
         "pending_trigger_rows": [{"local_order_id": "loi-999", "signal_id": "sig-1"}],
@@ -205,7 +205,7 @@ def test_paper_missing_overnight_reeval_degrades_not_blocks(monkeypatch):
     monkeypatch.setattr(pr, "_resolve_runner", lambda cid: runner)
     monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **kw: None)
     monkeypatch.setattr(pr, "_morning_handoff_success_exists", lambda cid, mode, td: True)
-    monkeypatch.setattr(pr, "_query_client_state", lambda cid: {
+    monkeypatch.setattr(pr, "_query_client_state", lambda cid, mode: {
         "stale_processing_ids": [],
         "watching_orphans": [],
         "pending_trigger_rows": [],

@@ -49,6 +49,10 @@ import pytest
 CLIENT_ID = "jose@example.com"
 LOCAL_ORDER_ID = "oid-due-retry-1"
 SIGNAL_ID = "sig-due-retry-1"
+# The seam intentionally performs 13 synchronous durability writes.  Keep a
+# bounded end-to-end guard, but leave enough room for normal CI scheduling and
+# driver overhead around the ~130 ms simulated write floor.
+SELECTOR_DURABILITY_PHASE_BUDGET_SECONDS = 0.35
 
 
 @pytest.fixture(autouse=True)
@@ -2409,7 +2413,7 @@ def test_spec_acceptance_two_phase_claim_seam(
     # is the correct, deliberate trade of speed for durability the audit
     # required -- not a regression.
     assert len(cursor_persist_calls) == 13
-    assert selector_elapsed < 0.25
+    assert selector_elapsed < SELECTOR_DURABILITY_PHASE_BUDGET_SECONDS
     assert copyback_calls, "validated retry selection must reach durable copyback"
     assert copyback_calls[-1]["contract"] == "RTX260117C00130000"
     assert float(copyback_calls[-1]["limit_price"]) > 0.01

@@ -148,6 +148,8 @@ def _order(
         "meta": meta or {},
         "last_error": last_error,
         "signal_id": "sig-test",
+        "client_id": "jasoncosby1@gmail.com",
+        "execution_mode": "live",
         "plan_id": "plan-test",
         "ticker": contract.split("2")[0] if "2" in contract else "C",
         "direction": "CALL",
@@ -300,6 +302,18 @@ class TestWatcherEvidenceHelper:
         ))
         assert is_valid is True
 
+    @pytest.mark.parametrize(
+        "value",
+        [False, "true", "false", "1", "0", 1, 0, [], {}, " ", None],
+    )
+    def test_malformed_contract_deferred_is_not_watcher_evidence(self, value):
+        is_valid, desc = self._helper(_order(
+            contract="TICK",
+            trigger_price=None,
+            meta={"contract_deferred": value},
+        ))
+        assert is_valid is False, (value, desc)
+
     def test_bare_ticker_no_evidence(self):
         """A short ticker-like contract with no other evidence is not a watcher row."""
         is_valid, desc = self._helper(_order(
@@ -361,7 +375,7 @@ class TestJasonRegressionPreserved:
         order = _order(contract="C260626C00150000", trigger_price=155.0)
         rearm_mock = MagicMock(return_value=(True, True, "rearm_success"))
         with patch.object(mon, "_is_after_pt_eod_cutoff", return_value=False), \
-             patch.object(mon, "_attempt_lost_handoff_rearm", rearm_mock), \
+             patch.object(mon, "_canonical_pending_trigger_rearm", rearm_mock), \
              patch.object(mon, "_log_pending_trigger_watchdog_seen"):
             mon._check_pending_trigger_order(
                 order=order, local_id="order-22514",
@@ -736,6 +750,31 @@ class TestOvernightDeferred:
         ))
         assert is_ov is True
         assert "overnight" in desc
+
+    @pytest.mark.parametrize("field", ["overnight", "contract_deferred"])
+    @pytest.mark.parametrize(
+        "value",
+        [False, "true", "false", "1", "0", 1, 0, [], {}, " ", None],
+    )
+    def test_boolean_authority_requires_exact_true(self, field, value):
+        """Malformed boolean metadata must not grant cross-session rollover."""
+        is_ov, desc = self._helper(_order(
+            contract="TICK",
+            trigger_price=None,
+            meta={field: value},
+        ))
+        assert is_ov is False, (field, value, desc)
+        assert desc == "no_overnight_deferred_evidence"
+
+    @pytest.mark.parametrize("field", ["overnight", "contract_deferred"])
+    def test_exact_boolean_true_is_valid_authority(self, field):
+        is_ov, desc = self._helper(_order(
+            contract="TICK",
+            trigger_price=None,
+            meta={field: True},
+        ))
+        assert is_ov is True
+        assert field in desc
 
     # Evidence 4: meta.queue_status variants
     def test_queue_status_after_hours_deferred(self):

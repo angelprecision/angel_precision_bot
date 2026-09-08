@@ -36,6 +36,60 @@ def _normalize_mode(value: str | None) -> str:
     return str(value or "").strip().lower()
 
 
+def _queue_execution_mode_predicate(payload_expr: str) -> str:
+    """Return the durable trade_queue execution-mode fence for one payload.
+
+    Queue dispatch already treats ``payload.execution_mode`` as the canonical
+    field and ``payload.mode`` as its legacy alias.  Readiness must use the
+    same durable source, while also refusing a row whose two non-blank aliases
+    disagree.  The returned predicate has two mode parameters: one for the
+    canonical field and one for the legacy-only field.
+    """
+    return f"""
+    (
+        (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NOT NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'execution_mode', ''))) = %s
+            AND (
+                NULLIF(BTRIM(COALESCE({payload_expr}->>'mode', '')), '') IS NULL
+                OR LOWER(BTRIM(COALESCE({payload_expr}->>'mode', ''))) =
+                   LOWER(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')))
+            )
+        )
+        OR (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'mode', ''))) = %s
+        )
+    )
+    """
+
+
+def _queue_unresolved_execution_mode_predicate(payload_expr: str) -> str:
+    """Return the fail-closed predicate for an unresolvable queue mode."""
+    return f"""
+    (
+        (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NULL
+            AND NULLIF(BTRIM(COALESCE({payload_expr}->>'mode', '')), '') IS NULL
+        )
+        OR (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NOT NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'execution_mode', ''))) NOT IN ('live', 'paper')
+        )
+        OR (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'mode', '')), '') IS NOT NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'mode', ''))) NOT IN ('live', 'paper')
+        )
+        OR (
+            NULLIF(BTRIM(COALESCE({payload_expr}->>'execution_mode', '')), '') IS NOT NULL
+            AND NULLIF(BTRIM(COALESCE({payload_expr}->>'mode', '')), '') IS NOT NULL
+            AND LOWER(BTRIM(COALESCE({payload_expr}->>'execution_mode', ''))) <>
+                LOWER(BTRIM(COALESCE({payload_expr}->>'mode', '')))
+        )
+    )
+    """
+
+
 def _nyse_is_trading_day(dt: datetime) -> bool:
     """Route through the canonical NYSE calendar in ap.flatline_alarm.
 
@@ -367,35 +421,50 @@ def _post_overnight_reeval_success_exists(client_id: str, execution_mode: str, t
     return False
 
 
-def _query_client_state(client_id: str) -> dict:
+def _query_client_state(client_id: str, execution_mode: str) -> dict:
+    """Load readiness inventory for one exact client/mode authority.
+
+    ``orders.execution_mode`` is the durable mode fence for PENDING_TRIGGER
+    ownership.  The caller must supply a normalized runner mode so a PAPER
+    row can never enter the LIVE ownership proof (or vice versa).
+    """
     from ap.db import conn, run_with_retry
+
+    client_id = str(client_id or "").strip()
+    execution_mode = _normalize_mode(execution_mode)
+    if not client_id or execution_mode not in {"live", "paper"}:
+        raise ValueError("client_id and execution_mode are required for readiness inventory")
 
     now_utc = datetime.now(timezone.utc)
     processing_cutoff = now_utc - timedelta(minutes=PROCESSING_STALE_MINUTES)
     watching_cutoff = now_utc - timedelta(minutes=WATCHING_ORPHAN_GRACE_MINUTES)
     pending_cutoff = now_utc - timedelta(hours=PENDING_TRIGGER_LOOKBACK_HOURS)
+    queue_mode_predicate = _queue_execution_mode_predicate("q.payload")
+    queue_unresolved_mode_predicate = _queue_unresolved_execution_mode_predicate("q.payload")
 
     def _load():
         with conn() as c:
             c.execute(
-                """
-                SELECT id
-                FROM trade_queue
-                WHERE client_id = %s
-                  AND status = 'PROCESSING'
-                  AND COALESCE(started_ts, created_ts) < %s
-                ORDER BY id
+                f"""
+                SELECT q.id
+                FROM trade_queue q
+                WHERE q.client_id = %s
+                  AND q.status = 'PROCESSING'
+                  AND {queue_mode_predicate}
+                  AND COALESCE(q.started_ts, q.created_ts) < %s
+                ORDER BY q.id
                 """,
-                (client_id, processing_cutoff),
+                (client_id, execution_mode, execution_mode, processing_cutoff),
             )
             stale_processing = [r[0] if not isinstance(r, dict) else r.get("id") for r in (c.fetchall() or [])]
 
             c.execute(
-                """
+                f"""
                 SELECT q.id, q.signal_id
                 FROM trade_queue q
                 WHERE q.client_id = %s
                   AND q.status = 'WATCHING'
+                  AND {queue_mode_predicate}
                   AND q.created_ts < %s
                   AND NOT EXISTS (
                       SELECT 1
@@ -403,10 +472,11 @@ def _query_client_state(client_id: str) -> dict:
                       WHERE o.client_id = q.client_id
                         AND COALESCE(o.signal_id, '') = COALESCE(q.signal_id, '')
                         AND o.kind = 'ENTRY'
+                        AND LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s
                   )
                 ORDER BY q.id
                 """,
-                (client_id, watching_cutoff),
+                (client_id, execution_mode, execution_mode, watching_cutoff, execution_mode),
             )
             watching_orphans = []
             for row in (c.fetchall() or []):
@@ -416,10 +486,27 @@ def _query_client_state(client_id: str) -> dict:
                     watching_orphans.append({"id": row[0], "signal_id": row[1]})
 
             c.execute(
+                f"""
+                SELECT q.id
+                FROM trade_queue q
+                WHERE q.client_id = %s
+                  AND q.status IN ('PROCESSING', 'WATCHING')
+                  AND {queue_unresolved_mode_predicate}
+                ORDER BY q.id
+                """,
+                (client_id,),
+            )
+            unresolved_execution_mode_queue_ids = [
+                r[0] if not isinstance(r, dict) else r.get("id")
+                for r in (c.fetchall() or [])
+            ]
+
+            c.execute(
                 """
                 SELECT local_order_id, signal_id
                 FROM orders
                 WHERE client_id = %s
+                  AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                   AND kind = 'ENTRY'
                   AND status = 'PENDING_TRIGGER'
                   AND created_ts >= %s
@@ -428,7 +515,7 @@ def _query_client_state(client_id: str) -> dict:
                   AND filled_ts IS NULL
                 ORDER BY created_ts
                 """,
-                (client_id, pending_cutoff),
+                (client_id, execution_mode, pending_cutoff),
             )
             pending_trigger = []
             for row in (c.fetchall() or []):
@@ -437,14 +524,49 @@ def _query_client_state(client_id: str) -> dict:
                 else:
                     pending_trigger.append({"local_order_id": row[0], "signal_id": row[1]})
 
+            # Amendment §2 — unresolved durable execution_mode authority on orders.
+            #
+            # PENDING_TRIGGER ENTRY rows whose durable orders.execution_mode is
+            # NULL, empty, whitespace, or any value that does not resolve to
+            # exactly 'live' or 'paper' must NOT silently disappear from the
+            # readiness inventory.  The previous query (parameterised by the
+            # requested mode) correctly excludes the opposite valid mode; this
+            # second query captures everything that is neither valid mode so the
+            # authority defect is surfaced independently.
+            #
+            # DO NOT infer or default mode from these rows.  They are not
+            # classified under any ownership tier.  Readiness fails closed when
+            # this collection is non-empty.
             c.execute(
                 """
-                SELECT COUNT(*)::int AS n
-                FROM trade_queue
+                SELECT local_order_id
+                FROM orders
                 WHERE client_id = %s
-                  AND status = 'WATCHING'
+                  AND kind = 'ENTRY'
+                  AND status = 'PENDING_TRIGGER'
+                  AND created_ts >= %s
+                  AND broker_order_id IS NULL
+                  AND submitted_ts IS NULL
+                  AND filled_ts IS NULL
+                  AND LOWER(TRIM(COALESCE(execution_mode, ''))) NOT IN ('live', 'paper')
+                ORDER BY created_ts
                 """,
-                (client_id,),
+                (client_id, pending_cutoff),
+            )
+            unresolved_em_pending_ids = [
+                r[0] if not isinstance(r, dict) else r.get("local_order_id")
+                for r in (c.fetchall() or [])
+            ]
+
+            c.execute(
+                f"""
+                SELECT COUNT(*)::int AS n
+                FROM trade_queue q
+                WHERE q.client_id = %s
+                  AND q.status = 'WATCHING'
+                  AND {queue_mode_predicate}
+                """,
+                (client_id, execution_mode, execution_mode),
             )
             watch_count_row = c.fetchone()
             watching_count = watch_count_row["n"] if isinstance(watch_count_row, dict) else (watch_count_row[0] if watch_count_row else 0)
@@ -452,34 +574,123 @@ def _query_client_state(client_id: str) -> dict:
             return {
                 "stale_processing_ids": stale_processing,
                 "watching_orphans": watching_orphans,
+                "unresolved_execution_mode_queue_ids": unresolved_execution_mode_queue_ids,
                 "pending_trigger_rows": pending_trigger,
+                "unresolved_execution_mode_pending_order_ids": unresolved_em_pending_ids,
                 "watching_count": int(watching_count or 0),
             }
 
     return run_with_retry(_load) or {
         "stale_processing_ids": [],
         "watching_orphans": [],
+        "unresolved_execution_mode_queue_ids": [],
         "pending_trigger_rows": [],
+        "unresolved_execution_mode_pending_order_ids": [],
         "watching_count": 0,
     }
 
 
-def _pending_trigger_without_watcher(runner, pending_rows: list[dict]) -> list[dict]:
+def _pending_trigger_ownership(
+    runner,
+    pending_rows: list[dict],
+    *,
+    client_id: str = "",
+    execution_mode: str = "",
+) -> dict[str, list[dict]]:
+    """Classify pending rows by the exact durable owner they prove.
+
+    A retry lease is recovery ownership only.  It keeps the lifecycle alive
+    while fresh market truth is unavailable, but it does not mean an in-memory
+    APEntryWatcher owns the breach callback.  Readiness therefore keeps retry
+    owned rows distinct from both executable watcher ownership and genuinely
+    ownerless rows.  The caller decides whether each class is account-blocking.
+    """
     entry_watcher = getattr(getattr(runner, "core", None), "entry_watcher", None)
+    classes = {"watcher_owned": [], "retry_owned": [], "ownerless": []}
     if entry_watcher is None or not hasattr(entry_watcher, "has_order"):
-        return list(pending_rows or [])
-    out = []
+        classes["ownerless"].extend(pending_rows or [])
+        return classes
+
+    # A bounded restart-rearm retry is active ownership, not an ownerless
+    # lifecycle.  Reuse the canonical verifier so readiness accepts it only
+    # when the durable client/mode/order identity, owner token, attempt,
+    # next-at, and unexpired deadline all reread exactly.  Any unavailable or
+    # malformed proof remains fail-closed.
+    retry_owner = None
+    osm = getattr(runner, "order_state_machine", None)
+    if osm is not None and client_id and execution_mode:
+        try:
+            from ap.pending_trigger_restart_recovery import PendingTriggerRestartRecovery
+
+            retry_owner = PendingTriggerRestartRecovery(
+                client_id=client_id,
+                execution_mode=execution_mode,
+                osm=osm,
+                entry_watcher=entry_watcher,
+                broker=None,
+                caller_source="ap.preopen_readiness",
+            )
+        except Exception:
+            retry_owner = None
     for row in pending_rows or []:
         local_order_id = str(row.get("local_order_id") or "").strip()
-        if not local_order_id:
-            out.append(row)
+        signal_id = str(row.get("signal_id") or "").strip()
+        if not local_order_id or not signal_id or retry_owner is None:
+            classes["ownerless"].append(row)
             continue
         try:
-            if not entry_watcher.has_order(local_order_id):
-                out.append(row)
-        except Exception:
-            out.append(row)
-    return out
+            # Never let local_order_id-only has_order() satisfy readiness.
+            # The canonical recovery engine proves durable client/mode/signal
+            # identity, lifecycle state, registry state, and dedup ownership.
+            if (
+                retry_owner.prove_registered_watcher_owner(
+                    local_order_id,
+                    expected_signal_id=signal_id,
+                )
+                is not None
+            ):
+                classes["watcher_owned"].append(row)
+                continue
+            if (
+                retry_owner.prove_restart_rearm_retry_owner(
+                    local_order_id,
+                    expected_signal_id=signal_id,
+                )
+                is not None
+            ):
+                classes["retry_owned"].append(row)
+                continue
+        except Exception as exc:
+            log.warning(
+                "PREOPEN_RESTART_REARM_OWNER_PROOF_FAILED local=%s: %s",
+                local_order_id,
+                exc,
+            )
+        classes["ownerless"].append(row)
+    return classes
+
+
+def _pending_trigger_without_watcher(
+    runner,
+    pending_rows: list[dict],
+    *,
+    client_id: str = "",
+    execution_mode: str = "",
+) -> list[dict]:
+    """Return pending rows that lack any exact durable ownership.
+
+    Exact retry ownership is deliberately excluded.  It is not executable
+    watcher ownership, but it is valid row-level recovery ownership and must
+    not freeze unrelated LIVE entries.  The full three-way classification is
+    retained by :func:`_pending_trigger_ownership` and the readiness details.
+    """
+    classes = _pending_trigger_ownership(
+        runner,
+        pending_rows,
+        client_id=client_id,
+        execution_mode=execution_mode,
+    )
+    return classes["ownerless"]
 
 
 def _overnight_status(
@@ -492,6 +703,26 @@ def _overnight_status(
     stage: str = "",
     now: datetime | None = None,
 ) -> tuple[str, dict]:
+    pending_rows = client_state.get("pending_trigger_rows") or []
+    if pending_rows:
+        ownership = _pending_trigger_ownership(
+            runner,
+            pending_rows,
+            client_id=client_id,
+            execution_mode=execution_mode,
+        )
+        if ownership["ownerless"]:
+            return "missing", {
+                "source": "pending_trigger_without_watcher_ownership",
+                "retry_owned": ownership["retry_owned"],
+                "ownerless": ownership["ownerless"],
+            }
+        if ownership["retry_owned"]:
+            return "pending", {
+                "source": "pending_trigger_retry_owned",
+                "retry_owned": ownership["retry_owned"],
+                "ownerless": [],
+            }
     if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
         return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
     success_date = getattr(runner, "_overnight_reeval_success_date", None)
@@ -623,7 +854,7 @@ def run_preopen_autonomous_readiness(
     if selector_identity["quote_source"] == "unknown" or not selector_identity["tradier_base_url"]:
         errors.append("selector_quote_identity_unresolved")
 
-    client_state = _query_client_state(client_id)
+    client_state = _query_client_state(client_id, mode)
     details["client_state"] = client_state
 
     if client_state.get("stale_processing_ids"):
@@ -632,10 +863,37 @@ def run_preopen_autonomous_readiness(
     if client_state.get("watching_orphans"):
         errors.append("watching_rows_missing_orders_recommend_new_rescue")
 
-    unowned_pending = _pending_trigger_without_watcher(runner, client_state.get("pending_trigger_rows") or [])
+    if client_state.get("unresolved_execution_mode_queue_ids"):
+        errors.append("trade_queue_execution_mode_unresolved")
+
+    pending_ownership = _pending_trigger_ownership(
+        runner,
+        client_state.get("pending_trigger_rows") or [],
+        client_id=client_id,
+        execution_mode=mode,
+    )
+    # Exact retry ownership is a row-level hold, not account-level evidence
+    # that LIVE readiness is unsafe.  Only rows with no proven watcher or
+    # canonical retry owner remain in the fatal ownership set.
+    unowned_pending = pending_ownership["ownerless"]
+    details["pending_trigger_watcher_owned"] = pending_ownership["watcher_owned"]
+    details["pending_trigger_retry_owned"] = pending_ownership["retry_owned"]
+    details["pending_trigger_ownerless"] = pending_ownership["ownerless"]
     details["pending_trigger_without_watcher"] = unowned_pending
     if unowned_pending:
         errors.append("pending_trigger_without_watcher_ownership")
+
+    # Amendment §2 — unresolved durable execution_mode authority on orders.
+    # An active PENDING_TRIGGER ENTRY whose orders.execution_mode cannot be
+    # resolved to exactly 'live' or 'paper' must NOT silently disappear.
+    # These rows are neither in the requested-mode inventory nor in the
+    # opposite-mode inventory — they are an authority defect surfaced here
+    # independently.  Do not infer mode; do not classify under any ownership
+    # tier.  Readiness fails closed.
+    unresolved_em_orders = client_state.get("unresolved_execution_mode_pending_order_ids") or []
+    details["pending_trigger_unresolved_execution_mode_order_ids"] = unresolved_em_orders
+    if unresolved_em_orders:
+        errors.append("pending_trigger_execution_mode_unresolved")
 
     handoff_ok = _morning_handoff_success_exists(client_id, mode, trading_date)
     details["morning_handoff_success"] = handoff_ok
@@ -658,7 +916,10 @@ def run_preopen_autonomous_readiness(
         now=now,
     )
     if overnight_state == "pending":
-        warnings.append("overnight_reeval_pending_startup")
+        if overnight_details.get("source") == "pending_trigger_retry_owned":
+            warnings.append("overnight_reeval_retryable")
+        else:
+            warnings.append("overnight_reeval_pending_startup")
     elif overnight_state == "missing":
         if mode == "live" or _after_929_et(now):
             errors.append("overnight_reeval_missing")
@@ -687,6 +948,9 @@ def run_preopen_autonomous_readiness(
         "runner_not_alive",
         "overnight_reeval_missing",
         "pending_trigger_without_watcher_ownership",
+        # Amendment §2: an order with unresolvable execution_mode is unknown
+        # authority — LIVE must never be authorized with unknown inventory.
+        "pending_trigger_execution_mode_unresolved",
     }
     if mode == "live" and any(err in blocked_keys for err in errors):
         status = "BLOCKED"

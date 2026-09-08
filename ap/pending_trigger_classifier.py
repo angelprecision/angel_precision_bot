@@ -898,13 +898,44 @@ def has_broker_handoff_evidence(row: dict) -> bool:
     """
     if not isinstance(row, dict):
         return False
-    meta = _coerce_classifier_meta(row.get("meta"))
+    if not _persisted_value_is_absent(row.get("broker_order_id")):
+        return True
+    if not _persisted_value_is_absent(row.get("submitted_ts")):
+        return True
+    raw_meta = row.get("meta")
+    if raw_meta is None:
+        meta = {}
+    elif isinstance(raw_meta, dict):
+        meta = raw_meta
+    elif isinstance(raw_meta, str) and raw_meta.strip():
+        try:
+            parsed_meta = json.loads(raw_meta)
+        except Exception:
+            return True
+        if not isinstance(parsed_meta, dict):
+            return True
+        meta = parsed_meta
+    else:
+        return True
     surfaces = [meta]
-    nested = meta.get("materialization")
-    if isinstance(nested, dict):
+    if "materialization" in meta:
+        nested = meta.get("materialization")
+        if not isinstance(nested, dict):
+            return True
         surfaces.append(nested)
 
     for surface in surfaces:
+        if str(surface.get("lifecycle_state") or "").strip().upper() in {
+            "SUBMITTING",
+            "SUBMITTED",
+        }:
+            return True
+        if str(surface.get("current_owner") or "").strip().lower().startswith(
+            "broker_submit:"
+        ):
+            return True
+        if not _persisted_value_is_absent(surface.get("recovery_submit_owner")):
+            return True
         broker_ready = surface.get("broker_ready")
         if not _persisted_value_is_absent(broker_ready) and not (
             broker_ready is False

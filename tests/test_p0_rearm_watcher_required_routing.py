@@ -343,7 +343,7 @@ def _build_harness(monkeypatch, *, due_meta_overrides=None, quote_bid=98.0,
             return None
         return dict(row_store["row"])
 
-    def _osm_update_order_meta(order_id, patch):
+    def _osm_update_order_meta(order_id, patch, **_kwargs):
         if str(order_id) != LOCAL_ORDER_ID:
             return False
         row_store["row"]["meta"] = {**row_store["row"].get("meta", {}), **patch}

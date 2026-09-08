@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import sys
 import types
+import os
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from zoneinfo import ZoneInfo
+
+os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 import ap_overnight_reeval as ov
 
@@ -84,27 +87,92 @@ class _MasterControl:
 
 
 class _OSM:
-    def __init__(self, *, fail: bool = False):
+    def __init__(self, *, fail: bool = False, fail_meta_update: bool = False):
         self.fail = fail
+        self.fail_meta_update = fail_meta_update
         self.create_calls: list[dict] = []
+        self.rows: dict[str, dict] = {}
 
     def create_entry_order(self, plan, **kwargs):
         if self.fail:
             raise RuntimeError("insert failed")
         local_order_id = f"local-{len(self.create_calls) + 1}"
         self.create_calls.append({"plan": plan, "local_order_id": local_order_id, **kwargs})
+        self.rows[local_order_id] = {
+            "local_order_id": local_order_id,
+            "signal_id": str(getattr(plan, "signal_id", "") or ""),
+            "client_id": str(getattr(plan, "client_id", "") or ""),
+            "execution_mode": str(kwargs.get("execution_mode") or "").lower(),
+            "status": str(kwargs.get("initial_status") or "PENDING_TRIGGER"),
+            "symbol": str(getattr(plan, "ticker", "") or ""),
+            "direction": str(getattr(plan, "direction", "") or ""),
+            "trigger_price": getattr(plan, "trigger_price", None),
+            "meta": dict(kwargs.get("meta") or {}),
+        }
         return local_order_id
 
     def get_order(self, local_order_id: str) -> dict:
-        return {"local_order_id": local_order_id, "status": "PENDING_TRIGGER"}
+        return dict(self.rows.get(local_order_id) or {})
+
+    def update_order_meta(self, local_order_id: str, patch: dict, **_kwargs) -> bool:
+        if self.fail_meta_update or local_order_id not in self.rows:
+            return False
+        self.rows[local_order_id]["meta"].update(dict(patch or {}))
+        return True
 
 
 class _Watcher:
-    def __init__(self):
+    def __init__(self, *, watch_returns: bool = True):
         self.calls: list[tuple[object, str]] = []
+        self._pending: list[object] = []
+        self._dedup_set: set[str] = set()
+        self._watch_returns = watch_returns
 
-    def watch(self, plan, local_order_id: str) -> bool:
+    def _is_past_entry_cutoff_now(self) -> bool:
+        """Expose the production cutoff authority while using the fixed test clock."""
+        return False
+
+    def has_order(self, local_order_id: str) -> bool:
+        return any(
+            str(getattr(item, "signal", {}).get("local_order_id") or "")
+            == local_order_id
+            for item in self._pending
+        )
+
+    def watch(
+        self,
+        plan,
+        local_order_id: str,
+        *,
+        registration_provenance_out: dict | None = None,
+        **_kwargs,
+    ) -> bool:
         self.calls.append((plan, local_order_id))
+        if not self._watch_returns:
+            self._last_reject_reason = "RECOVERY_REARM_QUOTE_UNAVAILABLE"
+            return False
+        get_value = (
+            (lambda key, default="": plan.get(key, default))
+            if isinstance(plan, dict)
+            else (lambda key, default="": getattr(plan, key, default))
+        )
+        signal_id = str(get_value("signal_id") or "")
+        item = SimpleNamespace(
+            state="PENDING",
+            _ownership_quarantine=False,
+            _registration_token=f"token-{local_order_id}",
+            signal={
+                "local_order_id": local_order_id,
+                "signal_id": signal_id,
+                "client_id": str(get_value("client_id") or ""),
+                "execution_mode": str(get_value("execution_mode") or "").lower(),
+            },
+        )
+        self._pending.append(item)
+        self._dedup_set.add(signal_id)
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = True
+            registration_provenance_out["registration_token"] = item._registration_token
         return True
 
 
@@ -117,7 +185,14 @@ def _run_harness(
     osm: _OSM | None = None,
     client_id: str = "jose@example.com",
     execution_mode: str = "PAPER",
+    now_et: datetime | None = None,
+    now_et_sequence: list[datetime] | None = None,
+    recovery_quote: tuple[float, float] | None = (100.0, 100.1),
+    watch_returns: bool = True,
 ):
+    import ap.pending_trigger_restart_recovery as ptr
+
+    run_now = now_et or FIXED_ET
     counters = {"prior": [], "snapshot": []}
 
     class _Broker:
@@ -134,7 +209,18 @@ def _run_harness(
                 "prior_day_low": 95.0,
                 "prior_day_close": 98.0,
                 "source": "test",
-                "observed_at": FIXED_ET.isoformat(),
+                "observed_at": run_now.isoformat(),
+            }
+
+        def get_quote(self, _ticker: str):
+            if recovery_quote is None:
+                return None
+            bid, ask = recovery_quote
+            return {
+                "bid": bid,
+                "ask": ask,
+                "source": "test",
+                "observed_at": run_now.isoformat(),
             }
 
     broker = _Broker()
@@ -148,7 +234,7 @@ def _run_harness(
         return {
             "last": 100.0,
             "source": "test",
-            "observed_at": FIXED_ET.isoformat(),
+            "observed_at": run_now.isoformat(),
         }
 
     validator.fetch_market_snapshot = _fetch_snapshot
@@ -178,7 +264,18 @@ def _run_harness(
     waiting: list[tuple[object, str, str]] = []
     armed_rows: list[tuple[object, str, str]] = []
     duplicate_signal_ids = duplicate_signal_ids or set()
-    monkeypatch.setattr(ov, "_et_now", lambda: FIXED_ET)
+    clock_values = list(now_et_sequence or [run_now])
+    clock_fallback = clock_values[-1]
+    clock_iter = iter(clock_values)
+
+    def _clock_now():
+        return next(clock_iter, clock_fallback)
+
+    monkeypatch.setattr(ov, "_et_now", _clock_now)
+    # The full P0 collection can reload ap_overnight_reeval before this test
+    # runs. Patch the live restart-recovery module directly as well so the
+    # simulated clock cannot fall back to CI wall time across module reloads.
+    monkeypatch.setattr(ptr, "_now_et", _clock_now)
     monkeypatch.setattr(ov, "_OVERNIGHT_SNAPSHOT_FAIL_CLOSED", False)
     monkeypatch.setattr(ov, "_fetch_watching_signals", lambda _client_id: list(jobs))
     monkeypatch.setattr(
@@ -209,7 +306,7 @@ def _run_harness(
 
     selector = MagicMock()
     osm = osm or _OSM()
-    watcher = _Watcher()
+    watcher = _Watcher(watch_returns=watch_returns)
     result = ov.run_overnight_reeval(
         client_id=client_id,
         broker=broker,
@@ -232,6 +329,282 @@ def _run_harness(
         waiting=waiting,
         armed_rows=armed_rows,
     )
+
+
+def test_092945_exact_new_lifecycle_installs_watcher_before_open(monkeypatch):
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-proof", _signal("late-proof", "NFLX"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 29, 45, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert state.result["market_truth_deferred"] == 0
+    assert state.result["retryable_deferred"] == 0
+    assert state.result["retry_owned"] == 0
+    assert state.result["armed"] == 1
+    assert state.result["completed"] is True
+    assert state.result["retryable"] is False
+    assert len(state.osm.create_calls) == 1
+    assert [oid for _plan, oid in state.watcher.calls] == ["local-1"]
+    assert len(state.watcher._pending) == 1
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_092929_slow_boundary_routes_to_market_truth_after_open(monkeypatch):
+    before_open = datetime(2026, 7, 22, 9, 29, 29, tzinfo=ZoneInfo("America/New_York"))
+    at_boundary = datetime(2026, 7, 22, 9, 30, 1, tzinfo=ZoneInfo("America/New_York"))
+    state = _run_harness(
+        monkeypatch,
+        [_job("slow-boundary", _signal("slow-boundary", "NFLX"))],
+        execution_mode="LIVE",
+        now_et=before_open,
+        now_et_sequence=[before_open, at_boundary],
+        recovery_quote=None,
+        watch_returns=False,
+    )
+
+    assert state.result["armed"] == 0
+    assert state.result["retry_owned"] == 1
+    assert state.result["result_class"] == "RETRYABLE_MARKET_TRUTH_PENDING"
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
+    retry_row = state.osm.rows["local-1"]
+    assert retry_row["local_order_id"] == "local-1"
+    assert retry_row["signal_id"] == "slow-boundary"
+    assert retry_row["client_id"] == "jose@example.com"
+    assert retry_row["execution_mode"] == "live"
+    assert retry_row["meta"]["restart_rearm_status"] == "RETRY_PENDING"
+    assert state.watcher._pending == []
+    state.broker.submit_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_post_open_legacy_osm_signature_cannot_grant_retry_or_watcher_authority(monkeypatch):
+    class _LegacyOSM(_OSM):
+        def update_order_meta(self, local_order_id: str, patch: dict) -> bool:
+            return super().update_order_meta(local_order_id, patch)
+
+    state = _run_harness(
+        monkeypatch,
+        [_job("legacy-cas", _signal("legacy-cas", "NFLX"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+        osm=_LegacyOSM(),
+    )
+
+    assert state.result["retry_owned"] == 0
+    assert state.result["retryable_deferred"] == 1
+    assert state.osm.rows["local-1"]["meta"].get("restart_rearm_status") is None
+    assert state.watcher._pending == []
+    state.broker.submit_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_post_open_valid_truth_preserves_exact_identity_and_installs_once(monkeypatch):
+    signal_id = "late-valid-identity"
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-valid-identity", _signal(signal_id, "C"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=(100.0, 100.1),
+    )
+
+    assert len(state.watcher.calls) == 1
+    plan, local_order_id = state.watcher.calls[0]
+    assert local_order_id == "local-1"
+    assert plan.signal_id == signal_id
+    assert plan.client_id == "jose@example.com"
+    assert plan.execution_mode == "live"
+    assert state.osm.rows[local_order_id]["signal_id"] == signal_id
+    assert state.osm.rows[local_order_id]["client_id"] == "jose@example.com"
+    assert state.osm.rows[local_order_id]["execution_mode"] == "live"
+    state.broker.submit_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_post_open_missing_quote_fails_closed_when_retry_owner_is_unproven(monkeypatch):
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-unowned", _signal("late-unowned", "BMY"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 30, 5, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+        osm=_OSM(fail_meta_update=True),
+    )
+
+    assert state.result["market_truth_deferred"] == 0
+    assert state.result["retryable_deferred"] == 1
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
+    assert [oid for _plan, oid in state.watcher.calls] == ["local-1"]
+    assert state.watcher._pending == []
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+
+
+def test_post_open_new_arm_routes_to_watcher_market_validity(monkeypatch):
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-valid", _signal("late-valid", "C"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 30, 5, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+    )
+
+    assert state.result["market_truth_deferred"] == 0
+    assert state.result["armed"] == 1
+    assert state.result["completed"] is True
+    assert len(state.watcher.calls) == 1
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+
+
+def test_post_open_missing_quote_gets_durable_retry_owner(monkeypatch):
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-hold", _signal("late-hold", "BMY"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 30, 5, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+    )
+
+    assert state.result["retry_owned"] == 1
+    assert state.result["result_class"] == "RETRYABLE_MARKET_TRUTH_PENDING"
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
+    assert [oid for _plan, oid in state.watcher.calls] == ["local-1"]
+    assert state.watcher._pending == []
+    assert state.osm.rows["local-1"]["meta"]["restart_rearm_status"] == "RETRY_PENDING"
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+
+
+def test_retry_owned_recovery_is_consumed_same_process_before_5400_seconds(monkeypatch):
+    from datetime import timedelta, timezone
+
+    from ap.order_monitor import APOrderMonitor
+
+    state = _run_harness(
+        monkeypatch,
+        [_job("late-same-process", _signal("late-same-process", "NFLX"))],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 30, 5, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+    )
+
+    assert state.result["result_class"] == "RETRYABLE_MARKET_TRUTH_PENDING"
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
+    assert state.watcher._pending == []
+
+    row = state.osm.rows["local-1"]
+    row["meta"]["restart_rearm_first_failed_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=2)
+    ).isoformat()
+    row["meta"]["restart_rearm_last_failed_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    row["meta"]["restart_rearm_next_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    row["meta"]["restart_rearm_deadline"] = (
+        datetime.now(timezone.utc) + timedelta(minutes=1)
+    ).isoformat()
+    row["created_ts"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=35)
+    ).isoformat()
+    row["contract"] = "DEFERRED:NFLX"
+    state.watcher._watch_returns = True
+    calls_before_due_cycle = len(state.watcher.calls)
+
+    monitor = APOrderMonitor(
+        client_id="jose@example.com",
+        broker=state.broker,
+        order_state_machine=state.osm,
+        position_manager=MagicMock(),
+        entry_watcher=state.watcher,
+        client_mode="LIVE",
+    )
+    monitor._get_active_entry_orders = lambda: [dict(row)]
+    monitor._check_entry_orders()
+
+    assert len(state.watcher.calls) == calls_before_due_cycle + 1
+    assert len(state.watcher._pending) == 1
+    assert state.watcher._pending[0].signal["local_order_id"] == "local-1"
+    assert state.watcher._pending[0].signal["signal_id"] == "late-same-process"
+    assert row["meta"]["restart_rearm_status"] == "CLOSED"
+    assert row["meta"]["restart_rearm_close_reason"] == "watcher_owned"
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_owned_retry_does_not_hide_unresolved_inventory(monkeypatch):
+    class _OneRowRetryCASFailure(_OSM):
+        def update_order_meta(self, local_order_id: str, patch: dict, **kwargs) -> bool:
+            if local_order_id == "local-2" and kwargs.get("expected_no_broker_handoff"):
+                return False
+            return super().update_order_meta(local_order_id, patch, **kwargs)
+
+    state = _run_harness(
+        monkeypatch,
+        [
+            _job("retry-owned", _signal("retry-owned", "NFLX")),
+            _job("unresolved", _signal("unresolved", "BMY")),
+        ],
+        execution_mode="LIVE",
+        now_et=datetime(2026, 7, 22, 9, 31, tzinfo=ZoneInfo("America/New_York")),
+        recovery_quote=None,
+        watch_returns=False,
+        osm=_OneRowRetryCASFailure(),
+    )
+
+    assert state.result["retry_owned"] == 1
+    assert state.result["retryable_deferred"] == 1
+    assert state.result["result_class"] == "RETRYABLE_ALL_DEFERRED"
+    assert state.result["completed"] is False
+    assert state.result["retryable"] is True
+    assert state.osm.rows["local-1"]["meta"]["restart_rearm_status"] == "RETRY_PENDING"
+    assert state.osm.rows["local-2"]["meta"].get("restart_rearm_status") is None
+
+    import ap.preopen_readiness as readiness
+
+    runner = SimpleNamespace(
+        core=SimpleNamespace(entry_watcher=state.watcher),
+        order_state_machine=state.osm,
+    )
+    pending = [
+        {"local_order_id": "local-1", "signal_id": "retry-owned"},
+        {"local_order_id": "local-2", "signal_id": "unresolved"},
+    ]
+    assert readiness._pending_trigger_without_watcher(
+        runner,
+        pending,
+        client_id="jose@example.com",
+        execution_mode="live",
+    ) == [
+        {"local_order_id": "local-2", "signal_id": "unresolved"},
+    ]
+    state.broker.submit_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
 
 
 def test_mixed_terminal_and_56_deferred_rows_remain_retryable(monkeypatch):

@@ -2700,3 +2700,101 @@ def test_identity_signature_requires_execution_mode():
     assert p.kind == inspect.Parameter.KEYWORD_ONLY, "execution_mode must be keyword-only"
     assert p.default is inspect.Parameter.empty, "execution_mode must NOT be optional"
     assert "job_id" in sig.parameters, "helper must require queue-job ownership"
+
+
+# ── Amendment §1: _stamp_payload_execution_mode durable write ─────────────────
+
+def test_stamp_payload_execution_mode_writes_resolved_mode_to_processing_row(monkeypatch):
+    """_stamp_payload_execution_mode persists the resolved mode to trade_queue.payload.
+
+    Invariants verified:
+    * Writes exactly {execution_mode: mode} to the payload column.
+    * UPDATE is guarded to status='PROCESSING' — not to any other status.
+    * Accepts only canonical 'live' or 'paper' — refuses invalid modes silently.
+    * Zero broker submit / cancel / replace.
+    """
+    updates = []
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            updates.append({"sql": " ".join(sql.split()), "params": params})
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    _cur = _Cursor()
+
+    def _fake_conn():
+        return _cur
+
+    import ap.queue as q
+    monkeypatch.setattr(q, "_conn", lambda: _fake_conn)
+    monkeypatch.setattr(q, "_run_with_retry", lambda fn: fn())
+
+    # --- positive: valid mode is written ---
+    q._stamp_payload_execution_mode(999, "live")
+    assert len(updates) == 1, "Exactly one UPDATE expected"
+    sql = updates[0]["sql"]
+    params = updates[0]["params"]
+    assert "update trade_queue" in sql.lower()
+    assert "status = 'processing'" in sql.lower(), "Must guard on PROCESSING status"
+    assert "payload" in sql.lower(), "Must update payload column"
+    assert "execution_mode" in str(params[0]).lower(), "Must inject execution_mode key"
+    assert "live" in str(params[0]).lower(), "Must inject correct mode value"
+    assert params[1] == 999, "Must target the exact job_id"
+
+    # --- negative: invalid mode is refused without a DB write ---
+    updates.clear()
+    q._stamp_payload_execution_mode(999, "sandbox")
+    assert updates == [], "Invalid mode must not produce any DB write"
+
+    q._stamp_payload_execution_mode(999, "")
+    assert updates == [], "Empty mode must not produce any DB write"
+
+    q._stamp_payload_execution_mode(999, None)
+    assert updates == [], "None mode must not produce any DB write"
+
+
+def test_stamp_payload_execution_mode_source_evidence():
+    """Source-level proof that _dispatch calls _stamp_payload_execution_mode.
+
+    Verifies:
+    * _stamp_payload_execution_mode is defined in ap/queue.py.
+    * The call site exists in _dispatch — exactly at the in-memory payload stamp.
+    * The helper guards on status='PROCESSING' (not WATCHING or any other state).
+    * No change to _mark_job, _checked_watching_cas, or _persist_watching_deferral.
+    """
+    src = (Path(__file__).resolve().parents[1] / "ap" / "queue.py").read_text()
+
+    assert "def _stamp_payload_execution_mode(" in src, \
+        "_stamp_payload_execution_mode helper must be defined in ap/queue.py"
+
+    assert "_stamp_payload_execution_mode(job_id, runtime_mode_for_dispatch.lower())" in src, \
+        "_dispatch must call _stamp_payload_execution_mode with the resolved runtime mode"
+
+    # Guard: must be guarded to PROCESSING rows only (prevents retroactive mutation).
+    stamp_body_start = src.index("def _stamp_payload_execution_mode(")
+    # Find the next function def or a reasonable chunk.
+    next_def = src.index("\ndef ", stamp_body_start + 1)
+    stamp_body = src[stamp_body_start:next_def]
+    assert "status = 'PROCESSING'" in stamp_body or "status='PROCESSING'" in stamp_body, \
+        "_stamp_payload_execution_mode UPDATE must be guarded to status='PROCESSING'"
+
+    # Confirm _checked_watching_cas signature is NOT widened by this amendment.
+    assert "def _checked_watching_cas(" in src
+    cas_start = src.index("def _checked_watching_cas(")
+    cas_end = src.index("\ndef ", cas_start + 1)
+    cas_sig = src[cas_start:cas_end]
+    assert "payload_patch" not in cas_sig, \
+        "_checked_watching_cas must NOT have been widened by this amendment"
