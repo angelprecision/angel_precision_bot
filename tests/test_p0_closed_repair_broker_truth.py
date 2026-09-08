@@ -383,7 +383,7 @@ def test_postgres_exact_quantity_restore_preserves_existing_restore_behavior(
     postgres_closed_row, mode
 ):
     """Matrix A: exact broker quantity is authoritative for this lifecycle."""
-    insert, read, _executed_sql = postgres_closed_row
+    insert, read, executed_sql = postgres_closed_row
     insert(qty=10, quantity_remaining=2, execution_mode=mode)
     broker = _tradier(
         payload={
@@ -403,6 +403,7 @@ def test_postgres_exact_quantity_restore_preserves_existing_restore_behavior(
         "quantity_remaining": 2,
         "close_source": "PARTIAL_CLOSE_REPAIR",
     }
+    assert sum(sql.startswith("UPDATE POSITIONS") for sql in executed_sql) == 1
 
 
 @pytest.mark.parametrize(
@@ -1227,7 +1228,7 @@ def test_postgres_multiple_local_rows_sharing_occ_hold_all_candidates(
 
 
 def test_postgres_flatten_cas_miss_is_not_reported_as_success(
-    postgres_closed_row,
+    postgres_closed_row, caplog
 ):
     """Matrix F: an authoritative flat snapshot cannot flatten a lifecycle
     that changes before the conditional UPDATE reaches the database."""
@@ -1246,11 +1247,12 @@ def test_postgres_flatten_cas_miss_is_not_reported_as_success(
         "close_source": "LEGACY_CLOSE",
     }
     assert "closed_repair_flatten_cas_miss" in summary["errors"]
+    assert "P0-PARTIAL-CLOSE-REPAIR FLATTEN |" not in caplog.text
     _assert_no_broker_mutations(broker)
 
 
 def test_postgres_restore_cas_miss_does_not_seed_stale_owner(
-    postgres_closed_row,
+    postgres_closed_row, caplog
 ):
     """Matrix G: a restore CAS miss performs no success follow-on, including
     no exit-engine ownership seed from the stale scan projection."""
@@ -1275,6 +1277,7 @@ def test_postgres_restore_cas_miss_does_not_seed_stale_owner(
         "close_source": "LEGACY_CLOSE",
     }
     assert "closed_repair_restore_cas_miss" in summary["errors"]
+    assert "P0-PARTIAL-CLOSE-REPAIR RESTORED |" not in caplog.text
     rec._find_db_position_by_id.assert_not_called()
     rec._seed_exit_engine_from_position.assert_not_called()
     _assert_no_broker_mutations(broker)
