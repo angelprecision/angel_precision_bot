@@ -1703,12 +1703,90 @@ class APEntryWatcher:
         def _terminal_family() -> bool:
             return status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
 
+        # ── PR #597: durable terminal reason authority ────────────────────
+        # The recovery terminalizer in ap/pending_trigger_restart_recovery.py
+        # (_terminalize_with_reason) writes and verifies terminal reasons from
+        # this exact canonical family:
+        #   * top-level orders.last_error
+        #   * meta.restart_recovery_terminal_reason
+        #   * meta.terminal_reason
+        #   * meta.reason_code
+        #   * meta.final_reason
+        #   * meta.watcher_invalidation_reason
+        # The previous watcher-side verifier only checked reason_code,
+        # final_reason, and materialization_reason, so a row that recovery
+        # had durably terminalized as CANCELED + last_error=... could still
+        # come back KEEP_WATCHER here — the Sep 8 TMO ownership split.
+        # Spec §7: watcher_audit.reason_code is NOT terminal proof on its
+        # own (would legalize trigger_ready residue) — deliberately excluded.
+        def _collect_durable_terminal_reasons() -> set[str]:
+            reasons: set[str] = set()
+            # Top-level authority.
+            _le = row.get("last_error")
+            if _le is not None:
+                _le_s = str(_le).strip()
+                if _le_s:
+                    reasons.add(_le_s)
+            # Meta authorities — canonical fields written by recovery and
+            # by legacy watcher/materialization paths.
+            for _field in (
+                "restart_recovery_terminal_reason",
+                "terminal_reason",
+                "reason_code",
+                "final_reason",
+                "materialization_reason",
+                "watcher_invalidation_reason",
+            ):
+                _v = meta.get(_field)
+                if _v is None:
+                    continue
+                _v_s = str(_v).strip()
+                if _v_s:
+                    reasons.add(_v_s)
+            return reasons
+
         def _terminal_reason_present() -> bool:
-            return bool(
-                meta.get("reason_code")
-                or meta.get("final_reason")
-                or meta.get("materialization_reason")
-            )
+            return bool(_collect_durable_terminal_reasons())
+
+        def _terminal_reason_conflict() -> bool:
+            # Spec §8.2: multiple DISTINCT non-empty durable authorities is
+            # conflicting authority — HOLD fail-closed, never last-writer-wins.
+            # Duplicate identical reasons across fields are accepted as
+            # consistent proof.
+            return len(_collect_durable_terminal_reasons()) > 1
+
+        def _identity_matches_watcher() -> bool:
+            # Spec §9: prove the reread order still names the same identity
+            # the watcher owns before allowing eviction. Never let a
+            # bad/missing identity evict a different watcher.
+            _sig_local = str(signal.get("local_order_id") or "").strip()
+            _row_local = str(row.get("local_order_id") or "").strip()
+            if not _sig_local or not _row_local or _sig_local != _row_local:
+                return False
+            # Client identity — accept client_id or legacy client_email.
+            _sig_client = str(
+                signal.get("client_id") or signal.get("client_email") or ""
+            ).strip().lower()
+            _row_client = str(
+                row.get("client_id") or row.get("client_email") or ""
+            ).strip().lower()
+            _runtime_client = str(getattr(self, "client_id", "") or "").strip().lower()
+            # If watcher runtime has a client, row must match it.
+            if _runtime_client and _row_client and _runtime_client != _row_client:
+                return False
+            # If signal carries a client, row must match it.
+            if _sig_client and _row_client and _sig_client != _row_client:
+                return False
+            # Execution mode identity — mirror recovery terminalizer's lower-case comparison.
+            _row_mode = str(row.get("execution_mode") or "").strip().lower()
+            _runtime_mode = str(
+                getattr(self, "execution_mode", "")
+                or getattr(self, "mode", "")
+                or ""
+            ).strip().lower()
+            if _runtime_mode and _row_mode and _runtime_mode != _row_mode:
+                return False
+            return True
 
         def _verify_submitted() -> tuple[str, str | None]:
             """Return the verified disposition for a SUBMITTED claim."""
@@ -1730,9 +1808,35 @@ class APEntryWatcher:
             return "KEEP_WATCHER", None
 
         def _verify_terminal() -> tuple[str, str | None]:
-            if _terminal_family() and _terminal_reason_present():
-                return "TERMINAL_DURABLE", None
-            return "KEEP_WATCHER", None
+            if not _terminal_family():
+                return "KEEP_WATCHER", None
+            if not _terminal_reason_present():
+                # Spec §8.1: terminal status with no durable reason → HOLD.
+                log.critical(
+                    "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                    "local_order_id=%s status=%s reason=no_recognized_durable_terminal_reason",
+                    local_order_id, status,
+                )
+                return "KEEP_WATCHER", None
+            if _terminal_reason_conflict():
+                # Spec §8.2: conflicting durable authorities → HOLD.
+                log.critical(
+                    "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                    "local_order_id=%s status=%s reason=conflicting_durable_terminal_reasons reasons=%s",
+                    local_order_id, status,
+                    sorted(_collect_durable_terminal_reasons()),
+                )
+                return "KEEP_WATCHER", None
+            if not _identity_matches_watcher():
+                # Spec §9: identity mismatch → never evict a watcher for the
+                # wrong row. Retain fail-closed.
+                log.critical(
+                    "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                    "local_order_id=%s status=%s reason=identity_mismatch_row_client_or_mode",
+                    local_order_id, status,
+                )
+                return "KEEP_WATCHER", None
+            return "TERMINAL_DURABLE", None
 
         def _verify_retry() -> tuple[str, str | None]:
             if status not in {"PENDING_TRIGGER", "CREATED"}:
@@ -5812,6 +5916,39 @@ class APEntryWatcher:
                             raise RuntimeError(
                                 "deferred_trigger_callback_returned_without_durable_outcome"
                             )
+                        # PR #597 §14: emit structured convergence proof when
+                        # a terminal durable reread evicts the watcher. This
+                        # is the paired-success side of the HOLD diagnostics
+                        # emitted by _verify_terminal(); together they let an
+                        # auditor prove watcher/canonical ownership never split.
+                        if _callback_disposition == "TERMINAL_DURABLE":
+                            try:
+                                _sig = getattr(w, "signal", {}) or {}
+                                _conv_local_oid = str(_sig.get("local_order_id") or "").strip()
+                                _conv_client = str(
+                                    _sig.get("client_email")
+                                    or _sig.get("client_id")
+                                    or ""
+                                ).strip()
+                                _conv_mode = str(
+                                    getattr(self, "execution_mode", "")
+                                    or getattr(self, "mode", "")
+                                    or ""
+                                ).strip()
+                                log.info(
+                                    "WATCHER_TERMINAL_DURABLE_CONVERGED "
+                                    "local_order_id=%s client_id=%s execution_mode=%s "
+                                    "signal_id=%s ticker=%s "
+                                    "watcher_removed=pending broker_submit=NOT_ATTEMPTED "
+                                    "broker_cancel=NOT_ATTEMPTED",
+                                    _conv_local_oid or "?",
+                                    _conv_client or "?",
+                                    _conv_mode or "?",
+                                    _sig_id or "?",
+                                    w.ticker,
+                                )
+                            except Exception:
+                                pass
                         w._trigger_attempts = 0   # reset on success
                         # ── P0 (PR #304) Bug B: explicit removal on SUCCESS.
                         # Since Bug B fix stopped removing triggered watchers

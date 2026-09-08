@@ -1,8 +1,9 @@
 # P0 — Terminal durable row must terminate the exact behavior-active watcher
 
-**Status:** SPEC ONLY / HARD HOLD  
-**Do not merge or deploy from this spec branch.**  
+**Status:** IMPLEMENTATION COMPLETE / HARD HOLD  
+**Do not merge or deploy without independent audit.**  
 **Audited base:** `main@98eeaadae05f9e4e1db624703ec1e3cd758b732c`  
+**Rebased onto:** current `main` (post #548 sector-identity merge)  
 **Incident date:** 2026-09-08  
 **Primary production example:** Jason LIVE TMO
 
@@ -443,3 +444,85 @@ The implementation remains HARD HOLD until:
 **HARD HOLD.**
 
 This spec authorizes implementation and testing only. It does not authorize merge or deployment.
+
+---
+
+## 19. Implementation record (2026-09-08)
+
+### 19.1 Changed control path
+
+```text
+watcher poll
+-> on_trigger callback
+-> callback returns claim (may be malformed / stale)
+-> _resolve_trigger_callback_disposition() rereads canonical order
+-> _terminal_family() ∧ _terminal_reason_present() ∧ ¬_terminal_reason_conflict()
+                     ∧ _identity_matches_watcher()
+   -> TERMINAL_DURABLE (WATCHER_TERMINAL_DURABLE_CONVERGED emitted at consumer)
+   -> pending watcher cleanup + dedup release (existing shared path)
+otherwise
+   -> KEEP_WATCHER + WATCHER_TERMINAL_CONVERGENCE_UNPROVEN with exact reason
+   -> zero broker action, zero position/proof mutation
+```
+
+### 19.2 Files changed
+
+- `ap_entry_watcher.py` — surgical addition of shared durable terminal
+  reason vocabulary, conflict detection, identity re-verification, and
+  paired observability logs. No public API change. No behavior change for
+  non-terminal or ambiguous rows.
+- `.github/workflows/p0_regression.yml` — the new fail-first regression is
+  wired into the P0 suite so exact-head green requires the convergence
+  behaviour to hold.
+- `tests/test_p0_pr597_terminal_watcher_convergence.py` — 31 behavioral
+  tests covering the §12 TMO replay and the §13.1–34 matrix. Executes
+  against the real production `_resolve_trigger_callback_disposition` code
+  path (no shim, no import mock).
+
+### 19.3 Fail-first evidence
+
+Test file placed on `main@84d8d612` (rebase base) without the fix:
+
+- `TestTMOFailFirstReplay::test_tmo_canceled_with_last_error_and_restart_recovery_reason_is_terminal` **FAIL** — proves the Sep-8 TMO ownership split lives on base.
+- `test_13_1_canceled_with_orders_last_error_is_terminal` **FAIL**
+- `test_13_2_canceled_with_restart_recovery_terminal_reason_is_terminal` **FAIL**
+- `test_13_3_expired_with_meta_terminal_reason_is_terminal` **FAIL**
+- `test_13_7_duplicate_consistent_reason_across_fields_is_terminal` **FAIL**
+- `test_watcher_invalidation_reason_alone_is_terminal` **FAIL**
+- `test_13_16_callback_starts_pending_reread_after_terminalization_wins_terminal` **FAIL**
+- `test_13_19_repeated_resolution_is_idempotent` **FAIL**
+- `test_13_20_terminal_row_does_not_rehydrate_watcher_via_verifier` **FAIL**
+- Structural anchors **FAIL** (shared collector / convergence logs absent)
+
+Total on base: 11 failed, 20 passed. On head: 31 passed. The failure set is
+exactly the class the spec was written to close.
+
+### 19.4 Money-path proof
+
+Behavioral tests 13.27–13.31 explicitly assert:
+
+- `broker.submit_order.assert_not_called()`
+- `broker.cancel_order.assert_not_called()`
+- `osm.cancel_pending_entry.assert_not_called()`
+- `osm.submit_existing_entry.assert_not_called()`
+- `osm.record_deferred_hydration_result.assert_not_called()`
+
+Terminal convergence adds zero broker submit authority, zero broker cancel
+authority, zero position mutation, zero proof mutation.
+
+### 19.5 Non-scope-creep proof
+
+- Diff is 145 additions / 8 deletions inside a single already-existing
+  method (`_resolve_trigger_callback_disposition`) plus one paired log at
+  its consumer.
+- No change to `LEGAL_TRANSITIONS`, `on_trigger`, `on_expire`, `on_invalidate`,
+  selector, sizing, retry policy, scanner, or reconciler.
+- Non-deferred trigger callbacks: unchanged (bypass the verifier as before).
+- SUBMITTED family: still routed through `_verify_submitted`; test 13.32–34
+  proves the terminal path cannot poach broker-owned rows.
+
+### 19.6 Remaining gate items
+
+- Exact-head P0 suite green on the pushed HEAD SHA (CI to confirm).
+- `pull_request` merge-ref suite green on the same valid test list.
+- Independent backwards audit per §17.11.
