@@ -543,13 +543,24 @@ class APMasterControl:
         signal_id: str,
         ticker: Any,
         client_id: str,
+        sector: Optional[str] = None,
+        unresolved_positions: Optional[list[dict[str, Any]]] = None,
     ) -> ControlDecision:
-        """Reject a candidate whose canonical sector identity is unproven.
+        """Block when candidate or active-position sector authority is unproven.
 
-        This is an eligibility block, not a sector-cap bypass. It deliberately
-        runs before selector/capital revalidation work can produce an
-        executable plan or hand one to the broker path.
+        This is an eligibility fence, not a sector-cap bypass. Candidate
+        identity is checked before snapshot work; active-position identity is
+        checked immediately after the snapshot is read and before any
+        pending-capital, selector, or broker-facing approval work.
         """
+        telemetry = self._sector_telemetry(sector)
+        if unresolved_positions:
+            telemetry.update(
+                {
+                    "sector_cap_applied": False,
+                    "sector_cap_skip_reason": "unresolved_active_position_identity",
+                }
+            )
         return self._block(
             signal_id,
             ticker,
@@ -558,8 +569,10 @@ class APMasterControl:
             "SECTOR_IDENTITY_UNPROVEN",
             reason_code="SECTOR_IDENTITY_UNPROVEN",
             meta={
-                "sector": None,
-                **self._sector_telemetry(None),
+                "sector": sector,
+                "sector_identity_complete": False,
+                "unresolved_sector_positions": list(unresolved_positions or []),
+                **telemetry,
             },
         )
 
@@ -1207,16 +1220,97 @@ class APMasterControl:
     def _position_capital_for_exposure(cls, pos: dict) -> float:
         return cls._position_price_for_exposure(pos) * cls._position_qty_for_exposure(pos) * 100
 
-    def _sector_capital_deployed(self, positions: list, sector: Optional[str]) -> float:
-        """Return exposure only for a proven, canonical sector identity.
+    def _sector_exposure_authority(
+        self,
+        positions: list,
+        sector: Optional[str],
+    ) -> dict[str, Any]:
+        """Return candidate-sector capital plus active-position identity status.
 
-        None means the candidate sector is unknown, so no unrelated unknown
-        positions may be aggregated into a shared risk bucket.
+        Sector-cap arithmetic is authoritative only when every OPEN/CLOSING
+        snapshot row has a proven canonical identity. Unresolved rows remain
+        symbol-qualified diagnostics and never enter a shared synthetic bucket.
+        """
+        active_positions = list(positions or [])
+        unresolved: list[dict[str, Any]] = []
+
+        for index, pos in enumerate(active_positions):
+            if not isinstance(pos, dict):
+                unresolved.append(
+                    {
+                        "position_index": index,
+                        "symbol": "<invalid_position>",
+                        "reason": "SECTOR_IDENTITY_UNPROVEN",
+                    }
+                )
+                continue
+
+            try:
+                raw_ticker = pos.get("underlying") or pos.get("ticker") or ""
+            except Exception:
+                raw_ticker = ""
+
+            try:
+                ticker_in_pos = str(raw_ticker).strip().upper()
+            except Exception:
+                ticker_in_pos = "<malformed>"
+
+            try:
+                resolved_sector = self._resolve_sector(raw_ticker)
+            except Exception as exc:
+                log.warning(
+                    "Active position sector resolution failed for %r: %s",
+                    ticker_in_pos,
+                    exc,
+                )
+                resolved_sector = None
+
+            if resolved_sector is not None:
+                continue
+
+            diagnostic = {
+                "position_index": index,
+                "symbol": ticker_in_pos or "<missing>",
+                "reason": "SECTOR_IDENTITY_UNPROVEN",
+            }
+            for key in ("id", "position_id", "local_order_id"):
+                try:
+                    position_ref = pos.get(key)
+                    if position_ref is not None:
+                        diagnostic["position_ref"] = str(position_ref)
+                        break
+                except Exception:
+                    continue
+            unresolved.append(diagnostic)
+
+        identity_complete = sector is not None and not unresolved
+        if identity_complete:
+            # Keep the existing numeric helper as the single cap-arithmetic
+            # implementation; this call is reached only after the complete
+            # identity check above. Existing numeric test doubles remain valid.
+            capital = self._sector_capital_deployed(active_positions, sector)
+        else:
+            capital = 0.0
+
+        return {
+            "capital": float(capital),
+            "identity_complete": identity_complete,
+            "unresolved": unresolved,
+        }
+
+    def _sector_capital_deployed(self, positions: list, sector: Optional[str]) -> float:
+        """Return candidate-sector exposure after identity has been proven.
+
+        Eligibility callers must inspect _sector_exposure_authority first.
+        This numeric helper intentionally has no fallback sector and is retained
+        as the existing cap-arithmetic implementation.
         """
         if not sector:
             return 0.0
         total = 0.0
         for pos in positions:
+            if not isinstance(pos, dict):
+                continue
             ticker_in_pos = str(pos.get("underlying") or pos.get("ticker") or "")
             pos_sector = self._resolve_sector(ticker_in_pos)
             if pos_sector is not None and pos_sector == sector:
@@ -2155,6 +2249,19 @@ class APMasterControl:
                 reason_code="SNAPSHOT_UNAVAILABLE_LIVE_BLOCKED",
             )
 
+        active_positions = list(snap.get("open_positions") or []) + list(
+            snap.get("closing_positions") or []
+        )
+        sector_authority = self._sector_exposure_authority(active_positions, sector)
+        if not sector_authority["identity_complete"]:
+            return self._sector_identity_block(
+                signal_id=signal_id,
+                ticker=ticker,
+                client_id=client_id,
+                sector=sector,
+                unresolved_positions=sector_authority["unresolved"],
+            )
+
         # PR: sizing-bootstrap-fix
         # bootstrap_mode = qty=1 safety guard for brand-new LIVE deployments.
         # LIVE: stays active until total_trades >= BOOTSTRAP_TRADES_THRESHOLD
@@ -2470,15 +2577,7 @@ class APMasterControl:
                     f"capital_limit (projected ${projected_total:.0f} > ${max_capital:.0f})",
                 )
 
-        if sector is None:
-            return self._sector_identity_block(
-                signal_id=signal_id,
-                ticker=ticker,
-                client_id=client_id,
-            )
-        sector_deployed = self._sector_capital_deployed(
-            snap["open_positions"] + snap["closing_positions"], sector
-        )
+        sector_deployed = float(sector_authority["capital"])
         # PR E FIX-3: use the snapshot value, not the instance field.
         effective_equity = account_equity
         max_sector_capital = effective_equity * self.max_sector_pct
@@ -4206,6 +4305,38 @@ class APMasterControl:
                 client_id=client_id,
             )
 
+        real_cost = float(plan.max_position_usd)
+        # PR E FIX-3 (reader-side patch): take atomic snapshot of
+        # (account_equity, max_daily_loss) under _equity_lock.
+        # revalidate_exposure uses equity for capital / sector / ticker
+        # caps; max_daily_loss is not used here but the snapshot is the
+        # consistent reader API. The lock is NEVER held across
+        # _get_snapshot / _pending_capital_from_snapshot_or_db / DB calls.
+        equity, _ = self._equity_snapshot()
+        snap = self._get_snapshot(client_id, ticker=ticker, signal_id=signal_id)
+        if self._is_live_mode() and not snap.get("_snapshot_ok", True):
+            return self._block(
+                signal_id,
+                ticker,
+                client_id,
+                "blocked_system",
+                f"snapshot_unavailable_live_blocked ({snap.get('_snapshot_error', 'unknown')})",
+                reason_code="SNAPSHOT_UNAVAILABLE_LIVE_BLOCKED",
+            )
+
+        active_positions = list(snap.get("open_positions") or []) + list(
+            snap.get("closing_positions") or []
+        )
+        sector_authority = self._sector_exposure_authority(active_positions, sector)
+        if not sector_authority["identity_complete"]:
+            return self._sector_identity_block(
+                signal_id=signal_id,
+                ticker=ticker,
+                client_id=client_id,
+                sector=sector,
+                unresolved_positions=sector_authority["unresolved"],
+            )
+
         # ---------------------------------------------------------------
         # PR p0/bootstrap-affordable-selection — review fix #1 (2026-06-05):
         # Bootstrap quantity is INVIOLATE = 1. The contract selector
@@ -4257,23 +4388,6 @@ class APMasterControl:
                 plan.contracts = 1
 
         real_cost = float(plan.max_position_usd)
-        # PR E FIX-3 (reader-side patch): take atomic snapshot of
-        # (account_equity, max_daily_loss) under _equity_lock.
-        # revalidate_exposure uses equity for capital / sector / ticker
-        # caps; max_daily_loss is not used here but the snapshot is the
-        # consistent reader API. The lock is NEVER held across
-        # _get_snapshot / _pending_capital_from_snapshot_or_db / DB calls.
-        equity, _ = self._equity_snapshot()
-        snap = self._get_snapshot(client_id, ticker=ticker, signal_id=signal_id)
-        if self._is_live_mode() and not snap.get("_snapshot_ok", True):
-            return self._block(
-                signal_id,
-                ticker,
-                client_id,
-                "blocked_system",
-                f"snapshot_unavailable_live_blocked ({snap.get('_snapshot_error', 'unknown')})",
-                reason_code="SNAPSHOT_UNAVAILABLE_LIVE_BLOCKED",
-            )
 
         if self._kill_switch_fn and self._kill_switch_fn():
             return self._block(signal_id, ticker, client_id, "blocked_system", "kill_switch_active_post_snapshot")
@@ -4343,15 +4457,7 @@ class APMasterControl:
         max_capital = per_trade_budget
         pct_used = projected_total_exposure / equity * 100 if equity > 0 else 0
 
-        if sector is None:
-            return self._sector_identity_block(
-                signal_id=signal_id,
-                ticker=ticker,
-                client_id=client_id,
-            )
-        sector_deployed = self._sector_capital_deployed(
-            snap["open_positions"] + snap["closing_positions"], sector
-        )
+        sector_deployed = float(sector_authority["capital"])
         proj_sector = sector_deployed + real_cost
         max_sector = equity * self.max_sector_pct
 
