@@ -193,6 +193,9 @@ jobs:
             tests/test_p0_terminal_close_proof_binding.py \
             tests/test_p1_expired_contract_db_close_repair.py \
             tests/test_p0_reconciler_proof_persistence.py \
+            tests/test_p0_reconciler_canonical_exit_adoption_20260825.py \
+            tests/test_p0_reconciler_entry_evidence_strict_20260825.py \
+            tests/test_p0_reconciler_direction_identity_20260826.py \
             tests/test_p0_expired_broker_import_idempotency.py \
             tests/test_p0_attribution_integrity.py \
             tests/test_p0_partial_close_reconciler.py \

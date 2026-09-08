@@ -290,6 +290,14 @@ def _live_reconciler_with_seeded_position(monkeypatch):
         def __init__(self):
             self.positions = []
 
+        def adopt_canonical_position_identity(self, **_kwargs):
+            return SimpleNamespace(
+                disposition="NO_REPAIR_FOUND",
+                adopted=False,
+                retryable=False,
+                safe_to_seed=True,
+            )
+
         def add_position(self, pos):
             self.positions.append(pos)
 
