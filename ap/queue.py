@@ -520,6 +520,54 @@ def _payload_execution_mode_value(payload: dict | None) -> Any:
     return None
 
 
+def _stamp_payload_execution_mode(job_id: int, mode: str) -> None:
+    """Durably persist the resolved runtime execution-mode into trade_queue.payload.
+
+    Called exactly once per dispatch when the owning worker resolved a missing
+    payload ``execution_mode`` from the runtime master_control authority.  The
+    UPDATE is guarded to ``status = 'PROCESSING'`` so a row that has already
+    transitioned (WATCHING, terminal) is never retroactively mutated.
+
+    Fail-soft: any DB error is logged but never re-raised into the dispatch
+    path.  A missed stamp is caught on restart by the
+    ``trade_queue_execution_mode_unresolved`` readiness fence — fail-closed
+    behaviour is preserved even if this write does not land.
+
+    Invariants:
+    * Writes only a validated canonical mode ('live' or 'paper' — lowercase).
+    * Never infers or defaults mode.  Caller must supply the already-resolved
+      ``runtime_mode_for_dispatch`` value.
+    * Never modifies status, result_json, last_error, or any other column.
+    """
+    _mode = str(mode or "").strip().lower()
+    if _mode not in ("live", "paper"):
+        log.error(
+            "_stamp_payload_execution_mode: refusing to stamp invalid mode=%r for job_id=%s",
+            mode, job_id,
+        )
+        return
+    try:
+        def _fn() -> None:
+            with _conn()() as c:
+                c.execute(
+                    """
+                    UPDATE trade_queue
+                    SET    payload = COALESCE(payload, '{}'::jsonb)
+                                     || %s::jsonb
+                    WHERE  id     = %s
+                      AND  status = 'PROCESSING'
+                    """,
+                    (_json_dumps({"execution_mode": _mode}), job_id),
+                )
+        _run_with_retry(_fn)
+    except Exception:
+        log.exception(
+            "_stamp_payload_execution_mode: failed to persist mode=%r for job_id=%s "
+            "(non-fatal — row may remain without durable mode on restart).",
+            mode, job_id,
+        )
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -2329,6 +2377,12 @@ def _dispatch(
         return
     if isinstance(payload, dict) and not str(payload_execution_mode_raw or "").strip():
         payload["execution_mode"] = runtime_mode_for_dispatch.lower()
+        # Persist the resolved mode durably so a restart can prove mode from DB
+        # state (trade_queue.payload) rather than re-resolving from an absent
+        # field.  This is the narrowest durable write boundary: the same point
+        # where the in-memory payload is authorised, before WATCHING or any
+        # mode-specific durable state.  Fail-soft — see _stamp_payload_execution_mode.
+        _stamp_payload_execution_mode(job_id, runtime_mode_for_dispatch.lower())
 
     if runtime_mode_for_dispatch == "LIVE" and bool(ALLOW_IMMEDIATE_EXECUTION):
         log.critical("[%s] LIVE_FATAL_IMMEDIATE_EXECUTION_ENABLED signal_id=%s", ticker, signal_id)

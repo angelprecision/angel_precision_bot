@@ -524,6 +524,40 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
                 else:
                     pending_trigger.append({"local_order_id": row[0], "signal_id": row[1]})
 
+            # Amendment §2 — unresolved durable execution_mode authority on orders.
+            #
+            # PENDING_TRIGGER ENTRY rows whose durable orders.execution_mode is
+            # NULL, empty, whitespace, or any value that does not resolve to
+            # exactly 'live' or 'paper' must NOT silently disappear from the
+            # readiness inventory.  The previous query (parameterised by the
+            # requested mode) correctly excludes the opposite valid mode; this
+            # second query captures everything that is neither valid mode so the
+            # authority defect is surfaced independently.
+            #
+            # DO NOT infer or default mode from these rows.  They are not
+            # classified under any ownership tier.  Readiness fails closed when
+            # this collection is non-empty.
+            c.execute(
+                """
+                SELECT local_order_id
+                FROM orders
+                WHERE client_id = %s
+                  AND kind = 'ENTRY'
+                  AND status = 'PENDING_TRIGGER'
+                  AND created_ts >= %s
+                  AND broker_order_id IS NULL
+                  AND submitted_ts IS NULL
+                  AND filled_ts IS NULL
+                  AND LOWER(TRIM(COALESCE(execution_mode, ''))) NOT IN ('live', 'paper')
+                ORDER BY created_ts
+                """,
+                (client_id, pending_cutoff),
+            )
+            unresolved_em_pending_ids = [
+                r[0] if not isinstance(r, dict) else r.get("local_order_id")
+                for r in (c.fetchall() or [])
+            ]
+
             c.execute(
                 f"""
                 SELECT COUNT(*)::int AS n
@@ -542,6 +576,7 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
                 "watching_orphans": watching_orphans,
                 "unresolved_execution_mode_queue_ids": unresolved_execution_mode_queue_ids,
                 "pending_trigger_rows": pending_trigger,
+                "unresolved_execution_mode_pending_order_ids": unresolved_em_pending_ids,
                 "watching_count": int(watching_count or 0),
             }
 
@@ -550,6 +585,7 @@ def _query_client_state(client_id: str, execution_mode: str) -> dict:
         "watching_orphans": [],
         "unresolved_execution_mode_queue_ids": [],
         "pending_trigger_rows": [],
+        "unresolved_execution_mode_pending_order_ids": [],
         "watching_count": 0,
     }
 
@@ -847,6 +883,18 @@ def run_preopen_autonomous_readiness(
     if unowned_pending:
         errors.append("pending_trigger_without_watcher_ownership")
 
+    # Amendment §2 — unresolved durable execution_mode authority on orders.
+    # An active PENDING_TRIGGER ENTRY whose orders.execution_mode cannot be
+    # resolved to exactly 'live' or 'paper' must NOT silently disappear.
+    # These rows are neither in the requested-mode inventory nor in the
+    # opposite-mode inventory — they are an authority defect surfaced here
+    # independently.  Do not infer mode; do not classify under any ownership
+    # tier.  Readiness fails closed.
+    unresolved_em_orders = client_state.get("unresolved_execution_mode_pending_order_ids") or []
+    details["pending_trigger_unresolved_execution_mode_order_ids"] = unresolved_em_orders
+    if unresolved_em_orders:
+        errors.append("pending_trigger_execution_mode_unresolved")
+
     handoff_ok = _morning_handoff_success_exists(client_id, mode, trading_date)
     details["morning_handoff_success"] = handoff_ok
     if stage != "startup":
@@ -900,6 +948,9 @@ def run_preopen_autonomous_readiness(
         "runner_not_alive",
         "overnight_reeval_missing",
         "pending_trigger_without_watcher_ownership",
+        # Amendment §2: an order with unresolvable execution_mode is unknown
+        # authority — LIVE must never be authorized with unknown inventory.
+        "pending_trigger_execution_mode_unresolved",
     }
     if mode == "live" and any(err in blocked_keys for err in errors):
         status = "BLOCKED"

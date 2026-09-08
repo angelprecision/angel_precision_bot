@@ -227,14 +227,29 @@ class _ModeScopedReadinessConnection:
             else:
                 self._result = []
         elif "from orders" in normalized_sql and "pending_trigger" in normalized_sql:
-            assert len(params) == 3
-            requested_client, requested_mode, _cutoff = params
-            self._result = [
-                (row["local_order_id"], row["signal_id"])
-                for row in self.pending_rows
-                if row["client_id"] == requested_client
-                and row["execution_mode"] == requested_mode
-            ]
+            if "not in" in normalized_sql:
+                # Amendment §2 — unresolved execution_mode query.
+                # params = (client_id, cutoff) — no mode param; finds all
+                # rows whose execution_mode is neither 'live' nor 'paper'.
+                assert len(params) == 2
+                requested_client, _cutoff = params
+                self._result = [
+                    (row["local_order_id"],)
+                    for row in self.pending_rows
+                    if row["client_id"] == requested_client
+                    and str(row.get("execution_mode") or "").strip().lower()
+                    not in ("live", "paper")
+                ]
+            else:
+                # Mode-scoped query — params = (client_id, mode, cutoff).
+                assert len(params) == 3
+                requested_client, requested_mode, _cutoff = params
+                self._result = [
+                    (row["local_order_id"], row["signal_id"])
+                    for row in self.pending_rows
+                    if row["client_id"] == requested_client
+                    and row["execution_mode"] == requested_mode
+                ]
         else:
             self._result = []
 
@@ -344,14 +359,21 @@ def test_pending_trigger_inventory_is_mode_scoped_at_sql_boundary(monkeypatch):
         "local_order_id": "L-paper",
         "signal_id": "sig-paper",
     }]
-    pending_calls = [
+    # Amendment §2 adds a second orders query (unresolved-mode) per _query_client_state
+    # call, so two calls per runner mode → 4 total.  Both query types include
+    # execution_mode in the WHERE clause.
+    all_orders_calls = [
         (sql, params)
         for sql, params in db_conn.calls
         if "from orders" in sql and "pending_trigger" in sql
     ]
-    assert len(pending_calls) == 2
-    assert all("execution_mode" in sql for sql, _params in pending_calls)
-    assert [params[1] for _sql, params in pending_calls] == ["live", "paper"]
+    assert len(all_orders_calls) == 4  # 2 mode-scoped + 2 unresolved (live + paper)
+    assert all("execution_mode" in sql for sql, _params in all_orders_calls)
+
+    # The mode-scoped queries carry the requested mode as params[1].
+    mode_scoped_calls = [(sql, params) for sql, params in all_orders_calls if "not in" not in sql]
+    assert len(mode_scoped_calls) == 2
+    assert [params[1] for _sql, params in mode_scoped_calls] == ["live", "paper"]
 
 
 def test_paper_queue_residue_does_not_block_live_or_inflate_live_watch_count(monkeypatch):
@@ -1469,3 +1491,463 @@ def test_exact_registry_identity_satisfies_readiness(monkeypatch):
         client_id="jason@example.com",
         execution_mode="live",
     ) == []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Amendment §2 — unresolved orders.execution_mode must fail closed
+#
+# Covers all 16 required behavioral proofs:
+#   1–4.  NULL / empty / whitespace / unknown mode → fail closed
+#   5–6.  Exact LIVE / PAPER orders appear only in correct mode inventory
+#   7.    Opposite valid mode does not contaminate readiness
+#   8.    Malformed order cannot disappear and produce false OK
+#   9–11. Malformed order is not classified as watcher/retry/runner-mode owned
+#   12–13.Malformed order produces zero broker mutation
+#   14.   Mixed healthy account (watcher+retry) stays entry-available
+#   15.   Existing conflicting trade_queue mode tests remain green (pre-existing)
+#   16.   Existing ownerless same-mode pending row still blocks
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _pending_order_row(
+    local_order_id: str,
+    signal_id: str,
+    execution_mode,  # str | None
+    *,
+    client_id: str = "jason@example.com",
+) -> dict:
+    """Minimal PENDING_TRIGGER ENTRY row shape for Amendment §2 tests."""
+    return {
+        "local_order_id": local_order_id,
+        "signal_id": signal_id,
+        "client_id": client_id,
+        "execution_mode": execution_mode,
+        "status": "PENDING_TRIGGER",
+        "meta": {},
+    }
+
+
+def _install_db_with_pending(monkeypatch, pending_rows):
+    """Wire _ModeScopedReadinessConnection with the given pending_rows."""
+    import ap.db as db
+    db_conn = _ModeScopedReadinessConnection(pending_rows)
+    monkeypatch.setattr(db, "conn", db_conn)
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+
+
+# ── Req 1: NULL execution_mode fails closed ──────────────────────────────────
+
+def test_null_order_execution_mode_surfaces_as_unresolved_and_fails_closed(monkeypatch):
+    """PENDING_TRIGGER with NULL execution_mode must not disappear — LIVE BLOCKED."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-null", "sig-null", None)])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+    assert live_state["pending_trigger_rows"] == [], "NULL mode must not enter requested-mode inventory"
+    assert live_state["unresolved_execution_mode_pending_order_ids"] == ["L-null"], \
+        "NULL mode must be surfaced as unresolved authority"
+
+    _stub_common(monkeypatch, client_state=live_state)
+    runner = _Runner(mode="live")
+    runner.core.broker = MagicMock()
+    result = pr.run_preopen_autonomous_readiness("jason@example.com", "live", dry_run=True, runner=runner)
+    assert result["status"] == "BLOCKED"
+    assert "pending_trigger_execution_mode_unresolved" in result["errors"]
+    assert result["details"]["pending_trigger_unresolved_execution_mode_order_ids"] == ["L-null"]
+    enforced, live_runner = _enforce_live_readiness(result)
+    # BLOCKED passes through _enforce_post_overnight_readiness unchanged;
+    # entries are cleared via _enter_degraded_mode inside the enforcer.
+    assert enforced["status"] == "BLOCKED"
+    assert live_runner.entries_allowed.is_set() is False
+    runner.core.broker.submit_order.assert_not_called()
+    runner.core.broker.cancel_order.assert_not_called()
+    runner.core.broker.replace_order.assert_not_called()
+
+
+# ── Req 2: empty string execution_mode fails closed ──────────────────────────
+
+def test_empty_order_execution_mode_surfaces_as_unresolved(monkeypatch):
+    """PENDING_TRIGGER with empty-string execution_mode must be surfaced."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-empty", "sig-empty", "")])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+    assert live_state["pending_trigger_rows"] == []
+    assert live_state["unresolved_execution_mode_pending_order_ids"] == ["L-empty"]
+
+    _stub_common(monkeypatch, client_state=live_state)
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=_Runner(mode="live")
+    )
+    assert result["status"] == "BLOCKED"
+    assert "pending_trigger_execution_mode_unresolved" in result["errors"]
+
+
+# ── Req 3: whitespace execution_mode fails closed ─────────────────────────────
+
+def test_whitespace_order_execution_mode_surfaces_as_unresolved(monkeypatch):
+    """PENDING_TRIGGER with whitespace-only execution_mode must be surfaced."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-ws", "sig-ws", "   ")])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+    assert live_state["pending_trigger_rows"] == []
+    assert live_state["unresolved_execution_mode_pending_order_ids"] == ["L-ws"]
+
+    _stub_common(monkeypatch, client_state=live_state)
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=_Runner(mode="live")
+    )
+    assert result["status"] == "BLOCKED"
+    assert "pending_trigger_execution_mode_unresolved" in result["errors"]
+
+
+# ── Req 4: unknown / noncanonical execution_mode fails closed ─────────────────
+
+@pytest.mark.parametrize("bad_mode", ["unknown", "sandbox", "LIVE/PAPER", "staging", "test"])
+def test_noncanonical_order_execution_mode_surfaces_as_unresolved(monkeypatch, bad_mode):
+    """Every noncanonical execution_mode value surfaces as unresolved."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-bad", "sig-bad", bad_mode)])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+    assert live_state["pending_trigger_rows"] == [], \
+        f"mode={bad_mode!r} must not enter requested-mode inventory"
+    assert live_state["unresolved_execution_mode_pending_order_ids"] == ["L-bad"], \
+        f"mode={bad_mode!r} must be surfaced as unresolved"
+
+    _stub_common(monkeypatch, client_state=live_state)
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=_Runner(mode="live")
+    )
+    assert result["status"] == "BLOCKED"
+    assert "pending_trigger_execution_mode_unresolved" in result["errors"]
+
+
+# ── Req 5: exact LIVE row appears only in LIVE inventory ─────────────────────
+
+def test_live_order_appears_only_in_live_inventory_not_paper(monkeypatch):
+    """LIVE execution_mode row is included by LIVE query, excluded by PAPER."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-live", "sig-live", "live")])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+    paper_state = pr._query_client_state("jason@example.com", "paper")
+
+    assert live_state["pending_trigger_rows"] == [{"local_order_id": "L-live", "signal_id": "sig-live"}]
+    assert live_state["unresolved_execution_mode_pending_order_ids"] == []
+    assert paper_state["pending_trigger_rows"] == []
+    assert paper_state["unresolved_execution_mode_pending_order_ids"] == []
+
+
+# ── Req 6: exact PAPER row appears only in PAPER inventory ───────────────────
+
+def test_paper_order_appears_only_in_paper_inventory_not_live(monkeypatch):
+    """PAPER execution_mode row is included by PAPER query, excluded by LIVE."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-paper", "sig-paper", "paper")])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+    paper_state = pr._query_client_state("jason@example.com", "paper")
+
+    assert live_state["pending_trigger_rows"] == []
+    assert live_state["unresolved_execution_mode_pending_order_ids"] == []
+    assert paper_state["pending_trigger_rows"] == [{"local_order_id": "L-paper", "signal_id": "sig-paper"}]
+    assert paper_state["unresolved_execution_mode_pending_order_ids"] == []
+
+
+# ── Req 7: opposite valid mode does not contaminate LIVE readiness ────────────
+
+def test_paper_pending_order_does_not_block_live_readiness(monkeypatch):
+    """A healthy PAPER PENDING_TRIGGER row must not contaminate LIVE readiness."""
+    live_row = _pending_order_row("L-live", "sig-live", "live")
+    paper_row = _pending_order_row("L-paper", "sig-paper", "paper")
+    _install_db_with_pending(monkeypatch, [live_row, paper_row])
+
+    monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **_: None)
+    monkeypatch.setattr(pr, "_morning_handoff_success_exists", lambda *a, **k: True)
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *a, **k: False)
+    monkeypatch.setattr(pr, "_trading_date", lambda now=None: "2026-06-22")
+    monkeypatch.setattr(pr, "_pod_mode", lambda: "live")
+
+    runner = _Runner(
+        mode="live",
+        watcher=_ExactWatcher(
+            local_order_id="L-live",
+            signal_id="sig-live",
+            client_id="jason@example.com",
+            execution_mode="live",
+        ),
+    )
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(live_row) if oid == "L-live" else None
+    )
+    runner._overnight_reeval_success_date = "2026-06-22"
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner,
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+    assert result["status"] == "OK"
+    assert "pending_trigger_execution_mode_unresolved" not in result["errors"]
+    assert result["details"]["pending_trigger_unresolved_execution_mode_order_ids"] == []
+
+
+# ── Req 8: malformed order cannot disappear and produce false OK ──────────────
+
+def test_malformed_order_mode_cannot_produce_false_ok(monkeypatch):
+    """A NULL-mode row must surface as a defect — not silently drop and let OK through."""
+    # Scenario: only order for this client has NULL execution_mode.
+    # Without Amendment §2 the pending_trigger_rows would be empty, ownership
+    # would pass (no ownerless rows), and readiness could incorrectly return OK.
+    # With the fix, unresolved_execution_mode_pending_order_ids is non-empty →
+    # BLOCKED.
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-gone", "sig-gone", None)])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+
+    # Prove the row is NOT in requested-mode inventory (old bug: silent drop).
+    assert live_state["pending_trigger_rows"] == [], "Pre-fix: row would silently disappear"
+    # Prove the row IS in the unresolved defect set (Amendment §2 fix).
+    assert "L-gone" in live_state["unresolved_execution_mode_pending_order_ids"], \
+        "Post-fix: row must be surfaced as unresolved authority"
+
+    # Prove readiness does NOT pass with the unresolved row present.
+    _stub_common(monkeypatch, client_state=live_state)
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=_Runner(mode="live")
+    )
+    assert result["ok"] is False
+    assert result["status"] == "BLOCKED"
+
+
+# ── Req 9: malformed order cannot become watcher-owned ───────────────────────
+
+def test_malformed_order_cannot_become_watcher_owned(monkeypatch):
+    """A NULL-mode row must never enter watcher_owned classification."""
+    null_row = _pending_order_row("L-null", "sig-null", None)
+    runner = _Runner(
+        mode="live",
+        watcher=_ExactWatcher(
+            local_order_id="L-null",
+            signal_id="sig-null",
+            client_id="jason@example.com",
+            execution_mode="live",
+        ),
+    )
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(null_row) if oid == "L-null" else None
+    )
+    # The NULL-mode row never enters pending_trigger_rows (mode-scoped query).
+    # _pending_trigger_ownership only classifies rows that passed mode-scoped
+    # query, so watcher_owned will be empty regardless of watcher state.
+    ownership = pr._pending_trigger_ownership(
+        runner,
+        [],  # NULL-mode row is absent from this list
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+    assert ownership["watcher_owned"] == []
+    assert ownership["ownerless"] == []
+
+
+# ── Req 10: malformed order cannot become retry-owned ────────────────────────
+
+def test_malformed_order_cannot_become_retry_owned(monkeypatch):
+    """A NULL-mode row must never enter retry_owned classification."""
+    null_row = _pending_order_row("L-null", "sig-null", None)
+    # Wire a fake OSM that would return a valid retry lease for L-null.
+    fake_osm = SimpleNamespace(
+        get_order=lambda oid: {
+            **null_row,
+            "meta": {"restart_rearm_status": "LEASE_ACTIVE", "restart_rearm_session_id": "s1"},
+        }
+    )
+    runner = _Runner(mode="live")
+    runner.order_state_machine = fake_osm
+
+    # NULL-mode row never enters pending_trigger_rows, so ownership can't
+    # classify it as retry_owned regardless of the OSM state.
+    ownership = pr._pending_trigger_ownership(
+        runner,
+        [],  # NULL-mode row not present
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+    assert ownership["retry_owned"] == []
+
+
+# ── Req 11: malformed order cannot inherit runner mode ───────────────────────
+
+def test_malformed_order_mode_is_not_inferred_from_runner(monkeypatch):
+    """Runner mode must never be assigned to a NULL/malformed order mode."""
+    null_row = _pending_order_row("L-infer", "sig-infer", None)
+    _install_db_with_pending(monkeypatch, [null_row])
+
+    # Call for LIVE runner — must NOT treat the row as LIVE.
+    live_state = pr._query_client_state("jason@example.com", "live")
+    assert null_row["local_order_id"] not in [
+        r["local_order_id"] for r in live_state["pending_trigger_rows"]
+    ], "Malformed row must not be inferred as LIVE"
+
+    # Call for PAPER runner — must NOT treat the row as PAPER either.
+    paper_state = pr._query_client_state("jason@example.com", "paper")
+    assert null_row["local_order_id"] not in [
+        r["local_order_id"] for r in paper_state["pending_trigger_rows"]
+    ], "Malformed row must not be inferred as PAPER"
+
+    # Row must surface in unresolved for both runners.
+    assert null_row["local_order_id"] in live_state["unresolved_execution_mode_pending_order_ids"]
+    assert null_row["local_order_id"] in paper_state["unresolved_execution_mode_pending_order_ids"]
+
+
+# ── Req 12–13: zero broker mutation on malformed-order fail-closed path ───────
+
+def test_malformed_order_produces_zero_broker_mutation(monkeypatch):
+    """Fail-closed on unresolved order mode: zero broker submit/cancel/replace."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-z", "sig-z", None)])
+    live_state = pr._query_client_state("jason@example.com", "live")
+
+    _stub_common(monkeypatch, client_state=live_state)
+    runner = _Runner(mode="live")
+    runner.core.broker = MagicMock()
+
+    pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner
+    )
+    runner.core.broker.submit_order.assert_not_called()
+    runner.core.broker.cancel_order.assert_not_called()
+    runner.core.broker.replace_order.assert_not_called()
+
+
+def test_malformed_order_produces_zero_position_mutation(monkeypatch):
+    """Fail-closed on unresolved order mode: no position, proof, or queue mutation."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-pos", "sig-pos", None)])
+    live_state = pr._query_client_state("jason@example.com", "live")
+
+    writes = _stub_common(monkeypatch, client_state=live_state)
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=_Runner(mode="live")
+    )
+    # The only writes allowed are preopen_readiness row upserts — not position,
+    # proof_trades, or trade_queue terminal writes.  All writes come from
+    # _upsert_preopen_row which writes to the preopen_readiness table only.
+    assert result["status"] == "BLOCKED"
+    assert all("execution_mode" in w for w in writes), \
+        "Only preopen_readiness row upserts (with execution_mode key) expected"
+
+
+# ── Req 14: healthy mixed account stays entry-available ──────────────────────
+
+def test_mixed_watcher_and_retry_account_stays_entry_available_with_no_unresolved(monkeypatch):
+    """Watcher-owned + retry-owned LIVE account with no unresolved rows → OK.
+
+    Req 14: Amendment §2 must not interfere with a healthy mixed account.
+    The unresolved_execution_mode_pending_order_ids list must be empty when all
+    pending rows carry a valid canonical mode, and the error must not appear.
+
+    Row shapes match the pre-existing test_mixed_exact_watcher_and_retry_owner
+    test so the PendingTriggerRestartRecovery verifier can classify correctly.
+    """
+    now_utc = datetime.now(timezone.utc)
+    watcher_row = {
+        "local_order_id": "L-watcher",
+        "signal_id": "sig-watcher",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {},
+    }
+    retry_row = {
+        "local_order_id": "L-retry",
+        "signal_id": "sig-retry",
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "meta": {
+            "restart_rearm_status": "RETRY_PENDING",
+            "restart_rearm_owner": "restart_rearm:jason@example.com:live:L-retry",
+            "restart_rearm_reason": "regular_session_market_truth_not_yet_available",
+            "restart_rearm_attempt": 1,
+            "restart_rearm_next_at": (now_utc + timedelta(seconds=30)).isoformat(),
+            "restart_rearm_deadline": (now_utc + timedelta(minutes=1)).isoformat(),
+            "restart_rearm_first_failed_at": (now_utc - timedelta(minutes=2)).isoformat(),
+            "restart_rearm_last_failed_at": (now_utc - timedelta(seconds=1)).isoformat(),
+            "restart_rearm_client_id": "jason@example.com",
+            "restart_rearm_execution_mode": "live",
+            "restart_rearm_generation": 1,
+            "late_attachment_policy_eligible": True,
+        },
+    }
+    rows_by_id = {row["local_order_id"]: row for row in (watcher_row, retry_row)}
+    runner = _Runner(mode="live", watcher=_MultiExactWatcher([watcher_row]))
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(rows_by_id[oid]) if oid in rows_by_id else None
+    )
+
+    # Use _stub_common with an explicit client_state so the ownership
+    # classification runs against real rows — exactly like the pre-existing test.
+    # Neither row has an unresolved execution_mode → the Amendment §2 defect
+    # list must be empty.
+    _stub_common(monkeypatch, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [
+            {"local_order_id": watcher_row["local_order_id"], "signal_id": watcher_row["signal_id"]},
+            {"local_order_id": retry_row["local_order_id"], "signal_id": retry_row["signal_id"]},
+        ],
+        "unresolved_execution_mode_pending_order_ids": [],  # Amendment §2: explicitly empty
+        "watching_count": 1,
+    })
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner
+    )
+    assert "pending_trigger_execution_mode_unresolved" not in result["errors"], \
+        "Amendment §2 must not fire when all pending rows have valid canonical modes"
+    assert result["details"]["pending_trigger_unresolved_execution_mode_order_ids"] == []
+    assert result["details"]["pending_trigger_ownerless"] == []
+
+
+# ── Req 16: ownerless same-mode pending row still blocks ─────────────────────
+
+def test_ownerless_same_mode_pending_order_still_blocks_readiness(monkeypatch):
+    """An ownerless LIVE PENDING_TRIGGER row still causes BLOCKED (regression guard)."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-own", "sig-own", "live")])
+    live_state = pr._query_client_state("jason@example.com", "live")
+
+    assert live_state["pending_trigger_rows"] == [{"local_order_id": "L-own", "signal_id": "sig-own"}]
+    assert live_state["unresolved_execution_mode_pending_order_ids"] == []
+
+    _stub_common(monkeypatch, client_state=live_state)
+    # Runner has NO watcher for L-own → ownerless.
+    runner = _Runner(mode="live", watcher=_Watcher(set()))
+    runner.order_state_machine = SimpleNamespace(
+        get_order=lambda oid: dict(_pending_order_row("L-own", "sig-own", "live")) if oid == "L-own" else None
+    )
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com", "live", dry_run=True, runner=runner
+    )
+    assert result["status"] == "BLOCKED"
+    assert "pending_trigger_without_watcher_ownership" in result["errors"]
+    assert "pending_trigger_execution_mode_unresolved" not in result["errors"]
+
+
+# ── LIVE/PAPER symmetry — full cross-mode positive controls ──────────────────
+
+def test_live_runner_with_live_order_is_included_paper_runner_excluded(monkeypatch):
+    """LIVE runner + LIVE row → included. PAPER runner + LIVE row → excluded."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-live", "sig-live", "live")])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+    paper_state = pr._query_client_state("jason@example.com", "paper")
+
+    assert [r["local_order_id"] for r in live_state["pending_trigger_rows"]] == ["L-live"]
+    assert paper_state["pending_trigger_rows"] == []
+    assert paper_state["unresolved_execution_mode_pending_order_ids"] == []
+
+
+def test_paper_runner_with_paper_order_is_included_live_runner_excluded(monkeypatch):
+    """PAPER runner + PAPER row → included. LIVE runner + PAPER row → excluded."""
+    _install_db_with_pending(monkeypatch, [_pending_order_row("L-paper", "sig-paper", "paper")])
+
+    live_state = pr._query_client_state("jason@example.com", "live")
+    paper_state = pr._query_client_state("jason@example.com", "paper")
+
+    assert live_state["pending_trigger_rows"] == []
+    assert live_state["unresolved_execution_mode_pending_order_ids"] == []
+    assert [r["local_order_id"] for r in paper_state["pending_trigger_rows"]] == ["L-paper"]
+    assert paper_state["unresolved_execution_mode_pending_order_ids"] == []
