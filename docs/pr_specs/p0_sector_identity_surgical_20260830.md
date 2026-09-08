@@ -23,9 +23,11 @@ After symbol normalization, `APMasterControl._resolve_sector()` calls only `ap.e
 
 Known identity → evaluate sector exposure normally.
 
-Missing, blank, malformed, or unresolved identity → `SECTOR_IDENTITY_UNPROVEN` with `ok=False` at both `evaluate()` and `revalidate_exposure()`.
+Missing, blank, malformed, or unresolved candidate identity → `SECTOR_IDENTITY_UNPROVEN` with `ok=False` at both `evaluate()` and `revalidate_exposure()`.
 
-`evaluate()` resolves and blocks before durable duplicate/snapshot/capital work can produce an executable plan. `revalidate_exposure()` resolves and blocks before bootstrap clamp, snapshot, pending-capital reads, resize, or any broker-bound handoff. No unknown candidate reaches selector approval, broker-ready handoff, or broker submission.
+Every `OPEN`/`CLOSING` position row included in the sector-cap snapshot must also resolve canonically before sector exposure is authoritative. An unresolved active row is not treated as zero exposure, `OTHER`, `UNKNOWN`, or any other shared bucket: the gate returns `SECTOR_IDENTITY_UNPROVEN` with symbol/row diagnostics and performs no sector-cap arithmetic or executable approval.
+
+`evaluate()` resolves the candidate and blocks before durable duplicate/capital work can produce an executable plan. After the required snapshot is read, it checks active-position identity before pending-capital, selector, or broker-facing approval work. `revalidate_exposure()` resolves the candidate before bootstrap clamp or snapshot work; after the snapshot is read, it checks active-position identity before bootstrap clamp, pending-capital reads, resize, or any broker-bound handoff. No unknown candidate or incomplete active-position snapshot reaches selector approval, broker-ready handoff, or broker submission.
 
 Reporting may expose symbol-qualified identity diagnostics, but reporting is not sector-cap authority and unresolved names are never aggregated.
 
@@ -49,7 +51,7 @@ Required known controls include UNH+BMY, WMT+PEP, AAPL+QCOM, T+VZ, COIN+MSTR, AM
 - exact base SHA and exact head SHA recorded;
 - complete changed-file list reviewed;
 - #589 map additions absent from the #548 production diff;
-- focused Master Control tests green;
+- focused Master Control tests green, including unresolved OPEN/CLOSING position fences;
 - neighboring exposure/risk tests green;
 - exact-head blocking P0 green;
 - independent final audit confirms no new money-path authority.
