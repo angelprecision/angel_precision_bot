@@ -108,7 +108,7 @@ class TestRepairClosedPositionsWithRemainingQty(unittest.TestCase):
                               contract="PG260620C00155000")]
 
         # Broker returns empty (flat)
-        rec.broker.list_positions.return_value = []
+        rec.broker.list_positions_strict.return_value = []
 
         written = {}
 
@@ -154,7 +154,7 @@ class TestRepairClosedPositionsWithRemainingQty(unittest.TestCase):
                               contract="PG260620C00155000")]
 
         broker_pos = _make_broker_pos("PG260620C00155000", qty=5)
-        rec.broker.list_positions.return_value = [broker_pos]
+        rec.broker.list_positions_strict.return_value = [broker_pos]
         rec._seed_exit_engine_from_position = MagicMock()
         canonical_row = _make_pos(
             qty=7,
@@ -214,7 +214,7 @@ class TestRepairClosedPositionsWithRemainingQty(unittest.TestCase):
         rec, summary = self._make_rec()
         bad_rows = [_make_pos(qty=5, quantity_remaining=3, status="CLOSED",
                               contract="AAPL260620C00200000")]
-        rec.broker.list_positions.side_effect = RuntimeError("broker timeout")
+        rec.broker.list_positions_strict.side_effect = RuntimeError("broker timeout")
 
         updates = []
 

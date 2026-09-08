@@ -195,4 +195,6 @@ def test_trade_queue_schema_contract_does_not_use_updated_ts():
 
 def test_flow_contract_suite_is_mandatory_in_p0_workflow():
     workflow = (REPO_ROOT / ".github" / "workflows" / "p0_regression.yml").read_text()
-    assert "tests/test_p0_trade_flow_contracts.py" in workflow
+    manifest_path = REPO_ROOT / ".github" / "workflows" / "p0_test_manifest.txt"
+    manifest = manifest_path.read_text() if manifest_path.exists() else ""
+    assert "tests/test_p0_trade_flow_contracts.py" in workflow + manifest

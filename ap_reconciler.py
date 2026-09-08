@@ -84,7 +84,9 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 log = logging.getLogger("ap.reconciler")
@@ -123,6 +125,10 @@ RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))  # was 1
 # the cached last summary and skip the full broker/DB/OSM pass.
 RUN_ONCE_MIN_INTERVAL_SEC = float(os.getenv("RECONCILER_RUN_ONCE_MIN_INTERVAL_SEC", "3.0"))
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+# This is a page size, not a cap: closed-repair discovery must continue until
+# the complete candidate universe is exhausted before any broker truth or
+# lifecycle mutation is allowed.
+_CLOSED_REPAIR_SCAN_PAGE_SIZE = 100
 
 # PR fix/health-and-reconciler-startup-noise:
 # Grace window after reconciler thread start during which a missing
@@ -5554,6 +5560,187 @@ class APBrokerReconciler:
     # P0-PARTIAL-CLOSE: broker-truth repair for CLOSED rows with remaining qty
     # ──────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _closed_repair_validate_position_row(bp: dict) -> None:
+        """Reject error-bearing or unknown-status rows at the repair seam.
+
+        TradierBroker.list_positions_strict() validates provider rows before
+        returning them. The reconciler still enforces the same boundary for
+        strict adapters and test doubles so a non-Tradier implementation
+        cannot turn an error-bearing row into apparent broker presence or
+        absence.
+        """
+        if not isinstance(bp, dict):
+            raise ValueError("closed_repair_broker_position_malformed")
+
+        successful_statuses = {"ok", "success", "successful"}
+        records = [bp]
+        raw = bp.get("raw")
+        if isinstance(raw, dict):
+            records.append(raw)
+
+        for record in records:
+            for key, raw_value in record.items():
+                normalized_key = str(key).strip().lower()
+                if normalized_key in {"error", "errors", "message", "reason"}:
+                    raise ValueError("closed_repair_broker_position_malformed")
+                if normalized_key == "status":
+                    if (
+                        not isinstance(raw_value, str)
+                        or raw_value.strip().lower() not in successful_statuses
+                    ):
+                        raise ValueError("closed_repair_broker_position_malformed")
+
+    @staticmethod
+    def _closed_repair_position_qty(bp: dict) -> int:
+        """Read the already-normalized signed quantity from one strict-reader row.
+
+        ``TradierBroker.list_positions_strict`` (ap/brokers/tradier.py) is the
+        single canonical parser for signed broker-quantity truth: it resolves
+        a provider row's quantity/short_quantity/side fields into one signed,
+        non-zero net quantity and stores it under the row's "quantity" key.
+        That normalized value is the sole quantity authority here.
+
+        The row's "raw" field is non-authoritative provider evidence for
+        diagnostics only. It must NEVER be independently re-parsed and
+        compared against the already-normalized value — the raw provider
+        quantity is by definition pre-sign-adjustment (e.g. a provider row
+        of quantity=3, side="short" normalizes to quantity=-3), so comparing
+        the two as if they were two independent authorities manufactures a
+        false contradiction on every legitimate short row and reintroduces
+        exactly the poisoning bug the signed-quantity correction removed.
+
+        A test double / strict adapter that returns a row without "raw"
+        evidence is still held to the same bar: the "quantity" key itself
+        must be present and resolve to a well-formed, non-zero integer.
+        """
+        if not isinstance(bp, dict) or "quantity" not in bp:
+            raise ValueError("closed_repair_broker_position_malformed")
+
+        value = bp["quantity"]
+        if value is None or isinstance(value, bool):
+            raise ValueError("closed_repair_broker_position_malformed")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("closed_repair_broker_position_malformed")
+        try:
+            parsed = Decimal(str(value))
+        except Exception as exc:
+            raise ValueError("closed_repair_broker_position_malformed") from exc
+        if not parsed.is_finite() or parsed != parsed.to_integral_value():
+            raise ValueError("closed_repair_broker_position_malformed")
+        quantity = int(parsed)
+        if quantity == 0:
+            raise ValueError("closed_repair_broker_position_malformed")
+        return quantity
+
+    @staticmethod
+    def _closed_repair_is_valid_non_option_row(bp: dict) -> bool:
+        """Accept only adapter-proven non-option identities outside OCC.
+
+        The shared lifecycle identity helper intentionally keeps its legacy
+        underlying grammar.  Tradier's strict adapter additionally accepts
+        documented slash-form non-option symbols (for example ``BRK/A``).
+        Those rows are valid snapshot members, but never exact OCC authority.
+        Recheck every identity alias before treating one as non-option so a
+        conflicting or malformed option identity cannot be hidden by the
+        slash-form symbol.
+        """
+        from ap.brokers.tradier import _STRICT_UNDERLYING_RE
+        from ap.exit_safety import _POSITION_IDENTITY_FIELDS, _normalize_contract
+
+        if not isinstance(bp, dict) or bp.get("side") not in (None, ""):
+            return False
+
+        records = [bp]
+        raw = bp.get("raw")
+        if isinstance(raw, dict):
+            records.append(raw)
+
+        saw_non_option = False
+        for record in records:
+            for key in _POSITION_IDENTITY_FIELDS:
+                if key not in record or record.get(key) in (None, ""):
+                    continue
+                normalized = _normalize_contract(record.get(key))
+                if key in {"symbol", "instrument"} and _STRICT_UNDERLYING_RE.fullmatch(
+                    normalized
+                ):
+                    saw_non_option = True
+                    continue
+                return False
+        return saw_non_option
+
+    def _closed_repair_broker_quantities(self) -> dict[str, int]:
+        """Build exact-OCC target-authority quantities from the strict seam.
+
+        Every structurally valid row (including unrelated short/negative
+        positions) is read without raising — a valid unrelated position must
+        never poison the whole snapshot. Only rows that resolve to an exact
+        canonical OCC option identity are eligible target-option authority;
+        generic underlying/equity rows remain valid snapshot members but are
+        excluded from this map since an underlying symbol is never option
+        lifecycle authority.
+
+        Any exact OCC identity appearing more than once in one snapshot is
+        ambiguous broker truth and fails closed — regardless of whether the
+        duplicate rows' quantities happen to agree. Matching quantities do
+        not prove which row is real; it could be duplicate transport
+        representation, duplicate lots, duplicate account data, or a
+        malformed payload. CLOSED repair must not guess.
+        """
+        from ap.exit_safety import (
+            _has_underlying_position_identity,
+            _iter_position_identity_values,
+        )
+
+        strict_reader = getattr(self.broker, "list_positions_strict", None)
+        if not callable(strict_reader):
+            raise RuntimeError("closed_repair_strict_positions_reader_missing")
+
+        rows = strict_reader()
+        if not isinstance(rows, list):
+            raise ValueError("closed_repair_broker_snapshot_malformed")
+
+        quantities: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("closed_repair_broker_position_malformed")
+            self._closed_repair_validate_position_row(row)
+
+            identity_state, contract = _iter_position_identity_values(row)
+            if (
+                identity_state == "invalid"
+                and self._closed_repair_is_valid_non_option_row(row)
+            ):
+                # Tradier's strict parser has already admitted this
+                # documented slash-form security as a valid non-option row.
+                # It contributes quantity to snapshot completeness only; it
+                # can never become exact OCC repair authority.
+                self._closed_repair_position_qty(row)
+                continue
+            if identity_state in {"invalid", "ambiguous"}:
+                raise ValueError("closed_repair_broker_snapshot_ambiguous")
+            if identity_state == "missing":
+                if not _has_underlying_position_identity(row):
+                    raise ValueError("closed_repair_broker_position_malformed")
+                # A well-formed equity/underlying row is a valid snapshot
+                # member but never exact OCC target authority.
+                self._closed_repair_position_qty(row)
+                continue
+            if identity_state != "valid":
+                raise ValueError("closed_repair_broker_position_malformed")
+
+            qty = self._closed_repair_position_qty(row)
+
+            if contract in quantities:
+                # Duplicate exact OCC identity — ambiguous no matter whether
+                # the quantities agree. See docstring above.
+                raise ValueError("closed_repair_broker_snapshot_ambiguous")
+            quantities[contract] = qty
+        return quantities
+
     def _repair_closed_positions_with_remaining_qty(self, summary: dict) -> None:
         """
         P0-PARTIAL-CLOSE repair pass.
@@ -5562,11 +5749,12 @@ class APBrokerReconciler:
         that hides live broker exposure from operator views and exit engine.
 
         For each such row:
-          1. Check broker truth.
-          2. Broker still holds the contract  → restore to PARTIAL (or OPEN if never
-             partially exited), update quantity_remaining from broker, log warning.
+          1. Check complete, unambiguous broker truth.
+          2. Restore only when one local lifecycle has the exact OCC and broker
+             quantity exactly equals its durable quantity_remaining.  Quantity
+             conflicts and shared local OCC candidates HOLD without mutation.
           3. Broker is flat                   → set quantity_remaining=0, keep CLOSED,
-             add close_source=CLOSED_REPAIR so the row is traceable.
+             add close_source=CLOSED_REPAIR only after a successful CAS.
           4. Broker unavailable               → flag manual review, do NOT change status
              (conservative: never hide live exposure on broker API errors).
 
@@ -5575,29 +5763,241 @@ class APBrokerReconciler:
         """
         try:
             from ap.db import conn, run_with_retry
+            from ap.exit_safety import (
+                _iter_position_identity_values,
+                _normalize_contract,
+                is_valid_exact_occ_contract,
+            )
 
-            # ── Step 1: find all CLOSED rows with quantity_remaining > 0 ──────
+            repair_mode = _normalize_execution_mode(self.execution_mode)
+            if repair_mode is None:
+                summary.setdefault("errors", []).append(
+                    "closed_repair_execution_mode_unproven"
+                )
+                log.error(
+                    "[%s] P0-PARTIAL-CLOSE-REPAIR blocked: execution_mode is unproven",
+                    self.client_id,
+                )
+                return
+
+            # ── Step 1: find the complete CLOSED candidate universe ──────────
             def _scan():
                 with conn() as c:
-                    c.execute(
-                        """
-                        SELECT id, contract, option_symbol, underlying, ticker,
-                               qty, quantity_remaining, avg_fill, entry_price,
-                               close_source, client_id
-                        FROM   positions
-                        WHERE  client_id           = %s
-                          AND  UPPER(status)        = 'CLOSED'
-                          AND  COALESCE(quantity_remaining, 0) > 0
-                        ORDER  BY entry_ts DESC NULLS LAST
-                        LIMIT  100
-                        """,
-                        (self.client_id,),
-                    )
-                    return [dict(r) for r in c.fetchall()]
+                    # A repeatable-read snapshot makes keyset pagination a
+                    # complete, stable read even if another worker changes the
+                    # positions table while this pass is discovering rows.
+                    # The test cursor is deliberately not a production DB
+                    # wrapper and has no _conn attribute, so it remains usable
+                    # with its autocommit temporary database.
+                    db_connection = getattr(c, "_conn", None)
+                    if (
+                        db_connection is not None
+                        and not getattr(db_connection, "autocommit", False)
+                    ):
+                        c.execute(
+                            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                        )
 
-            bad_rows = run_with_retry(_scan) or []
+                    rows: list[dict] = []
+                    seen_ids: set[str] = set()
+                    last_entry_ts = None
+                    last_id = None
+                    first_page = True
+
+                    while True:
+                        if first_page:
+                            c.execute(
+                                """
+                                SELECT id, contract, option_symbol, underlying, ticker,
+                                       qty, quantity_remaining, avg_fill, entry_price,
+                                       close_source, client_id, execution_mode, entry_ts
+                                FROM   positions
+                                WHERE  client_id           = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                                  AND  UPPER(status)        = 'CLOSED'
+                                  AND  COALESCE(quantity_remaining, 0) > 0
+                                ORDER  BY entry_ts DESC NULLS LAST, id DESC
+                                LIMIT  %s
+                                """,
+                                (
+                                    self.client_id,
+                                    repair_mode,
+                                    _CLOSED_REPAIR_SCAN_PAGE_SIZE,
+                                ),
+                            )
+                        elif last_entry_ts is None:
+                            c.execute(
+                                """
+                                SELECT id, contract, option_symbol, underlying, ticker,
+                                       qty, quantity_remaining, avg_fill, entry_price,
+                                       close_source, client_id, execution_mode, entry_ts
+                                FROM   positions
+                                WHERE  client_id           = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                                  AND  UPPER(status)        = 'CLOSED'
+                                  AND  COALESCE(quantity_remaining, 0) > 0
+                                  AND  entry_ts IS NULL
+                                  AND  id < %s
+                                ORDER  BY entry_ts DESC NULLS LAST, id DESC
+                                LIMIT  %s
+                                """,
+                                (
+                                    self.client_id,
+                                    repair_mode,
+                                    last_id,
+                                    _CLOSED_REPAIR_SCAN_PAGE_SIZE,
+                                ),
+                            )
+                        else:
+                            c.execute(
+                                """
+                                SELECT id, contract, option_symbol, underlying, ticker,
+                                       qty, quantity_remaining, avg_fill, entry_price,
+                                       close_source, client_id, execution_mode, entry_ts
+                                FROM   positions
+                                WHERE  client_id           = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                                  AND  UPPER(status)        = 'CLOSED'
+                                  AND  COALESCE(quantity_remaining, 0) > 0
+                                  AND  (
+                                         entry_ts < %s
+                                         OR (entry_ts = %s AND id < %s)
+                                         OR entry_ts IS NULL
+                                       )
+                                ORDER  BY entry_ts DESC NULLS LAST, id DESC
+                                LIMIT  %s
+                                """,
+                                (
+                                    self.client_id,
+                                    repair_mode,
+                                    last_entry_ts,
+                                    last_entry_ts,
+                                    last_id,
+                                    _CLOSED_REPAIR_SCAN_PAGE_SIZE,
+                                ),
+                            )
+
+                        raw_page = c.fetchall()
+                        if not isinstance(raw_page, list) or len(
+                            raw_page
+                        ) > _CLOSED_REPAIR_SCAN_PAGE_SIZE:
+                            raise ValueError(
+                                "closed_repair_local_candidate_page_malformed"
+                            )
+
+                        page: list[dict] = []
+                        for raw_row in raw_page:
+                            if not isinstance(raw_row, Mapping):
+                                raise ValueError(
+                                    "closed_repair_local_candidate_page_malformed"
+                                )
+                            row = dict(raw_row)
+                            candidate_id = str(row.get("id") or "").strip()
+                            if not candidate_id or candidate_id in seen_ids:
+                                raise ValueError(
+                                    "closed_repair_local_candidate_pagination_inconsistent"
+                                )
+                            seen_ids.add(candidate_id)
+                            page.append(row)
+
+                        rows.extend(page)
+                        if len(page) < _CLOSED_REPAIR_SCAN_PAGE_SIZE:
+                            return rows
+
+                        last_entry_ts = page[-1].get("entry_ts")
+                        last_id = str(page[-1].get("id") or "").strip()
+                        if not last_id:
+                            raise ValueError(
+                                "closed_repair_local_candidate_pagination_inconsistent"
+                            )
+                        first_page = False
+
+            try:
+                bad_rows = run_with_retry(_scan)
+            except Exception as _scan_exc:
+                summary.setdefault("errors", []).append(
+                    "closed_repair_local_candidate_discovery_incomplete"
+                )
+                log.error(
+                    "[%s] P0-PARTIAL-CLOSE-REPAIR blocked: complete local "
+                    "candidate discovery failed (%s) — zero broker truth and "
+                    "zero repair mutation",
+                    self.client_id,
+                    _scan_exc,
+                )
+                return
+
+            if not isinstance(bad_rows, list):
+                summary.setdefault("errors", []).append(
+                    "closed_repair_local_candidate_discovery_incomplete"
+                )
+                log.error(
+                    "[%s] P0-PARTIAL-CLOSE-REPAIR blocked: local candidate "
+                    "discovery returned a malformed result — zero broker truth "
+                    "and zero repair mutation",
+                    self.client_id,
+                )
+                return
+
             if not bad_rows:
                 return
+
+            # The strict Tradier reader canonicalizes padded OCC roots to the
+            # same compact identity used by exit safety. Resolve every
+            # populated durable identity alias together before taking the
+            # broker snapshot: a conflicting contract/option_symbol pair is
+            # unproven and must not fall through to one truthy alias.
+            for row in bad_rows:
+                identity_state, canonical_contract = _iter_position_identity_values(row)
+                row["_closed_repair_identity_state"] = identity_state
+                row["contract"] = (
+                    _normalize_contract(canonical_contract)
+                    if identity_state == "valid"
+                    else ""
+                )
+
+            # The broker snapshot reports aggregate quantity for an OCC, not
+            # ownership of that quantity by a particular local lifecycle.  If
+            # two eligible CLOSED rows share the same client/mode/canonical
+            # OCC, neither row can be restored safely without an existing
+            # durable per-lifecycle allocation authority.  Do not allocate by
+            # age, row order, or aggregate arithmetic.
+            local_allocation_ambiguous_ids: set[str] = set()
+            local_candidates_by_key: dict[tuple[str, str, str], list[dict]] = {}
+            for candidate in bad_rows:
+                if (
+                    candidate.get("_closed_repair_identity_state") == "valid"
+                    and is_valid_exact_occ_contract(candidate.get("contract") or "")
+                ):
+                    allocation_key = (
+                        str(candidate.get("client_id") or "").strip(),
+                        str(candidate.get("execution_mode") or "").strip().lower(),
+                        str(candidate.get("contract") or ""),
+                    )
+                    local_candidates_by_key.setdefault(allocation_key, []).append(
+                        candidate
+                    )
+
+            for allocation_key, candidates in local_candidates_by_key.items():
+                if len(candidates) < 2:
+                    continue
+                candidate_ids = [str(candidate.get("id") or "") for candidate in candidates]
+                local_allocation_ambiguous_ids.update(candidate_ids)
+                client_id, execution_mode, canonical_contract = allocation_key
+                summary.setdefault("errors", []).append(
+                    "closed_repair_local_allocation_ambiguous"
+                )
+                log.error(
+                    "[%s] P0-PARTIAL-CLOSE-REPAIR LOCAL-ALLOCATION-AMBIGUOUS | "
+                    "client_id=%s execution_mode=%s contract=%s pos_ids=%s | "
+                    "multiple CLOSED lifecycles share one exact OCC without "
+                    "durable quantity allocation authority — holding all candidates",
+                    self.client_id,
+                    client_id,
+                    execution_mode,
+                    canonical_contract,
+                    candidate_ids,
+                )
 
             count = len(bad_rows)
             summary["closed_positions_with_remaining_qty_count"] = \
@@ -5615,17 +6015,15 @@ class APBrokerReconciler:
             broker_open_by_contract: dict[str, int] = {}
             broker_truth_available  = False
             try:
-                if self.broker and hasattr(self.broker, "list_positions"):
-                    bp_list = self.broker.list_positions() or []
-                    for bp in bp_list:
-                        sym = self._norm_contract(
-                            str(bp.get("symbol") or bp.get("contract") or "")
-                        )
-                        qty = self._broker_position_qty(bp)
-                        if sym and qty > 0:
-                            broker_open_by_contract[sym] = qty
-                    broker_truth_available = True
+                broker_open_by_contract = self._closed_repair_broker_quantities()
+                broker_truth_available = True
             except Exception as _bpe:
+                error_code = (
+                    "closed_repair_broker_positions_malformed"
+                    if isinstance(_bpe, ValueError)
+                    else "closed_repair_broker_positions_unavailable"
+                )
+                summary.setdefault("errors", []).append(error_code)
                 log.warning(
                     "[%s] P0-PARTIAL-CLOSE-REPAIR broker fetch failed: %s — "
                     "flagging rows for manual review without changing status",
@@ -5635,11 +6033,45 @@ class APBrokerReconciler:
             # ── Step 3: per-row repair ────────────────────────────────────────
             for row in bad_rows:
                 pos_id     = row.get("id")
-                contract   = self._norm_contract(
-                    row.get("contract") or row.get("option_symbol") or ""
-                )
+                identity_state = row.get("_closed_repair_identity_state")
+                contract   = row.get("contract") if identity_state == "valid" else ""
                 rem_qty    = int(row.get("quantity_remaining") or 0)
                 full_qty   = int(row.get("qty") or rem_qty)
+
+                if str(pos_id or "") in local_allocation_ambiguous_ids:
+                    log.error(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR HOLD | pos=%s contract=%s | "
+                        "closed_repair_local_allocation_ambiguous",
+                        self.client_id,
+                        pos_id,
+                        contract,
+                    )
+                    summary["broker_positions_hidden_by_closed_status_count"] = \
+                        int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    continue
+
+                # A durable CLOSED row must prove an exact canonical OCC option
+                # identity before broker presence/absence is evaluated at all.
+                # A generic underlying ticker (e.g. an equity symbol) is never
+                # option lifecycle authority and must never be treated as a
+                # fallback target identity.
+                if (
+                    identity_state != "valid"
+                    or not is_valid_exact_occ_contract(contract)
+                ):
+                    log.error(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR TARGET-IDENTITY-UNPROVEN | "
+                        "pos=%s contract=%r | durable target does not resolve to "
+                        "an exact canonical OCC option identity — holding, "
+                        "zero mutation",
+                        self.client_id, pos_id, contract,
+                    )
+                    summary.setdefault("errors", []).append(
+                        "closed_repair_target_identity_unproven"
+                    )
+                    summary["broker_positions_hidden_by_closed_status_count"] = \
+                        int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    continue
 
                 if not broker_truth_available:
                     # Cannot verify — flag for operator, do not touch status
@@ -5654,14 +6086,68 @@ class APBrokerReconciler:
                         int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
                     continue
 
+                target_present = contract in broker_open_by_contract
                 broker_qty = broker_open_by_contract.get(contract, 0)
 
+                if target_present and broker_qty <= 0:
+                    # Exact target OCC exists at the broker but its quantity is
+                    # not long-compatible (e.g. a negative/short quantity at
+                    # this exact contract). It is neither valid RESTORE
+                    # authority nor genuinely absent — never silently RESTORE
+                    # a long CLOSED position from this, and never FLATTEN a
+                    # target that broker truth shows is not actually flat.
+                    log.error(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR TARGET-SIDE-MISMATCH | "
+                        "pos=%s contract=%s broker_qty=%d | exact target OCC "
+                        "present with a non-long-compatible quantity — "
+                        "holding, zero mutation",
+                        self.client_id, pos_id, contract, broker_qty,
+                    )
+                    summary.setdefault("errors", []).append(
+                        "closed_repair_target_side_mismatch"
+                    )
+                    summary["broker_positions_hidden_by_closed_status_count"] = \
+                        int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    continue
+
                 if broker_qty > 0:
+                    # The aggregate broker quantity is repair authority only
+                    # when it exactly matches this lifecycle's durable
+                    # remaining quantity.  A larger quantity may belong to
+                    # another lifecycle, while a smaller quantity may reflect
+                    # an unobserved partial fill/exit.  Neither can be safely
+                    # allocated from this snapshot alone.
+                    if broker_qty != rem_qty:
+                        relation = "greater" if broker_qty > rem_qty else "less"
+                        summary.setdefault("errors", []).append(
+                            "closed_repair_quantity_authority_conflict"
+                        )
+                        summary["broker_positions_hidden_by_closed_status_count"] = \
+                            int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                        log.error(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR QUANTITY-AUTHORITY-CONFLICT | "
+                            "pos=%s contract=%s broker_qty=%d local_remaining=%d "
+                            "(%s) — holding with zero mutation",
+                            self.client_id,
+                            pos_id,
+                            contract,
+                            broker_qty,
+                            rem_qty,
+                            relation,
+                        )
+                        continue
+
                     # Broker still holds this contract — restore to managed status
                     restore_status = "PARTIAL" if full_qty > rem_qty else "OPEN"
-                    restore_remaining = min(broker_qty, rem_qty)  # trust broker qty
+                    restore_remaining = rem_qty
 
-                    def _restore(pid=pos_id, st=restore_status, rq=restore_remaining):
+                    def _restore(
+                        pid=pos_id,
+                        st=restore_status,
+                        rq=restore_remaining,
+                        expected_remaining=rem_qty,
+                        mode=repair_mode,
+                    ):
                         with conn() as c:
                             c.execute(
                                 """
@@ -5672,53 +6158,86 @@ class APBrokerReconciler:
                                        updated_at         = NOW()
                                 WHERE  id         = %s
                                   AND  client_id  = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                                   AND  UPPER(status) = 'CLOSED'
+                                  AND  COALESCE(quantity_remaining, 0) = %s
                                 """,
-                                (st, rq, pid, self.client_id),
+                                (st, rq, pid, self.client_id, mode, expected_remaining),
                             )
                             return c.rowcount
 
                     updated = run_with_retry(_restore)
-                    if updated:
-                        summary["broker_positions_hidden_by_closed_status_count"] = \
-                            int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
-                        log.warning(
-                            "[%s] P0-PARTIAL-CLOSE-REPAIR RESTORED | "
-                            "pos=%s contract=%s | was CLOSED qty_remaining=%d | "
-                            "broker holds qty=%d → status=%s quantity_remaining=%d | "
-                            "close_source set to PARTIAL_CLOSE_REPAIR",
-                            self.client_id, pos_id, contract,
-                            rem_qty, broker_qty, restore_status, restore_remaining,
+                    if updated == 0:
+                        summary.setdefault("errors", []).append(
+                            "closed_repair_restore_cas_miss"
                         )
-                        # Re-read the canonical row after the UPDATE.  The scan
-                        # projection intentionally omits durable mode, side,
-                        # order IDs, and other owner metadata; passing it to
-                        # the strict installer would manufacture a same-cycle
-                        # ownership failure.  Never seed from that projection.
-                        restored_position = self._find_db_position_by_id(str(pos_id or ""))
-                        if restored_position is None:
-                            log.critical(
-                                "[%s] P0-PARTIAL-CLOSE-REPAIR canonical reread failed "
-                                "pos=%s contract=%s — owner install held",
-                                self.client_id, pos_id, contract,
-                            )
-                            self._record_exit_owner_install_failure(
-                                summary,
-                                contract=contract,
-                                position_id=str(pos_id or ""),
-                                context="closed_partial_restore_reread",
-                            )
-                            continue
-                        if not self._seed_exit_engine_from_position(restored_position):
-                            self._record_exit_owner_install_failure(
-                                summary,
-                                contract=contract,
-                                position_id=str(pos_id or ""),
-                                context="closed_partial_restore",
-                            )
+                        log.warning(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR RESTORE-CAS-MISS | "
+                            "pos=%s contract=%s | lifecycle changed before "
+                            "conditional update; no repair reported and no owner install",
+                            self.client_id,
+                            pos_id,
+                            contract,
+                        )
+                        continue
+                    if updated != 1:
+                        summary.setdefault("errors", []).append(
+                            "closed_repair_restore_cas_invariant_corruption"
+                        )
+                        log.critical(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR RESTORE-CAS-CORRUPTION | "
+                            "pos=%s contract=%s rowcount=%r | expected exactly one "
+                            "row; aborting repair pass",
+                            self.client_id,
+                            pos_id,
+                            contract,
+                            updated,
+                        )
+                        return
+
+                    summary["broker_positions_hidden_by_closed_status_count"] = \
+                        int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    log.warning(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR RESTORED | "
+                        "pos=%s contract=%s | was CLOSED qty_remaining=%d | "
+                        "broker holds qty=%d → status=%s quantity_remaining=%d | "
+                        "close_source set to PARTIAL_CLOSE_REPAIR",
+                        self.client_id, pos_id, contract,
+                        rem_qty, broker_qty, restore_status, restore_remaining,
+                    )
+                    # Re-read the canonical row after the UPDATE.  The scan
+                    # projection intentionally omits durable mode, side,
+                    # order IDs, and other owner metadata; passing it to
+                    # the strict installer would manufacture a same-cycle
+                    # ownership failure.  Never seed from that projection.
+                    restored_position = self._find_db_position_by_id(str(pos_id or ""))
+                    if restored_position is None:
+                        log.critical(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR canonical reread failed "
+                            "pos=%s contract=%s — owner install held",
+                            self.client_id, pos_id, contract,
+                        )
+                        self._record_exit_owner_install_failure(
+                            summary,
+                            contract=contract,
+                            position_id=str(pos_id or ""),
+                            context="closed_partial_restore_reread",
+                        )
+                        continue
+                    if not self._seed_exit_engine_from_position(restored_position):
+                        self._record_exit_owner_install_failure(
+                            summary,
+                            contract=contract,
+                            position_id=str(pos_id or ""),
+                            context="closed_partial_restore",
+                        )
                 else:
                     # Broker is flat — fix the DB row (zero remaining, stay CLOSED)
-                    def _flatten(pid=pos_id):
+                    def _flatten(
+                        pid=pos_id,
+                        expected_remaining=rem_qty,
+                        mode=repair_mode,
+                    ):
                         with conn() as c:
                             c.execute(
                                 """
@@ -5728,19 +6247,48 @@ class APBrokerReconciler:
                                        updated_at         = NOW()
                                 WHERE  id        = %s
                                   AND  client_id = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                                   AND  UPPER(status) = 'CLOSED'
+                                  AND  COALESCE(quantity_remaining, 0) = %s
                                 """,
-                                (pid, self.client_id),
+                                (pid, self.client_id, mode, expected_remaining),
                             )
                             return c.rowcount
 
-                    run_with_retry(_flatten)
-                    log.info(
-                        "[%s] P0-PARTIAL-CLOSE-REPAIR FLATTEN | "
-                        "pos=%s contract=%s | broker is flat, setting "
-                        "quantity_remaining=0, close_source=CLOSED_REPAIR",
-                        self.client_id, pos_id, contract,
-                    )
+                    updated = run_with_retry(_flatten)
+                    if updated == 1:
+                        log.info(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR FLATTEN | "
+                            "pos=%s contract=%s | broker is flat, setting "
+                            "quantity_remaining=0, close_source=CLOSED_REPAIR",
+                            self.client_id, pos_id, contract,
+                        )
+                    elif updated == 0:
+                        summary.setdefault("errors", []).append(
+                            "closed_repair_flatten_cas_miss"
+                        )
+                        log.warning(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR FLATTEN-CAS-MISS | "
+                            "pos=%s contract=%s | lifecycle changed before "
+                            "conditional update; no flatten reported",
+                            self.client_id,
+                            pos_id,
+                            contract,
+                        )
+                    else:
+                        summary.setdefault("errors", []).append(
+                            "closed_repair_flatten_cas_invariant_corruption"
+                        )
+                        log.critical(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR FLATTEN-CAS-CORRUPTION | "
+                            "pos=%s contract=%s rowcount=%r | expected exactly one "
+                            "row; aborting repair pass",
+                            self.client_id,
+                            pos_id,
+                            contract,
+                            updated,
+                        )
+                        return
 
         except Exception as exc:
             log.error(
