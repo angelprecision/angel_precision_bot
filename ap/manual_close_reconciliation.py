@@ -158,6 +158,19 @@ def positive_int(value: Any) -> int:
     return int(numeric)
 
 
+def nonnegative_int(value: Any) -> int | None:
+    """Parse a durable non-negative integer without coercing bad truth."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
 def parse_timestamp(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
@@ -1039,6 +1052,17 @@ def _validate_durable_fills(
                 client_id, position_id,
             )
             continue
+        durable_local_order_id = str(f.get("local_order_id") or "").strip()
+        if durable_local_order_id and (
+            not client_id
+            or durable_local_order_id != _external_local_order_id(client_id, bid)
+        ):
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_LOCAL_ID_MISMATCH pos=%s "
+                "broker_id=%s local_order_id=%r — rejected",
+                client_id, position_id, bid, durable_local_order_id,
+            )
+            continue
         if filled_qty <= 0 or fill_price <= 0:
             log.warning(
                 "[%s] MANUAL_CLOSE_DURABLE_FILL_ECONOMICS_INVALID pos=%s "
@@ -1363,7 +1387,13 @@ def load_manual_close_state(
                 local_order_id = str(row.get("local_order_id") or "").strip()
                 position_id = str(row.get("position_id") or "").strip()
                 if local_order_id.startswith(EXTERNAL_LOCAL_ID_PREFIX):
-                    if not position_id:
+                    if (
+                        not position_id
+                        or local_order_id
+                        != _external_local_order_id(client_id, broker_order_id)
+                    ):
+                        # An external-looking prefix is never a bot-owned
+                        # fallback. It must be the exact client/order identity.
                         continue
                     row_status = str(row.get("status") or "").upper().strip()
                     if row_status not in DURABLE_EXIT_FILLED_STATUSES:
@@ -1372,6 +1402,15 @@ def load_manual_close_state(
                         # recovery evidence; skip without adding to bot_ids.
                         continue
                     metadata = _metadata_object(row.get("meta"))
+                    if (
+                        metadata.get("source")
+                        != "manual_client_close_broker_fill"
+                        or metadata.get("external_broker_order") is not True
+                        or metadata.get("adopted_without_submit") is not True
+                    ):
+                        # Legacy/adulterated external rows are not restart
+                        # truth and must not reach the finalizer.
+                        continue
                     timestamp_source = str(
                         metadata.get("exit_fill_timestamp_source") or ""
                     ).strip()
@@ -1393,6 +1432,7 @@ def load_manual_close_state(
                     if filled_qty > 0 and fill_price > 0 and filled_at is not None:
                         fill_dict: dict = {
                             "broker_order_id": broker_order_id,
+                            "local_order_id": local_order_id,
                             "filled_qty": filled_qty,
                             "fill_price": fill_price,
                             "filled_at": filled_at,
@@ -1417,10 +1457,12 @@ def load_terminal_recovery_candidates(
     client_id: str,
     execution_mode: str,
 ) -> list[dict]:
-    """PR #386 fix 2: candidates for proof-only restart recovery.
+    """PR #386 fix 2: candidates for proof/queue-only restart recovery.
 
     Returns terminal positions with zero remaining quantity that also carry
-    at least one externally-adopted EXIT row in the durable ledger.
+    at least one externally-adopted EXIT row in the durable ledger. Existing
+    proof rows are intentionally not excluded: a crash after proof binding but
+    before downstream queue cleanup must remain discoverable on restart.
     Scoped to the exact execution mode of the current runner.
 
     Handed to APPositionManager.repair_terminal_proof_from_persisted, which
@@ -1442,6 +1484,7 @@ def load_terminal_recovery_candidates(
                     status,
                     quantity_remaining,
                     qty,
+                    contracts_exited,
                     exit_price,
                     realized_pnl,
                     realized_pnl_pct,
@@ -1465,13 +1508,16 @@ def load_terminal_recovery_candidates(
                         AND LOWER(COALESCE(o.execution_mode, '')) = %s
                         AND UPPER(COALESCE(o.kind, '')) = 'EXIT'
                         AND UPPER(COALESCE(o.status, '')) = ANY(%s)
-                        AND o.local_order_id LIKE %s
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM proof_trades pt
-                      WHERE pt.client_email = p.client_id
-                        AND pt.system_version = 'v2'
-                        AND pt.position_id = p.id
+                        AND COALESCE(o.broker_order_id, '') <> ''
+                        AND o.local_order_id = CONCAT(
+                            'external-exit:', p.client_id, ':', o.broker_order_id
+                        )
+                        AND COALESCE(o.meta->>'source', '') =
+                            'manual_client_close_broker_fill'
+                        AND COALESCE(o.meta->>'external_broker_order', '') = 'true'
+                        AND COALESCE(o.meta->>'adopted_without_submit', '') = 'true'
+                        AND COALESCE(o.meta->>'exit_fill_timestamp_source', '') = %s
+                        AND COALESCE(o.meta->>'exit_fill_timestamp_key', '') = ANY(%s)
                   )
                 """,
                 (
@@ -1480,7 +1526,8 @@ def load_terminal_recovery_candidates(
                     list(_terminal_position_statuses()),
                     norm_mode,
                     list(DURABLE_EXIT_FILLED_STATUSES),
-                    f"{EXTERNAL_LOCAL_ID_PREFIX}%",
+                    BROKER_FILL_TIMESTAMP_SOURCE,
+                    list(BROKER_FILL_TIMESTAMP_KEYS),
                 ),
             )
             return [dict(row) for row in (cursor.fetchall() or [])]
@@ -1822,6 +1869,22 @@ def _evict_exit_engine(
             )
 
 
+def _recover_manual_close_downstream_truth(
+    *,
+    client_id: str,
+    position_id: str,
+    broker_exit_order_id: str,
+    execution_mode: str,
+) -> bool:
+    """No-op until the downstream-truth guard is installed.
+
+    The mandatory lifecycle guard replaces this hook at startup. Keeping the
+    default inert preserves the reconciler's fail-closed behavior on branches
+    where that optional guard is not present.
+    """
+    return False
+
+
 def detect_manual_closes(self) -> None:
     """Finalize externally closed positions from exact broker fill truth.
 
@@ -1888,11 +1951,12 @@ def detect_manual_closes(self) -> None:
     # PASS 1/2 fence machinery below.
     detected_at = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
 
-    # ── PASS 0: proof-only recovery for terminal-without-proof rows ────────
-    # A crash after position commit but before proof persist leaves a
-    # terminal row (qty_remaining <= 0) with durable EXIT evidence but no
-    # canonical proof. This pass repairs proof through the canonical
-    # function using ONLY persisted position economics; it never calls the
+    # ── PASS 0: proof/queue recovery for terminal external-close rows ─────
+    # A crash after position commit but before proof persist, or after proof
+    # binding but before downstream queue cleanup, leaves a terminal row
+    # (qty_remaining <= 0) with durable EXIT evidence. This pass repairs the
+    # proof through the canonical function and replays the downstream truth
+    # hook using ONLY persisted position/fill economics; it never calls the
     # broker, never reopens the position, and evicts the exit engine only
     # after proof binding is proven.
     if callable(recovery_method):
@@ -1939,21 +2003,48 @@ def detect_manual_closes(self) -> None:
                 continue
             adopted_qty = sum(int(f["filled_qty"]) for f in valid_durable)
             required_qty = positive_int(candidate.get("qty"))
-            if required_qty <= 0 or adopted_qty != required_qty:
+            raw_contracts_exited = candidate.get("contracts_exited")
+            if raw_contracts_exited in (None, ""):
+                contracts_exited = 0
+            else:
+                contracts_exited = nonnegative_int(raw_contracts_exited)
+            expected_external_qty = (
+                required_qty - contracts_exited
+                if contracts_exited is not None
+                else 0
+            )
+            if (
+                required_qty <= 0
+                or contracts_exited is None
+                or contracts_exited > required_qty
+                or expected_external_qty <= 0
+                or adopted_qty != expected_external_qty
+            ):
                 log.warning(
                     "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_QTY_MISMATCH "
-                    "pos=%s required=%s adopted=%s — deferring",
-                    client_id, candidate_id, required_qty, adopted_qty,
+                    "pos=%s total=%s prior_exited=%s expected_external=%s "
+                    "adopted=%s — deferring",
+                    client_id, candidate_id, required_qty, contracts_exited,
+                    expected_external_qty, adopted_qty,
                 )
                 continue
-            weighted_notional = sum(
-                float(f["fill_price"]) * int(f["filled_qty"]) for f in valid_durable
-            )
-            avg_price = weighted_notional / adopted_qty
-            durable_evidence = {
-                "filled_qty": adopted_qty,
-                "fill_price": round(avg_price, 6),
-            }
+            # A full external close can prove the persisted aggregate from
+            # the external rows themselves. For a mixed bot-partial/manual
+            # close, the external rows prove only the residual; the recovery
+            # method must revalidate the already-terminal persisted truth and
+            # must not be handed an external-only aggregate as if it covered
+            # the original position quantity.
+            durable_evidence = None
+            if adopted_qty == required_qty:
+                weighted_notional = sum(
+                    float(f["fill_price"]) * int(f["filled_qty"])
+                    for f in valid_durable
+                )
+                avg_price = weighted_notional / adopted_qty
+                durable_evidence = {
+                    "filled_qty": adopted_qty,
+                    "fill_price": round(avg_price, 6),
+                }
             try:
                 ok, reason = recovery_method(
                     candidate_id,
@@ -1987,6 +2078,41 @@ def detect_manual_closes(self) -> None:
                 "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_BOUND pos=%s reason=%s",
                 client_id, candidate_id, reason,
             )
+            latest_durable = max(
+                valid_durable,
+                key=lambda fill: fill["filled_at"],
+            )
+            broker_exit_order_id = str(
+                latest_durable.get("broker_order_id") or ""
+            ).strip()
+            downstream_bound = False
+            if broker_exit_order_id:
+                try:
+                    downstream_bound = (
+                        _recover_manual_close_downstream_truth(
+                            client_id=client_id,
+                            position_id=candidate_id,
+                            broker_exit_order_id=broker_exit_order_id,
+                            execution_mode=runner_mode,
+                        )
+                        is True
+                    )
+                except Exception as exc:
+                    log.error(
+                        "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_DOWNSTREAM_ERROR "
+                        "pos=%s err=%s",
+                        client_id,
+                        candidate_id,
+                        exc,
+                    )
+            if not downstream_bound:
+                log.warning(
+                    "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_DOWNSTREAM_DEFERRED "
+                    "pos=%s — proof not bound; retaining exit-engine ownership",
+                    client_id,
+                    candidate_id,
+                )
+                continue
             _core = getattr(self, "core", None)
             _exit_eng = getattr(_core, "exit_eng", None) if _core is not None else None
             _mark = getattr(_exit_eng, "mark_position_closed", None)

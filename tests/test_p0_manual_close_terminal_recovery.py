@@ -534,10 +534,16 @@ def test_terminal_proof_lock_serializes_overlapping_workers(monkeypatch):
 
 # ═══ Reconciler PASS 0 wiring (proof-only recovery in detect_manual_closes) ═
 
-def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
+@pytest.mark.parametrize(
+    ("downstream_bound", "expected_closed"),
+    ((True, [POSITION_ID]), (False, [])),
+)
+def test_reconciler_pass0_gates_exit_engine_on_downstream_truth(
+    monkeypatch, downstream_bound, expected_closed
+):
     """detect_manual_closes must invoke repair_terminal_proof_from_persisted
     for each terminal-recovery candidate and evict the exit engine ONLY
-    after proof binding is proven."""
+    after downstream proof binding is proven."""
     class _Broker:
         cfg = types.SimpleNamespace(account_id="LIVE-ACCOUNT")
         def _get(self, path): return {"positions": "null"} if "/positions" in path else {"orders": "null"}
@@ -583,6 +589,8 @@ def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
                             "qty": 2, "quantity_remaining": 0,
                             "entry_ts": "2026-07-21T15:26:58.911238+00:00",
                         }])
+    monkeypatch.setattr(manual_mod, "_recover_manual_close_downstream_truth",
+                        lambda **kwargs: downstream_bound)
     monkeypatch.setattr(manual_mod.time, "time",
                         lambda: datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp())
 
@@ -590,8 +598,8 @@ def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
 
     # Recovery method was called exactly once for the candidate.
     assert any(c.get("__recovery__") == POSITION_ID for c in runner.position_manager.calls)
-    # Exit engine evicted AFTER recovery succeeded.
-    assert runner.core.exit_eng.closed == [POSITION_ID]
+    # Exit engine evicted only AFTER downstream proof binding succeeded.
+    assert runner.core.exit_eng.closed == expected_closed
 
 
 def test_reconciler_pass0_does_not_evict_when_recovery_defers(monkeypatch):
@@ -637,8 +645,90 @@ def test_reconciler_pass0_does_not_evict_when_recovery_defers(monkeypatch):
                             "qty": 2, "quantity_remaining": 0,
                             "entry_ts": "2026-07-21T15:26:58.911238+00:00",
                         }])
+    monkeypatch.setattr(manual_mod, "_recover_manual_close_downstream_truth",
+                        lambda **kwargs: None)
     monkeypatch.setattr(manual_mod.time, "time",
                         lambda: datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp())
 
     manual_mod.detect_manual_closes(runner)
     assert runner.core.exit_eng.closed == []
+
+
+def test_reconciler_pass0_recovers_manual_residual_after_bot_partial(monkeypatch):
+    """A terminal qty=2 position may have one bot exit and one manual residual."""
+    class _Broker:
+        cfg = types.SimpleNamespace(account_id="LIVE-ACCOUNT")
+        def _get(self, path): return {"positions": "null"} if "/positions" in path else {"orders": "null"}
+        def list_orders(self): return []
+
+    class _PM:
+        def __init__(self):
+            self.recovery_calls = []
+
+        def repair_terminal_proof_from_persisted(self, position_id, **kwargs):
+            self.recovery_calls.append((position_id, kwargs))
+            return True, "proof_bound"
+
+    class _ExitEng:
+        def __init__(self):
+            self.closed = []
+
+        def mark_position_closed(self, pid): self.closed.append(pid)
+
+    pm = _PM()
+    runner = types.SimpleNamespace(
+        email=CLIENT, mode="LIVE", broker=_Broker(),
+        position_manager=pm,
+        core=types.SimpleNamespace(exit_eng=_ExitEng()),
+        _last_manual_close_check_ts=0.0,
+    )
+    _fills = {POSITION_ID: [{
+        "broker_order_id": "BROK-MANUAL-RESIDUAL",
+        "filled_qty": 1,
+        "fill_price": 0.90,
+        "filled_at": datetime(2026, 7, 21, 15, 57, 39, tzinfo=timezone.utc),
+        "fill_timestamp_source": manual_mod.BROKER_FILL_TIMESTAMP_SOURCE,
+        "fill_timestamp_key": "last_fill_date",
+        "created_at": None,
+        "raw_status": "EXIT_FILLED",
+        "raw_side": "sell_to_close",
+        "db_contract": CONTRACT,
+        "db_direction": "CALL",
+    }]}
+    monkeypatch.setattr(
+        manual_mod, "load_manual_close_state",
+        lambda cid, mode: ([], set(), _fills),
+    )
+    monkeypatch.setattr(
+        manual_mod, "load_terminal_recovery_candidates",
+        lambda cid, mode: [{
+            "id": POSITION_ID, "execution_mode": "live",
+            "contract": CONTRACT, "side": "CALL", "direction": "CALL",
+            "qty": 2, "contracts_exited": 1, "quantity_remaining": 0,
+            "entry_ts": "2026-07-21T15:26:58.911238+00:00",
+        }],
+    )
+    downstream_calls = []
+    monkeypatch.setattr(
+        manual_mod,
+        "_recover_manual_close_downstream_truth",
+        lambda **kwargs: downstream_calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        manual_mod.time,
+        "time",
+        lambda: datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp(),
+    )
+
+    manual_mod.detect_manual_closes(runner)
+
+    assert len(pm.recovery_calls) == 1
+    assert pm.recovery_calls[0][0] == POSITION_ID
+    assert pm.recovery_calls[0][1]["durable_exit_evidence"] is None
+    assert downstream_calls == [{
+        "client_id": CLIENT,
+        "position_id": POSITION_ID,
+        "broker_exit_order_id": "BROK-MANUAL-RESIDUAL",
+        "execution_mode": "live",
+    }]
+    assert runner.core.exit_eng.closed == [POSITION_ID]

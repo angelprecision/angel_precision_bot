@@ -19,6 +19,7 @@ _GUARDS: tuple[tuple[str, str, str, bool], ...] = (
     ("proof_taxonomy", "ap.proof_taxonomy_guard", "install_proof_taxonomy_guard", True),
     ("proof_taxonomy_fill_bridge", "ap.proof_taxonomy_fill_bridge", "install_proof_taxonomy_fill_bridge", True),
     ("one_contract_policy", "ap.one_contract_exit_guard", "install_one_contract_exit_guard", False),
+    ("manual_close_downstream_truth", "ap.manual_close_truth_guard", "install_manual_close_truth_guard", True),
     (
         "touched_profit_bid_confirmation",
         "ap.touched_profit_confirmation_guard",
