@@ -2165,6 +2165,10 @@ class APOrderStateMachine:
         expected_status: str | None = None,
         expected_execution_mode: str | None = None,
         expected_signal_id: str | None = None,
+        expected_canonical_signal_id: str | None = None,
+        expected_kind: str | None = None,
+        expected_meta: dict | None = None,
+        expected_meta_absent: tuple[str, ...] | list[str] | None = None,
     ) -> bool:
         """Merge *meta_patch* into orders.meta using a safe JSONB || merge.
 
@@ -2178,10 +2182,11 @@ class APOrderStateMachine:
         handled safely without raising.
 
         ``expected_status`` optionally adds a lifecycle CAS predicate.  The
-        optional execution-mode and signal-id predicates are used together by
-        confirmed-direction claims, which must not authorize opposite
-        cancellation if the proven winner identity changes between the read
-        and the metadata write.  Ordinary callers retain the historical
+        optional execution-mode, signal-id, canonical-signal-id, kind, and
+        metadata predicates can be combined when a caller must add metadata
+        only to the exact row it just proved.  ``expected_meta_absent`` is a
+        strict JSONB-key absence fence; it is intentionally stronger than a
+        blank-value check.  Ordinary callers retain the historical
         local-order/client scoped merge semantics.
 
         Returns True only when Postgres confirms rowcount > 0 (the row exists
@@ -2189,6 +2194,24 @@ class APOrderStateMachine:
         callers must treat False as best-effort only.
         """
         import json as _json_local
+
+        if expected_meta is not None and not isinstance(expected_meta, dict):
+            return False
+        if expected_meta_absent is not None:
+            try:
+                expected_meta_absent = tuple(expected_meta_absent)
+            except (TypeError, ValueError):
+                return False
+            if any(not isinstance(key, str) or not key.strip() for key in expected_meta_absent):
+                return False
+
+        def _expected_meta_text(value) -> str:
+            if value is True:
+                return "true"
+            if value is False:
+                return "false"
+            return "" if value is None else str(value).strip()
+
         try:
             _patch_json = _json_local.dumps(meta_patch, default=str)
         except Exception:
@@ -2212,6 +2235,23 @@ class APOrderStateMachine:
                 if expected_signal_id is not None:
                     _sql += " AND COALESCE(signal_id, '') = %s"
                     _params.append(str(expected_signal_id).strip())
+                if expected_canonical_signal_id is not None:
+                    _sql += " AND COALESCE(canonical_signal_id, '') = %s"
+                    _params.append(str(expected_canonical_signal_id).strip())
+                if expected_kind is not None:
+                    _sql += " AND UPPER(COALESCE(kind, '')) = %s"
+                    _params.append(str(expected_kind).strip().upper())
+                for _meta_key, _meta_value in (expected_meta or {}).items():
+                    if not isinstance(_meta_key, str) or not _meta_key.strip():
+                        return 0
+                    _sql += " AND BTRIM(COALESCE(meta->>%s, '')) = %s"
+                    _params.extend([
+                        _meta_key,
+                        _expected_meta_text(_meta_value),
+                    ])
+                for _meta_key in (expected_meta_absent or ()):
+                    _sql += " AND NOT (COALESCE(meta, '{}'::jsonb) ? %s)"
+                    _params.append(_meta_key)
                 cur = c.execute(_sql, tuple(_params))
                 # psycopg2: execute() returns the cursor; rowcount is on the cursor.
                 # Never use `or 1` fallback — rowcount=0 means row not found.

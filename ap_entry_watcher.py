@@ -4546,6 +4546,12 @@ class APEntryWatcher:
                             classification=_terminal_reason,
                             watcher_owned=bool(_watcher_owned),
                             already_through=True,
+                            # This branch is proven terminal truth, not a
+                            # recoverable rejection/failure.  Preserve the
+                            # existing terminalization behavior even when the
+                            # caller set no_cancel_on_reject for other recovery
+                            # failure paths.
+                            no_cancel_on_reject=False,
                         )
                     # Preserve legacy log markers + reason code so downstream
                     # structural checks (PR #304 Bug C tests, invalidation
