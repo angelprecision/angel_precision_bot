@@ -42,10 +42,12 @@ from ap.pending_trigger_restart_recovery import (
     _RR_NEXT_AT_FIELD,
     _RR_DEADLINE_FIELD,
     _RR_FIRST_FAILED_AT,
+    _RR_LAST_FAILED_AT,
     _RR_CLIENT_FIELD,
     _RR_MODE_FIELD,
     _RR_GENERATION_FIELD,
     _RR_SESSION_FIELD,
+    _RR_CLOSED_AT,
     _RR_CLOSE_REASON,
     _LATE_REARM_MAX_GENERATIONS,
     _now_et,
@@ -3526,6 +3528,79 @@ class TestLateMarketValidityRecovery:
         assert osm.get_order(row["local_order_id"])["canonical_signal_id"] == row["canonical_signal_id"]
         assert osm.cancel_calls == []
         _assert_no_broker_mutation(rec_two.broker)
+
+    def test_overnight_rollover_then_market_truth_outage_reopens_retry(self):
+        """A rolled lease must survive the next unavailable-truth cycle."""
+        row = _canonical_late_retry_row(local_order_id="overnight-rollover-outage")
+        row["contract"] = "DEFERRED:SPY"
+        row["meta"]["overnight"] = True
+        row["canonical_signal_id"] = "canonical-overnight-rollover-outage"
+        row["meta"]["canonical_signal_id"] = row["canonical_signal_id"]
+        prior_session = (_now_et().date() - timedelta(days=1)).isoformat()
+        row["meta"][_RR_SESSION_FIELD] = prior_session
+        row["meta"]["overnight_reeval_session_key"] = prior_session
+
+        rollover_watcher = _MonitorWatcher(watch_returns=True)
+        rec_one, osm = _make_recovery(
+            row,
+            watcher=rollover_watcher,
+            quote_result=None,
+        )
+        assert rec_one.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert rollover_watcher.watch_calls == 0
+
+        # The next cycle reaches the canonical watcher boundary, but fresh
+        # market truth is unavailable. It must create a new bounded retry
+        # lease, not treat the closed rollover marker as malformed authority.
+        outage_watcher = _MonitorWatcher(watch_returns=False)
+        rec_two, _ = _make_recovery(
+            osm.get_order(row["local_order_id"]),
+            osm=osm,
+            watcher=outage_watcher,
+            quote_result=None,
+        )
+        second = rec_two.recover_one_row(osm.get_order(row["local_order_id"]))
+
+        assert second == _RowOutcome.RETRY_OWNED
+        assert outage_watcher.watch_calls == 1
+        persisted = osm.get_order(row["local_order_id"])
+        meta = persisted["meta"]
+        assert persisted["status"] == "PENDING_TRIGGER"
+        assert meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert meta[_RR_ATTEMPT_FIELD] == 1
+        assert meta[_RR_GENERATION_FIELD] == 1
+        assert meta[_RR_OWNER_FIELD] == (
+            f"restart_rearm:{row['client_id']}:{row['execution_mode']}:{row['local_order_id']}"
+        )
+        assert meta[_RR_SESSION_FIELD] == _now_et().date().isoformat()
+        assert meta[_RR_CLOSE_REASON] is None
+        assert meta[_RR_CLOSED_AT] is None
+        assert isinstance(meta[_RR_FIRST_FAILED_AT], str)
+        assert isinstance(meta[_RR_LAST_FAILED_AT], str)
+        assert meta[_RR_NEXT_AT_FIELD]
+        assert meta[_RR_DEADLINE_FIELD]
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec_two.broker)
+
+        # A later due retry can still establish the watcher exactly once.
+        due_row = _force_late_retry_attempt_due(
+            osm.get_order(row["local_order_id"])
+        )
+        recovery_watcher = _MonitorWatcher(watch_returns=True)
+        rec_three, _ = _make_recovery(
+            due_row,
+            osm=osm,
+            watcher=recovery_watcher,
+            quote_result=None,
+        )
+        third = rec_three.recover_one_row(due_row)
+
+        assert third == _RowOutcome.WATCHER_OWNED
+        assert recovery_watcher.watch_calls == 1
+        assert len(recovery_watcher._pending) == 1
+        assert osm.get_order(row["local_order_id"])["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec_three.broker)
 
     def test_post_open_through_trigger_routes_to_canonical_watcher_policy(self, monkeypatch):
         r = _row(meta={

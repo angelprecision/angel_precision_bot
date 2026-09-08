@@ -189,6 +189,12 @@ _RR_SESSION_FIELD    = "restart_rearm_session_key"
 _RR_CLOSED_AT        = "restart_rearm_closed_at"
 _RR_CLOSE_REASON     = "restart_rearm_close_reason"
 
+_OVERNIGHT_RETRY_ROLLOVER_REASONS = frozenset({
+    "overnight_retry_session_rollover",
+    "overnight_retry_session_conflict",
+    "overnight_retry_entry_cutoff_rollover",
+})
+
 # Late-attachment market truth may be unavailable across multiple durable
 # lease generations.  The generation is persisted in orders.meta so a process
 # restart cannot reset the diagnostic/cadence state.  It is never a finite
@@ -1578,6 +1584,7 @@ class PendingTriggerRestartRecovery:
         _meta = _extract_meta(row)
         _signal_id = str(row.get("signal_id") or "").strip()
         _expected_retry_state = _restart_rearm_expected_state(_meta)
+        _rollover_marker = _is_current_overnight_retry_rollover_marker(row)
         if not _signal_id:
             self._mark_failure(local_oid, "identity:missing_signal_id")
             log.critical(
@@ -1589,7 +1596,12 @@ class PendingTriggerRestartRecovery:
         _generation = None
         if _late_policy:
             _raw_generation = _meta.get(_RR_GENERATION_FIELD)
-            if prior_generation is not None:
+            if _rollover_marker:
+                # Rollover deliberately clears the prior generation. The
+                # current-session marker is a fresh infrastructure boundary,
+                # not an active lease with missing generation authority.
+                _generation = 1
+            elif prior_generation is not None:
                 if (
                     type(prior_generation) is not int
                     or not 1 <= prior_generation <= _LATE_REARM_MAX_GENERATIONS
@@ -1657,7 +1669,7 @@ class PendingTriggerRestartRecovery:
             if isinstance(first_failed_at, str) and first_failed_at.strip()
             else None
         )
-        _existing_late_lease = _late_policy and (
+        _existing_late_lease = _late_policy and not _rollover_marker and (
             _first_failed_arg is not None
             or prior_attempt is not None
             or prior_generation is not None
@@ -1827,6 +1839,12 @@ class PendingTriggerRestartRecovery:
         if _late_policy:
             _patch[_RR_GENERATION_FIELD] = _generation
             _patch[_RR_SESSION_FIELD] = _session_key
+        if _rollover_marker:
+            # These fields describe the closed predecessor lease. Clear them
+            # as the new lease is installed so later recovery sees only the
+            # active canonical retry state.
+            _patch[_RR_CLOSED_AT] = None
+            _patch[_RR_CLOSE_REASON] = None
         if not self._safe_meta_update(
             local_oid,
             _patch,
@@ -3126,6 +3144,50 @@ def _extract_meta(row: dict) -> dict:
         except Exception:
             meta = {}
     return meta if isinstance(meta, dict) else {}
+
+
+def _is_current_overnight_retry_rollover_marker(row: dict) -> bool:
+    """Recognize the exact fresh-lease boundary emitted by rollover.
+
+    Rollover intentionally clears the previous retry generation and timing
+    fields.  The marker must be narrowly validated so a generic CLOSED or
+    malformed retry shape cannot manufacture a new late-recovery lease.
+    """
+    if not _is_overnight_or_deferred_row(row):
+        return False
+    meta = _extract_meta(row)
+    if str(meta.get(_RR_STATUS_FIELD) or "").strip().upper() != "CLOSED":
+        return False
+    if str(meta.get(_RR_CLOSE_REASON) or "").strip() not in _OVERNIGHT_RETRY_ROLLOVER_REASONS:
+        return False
+    if meta.get("restart_recovery_late_boundary") != "overnight_retry_rollover":
+        return False
+    closed_at = meta.get(_RR_CLOSED_AT)
+    if not isinstance(closed_at, str) or not closed_at.strip():
+        return False
+
+    current_session = _now_et().date().isoformat()
+    if (
+        meta.get(_RR_SESSION_FIELD) != current_session
+        or meta.get("overnight_reeval_session_key") != current_session
+    ):
+        return False
+
+    for field in (
+        _RR_OWNER_FIELD,
+        _RR_REASON_FIELD,
+        _RR_ATTEMPT_FIELD,
+        _RR_NEXT_AT_FIELD,
+        _RR_DEADLINE_FIELD,
+        _RR_FIRST_FAILED_AT,
+        _RR_LAST_FAILED_AT,
+        _RR_CLIENT_FIELD,
+        _RR_MODE_FIELD,
+        _RR_GENERATION_FIELD,
+    ):
+        if meta.get(field) not in (None, ""):
+            return False
+    return True
 
 
 def _canonical_underlying_trigger(row: dict) -> Optional[float]:
