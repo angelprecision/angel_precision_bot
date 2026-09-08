@@ -520,3 +520,218 @@ def test_evaluate_unknown_sector_fails_closed_before_other_cap_gates(monkeypatch
     control._get_snapshot.assert_not_called()
     control._has_durable_duplicate_signal.assert_not_called()
     control._persist_dedup.assert_not_called()
+
+
+def test_sector_exposure_authority_reports_completeness_and_diagnostics():
+    control = _bare_control()
+
+    complete = control._sector_exposure_authority([_position("AAPL")], "tech")
+    assert complete == {
+        "capital": 200.0,
+        "identity_complete": True,
+        "unresolved": [],
+    }
+
+    cross_sector = control._sector_exposure_authority([_position("QQQ")], "healthcare")
+    assert cross_sector == {
+        "capital": 0.0,
+        "identity_complete": True,
+        "unresolved": [],
+    }
+
+    incomplete = control._sector_exposure_authority(
+        [_position("ZZUNKNOWN1"), _position("ZZUNKNOWN2")],
+        "healthcare",
+    )
+    assert incomplete["capital"] == 0.0
+    assert incomplete["identity_complete"] is False
+    assert [row["symbol"] for row in incomplete["unresolved"]] == [
+        "ZZUNKNOWN1",
+        "ZZUNKNOWN2",
+    ]
+    assert all(
+        row["reason"] == "SECTOR_IDENTITY_UNPROVEN"
+        for row in incomplete["unresolved"]
+    )
+
+
+@pytest.mark.parametrize("position_bucket", ["open_positions", "closing_positions"])
+def test_revalidate_blocks_known_candidate_when_active_position_identity_is_unproven(
+    position_bucket,
+):
+    control = _control(
+        max_position_pct=0.90,
+        max_total_capital_pct=0.90,
+        max_ticker_pct=0.90,
+        max_sector_pct=0.90,
+    )
+    snapshot = _snapshot(
+        **{position_bucket: [_position("ZZUNKNOWN1", price=3.0)]},
+        capital_deployed=300.0,
+    )
+    control._get_snapshot = MagicMock(return_value=snapshot)
+    control._sector_capital_deployed = MagicMock(
+        side_effect=AssertionError("incomplete sector authority must not calculate cap")
+    )
+    control._pending_capital_from_snapshot_or_db = MagicMock(
+        side_effect=AssertionError("incomplete sector authority must block before pending capital")
+    )
+    control._get_pending_capital_breakdown = MagicMock(
+        side_effect=AssertionError("incomplete sector authority must block before diagnostics")
+    )
+    control._log_capital_utilization = MagicMock()
+
+    plan = _plan("BMY", 150.0)
+    before_plan = (plan.contracts, plan.max_position_usd)
+    decision = control.revalidate_exposure(plan)
+
+    assert (decision.ok, decision.reason, decision.reason_code) == (
+        False,
+        "SECTOR_IDENTITY_UNPROVEN",
+        "SECTOR_IDENTITY_UNPROVEN",
+    )
+    assert (plan.contracts, plan.max_position_usd) == before_plan
+    control._sector_capital_deployed.assert_not_called()
+    control._pending_capital_from_snapshot_or_db.assert_not_called()
+    control._get_pending_capital_breakdown.assert_not_called()
+    control._log_capital_utilization.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("bad_position", "expected_symbol"),
+    [
+        ({"avg_fill": 3.0, "quantity_remaining": 1}, "<missing>"),
+        ({"underlying": "   ", "avg_fill": 3.0, "quantity_remaining": 1}, "<missing>"),
+        ({"underlying": {"not": "a symbol"}, "avg_fill": 3.0, "quantity_remaining": 1}, "{'NOT': 'A SYMBOL'}"),
+        (_position("ZZUNKNOWN1", price=3.0), "ZZUNKNOWN1"),
+    ],
+)
+def test_revalidate_blocks_missing_blank_malformed_and_unmapped_active_identity(
+    bad_position,
+    expected_symbol,
+):
+    control = _control(
+        max_position_pct=0.90,
+        max_total_capital_pct=0.90,
+        max_ticker_pct=0.90,
+        max_sector_pct=0.90,
+    )
+    control._get_snapshot = MagicMock(
+        return_value=_snapshot([bad_position], capital_deployed=300.0)
+    )
+
+    authority = control._sector_exposure_authority([bad_position], "healthcare")
+    assert authority["identity_complete"] is False
+    assert authority["unresolved"][0]["symbol"] == expected_symbol
+
+    decision = control.revalidate_exposure(_plan("BMY", 150.0))
+
+    assert (decision.ok, decision.reason, decision.reason_code) == (
+        False,
+        "SECTOR_IDENTITY_UNPROVEN",
+        "SECTOR_IDENTITY_UNPROVEN",
+    )
+    control._pending_capital_from_snapshot_or_db.assert_not_called()
+
+
+def test_revalidate_blocks_when_active_position_resolver_raises(monkeypatch):
+    original_resolver = mc_mod._canonical_get_sector
+
+    def raising_resolver(symbol):
+        if str(symbol).strip().upper() == "ZZUNKNOWN1":
+            raise RuntimeError("resolver unavailable")
+        return original_resolver(symbol)
+
+    monkeypatch.setattr(mc_mod, "_canonical_get_sector", raising_resolver)
+    control = _control(
+        max_position_pct=0.90,
+        max_total_capital_pct=0.90,
+        max_ticker_pct=0.90,
+        max_sector_pct=0.90,
+    )
+    control._get_snapshot = MagicMock(
+        return_value=_snapshot([_position("ZZUNKNOWN1", price=3.0)], capital_deployed=300.0)
+    )
+
+    decision = control.revalidate_exposure(_plan("BMY", 150.0))
+
+    assert (decision.ok, decision.reason, decision.reason_code) == (
+        False,
+        "SECTOR_IDENTITY_UNPROVEN",
+        "SECTOR_IDENTITY_UNPROVEN",
+    )
+    control._pending_capital_from_snapshot_or_db.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["paper", "live"])
+def test_known_candidate_with_unresolved_active_position_blocks_in_both_modes(mode):
+    control = _control(
+        mode=mode,
+        max_position_pct=0.90,
+        max_total_capital_pct=0.90,
+        max_ticker_pct=0.90,
+        max_sector_pct=0.90,
+    )
+    control._get_snapshot = MagicMock(
+        return_value=_snapshot([_position("ZZUNKNOWN1", price=3.0)], capital_deployed=300.0)
+    )
+    control._pending_capital_from_snapshot_or_db = MagicMock(
+        side_effect=AssertionError("identity failure must precede pending capital")
+    )
+
+    decision = control.revalidate_exposure(_plan("BMY", 150.0))
+
+    assert (decision.ok, decision.reason, decision.reason_code) == (
+        False,
+        "SECTOR_IDENTITY_UNPROVEN",
+        "SECTOR_IDENTITY_UNPROVEN",
+    )
+    control._pending_capital_from_snapshot_or_db.assert_not_called()
+
+
+def test_evaluate_blocks_known_candidate_with_unresolved_open_position_before_approval():
+    control = _control(
+        max_position_pct=0.90,
+        max_total_capital_pct=0.90,
+        max_ticker_pct=0.90,
+        max_sector_pct=0.90,
+    )
+    control._has_durable_duplicate_signal = MagicMock(return_value=(False, "", ""))
+    control._get_snapshot = MagicMock(
+        return_value=_snapshot([_position("ZZUNKNOWN1", price=3.0)], capital_deployed=300.0)
+    )
+    control._sector_capital_deployed = MagicMock(
+        side_effect=AssertionError("incomplete sector authority must not calculate cap")
+    )
+    control._pending_capital_from_snapshot_or_db = MagicMock(
+        side_effect=AssertionError("incomplete sector authority must block before pending capital")
+    )
+    control._run_intelligence = MagicMock(
+        side_effect=AssertionError("incomplete sector authority must not reach intelligence")
+    )
+    control._persist_dedup = MagicMock()
+
+    decision = control.evaluate(
+        {
+            "signal_id": "signal-548-existing-unknown",
+            "ticker": "BMY",
+            "side": "CALL",
+            "direction": "CALL",
+            "score": 80.0,
+            "underlying_price": 100.0,
+            "timeframe": "1d",
+            "pattern": "BREAKOUT",
+            "score_breakdown": {"real_time_ctx": 10.0},
+            "trigger": {"entry": 100.0, "stop": 99.0, "pt1": 105.0},
+        },
+        client_id="client@example.com",
+    )
+
+    assert decision.ok is False
+    assert decision.plan is None
+    assert decision.reason == "SECTOR_IDENTITY_UNPROVEN"
+    assert decision.reason_code == "SECTOR_IDENTITY_UNPROVEN"
+    control._sector_capital_deployed.assert_not_called()
+    control._pending_capital_from_snapshot_or_db.assert_not_called()
+    control._run_intelligence.assert_not_called()
+    control._persist_dedup.assert_not_called()
