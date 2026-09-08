@@ -280,7 +280,7 @@ jobs:
           test "$actual" = "$expected"
           expected_head="${{ github.event.pull_request.head.sha }}"
           parent_words="$(git rev-list --parents -n 1 HEAD | wc -w)"
-          if [ "$parent_words" -lt 3 ]; then
+          if [ "$parent_words" -ne 3 ]; then
             echo "expected a 2-parent synthetic merge commit for a pull_request event, got $((parent_words - 1)) parent(s)"
             exit 1
           fi

@@ -84,6 +84,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -124,6 +125,10 @@ RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))  # was 1
 # the cached last summary and skip the full broker/DB/OSM pass.
 RUN_ONCE_MIN_INTERVAL_SEC = float(os.getenv("RECONCILER_RUN_ONCE_MIN_INTERVAL_SEC", "3.0"))
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+# This is a page size, not a cap: closed-repair discovery must continue until
+# the complete candidate universe is exhausted before any broker truth or
+# lifecycle mutation is allowed.
+_CLOSED_REPAIR_SCAN_PAGE_SIZE = 100
 
 # PR fix/health-and-reconciler-startup-noise:
 # Grace window after reconciler thread start during which a missing
@@ -5728,27 +5733,165 @@ class APBrokerReconciler:
                 )
                 return
 
-            # ── Step 1: find all CLOSED rows with quantity_remaining > 0 ──────
+            # ── Step 1: find the complete CLOSED candidate universe ──────────
             def _scan():
                 with conn() as c:
-                    c.execute(
-                        """
-                        SELECT id, contract, option_symbol, underlying, ticker,
-                               qty, quantity_remaining, avg_fill, entry_price,
-                               close_source, client_id, execution_mode
-                        FROM   positions
-                        WHERE  client_id           = %s
-                          AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
-                          AND  UPPER(status)        = 'CLOSED'
-                          AND  COALESCE(quantity_remaining, 0) > 0
-                        ORDER  BY entry_ts DESC NULLS LAST
-                        LIMIT  100
-                        """,
-                        (self.client_id, repair_mode),
-                    )
-                    return [dict(r) for r in c.fetchall()]
+                    # A repeatable-read snapshot makes keyset pagination a
+                    # complete, stable read even if another worker changes the
+                    # positions table while this pass is discovering rows.
+                    # The test cursor is deliberately not a production DB
+                    # wrapper and has no _conn attribute, so it remains usable
+                    # with its autocommit temporary database.
+                    db_connection = getattr(c, "_conn", None)
+                    if (
+                        db_connection is not None
+                        and not getattr(db_connection, "autocommit", False)
+                    ):
+                        c.execute(
+                            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                        )
 
-            bad_rows = run_with_retry(_scan) or []
+                    rows: list[dict] = []
+                    seen_ids: set[str] = set()
+                    last_entry_ts = None
+                    last_id = None
+                    first_page = True
+
+                    while True:
+                        if first_page:
+                            c.execute(
+                                """
+                                SELECT id, contract, option_symbol, underlying, ticker,
+                                       qty, quantity_remaining, avg_fill, entry_price,
+                                       close_source, client_id, execution_mode, entry_ts
+                                FROM   positions
+                                WHERE  client_id           = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                                  AND  UPPER(status)        = 'CLOSED'
+                                  AND  COALESCE(quantity_remaining, 0) > 0
+                                ORDER  BY entry_ts DESC NULLS LAST, id DESC
+                                LIMIT  %s
+                                """,
+                                (
+                                    self.client_id,
+                                    repair_mode,
+                                    _CLOSED_REPAIR_SCAN_PAGE_SIZE,
+                                ),
+                            )
+                        elif last_entry_ts is None:
+                            c.execute(
+                                """
+                                SELECT id, contract, option_symbol, underlying, ticker,
+                                       qty, quantity_remaining, avg_fill, entry_price,
+                                       close_source, client_id, execution_mode, entry_ts
+                                FROM   positions
+                                WHERE  client_id           = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                                  AND  UPPER(status)        = 'CLOSED'
+                                  AND  COALESCE(quantity_remaining, 0) > 0
+                                  AND  entry_ts IS NULL
+                                  AND  id < %s
+                                ORDER  BY entry_ts DESC NULLS LAST, id DESC
+                                LIMIT  %s
+                                """,
+                                (
+                                    self.client_id,
+                                    repair_mode,
+                                    last_id,
+                                    _CLOSED_REPAIR_SCAN_PAGE_SIZE,
+                                ),
+                            )
+                        else:
+                            c.execute(
+                                """
+                                SELECT id, contract, option_symbol, underlying, ticker,
+                                       qty, quantity_remaining, avg_fill, entry_price,
+                                       close_source, client_id, execution_mode, entry_ts
+                                FROM   positions
+                                WHERE  client_id           = %s
+                                  AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                                  AND  UPPER(status)        = 'CLOSED'
+                                  AND  COALESCE(quantity_remaining, 0) > 0
+                                  AND  (
+                                         entry_ts < %s
+                                         OR (entry_ts = %s AND id < %s)
+                                         OR entry_ts IS NULL
+                                       )
+                                ORDER  BY entry_ts DESC NULLS LAST, id DESC
+                                LIMIT  %s
+                                """,
+                                (
+                                    self.client_id,
+                                    repair_mode,
+                                    last_entry_ts,
+                                    last_entry_ts,
+                                    last_id,
+                                    _CLOSED_REPAIR_SCAN_PAGE_SIZE,
+                                ),
+                            )
+
+                        raw_page = c.fetchall()
+                        if not isinstance(raw_page, list) or len(
+                            raw_page
+                        ) > _CLOSED_REPAIR_SCAN_PAGE_SIZE:
+                            raise ValueError(
+                                "closed_repair_local_candidate_page_malformed"
+                            )
+
+                        page: list[dict] = []
+                        for raw_row in raw_page:
+                            if not isinstance(raw_row, Mapping):
+                                raise ValueError(
+                                    "closed_repair_local_candidate_page_malformed"
+                                )
+                            row = dict(raw_row)
+                            candidate_id = str(row.get("id") or "").strip()
+                            if not candidate_id or candidate_id in seen_ids:
+                                raise ValueError(
+                                    "closed_repair_local_candidate_pagination_inconsistent"
+                                )
+                            seen_ids.add(candidate_id)
+                            page.append(row)
+
+                        rows.extend(page)
+                        if len(page) < _CLOSED_REPAIR_SCAN_PAGE_SIZE:
+                            return rows
+
+                        last_entry_ts = page[-1].get("entry_ts")
+                        last_id = str(page[-1].get("id") or "").strip()
+                        if not last_id:
+                            raise ValueError(
+                                "closed_repair_local_candidate_pagination_inconsistent"
+                            )
+                        first_page = False
+
+            try:
+                bad_rows = run_with_retry(_scan)
+            except Exception as _scan_exc:
+                summary.setdefault("errors", []).append(
+                    "closed_repair_local_candidate_discovery_incomplete"
+                )
+                log.error(
+                    "[%s] P0-PARTIAL-CLOSE-REPAIR blocked: complete local "
+                    "candidate discovery failed (%s) — zero broker truth and "
+                    "zero repair mutation",
+                    self.client_id,
+                    _scan_exc,
+                )
+                return
+
+            if not isinstance(bad_rows, list):
+                summary.setdefault("errors", []).append(
+                    "closed_repair_local_candidate_discovery_incomplete"
+                )
+                log.error(
+                    "[%s] P0-PARTIAL-CLOSE-REPAIR blocked: local candidate "
+                    "discovery returned a malformed result — zero broker truth "
+                    "and zero repair mutation",
+                    self.client_id,
+                )
+                return
+
             if not bad_rows:
                 return
 

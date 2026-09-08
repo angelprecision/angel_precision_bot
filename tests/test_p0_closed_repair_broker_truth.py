@@ -22,6 +22,10 @@ PADDED_CONTRACT = "GS  260717C00465000"
 PADDED_COMPACT_CONTRACT = "GS260717C00465000"
 
 
+def _unique_occ(index: int) -> str:
+    return f"U{index:05d}260620C00155000"
+
+
 def _tradier(*, payload=None, error=None) -> TradierBroker:
     broker = TradierBroker(
         TradierConfig(
@@ -103,14 +107,24 @@ def postgres_closed_row(monkeypatch):
         )
 
     executed_sql: list[str] = []
+    scan_page_count = 0
+    fail_after_scan_page = None
 
     class _TrackedCursor:
         def __init__(self, cursor):
             self._cursor = cursor
 
         def execute(self, sql, params=None):
+            nonlocal scan_page_count
             normalized_sql = " ".join(str(sql).split()).upper()
             executed_sql.append(normalized_sql)
+            if normalized_sql.startswith("SELECT ID, CONTRACT"):
+                scan_page_count += 1
+                if (
+                    fail_after_scan_page is not None
+                    and scan_page_count > fail_after_scan_page
+                ):
+                    raise RuntimeError("closed repair pagination failure")
             if normalized_sql.startswith("UPDATE POSITIONS"):
                 before_update = getattr(read, "before_update", None)
                 if before_update is not None:
@@ -146,6 +160,7 @@ def postgres_closed_row(monkeypatch):
             "client_id": CLIENT,
             "status": "CLOSED",
             "execution_mode": "live",
+            "entry_ts": None,
         }
         row.update(overrides)
         with connection.cursor() as cursor:
@@ -154,12 +169,12 @@ def postgres_closed_row(monkeypatch):
                 INSERT INTO positions (
                     id, contract, option_symbol, underlying, ticker, qty,
                     quantity_remaining, avg_fill, entry_price, close_source,
-                    client_id, status, execution_mode
+                    client_id, status, execution_mode, entry_ts
                 ) VALUES (
                     %(id)s, %(contract)s, %(option_symbol)s, %(underlying)s,
                     %(ticker)s, %(qty)s, %(quantity_remaining)s, %(avg_fill)s,
                     %(entry_price)s, %(close_source)s, %(client_id)s, %(status)s,
-                    %(execution_mode)s
+                    %(execution_mode)s, %(entry_ts)s
                 )
                 """,
                 row,
@@ -189,6 +204,16 @@ def postgres_closed_row(monkeypatch):
 
     read.before_update = None
     read.change_status = change_status
+
+    def _get_scan_page_count():
+        return scan_page_count
+
+    def _set_scan_failure(page):
+        nonlocal fail_after_scan_page
+        fail_after_scan_page = page
+
+    read.get_scan_page_count = _get_scan_page_count
+    read.set_scan_failure = _set_scan_failure
 
     yield insert, read, executed_sql
     connection.close()
@@ -1224,6 +1249,138 @@ def test_postgres_multiple_local_rows_sharing_occ_hold_all_candidates(
         }
     assert "closed_repair_local_allocation_ambiguous" in summary["errors"]
     assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_duplicate_local_occ_across_page_boundary_holds_all_candidates(
+    postgres_closed_row,
+):
+    """Matrices A/D: a same-OCC candidate on page 2 blocks page-1 repair.
+
+    The two exact OCC rows are deliberately the 100th and 101st rows under
+    the deterministic NULL-entry-ts/id ordering.  The other page-1 rows are
+    still eligible CLOSED candidates, but their non-OCC identities must not
+    create unrelated mutations in this allocation-authority proof.
+    """
+    insert, read, executed_sql = postgres_closed_row
+    for index in range(101):
+        contract = CONTRACT if index in (0, 1) else f"ZZ{index:03d}"
+        insert(
+            id=f"position-pr594-{index:03d}",
+            contract=contract,
+            option_symbol=contract,
+            qty=1,
+            quantity_remaining=1,
+        )
+
+    broker = _tradier(
+        payload={
+            "positions": {"position": [{"symbol": CONTRACT, "quantity": 1}]}
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock()
+    rec._seed_exit_engine_from_position = MagicMock()
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    for position_id in ("position-pr594-000", "position-pr594-001"):
+        assert read(position_id) == {
+            "status": "CLOSED",
+            "quantity_remaining": 1,
+            "close_source": "LEGACY_CLOSE",
+        }
+    assert read.get_scan_page_count() == 2
+    assert "closed_repair_local_allocation_ambiguous" in summary["errors"]
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    rec._find_db_position_by_id.assert_not_called()
+    rec._seed_exit_engine_from_position.assert_not_called()
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_multi_page_unique_closed_candidates_still_repair(
+    postgres_closed_row,
+):
+    """Matrix B: exhausting multiple pages does not suppress valid repairs."""
+    insert, read, executed_sql = postgres_closed_row
+    broker_rows = []
+    for index in range(101):
+        contract = _unique_occ(index)
+        insert(
+            id=f"position-pr594-{index:03d}",
+            contract=contract,
+            option_symbol=contract,
+            qty=1,
+            quantity_remaining=1,
+        )
+        broker_rows.append({"symbol": contract, "quantity": 1})
+
+    broker = _tradier(payload={"positions": {"position": broker_rows}})
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(
+        side_effect=lambda position_id: {"id": position_id}
+    )
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    assert read.get_scan_page_count() == 2
+    assert not any(
+        error == "closed_repair_local_allocation_ambiguous"
+        for error in summary["errors"]
+    )
+    for index in (0, 50, 100):
+        assert read(f"position-pr594-{index:03d}") == {
+            "status": "OPEN",
+            "quantity_remaining": 1,
+            "close_source": "PARTIAL_CLOSE_REPAIR",
+        }
+    assert rec._seed_exit_engine_from_position.call_count == 101
+    assert any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_later_page_discovery_failure_holds_entire_repair_pass(
+    postgres_closed_row,
+):
+    """Matrix C: no page-1 mutation occurs before page-2 discovery succeeds."""
+    insert, read, executed_sql = postgres_closed_row
+    for index in range(101):
+        contract = _unique_occ(index)
+        insert(
+            id=f"position-pr594-{index:03d}",
+            contract=contract,
+            option_symbol=contract,
+            qty=1,
+            quantity_remaining=1,
+        )
+
+    broker = _tradier(payload={"positions": {"position": []}})
+    rec = _reconciler(broker)
+    rec._closed_repair_broker_quantities = MagicMock()
+    rec._find_db_position_by_id = MagicMock()
+    rec._seed_exit_engine_from_position = MagicMock()
+    read.set_scan_failure(1)
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    assert read.get_scan_page_count() == 2
+    assert "closed_repair_local_candidate_discovery_incomplete" in summary[
+        "errors"
+    ]
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    rec._closed_repair_broker_quantities.assert_not_called()
+    rec._find_db_position_by_id.assert_not_called()
+    rec._seed_exit_engine_from_position.assert_not_called()
+    for index in (0, 100):
+        assert read(f"position-pr594-{index:03d}") == {
+            "status": "CLOSED",
+            "quantity_remaining": 1,
+            "close_source": "LEGACY_CLOSE",
+        }
     _assert_no_broker_mutations(broker)
 
 
