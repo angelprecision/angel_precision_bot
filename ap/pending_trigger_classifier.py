@@ -53,6 +53,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
 
 from ap.logger import get_logger
+from ap.selector_retry_policy import (
+    DeferredMaterializationConfigConflict,
+    is_retryable_selector_reason,
+    resolve_deferred_materialization_max_attempts,
+    resolve_deferred_retry_reason,
+)
 
 log = get_logger("ap.pending_trigger_classifier")
 
@@ -692,7 +698,6 @@ _RETRY_MATERIALIZATION_OUTCOMES: frozenset[str] = frozenset({
     "RETRY_LATER_SELECTOR_BUDGET",
 })
 
-
 def _reason_is_invalidation(reason_code: str) -> bool:
     """PR #324 §4: delegate to classify_watcher_reason for canonical classification.
 
@@ -921,6 +926,195 @@ def has_broker_handoff_evidence(row: dict) -> bool:
     return False
 
 
+def has_canonical_materialization_retry_authority(row: dict) -> bool:
+    """Recognize the exact post-breach retry handoff without claiming it.
+
+    This predicate is intentionally read-only.  It exists so the historical
+    ``watcher_audit=trigger_ready`` marker cannot outrank a complete durable
+    ``RETRY_PENDING`` handoff.  Callers still perform their own CAS/claim and
+    execution-mode checks before any selector or broker work.
+    """
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+        return False
+    if str(row.get("kind") or "").strip().upper() != "ENTRY":
+        return False
+    if not str(row.get("local_order_id") or "").strip():
+        return False
+    if not str(row.get("client_id") or "").strip():
+        return False
+    if str(row.get("execution_mode") or "").strip().lower() not in {"live", "paper"}:
+        return False
+    if not str(row.get("signal_id") or "").strip():
+        return False
+    if not _persisted_value_is_absent(row.get("broker_order_id")):
+        return False
+    if not _persisted_value_is_absent(row.get("submitted_ts")):
+        return False
+
+    meta = _coerce_classifier_meta(row.get("meta"))
+    nested_materialization = meta.get("materialization")
+    if nested_materialization is not None and not isinstance(
+        nested_materialization, dict
+    ):
+        return False
+
+    if str(meta.get("materialization_status") or "").strip().upper() != "RETRY_PENDING":
+        return False
+    if str(meta.get("lifecycle_state") or "").strip().upper() != "RETRY_WAIT":
+        return False
+
+    contract = str(row.get("contract") or "").strip().upper()
+    if contract and not contract.startswith("DEFERRED:"):
+        return False
+    if not contract and meta.get("contract_deferred") is not True:
+        return False
+
+    if meta.get("broker_ready") is not False:
+        return False
+    if has_broker_handoff_evidence(row):
+        return False
+
+    attempts = meta.get("materialization_attempts")
+    retry_attempt = meta.get("retry_attempt")
+    breach_attempt_count = meta.get("breach_attempt_count")
+    generation = meta.get("materialization_generation")
+    max_attempts = meta.get("retry_max_attempts")
+    counters = (attempts, retry_attempt, breach_attempt_count, generation, max_attempts)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in counters):
+        return False
+    if attempts < 1 or retry_attempt != attempts or breach_attempt_count != attempts:
+        return False
+    if generation < 1 or max_attempts < attempts:
+        return False
+    try:
+        live_max_attempts = resolve_deferred_materialization_max_attempts()
+    except (DeferredMaterializationConfigConflict, TypeError, ValueError):
+        return False
+    if attempts > live_max_attempts:
+        return False
+
+    selector_failure = meta.get("materialization_selector_failure")
+    if not isinstance(selector_failure, dict):
+        selector_failure = meta.get("selector_failure")
+    if not isinstance(selector_failure, dict):
+        selector_failure = None
+    reason, reason_error = resolve_deferred_retry_reason(
+        meta,
+        selector_failure=selector_failure,
+    )
+    if reason_error or not reason or not is_retryable_selector_reason(reason):
+        return False
+
+    def _aware_timestamp(raw) -> Optional[datetime]:
+        parsed = _parse_iso_classifier(raw)
+        if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    # Every populated alias is authority.  Contradictory timestamps do not
+    # get resolved by precedence or min/max selection.
+    retry_timestamps = []
+    for field in (
+        "materialization_next_retry_at",
+        "next_retry_at",
+        "deferred_retry_next_attempt_at",
+    ):
+        raw = meta.get(field)
+        if raw is None or not str(raw).strip():
+            continue
+        parsed = _aware_timestamp(raw)
+        if parsed is None:
+            return False
+        retry_timestamps.append(parsed)
+    if not retry_timestamps or any(value != retry_timestamps[0] for value in retry_timestamps[1:]):
+        return False
+
+    if _aware_timestamp(meta.get("materialization_last_failure_at")) is None:
+        return False
+    if _aware_timestamp(meta.get("trigger_crossed_at") or meta.get("triggered_at")) is None:
+        return False
+
+    # A missing provenance stamp is the narrow legacy gap this PR repairs.
+    # If a stamp is present, however, it is explicit authority and must match
+    # the same four identity fields; contradictory provenance stays HOLD.
+    if "trigger_crossed_at_provenance" in meta:
+        provenance = meta.get("trigger_crossed_at_provenance")
+        if not isinstance(provenance, dict):
+            return False
+        try:
+            from ap_canonical_signal import build_canonical_signal_id
+
+            expected_signal_id = str(
+                row.get("canonical_signal_id")
+                or meta.get("canonical_signal_id")
+                or build_canonical_signal_id(str(row.get("signal_id") or ""))
+            ).strip()
+        except Exception:
+            return False
+        actual_provenance = {
+            "canonical_signal_id": str(
+                provenance.get("canonical_signal_id") or ""
+            ).strip(),
+            "client_id": str(provenance.get("client_id") or "").strip().lower(),
+            "execution_mode": str(
+                provenance.get("execution_mode") or ""
+            ).strip().lower(),
+            "local_order_id": str(
+                provenance.get("local_order_id") or ""
+            ).strip(),
+        }
+        if actual_provenance != {
+            "canonical_signal_id": expected_signal_id,
+            "client_id": str(row.get("client_id") or "").strip().lower(),
+            "execution_mode": str(row.get("execution_mode") or "").strip().lower(),
+            "local_order_id": str(row.get("local_order_id") or "").strip(),
+        }:
+            return False
+
+    deadline_timestamps = []
+    for field in (
+        "absolute_entry_deadline",
+        "retry_deadline",
+        "deferred_retry_deadline",
+    ):
+        raw = meta.get(field)
+        if raw is None or not str(raw).strip():
+            continue
+        parsed = _aware_timestamp(raw)
+        if parsed is None:
+            return False
+        deadline_timestamps.append(parsed)
+    if not deadline_timestamps or any(
+        value != deadline_timestamps[0] for value in deadline_timestamps[1:]
+    ):
+        return False
+
+    if any(
+        str(value or "").strip().upper() not in _RETRY_MATERIALIZATION_OUTCOMES
+        for value in (
+            meta.get("materialization_outcome"),
+            _extract(meta, "materialization.outcome"),
+            _extract(meta, "materialization.materialization_outcome"),
+        )
+        if not _persisted_value_is_absent(value)
+    ):
+        return False
+    outcomes = [
+        str(value).strip().upper()
+        for value in (
+            meta.get("materialization_outcome"),
+            _extract(meta, "materialization.outcome"),
+            _extract(meta, "materialization.materialization_outcome"),
+        )
+        if not _persisted_value_is_absent(value)
+    ]
+    if not outcomes or any(value != outcomes[0] for value in outcomes[1:]):
+        return False
+    return True
+
+
 def is_active_materialization_in_flight(row: dict) -> bool:
     """Return whether a pending entry row has a current materializer owner.
 
@@ -1006,6 +1200,8 @@ def classify_pending_trigger_row(
         if watcher_reason == "trigger_ready":
             if is_active_materialization_in_flight(row):
                 return PendingTriggerClassification.MATERIALIZATION_IN_FLIGHT
+            if has_canonical_materialization_retry_authority(row):
+                return PendingTriggerClassification.WAITING_RETRYABLE
             return PendingTriggerClassification.STUCK_TRIGGER_READY
 
         # ── Priority 2: real invalidation reason ──

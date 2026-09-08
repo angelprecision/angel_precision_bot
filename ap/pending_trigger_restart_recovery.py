@@ -44,6 +44,7 @@ from ap_entry_watcher import (
 from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
+    has_canonical_materialization_retry_authority,
     has_broker_handoff_evidence,
     is_active_materialization_in_flight,
 )
@@ -310,11 +311,22 @@ class PendingTriggerRestartRecovery:
         # that path; the exact watcher/order ownership proof is the authority.
         watcher_owned: Optional[bool] = self._check_watcher_owns(local_oid, row)
         _evidence_proven = recovery_trigger_evidence_identity_is_proven(row, local_oid)
+        _canonical_retry_after_trigger = (
+            isinstance(_extract_meta(row).get("watcher_audit"), dict)
+            and str(
+                _extract_meta(row).get("watcher_audit", {}).get("reason_code") or ""
+            ).strip().lower() == "trigger_ready"
+            and has_canonical_materialization_retry_authority(row)
+        )
 
         # For an unowned row, keep the fail-closed fence before quote checks,
         # selector work, watcher admission, or any terminal/cleanup action.
         # A row with no timestamp remains an ordinary pre-breach candidate.
-        if watcher_owned is not True and not _evidence_proven:
+        if (
+            watcher_owned is not True
+            and not _evidence_proven
+            and not _canonical_retry_after_trigger
+        ):
             return _reject_unproven_trigger_evidence()
 
         # A contradictory broker-ready or submit marker is not permission to
@@ -492,7 +504,7 @@ class PendingTriggerRestartRecovery:
         # lifecycle identity.  Only the proven already-owned fast path above
         # and the MATERIALIZATION_IN_FLIGHT read-only path are allowed to
         # return before this fence.
-        if not _evidence_proven:
+        if not _evidence_proven and not _canonical_retry_after_trigger:
             return _reject_unproven_trigger_evidence()
 
         if cls == PTC.NOT_PENDING_TRIGGER:
@@ -1432,6 +1444,17 @@ class PendingTriggerRestartRecovery:
             return None
 
         meta = _extract_meta(reread)
+        watcher_audit = meta.get("watcher_audit")
+        if (
+            isinstance(watcher_audit, dict)
+            and str(watcher_audit.get("reason_code") or "").strip().lower()
+            == "trigger_ready"
+            and str(meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
+            == "RETRY_PENDING"
+            and reread.get("kind") is not None
+            and not has_canonical_materialization_retry_authority(reread)
+        ):
+            return None
         materialization_outcome = str(
             meta.get("materialization_outcome") or ""
         ).strip().upper()

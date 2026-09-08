@@ -3208,32 +3208,50 @@ class APExecutionCore:
         def _keep(reason: str) -> dict:
             return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
 
+        _post_claim_terminal_fence: dict | None = None
+
         def _term(reason: str, status: str = "EXPIRED", **extra) -> dict:
             # P0 FINAL AMENDMENT: return TERMINAL_REQUIRED (not TERMINAL_DURABLE)
-            # so recovery uses the fenced terminalize_deferred_retry_if_unchanged()
-            # CAS rather than the broad terminalize_deferred_breach(). The expected
-            # state fields enable the fenced predicate to refuse writes when a
-            # concurrent worker has already advanced generation, attempt, lifecycle,
-            # broker_ready, or submit_intent.
+            # so recovery uses an exact terminal CAS rather than the broad
+            # terminalize_deferred_breach(). Before the due retry claims, the
+            # expected state is RETRY_WAIT. After the phase-one claim, the
+            # expected state is the exact MATERIALIZING/RUNNING owner fence;
+            # using the pre-claim fence here would leave the row active.
+            _post_claim = _post_claim_terminal_fence
+            _expected = {
+                "expected_generation": (
+                    _post_claim["generation"]
+                    if _post_claim is not None
+                    else _expected_generation
+                ),
+                "expected_client_id": (
+                    str(getattr(self, "client_id", "") or getattr(self, "email", "") or "")
+                    .strip().lower()
+                ),
+                "expected_execution_mode": (
+                    str(getattr(self, "execution_mode", "") or getattr(self, "mode", "") or "")
+                    .strip().lower()
+                ),
+                "expected_lifecycle_state": (
+                    "MATERIALIZING" if _post_claim is not None else "RETRY_WAIT"
+                ),
+                "expected_materialization_status": (
+                    "RUNNING" if _post_claim is not None else "RETRY_PENDING"
+                ),
+            }
+            if _post_claim is not None:
+                _expected.update({
+                    "expected_owner": _post_claim["owner"],
+                    "expected_retry_attempt": _post_claim["retry_attempt"],
+                })
+            else:
+                _expected["expected_prior_retry_attempt"] = _expected_attempt - 1
             return {
                 **_base, **extra,
                 "disposition": "TERMINAL_REQUIRED",
                 "reason_code": reason,
                 "terminal_status": status,
-                # Fencing fields: exact state the row must still be in for the
-                # terminal CAS to succeed. Use the caller's expectation
-                # (_expected_generation, _expected_attempt) since these are
-                # locked in at call time and never change within the method.
-                "expected_generation": _expected_generation,
-                "expected_prior_retry_attempt": _expected_attempt - 1,
-                "expected_client_id": (
-                    str(getattr(self, "client_id", "") or getattr(self, "email", "") or "").strip().lower()
-                ),
-                "expected_execution_mode": (
-                    str(getattr(self, "execution_mode", "") or getattr(self, "mode", "") or "").strip().lower()
-                ),
-                "expected_lifecycle_state": "RETRY_WAIT",
-                "expected_materialization_status": "RETRY_PENDING",
+                **_expected,
             }
 
         def _claim_lost(reason: str) -> dict:
@@ -3566,6 +3584,11 @@ class APExecutionCore:
             max_attempts=max_attempts,
             generation=_new_generation,
         )
+        _post_claim_terminal_fence = {
+            "owner": str(owner),
+            "generation": _new_generation,
+            "retry_attempt": _callback_attempt,
+        }
 
         # ── Helper: durable RETRY_WAIT schedule (blocker §5) ────────
         # Every RETRY_WAIT return MUST call this so the durable row
