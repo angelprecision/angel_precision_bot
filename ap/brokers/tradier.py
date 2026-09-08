@@ -19,6 +19,7 @@ log = get_logger("ap.brokers.tradier")
 _STRICT_PADDED_OCC_RE = re.compile(
     r"^([A-Z0-9.]{1,6})\s+(\d{6}[CP]\d{8})$"
 )
+_STRICT_OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
 
 
 @dataclass(frozen=True)
@@ -674,9 +675,17 @@ class TradierBroker(BrokerAdapter):
             )
 
             if symbol in seen:
-                # Compact/padded duplicate representations of the same exact
-                # identity may only collapse when their authority agrees.
-                # A contradictory duplicate (different quantity) fails closed
+                if _STRICT_OCC_RE.fullmatch(symbol):
+                    # An exact OCC option identity appearing twice in one
+                    # snapshot is ambiguous broker truth no matter whether
+                    # the quantities happen to agree — duplicate transport
+                    # representation, duplicate lots, and duplicate/garbled
+                    # provider rows are all indistinguishable from here, and
+                    # CLOSED repair must not guess which one is real.
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+                # Non-option (e.g. equity/underlying) duplicate representations
+                # may only collapse when their authority agrees. A
+                # contradictory duplicate (different quantity) fails closed
                 # rather than silently picking one.
                 if seen[symbol]["quantity"] != quantity:
                     raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")

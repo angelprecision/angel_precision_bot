@@ -227,6 +227,10 @@ def test_strict_positions_reader_propagates_transport_failure():
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": -1, "side": "long"}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "side": "short", "position_type": "long"}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "cost_basis": "nan"}]}},
+        {"positions": {"position": [
+            {"symbol": CONTRACT, "quantity": 5},
+            {"symbol": CONTRACT, "quantity": 5},
+        ]}},
     ],
 )
 def test_strict_positions_reader_rejects_unusable_payloads(payload):
@@ -404,13 +408,15 @@ def test_postgres_padded_db_occ_preserves_restore_behavior(
     }
 
 
-def test_postgres_duplicate_padded_and_compact_rows_with_identical_qty_collapse_and_restore(
+def test_postgres_duplicate_padded_and_compact_rows_with_identical_qty_holds_safely(
     postgres_closed_row,
 ):
-    """Compact/padded duplicates of the same exact OCC may collapse — but
-    only because their quantity authority agrees. See the CONFLICTING
-    variant below for the case that must still HOLD."""
-    insert, read, _executed_sql = postgres_closed_row
+    """Amendment: an exact OCC identity appearing twice — even with agreeing
+    quantities — is ambiguous broker truth, not a safe collapse. Matching
+    quantities do not prove which row is real (duplicate transport
+    representation, duplicate lots, duplicate account data, or a malformed
+    payload are all indistinguishable from here)."""
+    insert, read, executed_sql = postgres_closed_row
     insert(
         contract=PADDED_CONTRACT,
         option_symbol=PADDED_CONTRACT,
@@ -428,16 +434,16 @@ def test_postgres_duplicate_padded_and_compact_rows_with_identical_qty_collapse_
         }
     )
     rec = _reconciler(broker)
-    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
-    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
 
     rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
 
     assert read() == {
-        "status": "PARTIAL",
+        "status": "CLOSED",
         "quantity_remaining": 2,
-        "close_source": "PARTIAL_CLOSE_REPAIR",
+        "close_source": "LEGACY_CLOSE",
     }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
     _assert_no_broker_mutations(broker)
 
 
@@ -457,6 +463,37 @@ def test_postgres_duplicate_padded_and_compact_rows_with_conflicting_qty_hold_sa
                 "position": [
                     {"symbol": PADDED_CONTRACT, "quantity": 5},
                     {"symbol": PADDED_COMPACT_CONTRACT, "quantity": 3},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_same_raw_occ_symbol_twice_same_qty_holds_safely(
+    postgres_closed_row,
+):
+    """Same exact OCC repeated twice with identical spelling and quantity —
+    still ambiguous, still HOLD."""
+    insert, read, executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": CONTRACT, "quantity": 5},
                 ]
             }
         }
@@ -662,9 +699,189 @@ def test_postgres_exact_target_negative_quantity_holds_without_mutation(
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# PR #594 AMENDMENT — Correction 2: CLOSED option repair requires exact OCC
-# identity on both the durable target and the broker-side match.
+# PR #594 2ND AMENDMENT — Correction 1: eliminate the raw-vs-normalized
+# double-parser contradiction. A provider row shaped like
+# quantity=3, side="short" normalizes to signed quantity=-3, but the
+# ORIGINAL (pre-sign-adjustment) raw quantity of +3 must never be
+# independently re-parsed and compared against the already-normalized -3 —
+# doing so manufactures a false "contradiction" on every legitimate
+# short-via-side-flag row and reintroduces the exact poisoning bug the
+# first amendment was supposed to remove. These tests use quantity+side
+# (not a bare negative number) specifically to exercise that raw path.
 # ──────────────────────────────────────────────────────────────────────────
+
+def test_postgres_unrelated_short_via_side_flag_equity_does_not_poison_restore(
+    postgres_closed_row,
+):
+    """Required regression #1: target long OCC + unrelated equity
+    (quantity=100, side="short") — unrelated short must not poison target
+    RESTORE, and must not raise via the raw-vs-normalized double-parse."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": "MSFT", "quantity": 100, "side": "short"},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_unrelated_short_via_side_flag_option_does_not_poison_restore(
+    postgres_closed_row,
+):
+    """Required regression #2: target long OCC + unrelated option
+    (quantity=2, side="short") — unrelated short option must not poison
+    target RESTORE."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 5},
+                    {
+                        "symbol": "MSFT260620P00300000",
+                        "quantity": 2,
+                        "side": "short",
+                    },
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_exact_target_short_via_side_flag_holds_without_mutation(
+    postgres_closed_row,
+):
+    """Required regression #3: exact target OCC itself is quantity=2,
+    side="short" — HOLD with zero mutation, never RESTORE as long, never
+    treated as absent/FLAT."""
+    insert, read, executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [{"symbol": CONTRACT, "quantity": 2, "side": "short"}]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+def test_closed_repair_position_qty_trusts_normalized_quantity_not_raw():
+    """Direct unit proof of the fix: a strict-reader row shaped exactly like
+    what TradierBroker.list_positions_strict() produces for a
+    quantity=3/side="short" provider row (normalized quantity=-3, raw
+    quantity=+3 preserved for diagnostics) must resolve to -3, not raise."""
+    row = {
+        "symbol": CONTRACT,
+        "quantity": -3,
+        "cost_basis": 100.0,
+        "side": "PUT",
+        "raw": {"symbol": CONTRACT, "quantity": 3, "side": "short"},
+    }
+    assert APBrokerReconciler._closed_repair_position_qty(row) == -3
+
+
+def test_closed_repair_position_qty_requires_normalized_quantity_key():
+    """Required: for test doubles/strict adapters that return a row without
+    raw evidence, the reconciler still requires a valid integral non-zero
+    signed quantity — read from the normalized "quantity" key directly."""
+    assert APBrokerReconciler._closed_repair_position_qty({"quantity": -7}) == -7
+    assert APBrokerReconciler._closed_repair_position_qty({"quantity": 4}) == 4
+
+    for bad_row in (
+        {},
+        {"quantity": 0},
+        {"quantity": None},
+        {"quantity": True},
+        {"quantity": 1.5},
+        {"quantity": "garbage"},
+        {"quantity": float("nan")},
+    ):
+        with pytest.raises(ValueError, match="closed_repair_broker_position_malformed"):
+            APBrokerReconciler._closed_repair_position_qty(bad_row)
+
+
+def _stub_broker(rows) -> MagicMock:
+    """A bare strict-position-reader double that bypasses TradierBroker
+    entirely — used to prove the reconciler enforces its own invariants
+    (signed-quantity trust, duplicate-OCC ambiguity) independent of the
+    Tradier-specific normalizer."""
+    broker = MagicMock()
+    broker.list_positions_strict = MagicMock(return_value=rows)
+    broker.session = MagicMock()
+    broker.session.post = MagicMock(name="post")
+    broker.session.delete = MagicMock(name="delete")
+    return broker
+
+
+def test_postgres_duplicate_exact_occ_without_raw_evidence_holds_safely(
+    postgres_closed_row,
+):
+    """Duplicate exact OCC ambiguity is enforced by the reconciler itself,
+    not only by the Tradier-specific normalizer — proven here via bare rows
+    with no "raw" field at all."""
+    insert, read, executed_sql = postgres_closed_row
+    insert()
+    broker = _stub_broker(
+        [
+            {"symbol": CONTRACT, "quantity": 5},
+            {"symbol": CONTRACT, "quantity": 5},
+        ]
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
 
 def test_postgres_generic_ticker_durable_target_identity_unproven_holds(
     postgres_closed_row,

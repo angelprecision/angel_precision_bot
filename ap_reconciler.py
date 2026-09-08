@@ -5557,104 +5557,47 @@ class APBrokerReconciler:
 
     @staticmethod
     def _closed_repair_position_qty(bp: dict) -> int:
-        """Read one strict-repair signed quantity without lossy normalization.
+        """Read the already-normalized signed quantity from one strict-reader row.
 
-        Sign is legitimate broker truth: negative means short. A short (or
-        short-flagged) row is structurally valid on its own and must not be
-        rejected here — this only proves a well-formed, non-zero net
-        quantity exists on the row. It does NOT decide target-option
-        authority; callers must independently confirm exact OCC identity
-        and side compatibility before treating a positive result as RESTORE
-        authority (see ``_closed_repair_broker_quantities`` and the
-        target-side check in ``_repair_closed_positions_with_remaining_qty``).
+        ``TradierBroker.list_positions_strict`` (ap/brokers/tradier.py) is the
+        single canonical parser for signed broker-quantity truth: it resolves
+        a provider row's quantity/short_quantity/side fields into one signed,
+        non-zero net quantity and stores it under the row's "quantity" key.
+        That normalized value is the sole quantity authority here.
+
+        The row's "raw" field is non-authoritative provider evidence for
+        diagnostics only. It must NEVER be independently re-parsed and
+        compared against the already-normalized value — the raw provider
+        quantity is by definition pre-sign-adjustment (e.g. a provider row
+        of quantity=3, side="short" normalizes to quantity=-3), so comparing
+        the two as if they were two independent authorities manufactures a
+        false contradiction on every legitimate short row and reintroduces
+        exactly the poisoning bug the signed-quantity correction removed.
+
+        A test double / strict adapter that returns a row without "raw"
+        evidence is still held to the same bar: the "quantity" key itself
+        must be present and resolve to a well-formed, non-zero integer.
         """
-        if not isinstance(bp, dict):
+        if not isinstance(bp, dict) or "quantity" not in bp:
             raise ValueError("closed_repair_broker_position_malformed")
 
-        records = [bp]
-        raw = bp.get("raw")
-        if isinstance(raw, dict):
-            records.append(raw)
-
-        def _integral(value):
-            if value is None or isinstance(value, bool):
+        value = bp["quantity"]
+        if value is None or isinstance(value, bool):
+            raise ValueError("closed_repair_broker_position_malformed")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
                 raise ValueError("closed_repair_broker_position_malformed")
-            if isinstance(value, str):
-                value = value.strip()
-                if not value:
-                    raise ValueError("closed_repair_broker_position_malformed")
-            try:
-                parsed = Decimal(str(value))
-            except Exception as exc:
-                raise ValueError(
-                    "closed_repair_broker_position_malformed"
-                ) from exc
-            if not parsed.is_finite() or parsed != parsed.to_integral_value():
-                raise ValueError("closed_repair_broker_position_malformed")
-            return int(parsed)
-
-        net: Optional[int] = None
-        direction_hint: Optional[str] = None
-
-        for record in records:
-            magnitude_candidates: list[int] = []
-            for key in ("quantity", "qty", "long_quantity"):
-                if key in record:
-                    magnitude_candidates.append(_integral(record[key]))
-
-            if magnitude_candidates and len(set(magnitude_candidates)) != 1:
-                raise ValueError("closed_repair_broker_position_malformed")
-            record_net = magnitude_candidates[0] if magnitude_candidates else None
-
-            if "short_quantity" in record:
-                raw_short = _integral(record["short_quantity"])
-                short_signal = -abs(raw_short) if raw_short != 0 else 0
-                if short_signal != 0:
-                    if record_net is not None and record_net != short_signal:
-                        raise ValueError(
-                            "closed_repair_broker_position_malformed"
-                        )
-                    record_net = short_signal if record_net is None else record_net
-
-            if record_net is not None:
-                if net is not None and net != record_net:
-                    raise ValueError("closed_repair_broker_position_malformed")
-                net = record_net
-
-            for key in ("side", "position_type", "direction"):
-                if key not in record or record[key] in (None, ""):
-                    continue
-                if not isinstance(record[key], str):
-                    raise ValueError("closed_repair_broker_position_malformed")
-                direction = (
-                    record[key]
-                    .strip()
-                    .lower()
-                    .replace("_", " ")
-                    .replace("-", " ")
-                )
-                if "short" in direction or direction in {"sell to open", "selltoopen"}:
-                    hint = "short"
-                elif "long" in direction or direction in {"buy to open", "buytoopen"}:
-                    hint = "long"
-                else:
-                    continue
-                if direction_hint not in (None, hint):
-                    raise ValueError("closed_repair_broker_position_malformed")
-                direction_hint = hint
-
-        if net is None:
+        try:
+            parsed = Decimal(str(value))
+        except Exception as exc:
+            raise ValueError("closed_repair_broker_position_malformed") from exc
+        if not parsed.is_finite() or parsed != parsed.to_integral_value():
             raise ValueError("closed_repair_broker_position_malformed")
-
-        if direction_hint == "short" and net > 0:
-            net = -net
-        elif direction_hint == "long" and net < 0:
+        quantity = int(parsed)
+        if quantity == 0:
             raise ValueError("closed_repair_broker_position_malformed")
-
-        if net == 0:
-            raise ValueError("closed_repair_broker_position_malformed")
-
-        return net
+        return quantity
 
     def _closed_repair_broker_quantities(self) -> dict[str, int]:
         """Build exact-OCC target-authority quantities from the strict seam.
@@ -5665,9 +5608,14 @@ class APBrokerReconciler:
         canonical OCC option identity are eligible target-option authority;
         generic underlying/equity rows remain valid snapshot members but are
         excluded from this map since an underlying symbol is never option
-        lifecycle authority. Duplicate representations of the same exact OCC
-        (e.g. compact vs. provider-padded root) collapse only when they carry
-        identical quantity authority; conflicting duplicates fail closed.
+        lifecycle authority.
+
+        Any exact OCC identity appearing more than once in one snapshot is
+        ambiguous broker truth and fails closed — regardless of whether the
+        duplicate rows' quantities happen to agree. Matching quantities do
+        not prove which row is real; it could be duplicate transport
+        representation, duplicate lots, duplicate account data, or a
+        malformed payload. CLOSED repair must not guess.
         """
         from ap.exit_safety import is_valid_exact_occ_contract
 
@@ -5700,9 +5648,9 @@ class APBrokerReconciler:
                 continue
 
             if contract in quantities:
-                if quantities[contract] != qty:
-                    raise ValueError("closed_repair_broker_snapshot_ambiguous")
-                continue
+                # Duplicate exact OCC identity — ambiguous no matter whether
+                # the quantities agree. See docstring above.
+                raise ValueError("closed_repair_broker_snapshot_ambiguous")
             quantities[contract] = qty
         return quantities
 
