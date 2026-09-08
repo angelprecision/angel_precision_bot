@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import ap.preopen_readiness as pr
 
@@ -63,6 +64,48 @@ class _Runner:
         return "tok"
 
 
+def _durable_overnight_row(
+    client_id="jason@example.com",
+    mode="live",
+    trading_date="2026-06-22",
+    *,
+    status="success",
+    result_class="COMPLETED_WITH_DECISIONS",
+    completed=True,
+    retryable=False,
+    source_lookup_partial=False,
+    source_identity_conflict=False,
+    attempt_id="2026-06-22:1:restart-stable",
+    attempt_generation=1,
+):
+    return {
+        "client_id": client_id,
+        "execution_mode": mode,
+        "trading_date": trading_date,
+        "stage": "overnight_reeval",
+        "status": status,
+        "last_success_at": "2026-06-22T13:00:00+00:00" if status == "success" else None,
+        "last_error": "SOURCE_IDENTITY_CONFLICT" if source_identity_conflict else None,
+        "details": {
+            "client_id": client_id,
+            "execution_mode": mode,
+            "trading_date": trading_date,
+            "overnight_reeval_session_key": trading_date,
+            "attempt_id": attempt_id,
+            "attempt_generation": attempt_generation,
+            "attempt_count": attempt_generation,
+            "result_class": result_class,
+            "completed": completed,
+            "retryable": retryable,
+            "retry_reason": "source_identity_conflict" if source_identity_conflict else None,
+            "source_lookup_partial": source_lookup_partial,
+            "source_identity_conflict": source_identity_conflict,
+            "trade_queue_status": "SUCCESS",
+            "ap_signals_status": "SUCCESS",
+        },
+    }
+
+
 def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     writes = []
     monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **kwargs: writes.append(kwargs))
@@ -70,8 +113,20 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: False)
     monkeypatch.setattr(
         pr,
+        "_load_durable_overnight_attempt",
+        lambda **kwargs: (
+            _durable_overnight_row(
+                kwargs["client_id"],
+                kwargs["execution_mode"],
+                kwargs["trading_date"],
+            ),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        pr,
         "_query_client_state",
-        lambda client_id: client_state or {
+        lambda client_id, execution_mode="live": client_state or {
             "stale_processing_ids": [],
             "watching_orphans": [],
             "pending_trigger_rows": [],
@@ -82,6 +137,168 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     monkeypatch.setattr(pr, "_pod_mode", lambda: "live")
     monkeypatch.setattr(pr, "_after_929_et", lambda now=None: True)
     return writes
+
+
+def test_restart_with_shared_ap_signals_only_row_blocks_live(monkeypatch):
+    """Shared AP state is not an explicit no-op when trade_queue is empty."""
+    _stub_common(monkeypatch, handoff=True)
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (None, None))
+    first = _Runner(mode="live")
+    second = _Runner(mode="live")
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        runner=second,
+        stage="post_overnight_reeval",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+
+    assert first is not second
+    assert result["status"] == "BLOCKED"
+    assert result["ok"] is False
+    assert "overnight_reeval_missing" in result["errors"]
+    assert result["details"]["overnight_reeval"]["status"] == "missing"
+    assert result["details"]["overnight_reeval"].get("durable_authority") == "missing"
+
+
+def test_restart_after_source_conflict_blocks_live_and_preserves_diagnostic(monkeypatch):
+    """A durable conflict survives process replacement as a hard block."""
+    _stub_common(monkeypatch, handoff=True)
+    conflict_row = _durable_overnight_row(
+        client_id="jason@example.com",
+        mode="live",
+        status="partial",
+        result_class="SOURCE_IDENTITY_CONFLICT",
+        completed=False,
+        retryable=False,
+        source_lookup_partial=False,
+        source_identity_conflict=True,
+        attempt_id="2026-06-22:2:conflict",
+        attempt_generation=2,
+    )
+    conflict_row["details"]["source_identity_conflicts"] = [
+        {
+            "signal_id": "S1",
+            "authorities": [
+                {"source": "trade_queue", "job_id": "tq-S1", "ticker": "AAPL"},
+                {"source": "ap_signals", "job_id": "sup:S1", "ticker": "NVDA"},
+            ],
+        }
+    ]
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (conflict_row, None))
+    _old_runner = _Runner(mode="live")
+    restarted_runner = _Runner(mode="live")
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        runner=restarted_runner,
+        stage="post_overnight_reeval",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+
+    assert _old_runner is not restarted_runner
+    assert result["status"] == "BLOCKED"
+    assert result["details"]["overnight_reeval"]["durable_status"] == "partial"
+    assert result["details"]["overnight_reeval"]["source_identity_conflict"] is True
+    assert "overnight_reeval_missing" in result["errors"]
+
+
+def test_newer_partial_supersedes_prior_post_success_after_restart(monkeypatch):
+    """Readiness never falls back to an older post-stage success."""
+    _stub_common(monkeypatch, handoff=True)
+    newer_partial = _durable_overnight_row(
+        client_id="jason@example.com",
+        mode="live",
+        status="partial",
+        result_class="RETRYABLE_PARTIAL_SOURCE_INVENTORY",
+        completed=False,
+        retryable=True,
+        source_lookup_partial=True,
+        attempt_generation=4,
+        attempt_id="2026-06-22:4:newer-partial",
+    )
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (newer_partial, None))
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *a, **k: True)
+    restarted_runner = _Runner(mode="live")
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        runner=restarted_runner,
+        stage="post_overnight_reeval",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["ok"] is False
+    assert result["details"]["overnight_reeval"]["attempt_generation"] == 4
+    assert "overnight_reeval_missing" in result["errors"]
+
+
+def test_valid_durable_success_survives_out_of_window_tick_after_restart(monkeypatch):
+    """A harmless later scheduler tick does not invalidate durable success."""
+    _stub_common(monkeypatch, handoff=True)
+    success_row = _durable_overnight_row(
+        client_id="jason@example.com",
+        mode="live",
+        status="success",
+        result_class="COMPLETED_NO_WORK",
+        completed=True,
+        retryable=False,
+        source_lookup_partial=False,
+        attempt_generation=5,
+        attempt_id="2026-06-22:5:success",
+    )
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (success_row, None))
+    restarted_runner = _Runner(mode="live")
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        runner=restarted_runner,
+        stage="manual",
+        now=datetime(2026, 6, 22, 11, 0, tzinfo=pr.ET),
+    )
+
+    assert result["status"] == "OK"
+    assert result["ok"] is True
+    assert result["details"]["overnight_reeval"]["durable_authority"] == "valid_success"
+
+
+def test_paper_missing_durable_attempt_degrades_without_broker_mutation(monkeypatch):
+    """PAPER may report unresolved authority but never touches the broker."""
+    _stub_common(monkeypatch, handoff=True)
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (None, None))
+    monkeypatch.setattr(pr, "_pod_mode", lambda: "paper")
+    broker = SimpleNamespace(
+        submit_order=MagicMock(),
+        place_order=MagicMock(),
+        cancel_order=MagicMock(),
+        replace_order=MagicMock(),
+    )
+    restarted_runner = _Runner(mode="paper")
+    restarted_runner.core.broker = broker
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "paper",
+        runner=restarted_runner,
+        stage="post_overnight_reeval",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+
+    assert result["status"] == "DEGRADED"
+    assert result["ok"] is False
+    assert "overnight_reeval_missing" in result["errors"]
+    for method in (
+        broker.submit_order,
+        broker.place_order,
+        broker.cancel_order,
+        broker.replace_order,
+    ):
+        method.assert_not_called()
 
 
 def test_all_green_readiness(monkeypatch):
@@ -132,6 +349,7 @@ def test_live_startup_with_watching_rows_does_not_degrade_for_missing_overnight(
     })
     runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
     runner._last_overnight_reeval_date = None
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (None, None))
 
     result = pr.run_preopen_autonomous_readiness(
         "jason@example.com",
@@ -156,6 +374,7 @@ def test_startup_stage_with_watching_rows_before_due_is_pending_not_missing(monk
     })
     runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
     runner._last_overnight_reeval_date = None
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (None, None))
 
     result = pr.run_preopen_autonomous_readiness(
         "jason@example.com",
@@ -178,6 +397,7 @@ def test_post_due_missing_overnight_is_reported(monkeypatch):
     })
     runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
     runner._last_overnight_reeval_date = None
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (None, None))
 
     result = pr.run_preopen_autonomous_readiness(
         "jason@example.com",
@@ -257,7 +477,7 @@ def test_mode_mismatch_is_critical(monkeypatch):
     assert "pod_mode_client_mode_mismatch" in result["errors"]
 
 
-def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
+def test_overnight_status_accepts_only_matching_durable_overnight_success(monkeypatch):
     _stub_common(monkeypatch, handoff=True, client_state={
         "stale_processing_ids": [],
         "watching_orphans": [],
@@ -266,7 +486,6 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
     })
     runner = _Runner(mode="live")
     runner._last_overnight_reeval_date = None
-    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
     status, details = pr._overnight_status(
         runner,
         {
@@ -282,7 +501,53 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
         now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
     )
     assert status == "success"
-    assert details["source"] == "handoff_run_locks.post_overnight_reeval"
+    assert details["source"] == "handoff_run_locks.overnight_reeval"
+    assert details["durable_authority"] == "valid_success"
+
+
+def test_overnight_status_rejects_persisted_success_after_current_attempt_fails(monkeypatch):
+    _stub_common(monkeypatch, handoff=True, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="live")
+    runner._overnight_reeval_state_date = "2026-06-22"
+    runner._overnight_reeval_success_date = None
+    monkeypatch.setattr(
+        pr,
+        "_load_durable_overnight_attempt",
+        lambda **_: (
+            _durable_overnight_row(
+                status="partial",
+                result_class="RETRYABLE_PARTIAL_SOURCE_INVENTORY",
+                completed=False,
+                retryable=True,
+                source_lookup_partial=True,
+            ),
+            None,
+        ),
+    )
+
+    status, details = pr._overnight_status(
+        runner,
+        {
+            "stale_processing_ids": [],
+            "watching_orphans": [],
+            "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+            "watching_count": 1,
+        },
+        "2026-06-22",
+        client_id="jason@example.com",
+        execution_mode="live",
+        stage="manual",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+
+    assert status == "missing"
+    assert details["source"] == "handoff_run_locks.overnight_reeval"
+    assert details["durable_status"] == "partial"
 
 
 def test_overnight_status_ignores_legacy_last_reeval_date(monkeypatch):
@@ -294,7 +559,7 @@ def test_overnight_status_ignores_legacy_last_reeval_date(monkeypatch):
     })
     runner = _Runner(mode="live")
     runner._last_overnight_reeval_date = "2026-06-22"
-    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: False)
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (None, None))
 
     status, details = pr._overnight_status(
         runner,
@@ -311,7 +576,8 @@ def test_overnight_status_ignores_legacy_last_reeval_date(monkeypatch):
         now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
     )
     assert status == "missing"
-    assert details["source"] == "watching_or_pending_trigger_present_without_overnight_success"
+    assert details["source"] == "handoff_run_locks.overnight_reeval"
+    assert details["durable_authority"] == "missing"
 
 
 def test_startup_handoff_success_does_not_count_as_post_overnight_success(monkeypatch):
@@ -323,6 +589,7 @@ def test_startup_handoff_success_does_not_count_as_post_overnight_success(monkey
     })
     runner = _Runner(mode="live")
     runner._last_overnight_reeval_date = None
+    monkeypatch.setattr(pr, "_load_durable_overnight_attempt", lambda **_: (None, None))
     monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: False)
 
     status, details = pr._overnight_status(
@@ -340,7 +607,8 @@ def test_startup_handoff_success_does_not_count_as_post_overnight_success(monkey
         now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
     )
     assert status == "missing"
-    assert details["source"] == "watching_or_pending_trigger_present_without_overnight_success"
+    assert details["source"] == "handoff_run_locks.overnight_reeval"
+    assert details["durable_authority"] == "missing"
 
 
 def test_health_summary_exposes_preopen_status(monkeypatch):

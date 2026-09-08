@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -717,6 +718,12 @@ class ClientRunner(threading.Thread):
         self._overnight_reeval_last_attempt_at = None
         self._overnight_reeval_next_retry_at = None
         self._overnight_reeval_attempt_count = 0
+        self._overnight_reeval_attempt_generation = 0
+        self._overnight_reeval_attempt_id = None
+        self._overnight_reeval_session_key = None
+        self._overnight_reeval_durable_state_loaded_date = None
+        self._overnight_reeval_durable_attempts_enabled = True
+        self._overnight_reeval_durable_load_failed = False
         self._overnight_reeval_last_result_class = None
         self._overnight_reeval_last_retry_reason = None
 
@@ -1881,6 +1888,167 @@ class ClientRunner(threading.Thread):
         """Broker lives inside self.core — resolve it safely."""
         return getattr(self.core, "broker", None) if self.core else None
 
+    def _load_durable_overnight_reeval_state(self, today, *, refresh: bool = False) -> bool:
+        """Hydrate overnight authority from the exact durable client/mode/date row.
+
+        The in-memory runner fields are scheduling hints only.  Readiness and
+        restart behavior must follow the durable attempt row, including a
+        newer partial/failure that another runner wrote after this process
+        started.
+        """
+        if not bool(getattr(self, "_overnight_reeval_durable_attempts_enabled", False)):
+            return True
+        if (
+            not refresh
+            and getattr(self, "_overnight_reeval_durable_state_loaded_date", None) == today
+        ):
+            return not bool(getattr(self, "_overnight_reeval_durable_load_failed", False))
+        try:
+            from ap.morning_handoff import _load_handoff_run_lock
+
+            row = _load_handoff_run_lock(
+                client_id=str(self.email or "").strip(),
+                execution_mode=str(self.mode or "").strip().lower(),
+                trading_date=today.isoformat(),
+                stage="overnight_reeval",
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] durable overnight attempt load failed date=%s: %s",
+                getattr(self, "email", ""), today, exc, exc_info=True,
+            )
+            self._overnight_reeval_durable_state_loaded_date = today
+            self._overnight_reeval_durable_load_failed = True
+            # Never let a stale local success survive an authority outage.
+            self._overnight_reeval_success_date = None
+            self._overnight_reeval_session_key = None
+            return False
+
+        self._overnight_reeval_durable_state_loaded_date = today
+        self._overnight_reeval_durable_load_failed = False
+        if not isinstance(row, dict):
+            self._overnight_reeval_attempt_generation = 0
+            self._overnight_reeval_attempt_id = None
+            self._overnight_reeval_session_key = None
+            self._overnight_reeval_success_date = None
+            return True
+
+        try:
+            from ap.preopen_readiness import _validate_durable_overnight_success
+
+            durable_success, authority = _validate_durable_overnight_success(
+                row,
+                client_id=str(self.email or "").strip(),
+                execution_mode=str(self.mode or "").strip().lower(),
+                trading_date=today.isoformat(),
+            )
+        except Exception as exc:
+            logger.critical(
+                "[%s] durable overnight authority validator failed date=%s: %s",
+                getattr(self, "email", ""), today, exc, exc_info=True,
+            )
+            durable_success = False
+            authority = {
+                "details": {},
+                "attempt_id": "",
+                "attempt_generation": 0,
+                "overnight_reeval_session_key": "",
+                "validation_errors": ("validator_failure",),
+            }
+        details = authority.get("details") if isinstance(authority, dict) else {}
+        if not isinstance(details, dict):
+            details = {}
+
+        def _positive_int(value, default=0):
+            if isinstance(value, bool) or not isinstance(value, int):
+                return default
+            return value if value >= 0 else default
+
+        self._overnight_reeval_attempt_generation = _positive_int(
+            authority.get("attempt_generation") if isinstance(authority, dict) else 0,
+        )
+        _attempt_id = authority.get("attempt_id") if isinstance(authority, dict) else ""
+        self._overnight_reeval_attempt_id = _attempt_id or None
+        _session_key = (
+            authority.get("overnight_reeval_session_key")
+            if isinstance(authority, dict)
+            else ""
+        )
+        self._overnight_reeval_session_key = _session_key or None
+        self._overnight_reeval_attempt_count = _positive_int(
+            details.get("attempt_count"),
+        )
+        self._overnight_reeval_last_result_class = details.get("result_class")
+        self._overnight_reeval_last_retry_reason = details.get("retry_reason")
+
+        def _parse_dt(value):
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        self._overnight_reeval_last_attempt_at = _parse_dt(details.get("attempted_at"))
+        self._overnight_reeval_next_retry_at = _parse_dt(details.get("next_retry_at"))
+
+        status = str(row.get("status") or "").strip().lower()
+        self._overnight_reeval_success_date = today if durable_success else None
+        self._overnight_reeval_exhausted_date = (
+            today
+            if status in {"partial", "failed"}
+            and (
+                str(row.get("last_error") or "").strip()
+                == "OVERNIGHT_REEVAL_RETRY_EXHAUSTED"
+                or str(details.get("result_class") or "").strip().upper()
+                in {"RETRY_EXHAUSTED", "SOURCE_IDENTITY_CONFLICT"}
+            )
+            else None
+        )
+        return True
+
+    def _begin_overnight_reeval_attempt(self, *, today, session_key: str) -> dict | None:
+        """Claim a new durable attempt before the engine can mutate anything."""
+        if not bool(getattr(self, "_overnight_reeval_durable_attempts_enabled", False)):
+            self._overnight_reeval_attempt_count += 1
+            self._overnight_reeval_attempt_generation = self._overnight_reeval_attempt_count
+            self._overnight_reeval_attempt_id = (
+                f"local:{today.isoformat()}:{self._overnight_reeval_attempt_generation}:{uuid.uuid4().hex}"
+            )
+            self._overnight_reeval_session_key = session_key
+            return {
+                "attempt_id": self._overnight_reeval_attempt_id,
+                "attempt_generation": self._overnight_reeval_attempt_generation,
+                "attempt_count": self._overnight_reeval_attempt_count,
+                "session_key": session_key,
+            }
+        try:
+            from ap.morning_handoff import _claim_overnight_reeval_attempt
+
+            claim = _claim_overnight_reeval_attempt(
+                client_id=str(self.email or "").strip(),
+                execution_mode=str(self.mode or "").strip().lower(),
+                trading_date=today.isoformat(),
+                session_key=session_key,
+            )
+            self._overnight_reeval_attempt_id = str(claim["attempt_id"]).strip()
+            self._overnight_reeval_attempt_generation = int(claim["attempt_generation"])
+            self._overnight_reeval_attempt_count = int(claim["attempt_count"])
+            self._overnight_reeval_session_key = str(session_key or "").strip() or None
+            self._overnight_reeval_success_date = None
+            self._overnight_reeval_exhausted_date = None
+            self._overnight_reeval_next_retry_at = None
+            self._overnight_reeval_last_attempt_at = None
+            return claim
+        except Exception as exc:
+            logger.critical(
+                "[%s] OVERNIGHT_ATTEMPT_CLAIM_FAILED date=%s: %s — refusing engine run",
+                getattr(self, "email", ""), today, exc, exc_info=True,
+            )
+            self._overnight_reeval_attempt_id = None
+            return None
+
     def _reset_overnight_reeval_state_for_date(self, today) -> None:
         if self._overnight_reeval_state_date == today:
             return
@@ -1890,8 +2058,13 @@ class ClientRunner(threading.Thread):
         self._overnight_reeval_last_attempt_at = None
         self._overnight_reeval_next_retry_at = None
         self._overnight_reeval_attempt_count = 0
+        self._overnight_reeval_attempt_generation = 0
+        self._overnight_reeval_attempt_id = None
+        self._overnight_reeval_session_key = None
         self._overnight_reeval_last_result_class = None
         self._overnight_reeval_last_retry_reason = None
+        self._overnight_reeval_durable_state_loaded_date = None
+        self._load_durable_overnight_reeval_state(today)
 
     def _overnight_reeval_base_result(
         self,
@@ -1927,6 +2100,9 @@ class ClientRunner(threading.Thread):
             "retryable": retryable,
             "retry_reason": retry_reason,
             "attempt_count": self._overnight_reeval_attempt_count,
+            "attempt_generation": getattr(self, "_overnight_reeval_attempt_generation", 0),
+            "attempt_id": getattr(self, "_overnight_reeval_attempt_id", None),
+            "overnight_reeval_session_key": now_et.date().isoformat(),
             "attempt_source": source,
             "attempted_at": (
                 self._overnight_reeval_last_attempt_at.isoformat()
@@ -1978,7 +2154,7 @@ class ClientRunner(threading.Thread):
         source: str,
         now_et,
         last_error: str | None = None,
-    ) -> None:
+    ) -> bool:
         try:
             from ap.morning_handoff import _upsert_handoff_run_lock
             completed = bool(result.get("completed"))
@@ -1999,7 +2175,7 @@ class ClientRunner(threading.Thread):
                 )
             else:
                 status = "partial"
-                lock_error = last_error
+                lock_error = last_error or result.get("last_error")
             details = {
                 "fetched": result.get("fetched"),
                 "processed": result.get("processed"),
@@ -2010,6 +2186,17 @@ class ClientRunner(threading.Thread):
                 "errors": result.get("errors"),
                 "terminal_errors": result.get("terminal_errors"),
                 "retryable_deferred": result.get("retryable_deferred"),
+                "retryable_rows": result.get("retryable_rows"),
+                "source_lookup_partial": result.get("source_lookup_partial"),
+                "trade_queue_status": result.get("trade_queue_status"),
+                "ap_signals_status": result.get("ap_signals_status"),
+                "trade_queue_error": result.get("trade_queue_error"),
+                "ap_signals_error": result.get("ap_signals_error"),
+                "source_identity_conflict": bool(result.get("source_identity_conflict")),
+                "source_identity_conflicts": result.get("source_identity_conflicts"),
+                "equivalent_source_duplicates": result.get("equivalent_source_duplicates"),
+                "source_row_accounting": result.get("source_row_accounting"),
+                "already_resolved": result.get("already_resolved"),
                 "unresolved": result.get("unresolved"),
                 "stale_skipped": result.get("stale_skipped"),
                 "fresh_processed": result.get("fresh_processed"),
@@ -2020,6 +2207,14 @@ class ClientRunner(threading.Thread):
                 "retryable": result.get("retryable"),
                 "retry_reason": result.get("retry_reason"),
                 "attempt_count": self._overnight_reeval_attempt_count,
+                "attempt_generation": getattr(self, "_overnight_reeval_attempt_generation", 0),
+                "attempt_id": getattr(self, "_overnight_reeval_attempt_id", None),
+                "client_id": self.email,
+                "execution_mode": str(self.mode).lower(),
+                "trading_date": today.isoformat(),
+                "overnight_reeval_session_key": result.get(
+                    "overnight_reeval_session_key", today.isoformat()
+                ),
                 "attempt_source": source,
                 "attempted_at": (
                     self._overnight_reeval_last_attempt_at.isoformat()
@@ -2031,7 +2226,7 @@ class ClientRunner(threading.Thread):
                 ),
                 "post_open_attempt": bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)),
             }
-            _upsert_handoff_run_lock(
+            return bool(_upsert_handoff_run_lock(
                 client_id=self.email,
                 execution_mode=str(self.mode).lower(),
                 trading_date=today.isoformat(),
@@ -2040,12 +2235,15 @@ class ClientRunner(threading.Thread):
                 last_error=lock_error,
                 details=details,
                 mark_success=completed,
-            )
+                attempt_generation=getattr(self, "_overnight_reeval_attempt_generation", None),
+                attempt_id=getattr(self, "_overnight_reeval_attempt_id", None),
+            ))
         except Exception as _lock_exc:
             logger.warning(
                 "[%s] overnight_reeval lock write failed (non-fatal): %s",
                 self.email, _lock_exc,
             )
+            return False
 
     def _enforce_preopen_readiness_at_deadline(
         self,
@@ -2251,6 +2449,17 @@ class ClientRunner(threading.Thread):
         now_et = now_et or datetime.now(_ET)
         today = now_et.date()
         self._reset_overnight_reeval_state_for_date(today)
+        # A scheduler tick can run in a process that was started before a
+        # different runner completed (or failed) today's attempt.  Refresh
+        # the durable authority on every tick so local fields never
+        # re-authorize a stale result.
+        if bool(getattr(self, "_overnight_reeval_durable_attempts_enabled", False)):
+            self._load_durable_overnight_reeval_state(today, refresh=True)
+        if force:
+            # A forced run is a new attempt authority.  It must invalidate the
+            # in-memory success fence before the durable claim is evaluated so
+            # an older success cannot survive a newer failed/partial attempt.
+            self._overnight_reeval_success_date = None
 
         if not force:
             # PR #388 amendment: route the trading-day precheck through the
@@ -2409,12 +2618,40 @@ class ClientRunner(threading.Thread):
         result: dict
         last_error = None
         try:
-            self._overnight_reeval_attempt_count += 1
+            session_key = today.isoformat()
+            claim = self._begin_overnight_reeval_attempt(
+                today=today,
+                session_key=session_key,
+            )
+            if not claim:
+                result = self._overnight_reeval_base_result(
+                    result_class="RETRYABLE_ATTEMPT_DURABILITY_FAILURE",
+                    completed=False,
+                    retryable=True,
+                    retry_reason="attempt_durability_unavailable",
+                    now_et=now_et,
+                    source=source,
+                    errors=1,
+                    last_error="OVERNIGHT_ATTEMPT_DURABILITY_FAILURE",
+                )
+                result["attempt_performed"] = False
+                result["attempt_id"] = None
+                self._persist_overnight_reeval_lock(
+                    result,
+                    today=today,
+                    source=source,
+                    now_et=now_et,
+                    last_error="OVERNIGHT_ATTEMPT_DURABILITY_FAILURE",
+                )
+                return result
+
             self._overnight_reeval_last_attempt_at = now_et
             logger.info(
-                "[%s] Overnight daily signal reeval attempt=%d source=%s post_open=%s -- %02d:%02d ET | checking WATCHING queue",
+                "[%s] Overnight daily signal reeval attempt=%d generation=%d id=%s source=%s post_open=%s -- %02d:%02d ET | checking WATCHING queue",
                 self.email,
                 self._overnight_reeval_attempt_count,
+                getattr(self, "_overnight_reeval_attempt_generation", 0),
+                getattr(self, "_overnight_reeval_attempt_id", None),
                 source,
                 bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)),
                 now_et.hour,
@@ -2443,6 +2680,9 @@ class ClientRunner(threading.Thread):
                     position_manager=self.position_manager,
                     exit_eng=exit_eng,
                     force=force,
+                    attempt_id=getattr(self, "_overnight_reeval_attempt_id", None),
+                    attempt_generation=getattr(self, "_overnight_reeval_attempt_generation", 0),
+                    execution_mode=str(self.mode).lower(),
                 )
             except Exception as exc:
                 logger.error("[%s] Overnight reeval engine exception: %s", self.email, exc, exc_info=True)
@@ -2458,13 +2698,32 @@ class ClientRunner(threading.Thread):
 
             retryable_deferred = int(result.get("retryable_deferred", 0) or 0)
             unresolved = int(result.get("unresolved", 0) or 0)
-            if bool(result.get("completed")) and (retryable_deferred > 0 or unresolved > 0):
+            _source_lookup_failed = (
+                result.get("trade_queue_status") == "FAILED"
+                and result.get("ap_signals_status") == "FAILED"
+            )
+            if _source_lookup_failed:
+                result["result_class"] = "RETRYABLE_SOURCE_LOOKUP_FAILED"
+                result["completed"] = False
+                result["retryable"] = True
+                result["retry_reason"] = "source_lookup_failed"
+            elif bool(result.get("source_lookup_partial")):
+                result["result_class"] = "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
+                result["completed"] = False
+                result["retryable"] = True
+                result["retry_reason"] = "partial_source_inventory"
+            elif bool(result.get("completed")) and (retryable_deferred > 0 or unresolved > 0):
                 result["result_class"] = "RETRYABLE_PARTIAL_DEFERRED"
                 result["completed"] = False
                 result["retryable"] = True
                 result["retry_reason"] = "retryable_rows_remain"
 
             result["attempt_count"] = self._overnight_reeval_attempt_count
+            result["attempt_generation"] = getattr(self, "_overnight_reeval_attempt_generation", 0)
+            result["attempt_id"] = getattr(self, "_overnight_reeval_attempt_id", None)
+            result["overnight_reeval_session_key"] = session_key
+            result["client_id"] = self.email
+            result["execution_mode"] = str(self.mode).lower()
             result["attempt_source"] = source
             result["attempted_at"] = now_et.isoformat()
             result["post_open_attempt"] = bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30))
@@ -2495,13 +2754,36 @@ class ClientRunner(threading.Thread):
                 if self._overnight_reeval_next_retry_at is not None else None
             )
 
-            self._persist_overnight_reeval_lock(
+            persisted = self._persist_overnight_reeval_lock(
                 result,
                 today=today,
                 source=source,
                 now_et=now_et,
                 last_error=last_error,
             )
+
+            if (
+                bool(getattr(self, "_overnight_reeval_durable_attempts_enabled", False))
+                and not persisted
+            ):
+                # The engine may have completed, but without a durable
+                # success record no process may certify or hand off that
+                # result.  Keep the attempt retryable and do not run the
+                # success-only handoff.
+                result["result_class"] = "RETRYABLE_ATTEMPT_DURABILITY_FAILURE"
+                result["completed"] = False
+                result["retryable"] = True
+                result["retry_reason"] = "attempt_persistence_failed"
+                result["last_error"] = "OVERNIGHT_ATTEMPT_DURABILITY_FAILURE"
+                self._overnight_reeval_success_date = None
+                result["handoff_result"] = None
+                result["readiness_result"] = self._enforce_preopen_readiness_at_deadline(
+                    now_et=now_et,
+                    today=today,
+                    source=source,
+                    result_class=result["result_class"],
+                )
+                return result
 
             if bool(result.get("completed")):
                 post = self._run_post_overnight_morning_handoff(result)
@@ -2567,6 +2849,15 @@ class ClientRunner(threading.Thread):
     def _run_startup_morning_handoff(self) -> None:
         handoff_result = None
         try:
+            # Hydrate the exact durable overnight authority before startup
+            # handoff/readiness can make any entry authorization decision.
+            # Readiness performs its own exact lookup as well; this hydration
+            # keeps a newly constructed runner's restart state truthful for
+            # callers that inspect it before the readiness pass returns.
+            self._load_durable_overnight_reeval_state(
+                datetime.now(_ET).date(),
+                refresh=True,
+            )
             from ap.morning_handoff import run_morning_handoff_audit
             from ap.preopen_readiness import run_preopen_autonomous_readiness
 
@@ -2615,6 +2906,15 @@ class ClientRunner(threading.Thread):
                 stage="post_overnight_reeval",
                 dry_run=False,
                 runner=self,
+                overnight_attempt={
+                    "attempt_id": getattr(self, "_overnight_reeval_attempt_id", None),
+                    "attempt_generation": getattr(
+                        self, "_overnight_reeval_attempt_generation", 0
+                    ),
+                    "session_key": overnight_result.get(
+                        "overnight_reeval_session_key", ""
+                    ),
+                },
             )
             logger.info("[%s] Post-overnight morning handoff result: %s", self.email, handoff_result)
             readiness = run_preopen_autonomous_readiness(

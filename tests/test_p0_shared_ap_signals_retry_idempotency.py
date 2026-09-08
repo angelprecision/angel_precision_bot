@@ -628,6 +628,70 @@ def test_10_watcher_armed_but_proof_write_fails(monkeypatch):
     )
 
 
+def test_10b_healthy_source_truth_keeps_normal_arm_reachable(monkeypatch):
+    """The source-identity fence must not delay a healthy normal arm."""
+    _install_base_stubs(monkeypatch)
+
+    monkeypatch.setattr(
+        ov,
+        "_resolve_shared_setup_disposition",
+        lambda *a, **k: ov._DispositionResult(ov._DISPOSITION_NEW),
+    )
+
+    ledger = types.ModuleType("ap.opportunity_ledger")
+    ledger.create_opportunities = MagicMock(return_value=1)
+    ledger.mark_watcher_armed = MagicMock(return_value=True)
+    ledger.WATCHER_ARMED = "WATCHER_ARMED"
+    ledger.BROKER_SUBMITTED = "BROKER_SUBMITTED"
+    ledger.BROKER_ACKED = "BROKER_ACKED"
+    ledger.FILLED = "FILLED"
+    ledger.TERMINAL_STATUSES = frozenset(
+        {"FILLED", "EXPIRED", "CANCELED", "MISSED", "INTERNAL_ERROR"}
+    )
+    ledger._get_sb = lambda: None
+    monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", ledger)
+    monkeypatch.setattr(
+        ov,
+        "_get_client_opportunity_row",
+        lambda *_a, **_k: ov._LookupResult(
+            "sig-A",
+            ov._LS_FOUND,
+            {
+                "opportunity_status": "WATCHER_ARMED",
+                "canonical_signal_id": "sig-A",
+                "client_id": "jose@example.com",
+                "order_local_id": "local-1",
+                "metadata": {
+                    "execution_mode": "paper",
+                    "overnight_reeval_session_key": SESSION_KEY,
+                    "local_order_id": "local-1",
+                },
+            },
+            None,
+        ),
+    )
+
+    watched = {}
+
+    def _watch(plan, local_order_id):
+        watched["plan"] = plan
+        watched["local_order_id"] = local_order_id
+        return True
+
+    result = _run_shared_ap_signals_harness(
+        monkeypatch,
+        signal_id="sig-A",
+        watch_fn=_watch,
+        disposition=ov._DISPOSITION_NEW,
+    )
+
+    assert result["armed"] == 1
+    assert watched["local_order_id"] == "local-1"
+    assert watched["plan"].metadata["overnight_source_table"] == "ap_signals"
+    assert watched["plan"].metadata["overnight_source_job_id"] == "sup:sig-A"
+    assert watched["plan"].metadata["overnight_source_signal_id"] == "sig-A"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST 11: Active-order lookup failure fails closed
 # ─────────────────────────────────────────────────────────────────────────────

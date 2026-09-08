@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os as _os
+import uuid
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -796,15 +797,30 @@ def _upsert_handoff_run_lock(
     last_error: str | None,
     details: dict | None,
     mark_success: bool,
-) -> None:
+    attempt_generation: int | None = None,
+    attempt_id: str | None = None,
+) -> bool:
     from ap.db import conn, run_with_retry
     import json
 
     _ensure_handoff_table()
+    if attempt_generation is not None and (
+        isinstance(attempt_generation, bool)
+        or not isinstance(attempt_generation, int)
+        or attempt_generation <= 0
+    ):
+        return False
+    if attempt_id is not None and not str(attempt_id).strip():
+        return False
+    durable_details = dict(details or {}) if isinstance(details, dict) else {}
+    if attempt_generation is not None:
+        durable_details["attempt_generation"] = int(attempt_generation)
+    if attempt_id is not None:
+        durable_details["attempt_id"] = str(attempt_id).strip()
 
     def _write():
         with conn() as c:
-            c.execute(
+            cur = c.execute(
                 """
                 INSERT INTO handoff_run_locks (
                     client_id, execution_mode, trading_date, stage, status,
@@ -829,6 +845,34 @@ def _upsert_handoff_run_lock(
                     last_error = EXCLUDED.last_error,
                     details = EXCLUDED.details,
                     updated_at = NOW()
+                WHERE
+                    (
+                        NOT (handoff_run_locks.details ? 'attempt_generation')
+                        AND NOT (EXCLUDED.details ? 'attempt_generation')
+                    )
+                    OR (
+                        (EXCLUDED.details->>'attempt_generation') ~ '^[0-9]+$'
+                        AND (
+                            NOT (handoff_run_locks.details ? 'attempt_generation')
+                            OR CASE
+                                WHEN handoff_run_locks.details->>'attempt_generation' ~ '^[0-9]+$'
+                                THEN (handoff_run_locks.details->>'attempt_generation')::bigint
+                                ELSE 0
+                            END < (EXCLUDED.details->>'attempt_generation')::bigint
+                            OR (
+                                CASE
+                                    WHEN handoff_run_locks.details->>'attempt_generation' ~ '^[0-9]+$'
+                                    THEN (handoff_run_locks.details->>'attempt_generation')::bigint
+                                    ELSE 0
+                                END = (EXCLUDED.details->>'attempt_generation')::bigint
+                                AND (
+                                    NOT (handoff_run_locks.details ? 'attempt_id')
+                                    OR COALESCE(handoff_run_locks.details->>'attempt_id', '')
+                                       = COALESCE(EXCLUDED.details->>'attempt_id', '')
+                                )
+                            )
+                        )
+                    )
                 """,
                 (
                     client_id,
@@ -838,13 +882,194 @@ def _upsert_handoff_run_lock(
                     status,
                     mark_success,
                     last_error,
-                    json.dumps(details or {}, default=str),
+                    json.dumps(durable_details, default=str),
                     mark_success,
                 ),
             )
-            return True
+            return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
-    run_with_retry(_write)
+    return bool(run_with_retry(_write))
+
+
+def _claim_overnight_reeval_attempt(
+    *,
+    client_id: str,
+    execution_mode: str,
+    trading_date: str,
+    session_key: str,
+) -> dict:
+    """Atomically claim the next durable overnight authority generation.
+
+    The claim is the invalidation boundary: it records a new ``running``
+    attempt and clears the prior overnight/post-handoff success before the
+    engine can mutate a queue, order, ledger, or watcher.  The row lock plus
+    ``ON CONFLICT DO NOTHING`` makes two runners converge on one monotonic
+    generation instead of racing a local counter.
+    """
+    from ap.db import conn, run_with_retry
+    import json
+
+    _ensure_handoff_table()
+    client_id = str(client_id or "").strip()
+    execution_mode = _normalize_mode(execution_mode)
+    trading_date = str(trading_date or "").strip()
+    session_key = str(session_key or "").strip()
+    if not client_id or execution_mode not in {"live", "paper"} or not trading_date or not session_key:
+        raise ValueError("overnight_attempt_identity_incomplete")
+
+    def _new_details(attempt_id: str, generation: int, attempt_count: int) -> dict:
+        return {
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "trading_date": trading_date,
+            "overnight_reeval_session_key": session_key,
+            "attempt_id": attempt_id,
+            "attempt_generation": generation,
+            "attempt_count": attempt_count,
+            "result_class": "ATTEMPT_IN_PROGRESS",
+            "completed": False,
+            "retryable": True,
+            "retry_reason": "attempt_in_progress",
+            "source_lookup_partial": True,
+            "source_identity_conflict": False,
+        }
+
+    def _int_detail(details: dict, key: str) -> int:
+        value = details.get(key) if isinstance(details, dict) else None
+        if value is None:
+            return 0
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"overnight_attempt_{key}_malformed")
+        return max(0, value)
+
+    def _claim():
+        with conn() as c:
+            # Establish the row if this is the first attempt. A concurrent
+            # first writer loses this insert and then takes the row lock below
+            # after the winner commits.
+            first_id = f"{trading_date}:1:{uuid.uuid4().hex}"
+            first_details = _new_details(first_id, 1, 1)
+            cur = c.execute(
+                """
+                INSERT INTO handoff_run_locks (
+                    client_id, execution_mode, trading_date, stage, status,
+                    last_run_at, last_success_at, last_error, details, updated_at
+                )
+                VALUES (%s, %s, %s::date, 'overnight_reeval', 'running',
+                        NOW(), NULL, %s, %s::jsonb, NOW())
+                ON CONFLICT (client_id, execution_mode, trading_date, stage)
+                DO NOTHING
+                """,
+                (
+                    client_id,
+                    execution_mode,
+                    trading_date,
+                    "OVERNIGHT_REEVAL_IN_PROGRESS",
+                    json.dumps(first_details, default=str),
+                ),
+            )
+            inserted = int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0) > 0
+            if inserted:
+                generation = 1
+                attempt_count = 1
+                attempt_id = first_id
+            else:
+                c.execute(
+                    """
+                    SELECT details
+                    FROM handoff_run_locks
+                    WHERE client_id = %s
+                      AND execution_mode = %s
+                      AND trading_date = %s::date
+                      AND stage = 'overnight_reeval'
+                    FOR UPDATE
+                    """,
+                    (client_id, execution_mode, trading_date),
+                )
+                row = c.fetchone()
+                raw_details = row.get("details") if isinstance(row, dict) else (row[0] if row else {})
+                if isinstance(raw_details, str):
+                    try:
+                        raw_details = json.loads(raw_details)
+                    except Exception:
+                        raw_details = {}
+                prior_details = raw_details if isinstance(raw_details, dict) else {}
+                generation = _int_detail(prior_details, "attempt_generation") + 1
+                attempt_count = _int_detail(prior_details, "attempt_count") + 1
+                attempt_id = f"{trading_date}:{generation}:{uuid.uuid4().hex}"
+                details = _new_details(attempt_id, generation, attempt_count)
+                c.execute(
+                    """
+                    UPDATE handoff_run_locks
+                    SET status = 'running',
+                        last_run_at = NOW(),
+                        last_success_at = NULL,
+                        last_error = %s,
+                        details = %s::jsonb,
+                        updated_at = NOW()
+                    WHERE client_id = %s
+                      AND execution_mode = %s
+                      AND trading_date = %s::date
+                      AND stage = 'overnight_reeval'
+                    """,
+                    (
+                        "OVERNIGHT_REEVAL_IN_PROGRESS",
+                        json.dumps(details, default=str),
+                        client_id,
+                        execution_mode,
+                        trading_date,
+                    ),
+                )
+
+            # A new overnight attempt supersedes any post-overnight success
+            # from an older generation. Readiness must not discover that stale
+            # stage and re-authorize LIVE while this attempt is unresolved.
+            c.execute(
+                """
+                UPDATE handoff_run_locks
+                SET status = 'superseded',
+                    last_success_at = NULL,
+                    last_error = 'OVERNIGHT_ATTEMPT_SUPERSEDED',
+                    details = COALESCE(details, '{}'::jsonb)
+                              || jsonb_build_object(
+                                   'superseded_by_attempt_id', %s,
+                                   'superseded_by_attempt_generation', %s
+                                 ),
+                    updated_at = NOW()
+                WHERE client_id = %s
+                  AND execution_mode = %s
+                  AND trading_date = %s::date
+                  AND stage = 'post_overnight_reeval'
+                  AND LOWER(COALESCE(status, '')) = 'success'
+                  AND (
+                      NOT (COALESCE(details, '{}'::jsonb) ? 'attempt_generation')
+                      OR CASE
+                          WHEN details->>'attempt_generation' ~ '^[0-9]+$'
+                          THEN (details->>'attempt_generation')::bigint
+                          ELSE 0
+                      END < %s
+                  )
+                """,
+                (
+                    attempt_id,
+                    generation,
+                    client_id,
+                    execution_mode,
+                    trading_date,
+                    generation,
+                ),
+            )
+            return {
+                "client_id": client_id,
+                "execution_mode": execution_mode,
+                "trading_date": trading_date,
+                "session_key": session_key,
+                "attempt_id": attempt_id,
+                "attempt_generation": generation,
+                "attempt_count": attempt_count,
+            }
+
+    return run_with_retry(_claim)
 
 
 def _count_state(client_id: str) -> dict:
@@ -1040,10 +1265,36 @@ def run_morning_handoff_audit(
     dry_run: bool = False,
     runner=None,
     now: datetime | None = None,
+    overnight_attempt: dict | None = None,
 ) -> dict:
     mode = _normalize_mode(execution_mode)
     client_id = str(client_id or "").strip()
     stage = str(stage or "").strip().lower()
+    overnight_attempt = dict(overnight_attempt or {})
+    _attempt_id = str(overnight_attempt.get("attempt_id") or "").strip() or None
+    _raw_attempt_generation = overnight_attempt.get("attempt_generation")
+    _attempt_generation = (
+        _raw_attempt_generation
+        if isinstance(_raw_attempt_generation, int)
+        and not isinstance(_raw_attempt_generation, bool)
+        and _raw_attempt_generation > 0
+        else None
+    )
+    _attempt_session = (
+        str(
+            overnight_attempt.get("overnight_reeval_session_key")
+            or overnight_attempt.get("session_key")
+            or ""
+        ).strip()
+        or None
+    )
+    _attempt_details = {}
+    if _attempt_id is not None:
+        _attempt_details["attempt_id"] = _attempt_id
+    if _attempt_generation is not None:
+        _attempt_details["attempt_generation"] = _attempt_generation
+    if _attempt_session is not None:
+        _attempt_details["overnight_reeval_session_key"] = _attempt_session
     if not client_id:
         return {"ok": False, "error": "client_id_required", "stage": stage}
     if mode not in {"paper", "live"}:
@@ -1129,7 +1380,7 @@ def run_morning_handoff_audit(
         stage=stage,
         status="running",
         last_error=None,
-        details={"dry_run": dry_run},
+        details={"dry_run": dry_run, **_attempt_details},
         mark_success=False,
     )
 
@@ -1142,7 +1393,7 @@ def run_morning_handoff_audit(
             stage=stage,
             status="failed",
             last_error=err,
-            details={"dry_run": dry_run},
+            details={"dry_run": dry_run, **_attempt_details},
             mark_success=False,
         )
         summary = {
@@ -1350,6 +1601,7 @@ def run_morning_handoff_audit(
     }
     details = {
         "dry_run": dry_run,
+        **_attempt_details,
         "before": before,
         "after": after,
         "watchers_requeued": int(recovery_result.get("watchers_requeued", 0) or 0),
@@ -1372,6 +1624,8 @@ def run_morning_handoff_audit(
         last_error=error,
         details=details,
         mark_success=ok,
+        attempt_generation=_attempt_generation,
+        attempt_id=_attempt_id,
     )
     result = {
         "ok": ok,

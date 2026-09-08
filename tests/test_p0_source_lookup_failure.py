@@ -69,6 +69,41 @@ def test_both_sources_failed_zero_rows_classifies_retryable_source_lookup_failed
     assert result["ap_signals_status"]  == "FAILED"
 
 
+def test_source_lookup_failure_is_read_only_and_never_touches_broker(monkeypatch):
+    """Incomplete inventory is a retry decision, never a money-path action."""
+    fetch = _empty_fetch_result(tq_ok=False, sup_ok=False, rows=[])
+    monkeypatch.setattr(
+        ov, "_fetch_watching_signals_with_status", lambda _client: fetch
+    )
+    broker = SimpleNamespace(
+        submit_order=MagicMock(),
+        place_order=MagicMock(),
+        cancel_order=MagicMock(),
+        replace_order=MagicMock(),
+    )
+
+    result = ov.run_overnight_reeval(
+        client_id="jose@example.com",
+        broker=broker,
+        data_broker=broker,
+        master_control=SimpleNamespace(),
+        contract_selector=SimpleNamespace(),
+        order_state_machine=SimpleNamespace(),
+        entry_watcher=SimpleNamespace(),
+        force=True,
+    )
+
+    assert result["result_class"] == "RETRYABLE_SOURCE_LOOKUP_FAILED"
+    assert result["completed"] is False
+    for method in (
+        broker.submit_order,
+        broker.place_order,
+        broker.cancel_order,
+        broker.replace_order,
+    ):
+        method.assert_not_called()
+
+
 def test_missing_supabase_credentials_is_treated_as_failed_not_zero_rows(monkeypatch):
     """Missing credentials was previously a warning that returned an empty
     list. It must now be a FAILED status so a bad deploy cannot silently
@@ -115,6 +150,55 @@ def test_partial_source_inventory_forces_retryable_even_when_rows_processed(monk
     assert result["retryable"] is True
     assert result["result_class"] == "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
 
+
+def test_partial_source_inventory_overrides_deferred_subset_classification():
+    """An incomplete source cannot remain RETRYABLE_PARTIAL_DEFERRED.
+
+    That classification can later exhaust into the #559 readiness exception;
+    partial source truth must retain the stronger source-inventory reason even
+    when visible rows include both armed and deferred outcomes.
+    """
+    result = ov._classify_overnight_reeval_result(
+        {
+            "fetched": 2,
+            "processed": 2,
+            "armed": 1,
+            "terminal_rejected": 0,
+            "terminal_errors": 0,
+            "errors": 0,
+            "retryable_deferred": 1,
+            "already_resolved": 0,
+            "unresolved": 0,
+            "source_lookup_partial": True,
+            "trade_queue_status": ov._SOURCE_STATUS_FAILED,
+            "ap_signals_status": ov._SOURCE_STATUS_SUCCESS,
+        }
+    )
+
+    assert result["result_class"] == "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
+    assert result["completed"] is False
+    assert result["retryable"] is True
+    assert result["retry_reason"] == "partial_source_inventory"
+
+
+def test_truncated_successful_source_is_still_retryable(monkeypatch):
+    row = {
+        "id": "sup:visible",
+        "signal_id": "visible",
+        "payload": {"signal_id": "visible", "ticker": "VISIBLE", "side": "invalid"},
+        "created_ts": None,
+        "_source": "ap_signals",
+    }
+    fetch = _empty_fetch_result(tq_ok=True, sup_ok=True, rows=[row])._replace(
+        source_lookup_partial=True
+    )
+
+    result = _run_reeval(monkeypatch, fetch)
+
+    assert result["source_lookup_partial"] is True
+    assert result["completed"] is False
+    assert result["retryable"] is True
+    assert result["retry_reason"] == "partial_source_inventory"
 
 def test_runner_does_not_set_success_date_on_source_lookup_failed(monkeypatch):
     """Wire the failing result through run_overnight_reeval_attempt on a
