@@ -3204,6 +3204,7 @@ class APExecutionCore:
             "generation": None,
             "next_retry_at": None,
         }
+        signal_id = ""
 
         def _keep(reason: str) -> dict:
             return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
@@ -3232,6 +3233,7 @@ class APExecutionCore:
                     str(getattr(self, "execution_mode", "") or getattr(self, "mode", "") or "")
                     .strip().lower()
                 ),
+                "expected_signal_id": str(signal_id or "").strip(),
                 "expected_lifecycle_state": (
                     "MATERIALIZING" if _post_claim is not None else "RETRY_WAIT"
                 ),
@@ -3316,6 +3318,17 @@ class APExecutionCore:
             meta = {}
             _meta_parse_ok = False
 
+        # Retry aliases are one durable authority.  A row with a trigger
+        # marker plus contradictory retry identity is unresolved; it must not
+        # earn a phase-one claim merely because one alias looks usable.
+        from ap.pending_trigger_classifier import (
+            has_conflicting_materialization_retry_authority,
+            resolve_materialization_retry_schedule,
+            resolve_materialization_trigger_crossed_at,
+        )
+        if has_conflicting_materialization_retry_authority(row):
+            return _keep("RETRY_CONFLICTING_AUTHORITY")
+
         _selector_failure_meta = meta.get("materialization_selector_failure")
         if not isinstance(_selector_failure_meta, dict):
             _selector_failure_meta = meta.get("selector_failure")
@@ -3379,17 +3392,17 @@ class APExecutionCore:
             return _term("RETRY_MISSING_TICKER", status="ERROR")
 
         # trigger_crossed_at: must be present and parseable — never substitute now.
-        trigger_crossed_at_raw = (
-            meta.get("trigger_crossed_at") or meta.get("triggered_at")
+        trigger_crossed_at_dt, trigger_timestamp_error = (
+            resolve_materialization_trigger_crossed_at(row, meta)
         )
-        if not trigger_crossed_at_raw:
+        trigger_crossed_at_raw = (
+            trigger_crossed_at_dt.isoformat() if trigger_crossed_at_dt is not None else ""
+        )
+        if trigger_timestamp_error == "trigger_timestamp_missing":
             return _term("RETRY_MISSING_TRIGGER_CROSSED_AT", status="ERROR")
-        try:
-            trigger_crossed_dt = datetime.fromisoformat(str(trigger_crossed_at_raw))
-            if trigger_crossed_dt.tzinfo is None:
-                trigger_crossed_dt = trigger_crossed_dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            return _term("RETRY_INVALID_TRIGGER_CROSSED_AT", status="ERROR")
+        if trigger_timestamp_error:
+            return _keep("RETRY_CONFLICTING_TRIGGER_TIMESTAMP_AUTHORITY")
+        trigger_crossed_dt = trigger_crossed_at_dt
 
         # trigger_price: must be positive.
         _trigger_price_raw = row.get("trigger_price") or meta.get("trigger_price")
@@ -3481,19 +3494,11 @@ class APExecutionCore:
                 max_attempts=max_attempts,
             )
 
-        durable_due_at_raw = (
-            meta.get("materialization_next_retry_at")
-            or meta.get("deferred_retry_next_attempt_at")
-            or meta.get("next_retry_at")
-        )
-        if not durable_due_at_raw:
+        durable_due_at, durable_schedule_error = resolve_materialization_retry_schedule(meta)
+        if durable_schedule_error == "retry_schedule_missing":
             return _keep("RETRY_NO_DURABLE_SCHEDULE")
-        try:
-            durable_due_at = datetime.fromisoformat(str(durable_due_at_raw))
-            if durable_due_at.tzinfo is None:
-                durable_due_at = durable_due_at.replace(tzinfo=timezone.utc)
-        except Exception:
-            return _term("RETRY_INVALID_DURABLE_SCHEDULE", status="ERROR")
+        if durable_schedule_error:
+            return _keep("RETRY_CONFLICTING_DURABLE_SCHEDULE")
         if durable_due_at > _now:
             return {**_base, "disposition": "NOT_DUE", "reason_code": "RETRY_NOT_DUE"}
 
@@ -4009,16 +4014,17 @@ class APExecutionCore:
             return {**_base, "disposition": "BROKER_READY",
                     "reason_code": "RETRY_CANONICAL_BROKER_READY"}
         after_lifecycle = str(after_meta.get("lifecycle_state") or "").upper()
-        after_next_retry = (
-            after_meta.get("materialization_next_retry_at")
-            or after_meta.get("next_retry_at")
+        after_next_retry, after_schedule_error = resolve_materialization_retry_schedule(
+            after_meta
         )
-        if after_lifecycle == "RETRY_WAIT" and after_next_retry:
+        if after_lifecycle == "RETRY_WAIT" and after_schedule_error:
+            return _keep("RETRY_CONFLICTING_DURABLE_SCHEDULE")
+        if after_lifecycle == "RETRY_WAIT" and after_next_retry is not None:
             return {**_base, "disposition": "RETRY_WAIT",
                     "reason_code": str(after_meta.get("retry_reason")
                                        or after_meta.get("materialization_reason")
                                        or "RETRY_RESCHEDULED"),
-                    "next_retry_at": str(after_next_retry)}
+                    "next_retry_at": after_next_retry.isoformat()}
         # P0 FINAL AMENDMENT: use TERMINAL_ALREADY_DURABLE (not TERMINAL_DURABLE)
         # when the canonical downstream path already wrote a terminal status.
         # Recovery must NOT call terminalize_deferred_retry_if_unchanged() again —
@@ -4658,6 +4664,9 @@ class APExecutionCore:
                     "retry_attempt": _prior_mat_attempt,
                     "client_id": _mat_client_id,
                     "execution_mode": _mat_exec_mode,
+                    "signal_id": str(
+                        sig.get("signal_id") or signal_id or ""
+                    ).strip(),
                     "diagnostics": diagnostics or {},
                 }
             else:
@@ -11247,6 +11256,7 @@ class APExecutionCore:
                         retry_attempt=ownership.get("retry_attempt"),
                         client_id=str(ownership.get("client_id") or ""),
                         execution_mode=str(ownership.get("execution_mode") or ""),
+                        signal_id=str(sig.get("signal_id") or "").strip(),
                         terminal_status=terminal_status,
                         reason=reason,
                     ))

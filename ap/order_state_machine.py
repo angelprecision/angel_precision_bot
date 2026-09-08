@@ -4448,6 +4448,7 @@ class APOrderStateMachine:
         retry_attempt: int,
         client_id: str,
         execution_mode: str,
+        signal_id: str,
         diagnostics: dict | None = None,
     ) -> bool:
         """Terminalize only the exact in-flight materialization retry claim."""
@@ -4458,6 +4459,7 @@ class APOrderStateMachine:
         _owner = str(owner or "").strip()
         _client = str(client_id or "").strip().lower()
         _mode = str(execution_mode or "").strip().lower()
+        _signal = str(signal_id or "").strip()
         try:
             _generation = int(generation)
             _attempt = int(retry_attempt)
@@ -4471,7 +4473,17 @@ class APOrderStateMachine:
             or _attempt < 1
             or not _client
             or _mode not in {"live", "paper"}
+            or not _signal
         ):
+            return False
+
+        try:
+            from ap_canonical_signal import build_canonical_signal_id
+
+            _canonical_signal = str(build_canonical_signal_id(_signal) or "").strip()
+        except Exception:
+            return False
+        if not _canonical_signal:
             return False
 
         _now = now_utc_iso()
@@ -4518,17 +4530,118 @@ class APOrderStateMachine:
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
+                      AND (
+                            NULLIF(BTRIM(meta->>'client_id'), '') IS NULL
+                            OR LOWER(BTRIM(meta->>'client_id')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->>'client_email'), '') IS NULL
+                            OR LOWER(BTRIM(meta->>'client_email')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,client_id}'), '') IS NULL
+                            OR LOWER(BTRIM(meta #>> '{materialization,client_id}')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,client_email}'), '') IS NULL
+                            OR LOWER(BTRIM(meta #>> '{materialization,client_email}')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->>'execution_mode'), '') IS NULL
+                            OR LOWER(BTRIM(meta->>'execution_mode')) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,execution_mode}'), '') IS NULL
+                            OR LOWER(BTRIM(meta #>> '{materialization,execution_mode}')) = %s
+                          )
+                      AND signal_id = %s
+                      AND (
+                            NULLIF(BTRIM(meta->>'signal_id'), '') IS NULL
+                            OR BTRIM(meta->>'signal_id') = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(canonical_signal_id), '') IS NULL
+                            OR BTRIM(canonical_signal_id) = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta->>'canonical_signal_id'), '') IS NULL
+                            OR BTRIM(meta->>'canonical_signal_id') = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,signal_id}'), '') IS NULL
+                            OR BTRIM(meta #>> '{materialization,signal_id}') = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,canonical_signal_id}'), '') IS NULL
+                            OR BTRIM(meta #>> '{materialization,canonical_signal_id}') = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,execution_mode}'), '') IS NULL
+                            OR LOWER(BTRIM(meta #>> '{materialization,execution_mode}')) = %s
+                          )
+                      AND COALESCE(meta->>'broker_ready', 'false') = 'false'
+                      AND COALESCE(meta #>> '{materialization,broker_ready}', 'false') = 'false'
+                      AND NULLIF(COALESCE(meta #>> '{materialization,submit_intent_at}', ''), '') IS NULL
+                      AND NULLIF(COALESCE(meta->>'broker_submit_key', ''), '') IS NULL
+                      AND NULLIF(COALESCE(meta->>'broker_submit_payload_hash', ''), '') IS NULL
+                      AND NULLIF(COALESCE(meta->>'recovery_submit_owner', ''), '') IS NULL
+                      AND NULLIF(COALESCE(meta->>'recovery_submit_lease_until', ''), '') IS NULL
+                      AND COALESCE(meta->>'recovery_submit_fenced', 'false') = 'false'
+                      AND NULLIF(COALESCE(meta #>> '{materialization,broker_submit_key}', ''), '') IS NULL
+                      AND NULLIF(COALESCE(meta #>> '{materialization,broker_submit_payload_hash}', ''), '') IS NULL
+                      AND NULLIF(COALESCE(meta #>> '{materialization,recovery_submit_owner}', ''), '') IS NULL
+                      AND NULLIF(COALESCE(meta #>> '{materialization,recovery_submit_lease_until}', ''), '') IS NULL
+                      AND COALESCE(meta #>> '{materialization,recovery_submit_fenced}', 'false') = 'false'
                       AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
                       AND COALESCE(meta->>'materialization_status','') = 'RUNNING'
                       AND COALESCE(meta->>'materialization_in_flight', 'false') = 'true'
                       AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE(meta->>'current_owner','') = %s
+                      AND COALESCE(meta->>'watcher_token','') = %s
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE((meta->>'retry_attempt')::int, 0) = %s
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,lifecycle_state}'), '') IS NULL
+                            OR meta #>> '{materialization,lifecycle_state}' = 'MATERIALIZING'
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,materialization_status}'), '') IS NULL
+                            OR meta #>> '{materialization,materialization_status}' = 'RUNNING'
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,materialization_in_flight}'), '') IS NULL
+                            OR meta #>> '{materialization,materialization_in_flight}' = 'true'
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,materialization_owner}'), '') IS NULL
+                            OR meta #>> '{materialization,materialization_owner}' = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,current_owner}'), '') IS NULL
+                            OR meta #>> '{materialization,current_owner}' = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,watcher_token}'), '') IS NULL
+                            OR meta #>> '{materialization,watcher_token}' = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,materialization_generation}'), '') IS NULL
+                            OR meta #>> '{materialization,materialization_generation}' = %s
+                          )
+                      AND (
+                            NULLIF(BTRIM(meta #>> '{materialization,retry_attempt}'), '') IS NULL
+                            OR meta #>> '{materialization,retry_attempt}' = %s
+                          )
                     """,
                     (
                         _status, _reason, _patch_json,
                         local_order_id, _client, _mode,
-                        _owner, _generation, _attempt,
+                        _client, _client, _client, _client, _mode, _mode,
+                        _signal, _signal, _canonical_signal,
+                        _canonical_signal,
+                        _signal, _canonical_signal, _mode,
+                        _owner, _owner, _owner, _generation, _attempt,
+                        _owner, _owner, _owner, str(_generation), str(_attempt),
                     ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)

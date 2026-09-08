@@ -45,6 +45,7 @@ from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
     has_canonical_materialization_retry_authority,
+    has_conflicting_materialization_retry_authority,
     has_broker_handoff_evidence,
     is_active_materialization_in_flight,
 )
@@ -300,6 +301,20 @@ class PendingTriggerRestartRecovery:
                 signal_id=signal_id,
                 durable_client=row_client,
                 durable_mode=row_mode,
+            )
+            return _RowOutcome.UNRESOLVED
+
+        # A retry-marked trigger row with contradictory durable authority is
+        # unresolved, even when the trigger marker itself is proven.  In
+        # particular, do not let the STUCK_TRIGGER_READY cleanup branch turn
+        # malformed retry metadata into a terminal outcome.
+        if has_conflicting_materialization_retry_authority(row):
+            self._mark_failure(local_oid, "retry_authority_conflict")
+            log.critical(
+                "RESTART_RECOVERY_RETRY_AUTHORITY_CONFLICT local=%s client=%s "
+                "mode=%s signal=%s — row held; no claim, selector, broker, "
+                "cancel, or terminal write",
+                local_oid, row_client, row_mode, signal_id,
             )
             return _RowOutcome.UNRESOLVED
 
