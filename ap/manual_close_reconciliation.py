@@ -454,13 +454,22 @@ def normalize_positions_payload(payload: Any) -> BrokerPositionSnapshot:
         )
 
     positions_node = payload.get("positions")
-    if positions_node == "null":
+    if positions_node is None or positions_node == "null":
         return BrokerPositionSnapshot(POSITIONS_AVAILABLE_COMPLETE_EMPTY, [])
     if not isinstance(positions_node, dict):
         return BrokerPositionSnapshot(
             POSITIONS_MALFORMED,
             [],
             "broker_positions_node_malformed",
+        )
+    if any(
+        key in positions_node and _position_field_is_present(positions_node.get(key))
+        for key in ("error", "errors", "message", "reason")
+    ):
+        return BrokerPositionSnapshot(
+            POSITIONS_MALFORMED,
+            [],
+            "broker_positions_node_error",
         )
     if not positions_node:
         return BrokerPositionSnapshot(POSITIONS_AVAILABLE_COMPLETE_EMPTY, [])

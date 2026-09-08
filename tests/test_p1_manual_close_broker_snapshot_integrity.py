@@ -233,6 +233,24 @@ def test_documented_null_positions_payload_is_complete_empty_authority():
     assert manual_mod._broker_position_contract_quantities(snapshot) == ({}, "")
 
 
+def test_json_null_positions_node_preserves_complete_empty_authority():
+    snapshot = manual_mod.normalize_positions_payload({"positions": None})
+
+    assert snapshot.state == manual_mod.POSITIONS_AVAILABLE_COMPLETE_EMPTY
+    assert snapshot.rows == []
+    assert manual_mod._broker_position_contract_quantities(snapshot) == ({}, "")
+
+
+def test_nested_error_position_envelope_is_malformed_not_empty_authority():
+    snapshot = manual_mod.normalize_positions_payload(
+        {"positions": {"position": [], "error": "unavailable"}}
+    )
+
+    assert snapshot.state == manual_mod.POSITIONS_MALFORMED
+    assert snapshot.rows == []
+    assert snapshot.reason == "broker_positions_node_error"
+
+
 def test_authoritative_adapter_rows_are_validated_without_filtering_bad_rows():
     class _AuthoritativeBroker:
         def list_positions_authoritative(self):
@@ -260,6 +278,24 @@ def test_incomplete_snapshot_blocks_order_discovery_and_adoption(monkeypatch):
         positions_payload=_payload(
             [{"symbol": OTHER_CONTRACT, "quantity": 1}, "malformed"]
         ),
+        orders=[_filled_exit()],
+    )
+    finalizer = MagicMock(return_value=True)
+    runner = _runner(broker, finalizer)
+    adopted = _install_scan(monkeypatch, finalizer)
+
+    manual_mod.detect_manual_closes(runner)
+
+    assert adopted == []
+    finalizer.assert_not_called()
+    assert len(broker.calls) == 1
+    assert "/positions" in broker.calls[0]
+    assert not any("/orders" in call for call in broker.calls)
+
+
+def test_nested_error_snapshot_blocks_order_discovery_and_adoption(monkeypatch):
+    broker = _Broker(
+        positions_payload={"positions": {"position": [], "error": "unavailable"}},
         orders=[_filled_exit()],
     )
     finalizer = MagicMock(return_value=True)
