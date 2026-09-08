@@ -43,6 +43,7 @@ import math
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -68,6 +69,18 @@ ORDERS_UNAVAILABLE = "unavailable"
 ORDERS_INCOMPLETE = "incomplete"
 _ORDER_PAGE_DATA = "data"
 _ORDER_PAGE_EMPTY = "empty"
+POSITIONS_AVAILABLE_COMPLETE_NONEMPTY = "available_complete_nonempty"
+POSITIONS_AVAILABLE_COMPLETE_EMPTY = "available_complete_empty"
+POSITIONS_UNAVAILABLE = "unavailable"
+POSITIONS_MALFORMED = "malformed"
+POSITIONS_INCOMPLETE = "incomplete"
+POSITIONS_AMBIGUOUS = "ambiguous"
+POSITION_COMPLETE_STATES = frozenset(
+    {
+        POSITIONS_AVAILABLE_COMPLETE_NONEMPTY,
+        POSITIONS_AVAILABLE_COMPLETE_EMPTY,
+    }
+)
 VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 MANUAL_CLOSE_SIDES = frozenset(
     {"sell_to_close", "sell-to-close", "selltoclose", "stc"}
@@ -257,55 +270,274 @@ def _metadata_object(value: Any) -> dict:
     return {}
 
 
-def normalize_positions_payload(payload: Any) -> list[dict]:
+@dataclass(frozen=True)
+class BrokerPositionSnapshot:
+    """Validated broker-position truth used by manual-close PASS 2."""
+
+    state: str
+    rows: list[dict]
+    reason: str = ""
+
+
+_POSITION_OPTION_IDENTITY_KEYS = (
+    "option_symbol",
+    "optionSymbol",
+    "option_contract",
+    "optionContract",
+    "contract",
+)
+_POSITION_GENERAL_IDENTITY_KEYS = ("symbol", "instrument")
+_POSITION_UNDERLYING_KEYS = ("underlying",)
+_POSITION_QUANTITY_KEYS = ("quantity", "qty")
+_POSITION_OPTION_HINT_KEYS = (
+    "option_type",
+    "put_call",
+    "right",
+    "strike",
+    "expiration",
+    "expiration_date",
+    "expiry",
+)
+_POSITION_NON_OPTION_SYMBOL_RE = re.compile(r"^[A-Z0-9.]{1,6}$")
+
+
+def _position_field_is_present(value: Any) -> bool:
+    return value is not None and not (
+        isinstance(value, str) and not value.strip()
+    )
+
+
+def _position_quantity(row: dict) -> int | None:
+    values: list[int] = []
+    for key in _POSITION_QUANTITY_KEYS:
+        if key not in row:
+            continue
+        raw_value = row.get(key)
+        if not _position_field_is_present(raw_value):
+            return None
+        quantity = positive_int(raw_value)
+        if quantity <= 0:
+            return None
+        values.append(quantity)
+    if not values or len(set(values)) != 1:
+        return None
+    return values[0]
+
+
+def _position_identity(row: dict) -> tuple[str, str, str]:
+    """Return ``(kind, identity, reason)`` for one broker position row."""
+    exact_contracts: list[str] = []
+    non_option_symbols: list[str] = []
+    invalid_identity = False
+
+    for key in _POSITION_OPTION_IDENTITY_KEYS:
+        if key not in row or not _position_field_is_present(row.get(key)):
+            continue
+        normalized = normalize_contract(row.get(key))
+        if is_valid_occ_contract(normalized):
+            exact_contracts.append(normalized)
+        else:
+            invalid_identity = True
+
+    for key in _POSITION_GENERAL_IDENTITY_KEYS:
+        if key not in row or not _position_field_is_present(row.get(key)):
+            continue
+        normalized = normalize_contract(row.get(key))
+        if is_valid_occ_contract(normalized):
+            exact_contracts.append(normalized)
+        elif _POSITION_NON_OPTION_SYMBOL_RE.fullmatch(normalized):
+            non_option_symbols.append(normalized)
+        else:
+            invalid_identity = True
+
+    for key in _POSITION_UNDERLYING_KEYS:
+        if key not in row or not _position_field_is_present(row.get(key)):
+            continue
+        normalized = normalize_contract(row.get(key))
+        if _POSITION_NON_OPTION_SYMBOL_RE.fullmatch(normalized):
+            non_option_symbols.append(normalized)
+        else:
+            invalid_identity = True
+
+    if len(set(exact_contracts)) > 1:
+        return "ambiguous", "", "conflicting_exact_occ_identity"
+    if invalid_identity:
+        return "invalid", "", "invalid_or_weak_position_identity"
+
+    if exact_contracts:
+        contract = exact_contracts[0]
+        underlying = contract[:-15]
+        if any(symbol != underlying for symbol in non_option_symbols):
+            return "ambiguous", "", "position_identity_underlying_conflict"
+        return "option", contract, ""
+
+    option_hint = any(
+        key in row and _position_field_is_present(row.get(key))
+        for key in _POSITION_OPTION_HINT_KEYS
+    )
+    side = str(row.get("side") or row.get("direction") or "").upper().strip()
+    if side in {"CALL", "PUT"}:
+        option_hint = True
+    if option_hint:
+        return "invalid", "", "option_row_missing_exact_occ_identity"
+    if len(set(non_option_symbols)) > 1:
+        return "ambiguous", "", "conflicting_non_option_identity"
+    if not non_option_symbols:
+        return "invalid", "", "position_identity_missing"
+    return "non_option", non_option_symbols[0], ""
+
+
+def _normalize_position_rows(rows: Any) -> BrokerPositionSnapshot:
+    if not isinstance(rows, list):
+        return BrokerPositionSnapshot(
+            POSITIONS_MALFORMED,
+            [],
+            "broker_position_rows_malformed",
+        )
+
+    normalized: list[dict] = []
+    option_contracts: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            return BrokerPositionSnapshot(
+                POSITIONS_INCOMPLETE,
+                [],
+                f"position_row_{index}_not_mapping",
+            )
+        quantity = _position_quantity(row)
+        if quantity is None:
+            return BrokerPositionSnapshot(
+                POSITIONS_INCOMPLETE,
+                [],
+                f"position_row_{index}_quantity_invalid",
+            )
+        kind, identity, reason = _position_identity(row)
+        if kind == "ambiguous":
+            return BrokerPositionSnapshot(POSITIONS_AMBIGUOUS, [], reason)
+        if kind != "option" and kind != "non_option":
+            return BrokerPositionSnapshot(POSITIONS_INCOMPLETE, [], reason)
+        if kind == "option":
+            if identity in option_contracts:
+                return BrokerPositionSnapshot(
+                    POSITIONS_AMBIGUOUS,
+                    [],
+                    f"duplicate_exact_occ:{identity}",
+                )
+            option_contracts.add(identity)
+        normalized.append(
+            {"symbol": identity, "quantity": quantity, "raw": dict(row)}
+        )
+
+    state = (
+        POSITIONS_AVAILABLE_COMPLETE_NONEMPTY
+        if normalized
+        else POSITIONS_AVAILABLE_COMPLETE_EMPTY
+    )
+    return BrokerPositionSnapshot(state, normalized)
+
+
+def normalize_positions_payload(payload: Any) -> BrokerPositionSnapshot:
     if not isinstance(payload, dict) or "positions" not in payload:
-        raise ValueError("BROKER_POSITIONS_PAYLOAD_MALFORMED")
+        return BrokerPositionSnapshot(
+            POSITIONS_MALFORMED,
+            [],
+            "broker_positions_payload_malformed",
+        )
+    if any(
+        key in payload and _position_field_is_present(payload.get(key))
+        for key in ("error", "errors", "message", "reason")
+    ):
+        return BrokerPositionSnapshot(
+            POSITIONS_MALFORMED,
+            [],
+            "broker_positions_payload_error",
+        )
 
     positions_node = payload.get("positions")
-    if positions_node is None or positions_node == "null":
-        return []
+    if positions_node == "null":
+        return BrokerPositionSnapshot(POSITIONS_AVAILABLE_COMPLETE_EMPTY, [])
     if not isinstance(positions_node, dict):
-        raise ValueError("BROKER_POSITIONS_NODE_MALFORMED")
+        return BrokerPositionSnapshot(
+            POSITIONS_MALFORMED,
+            [],
+            "broker_positions_node_malformed",
+        )
+    if not positions_node:
+        return BrokerPositionSnapshot(POSITIONS_AVAILABLE_COMPLETE_EMPTY, [])
 
     rows = positions_node.get("position")
-    if rows is None or rows == "null":
-        return []
+    if rows == "null":
+        return BrokerPositionSnapshot(POSITIONS_AVAILABLE_COMPLETE_EMPTY, [])
     if isinstance(rows, dict):
         rows = [rows]
     if not isinstance(rows, list):
-        raise ValueError("BROKER_POSITION_ROWS_MALFORMED")
-
-    normalized: list[dict] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        contract = normalize_contract(
-            row.get("option_symbol") or row.get("contract") or row.get("symbol")
+        return BrokerPositionSnapshot(
+            POSITIONS_MALFORMED,
+            [],
+            "broker_position_rows_malformed",
         )
-        quantity = positive_int(row.get("quantity") or row.get("qty"))
-        if contract and quantity > 0:
-            normalized.append(
-                {"symbol": contract, "quantity": quantity, "raw": dict(row)}
-            )
-    return normalized
+    return _normalize_position_rows(rows)
 
 
-def fetch_authoritative_broker_positions(broker: Any) -> list[dict]:
+def fetch_authoritative_broker_positions(broker: Any) -> BrokerPositionSnapshot:
     authoritative = getattr(broker, "list_positions_authoritative", None)
     if callable(authoritative):
-        rows = authoritative()
-        if not isinstance(rows, list):
-            raise ValueError("AUTHORITATIVE_POSITIONS_RESULT_MALFORMED")
-        return [dict(row) for row in rows if isinstance(row, dict)]
+        try:
+            rows = authoritative()
+        except Exception as exc:
+            return BrokerPositionSnapshot(
+                POSITIONS_UNAVAILABLE,
+                [],
+                f"authoritative_positions_read_failed:{type(exc).__name__}",
+            )
+        return _normalize_position_rows(rows)
 
     raw_get = getattr(broker, "_get", None)
     cfg = getattr(broker, "cfg", None)
     account_id = str(getattr(cfg, "account_id", "") or "").strip()
     if not callable(raw_get) or not account_id:
-        raise RuntimeError("AUTHORITATIVE_BROKER_POSITIONS_UNAVAILABLE")
+        return BrokerPositionSnapshot(
+            POSITIONS_UNAVAILABLE,
+            [],
+            "authoritative_broker_positions_unavailable",
+        )
 
-    payload = raw_get(f"/v1/accounts/{account_id}/positions")
+    try:
+        payload = raw_get(f"/v1/accounts/{account_id}/positions")
+    except Exception as exc:
+        return BrokerPositionSnapshot(
+            POSITIONS_UNAVAILABLE,
+            [],
+            f"broker_positions_read_failed:{type(exc).__name__}",
+        )
     return normalize_positions_payload(payload)
+
+
+def _broker_position_contract_quantities(
+    snapshot: BrokerPositionSnapshot,
+) -> tuple[dict[str, int] | None, str]:
+    """Build the PASS 2 map only from an explicitly complete snapshot."""
+    if not isinstance(snapshot, BrokerPositionSnapshot):
+        return None, "snapshot_result_malformed"
+    if snapshot.state not in POSITION_COMPLETE_STATES:
+        return None, f"snapshot_state:{snapshot.state}"
+
+    contract_quantities: dict[str, int] = {}
+    for row in snapshot.rows:
+        if not isinstance(row, dict):
+            return None, "normalized_position_row_not_mapping"
+        contract = normalize_contract(row.get("symbol"))
+        quantity = positive_int(row.get("quantity"))
+        if not is_valid_occ_contract(contract) or quantity <= 0:
+            # Non-option rows were validated at the snapshot boundary and do
+            # not establish option-contract presence/absence.
+            if not is_valid_occ_contract(contract):
+                continue
+            return None, "normalized_option_row_invalid"
+        if contract in contract_quantities:
+            return None, f"duplicate_exact_occ:{contract}"
+        contract_quantities[contract] = quantity
+    return contract_quantities, ""
 
 
 def _order_page_row_is_structured(row: Any) -> bool:
@@ -1860,7 +2092,7 @@ def detect_manual_closes(self) -> None:
         # Only PASS 2 requires broker access; upstream passes have already run.
         return
     try:
-        broker_positions = fetch_authoritative_broker_positions(broker)
+        broker_position_snapshot = fetch_authoritative_broker_positions(broker)
     except Exception as exc:
         log.error(
             "[%s] MANUAL_CLOSE_SCAN_UNCERTAIN broker_positions_unavailable "
@@ -1869,20 +2101,19 @@ def detect_manual_closes(self) -> None:
         )
         return
 
-    broker_contract_qty: dict[str, int] = {}
-    for broker_position in broker_positions:
-        bpos_contract = normalize_contract(
-            broker_position.get("symbol")
-            or broker_position.get("option_symbol")
-            or broker_position.get("contract")
+    broker_contract_qty, snapshot_reason = _broker_position_contract_quantities(
+        broker_position_snapshot
+    )
+    if broker_contract_qty is None:
+        log.error(
+            "[%s] MANUAL_CLOSE_SCAN_UNCERTAIN broker_positions_state=%s "
+            "reason=%s mode=%s — no missing-position inference or state mutation",
+            client_id,
+            getattr(broker_position_snapshot, "state", POSITIONS_MALFORMED),
+            getattr(broker_position_snapshot, "reason", "") or snapshot_reason,
+            runner_mode,
         )
-        quantity = positive_int(
-            broker_position.get("quantity") or broker_position.get("qty")
-        )
-        if bpos_contract and quantity > 0:
-            broker_contract_qty[bpos_contract] = (
-                broker_contract_qty.get(bpos_contract, 0) + quantity
-            )
+        return
 
     missing_positions = [
         position
