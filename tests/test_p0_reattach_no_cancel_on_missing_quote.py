@@ -86,6 +86,8 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
         return {
             "local_order_id":     oid,
             "status":             "PENDING_TRIGGER",
+            "signal_id":          "sig-reattach-1",
+            "canonical_signal_id": "sig-reattach-1",
             "meta":               {"watcher_audit": {}},
             "client_id":          "jason@example.com",
             "execution_mode":     "live",
