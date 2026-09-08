@@ -4305,7 +4305,6 @@ class APMasterControl:
                 client_id=client_id,
             )
 
-        real_cost = float(plan.max_position_usd)
         # PR E FIX-3 (reader-side patch): take atomic snapshot of
         # (account_equity, max_daily_loss) under _equity_lock.
         # revalidate_exposure uses equity for capital / sector / ticker
