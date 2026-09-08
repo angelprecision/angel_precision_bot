@@ -89,6 +89,8 @@ jobs:
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           MANUAL_CLOSE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
+          # The shared list must retain tests/test_p0_trade_flow_contracts.py;
+          # both exact-head and synthetic merge-ref jobs consume this same list.
           mapfile -t P0_TESTS < <(grep -vE "^[[:space:]]*(#|$)" .github/p0_test_list.txt)
           test "${#P0_TESTS[@]}" -gt 0
           python -m pytest "${P0_TESTS[@]}" -v --tb=short --color=yes
