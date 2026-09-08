@@ -342,8 +342,9 @@ class PendingTriggerRestartRecovery:
         """Resolve the clock/session boundary immediately before ``watch()``."""
         session_status = _late_retry_session_status(row)
         overnight_or_deferred = _is_overnight_or_deferred_row(row)
+        meta = _extract_meta(row)
         has_retry_state = any(
-            field in _extract_meta(row)
+            field in meta
             for field in (
                 _RR_STATUS_FIELD,
                 _RR_OWNER_FIELD,
@@ -354,9 +355,19 @@ class PendingTriggerRestartRecovery:
                 _RR_LAST_FAILED_AT,
             )
         )
-        if session_status == "EXPIRED" and has_retry_state:
+        # Overnight reevaluation persists its session fence before the
+        # restart-rearm retry writer gets a chance to persist a lease.  That
+        # explicit authority is itself enough to reject a prior-session
+        # watcher registration after a crash; retry metadata is not required
+        # to make the session boundary real.
+        explicit_session_authority = (
+            "overnight_reeval_session_key" in meta
+            or _RR_SESSION_FIELD in meta
+        )
+        has_session_authority = has_retry_state or explicit_session_authority
+        if session_status == "EXPIRED" and has_session_authority:
             return "OVERNIGHT_RETRY_ROLLOVER" if overnight_or_deferred else "SESSION_EXPIRED"
-        if session_status == "INVALID" and has_retry_state:
+        if session_status == "INVALID" and has_session_authority:
             if overnight_or_deferred:
                 return "OVERNIGHT_RETRY_ROLLOVER"
             self._mark_failure(local_oid, "retry_verification:late_session")
@@ -401,7 +412,11 @@ class PendingTriggerRestartRecovery:
             and not (isinstance(value, str) and not value.strip())
             for value in expected_state.values()
         )
-        if not has_retry_state:
+        explicit_session_authority = (
+            "overnight_reeval_session_key" in meta
+            or _RR_SESSION_FIELD in meta
+        )
+        if not has_retry_state and not explicit_session_authority:
             return True
 
         current_session = _now_et().date().isoformat()

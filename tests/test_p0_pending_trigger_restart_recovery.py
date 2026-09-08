@@ -3328,6 +3328,143 @@ class TestLateMarketValidityRecovery:
         assert "late_attachment_entry_cutoff" in osm.cancel_calls[0][1]
         _assert_no_broker_mutation(rec.broker)
 
+    @pytest.mark.parametrize(
+        "restart_clock",
+        [
+            datetime(2026, 9, 8, 9, 20, tzinfo=timezone(timedelta(hours=-4))),
+            datetime(2026, 9, 8, 9, 31, tzinfo=timezone(timedelta(hours=-4))),
+        ],
+        ids=["day2-preopen", "day2-after-open"],
+    )
+    def test_prior_session_explicit_authority_without_retry_lease_rolls_before_watch(
+        self,
+        monkeypatch,
+        restart_clock,
+    ):
+        """A crash before the first retry lease cannot rearm a prior-session row."""
+        import ap.pending_trigger_restart_recovery as ptr
+
+        monkeypatch.setattr(ptr, "_now_et", lambda: restart_clock)
+        prior_session = (restart_clock.date() - timedelta(days=1)).isoformat()
+        current_session = restart_clock.date().isoformat()
+        local_order_id = "prior-session-before-first-retry-lease"
+        row = _row(
+            local_order_id=local_order_id,
+            signal_id="exact-signal-before-first-retry-lease",
+            client_id="exact-client-before-first-retry-lease@test.com",
+            execution_mode="paper",
+            meta={
+                "trigger_price": 450.0,
+                "late_attachment_policy_eligible": True,
+                "overnight": True,
+                "contract_deferred": True,
+                "overnight_reeval_session_key": prior_session,
+                "canonical_signal_id": "exact-canonical-before-first-retry-lease",
+            },
+        )
+        row["kind"] = "ENTRY"
+        row["contract"] = "DEFERRED:SPY"
+        row["canonical_signal_id"] = "exact-canonical-before-first-retry-lease"
+
+        # Deliberately no restart_rearm_* retry fields exist: the process died
+        # after the durable overnight session fence but before first lease
+        # ownership was persisted.
+        assert not any(
+            key.startswith("restart_rearm_") for key in row["meta"]
+        )
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(
+            row,
+            watcher=watcher,
+            client_id=row["client_id"],
+            mode=row["execution_mode"],
+            quote_result=None,
+        )
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        persisted = osm.get_order(local_order_id)
+        assert persisted["status"] == "PENDING_TRIGGER"
+        assert persisted["local_order_id"] == local_order_id
+        assert persisted["signal_id"] == row["signal_id"]
+        assert persisted["canonical_signal_id"] == row["canonical_signal_id"]
+        assert persisted["client_id"] == row["client_id"]
+        assert persisted["execution_mode"] == row["execution_mode"]
+        assert persisted["meta"][_RR_STATUS_FIELD] == "CLOSED"
+        assert persisted["meta"][_RR_SESSION_FIELD] == current_session
+        assert persisted["meta"]["overnight_reeval_session_key"] == current_session
+        assert persisted["meta"]["restart_recovery_late_boundary"] == (
+            "overnight_retry_rollover"
+        )
+        assert persisted["meta"][_RR_CLOSE_REASON] == (
+            "overnight_retry_session_rollover"
+        )
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
+    @pytest.mark.parametrize(
+        "authority_meta",
+        [
+            {"overnight_reeval_session_key": "not-a-session-date"},
+            {
+                "overnight_reeval_session_key": "2026-09-07",
+                _RR_SESSION_FIELD: "2026-09-08",
+            },
+        ],
+        ids=["malformed", "conflicting"],
+    )
+    def test_malformed_or_conflicting_explicit_authority_without_retry_fails_closed(
+        self,
+        monkeypatch,
+        authority_meta,
+    ):
+        """Malformed session authority cannot grant watcher or broker ownership."""
+        import ap.pending_trigger_restart_recovery as ptr
+
+        restart_clock = datetime(
+            2026, 9, 8, 9, 31, tzinfo=timezone(timedelta(hours=-4))
+        )
+        monkeypatch.setattr(ptr, "_now_et", lambda: restart_clock)
+        row = _row(
+            local_order_id="malformed-explicit-authority",
+            signal_id="exact-signal-malformed-explicit-authority",
+            client_id="exact-client-malformed-explicit-authority@test.com",
+            execution_mode="paper",
+            meta={
+                "trigger_price": 450.0,
+                "late_attachment_policy_eligible": True,
+                "overnight": True,
+                "contract_deferred": True,
+                "canonical_signal_id": "exact-canonical-malformed-explicit-authority",
+                **authority_meta,
+            },
+        )
+        row["kind"] = "ENTRY"
+        row["contract"] = "DEFERRED:SPY"
+        row["canonical_signal_id"] = "exact-canonical-malformed-explicit-authority"
+        watcher = _MonitorWatcher(watch_returns=True)
+        rec, osm = _make_recovery(
+            row,
+            watcher=watcher,
+            client_id=row["client_id"],
+            mode=row["execution_mode"],
+            quote_result=None,
+        )
+
+        assert rec._late_ownership_boundary(
+            row,
+            row["local_order_id"],
+        ) == "OVERNIGHT_RETRY_ROLLOVER"
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        assert watcher.watch_calls == 0
+        assert osm.get_order(row["local_order_id"])["status"] == "PENDING_TRIGGER"
+        assert osm.cancel_calls == []
+        _assert_no_broker_mutation(rec.broker)
+
     def test_overnight_late_retry_from_prior_session_rolls_without_terminalizing(self):
         row = _canonical_late_retry_row(local_order_id="late-prior-session")
         row["contract"] = "DEFERRED:SPY"
