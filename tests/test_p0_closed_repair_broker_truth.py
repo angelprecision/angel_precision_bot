@@ -109,7 +109,13 @@ def postgres_closed_row(monkeypatch):
             self._cursor = cursor
 
         def execute(self, sql, params=None):
-            executed_sql.append(" ".join(str(sql).split()).upper())
+            normalized_sql = " ".join(str(sql).split()).upper()
+            executed_sql.append(normalized_sql)
+            if normalized_sql.startswith("UPDATE POSITIONS"):
+                before_update = getattr(read, "before_update", None)
+                if before_update is not None:
+                    read.before_update = None
+                    before_update()
             return self._cursor.execute(sql, params)
 
         def __getattr__(self, name):
@@ -159,13 +165,30 @@ def postgres_closed_row(monkeypatch):
                 row,
             )
 
-    def read():
+    def read(position_id=None):
+        sql = (
+            "SELECT status, quantity_remaining, close_source "
+            "FROM positions"
+        )
+        params = ()
+        if position_id is not None:
+            sql += " WHERE id = %s"
+            params = (position_id,)
+        sql += " ORDER BY id"
         with connection.cursor(cursor_factory=extras.RealDictCursor) as cursor:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def change_status(position_id, status):
+        with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT status, quantity_remaining, close_source "
-                "FROM positions"
+                "UPDATE positions SET status = %s WHERE id = %s",
+                (status, position_id),
             )
-            return dict(cursor.fetchone())
+
+    read.before_update = None
+    read.change_status = change_status
 
     yield insert, read, executed_sql
     connection.close()
@@ -356,15 +379,16 @@ def test_postgres_malformed_truth_leaves_closed_row_unchanged(
 
 
 @pytest.mark.parametrize("mode", ["live", "paper"])
-def test_postgres_valid_long_preserves_existing_restore_behavior(
+def test_postgres_exact_quantity_restore_preserves_existing_restore_behavior(
     postgres_closed_row, mode
 ):
+    """Matrix A: exact broker quantity is authoritative for this lifecycle."""
     insert, read, _executed_sql = postgres_closed_row
     insert(qty=10, quantity_remaining=2, execution_mode=mode)
     broker = _tradier(
         payload={
             "positions": {
-                "position": [{"symbol": CONTRACT, "quantity": 5}]
+                "position": [{"symbol": CONTRACT, "quantity": 2}]
             }
         }
     )
@@ -399,7 +423,7 @@ def test_postgres_padded_db_occ_preserves_restore_behavior(
     broker = _tradier(
         payload={
             "positions": {
-                "position": [{"symbol": broker_contract, "quantity": 5}]
+                "position": [{"symbol": broker_contract, "quantity": 2}]
             }
         }
     )
@@ -429,7 +453,7 @@ def test_postgres_compact_db_occ_matches_padded_broker_row(postgres_closed_row):
     )
     broker = _tradier(
         payload={
-            "positions": {"position": [{"symbol": PADDED_CONTRACT, "quantity": 5}]}
+            "positions": {"position": [{"symbol": PADDED_CONTRACT, "quantity": 2}]}
         }
     )
     rec = _reconciler(broker)
@@ -659,7 +683,7 @@ def test_postgres_unrelated_negative_equity_does_not_poison_target_restore(
         payload={
             "positions": {
                 "position": [
-                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": CONTRACT, "quantity": 2},
                     {"symbol": "MSFT", "quantity": -100},
                 ]
             }
@@ -690,7 +714,7 @@ def test_postgres_unrelated_negative_option_does_not_poison_target_restore(
         payload={
             "positions": {
                 "position": [
-                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": CONTRACT, "quantity": 2},
                     {"symbol": "MSFT260620P00300000", "quantity": -2},
                 ]
             }
@@ -759,7 +783,7 @@ def test_postgres_unrelated_short_via_side_flag_equity_does_not_poison_restore(
         payload={
             "positions": {
                 "position": [
-                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": CONTRACT, "quantity": 2},
                     {"symbol": "MSFT", "quantity": 100, "side": "short"},
                 ]
             }
@@ -791,7 +815,7 @@ def test_postgres_unrelated_short_via_side_flag_option_does_not_poison_restore(
         payload={
             "positions": {
                 "position": [
-                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": CONTRACT, "quantity": 2},
                     {
                         "symbol": "MSFT260620P00300000",
                         "quantity": 2,
@@ -1092,7 +1116,7 @@ def test_postgres_equity_and_option_same_root_only_option_is_target_authority(
             "positions": {
                 "position": [
                     {"symbol": "AAPL", "quantity": 100},
-                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": CONTRACT, "quantity": 2},
                 ]
             }
         }
@@ -1108,4 +1132,149 @@ def test_postgres_equity_and_option_same_root_only_option_is_target_authority(
         "quantity_remaining": 2,
         "close_source": "PARTIAL_CLOSE_REPAIR",
     }
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_broker_quantity_greater_than_local_remaining_holds_safely(
+    postgres_closed_row,
+):
+    """Matrix B: aggregate broker quantity greater than local remainder is
+    not silently clamped or assigned to this lifecycle."""
+    insert, read, executed_sql = postgres_closed_row
+    insert(qty=10, quantity_remaining=2)
+    broker = _tradier(
+        payload={
+            "positions": {"position": [{"symbol": CONTRACT, "quantity": 5}]}
+        }
+    )
+    rec = _reconciler(broker)
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert "closed_repair_quantity_authority_conflict" in summary["errors"]
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_broker_quantity_less_than_local_remaining_holds_safely(
+    postgres_closed_row,
+):
+    """Matrix E: this lifecycle has no durable partial-allocation authority
+    proving that a smaller aggregate broker quantity is its valid remainder,
+    so the repair path holds instead of guessing."""
+    insert, read, executed_sql = postgres_closed_row
+    insert(qty=10, quantity_remaining=2)
+    broker = _tradier(
+        payload={
+            "positions": {"position": [{"symbol": CONTRACT, "quantity": 1}]}
+        }
+    )
+    rec = _reconciler(broker)
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert "closed_repair_quantity_authority_conflict" in summary["errors"]
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+@pytest.mark.parametrize(
+    "broker_quantity",
+    [1, 2],
+    ids=["broker-less-than-aggregate", "broker-equals-aggregate"],
+)
+def test_postgres_multiple_local_rows_sharing_occ_hold_all_candidates(
+    postgres_closed_row, broker_quantity
+):
+    """Matrices C/D: aggregate arithmetic never proves which local
+    lifecycle owns a shared broker OCC quantity."""
+    insert, read, executed_sql = postgres_closed_row
+    insert(id="position-pr594-a", qty=1, quantity_remaining=1)
+    insert(id="position-pr594-b", qty=1, quantity_remaining=1)
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [{"symbol": CONTRACT, "quantity": broker_quantity}]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    summary = _empty_summary(CLIENT)
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    for position_id in ("position-pr594-a", "position-pr594-b"):
+        assert read(position_id) == {
+            "status": "CLOSED",
+            "quantity_remaining": 1,
+            "close_source": "LEGACY_CLOSE",
+        }
+    assert "closed_repair_local_allocation_ambiguous" in summary["errors"]
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_flatten_cas_miss_is_not_reported_as_success(
+    postgres_closed_row,
+):
+    """Matrix F: an authoritative flat snapshot cannot flatten a lifecycle
+    that changes before the conditional UPDATE reaches the database."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(payload={"positions": {"position": []}})
+    rec = _reconciler(broker)
+    summary = _empty_summary(CLIENT)
+    read.before_update = lambda: read.change_status("position-pr594", "OPEN")
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    assert read() == {
+        "status": "OPEN",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert "closed_repair_flatten_cas_miss" in summary["errors"]
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_restore_cas_miss_does_not_seed_stale_owner(
+    postgres_closed_row,
+):
+    """Matrix G: a restore CAS miss performs no success follow-on, including
+    no exit-engine ownership seed from the stale scan projection."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {"position": [{"symbol": CONTRACT, "quantity": 2}]}
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+    summary = _empty_summary(CLIENT)
+    read.before_update = lambda: read.change_status("position-pr594", "OPEN")
+
+    rec._repair_closed_positions_with_remaining_qty(summary)
+
+    assert read() == {
+        "status": "OPEN",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert "closed_repair_restore_cas_miss" in summary["errors"]
+    rec._find_db_position_by_id.assert_not_called()
+    rec._seed_exit_engine_from_position.assert_not_called()
     _assert_no_broker_mutations(broker)
