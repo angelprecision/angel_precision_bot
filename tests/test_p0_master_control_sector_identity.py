@@ -140,6 +140,15 @@ def test_resolver_uses_canonical_identity_and_normalizes(symbol, expected):
     assert mc_mod.APMasterControl._resolve_sector(symbol) == expected
 
 
+@pytest.mark.parametrize(
+    "resolved",
+    ["OTHER", " unknown ", "MISC", "UNMAPPED", {"sector": "tech"}, None],
+)
+def test_resolver_rejects_non_authoritative_canonical_output(monkeypatch, resolved):
+    monkeypatch.setattr(mc_mod, "_canonical_get_sector", lambda _symbol: resolved)
+    assert mc_mod.APMasterControl._resolve_sector("ZZRESOLVER") is None
+
+
 def test_canonical_known_positions_are_counted_together():
     control = _bare_control()
     positions = [_position("AAPL"), _position("QCOM")]
