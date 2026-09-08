@@ -560,6 +560,7 @@ def test_revalidate_blocks_known_candidate_when_active_position_identity_is_unpr
     position_bucket,
 ):
     control = _control(
+        mode="live",
         max_position_pct=0.90,
         max_total_capital_pct=0.90,
         max_ticker_pct=0.90,
@@ -582,6 +583,8 @@ def test_revalidate_blocks_known_candidate_when_active_position_identity_is_unpr
     control._log_capital_utilization = MagicMock()
 
     plan = _plan("BMY", 150.0)
+    plan.metadata["sizing_context"] = {"bootstrap_mode": True}
+    plan.contracts = 3
     before_plan = (plan.contracts, plan.max_position_usd)
     decision = control.revalidate_exposure(plan)
 
