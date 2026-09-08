@@ -3194,37 +3194,43 @@ class APEntryWatcher:
     # ── Broker handoff evidence check (Correction 1 / PR #580 amendment) ────
     @staticmethod
     def _recovery_has_broker_handoff_evidence(sig: dict, meta: dict) -> bool:
-        """Return True if any durable evidence indicates the broker already
-        handled or is handling this order.
+        """Return whether canonical durable broker authority has advanced.
 
-        Evidence list mirrors has_broker_handoff_evidence() in
-        ap.pending_trigger_classifier and the PR #580 amendment §1 list.
-        This duplicate is intentional: it avoids importing the classifier
-        (which pulls psycopg2 at module init) inside the lifecycle bridge.
+        Recovery used to maintain a second handoff vocabulary here. That
+        drifted from ``ap.pending_trigger_classifier`` and incorrectly treated
+        ``watcher_audit.reason_code == 'trigger_ready'`` as broker ownership.
+        Reuse the canonical classifier and materialization proof instead. The
+        classifier's ``NOT_PENDING_TRIGGER`` result is the canonical row-level
+        check for populated ``broker_order_id``/``submitted_ts``; its dedicated
+        predicates own durable submit-intent and active-materializer evidence.
+
+        An unavailable canonical authority is HOLD, not permission to rearm.
         """
-        # Top-level broker fields
-        if sig.get("broker_order_id") or sig.get("submitted_ts"):
+        if not isinstance(sig, dict) or not isinstance(meta, dict):
             return True
-        # Meta broker-intent markers
-        for _k in (
-            "broker_ready",
-            "submit_intent_at",
-            "broker_submit_key",
-            "broker_submit_payload_hash",
-            "recovery_submit_owner",
-            "recovery_submit_fenced",
-            "recovery_submit_lease_until",
-        ):
-            if meta.get(_k):
-                return True
-        # Durable watcher_audit trigger_ready
-        _wa = meta.get("watcher_audit")
-        if isinstance(_wa, dict) and str(_wa.get("reason_code") or "") == "trigger_ready":
+
+        _row = dict(sig)
+        # The lifecycle bridge receives a signal-shaped mapping, while the
+        # canonical predicates receive an orders-shaped mapping. Supplying the
+        # known row status and canonical merged meta is an adapter only; it does
+        # not introduce another handoff definition.
+        _row["status"] = "PENDING_TRIGGER"
+        _row["meta"] = meta
+        try:
+            from ap.pending_trigger_classifier import (
+                PendingTriggerClassification as _PTC,
+                classify_pending_trigger_row as _classify_pending_trigger_row,
+                has_broker_handoff_evidence as _has_broker_handoff_evidence,
+                is_active_materialization_in_flight as _is_active_materialization_in_flight,
+            )
+        except Exception:
             return True
-        # Active materialization ownership/proof
-        if meta.get("materialization_owner") and meta.get("materialization_in_flight"):
+
+        if _classify_pending_trigger_row(_row) == _PTC.NOT_PENDING_TRIGGER:
             return True
-        return False
+        if _has_broker_handoff_evidence(_row):
+            return True
+        return bool(_is_active_materialization_in_flight(_row))
 
     def _restore_recovered_watcher_lifecycle(self, watched) -> tuple[bool, str]:
         """Restore in-memory lifecycle for a proven-recovery watcher.
@@ -3259,14 +3265,36 @@ class APEntryWatcher:
         # NOT lowercased: the durable row always stores it lowercase
         # ("live"/"paper"); any other form means the row is corrupt.
         sig = getattr(watched, "signal", {}) or {}
-        _raw_meta = sig.get("metadata") or sig.get("meta") or {}
-        if isinstance(_raw_meta, str):
+        if not isinstance(sig, dict):
+            return False, "recovery_lifecycle_malformed_signal"
+
+        # Parse both durable metadata aliases independently. An explicit
+        # malformed alias is not absence, and conflicting aliases are not
+        # resolved by truthiness or last-writer order.
+        _meta_sources: list[dict] = []
+        for _meta_key in ("metadata", "meta"):
+            if _meta_key not in sig:
+                continue
+            _raw_meta = sig.get(_meta_key)
+            if isinstance(_raw_meta, dict):
+                _meta_sources.append(_raw_meta)
+                continue
+            if not isinstance(_raw_meta, str) or not _raw_meta.strip():
+                return False, "recovery_lifecycle_malformed_durable_metadata"
             try:
-                import json as _json
-                _raw_meta = _json.loads(_raw_meta)
+                _parsed_meta = json.loads(_raw_meta)
             except Exception:
-                _raw_meta = {}
-        meta: dict = _raw_meta if isinstance(_raw_meta, dict) else {}
+                return False, "recovery_lifecycle_malformed_durable_metadata"
+            if not isinstance(_parsed_meta, dict):
+                return False, "recovery_lifecycle_malformed_durable_metadata"
+            _meta_sources.append(_parsed_meta)
+
+        meta: dict = {}
+        for _meta_source in _meta_sources:
+            for _meta_key, _meta_value in _meta_source.items():
+                if _meta_key in meta and meta[_meta_key] != _meta_value:
+                    return False, "recovery_lifecycle_conflicting_durable_metadata"
+                meta[_meta_key] = _meta_value
 
         def _blank(v) -> bool:
             return v is None or not str(v).strip()
@@ -3303,18 +3331,35 @@ class APEntryWatcher:
         if side not in ("CALL", "PUT"):
             return False, "recovery_lifecycle_invalid_side"
 
-        # Materialization generation: reject zero/negative if explicitly present
-        _gen_raw = sig.get("materialization_generation") or meta.get("materialization_generation")
-        if _gen_raw is not None and not isinstance(_gen_raw, bool):
-            try:
-                _gen_int = int(_gen_raw)
-                if _gen_int < 0:
-                    return False, "recovery_lifecycle_negative_generation"
-                # Zero generation is ambiguous — reject
-                if _gen_int == 0:
-                    return False, "recovery_lifecycle_zero_generation"
-            except (TypeError, ValueError):
+        # Materialization generation is an optional recovery authority in this
+        # contract, but every populated source must be strict and coherent.
+        # Never use ``or``: explicit zero/blank/False is data, not absence.
+        _generation_authorities: list[tuple[str, object]] = []
+        if "materialization_generation" in sig:
+            _generation_authorities.append(
+                ("signal", sig.get("materialization_generation"))
+            )
+        for _index, _meta_source in enumerate(_meta_sources):
+            if "materialization_generation" in _meta_source:
+                _generation_authorities.append(
+                    (f"metadata[{_index}]", _meta_source.get("materialization_generation"))
+                )
+
+        _parsed_generations: list[int] = []
+        for _authority_name, _gen_raw in _generation_authorities:
+            if isinstance(_gen_raw, bool) or not isinstance(_gen_raw, int):
                 return False, "recovery_lifecycle_malformed_generation"
+            if _gen_raw < 0:
+                return False, "recovery_lifecycle_negative_generation"
+            if _gen_raw == 0:
+                return False, "recovery_lifecycle_zero_generation"
+            _parsed_generations.append(_gen_raw)
+
+        if _parsed_generations and any(
+            _generation != _parsed_generations[0]
+            for _generation in _parsed_generations[1:]
+        ):
+            return False, "recovery_lifecycle_conflicting_generation"
 
         # ── Broker handoff evidence check (Correction 1) ──────────────────
         #

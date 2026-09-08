@@ -625,10 +625,12 @@ class TestBugA_LiveFailsClosed:
 
 class TestPR580AmendmentCorrections:
     """
-    Behavioral proof of the four corrections in the #580 amendment.
+    Behavioral proof of the #580 recovery lifecycle authority corrections.
 
-    Correction 1: Broker handoff evidence → HOLD before any registration.
-    Correction 2: Recovery identity must fail closed on every gap.
+    Correction 1: canonical broker handoff evidence → HOLD before any
+    registration; watcher_audit.trigger_ready alone is not broker evidence.
+    Correction 2: generation and recovery identity must fail closed on every
+    corruption or mismatch.
     Correction 3: Lifecycle import failure → HOLD (not soft success).
     Correction 4: Lifecycle validation happens BEFORE _pending.append().
     """
@@ -803,6 +805,92 @@ class TestPR580AmendmentCorrections:
         assert ok is False
         assert "generation" in reason
 
+    @pytest.mark.parametrize("malformed_metadata", [None, "", "not-json", []])
+    def test_c2_malformed_durable_metadata_is_hold(self, malformed_metadata):
+        """An explicit malformed metadata alias cannot become absence."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig["metadata"] = malformed_metadata
+        watched = ew.WatchedSignal(sig, overnight=False)
+
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False
+        assert "metadata" in reason
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+
+    def test_c2_conflicting_metadata_aliases_are_hold(self):
+        """Conflicting metadata/meta aliases never use last-writer order."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig["meta"] = dict(sig["metadata"])
+        sig["meta"]["materialization_generation"] = 2
+        watched = ew.WatchedSignal(sig, overnight=False)
+
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False
+        assert "conflicting" in reason
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+
+    @pytest.mark.parametrize(
+        "signal_generation,metadata_generation,should_admit",
+        [
+            (2, 2, True),
+            (0, 2, False),
+            (2, 0, False),
+            (1, 2, False),
+            (-1, 2, False),
+            (2, -1, False),
+            ("malformed", 2, False),
+            (2, "malformed", False),
+            (True, 2, False),
+            (2, True, False),
+            ("", 2, False),
+            (2, "", False),
+            (None, 2, False),
+            (2, None, False),
+            ("MISSING", 2, True),
+            (2, "MISSING", True),
+        ],
+    )
+    def test_c2_generation_authorities_are_independent_and_fail_closed(
+        self, signal_generation, metadata_generation, should_admit
+    ):
+        """Every populated generation is strict, and two values must agree.
+
+        This exercises the real recovery bridge through add_signal(), so a
+        rejected generation proves both zero lifecycle restoration and zero
+        behavior-active watcher registration. ``MISSING`` represents a truly
+        absent key; the current recovery contract permits the other valid
+        authority to carry the generation in that case.
+        """
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        if signal_generation == "MISSING":
+            sig.pop("materialization_generation", None)
+        else:
+            sig["materialization_generation"] = signal_generation
+        if metadata_generation == "MISSING":
+            sig["metadata"].pop("materialization_generation", None)
+        else:
+            sig["metadata"]["materialization_generation"] = metadata_generation
+
+        sid = sig["signal_id"]
+        ok = w.add_signal(sig)
+        assert ok is should_admit
+        if should_admit:
+            assert L.LEDGER.current_state(sid) == L.SignalState.WATCHING
+            assert len(w._pending) == 1
+        else:
+            assert L.LEDGER.current_state(sid) is None
+            assert w._pending == []
+            assert "generation" in w._last_reject_reason
+
     def test_c2_live_and_paper_modes_both_admitted(self):
         """Correction 2: exactly 'live' and 'paper' (lowercase) are admitted."""
         import ap_entry_watcher as ew, ap_lifecycle as L, uuid
@@ -844,10 +932,9 @@ class TestPR580AmendmentCorrections:
         ("broker_submit_key", "ap:lo-abc123"),
         ("broker_submit_payload_hash", "sha256:abc"),
         ("broker_ready", True),
-        ("recovery_submit_owner", "recovery:jason:live:lo-abc"),
     ])
     def test_c1_meta_broker_evidence_is_hold(self, meta_key, meta_value):
-        """Correction 1: meta broker-intent fields → HOLD."""
+        """Correction 1: canonical meta broker-intent fields → HOLD."""
         import ap_entry_watcher as ew
         _, w = self._bare_watcher()
         sig = self._recovery_sig()
@@ -857,20 +944,74 @@ class TestPR580AmendmentCorrections:
         assert ok is False
         assert "broker_handoff" in reason or "hold" in reason
 
-    def test_c1_watcher_audit_trigger_ready_is_hold(self):
+    def test_c1_watcher_audit_trigger_ready_is_not_broker_handoff(self):
         """
-        Correction 1: durable watcher_audit.reason_code == 'trigger_ready' →
-        HOLD. This is a durable lifecycle fact that the broker already
-        received a trigger-ready callback — recovery must not re-register.
+        Correction 1: trigger_ready is breach confirmation only. It does not
+        prove broker submission or broker ownership, so a clean recovered
+        watcher still restores NONE → ADOPTED → WATCHING.
         """
-        import ap_entry_watcher as ew
+        import ap_entry_watcher as ew, ap_lifecycle as L
         _, w = self._bare_watcher()
         sig = self._recovery_sig()
         sig["metadata"]["watcher_audit"] = {"reason_code": "trigger_ready"}
         watched = ew.WatchedSignal(sig, overnight=False)
         ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is True, f"trigger_ready alone must not hold recovery: {reason!r}"
+        assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.WATCHING
+        transitions = [
+            (entry.from_state, entry.to_state)
+            for entry in L.LEDGER.history(sig["signal_id"])
+        ]
+        assert (None, L.SignalState.ADOPTED) in transitions
+        assert (L.SignalState.ADOPTED, L.SignalState.WATCHING) in transitions
+
+    @pytest.mark.parametrize(
+        "surface,field,value",
+        [
+            ("signal", "broker_order_id", "TRD-READY-1"),
+            ("signal", "submitted_ts", "2026-09-08T16:00:00+00:00"),
+            ("metadata", "submit_intent_at", "2026-09-08T16:00:00+00:00"),
+            ("metadata", "broker_submit_key", "ap:lo-ready"),
+            ("metadata", "broker_ready", True),
+        ],
+    )
+    def test_c1_trigger_ready_plus_actual_canonical_handoff_holds(
+        self, surface, field, value
+    ):
+        """Actual canonical handoff evidence still wins over the audit label."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig["metadata"]["watcher_audit"] = {"reason_code": "trigger_ready"}
+        target = sig if surface == "signal" else sig["metadata"]
+        target[field] = value
+        watched = ew.WatchedSignal(sig, overnight=False)
+
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
         assert ok is False
         assert "broker_handoff" in reason or "hold" in reason
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+
+    def test_c1_canonical_active_materialization_handoff_is_hold(self):
+        """A complete current materializer proof remains the sole owner."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig["metadata"].update({
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
+            "materialization_in_flight": True,
+            "materialization_owner": "materializer:test-owner",
+            "materialization_lease_until": "2099-01-01T00:00:00+00:00",
+        })
+        watched = ew.WatchedSignal(sig, overnight=False)
+
+        ok, reason = w._restore_recovered_watcher_lifecycle(watched)
+        assert ok is False
+        assert "broker_handoff" in reason or "hold" in reason
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
 
     # ── Correction 4: lifecycle restored BEFORE _pending.append() ─────────
 

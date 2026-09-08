@@ -30,18 +30,23 @@ Before merge:
 Six P0-class corrections applied surgically to `ap_entry_watcher.py` per
 the amendment specification. Scope boundary unchanged.
 
-### Correction 1 — Broker handoff must block recovery before watcher admission
+### Correction 1 — Canonical broker handoff must block recovery before watcher admission
 
-`_restore_recovered_watcher_lifecycle()` now runs
-`_recovery_has_broker_handoff_evidence(sig, meta)` before any lifecycle write.
-Evidence list: `broker_order_id`, `submitted_ts`, `meta.broker_ready`,
-`meta.submit_intent_at`, `meta.broker_submit_key`,
-`meta.broker_submit_payload_hash`, `meta.recovery_submit_owner`,
-`meta.recovery_submit_fenced`, `meta.recovery_submit_lease_until`,
-`watcher_audit.reason_code == "trigger_ready"`, and active
-materialization ownership (`materialization_owner` + `materialization_in_flight`).
-Any evidence → HOLD; return before any watcher registration, lifecycle write,
-callback, or broker mutation.
+`_restore_recovered_watcher_lifecycle()` now adapts the existing canonical
+`ap.pending_trigger_classifier` authorities before any lifecycle write:
+`classify_pending_trigger_row()` owns populated row-level
+`broker_order_id`/`submitted_ts`, `has_broker_handoff_evidence()` owns durable
+submit-intent markers, and `is_active_materialization_in_flight()` owns the
+complete current materializer proof. Any canonical evidence → HOLD; an
+unavailable canonical authority also → HOLD. The bridge no longer maintains a
+second broker-handoff vocabulary.
+
+`watcher_audit.reason_code == "trigger_ready"` is deliberately not broker
+evidence. It proves watcher breach confirmation only. At this lifecycle-bridge
+boundary, a PENDING_TRIGGER row with that audit label but no canonical
+broker/materialization handoff evidence remains eligible for restoration. The
+shared due-retry classifier precedence remains untouched for its separate P0
+owner (#596).
 
 ### Correction 2 — Recovery identity must fail closed
 
@@ -50,9 +55,15 @@ identity from column values only — no metadata fallback for blank columns,
 no UUID fabrication, no mode fallback, no default side. Validated:
 `signal_id`, `ticker`, `client_id`, `execution_mode` (exactly `"live"` or
 `"paper"`, case-sensitive, no normalization), `local_order_id`,
-`canonical_signal_id`, `side` (exactly `"CALL"` or `"PUT"`),
-and `materialization_generation` (zero/negative rejected).
-Any gap → HOLD.
+`canonical_signal_id`, and `side` (exactly `"CALL"` or `"PUT"`). Metadata
+aliases are parsed independently; malformed or conflicting aliases → HOLD.
+
+Materialization generation is parsed independently from every populated
+signal/metadata authority. Each populated value must be a strict positive
+Python integer, and multiple populated values must agree exactly. Explicit
+zero, negative, boolean, string, float, malformed, or blank values never fall
+through to another source. A genuinely absent source may fall back to one
+valid source under the existing optional-generation contract.
 
 ### Correction 6 — Recheck the exact durable row before recovery classification
 
@@ -92,7 +103,9 @@ Production files touched:
 - `ap_entry_watcher.py`: `_restore_recovered_watcher_lifecycle()` fully
   hardened (Corrections 1-4), plus the exact durable plan/row identity fence
   in `watch()` (Correction 6). New static method
-  `_recovery_has_broker_handoff_evidence()`.
+  `_recovery_has_broker_handoff_evidence()` is only an adapter to the existing
+  canonical broker/materialization predicates; it does not define new broker
+  evidence.
   `add_signal()` reordered: validate → lifecycle → register.
   Guarded by `signal["__recovery_rearm"]` — ordinary new admissions untouched.
 - `ap/pending_trigger_restart_recovery.py`: docstring only — documents
@@ -105,7 +118,8 @@ Supporting files:
   (NONE/ADOPTED/WATCHING/terminal), non-recovery guard, identity gate
   refusal, `NONE→TRIGGER_READY` invariant, and zero broker mutation.
 - `tests/test_p0_pending_trigger_lifecycle_integrity.py::TestPR580AmendmentCorrections`:
-  26 focused amendment-correction tests; unrelated baseline tests in that
+  focused amendment-correction tests covering independent generation
+  authority and canonical broker-handoff behavior; unrelated baseline tests in that
   historical file are not part of this PR's gate.
 - `.github/workflows/p0_regression.yml`: adds the new test to the P0
   suite.
@@ -135,8 +149,8 @@ No strategy thresholds or broker semantics belong here.
 
 This PR does not modify `ap.pending_trigger_classifier` retry precedence or
 `_resolve_trigger_callback_disposition()` terminal-reason aliases. Those are
-the separate due-materialization-retry-liveness and terminal-watcher-
-convergence P0 ownership seams.
+the separate due-materialization-retry-liveness (#596) and terminal-watcher-
+convergence (#597) ownership seams.
 
 ---
 

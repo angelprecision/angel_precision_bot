@@ -705,6 +705,13 @@ class TestSeptember8JasonLiveRecoveryRearm:
             ("behavior_active_registration", L.SignalState.WATCHING),
         ]
 
+        # The test may run after the local wall clock crosses the production
+        # overnight threshold. Recovery/lifecycle ownership is independent of
+        # that scheduling boundary; pin this already-admitted watcher to the
+        # regular-session poll phase so the two observations below exercise the
+        # normal WATCHING -> TRIGGER_READY path deterministically.
+        watcher._pending[0].overnight = False
+
         watcher.on_trigger = MagicMock(return_value={"disposition": "KEEP_WATCHER"})
         watcher._poll_active_signals()
         assert watcher.on_trigger.call_count == 0
