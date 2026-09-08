@@ -426,6 +426,53 @@ def test_complete_empty_snapshot_and_exact_external_fill_use_existing_path(monke
     assert any("/orders" in call for call in broker.calls)
 
 
+def test_complete_snapshot_restart_rerun_does_not_duplicate_adoption_or_proof(monkeypatch):
+    """A restart after successful adoption/finalization must be a no-op."""
+    broker = _Broker(positions_payload=_payload([]), orders=[_filled_exit()])
+    durable_fills: list[dict] = []
+    adoption_calls: list[dict] = []
+    proof_calls: list[dict] = []
+    state = {"terminal": False}
+
+    monkeypatch.setattr(manual_mod, "MANUAL_CLOSE_INTERVAL_SEC", 0)
+    monkeypatch.setattr(manual_mod.time, "time", lambda: 1735830000.0)
+
+    def _load_state(*_):
+        if state["terminal"]:
+            return [], set(), {"position-592": list(durable_fills)}
+        return [_position()], set(), {}
+
+    monkeypatch.setattr(manual_mod, "load_manual_close_state", _load_state)
+    monkeypatch.setattr(manual_mod, "load_terminal_recovery_candidates", lambda *_: [])
+
+    def _adopt(**kwargs):
+        adoption_calls.append(kwargs)
+        durable_fills.extend(kwargs["evidence"]["fills"])
+        return True, "test_adoption"
+
+    monkeypatch.setattr(manual_mod, "adopt_external_exit_fills", _adopt)
+
+    def _finalize(**kwargs):
+        proof_calls.append(kwargs)
+        state["terminal"] = True
+        return True
+
+    first_runner = _runner(broker, _finalize)
+    manual_mod.detect_manual_closes(first_runner)
+
+    restarted_runner = _runner(broker, _finalize)
+    manual_mod.detect_manual_closes(restarted_runner)
+
+    assert len(adoption_calls) == 1
+    assert len(durable_fills) == 1
+    assert len(proof_calls) == 1
+    assert proof_calls[0]["position_id"] == "position-592"
+    assert first_runner.core.exit_eng.mark_position_closed.call_count == 1
+    assert restarted_runner.core.exit_eng.mark_position_closed.call_count == 0
+    assert sum("/positions" in call for call in broker.calls) == 1
+    assert sum("/orders" in call for call in broker.calls) == 1
+
+
 def test_well_formed_unrelated_stock_row_can_establish_option_absence(monkeypatch):
     broker = _Broker(
         positions_payload=_payload([{"symbol": "MSFT", "quantity": 20}]),
