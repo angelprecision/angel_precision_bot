@@ -20,6 +20,11 @@ from ap.admission_thresholds import (
     resolve_admission_thresholds,
 )
 
+# Master Control and the standalone exposure gate must resolve sector identity
+# from one canonical map. Keeping a second local map caused known tickers to
+# lose sector protection and unknown tickers to collapse into one fake bucket.
+from ap.exposure_gate import get_sector as _canonical_get_sector
+
 try:
     from ap.counterfactual_tracker import track_counterfactual_signal
 except Exception:  # pragma: no cover
@@ -477,48 +482,75 @@ def _setup_lifecycle_owner_key(signal: dict, *, raw_signal_id: str = "") -> str:
 class APMasterControl:
     """Single decision authority for whether a signal may become a trade."""
 
-    SECTOR_MAP: dict[str, str] = {
-        "AAPL": "tech",
-        "MSFT": "tech",
-        "NVDA": "tech",
-        "AMD": "tech",
-        "GOOGL": "tech",
-        "META": "tech",
-        "CRM": "tech",
-        "ORCL": "tech",
-        "TSLA": "tech",
-        "AMZN": "tech",
-        "NFLX": "tech",
-        "SNOW": "tech",
-        "JPM": "financials",
-        "BAC": "financials",
-        "GS": "financials",
-        "MS": "financials",
-        "C": "financials",
-        "WFC": "financials",
-        "UNH": "healthcare",
-        "JNJ": "healthcare",
-        "PFE": "healthcare",
-        "ABBV": "healthcare",
-        "MRK": "healthcare",
-        "LLY": "healthcare",
-        "WMT": "consumer",
-        "COST": "consumer",
-        "TGT": "consumer",
-        "LOW": "consumer",
-        "HD": "consumer",
-        "NKE": "consumer",
-        "XOM": "energy",
-        "CVX": "energy",
-        "SLB": "energy",
-        "CAT": "industrials",
-        "DE": "industrials",
-        "BA": "industrials",
-        "CMCSA": "telecom",
-        "VZ": "telecom",
-        "T": "telecom",
-        "DIS": "media",
-    }
+    @staticmethod
+    def _resolve_sector(symbol: Any) -> Optional[str]:
+        """Return canonical sector identity, or None when it is unknown.
+
+        Sector identity is a risk input, not a display default. A missing or
+        malformed symbol must never become a shared synthetic sector such as
+        "other". Known values are normalized to the lowercase form used by
+        Master Control's existing diagnostics and cap calculations.
+        """
+        if symbol is None:
+            return None
+        try:
+            raw_symbol = str(symbol).strip()
+        except Exception:
+            return None
+        if not raw_symbol:
+            return None
+        try:
+            resolved = _canonical_get_sector(raw_symbol)
+        except Exception as exc:
+            log.warning("Canonical sector resolution failed for %r: %s", raw_symbol, exc)
+            return None
+        normalized = str(resolved or "").strip().lower()
+        return normalized or None
+
+    @staticmethod
+    def _sector_telemetry(sector: Optional[str]) -> dict[str, Any]:
+        """Describe sector resolution for diagnostics only.
+
+        The telemetry bucket is never used as a risk key. A sector cap is
+        applied only when the candidate has a proven canonical sector.
+        """
+        if sector is None:
+            return {
+                "sector_resolution": "unknown",
+                "sector_cap_applied": False,
+                "sector_cap_skip_reason": "unknown_sector_identity",
+            }
+        return {
+            "sector_resolution": "known",
+            "sector_cap_applied": True,
+            "sector_cap_skip_reason": None,
+        }
+
+    def _sector_identity_block(
+        self,
+        *,
+        signal_id: str,
+        ticker: Any,
+        client_id: str,
+    ) -> ControlDecision:
+        """Reject a candidate whose canonical sector identity is unproven.
+
+        This is an eligibility block, not a sector-cap bypass. It deliberately
+        runs before selector/capital revalidation work can produce an
+        executable plan or hand one to the broker path.
+        """
+        return self._block(
+            signal_id,
+            ticker,
+            client_id,
+            "blocked_risk",
+            "SECTOR_IDENTITY_UNPROVEN",
+            reason_code="SECTOR_IDENTITY_UNPROVEN",
+            meta={
+                "sector": None,
+                **self._sector_telemetry(None),
+            },
+        )
 
     def __init__(
         self,
@@ -1164,12 +1196,19 @@ class APMasterControl:
     def _position_capital_for_exposure(cls, pos: dict) -> float:
         return cls._position_price_for_exposure(pos) * cls._position_qty_for_exposure(pos) * 100
 
-    def _sector_capital_deployed(self, positions: list, sector: str) -> float:
+    def _sector_capital_deployed(self, positions: list, sector: Optional[str]) -> float:
+        """Return exposure only for a proven, canonical sector identity.
+
+        None means the candidate sector is unknown, so no unrelated unknown
+        positions may be aggregated into a shared risk bucket.
+        """
+        if not sector:
+            return 0.0
         total = 0.0
         for pos in positions:
             ticker_in_pos = str(pos.get("underlying") or pos.get("ticker") or "")
-            pos_sector = self.SECTOR_MAP.get(ticker_in_pos.upper(), "other")
-            if pos_sector == sector:
+            pos_sector = self._resolve_sector(ticker_in_pos)
+            if pos_sector is not None and pos_sector == sector:
                 try:
                     total += self._position_capital_for_exposure(pos)
                 except Exception:
@@ -1848,21 +1887,37 @@ class APMasterControl:
         return True
 
     def get_sector_exposure(self, positions: list) -> dict[str, float]:
+        """Return reporting exposure with explicit identity diagnostics.
+
+        Unresolved names are symbol-qualified so reporting never creates a
+        shared synthetic sector or feeds one back into cap authority.
+        """
         exposure: dict[str, float] = {}
         for pos in positions:
-            ticker_in_pos = str(pos.get("underlying") or pos.get("ticker") or "")
-            sector = self.SECTOR_MAP.get(ticker_in_pos.upper(), "other")
+            raw_ticker = pos.get("underlying") or pos.get("ticker") or ""
+            ticker_in_pos = str(raw_ticker).strip().upper()
+            resolved_sector = self._resolve_sector(ticker_in_pos)
+            if resolved_sector is None:
+                # Do not aggregate unrelated unresolved names into one risk key.
+                # Keep the missing authority explicit and symbol-qualified.
+                sector_key = "sector_identity_unproven:" + (ticker_in_pos or "<missing>")
+            else:
+                sector_key = resolved_sector
             try:
-                exposure[sector] = exposure.get(sector, 0.0) + self._position_capital_for_exposure(pos)
+                exposure[sector_key] = exposure.get(sector_key, 0.0) + self._position_capital_for_exposure(pos)
             except Exception as _exp_err:
-                log.error("Failed to calculate exposure for sector %s: %s", sector, _exp_err)
+                log.error("Failed to calculate exposure for sector %s: %s", sector_key, _exp_err)
         return exposure
 
     @_serialize_setup_cache_evaluation
     def evaluate(self, signal: dict, client_id: str = "default") -> ControlDecision:
         bootstrap_mode = False
         total_trades = 0
-        ticker = signal.get("ticker", signal.get("symbol", "?"))
+        raw_ticker = signal.get("ticker", signal.get("symbol", "?"))
+        if isinstance(raw_ticker, str):
+            ticker = raw_ticker.strip()
+        else:
+            ticker = str(raw_ticker or "").strip()
 
         if ticker and ticker.upper() in _INDEX_TO_ETF:
             mapped = _INDEX_TO_ETF[ticker.upper()]
@@ -1944,6 +1999,18 @@ class APMasterControl:
         current_mode = self._current_mode()
         if current_mode == "READ_ONLY":
             return self._block(signal_id, ticker, client_id, "blocked_system", "mode_read_only")
+
+        # Sector identity is an executable risk prerequisite. Resolve it after
+        # existing system/side gates but before durable admission work, so an
+        # unknown symbol cannot become an approved plan or reach the selector.
+        sector = self._resolve_sector(ticker)
+        if sector is None:
+            return self._sector_identity_block(
+                signal_id=signal_id,
+                ticker=ticker,
+                client_id=client_id,
+            )
+
         # Live trading must not depend on backtest EV metadata being present.
         # Scanner score remains the gating score for both paper and live.
         effective_score = score
@@ -2392,8 +2459,15 @@ class APMasterControl:
                     f"capital_limit (projected ${projected_total:.0f} > ${max_capital:.0f})",
                 )
 
-        sector = self.SECTOR_MAP.get(ticker.upper(), "other")
-        sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
+        if sector is None:
+            return self._sector_identity_block(
+                signal_id=signal_id,
+                ticker=ticker,
+                client_id=client_id,
+            )
+        sector_deployed = self._sector_capital_deployed(
+            snap["open_positions"] + snap["closing_positions"], sector
+        )
         # PR E FIX-3: use the snapshot value, not the instance field.
         effective_equity = account_equity
         max_sector_capital = effective_equity * self.max_sector_pct
@@ -3045,7 +3119,8 @@ class APMasterControl:
                 "sizing_method": _sizing.method if _sizing is not None else "tier_fallback",
                 "sizing_reason": _sizing.reason if _sizing is not None else "",
                 "intel_result": intel,
-                "sector": self.SECTOR_MAP.get(ticker.upper(), "other"),
+                "sector": sector,
+                **self._sector_telemetry(sector),
                 # PR: sizing-bootstrap-fix — dedicated, named bucket so
                 # future audits can answer "why N contracts?" from a single
                 # JSON path in orders.meta. Persisted unconditionally on
@@ -4106,7 +4181,19 @@ class APMasterControl:
         except Exception:
             pass
         ticker = plan.ticker
+        signal_id = plan.signal_id
         execution_mode = "live" if self._is_live_mode() else "paper"
+
+        # Resolve before bootstrap clamp, snapshot, pending-capital reads, or
+        # any plan mutation. Initial evaluation and revalidation therefore
+        # share the same canonical identity authority and fail-closed result.
+        sector = self._resolve_sector(ticker)
+        if sector is None:
+            return self._sector_identity_block(
+                signal_id=signal_id,
+                ticker=ticker,
+                client_id=client_id,
+            )
 
         # ---------------------------------------------------------------
         # PR p0/bootstrap-affordable-selection — review fix #1 (2026-06-05):
@@ -4166,7 +4253,6 @@ class APMasterControl:
         # consistent reader API. The lock is NEVER held across
         # _get_snapshot / _pending_capital_from_snapshot_or_db / DB calls.
         equity, _ = self._equity_snapshot()
-        signal_id = plan.signal_id
         snap = self._get_snapshot(client_id, ticker=ticker, signal_id=signal_id)
         if self._is_live_mode() and not snap.get("_snapshot_ok", True):
             return self._block(
@@ -4246,8 +4332,15 @@ class APMasterControl:
         max_capital = per_trade_budget
         pct_used = projected_total_exposure / equity * 100 if equity > 0 else 0
 
-        sector = self.SECTOR_MAP.get(ticker.upper(), "other")
-        sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
+        if sector is None:
+            return self._sector_identity_block(
+                signal_id=signal_id,
+                ticker=ticker,
+                client_id=client_id,
+            )
+        sector_deployed = self._sector_capital_deployed(
+            snap["open_positions"] + snap["closing_positions"], sector
+        )
         proj_sector = sector_deployed + real_cost
         max_sector = equity * self.max_sector_pct
 
@@ -4281,6 +4374,7 @@ class APMasterControl:
                 ticker_limit=max_ticker,
                 blocked=blocked,
                 block_reason=block_reason,
+                **self._sector_telemetry(sector),
             )
 
         # ── PR #155 split-cap revalidate_exposure ─────────────────────────────
@@ -4584,6 +4678,8 @@ class APMasterControl:
             return "DEDUP_BLOCK"
         if "capital_limit" in r:
             return "CAPITAL_UTIL_BLOCK"
+        if "sector_identity_unproven" in r:
+            return "SECTOR_IDENTITY_UNPROVEN"
         if "sector_cap" in r:
             return "SECTOR_CAP_BLOCK"
         if "ticker_cap" in r:
@@ -4635,7 +4731,7 @@ class APMasterControl:
         pending_reserved: Optional[float] = None,
         remaining_capacity: Optional[float] = None,
         pct_used: float,
-        sector: str,
+        sector: Optional[str],
         sector_deployed: float,
         sector_projected: float,
         sector_limit: float,
@@ -4644,6 +4740,9 @@ class APMasterControl:
         ticker_limit: float,
         blocked: bool,
         block_reason: str,
+        sector_resolution: str = "unknown",
+        sector_cap_applied: bool = False,
+        sector_cap_skip_reason: Optional[str] = "unknown_sector_identity",
     ):
         decision = "BLOCKED" if blocked else "APPROVED"
         per_trade_budget_value = float(limit if per_trade_budget is None else per_trade_budget)
@@ -4679,6 +4778,9 @@ class APMasterControl:
             "headroom": round(remaining_capacity_value, 2),
             "pct_used": round(pct_used, 1),
             "sector": sector,
+            "sector_resolution": sector_resolution,
+            "sector_cap_applied": sector_cap_applied,
+            "sector_cap_skip_reason": sector_cap_skip_reason,
             "sector_deployed": round(sector_deployed, 2),
             "sector_projected": round(sector_projected, 2),
             "sector_limit": round(sector_limit, 2),
