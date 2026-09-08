@@ -214,7 +214,6 @@ def test_strict_positions_reader_propagates_transport_failure():
         {"positions": {"position": [{"symbol": "", "quantity": 1}]}},
         {"positions": {"position": [{"symbol": CONTRACT}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 0}]}},
-        {"positions": {"position": [{"symbol": CONTRACT, "quantity": -1}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1.5}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": True}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": False}]}},
@@ -224,8 +223,9 @@ def test_strict_positions_reader_propagates_transport_failure():
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": ""}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": "garbage"}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "qty": 2}]}},
-        {"positions": {"position": [{"symbol": CONTRACT, "short_quantity": 1}]}},
-        {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "side": "short"}]}},
+        {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "short_quantity": 2}]}},
+        {"positions": {"position": [{"symbol": CONTRACT, "quantity": -1, "side": "long"}]}},
+        {"positions": {"position": [{"symbol": CONTRACT, "side": "short", "position_type": "long"}]}},
         {"positions": {"position": [{"symbol": CONTRACT, "quantity": 1, "cost_basis": "nan"}]}},
     ],
 )
@@ -404,7 +404,44 @@ def test_postgres_padded_db_occ_preserves_restore_behavior(
     }
 
 
-def test_postgres_duplicate_padded_and_compact_broker_rows_hold_safely(
+def test_postgres_duplicate_padded_and_compact_rows_with_identical_qty_collapse_and_restore(
+    postgres_closed_row,
+):
+    """Compact/padded duplicates of the same exact OCC may collapse — but
+    only because their quantity authority agrees. See the CONFLICTING
+    variant below for the case that must still HOLD."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert(
+        contract=PADDED_CONTRACT,
+        option_symbol=PADDED_CONTRACT,
+        underlying="GS",
+        ticker="GS",
+    )
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": PADDED_CONTRACT, "quantity": 5},
+                    {"symbol": PADDED_COMPACT_CONTRACT, "quantity": 5},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_duplicate_padded_and_compact_rows_with_conflicting_qty_hold_safely(
     postgres_closed_row,
 ):
     insert, read, executed_sql = postgres_closed_row
@@ -419,7 +456,7 @@ def test_postgres_duplicate_padded_and_compact_broker_rows_hold_safely(
             "positions": {
                 "position": [
                     {"symbol": PADDED_CONTRACT, "quantity": 5},
-                    {"symbol": PADDED_COMPACT_CONTRACT, "quantity": 5},
+                    {"symbol": PADDED_COMPACT_CONTRACT, "quantity": 3},
                 ]
             }
         }
@@ -504,4 +541,205 @@ def test_postgres_unproven_execution_mode_does_not_mutate_closed_row(
     }
     assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
     assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR #594 AMENDMENT — Correction 1: signed broker quantities must not poison
+# an otherwise valid snapshot.
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_strict_positions_reader_returns_negative_quantity_for_short_row():
+    rows = _tradier(
+        payload={"positions": {"position": [{"symbol": CONTRACT, "quantity": -3}]}}
+    ).list_positions_strict()
+    assert rows[0]["quantity"] == -3
+
+
+def test_strict_positions_reader_derives_negative_quantity_from_short_quantity_field():
+    rows = _tradier(
+        payload={"positions": {"position": [{"symbol": CONTRACT, "short_quantity": 3}]}}
+    ).list_positions_strict()
+    assert rows[0]["quantity"] == -3
+
+
+def test_strict_positions_reader_derives_negative_quantity_from_direction_hint():
+    rows = _tradier(
+        payload={
+            "positions": {
+                "position": [{"symbol": CONTRACT, "quantity": 3, "side": "short"}]
+            }
+        }
+    ).list_positions_strict()
+    assert rows[0]["quantity"] == -3
+
+
+def test_postgres_unrelated_negative_equity_does_not_poison_target_restore(
+    postgres_closed_row,
+):
+    """Signed matrix #1: exact target long option + unrelated negative
+    equity position — target repair proceeds normally."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": "MSFT", "quantity": -100},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_unrelated_negative_option_does_not_poison_target_restore(
+    postgres_closed_row,
+):
+    """Signed matrix #2: exact target long option + unrelated negative
+    option position — target repair proceeds normally."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 5},
+                    {"symbol": "MSFT260620P00300000", "quantity": -2},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_exact_target_negative_quantity_holds_without_mutation(
+    postgres_closed_row,
+):
+    """Signed matrix #3: exact target OCC itself is negative (short) — must
+    not be accepted as long RESTORE authority, and must not be silently
+    treated as flat either. Zero mutation."""
+    insert, read, executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={"positions": {"position": [{"symbol": CONTRACT, "quantity": -2}]}}
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR #594 AMENDMENT — Correction 2: CLOSED option repair requires exact OCC
+# identity on both the durable target and the broker-side match.
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_postgres_generic_ticker_durable_target_identity_unproven_holds(
+    postgres_closed_row,
+):
+    """Cross-asset #7: durable CLOSED target is a generic ticker only —
+    target identity unproven, HOLD, zero mutation."""
+    insert, read, executed_sql = postgres_closed_row
+    insert(contract="AAPL", option_symbol="AAPL", underlying="AAPL", ticker="AAPL")
+    broker = _tradier(
+        payload={"positions": {"position": [{"symbol": "AAPL", "quantity": 100}]}}
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 2,
+        "close_source": "LEGACY_CLOSE",
+    }
+    assert not any(sql.startswith("UPDATE POSITIONS") for sql in executed_sql)
+    assert all(sql.startswith("SELECT") for sql in executed_sql)
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_exact_occ_target_absent_flattens_despite_unrelated_equity(
+    postgres_closed_row,
+):
+    """Cross-asset #6: durable target is exact OCC; broker contains only the
+    same underlying's equity row — no RESTORE from equity, and absence
+    inference is still valid because the snapshot is complete and
+    unambiguous, so FLATTEN proceeds."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={"positions": {"position": [{"symbol": "AAPL", "quantity": 100}]}}
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 0,
+        "close_source": "CLOSED_REPAIR",
+    }
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_equity_and_option_same_root_only_option_is_target_authority(
+    postgres_closed_row,
+):
+    """Cross-asset #11: broker holds equity AAPL and option AAPL OCC
+    simultaneously — only the exact OCC is target authority."""
+    insert, read, _executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": "AAPL", "quantity": 100},
+                    {"symbol": CONTRACT, "quantity": 5},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
     _assert_no_broker_mutations(broker)

@@ -5557,7 +5557,17 @@ class APBrokerReconciler:
 
     @staticmethod
     def _closed_repair_position_qty(bp: dict) -> int:
-        """Read one strict-repair quantity without lossy normalization."""
+        """Read one strict-repair signed quantity without lossy normalization.
+
+        Sign is legitimate broker truth: negative means short. A short (or
+        short-flagged) row is structurally valid on its own and must not be
+        rejected here — this only proves a well-formed, non-zero net
+        quantity exists on the row. It does NOT decide target-option
+        authority; callers must independently confirm exact OCC identity
+        and side compatibility before treating a positive result as RESTORE
+        authority (see ``_closed_repair_broker_quantities`` and the
+        target-side check in ``_repair_closed_positions_with_remaining_qty``).
+        """
         if not isinstance(bp, dict):
             raise ValueError("closed_repair_broker_position_malformed")
 
@@ -5566,47 +5576,50 @@ class APBrokerReconciler:
         if isinstance(raw, dict):
             records.append(raw)
 
-        values: list[int] = []
+        def _integral(value):
+            if value is None or isinstance(value, bool):
+                raise ValueError("closed_repair_broker_position_malformed")
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    raise ValueError("closed_repair_broker_position_malformed")
+            try:
+                parsed = Decimal(str(value))
+            except Exception as exc:
+                raise ValueError(
+                    "closed_repair_broker_position_malformed"
+                ) from exc
+            if not parsed.is_finite() or parsed != parsed.to_integral_value():
+                raise ValueError("closed_repair_broker_position_malformed")
+            return int(parsed)
+
+        net: Optional[int] = None
+        direction_hint: Optional[str] = None
+
         for record in records:
+            magnitude_candidates: list[int] = []
             for key in ("quantity", "qty", "long_quantity"):
-                if key not in record:
-                    continue
-                value = record[key]
-                if value is None or isinstance(value, bool):
-                    raise ValueError("closed_repair_broker_position_malformed")
-                if isinstance(value, str):
-                    value = value.strip()
-                    if not value:
-                        raise ValueError("closed_repair_broker_position_malformed")
-                try:
-                    parsed = Decimal(str(value))
-                except Exception as exc:
-                    raise ValueError(
-                        "closed_repair_broker_position_malformed"
-                    ) from exc
-                if not parsed.is_finite() or parsed != parsed.to_integral_value():
-                    raise ValueError("closed_repair_broker_position_malformed")
-                quantity = int(parsed)
-                if quantity <= 0:
-                    raise ValueError("closed_repair_broker_position_malformed")
-                values.append(quantity)
+                if key in record:
+                    magnitude_candidates.append(_integral(record[key]))
+
+            if magnitude_candidates and len(set(magnitude_candidates)) != 1:
+                raise ValueError("closed_repair_broker_position_malformed")
+            record_net = magnitude_candidates[0] if magnitude_candidates else None
 
             if "short_quantity" in record:
-                value = record["short_quantity"]
-                if value is None or isinstance(value, bool):
+                raw_short = _integral(record["short_quantity"])
+                short_signal = -abs(raw_short) if raw_short != 0 else 0
+                if short_signal != 0:
+                    if record_net is not None and record_net != short_signal:
+                        raise ValueError(
+                            "closed_repair_broker_position_malformed"
+                        )
+                    record_net = short_signal if record_net is None else record_net
+
+            if record_net is not None:
+                if net is not None and net != record_net:
                     raise ValueError("closed_repair_broker_position_malformed")
-                try:
-                    short_quantity = Decimal(str(value))
-                except Exception as exc:
-                    raise ValueError(
-                        "closed_repair_broker_position_malformed"
-                    ) from exc
-                if (
-                    not short_quantity.is_finite()
-                    or short_quantity != short_quantity.to_integral_value()
-                    or int(short_quantity) != 0
-                ):
-                    raise ValueError("closed_repair_broker_position_malformed")
+                net = record_net
 
             for key in ("side", "position_type", "direction"):
                 if key not in record or record[key] in (None, ""):
@@ -5621,14 +5634,43 @@ class APBrokerReconciler:
                     .replace("-", " ")
                 )
                 if "short" in direction or direction in {"sell to open", "selltoopen"}:
+                    hint = "short"
+                elif "long" in direction or direction in {"buy to open", "buytoopen"}:
+                    hint = "long"
+                else:
+                    continue
+                if direction_hint not in (None, hint):
                     raise ValueError("closed_repair_broker_position_malformed")
+                direction_hint = hint
 
-        if not values or len(set(values)) != 1:
+        if net is None:
             raise ValueError("closed_repair_broker_position_malformed")
-        return values[0]
+
+        if direction_hint == "short" and net > 0:
+            net = -net
+        elif direction_hint == "long" and net < 0:
+            raise ValueError("closed_repair_broker_position_malformed")
+
+        if net == 0:
+            raise ValueError("closed_repair_broker_position_malformed")
+
+        return net
 
     def _closed_repair_broker_quantities(self) -> dict[str, int]:
-        """Build exact contract quantities from the strict broker-read seam."""
+        """Build exact-OCC target-authority quantities from the strict seam.
+
+        Every structurally valid row (including unrelated short/negative
+        positions) is read without raising — a valid unrelated position must
+        never poison the whole snapshot. Only rows that resolve to an exact
+        canonical OCC option identity are eligible target-option authority;
+        generic underlying/equity rows remain valid snapshot members but are
+        excluded from this map since an underlying symbol is never option
+        lifecycle authority. Duplicate representations of the same exact OCC
+        (e.g. compact vs. provider-padded root) collapse only when they carry
+        identical quantity authority; conflicting duplicates fail closed.
+        """
+        from ap.exit_safety import is_valid_exact_occ_contract
+
         strict_reader = getattr(self.broker, "list_positions_strict", None)
         if not callable(strict_reader):
             raise RuntimeError("closed_repair_strict_positions_reader_missing")
@@ -5649,9 +5691,19 @@ class APBrokerReconciler:
             contract = self._norm_contract(raw_contract)
             if not re.fullmatch(r"[A-Z0-9.]{1,32}", contract):
                 raise ValueError("closed_repair_broker_position_malformed")
+
+            qty = self._closed_repair_position_qty(row)
+
+            if not is_valid_exact_occ_contract(contract):
+                # Structurally valid snapshot member (e.g. an equity row) —
+                # never option-target authority. Do not add to the map.
+                continue
+
             if contract in quantities:
-                raise ValueError("closed_repair_broker_snapshot_ambiguous")
-            quantities[contract] = self._closed_repair_position_qty(row)
+                if quantities[contract] != qty:
+                    raise ValueError("closed_repair_broker_snapshot_ambiguous")
+                continue
+            quantities[contract] = qty
         return quantities
 
     def _repair_closed_positions_with_remaining_qty(self, summary: dict) -> None:
@@ -5675,7 +5727,7 @@ class APBrokerReconciler:
         """
         try:
             from ap.db import conn, run_with_retry
-            from ap.exit_safety import _normalize_contract
+            from ap.exit_safety import _normalize_contract, is_valid_exact_occ_contract
 
             repair_mode = _normalize_execution_mode(self.execution_mode)
             if repair_mode is None:
@@ -5760,6 +5812,26 @@ class APBrokerReconciler:
                 rem_qty    = int(row.get("quantity_remaining") or 0)
                 full_qty   = int(row.get("qty") or rem_qty)
 
+                # A durable CLOSED row must prove an exact canonical OCC option
+                # identity before broker presence/absence is evaluated at all.
+                # A generic underlying ticker (e.g. an equity symbol) is never
+                # option lifecycle authority and must never be treated as a
+                # fallback target identity.
+                if not is_valid_exact_occ_contract(contract):
+                    log.error(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR TARGET-IDENTITY-UNPROVEN | "
+                        "pos=%s contract=%r | durable target does not resolve to "
+                        "an exact canonical OCC option identity — holding, "
+                        "zero mutation",
+                        self.client_id, pos_id, contract,
+                    )
+                    summary.setdefault("errors", []).append(
+                        "closed_repair_target_identity_unproven"
+                    )
+                    summary["broker_positions_hidden_by_closed_status_count"] = \
+                        int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    continue
+
                 if not broker_truth_available:
                     # Cannot verify — flag for operator, do not touch status
                     log.error(
@@ -5773,7 +5845,29 @@ class APBrokerReconciler:
                         int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
                     continue
 
+                target_present = contract in broker_open_by_contract
                 broker_qty = broker_open_by_contract.get(contract, 0)
+
+                if target_present and broker_qty <= 0:
+                    # Exact target OCC exists at the broker but its quantity is
+                    # not long-compatible (e.g. a negative/short quantity at
+                    # this exact contract). It is neither valid RESTORE
+                    # authority nor genuinely absent — never silently RESTORE
+                    # a long CLOSED position from this, and never FLATTEN a
+                    # target that broker truth shows is not actually flat.
+                    log.error(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR TARGET-SIDE-MISMATCH | "
+                        "pos=%s contract=%s broker_qty=%d | exact target OCC "
+                        "present with a non-long-compatible quantity — "
+                        "holding, zero mutation",
+                        self.client_id, pos_id, contract, broker_qty,
+                    )
+                    summary.setdefault("errors", []).append(
+                        "closed_repair_target_side_mismatch"
+                    )
+                    summary["broker_positions_hidden_by_closed_status_count"] = \
+                        int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    continue
 
                 if broker_qty > 0:
                     # Broker still holds this contract — restore to managed status

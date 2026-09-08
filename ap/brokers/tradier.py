@@ -536,10 +536,7 @@ class TradierBroker(BrokerAdapter):
             raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED") from exc
         if not parsed.is_finite() or parsed != parsed.to_integral_value():
             raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
-        quantity = int(parsed)
-        if quantity < 0:
-            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
-        return quantity
+        return int(parsed)
 
     @staticmethod
     def _strict_optional_float(value: Any) -> float:
@@ -573,21 +570,36 @@ class TradierBroker(BrokerAdapter):
 
     @classmethod
     def _strict_position_quantity(cls, row: dict) -> int:
-        values: list[int] = []
+        """Resolve one broker row to a signed, non-zero net quantity.
+
+        Sign is legitimate broker truth: negative means short. A short (or
+        short-flagged) row is structurally valid on its own — it must not
+        poison the whole snapshot. This only proves a well-formed quantity
+        exists on THIS row; it never decides whether the row is usable as
+        target-option RESTORE authority for some other repair — that is an
+        independent decision made by the caller against the exact target
+        identity and required sign.
+        """
+        magnitude_candidates: list[int] = []
         for key in ("quantity", "qty", "long_quantity"):
             if key in row:
-                values.append(cls._strict_integral_quantity(row[key]))
+                magnitude_candidates.append(cls._strict_integral_quantity(row[key]))
+        if magnitude_candidates and len(set(magnitude_candidates)) != 1:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+        net = magnitude_candidates[0] if magnitude_candidates else None
 
         if "short_quantity" in row:
-            short_quantity = cls._strict_integral_quantity(row["short_quantity"])
-            if short_quantity != 0:
-                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            raw_short = cls._strict_integral_quantity(row["short_quantity"])
+            short_signal = -abs(raw_short) if raw_short != 0 else 0
+            if short_signal != 0:
+                if net is not None and net != short_signal:
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+                net = short_signal if net is None else net
 
-        if not values or len(set(values)) != 1:
-            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
-        if values[0] <= 0:
+        if net is None:
             raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
 
+        direction_hint: Optional[str] = None
         for key in ("side", "position_type", "direction"):
             if key not in row or row[key] in (None, ""):
                 continue
@@ -595,9 +607,24 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
             direction = row[key].strip().lower().replace("_", " ").replace("-", " ")
             if "short" in direction or direction in {"sell to open", "selltoopen"}:
+                hint = "short"
+            elif "long" in direction or direction in {"buy to open", "buytoopen"}:
+                hint = "long"
+            else:
+                continue
+            if direction_hint not in (None, hint):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            direction_hint = hint
 
-        return values[0]
+        if direction_hint == "short" and net > 0:
+            net = -net
+        elif direction_hint == "long" and net < 0:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        if net == 0:
+            raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+
+        return net
 
     @classmethod
     def _normalize_strict_positions_payload(cls, payload: Any) -> list[dict]:
@@ -624,7 +651,7 @@ class TradierBroker(BrokerAdapter):
             raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
 
         normalized: list[dict] = []
-        seen_symbols: set[str] = set()
+        seen: dict[str, dict] = {}
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
@@ -635,13 +662,8 @@ class TradierBroker(BrokerAdapter):
             padded = _STRICT_PADDED_OCC_RE.fullmatch(symbol)
             if padded:
                 symbol = f"{padded.group(1)}{padded.group(2)}"
-            if (
-                not symbol
-                or not re.fullmatch(r"[A-Z0-9.]{1,32}", symbol)
-                or symbol in seen_symbols
-            ):
+            if not symbol or not re.fullmatch(r"[A-Z0-9.]{1,32}", symbol):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
-            seen_symbols.add(symbol)
 
             quantity = cls._strict_position_quantity(row)
             cost_basis = cls._strict_optional_float(row.get("cost_basis"))
@@ -650,11 +672,23 @@ class TradierBroker(BrokerAdapter):
                 "CALL" if match and match.group(1) == "C"
                 else "PUT" if match else ""
             )
-            normalized.append({
+
+            if symbol in seen:
+                # Compact/padded duplicate representations of the same exact
+                # identity may only collapse when their authority agrees.
+                # A contradictory duplicate (different quantity) fails closed
+                # rather than silently picking one.
+                if seen[symbol]["quantity"] != quantity:
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+                continue
+
+            entry = {
                 "symbol": symbol,
                 "quantity": quantity,
                 "cost_basis": cost_basis,
                 "side": side,
                 "raw": dict(row),
-            })
+            }
+            seen[symbol] = entry
+            normalized.append(entry)
         return normalized
