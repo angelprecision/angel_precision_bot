@@ -4,150 +4,16 @@ on:
   push:
     branches:
       - main
+      - p1/safe-partial-source-identity-20260907
   pull_request:
     branches:
       - main
-
-env:
-  P0_TEST_INVENTORY: >-
-    tests/test_osm_retry_idempotency.py
-    tests/test_force_close_breaker.py
-    tests/test_readiness_contract.py
-    tests/test_funnel_fixes.py
-    tests/test_p0_regression_suite.py
-    tests/test_p0_prebreach_stop_activation.py
-    tests/test_p0_entry_metadata_guard.py
-    tests/test_p0_trade_flow_contracts.py
-    tests/test_p0_fresh_sync_live_submit_quote.py
-    tests/test_p0_canonical_live_entry_confirmation.py
-    tests/test_p0_deferred_breach_lifecycle_completion.py
-    tests/test_p0_amendment10_recovery_full_wiring.py
-    tests/test_p0_amendment11_ownership_through_cleanup.py
-    tests/test_p0_watcher_recovery_execution_ownership.py
-    tests/test_p0_watcher_conflict_cancellation_proof.py
-    tests/test_p0_seam1_pre_submit_proof_retry.py
-    tests/test_p0_seam2_timing_boundary.py
-    tests/test_p0_selector_retry_taxonomy.py
-    tests/test_p1_selector_identity_assertion_mode_fallback.py
-    tests/test_p1_intelligence_admission_policy.py
-    tests/test_p1_intel_admission_e2e_final_gate.py
-    tests/test_p0_forward_regime_advisory_flow.py
-    tests/test_p0_strict_direct_quote_cache.py
-    tests/test_p0_selector_direct_quote_budget_authority.py
-    tests/test_p0_live_deferred_capacity_authority.py
-    tests/test_p0_selector_terminal_truth_ranked_quotes_current_main.py
-    tests/test_p0_trigger_anchored_strike_selection.py
-    tests/test_p0_selector_recovery_capacity_and_validity.py
-    tests/test_p0_selector_recovery_cursor.py
-    tests/test_p0_selector_recovery_july27_replay.py
-    tests/test_p0_request_scope_moneyness_terminalization.py
-    tests/test_p0_selector_recovery_production_replay_491.py
-    tests/test_p0_jason_live_moneyness_replay_20260819_21.py
-    tests/test_p0_item11_behavioral_regressions.py
-    tests/test_p0_audit_blockers_401.py
-    tests/test_p0_selector_recovery_deploy_preflight.py
-    tests/test_p0_pr401_deployability_closure.py
-    tests/test_p0_selector_cursor_strictness.py
-    tests/test_p0_direction_reversal_rearm.py
-    tests/test_p0_rearm_watcher_required_routing.py
-    tests/test_p0_pr418_preflight_coverage_parity.py
-    tests/test_p0_broker_owned_exit_requested_recovery.py
-    tests/test_p0_broker_owned_exit_recovery_preflight.py
-    tests/test_p0_pr566_signed_position_truth.py
-    tests/test_fill_monitor_mvp_hardening.py
-    tests/test_p0_trace_non_authority.py
-    tests/test_p0_filled_entry_durable_identity_handoff.py
-    tests/test_p0_disable_standing_protective_stop.py
-    tests/test_p0_seam4_e2e_deferred_lifecycle.py
-    tests/test_p0_intelligence_postgres.py
-    tests/test_p0_pending_trigger_restart_recovery.py
-    tests/test_entry_watcher_audit.py
-    tests/test_p0_watcher_invalidation_ownership.py
-    tests/test_p0_watcher_breach_continuity_bounded_gap.py
-    tests/test_p0_watcher_missing_observation_hold.py
-    tests/test_p0_watcher_zero_quote_breach_guard.py
-    tests/test_p0_watcher_same_poll_stop_truth.py
-    tests/test_p0_watcher_rollback_exact_registration_identity.py
-    tests/test_p0_broker_open_protective_monitoring.py
-    tests/test_p0_final_duplicate_honesty.py
-    tests/test_p0_setup_lifecycle_owner.py
-    tests/test_p0_autonomous_startup_scheduler_contract.py
-    tests/test_p0_autonomous_morning_handoff.py
-    tests/test_p0_overnight_reeval_retry_liveness.py
-    tests/test_p0_overnight_mixed_inventory_watcher_first.py
-    tests/test_p0_late_attachment_continuation.py
-    tests/test_p0_late_attachment_watcher_integration.py
-    tests/test_p0_july23_late_attachment_replay.py
-    tests/test_p0_signals_lookback_session_aware.py
-    tests/test_p0_source_lookup_failure.py
-    tests/test_p0_open_revalidation_late_attachment.py
-    tests/test_p0_hydration_identity_and_target_complete.py
-    tests/test_p0_shared_fetch_limit_unified.py
-    tests/test_p0_active_order_fence_full_family.py
-    tests/test_p0_classifier_import_failure_fail_closed.py
-    tests/test_p0_decisive_drift_wired.py
-    tests/test_p0_late_attachment_provenance_gate.py
-    tests/test_p0_reattach_no_cancel_on_missing_quote.py
-    tests/test_p0_reattach_two_attempt_order_preservation.py
-    tests/test_p0_deferred_due_retry_ownership.py
-    tests/test_p0_attempt_mirror_atomic_advance.py
-    tests/test_p0_deferred_blank_contract_ownership.py
-    tests/test_p0_watcher_materialization_ownership.py
-    tests/test_p0_fenced_retry_terminalization.py
-    tests/test_p0_deferred_materialization_copyback_before_proof.py
-    tests/test_p0_amendment3_monotonic_generation_fencing.py
-    tests/test_p0_amendment6_broker_ambiguity_reconciler.py
-    tests/test_p0_osm_broker_submit_boundary.py
-    tests/test_p0_exit_closed_guard_and_circuit_breaker.py
-    tests/test_p0_unknown_execution_mode_fail_closed.py
-    tests/test_p0_exit_engine_broker_truth.py
-    tests/test_p0_live_executable_bid_pnl.py
-    tests/test_soft_exit_executable_truth.py
-    tests/test_p0_canonical_exit_fill_truth.py
-    tests/test_p0_partial_exit_ownership_guard.py
-    tests/test_p0_exit_position_ambiguity_guard.py
-    tests/test_p0_exit_decision_idempotency_guard.py
-    tests/test_p0_proof_entry_identity_and_taxonomy.py
-    tests/test_p0_proof_taxonomy_fill_bridge.py
-    tests/test_p0_terminal_close_proof_binding.py
-    tests/test_p1_expired_contract_db_close_repair.py
-    tests/test_p0_reconciler_proof_persistence.py
-    tests/test_p0_expired_broker_import_idempotency.py
-    tests/test_p0_attribution_integrity.py
-    tests/test_p0_partial_close_reconciler.py
-    tests/test_p0_broker_confirmed_daily_trade_count.py
-    tests/test_p0_schema_attestation_and_migration_runner.py
-    tests/test_p0_position_execution_mode_schema.py
-    tests/test_p0_executable_sector_coverage.py
-    tests/test_p0_master_control_sector_identity.py
-    tests/test_p0_live_startup_preflight.py
-    tests/test_p0_live_one_contract_runner_precedence.py
-    tests/test_p0_live_submit_gates.py
-    tests/test_p0_live_submit_gates_amended.py
-    tests/test_p0_touched_profit_bid_confirmation.py
-    tests/test_p0_position_quote_monitor_binding_health.py
-    tests/test_p0_live_position_direct_quote_recovery.py
-    tests/test_p0_paper_recovery_restart_guard_bypass.py
-    tests/test_p0_shared_ap_signals_retry_idempotency.py
-    tests/test_p0_nonterminal_ownership_poisoning.py
-    tests/test_p0_reconciler_external_close_broker_truth.py
-    tests/test_p0_reconciler_exit_filled_query_parameterization.py
-    tests/test_p0_reconciler_historical_entry_truth.py
-    tests/test_p0_reconciler_canonical_owner_adoption.py
-    tests/test_p0_live_readiness_blocked_keys.py
-    tests/test_p0_readiness_deadline_enforcement.py
-    tests/test_p0_startup_readiness_fail_closed.py
-    tests/test_p0_manual_client_close_proof.py
-    tests/test_p0_manual_close_production_shape.py
-    tests/test_p1_manual_close_broker_snapshot_integrity.py
-    tests/test_p0_manual_close_idempotency_and_validation.py
-    tests/test_p0_manual_close_terminal_recovery.py
-    tests/test_p0_terminal_proof_lock_postgres_concurrency.py
-    tests/test_p0_queue_deferral_truth.py
-    tests/test_p0_manual_rescue_restart_guard_bypass.py
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
 
 jobs:
-  p0-tests:
+  exact-head:
+    name: Exact PR head / pushed commit
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -166,10 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Test the submitted PR head, not GitHub's synthetic merge ref.
+          # The exact-head job deliberately bypasses GitHub's synthetic merge ref.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
 
-      - name: Assert checked out commit
+      - name: Assert exact head checkout
         run: |
           expected="${{ github.event.pull_request.head.sha || github.sha }}"
           actual="$(git rev-parse HEAD)"
@@ -217,26 +84,17 @@ jobs:
 
       - name: Run P0 plus cohesion tests
         env:
-          # PR #388 CI fix: PGSSLMODE=disable so ap.db never tries SSL
-          # against CI's localhost Postgres. Prior runs hit
-          # "server does not support SSL, but SSL was required" on every
-          # DB access, which caused source-truth tests that legitimately
-          # patch _fetch_watching_signals to instead fail because the
-          # compat layer's fallback path attempted an SSL connect.
           PGSSLMODE: "disable"
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           MANUAL_CLOSE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
-          python -m pytest ${P0_TEST_INVENTORY} -v --tb=short --color=yes
+          mapfile -t P0_TESTS < <(grep -vE "^[[:space:]]*(#|$)" .github/p0_test_list.txt)
+          test "${#P0_TESTS[@]}" -gt 0
+          python -m pytest "${P0_TESTS[@]}" -v --tb=short --color=yes
 
-      - name: Summary
-        if: always()
-        run: |
-          echo "P0 regression suite complete"
-
-
-  p0-merge-ref-tests:
+  merge-ref:
+    name: Synthetic pull_request merge ref
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     services:
@@ -256,14 +114,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Test GitHub's synthetic pull_request merge ref.
+          # This is the actual synthetic merge ref, never the PR head.
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
 
-      - name: Assert checked out commit
+      - name: Assert synthetic merge checkout
         run: |
-          expected="${{ github.sha }}"
+          expected_merge="${{ github.sha }}"
+          pr_head="${{ github.event.pull_request.head.sha }}"
           actual="$(git rev-parse HEAD)"
-          test "$actual" = "$expected"
+          test "$actual" = "$expected_merge"
+          test "$actual" != "$pr_head"
+          test "$(git rev-list --parents -n 1 HEAD | awk '{print NF}')" -eq 3
+          git merge-base --is-ancestor "$pr_head" "$actual"
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -307,20 +170,11 @@ jobs:
 
       - name: Run P0 plus cohesion tests
         env:
-          # PR #388 CI fix: PGSSLMODE=disable so ap.db never tries SSL
-          # against CI's localhost Postgres. Prior runs hit
-          # "server does not support SSL, but SSL was required" on every
-          # DB access, which caused source-truth tests that legitimately
-          # patch _fetch_watching_signals to instead fail because the
-          # compat layer's fallback path attempted an SSL connect.
           PGSSLMODE: "disable"
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           MANUAL_CLOSE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
-          python -m pytest ${P0_TEST_INVENTORY} -v --tb=short --color=yes
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "P0 merge-ref regression suite complete"
+          mapfile -t P0_TESTS < <(grep -vE "^[[:space:]]*(#|$)" .github/p0_test_list.txt)
+          test "${#P0_TESTS[@]}" -gt 0
+          python -m pytest "${P0_TESTS[@]}" -v --tb=short --color=yes

@@ -37,6 +37,7 @@ import os
 import inspect
 import time
 from datetime import date, datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from ap_signal_store import canonical_client_email, canonical_signal_id, upsert_ap_signal_row_with_fallback
@@ -1725,6 +1726,85 @@ def _record_watch_arm_failure_proof(
         )
 
 
+def _record_retryable_row(
+    result: dict,
+    *,
+    job_id,
+    signal_id,
+    source: str,
+) -> None:
+    """Keep the durable retry count bound to the exact source rows."""
+    result["retryable_deferred"] = int(result.get("retryable_deferred", 0) or 0) + 1
+    retryable_rows = result.setdefault("retryable_rows", [])
+    if not isinstance(retryable_rows, list):
+        retryable_rows = []
+        result["retryable_rows"] = retryable_rows
+    _source = str(source or "").strip().lower()
+    _job_id = "" if job_id is None else str(job_id).strip()
+    _signal_id = "" if signal_id is None else str(signal_id).strip()
+    row_identity = {
+        "job_id": _job_id,
+        "signal_id": _signal_id,
+        "source": _source,
+    }
+    # The source triple is necessary but not sufficient for the safe-partial
+    # proof.  Carry the exact attempt/session/client/mode/canonical authority
+    # that was visible when this row was classified, so a later restart cannot
+    # accidentally prove a retry against a different durable attempt.
+    context = (result.get("_retryable_row_context") or {}).get(
+        (_source, _job_id, _signal_id),
+        {},
+    )
+    if isinstance(context, dict):
+        for key in (
+            "canonical_signal_id",
+            "client_id",
+            "execution_mode",
+            "overnight_reeval_session_key",
+            "attempt_id",
+            "attempt_generation",
+            "overnight_attempt_id",
+            "overnight_attempt_generation",
+        ):
+            if key in context:
+                row_identity[key] = context[key]
+    retryable_rows.append(row_identity)
+
+
+def _overnight_source_provenance(*, source: str, job_id, signal_id) -> dict | None:
+    """Return the exact source-row identity that must follow an overnight order."""
+    _source = str(source or "").strip().lower()
+    _job_id = "" if job_id is None else str(job_id).strip()
+    _signal_id = "" if signal_id is None else str(signal_id).strip()
+    if _source not in {"trade_queue", "ap_signals"} or not _job_id or not _signal_id:
+        return None
+    return {
+        "overnight_source_table": _source,
+        "overnight_source_job_id": _job_id,
+        "overnight_source_signal_id": _signal_id,
+    }
+
+
+def _overnight_source_provenance_matches(
+    metadata: dict,
+    provenance: dict | None,
+) -> bool:
+    """Prove an existing order already carries the exact source-row identity."""
+    if not isinstance(metadata, dict) or not isinstance(provenance, dict):
+        return False
+    _keys = (
+        "overnight_source_table",
+        "overnight_source_job_id",
+        "overnight_source_signal_id",
+    )
+    return all(
+        str(metadata.get(key) or "").strip()
+        == str(provenance.get(key) or "").strip()
+        and bool(str(metadata.get(key) or "").strip())
+        for key in _keys
+    )
+
+
 def _classify_overnight_reeval_result(result: dict) -> dict:
     """Attach the operational completion/retry contract to a result dict."""
     if not isinstance(result, dict):
@@ -1755,6 +1835,15 @@ def _classify_overnight_reeval_result(result: dict) -> dict:
         )
         or 0
     )
+
+    if result.get("source_identity_conflict") or result.get("source_identity_conflicts"):
+        # A source-authority contradiction is a distinct fail-closed result,
+        # not a retry-exhaustion or completed-decision classification.
+        result["result_class"] = "SOURCE_IDENTITY_CONFLICT"
+        result["completed"] = False
+        result["retryable"] = False
+        result["retry_reason"] = "source_identity_conflict"
+        return result
 
     if skipped == -1:
         result_class = "SKIPPED_NOT_DUE"
@@ -1804,11 +1893,11 @@ def _classify_overnight_reeval_result(result: dict) -> dict:
         and terminal_errors == 0
         and already_resolved == 0
     )
-    # PR #388 P0-2: partial-source inventory override. If either source
-    # lookup failed, we cannot certify the run complete — even when every
-    # observed row was processed. Downgrade to a retryable classification so
-    # the runner never sets success_date on incomplete truth.
-    if bool(result.get("source_lookup_partial")) and completed:
+    # PR #388 P0-2: partial-source inventory is authoritative. If either
+    # source lookup failed or a successful lookup was truncated, no visible
+    # subset may retain a weaker row/deferred classification. Downgrade to a
+    # retryable classification so the runner never certifies incomplete truth.
+    if bool(result.get("source_lookup_partial")):
         result_class = "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
         completed = False
         retryable = True
@@ -1834,6 +1923,10 @@ def run_overnight_reeval(
     exit_eng=None,
     on_split_brain=None,
     force: bool = False,
+    attempt_id: str | None = None,
+    attempt_generation: int | None = None,
+    execution_mode: str | None = None,
+    overnight_reeval_session_key: str | None = None,
 ) -> dict:
     """
     Re-evaluate all WATCHING signals for client_id.
@@ -1886,6 +1979,9 @@ def run_overnight_reeval(
         _run_execution_mode = str(_exec_mode_for_broker(broker) or "").upper()
     except Exception:
         _run_execution_mode = ""
+    _provided_execution_mode = str(execution_mode or "").strip().upper()
+    if _provided_execution_mode in {"LIVE", "PAPER"}:
+        _run_execution_mode = _provided_execution_mode
     log.info(
         "OVERNIGHT_REEVAL_MARKET_DATA_BROKER_SELECTED "
         "client_id=%s execution_mode=%s data_broker_present=%s "
@@ -1911,6 +2007,13 @@ def run_overnight_reeval(
             type(broker).__name__ if broker is not None else "None",
             type(market_data_broker).__name__ if market_data_broker is not None else "None",
         )
+    _attempt_generation_value = (
+        attempt_generation
+        if isinstance(attempt_generation, int)
+        and not isinstance(attempt_generation, bool)
+        and attempt_generation > 0
+        else 0
+    )
     result = {
         "processed": 0,
         "armed": 0,
@@ -1920,6 +2023,7 @@ def run_overnight_reeval(
         "errors": 0,
         "terminal_errors": 0,
         "retryable_deferred": 0,
+        "retryable_rows": [],
         "already_resolved": 0,
         "unresolved": 0,
         "stale_skipped": 0,
@@ -1935,11 +2039,36 @@ def run_overnight_reeval(
         # caller can persist an honest status instead of "success".
         "fetched": 0,
         "stalled": False,
+        "source_lookup_partial": False,
+        "trade_queue_status": None,
+        "ap_signals_status": None,
+        "trade_queue_error": None,
+        "ap_signals_error": None,
+        "source_identity_conflict": False,
+        "source_identity_conflicts": [],
+        "equivalent_source_duplicates": [],
+        "source_row_accounting": {},
+        "attempt_id": str(attempt_id or "").strip() or None,
+        "attempt_generation": _attempt_generation_value,
+        "client_id": client_id,
+        "execution_mode": str(_run_execution_mode or "").strip().lower(),
     }
 
     # Guard: only run on trading days, 9:00-9:45 AM ET window (unless force=True)
     now_et = _et_now()
-    session_key = _overnight_reeval_session_key(now_et)
+    session_key = str(
+        overnight_reeval_session_key or _overnight_reeval_session_key(now_et)
+    ).strip()
+    result["overnight_reeval_session_key"] = session_key
+    _attempt_meta = {
+        "attempt_id": result.get("attempt_id"),
+        "attempt_generation": result.get("attempt_generation"),
+        "overnight_attempt_id": result.get("attempt_id"),
+        "overnight_attempt_generation": result.get("attempt_generation"),
+        "client_id": client_id,
+        "execution_mode": str(_run_execution_mode or "").strip().lower(),
+        "overnight_reeval_session_key": session_key,
+    }
     if not force:
         if not _is_trading_day(now_et):
             log.info("[%s] overnight_reeval: skipping — not a trading day", client_id)
@@ -1964,9 +2093,71 @@ def run_overnight_reeval(
     result["ap_signals_status"]  = _fetch_result.ap_signals_status
     result["trade_queue_error"]  = _fetch_result.trade_queue_error
     result["ap_signals_error"]   = _fetch_result.ap_signals_error
+    result["source_identity_conflicts"] = list(
+        _fetch_result.source_identity_conflicts or []
+    )
+    result["source_identity_conflict"] = bool(result["source_identity_conflicts"])
+    result["equivalent_source_duplicates"] = list(
+        _fetch_result.equivalent_source_duplicates or []
+    )
+    result["source_row_accounting"] = dict(
+        _fetch_result.source_row_accounting or {}
+    )
+    _retryable_row_context = {}
+    for _source_row in watching_signals:
+        _source_name = str(
+            _source_row.get("_source")
+            or ("ap_signals" if str(_source_row.get("id") or "").startswith("sup:") else "trade_queue")
+        ).strip().lower()
+        _source_job_id = str(_source_row.get("id") or "").strip()
+        _source_payload = _source_row.get("payload") or {}
+        if isinstance(_source_payload, str):
+            try:
+                import json as _context_json
+                _source_payload = _context_json.loads(_source_payload)
+            except Exception:
+                _source_payload = {}
+        if not isinstance(_source_payload, dict):
+            _source_payload = {}
+        _source_signal_id = str(
+            _source_row.get("signal_id") or _source_payload.get("signal_id") or ""
+        ).strip()
+        _source_canonical = str(
+            _source_row.get("canonical_signal_id")
+            or _source_payload.get("canonical_signal_id")
+            or _resolve_canonical_signal_id(_source_signal_id, _source_payload)
+            or ""
+        ).strip()
+        _retryable_row_context[(_source_name, _source_job_id, _source_signal_id)] = {
+            **_attempt_meta,
+            "canonical_signal_id": _source_canonical,
+        }
+    result["_retryable_row_context"] = _retryable_row_context
 
     _tq_failed  = _fetch_result.trade_queue_status != _SOURCE_STATUS_SUCCESS
     _sup_failed = _fetch_result.ap_signals_status  != _SOURCE_STATUS_SUCCESS
+    result["source_lookup_partial"] = bool(
+        _tq_failed or _sup_failed or _fetch_result.source_lookup_partial
+    )
+
+    if result["source_identity_conflict"]:
+        # The fetch boundary retained all contradictory authorities for
+        # diagnostics. Do not let any of them enter the per-row loop, where a
+        # rejection/arm path could mutate queue or watcher state.
+        result["unresolved"] = len(watching_signals or [])
+        result["last_error"] = "SOURCE_IDENTITY_CONFLICT"
+        log.critical(
+            "[%s] overnight_reeval: SOURCE_IDENTITY_CONFLICT groups=%d "
+            "raw_rows=%s — refusing watcher/order/source mutation",
+            client_id,
+            len(result["source_identity_conflicts"]),
+            result["source_row_accounting"].get("raw_source_rows_fetched"),
+        )
+        result["result_class"] = "SOURCE_IDENTITY_CONFLICT"
+        result["completed"] = False
+        result["retryable"] = False
+        result["retry_reason"] = "source_identity_conflict"
+        return result
 
     if _tq_failed and _sup_failed and not watching_signals:
         # Both sources failed and no rows visible → cannot certify empty
@@ -2019,6 +2210,22 @@ def run_overnight_reeval(
             import json; signal = json.loads(signal)
         signal_id = job.get("signal_id") or signal.get("signal_id", "")
         job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
+        source_provenance = _overnight_source_provenance(
+            source=job_source,
+            job_id=job_id,
+            signal_id=signal_id,
+        )
+        if source_provenance is None:
+            log.critical(
+                "[%s] overnight_reeval: source-row identity incomplete source=%r "
+                "job_id=%r signal_id=%r — classifying retryable_deferred",
+                client_id, job_source, job_id, signal_id,
+            )
+            result["skipped"] = result.get("skipped", 0) + 1
+            _record_retryable_row(
+                result, job_id=job_id, signal_id=signal_id, source=job_source
+            )
+            continue
         ticker = signal.get("ticker") or signal.get("symbol", "?")
         side = _normalize_overnight_side(signal.get("side") or signal.get("direction"))
         if side not in {"CALL", "PUT"}:
@@ -2133,7 +2340,9 @@ def run_overnight_reeval(
                         ticker, _disp, signal_id,
                     )
                     result["skipped"] = result.get("skipped", 0) + 1
-                    result["retryable_deferred"] += 1
+                    _record_retryable_row(
+                        result, job_id=job_id, signal_id=signal_id, source=job_source
+                    )
                     continue
 
                 if _disp == _DISPOSITION_REATTACH_WATCHER:
@@ -2160,7 +2369,9 @@ def run_overnight_reeval(
                             ticker, signal_id,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
-                        result["retryable_deferred"] += 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
                         continue
 
                     # Explicit per-row locals — never fall back to outer-loop
@@ -2185,7 +2396,9 @@ def run_overnight_reeval(
                             ticker, signal_id, _existing_oid,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
-                        result["retryable_deferred"] += 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
                         continue
 
                     def _reattach_price(order_key, signal_key):
@@ -2219,6 +2432,30 @@ def run_overnight_reeval(
                     if not isinstance(_ord_meta, dict):
                         _ord_meta = {}
 
+                    # A legacy order without the new source-row fields is not
+                    # identifiable enough to reattach.  The current source row
+                    # may share signal/canonical identity with a different
+                    # source's old order, so stamping the current provenance
+                    # here would manufacture the exact proof the readiness
+                    # guard relies on.  Only an already-complete matching
+                    # provenance record may authorize reattachment.
+                    if not _overnight_source_provenance_matches(
+                        _ord_meta, source_provenance
+                    ):
+                        log.critical(
+                            "[%s] overnight_reeval: REATTACH_WATCHER source provenance "
+                            "missing_or_mismatched signal=%s local_order_id=%s "
+                            "expected=%s existing=%s — preserving order and "
+                            "classifying retryable",
+                            ticker, signal_id, _existing_oid,
+                            source_provenance, _ord_meta,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
+                        continue
+
                     # Metadata merge: existing FIRST, canonical values LAST
                     # so proven session/mode/client/canonical always win over
                     # any stale or blank stored metadata.
@@ -2233,6 +2470,7 @@ def run_overnight_reeval(
                         "overnight_reeval_session_key":     session_key,
                         "signal_id":                        _reattach_signal_id,
                         "canonical_signal_id":              _reattach_canonical,
+                        **source_provenance,
                         # PR #388 Blocker 1: REATTACH is a proven PR#388
                         # seam and opts in to the late-attachment classifier.
                         "late_attachment_policy_eligible":  True,
@@ -2336,7 +2574,9 @@ def run_overnight_reeval(
                                 ticker, signal_id, _existing_oid,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
-                            result["retryable_deferred"] += 1
+                            _record_retryable_row(
+                                result, job_id=job_id, signal_id=signal_id, source=job_source
+                            )
                             continue
                         try:
                             _reattach_armed = entry_watcher.watch(
@@ -2354,7 +2594,9 @@ def run_overnight_reeval(
                             # PENDING_TRIGGER order is untouched and the
                             # next retry can attempt reattach again.
                             result["skipped"] = result.get("skipped", 0) + 1
-                            result["retryable_deferred"] += 1
+                            _record_retryable_row(
+                                result, job_id=job_id, signal_id=signal_id, source=job_source
+                            )
                             continue
 
                     if not _reattach_armed:
@@ -2383,7 +2625,9 @@ def run_overnight_reeval(
                                 ticker, signal_id, _existing_oid, _post_active_status,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
-                            result["retryable_deferred"] += 1
+                            _record_retryable_row(
+                                result, job_id=job_id, signal_id=signal_id, source=job_source
+                            )
                             continue
 
                         # Case 2: row found in active-ownership family
@@ -2425,7 +2669,9 @@ def run_overnight_reeval(
                                     ticker, signal_id, _existing_oid, _post_active_status,
                                 )
                                 result["skipped"] = result.get("skipped", 0) + 1
-                                result["retryable_deferred"] += 1
+                                _record_retryable_row(
+                                    result, job_id=job_id, signal_id=signal_id, source=job_source
+                                )
                                 continue
 
                             log.warning(
@@ -2493,7 +2739,9 @@ def run_overnight_reeval(
                             signal_id, _existing_oid,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
-                        result["retryable_deferred"] += 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
                         continue
 
                     # Persist durable WATCHER_ARMED proof after successful reattachment.
@@ -2508,8 +2756,9 @@ def run_overnight_reeval(
                         session_key=session_key,
                         clear_reattach_in_progress=True,
                         extra_meta={
-                            "source_table": "ap_signals",
-                            "source_job_id": str(job_id),
+                            "source_table": source_provenance["overnight_source_table"],
+                            "source_job_id": source_provenance["overnight_source_job_id"],
+                            **source_provenance,
                             "ticker": ticker,
                             "side": side,
                             "contract_deferred": True,
@@ -2529,7 +2778,9 @@ def run_overnight_reeval(
                             _existing_oid, session_key,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
-                        result["retryable_deferred"] += 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
                         continue
 
                     log.info(
@@ -2559,7 +2810,9 @@ def run_overnight_reeval(
                         ticker, signal_id, _created_oid,
                     )
                     result["skipped"] = result.get("skipped", 0) + 1
-                    result["retryable_deferred"] += 1
+                    _record_retryable_row(
+                        result, job_id=job_id, signal_id=signal_id, source=job_source
+                    )
                     continue
 
                 # RETRYABLE or NEW — fall through to normal processing.
@@ -2599,7 +2852,9 @@ def run_overnight_reeval(
                                 "after_hours_deferred:overnight_prior_levels_fetch_failed",
                             )
                         result["skipped"] += 1
-                        result["retryable_deferred"] += 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
                         continue
                 else:
                     log.warning(
@@ -2727,7 +2982,9 @@ def run_overnight_reeval(
                         ),
                     )
                 result["skipped"] = result.get("skipped", 0) + 1
-                result["retryable_deferred"] += 1
+                _record_retryable_row(
+                    result, job_id=job_id, signal_id=signal_id, source=job_source
+                )
                 continue  # leave job WATCHING for next reeval run
 
             # Step 2: Derive entry_trigger if not provided by scanner
@@ -2765,7 +3022,9 @@ def run_overnight_reeval(
                             "after_hours_deferred:overnight_snapshot_fetch_failed",
                         )
                     result["skipped"] += 1
-                    result["retryable_deferred"] += 1
+                    _record_retryable_row(
+                        result, job_id=job_id, signal_id=signal_id, source=job_source
+                    )
                     continue
                 if snapshot:
                     snapshot_by_ticker[_ticker_key] = snapshot
@@ -2797,7 +3056,9 @@ def run_overnight_reeval(
                             "after_hours_deferred:overnight_snapshot_unavailable",
                         )
                     result["skipped"] = result.get("skipped", 0) + 1
-                    result["retryable_deferred"] += 1
+                    _record_retryable_row(
+                        result, job_id=job_id, signal_id=signal_id, source=job_source
+                    )
                     continue  # leave job WATCHING for next reeval run
                 # True invalidation — reject
                 log.info("[%s] overnight_reeval: OVERNIGHT_TRUE_INVALIDATION %s — %s",
@@ -3022,6 +3283,8 @@ def run_overnight_reeval(
             if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
                 decision.plan.metadata = {}
             decision.plan.metadata.update({
+                **_attempt_meta,
+                **source_provenance,
                 "contract_deferred": True,
                 "deferred_breach_selection": True,
                 "selection_context": "deferred_breach",
@@ -3325,8 +3588,10 @@ def run_overnight_reeval(
                             local_order_id=str(local_order_id),
                             session_key=session_key,
                             extra_meta={
-                                "source_table": "ap_signals",
-                                "source_job_id": str(job_id),
+                                **_attempt_meta,
+                                "source_table": source_provenance["overnight_source_table"],
+                                "source_job_id": source_provenance["overnight_source_job_id"],
+                                **source_provenance,
                                 "ticker": ticker,
                                 "side": side,
                                 "contract_deferred": contract_deferred,
@@ -3346,7 +3611,9 @@ def run_overnight_reeval(
                                 local_order_id, session_key,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
-                            result["retryable_deferred"] += 1
+                            _record_retryable_row(
+                                result, job_id=job_id, signal_id=signal_id, source=job_source
+                            )
                             continue
 
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
@@ -3592,6 +3859,13 @@ class _FetchWatchingSignalsResult(NamedTuple):
     .ap_signals_status   — SUCCESS / FAILED
     .trade_queue_error   — short error string if FAILED
     .ap_signals_error    — short error string if FAILED
+    .source_lookup_partial — True when a successful source query was truncated
+    .source_identity_conflicts — source authorities with the same signal_id
+      that disagree in execution-relevant identity
+    .equivalent_source_duplicates — equivalent duplicate authorities and the
+      deterministic source row retained for processing
+    .source_row_accounting — raw inventory and logical-row accounting after
+      duplicate classification
 
     A FAILED status must never be interpreted as "zero rows / completed no
     work". The caller must classify the run retryable when any source is
@@ -3603,6 +3877,546 @@ class _FetchWatchingSignalsResult(NamedTuple):
     ap_signals_status:  str
     trade_queue_error:  Optional[str]
     ap_signals_error:   Optional[str]
+    source_lookup_partial: bool = False
+    source_identity_conflicts: Optional[list] = None
+    equivalent_source_duplicates: Optional[list] = None
+    source_row_accounting: Optional[dict] = None
+
+
+_SOURCE_IDENTITY_REQUIRED_FIELDS = (
+    "canonical_signal_id",
+    "ticker",
+    "side",
+    "timeframe",
+    "entry_trigger",
+)
+_SOURCE_IDENTITY_OPTIONAL_FIELDS = (
+    "strategy",
+    "pattern",
+    "score",
+    "tier",
+    "stop_price",
+    "target_price",
+    "underlying_at_signal",
+)
+
+
+def _source_identity_text(value, *, upper: bool = False, lower: bool = False):
+    """Normalize text for source-authority comparison without false blanks."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if upper:
+        return text.upper()
+    if lower:
+        return text.lower()
+    return text
+
+
+def _source_identity_number(value):
+    """Normalize numeric authority, retaining explicit zero and invalidity."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return f"INVALID:{value}"
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        number = Decimal(str(value).strip())
+        if not number.is_finite():
+            raise InvalidOperation
+        normalized = format(number.normalize(), "f")
+        if normalized in {"-0", "-0.0"}:
+            normalized = "0"
+        return normalized
+    except (InvalidOperation, TypeError, ValueError):
+        return f"INVALID:{str(value).strip()}"
+
+
+def _source_identity_side(value):
+    raw = _source_identity_text(value, upper=True)
+    if raw is None:
+        return None
+    normalized = _normalize_overnight_side(raw)
+    if normalized == "UNKNOWN":
+        return f"INVALID:{raw}"
+    return normalized
+
+
+def _source_trigger_authority(value):
+    """Normalize an explicit trigger label without inventing one."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return f"INVALID:{value!r}"
+    text = value.strip()
+    if not text:
+        return None
+    return text.lower()
+
+
+def _parse_source_payload(raw):
+    """Parse a source payload while preserving malformed-payload evidence."""
+    if raw is None:
+        return None, None
+    if isinstance(raw, dict):
+        return dict(raw), None
+    if isinstance(raw, str):
+        import json as _source_json
+        try:
+            parsed = _source_json.loads(raw)
+        except Exception:
+            return None, "payload_json_invalid"
+        if not isinstance(parsed, dict):
+            return None, "payload_not_object"
+        return dict(parsed), None
+    return None, "payload_not_object"
+
+
+def _source_identity_error_field(error) -> str:
+    """Map source-container parse errors to the comparable payload field."""
+    field = str(error or "").split(":", 1)[0]
+    if field.startswith("blank_"):
+        field = field[len("blank_"):]
+    if field in {"payload", "signal_payload", "raw_payload"}:
+        return "payload"
+    return field
+
+
+def _source_authority_descriptor(row: dict) -> dict:
+    """Build the comparable authority represented by one raw source row.
+
+    Both payload containers and selected source columns are considered. A
+    sparse payload is therefore hydrated for comparison, while contradictory
+    payload/column values remain visible as an authority error instead of
+    being silently resolved by precedence.
+    """
+    if not isinstance(row, dict):
+        row = {}
+    source = _source_identity_text(row.get("_source"), lower=True) or "unknown"
+    payload_keys = ("payload", "signal_payload", "raw_payload")
+    payloads = []
+    errors: set[str] = set()
+    if source not in {"trade_queue", "ap_signals"}:
+        errors.add("source")
+    # ``id`` is the source job identity.  Falling back to signal_id here
+    # would manufacture a source triple for an otherwise unowned row.
+    if not _source_identity_text(row.get("id")):
+        errors.add("job_id")
+    if row.get("_source_payload_error"):
+        for error in str(row.get("_source_payload_error")).split(";"):
+            if error:
+                errors.add(error)
+    for key in payload_keys:
+        if key not in row or row.get(key) is None:
+            continue
+        parsed, error = _parse_source_payload(row.get(key))
+        if error:
+            errors.add(f"{key}:{error}")
+        elif parsed is not None:
+            payloads.append((key, parsed))
+
+    def _candidates(keys, *, row_keys=()):
+        values = []
+        for origin, payload in payloads:
+            for key in keys:
+                if key in payload:
+                    values.append((f"{origin}.{key}", payload.get(key)))
+        for key in row_keys:
+            if key in row:
+                values.append((f"row.{key}", row.get(key)))
+        return values
+
+    def _resolve(field, keys, normalizer, *, row_keys=()):
+        normalized = []
+        for _origin, raw in _candidates(keys, row_keys=row_keys):
+            if (
+                field in {
+                    "signal_id",
+                    "canonical_signal_id",
+                    "ticker",
+                    "side",
+                    "timeframe",
+                    "entry_trigger",
+                    "trigger_authority",
+                }
+                and isinstance(raw, str)
+                and not raw.strip()
+            ):
+                errors.add(f"blank_{field}")
+            value = normalizer(raw)
+            if value is not None:
+                if isinstance(value, str) and value.startswith("INVALID:"):
+                    errors.add(field)
+                normalized.append(value)
+        unique = []
+        for value in normalized:
+            if value not in unique:
+                unique.append(value)
+        if len(unique) > 1:
+            errors.add(field)
+        return unique[0] if unique else None
+
+    signal_id = _resolve(
+        "signal_id",
+        ("signal_id",),
+        lambda value: _source_identity_text(value),
+        row_keys=("signal_id",),
+    )
+    # The row column is the source-row key when present. Prefer it for the
+    # downstream job identity, but retain a payload contradiction as an error.
+    row_signal_id = _source_identity_text(row.get("signal_id"))
+    if row_signal_id:
+        signal_id = row_signal_id
+
+    explicit_canonical = _resolve(
+        "canonical_signal_id",
+        ("canonical_signal_id",),
+        lambda value: _source_identity_text(value),
+        row_keys=("canonical_signal_id",),
+    )
+    fallback_canonical = _resolve_canonical_signal_id(signal_id or "", {})
+    # An explicit canonical ID is allowed to differ from the raw signal ID
+    # (for example, a retry/reeval signal can have a stable canonical parent).
+    # Compare that explicit authority across source rows; do not manufacture a
+    # same-row conflict by comparing it with the fallback derived from
+    # signal_id.
+    canonical = explicit_canonical or fallback_canonical or None
+
+    _trigger_authority_candidates = _candidates(
+        (
+            "trigger_authority",
+            "trigger_type",
+            "trigger_kind",
+            "trigger_basis",
+            "trigger_source",
+        ),
+        row_keys=(
+            "trigger_authority",
+            "trigger_type",
+            "trigger_kind",
+            "trigger_basis",
+            "trigger_source",
+        ),
+    )
+    _trigger_authority = _resolve(
+        "trigger_authority",
+        (
+            "trigger_authority",
+            "trigger_type",
+            "trigger_kind",
+            "trigger_basis",
+            "trigger_source",
+        ),
+        _source_trigger_authority,
+        row_keys=(
+            "trigger_authority",
+            "trigger_type",
+            "trigger_kind",
+            "trigger_basis",
+            "trigger_source",
+        ),
+    )
+    _trigger_authority_explicit = any(
+        raw is not None for _origin, raw in _trigger_authority_candidates
+    )
+
+    # Existing WATCHING rows carry an execution trigger but not always a
+    # separate trigger-kind label. Treat the concrete trigger as the effective
+    # authority in that sparse representation, but retain whether a label was
+    # actually supplied. A sparse row and a richer row with the same concrete
+    # trigger are equivalent; explicit labels are compared only when both
+    # representations provide one. An explicitly blank/malformed label remains
+    # a validation error via field_errors.
+    if _trigger_authority is None:
+        _entry_trigger = _source_identity_number(
+            next(
+                (
+                    raw
+                    for _origin, raw in _candidates(
+                        ("entry_trigger", "trigger_price", "trigger"),
+                        row_keys=("entry_trigger",),
+                    )
+                    if raw is not None and not (isinstance(raw, str) and not raw.strip())
+                ),
+                None,
+            )
+        )
+        if _entry_trigger is not None and not (
+            isinstance(_entry_trigger, str) and _entry_trigger.startswith("INVALID:")
+        ):
+            _trigger_authority = f"entry_trigger:{_entry_trigger}"
+
+    authority = {
+        "signal_id": signal_id,
+        "canonical_signal_id": canonical,
+        "ticker": _resolve(
+            "ticker", ("ticker", "symbol"), lambda value: _source_identity_text(value, upper=True),
+            row_keys=("ticker",),
+        ),
+        "side": _resolve(
+            "side", ("side", "direction"), _source_identity_side,
+            row_keys=("side", "direction"),
+        ),
+        "timeframe": _resolve(
+            "timeframe", ("timeframe", "tf"), lambda value: _source_identity_text(value, lower=True),
+            row_keys=("timeframe",),
+        ),
+        "entry_trigger": _resolve(
+            "entry_trigger", ("entry_trigger", "trigger_price", "trigger"),
+            _source_identity_number, row_keys=("entry_trigger",),
+        ),
+        "trigger_authority": _trigger_authority,
+        "trigger_authority_explicit": _trigger_authority_explicit,
+        "strategy": _resolve(
+            "strategy", ("strategy", "strategy_name", "strategy_id"),
+            lambda value: _source_identity_text(value, upper=True),
+            row_keys=("strategy", "strategy_name", "strategy_id"),
+        ),
+        "pattern": _resolve(
+            "pattern", ("pattern", "setup", "setup_type"),
+            lambda value: _source_identity_text(value, upper=True),
+            row_keys=("pattern", "setup", "setup_type"),
+        ),
+        "score": _resolve("score", ("score",), _source_identity_number, row_keys=("score",)),
+        "tier": _resolve(
+            "tier", ("tier",), lambda value: _source_identity_text(value, upper=True), row_keys=("tier",)
+        ),
+        "stop_price": _resolve(
+            "stop_price", ("stop_price", "stop"), _source_identity_number, row_keys=("stop_price",)
+        ),
+        "target_price": _resolve(
+            "target_price", ("target_price", "target"), _source_identity_number, row_keys=("target_price",)
+        ),
+        "underlying_at_signal": _resolve(
+            "underlying_at_signal", ("underlying_at_signal", "underlying_price"),
+            _source_identity_number, row_keys=("underlying_at_signal",),
+        ),
+    }
+
+    return {
+        "source": source,
+        "job_id": _source_identity_text(row.get("id")) or "",
+        "signal_id": signal_id or "",
+        "authority": authority,
+        "field_errors": sorted(errors),
+    }
+
+
+def _source_authority_conflicting_fields(left: dict, right: dict) -> list[str]:
+    """Return only disagreement in underlying authority, never source labels."""
+    fields = {
+        _source_identity_error_field(error)
+        for error in tuple(left.get("field_errors") or ())
+        + tuple(right.get("field_errors") or ())
+    }
+    left_authority = left.get("authority") or {}
+    right_authority = right.get("authority") or {}
+    for field in _SOURCE_IDENTITY_REQUIRED_FIELDS:
+        if left_authority.get(field) != right_authority.get(field):
+            fields.add(field)
+    left_trigger = left_authority.get("trigger_authority")
+    right_trigger = right_authority.get("trigger_authority")
+    left_trigger_explicit = bool(left_authority.get("trigger_authority_explicit"))
+    right_trigger_explicit = bool(right_authority.get("trigger_authority_explicit"))
+    if left_trigger_explicit and right_trigger_explicit and left_trigger != right_trigger:
+        fields.add("trigger_authority")
+    for field in _SOURCE_IDENTITY_OPTIONAL_FIELDS:
+        left_value = left_authority.get(field)
+        right_value = right_authority.get(field)
+        if left_value is not None and right_value is not None and left_value != right_value:
+            fields.add(field)
+    return sorted(fields)
+
+
+def _classify_source_authorities(raw_rows: list[dict]) -> tuple[list[dict], list[dict], list[dict], dict]:
+    """Classify every raw authority before any signal/setup deduplication.
+
+    Components are connected by either raw ``signal_id`` or normalized
+    ``canonical_signal_id``.  This is deliberately a small union-find rather
+    than a dict keyed only by signal_id: two source rows can carry different
+    wire IDs while claiming the same canonical opportunity.  A source row is
+    invalid on its own when its payload containers disagree or its required
+    identity is blank; it does not need a second source row to become a
+    fail-closed conflict.
+    """
+    descriptors: list[dict] = [
+        _source_authority_descriptor(row) for row in raw_rows
+    ]
+    parent = list(range(len(raw_rows)))
+
+    def _find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def _union(left: int, right: int) -> None:
+        left_root = _find(left)
+        right_root = _find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    authority_keys: dict[tuple[str, str], int] = {}
+    for index, descriptor in enumerate(descriptors):
+        authority = descriptor.get("authority") or {}
+        keys = []
+        signal_id = str(authority.get("signal_id") or "").strip()
+        canonical = str(authority.get("canonical_signal_id") or "").strip()
+        if signal_id:
+            keys.append(("signal_id", signal_id))
+        if canonical:
+            keys.append(("canonical_signal_id", canonical))
+        for key in keys:
+            previous = authority_keys.get(key)
+            if previous is None:
+                authority_keys[key] = index
+            else:
+                _union(previous, index)
+
+    components: dict[int, list[tuple[int, dict, dict]]] = {}
+    for index, (row, descriptor) in enumerate(zip(raw_rows, descriptors)):
+        components.setdefault(_find(index), []).append((index, row, descriptor))
+
+    selected: list[dict] = []
+    conflicts: list[dict] = []
+    equivalents: list[dict] = []
+
+    def _sort_item(item):
+        index, _row, descriptor = item
+        return (
+            0 if descriptor.get("source") == "trade_queue" else 1,
+            str(descriptor.get("job_id") or ""),
+            str(descriptor.get("signal_id") or ""),
+            index,
+        )
+
+    for group in sorted(components.values(), key=lambda items: min(item[0] for item in items)):
+        group = sorted(group, key=_sort_item)
+        authorities = [descriptor for _index, _row, descriptor in group]
+        authority_values = [descriptor.get("authority") or {} for descriptor in authorities]
+        conflicting_fields: set[str] = set()
+
+        # Every source row is independently validated.  The fallback canonical
+        # identity and entry-trigger values keep legacy sparse rows usable, but
+        # a blank raw/canonical identity, ticker, side, or timeframe cannot be
+        # treated as an empty/unknown setup.
+        for descriptor, authority in zip(authorities, authority_values):
+            conflicting_fields.update(
+                _source_identity_error_field(error)
+                for error in (descriptor.get("field_errors") or ())
+            )
+            for field in (
+                "signal_id",
+                "canonical_signal_id",
+                "ticker",
+                "side",
+                "timeframe",
+                "entry_trigger",
+            ):
+                if not str(authority.get(field) or "").strip():
+                    conflicting_fields.add(f"blank_{field}")
+
+        for position, descriptor in enumerate(authorities):
+            for other in authorities[position + 1:]:
+                conflicting_fields.update(
+                    _source_authority_conflicting_fields(descriptor, other)
+                )
+
+        component_keys = sorted({
+            key
+            for descriptor in authorities
+            for key in (
+                str((descriptor.get("authority") or {}).get("signal_id") or "").strip(),
+                str((descriptor.get("authority") or {}).get("canonical_signal_id") or "").strip(),
+            )
+            if key
+        })
+        raw_signal_ids = sorted({
+                str(descriptor.get("signal_id") or "").strip()
+                for descriptor in authorities
+                if str(descriptor.get("signal_id") or "").strip()
+            })
+        canonical_signal_ids = sorted({
+                str((descriptor.get("authority") or {}).get("canonical_signal_id") or "").strip()
+                for descriptor in authorities
+                if str((descriptor.get("authority") or {}).get("canonical_signal_id") or "").strip()
+            })
+        diagnostic = {
+            # Diagnostics identify the raw source signal first. Canonical
+            # identity remains separately preserved below, and must not hide
+            # the raw signal_id that connected the two source authorities.
+            "signal_id": (
+                raw_signal_ids[0]
+                if raw_signal_ids
+                else (canonical_signal_ids[0] if canonical_signal_ids else "")
+            ),
+            "raw_signal_ids": raw_signal_ids,
+            "canonical_signal_ids": canonical_signal_ids,
+            "conflicting_fields": sorted(conflicting_fields),
+            "authorities": authorities,
+        }
+
+        if conflicting_fields:
+            diagnostic["classification"] = "CONFLICTING_DUPLICATE_AUTHORITY"
+            conflicts.append(diagnostic)
+            # Mark the raw rows before setup dedup.  The caller returns before
+            # any row processing, and the marker makes it impossible for a
+            # later setup dedup pass to erase conflict accounting.
+            for _index, row, _descriptor in group:
+                row["_source_identity_conflict"] = True
+                selected.append(row)
+            continue
+
+        if len(group) == 1:
+            selected.append(group[0][1])
+            continue
+
+        if len({item[2].get("source") for item in group}) == 1:
+            # Distinct jobs from one source retain independent ownership rows.
+            # They were validated as one authority component above, but are not
+            # cross-source duplicate representations and therefore do not
+            # receive the source-precedence diagnostic.
+            selected.extend(item[1] for item in group)
+            continue
+
+        # Same-source rows remain independent queue jobs.  When both source
+        # authorities are present, retain every trade_queue row (the existing
+        # precedence) and classify the ap_signals representation as diagnostic
+        # only.  A component connected only by canonical identity follows the
+        # same deterministic rule without inventing a source/job conflict.
+        preferred_rows = [
+            item for item in group if item[2].get("source") == "trade_queue"
+        ] or [item for item in group if item[2].get("source") == "ap_signals"]
+        chosen = min(preferred_rows, key=_sort_item)
+        chosen_descriptor = chosen[2]
+        diagnostic.update({
+            "classification": "EQUIVALENT_DUPLICATE",
+            "chosen_source": chosen_descriptor.get("source"),
+            "chosen_job_id": chosen_descriptor.get("job_id"),
+            "retained_job_ids": [item[2].get("job_id") for item in preferred_rows],
+        })
+        equivalents.append(diagnostic)
+        selected.extend(item[1] for item in preferred_rows)
+
+    accounting = {
+        "raw_source_rows_fetched": len(raw_rows),
+        "raw_trade_queue_rows": sum(1 for row in raw_rows if row.get("_source") == "trade_queue"),
+        "raw_ap_signals_rows": sum(1 for row in raw_rows if row.get("_source") == "ap_signals"),
+        "authority_components": len(components),
+        "equivalent_duplicate_groups": len(equivalents),
+        "equivalent_duplicate_rows_collapsed": sum(
+            max(0, len(item.get("authorities") or []) - len(item.get("retained_job_ids") or []))
+            for item in equivalents
+        ),
+        "source_identity_conflict_groups": len(conflicts),
+        "source_identity_conflict_rows": sum(len(item.get("authorities") or []) for item in conflicts),
+        "authority_rows_after_classification": len(selected),
+        "logical_rows_before_setup_dedup": len(selected),
+    }
+    return selected, conflicts, equivalents, accounting
 
 
 def _fetch_watching_signals(client_id: str) -> list:
@@ -3696,11 +4510,11 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
        by APSignalStore.
     """
     results: list[dict] = []
-    seen_signal_ids: set[str] = set()
     trade_queue_status: str = _SOURCE_STATUS_SUCCESS
     trade_queue_error:  Optional[str] = None
     ap_signals_status:  str = _SOURCE_STATUS_SUCCESS
     ap_signals_error:   Optional[str] = None
+    source_lookup_partial: bool = False
 
     # PR #388 P0-8: SINGLE fetch limit for BOTH sources. Previously the
     # shared ap_signals query was hardcoded at .limit(300) while trade_queue
@@ -3727,21 +4541,29 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
                       AND status = 'WATCHING'
                     ORDER BY created_ts DESC
                     LIMIT %s
-                """, (client_id, _fetch_limit))
+                """, (client_id, _fetch_limit + 1))
                 return c.fetchall()
 
         rows = run_with_retry(_fn) or []
+        if len(rows) > _fetch_limit:
+            source_lookup_partial = True
+            log.error(
+                "[%s] _fetch_watching_signals[trade_queue] inventory exceeds fetch limit=%d "
+                "— refusing to certify complete source truth",
+                client_id, _fetch_limit,
+            )
+            rows = rows[:_fetch_limit]
         for row in rows:
             d = dict(row) if not isinstance(row, dict) else row
             if isinstance(d.get("payload"), str):
                 try:
                     d["payload"] = _j.loads(d["payload"])
                 except Exception:
-                    pass
+                    # Retain the malformed-source evidence even though the
+                    # legacy downstream path keeps the original value.
+                    d["_source_payload_error"] = "payload:payload_json_invalid"
             d["_source"] = "trade_queue"
             results.append(d)
-            if d.get("signal_id"):
-                seen_signal_ids.add(str(d["signal_id"]))
     except Exception as e:
         log.error("_fetch_watching_signals[trade_queue] failed: %s", e)
         trade_queue_status = _SOURCE_STATUS_FAILED
@@ -3793,29 +4615,44 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
             res = (
                 sb.table("ap_signals")
                 .select(
-                    "signal_id, signal_payload, raw_payload, created_at, ticker, "
+                    "signal_id, canonical_signal_id, signal_payload, raw_payload, created_at, ticker, "
                     "side, score, timeframe, pattern, tier, decision_status, "
                     "entry_trigger, stop_price, target_price, underlying_at_signal"
                 )
                 .eq("decision_status", "WATCHING")
                 .gte("created_at", cutoff)
                 .order("created_at", desc=True)
-                .limit(_fetch_limit)  # P0-8: unified with trade_queue limit
+                .limit(_fetch_limit + 1)  # probe one extra row for completeness
                 .execute()
             )
 
-            for row in (res.data or []):
+            source_rows = list(res.data or [])
+            if len(source_rows) > _fetch_limit:
+                source_lookup_partial = True
+                log.error(
+                    "[%s] _fetch_watching_signals[ap_signals] inventory exceeds fetch limit=%d "
+                    "— refusing to certify complete source truth",
+                    client_id, _fetch_limit,
+                )
+                source_rows = source_rows[:_fetch_limit]
+
+            for _source_index, row in enumerate(source_rows):
                 sid = str(row.get("signal_id") or "")
-                if not sid or sid in seen_signal_ids:
-                    continue
+
+                _payload_errors = []
+                for _payload_key in ("signal_payload", "raw_payload"):
+                    _raw_payload = row.get(_payload_key)
+                    if _raw_payload is None:
+                        continue
+                    if isinstance(_raw_payload, str) and not _raw_payload.strip():
+                        continue
+                    _unused_payload, _payload_error = _parse_source_payload(_raw_payload)
+                    if _payload_error:
+                        _payload_errors.append(f"{_payload_key}:{_payload_error}")
 
                 payload = row.get("signal_payload") or row.get("raw_payload") or {}
-                if isinstance(payload, str):
-                    try:
-                        payload = _j2.loads(payload)
-                    except Exception:
-                        payload = {}
-                if not isinstance(payload, dict):
+                payload, _primary_payload_error = _parse_source_payload(payload)
+                if payload is None:
                     payload = {}
 
                 # Hydrate required downstream fields from columns if the JSON
@@ -3827,6 +4664,8 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
                     payload["symbol"] = row.get("ticker")
                 if not payload.get("signal_id"):
                     payload["signal_id"] = sid
+                if not payload.get("canonical_signal_id") and row.get("canonical_signal_id"):
+                    payload["canonical_signal_id"] = row.get("canonical_signal_id")
                 if not payload.get("created_at") and row.get("created_at"):
                     payload["created_at"] = row.get("created_at")
                 if not payload.get("entry_trigger") and row.get("entry_trigger") is not None:
@@ -3838,18 +4677,54 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
                 if not payload.get("underlying_price") and row.get("underlying_at_signal") is not None:
                     payload["underlying_price"] = row.get("underlying_at_signal")
 
-                results.append({
-                    "id": f"sup:{sid}",
+                _normalized_row = {
+                    "id": f"sup:{sid}" if sid else f"sup:missing:{_source_index}",
                     "signal_id": sid,
                     "payload": payload,
+                    # Keep the independently persisted AP columns beside the
+                    # hydrated payload.  Hydration is for downstream shape;
+                    # it is not authority resolution.  Dropping these values
+                    # here would make a payload-vs-column contradiction
+                    # impossible to observe before deduplication.
+                    "canonical_signal_id": row.get("canonical_signal_id"),
+                    "ticker": row.get("ticker"),
+                    "side": row.get("side"),
+                    "score": row.get("score"),
+                    "timeframe": row.get("timeframe"),
+                    "pattern": row.get("pattern"),
+                    "tier": row.get("tier"),
+                    "entry_trigger": row.get("entry_trigger"),
+                    "stop_price": row.get("stop_price"),
+                    "target_price": row.get("target_price"),
+                    "underlying_at_signal": row.get("underlying_at_signal"),
+                    # Retain both persisted source payload authorities for
+                    # the pre-dedup comparison. The hydrated `payload` is
+                    # still the downstream shape, while these raw containers
+                    # prevent a contradictory signal_payload/raw_payload
+                    # pair from being hidden by `or` selection.
+                    "signal_payload": row.get("signal_payload"),
+                    "raw_payload": row.get("raw_payload"),
                     "created_ts": row.get("created_at"),
                     "_source": "ap_signals",
-                })
-                seen_signal_ids.add(sid)
+                }
+                if _payload_errors:
+                    _normalized_row["_source_payload_error"] = ";".join(_payload_errors)
+                results.append(_normalized_row)
     except Exception as e:
         log.error("_fetch_watching_signals[ap_signals] failed: %s", e)
         ap_signals_status = _SOURCE_STATUS_FAILED
         ap_signals_error = str(e)
+
+    # ── SOURCE-AUTHORITY CLASSIFICATION BEFORE ANY DEDUP ─────────────────
+    # Both source rows must be visible before signal_id can select a winner.
+    # An equivalent duplicate may retain deterministic source precedence; a
+    # disagreement remains in the returned inventory and blocks the caller.
+    (
+        results,
+        source_identity_conflicts,
+        equivalent_source_duplicates,
+        source_row_accounting,
+    ) = _classify_source_authorities(results)
 
     # ── SETUP-IDENTITY DEDUP ──────────────────────────────────────────────
     # Now that ap_signals is fetched WITHOUT a client_email filter, the same
@@ -3861,8 +4736,16 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
     # as-is (genuine per-client jobs, never deduped against scanner setups).
     _deduped: list[dict] = []
     _seen_setup_keys: set = set()
+    _setup_duplicate_rows = 0
     for r in results:
-        if r.get("_source") == "trade_queue":
+        _row_signal_id = str(r.get("signal_id") or "").strip()
+        if r.get("_source") == "trade_queue" or not _row_signal_id:
+            _deduped.append(r)
+            continue
+        if r.get("_source_identity_conflict"):
+            # Preserve every conflicting source row for diagnostics and
+            # truthful fetched-row accounting. The caller returns before any
+            # row mutation when this set is non-empty.
             _deduped.append(r)
             continue
         p = r.get("payload") or {}
@@ -3876,6 +4759,7 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
             _trig_k = None
         _key = (_tkr, _side, _tf, _trig_k)
         if _tkr and _key in _seen_setup_keys:
+            _setup_duplicate_rows += 1
             log.info(
                 "[%s] dedup: skipping duplicate setup %s %s %s (already have one)",
                 client_id, _tkr, _side, _tf,
@@ -3885,6 +4769,8 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
             _seen_setup_keys.add(_key)
         _deduped.append(r)
     results = _deduped
+    source_row_accounting["logical_rows_after_setup_dedup"] = len(results)
+    source_row_accounting["setup_duplicate_rows_collapsed"] = _setup_duplicate_rows
 
     tq_count = sum(1 for r in results if r.get("_source") == "trade_queue")
     sup_count = sum(1 for r in results if r.get("_source") == "ap_signals")
@@ -3901,6 +4787,10 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
         ap_signals_status=ap_signals_status,
         trade_queue_error=trade_queue_error,
         ap_signals_error=ap_signals_error,
+        source_lookup_partial=source_lookup_partial,
+        source_identity_conflicts=source_identity_conflicts,
+        equivalent_source_duplicates=equivalent_source_duplicates,
+        source_row_accounting=source_row_accounting,
     )
 
 

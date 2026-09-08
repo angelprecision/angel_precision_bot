@@ -8,6 +8,7 @@ import types
 import datetime as _dt_module
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -94,6 +95,14 @@ def _runner(email="jose@example.com"):
     runner._overnight_reeval_last_attempt_at = None
     runner._overnight_reeval_next_retry_at = None
     runner._overnight_reeval_attempt_count = 0
+    # These tests isolate scheduler retry semantics from the production
+    # PostgreSQL durable-attempt claim.  Dedicated restart/durability tests
+    # below exercise the enabled path with a newly constructed runner.
+    runner._overnight_reeval_durable_attempts_enabled = False
+    runner._overnight_reeval_attempt_generation = 0
+    runner._overnight_reeval_attempt_id = None
+    runner._overnight_reeval_durable_state_loaded_date = None
+    runner._overnight_reeval_durable_load_failed = False
     runner._overnight_reeval_last_result_class = None
     runner._overnight_reeval_last_retry_reason = None
     runner._degraded_lock = threading.Lock()
@@ -125,6 +134,130 @@ def _runner(email="jose@example.com"):
     runner._persist_overnight_reeval_lock = _persist
     runner._run_post_overnight_morning_handoff = _post
     return runner
+
+
+def _durable_runner(email="jose@example.com", mode="LIVE"):
+    runner = _runner(email)
+    runner.mode = mode
+    runner._overnight_reeval_durable_attempts_enabled = True
+    return runner
+
+
+def _durable_row(
+    *,
+    client_id="jose@example.com",
+    mode="live",
+    trading_date="2026-07-23",
+    status="partial",
+    result_class="RETRYABLE_PARTIAL_SOURCE_INVENTORY",
+    completed=False,
+    retryable=True,
+    source_lookup_partial=True,
+    source_identity_conflict=False,
+    generation=2,
+    attempt_id="2026-07-23:2:restart",
+):
+    return {
+        "client_id": client_id,
+        "execution_mode": mode,
+        "trading_date": trading_date,
+        "stage": "overnight_reeval",
+        "status": status,
+        "last_success_at": "2026-07-23T13:00:00+00:00" if status == "success" else None,
+        "last_error": "SOURCE_IDENTITY_CONFLICT" if source_identity_conflict else None,
+        "details": {
+            "client_id": client_id,
+            "execution_mode": mode,
+            "trading_date": trading_date,
+            "overnight_reeval_session_key": trading_date,
+            "attempt_id": attempt_id,
+            "attempt_generation": generation,
+            "attempt_count": generation,
+            "result_class": result_class,
+            "completed": completed,
+            "retryable": retryable,
+            "retry_reason": "source_identity_conflict" if source_identity_conflict else "partial_source_inventory",
+            "source_lookup_partial": source_lookup_partial,
+            "source_identity_conflict": source_identity_conflict,
+            "trade_queue_status": "SUCCESS",
+            "ap_signals_status": "SUCCESS",
+        },
+    }
+
+
+def test_newly_constructed_runner_hydrates_latest_partial_after_prior_success(monkeypatch):
+    """A restart cannot retain an older in-memory success certificate."""
+    today = _dt(9).date()
+    row = _durable_row(
+        status="partial",
+        result_class="SOURCE_IDENTITY_CONFLICT",
+        completed=False,
+        retryable=False,
+        source_lookup_partial=False,
+        source_identity_conflict=True,
+        generation=3,
+        attempt_id="2026-07-23:3:conflict",
+    )
+    handoff = types.ModuleType("ap.morning_handoff")
+    handoff._load_handoff_run_lock = lambda **kwargs: dict(row)
+    monkeypatch.setitem(sys.modules, "ap.morning_handoff", handoff)
+
+    first = _durable_runner()
+    first._overnight_reeval_state_date = None
+    first._overnight_reeval_success_date = today
+    first._reset_overnight_reeval_state_for_date(today)
+
+    second = _durable_runner()
+    second._reset_overnight_reeval_state_for_date(today)
+
+    assert first._overnight_reeval_success_date is None
+    assert second._overnight_reeval_success_date is None
+    assert second._overnight_reeval_attempt_id == "2026-07-23:3:conflict"
+    assert second._overnight_reeval_attempt_generation == 3
+    assert second._overnight_reeval_exhausted_date == today
+
+
+def test_durable_attempt_claim_and_result_persist_exact_generation(monkeypatch):
+    """The production runner claims and persists one durable attempt identity."""
+    calls = {"claim": [], "upsert": []}
+    handoff = types.ModuleType("ap.morning_handoff")
+    handoff._load_handoff_run_lock = lambda **kwargs: None
+    handoff._claim_overnight_reeval_attempt = (
+        lambda **kwargs: calls["claim"].append(kwargs)
+        or {
+            "attempt_id": "2026-07-23:1:claimed",
+            "attempt_generation": 1,
+            "attempt_count": 1,
+            "session_key": "2026-07-23",
+        }
+    )
+    handoff._upsert_handoff_run_lock = lambda **kwargs: calls["upsert"].append(kwargs) or True
+    monkeypatch.setitem(sys.modules, "ap.morning_handoff", handoff)
+    monkeypatch.setattr(
+        ov,
+        "run_overnight_reeval",
+        lambda **kwargs: _result(
+            completed=False,
+            retryable=True,
+            result_class="RETRYABLE_ALL_DEFERRED",
+        ),
+    )
+
+    runner = _durable_runner()
+    del runner._persist_overnight_reeval_lock
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9), source="scheduler")
+
+    assert result["attempt_id"] == "2026-07-23:1:claimed"
+    assert result["attempt_generation"] == 1
+    assert calls["claim"][0] == {
+        "client_id": "jose@example.com",
+        "execution_mode": "live",
+        "trading_date": "2026-07-23",
+        "session_key": "2026-07-23",
+    }
+    assert calls["upsert"]
+    assert calls["upsert"][-1]["attempt_id"] == "2026-07-23:1:claimed"
+    assert calls["upsert"][-1]["attempt_generation"] == 1
 
 
 def test_first_all_deferred_stall_schedules_retry_and_skips_post_handoff(monkeypatch):
@@ -721,6 +854,23 @@ def test_force_true_bypasses_success_suppression_but_respects_lock(monkeypatch):
     assert locked["result_class"] == "ATTEMPT_ALREADY_RUNNING"
     assert forced["completed"] is True
     assert len(calls) == 1
+
+
+def test_force_true_clears_prior_success_before_failed_attempt(monkeypatch):
+    monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: _result())
+    runner = _runner()
+    today = _dt(9).date()
+    runner._overnight_reeval_state_date = today
+    runner._overnight_reeval_success_date = today
+
+    result = runner.run_overnight_reeval_attempt(
+        force=True,
+        now_et=_dt(9, 33),
+        source="admin_sync",
+    )
+
+    assert result["completed"] is False
+    assert runner._overnight_reeval_success_date is None
 
 
 def test_force_true_bypasses_exhausted_suppression(monkeypatch):

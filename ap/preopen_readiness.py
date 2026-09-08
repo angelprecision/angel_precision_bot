@@ -367,9 +367,10 @@ def _post_overnight_reeval_success_exists(client_id: str, execution_mode: str, t
     return False
 
 
-def _query_client_state(client_id: str) -> dict:
+def _query_client_state(client_id: str, execution_mode: str = "live") -> dict:
     from ap.db import conn, run_with_retry
 
+    execution_mode = _normalize_mode(execution_mode)
     now_utc = datetime.now(timezone.utc)
     processing_cutoff = now_utc - timedelta(minutes=PROCESSING_STALE_MINUTES)
     watching_cutoff = now_utc - timedelta(minutes=WATCHING_ORPHAN_GRACE_MINUTES)
@@ -417,9 +418,23 @@ def _query_client_state(client_id: str) -> dict:
 
             c.execute(
                 """
-                SELECT local_order_id, signal_id
+                SELECT local_order_id,
+                       signal_id,
+                       execution_mode,
+                       client_id,
+                       canonical_signal_id,
+                       meta->>'client_id' AS meta_client_id,
+                       meta->>'execution_mode' AS meta_execution_mode,
+                       meta->>'canonical_signal_id' AS meta_canonical_signal_id,
+                       meta->>'overnight_reeval_session_key' AS overnight_reeval_session_key,
+                       COALESCE(meta->>'attempt_id', meta->>'overnight_attempt_id') AS attempt_id,
+                       COALESCE(meta->>'attempt_generation', meta->>'overnight_attempt_generation') AS attempt_generation,
+                       meta->>'overnight_source_table' AS overnight_source_table,
+                       meta->>'overnight_source_job_id' AS overnight_source_job_id,
+                       meta->>'overnight_source_signal_id' AS overnight_source_signal_id
                 FROM orders
                 WHERE client_id = %s
+                  AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                   AND kind = 'ENTRY'
                   AND status = 'PENDING_TRIGGER'
                   AND created_ts >= %s
@@ -428,14 +443,48 @@ def _query_client_state(client_id: str) -> dict:
                   AND filled_ts IS NULL
                 ORDER BY created_ts
                 """,
-                (client_id, pending_cutoff),
+                (client_id, execution_mode, pending_cutoff),
             )
             pending_trigger = []
             for row in (c.fetchall() or []):
                 if isinstance(row, dict):
-                    pending_trigger.append({"local_order_id": row.get("local_order_id"), "signal_id": row.get("signal_id")})
+                    pending_trigger.append(
+                        {
+                            "local_order_id": row.get("local_order_id"),
+                            "signal_id": row.get("signal_id"),
+                            "execution_mode": row.get("execution_mode"),
+                            "client_id": row.get("client_id"),
+                            "meta_client_id": row.get("meta_client_id"),
+                            "meta_execution_mode": row.get("meta_execution_mode"),
+                            "canonical_signal_id": row.get("canonical_signal_id"),
+                            "meta_canonical_signal_id": row.get("meta_canonical_signal_id"),
+                            "overnight_reeval_session_key": row.get("overnight_reeval_session_key"),
+                            "attempt_id": row.get("attempt_id"),
+                            "attempt_generation": row.get("attempt_generation"),
+                            "overnight_source_table": row.get("overnight_source_table"),
+                            "overnight_source_job_id": row.get("overnight_source_job_id"),
+                            "overnight_source_signal_id": row.get("overnight_source_signal_id"),
+                        }
+                    )
                 else:
-                    pending_trigger.append({"local_order_id": row[0], "signal_id": row[1]})
+                    pending_trigger.append(
+                        {
+                            "local_order_id": row[0],
+                            "signal_id": row[1],
+                            "execution_mode": row[2],
+                            "client_id": row[3],
+                            "meta_client_id": row[5],
+                            "meta_execution_mode": row[6],
+                            "canonical_signal_id": row[4],
+                            "meta_canonical_signal_id": row[7],
+                            "overnight_reeval_session_key": row[8],
+                            "attempt_id": row[9],
+                            "attempt_generation": row[10],
+                            "overnight_source_table": row[11],
+                            "overnight_source_job_id": row[12],
+                            "overnight_source_signal_id": row[13],
+                        }
+                    )
 
             c.execute(
                 """
@@ -482,6 +531,50 @@ def _pending_trigger_without_watcher(runner, pending_rows: list[dict]) -> list[d
     return out
 
 
+def _load_durable_overnight_attempt(
+    *,
+    client_id: str,
+    execution_mode: str,
+    trading_date: str,
+) -> tuple[dict | None, str | None]:
+    """Read the exact durable overnight authority for one client/mode/date.
+
+    None means no attempt has ever been claimed.  A non-None error means
+    the authority could not be read and must be treated as unknown; callers
+    must not infer an explicit no-op from that condition.
+    """
+    try:
+        from ap.morning_handoff import _load_handoff_run_lock
+
+        row = _load_handoff_run_lock(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            trading_date=trading_date,
+            stage="overnight_reeval",
+        )
+        if not isinstance(row, dict):
+            return None, None
+        details = row.get("details")
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                details = {}
+        row = dict(row)
+        row["details"] = details if isinstance(details, dict) else {}
+        return row, None
+    except Exception as exc:
+        log.error(
+            "durable overnight authority load failed client_id=%s mode=%s date=%s: %s",
+            client_id,
+            execution_mode,
+            trading_date,
+            exc,
+            exc_info=True,
+        )
+        return None, f"{type(exc).__name__}:{exc}"
+
+
 def _overnight_status(
     runner,
     client_state: dict,
@@ -492,16 +585,102 @@ def _overnight_status(
     stage: str = "",
     now: datetime | None = None,
 ) -> tuple[str, dict]:
-    if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
-        return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
-    success_date = getattr(runner, "_overnight_reeval_success_date", None)
-    if str(success_date or "") == trading_date:
-        return "success", {"source": "runner_overnight_reeval_success_date"}
-    if int(client_state.get("watching_count", 0) or 0) == 0 and not client_state.get("pending_trigger_rows"):
-        return "explicit_noop", {"source": "no_watching_or_pending_trigger_rows"}
-    if str(stage or "").strip().lower() == "startup" and not _overnight_reeval_due(now):
-        return "pending", {"source": "startup_before_overnight_reeval_due"}
-    return "missing", {"source": "watching_or_pending_trigger_present_without_overnight_success"}
+    """Return readiness state from the latest exact durable overnight attempt.
+
+    The post-overnight handoff is deliberately not an authority source: a
+    newer partial/failure/conflict must invalidate any older post-stage
+    success, and a process restart must make the same decision from durable
+    state alone.
+    """
+    row, load_error = _load_durable_overnight_attempt(
+        client_id=client_id,
+        execution_mode=execution_mode,
+        trading_date=trading_date,
+    )
+    if load_error:
+        return "missing", {
+            "source": "handoff_run_locks.overnight_reeval",
+            "durable_authority": "unknown",
+            "durable_load_error": load_error,
+        }
+
+    if row is None:
+        if str(stage or "").strip().lower() == "startup" and not _overnight_reeval_due(now):
+            return "pending", {
+                "source": "handoff_run_locks.overnight_reeval",
+                "durable_authority": "missing_before_due",
+            }
+        return "missing", {
+            "source": "handoff_run_locks.overnight_reeval",
+            "durable_authority": "missing",
+        }
+
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    row_client = row.get("client_id").strip() if isinstance(row.get("client_id"), str) else ""
+    row_mode = _normalize_mode(row.get("execution_mode"))
+    row_date = row.get("trading_date").strip()[:10] if isinstance(row.get("trading_date"), str) else ""
+    detail_client = details.get("client_id").strip() if isinstance(details.get("client_id"), str) else ""
+    detail_mode = _normalize_mode(details.get("execution_mode"))
+    detail_date = details.get("trading_date").strip()[:10] if isinstance(details.get("trading_date"), str) else ""
+    attempt_id = details.get("attempt_id").strip() if isinstance(details.get("attempt_id"), str) else ""
+    raw_attempt_generation = details.get("attempt_generation")
+    attempt_generation = (
+        raw_attempt_generation
+        if isinstance(raw_attempt_generation, int)
+        and not isinstance(raw_attempt_generation, bool)
+        and raw_attempt_generation > 0
+        else 0
+    )
+    session_key = (
+        details.get("overnight_reeval_session_key").strip()
+        if isinstance(details.get("overnight_reeval_session_key"), str)
+        else ""
+    )
+    source_conflict = bool(
+        details.get("source_identity_conflict")
+        or details.get("source_identity_conflicts")
+        or str(details.get("result_class") or "").strip().upper()
+        == "SOURCE_IDENTITY_CONFLICT"
+    )
+    authority_identity_ok = (
+        row_client == client_id
+        and row_mode == execution_mode
+        and row_date == trading_date
+        and detail_client == client_id
+        and detail_mode == execution_mode
+        and detail_date == trading_date
+        and bool(attempt_id)
+        and attempt_generation > 0
+        and bool(session_key)
+    )
+    durable_success = (
+        str(row.get("status") or "").strip().lower() == "success"
+        and isinstance(row.get("last_success_at"), str)
+        and bool(row.get("last_success_at").strip())
+        and authority_identity_ok
+        and details.get("completed") is True
+        and details.get("retryable") is False
+        and details.get("source_lookup_partial") is False
+        and not source_conflict
+        and details.get("trade_queue_status") == "SUCCESS"
+        and details.get("ap_signals_status") == "SUCCESS"
+    )
+    diagnostic = {
+        "source": "handoff_run_locks.overnight_reeval",
+        "durable_authority": "valid_success" if durable_success else "unresolved",
+        "durable_status": str(row.get("status") or "").strip().lower(),
+        "result_class": details.get("result_class"),
+        "retry_reason": details.get("retry_reason"),
+        "last_error": row.get("last_error"),
+        "attempt_id": attempt_id or None,
+        "attempt_generation": attempt_generation,
+        "overnight_reeval_session_key": session_key or None,
+        "source_lookup_partial": details.get("source_lookup_partial"),
+        "source_identity_conflict": source_conflict,
+    }
+    if durable_success:
+        return "success", diagnostic
+    return "missing", diagnostic
 
 
 def _stage_success_recent(existing: dict | None) -> bool:
@@ -623,7 +802,7 @@ def run_preopen_autonomous_readiness(
     if selector_identity["quote_source"] == "unknown" or not selector_identity["tradier_base_url"]:
         errors.append("selector_quote_identity_unresolved")
 
-    client_state = _query_client_state(client_id)
+    client_state = _query_client_state(client_id, mode)
     details["client_state"] = client_state
 
     if client_state.get("stale_processing_ids"):
@@ -660,10 +839,10 @@ def run_preopen_autonomous_readiness(
     if overnight_state == "pending":
         warnings.append("overnight_reeval_pending_startup")
     elif overnight_state == "missing":
-        if mode == "live" or _after_929_et(now):
-            errors.append("overnight_reeval_missing")
-        else:
-            warnings.append("overnight_reeval_missing")
+        # Unknown/missing/partial/conflicted durable authority is never an
+        # explicit no-op.  PAPER may report DEGRADED, but it must not turn
+        # the unresolved shared source state into OK or submit/cancel work.
+        errors.append("overnight_reeval_missing")
     details["overnight_reeval"] = {"status": overnight_state, **overnight_details}
 
     # PR #388 LIVE blocked_keys hardening
