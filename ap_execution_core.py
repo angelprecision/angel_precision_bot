@@ -2013,8 +2013,14 @@ class APExecutionCore:
             meta = {}
             try:
                 approved_plan.metadata = meta
-            except Exception:
-                pass
+            except Exception as _deadline_read_exc:
+                log.warning(
+                    "[%s] deferred retry post-claim deadline reread failed "
+                    "order=%s exc=%s — using pre-claim deadline authority",
+                    self.client_id,
+                    local_order_id,
+                    _deadline_read_exc,
+                )
 
         approved_plan.contract_symbol = contract
         approved_plan.limit_price = limit_price
@@ -4718,8 +4724,14 @@ class APExecutionCore:
                             )
                         ):
                             _kwargs.pop("signal_id", None)
-                    except (TypeError, ValueError):
-                        pass
+                    except (TypeError, ValueError) as _signature_exc:
+                        log.warning(
+                            "[%s] deferred retry terminal callable signature "
+                            "unavailable order=%s exc=%s — preserving fenced call",
+                            self.client_id,
+                            queue_local_order_id,
+                            _signature_exc,
+                        )
                 return bool(_terminalize(queue_local_order_id, **_kwargs))
             except TypeError as _terminal_exc:
                 if (
