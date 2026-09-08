@@ -145,6 +145,7 @@ SECTOR_MAP: dict[str, str] = {
     "MDB": "TECH", "CDW": "TECH", "DELL": "TECH",
     "TEAM": "TECH", "ON": "TECH", "GFS": "TECH",
     "CTSH": "TECH", "ZM": "TECH",
+    "ROP": "TECH",   # GICS Information Technology (Application Software)
 
     # Communication services (new bucket)
     "T": "COMMUNICATION", "VZ": "COMMUNICATION", "TMUS": "COMMUNICATION",
@@ -165,8 +166,8 @@ SECTOR_MAP: dict[str, str] = {
     "GD": "INDUSTRIAL", "UNP": "INDUSTRIAL", "UPS": "INDUSTRIAL",
     "FDX": "INDUSTRIAL", "CSX": "INDUSTRIAL", "CTAS": "INDUSTRIAL",
     "FAST": "INDUSTRIAL", "ODFL": "INDUSTRIAL", "CPRT": "INDUSTRIAL",
-    "ROP": "INDUSTRIAL", "PCAR": "INDUSTRIAL", "VRSK": "INDUSTRIAL",
-    "PAYX": "INDUSTRIAL", "ADP": "INDUSTRIAL", "CSGP": "INDUSTRIAL",
+    "PCAR": "INDUSTRIAL", "VRSK": "INDUSTRIAL", "PAYX": "INDUSTRIAL",
+    "ADP": "INDUSTRIAL",
 
     # Utilities
     "NEE": "UTILITIES", "DUK": "UTILITIES", "SO": "UTILITIES",
@@ -177,6 +178,7 @@ SECTOR_MAP: dict[str, str] = {
 
     # Real estate (new bucket)
     "AMT": "REAL_ESTATE", "SPG": "REAL_ESTATE",
+    "CSGP": "REAL_ESTATE",   # GICS Real Estate (Real Estate Services)
 
     # Materials (new bucket)
     "LIN": "MATERIALS", "DOW": "MATERIALS",
