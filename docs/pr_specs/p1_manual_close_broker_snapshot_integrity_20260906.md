@@ -395,7 +395,7 @@ These are the concrete fail-first defects.
 4. one non-dict row among otherwise valid rows -> snapshot incomplete/HOLD.
 5. missing contract/OCC identity -> HOLD.
 6. non-empty but invalid OCC symbol -> HOLD for option snapshot completeness.
-7. quantity negative -> HOLD.
+7. valid negative integral quantity -> position presence (not HOLD).
 8. quantity fractional -> HOLD.
 9. quantity boolean -> HOLD.
 10. quantity NaN/inf -> HOLD.
