@@ -5635,6 +5635,43 @@ class APBrokerReconciler:
             raise ValueError("closed_repair_broker_position_malformed")
         return quantity
 
+    @staticmethod
+    def _closed_repair_is_valid_non_option_row(bp: dict) -> bool:
+        """Accept only adapter-proven non-option identities outside OCC.
+
+        The shared lifecycle identity helper intentionally keeps its legacy
+        underlying grammar.  Tradier's strict adapter additionally accepts
+        documented slash-form non-option symbols (for example ``BRK/A``).
+        Those rows are valid snapshot members, but never exact OCC authority.
+        Recheck every identity alias before treating one as non-option so a
+        conflicting or malformed option identity cannot be hidden by the
+        slash-form symbol.
+        """
+        from ap.brokers.tradier import _STRICT_UNDERLYING_RE
+        from ap.exit_safety import _POSITION_IDENTITY_FIELDS, _normalize_contract
+
+        if not isinstance(bp, dict) or bp.get("side") not in (None, ""):
+            return False
+
+        records = [bp]
+        raw = bp.get("raw")
+        if isinstance(raw, dict):
+            records.append(raw)
+
+        saw_non_option = False
+        for record in records:
+            for key in _POSITION_IDENTITY_FIELDS:
+                if key not in record or record.get(key) in (None, ""):
+                    continue
+                normalized = _normalize_contract(record.get(key))
+                if key in {"symbol", "instrument"} and _STRICT_UNDERLYING_RE.fullmatch(
+                    normalized
+                ):
+                    saw_non_option = True
+                    continue
+                return False
+        return saw_non_option
+
     def _closed_repair_broker_quantities(self) -> dict[str, int]:
         """Build exact-OCC target-authority quantities from the strict seam.
 
@@ -5673,6 +5710,16 @@ class APBrokerReconciler:
             self._closed_repair_validate_position_row(row)
 
             identity_state, contract = _iter_position_identity_values(row)
+            if (
+                identity_state == "invalid"
+                and self._closed_repair_is_valid_non_option_row(row)
+            ):
+                # Tradier's strict parser has already admitted this
+                # documented slash-form security as a valid non-option row.
+                # It contributes quantity to snapshot completeness only; it
+                # can never become exact OCC repair authority.
+                self._closed_repair_position_qty(row)
+                continue
             if identity_state in {"invalid", "ambiguous"}:
                 raise ValueError("closed_repair_broker_snapshot_ambiguous")
             if identity_state == "missing":

@@ -20,7 +20,9 @@ _STRICT_PADDED_OCC_RE = re.compile(
     r"^([A-Z0-9.]{1,6})\s+(\d{6}[CP]\d{8})$"
 )
 _STRICT_OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
-_STRICT_UNDERLYING_RE = re.compile(r"^[A-Z0-9.]{1,6}$")
+_STRICT_UNDERLYING_RE = re.compile(
+    r"^[A-Z0-9.]{1,6}(?:/[A-Z0-9.]{1,6})?$"
+)
 
 
 @dataclass(frozen=True)

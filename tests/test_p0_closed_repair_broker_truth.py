@@ -18,6 +18,7 @@ from ap_reconciler import APBrokerReconciler, _empty_summary
 CLIENT = "pr594@example.com"
 ACCOUNT = "PR594-ACCOUNT"
 CONTRACT = "AAPL260620C00155000"
+SLASH_SYMBOL = "BRK/A"
 PADDED_CONTRACT = "GS  260717C00465000"
 PADDED_COMPACT_CONTRACT = "GS260717C00465000"
 
@@ -336,6 +337,59 @@ def test_strict_positions_reader_accepts_only_documented_empty_and_valid_long():
     assert padded_rows[0]["raw"]["symbol"] == PADDED_CONTRACT
 
 
+def test_strict_positions_reader_accepts_documented_slash_non_option_symbol():
+    rows = _tradier(
+        payload={
+            "positions": {
+                "position": [{"symbol": SLASH_SYMBOL, "quantity": 10}]
+            }
+        }
+    ).list_positions_strict()
+
+    assert rows == [
+        {
+            "symbol": SLASH_SYMBOL,
+            "quantity": 10,
+            "cost_basis": 0.0,
+            "side": "",
+            "raw": {"symbol": SLASH_SYMBOL, "quantity": 10},
+        }
+    ]
+
+
+def test_strict_slash_symbol_is_non_option_and_never_occ_authority():
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 2},
+                    {"symbol": SLASH_SYMBOL, "quantity": 10},
+                ]
+            }
+        }
+    )
+
+    rows = broker.list_positions_strict()
+    assert rows[1]["symbol"] == SLASH_SYMBOL
+    assert rows[1]["side"] == ""
+    assert _reconciler(broker)._closed_repair_broker_quantities() == {
+        CONTRACT: 2
+    }
+
+
+def test_strict_positions_reader_rejects_slash_form_option_like_symbol():
+    with pytest.raises(ValueError, match="TRADIER_POSITIONS_PAYLOAD_MALFORMED"):
+        _tradier(
+            payload={
+                "positions": {
+                    "position": [
+                        {"symbol": f"{SLASH_SYMBOL}260620C00155000", "quantity": 2}
+                    ]
+                }
+            }
+        ).list_positions_strict()
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -429,6 +483,92 @@ def test_postgres_exact_quantity_restore_preserves_existing_restore_behavior(
         "close_source": "PARTIAL_CLOSE_REPAIR",
     }
     assert sum(sql.startswith("UPDATE POSITIONS") for sql in executed_sql) == 1
+
+
+def test_postgres_target_restore_survives_unrelated_slash_symbol(
+    postgres_closed_row,
+):
+    """A valid Tradier slash-form security is complete snapshot data only."""
+    insert, read, executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 2},
+                    {"symbol": SLASH_SYMBOL, "quantity": 10},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+    assert sum(sql.startswith("UPDATE POSITIONS") for sql in executed_sql) == 1
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_target_absence_flattens_with_unrelated_slash_symbol(
+    postgres_closed_row,
+):
+    """A complete snapshot containing only BRK/A still proves target absence."""
+    insert, read, executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {"position": [{"symbol": SLASH_SYMBOL, "quantity": 10}]}
+        }
+    )
+    rec = _reconciler(broker)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "CLOSED",
+        "quantity_remaining": 0,
+        "close_source": "CLOSED_REPAIR",
+    }
+    assert sum(sql.startswith("UPDATE POSITIONS") for sql in executed_sql) == 1
+    _assert_no_broker_mutations(broker)
+
+
+def test_postgres_target_restore_survives_unrelated_short_slash_symbol(
+    postgres_closed_row,
+):
+    """A signed short BRK/A row remains valid non-target snapshot data."""
+    insert, read, executed_sql = postgres_closed_row
+    insert()
+    broker = _tradier(
+        payload={
+            "positions": {
+                "position": [
+                    {"symbol": CONTRACT, "quantity": 2},
+                    {"symbol": SLASH_SYMBOL, "quantity": 10, "side": "short"},
+                ]
+            }
+        }
+    )
+    rec = _reconciler(broker)
+    rec._find_db_position_by_id = MagicMock(return_value={"id": "position-pr594"})
+    rec._seed_exit_engine_from_position = MagicMock(return_value=True)
+
+    rec._repair_closed_positions_with_remaining_qty(_empty_summary(CLIENT))
+
+    assert read() == {
+        "status": "PARTIAL",
+        "quantity_remaining": 2,
+        "close_source": "PARTIAL_CLOSE_REPAIR",
+    }
+    assert sum(sql.startswith("UPDATE POSITIONS") for sql in executed_sql) == 1
+    _assert_no_broker_mutations(broker)
 
 
 @pytest.mark.parametrize(
