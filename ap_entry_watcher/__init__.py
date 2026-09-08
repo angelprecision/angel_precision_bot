@@ -639,6 +639,16 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 signal, registration_provenance_out=registration_provenance_out,
             )
         with self._watch_admission_gate:
+            # PR #580 amendment: a recovery candidate must not destructively
+            # evict an incumbent before the base watcher has completed its
+            # final durable fence, lifecycle restoration, and registry commit.
+            # Ordinary admissions retain the existing proof-before-cancel
+            # arbitration below; this marker is limited to pre-breach #580
+            # recovery and excludes the separate deferred-retry resume path.
+            recovery_atomic_admission = bool(
+                (signal or {}).get("__recovery_rearm")
+                and not (signal or {}).get("__materialization_resume")
+            )
             incoming_key = self._ownership_key(signal)
             if incoming_key is None:
                 # A standalone legacy watcher may still be admitted without a
@@ -675,8 +685,12 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 if not self._has_durable_confirmed_direction_evidence(item)
                 and self._prunable(signal, item)
             ]
-            if prune and not self._prove_remove_all(
-                signal, prune, "opposite_side_replaced_stale_or_weaker"
+            if (
+                prune
+                and not recovery_atomic_admission
+                and not self._prove_remove_all(
+                    signal, prune, "opposite_side_replaced_stale_or_weaker"
+                )
             ):
                 return False
             opposites = self._opposites(ticker, side, signal)
@@ -713,15 +727,18 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         signal, best, "opposite_side_conflict",
                         "opposite_side_conflict:existing_watcher_wins",
                     )
-                if not self._prove_remove_all(
-                    signal, protected_opposites, "direction_flip_watcher_cancel"
+                if (
+                    not recovery_atomic_admission
+                    and not self._prove_remove_all(
+                        signal, protected_opposites, "direction_flip_watcher_cancel"
+                    )
                 ):
                     return False
             remaining = [
                 item for item in self._opposites(ticker, side, signal)
                 if not self._is_coarmable_opposite(item)
             ]
-            if remaining:
+            if remaining and not recovery_atomic_admission:
                 return self._block(
                     signal, remaining[0], "conflict_cancel_unproven",
                     "conflict_cancel_unproven:opposite_reappeared_before_admission",
@@ -743,7 +760,12 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         "same_side_block",
                         "same_side_block:existing_watcher_score_wins",
                     )
-                if not self._prove_remove_all(signal, same_side, "same_side_replace_watcher_cancel"):
+                if (
+                    not recovery_atomic_admission
+                    and not self._prove_remove_all(
+                        signal, same_side, "same_side_replace_watcher_cancel"
+                    )
+                ):
                     return False
             accepted = super().add_signal(
                 signal, registration_provenance_out=registration_provenance_out,

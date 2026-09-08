@@ -22,7 +22,10 @@ Additional:
 """
 from __future__ import annotations
 
+import copy
+import json
 import os
+import threading
 import types
 from unittest.mock import MagicMock, patch
 
@@ -440,6 +443,9 @@ class TestBugE_RecoveryRearmWiring:
     def _plan(self):
         return types.SimpleNamespace(
             signal_id="sig-recovery",
+            canonical_signal_id="canonical-recovery",
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",
             ticker="SPY",
             side="CALL",
             score=80,
@@ -458,9 +464,14 @@ class TestBugE_RecoveryRearmWiring:
             metadata={},
         )
 
-    def _row(self, meta=None, status="PENDING_TRIGGER"):
+    def _row(self, meta=None, status="PENDING_TRIGGER", local_order_id=None):
         return {
             "status": status,
+            "local_order_id": local_order_id,
+            "signal_id": "sig-recovery",
+            "canonical_signal_id": "canonical-recovery",
+            "client_id": "jasoncosby1@gmail.com",
+            "execution_mode": "live",
             "broker_order_id": None,
             "submitted_ts": None,
             "meta": meta or {},
@@ -469,11 +480,17 @@ class TestBugE_RecoveryRearmWiring:
     def _watcher(self, row):
         import ap_entry_watcher as ew
         osm = MagicMock()
-        osm.get_order.return_value = row
+        def _get_order(local_order_id):
+            loaded = dict(row)
+            if not loaded.get("local_order_id"):
+                loaded["local_order_id"] = local_order_id
+            return loaded
+        osm.get_order.side_effect = _get_order
         osm.cancel_pending_entry.return_value = True
         osm.submit_existing_entry = MagicMock()
         osm.record_deferred_hydration_result = MagicMock()
         w = ew.APEntryWatcher(MagicMock(), order_state_machine=osm, mode="LIVE")
+        w._persist_watcher_audit = lambda *a, **kw: None
         return ew, w, osm
 
     def _patch_safe_context(self, w):
@@ -1131,3 +1148,557 @@ class TestPR580AmendmentCorrections:
         assert len(w._pending) == 1, "duplicate recovery must not add second watcher"
         # Lifecycle state must remain stable
         assert L.LEDGER.current_state(sid) == L.SignalState.WATCHING
+
+    # ── Amendment atomicity: durable-owner race and staged conflicts ────────
+
+    def _recovery_plan(self, sig, local_order_id):
+        return types.SimpleNamespace(
+            signal_id=sig["signal_id"],
+            canonical_signal_id=sig["canonical_signal_id"],
+            client_id=sig["client_id"],
+            execution_mode=sig["execution_mode"],
+            ticker=sig["ticker"],
+            side=sig["side"],
+            score=sig["score"],
+            tier="A",
+            trigger_price=sig["entry_price"],
+            stop_underlying=sig["stop_price"],
+            target_underlying=sig["target_price"],
+            contract_symbol="DEFERRED:AAPL",
+            plan_id=sig["plan_id"],
+            pattern="2-1-2",
+            prior_day_high=200.10,
+            prior_day_low=197.90,
+            timeframe="1h",
+            strategy_type="continuation",
+            metadata={
+                **dict(sig["metadata"]),
+                "canonical_signal_id": sig["canonical_signal_id"],
+                "client_id": sig["client_id"],
+                "execution_mode": sig["execution_mode"],
+                "materialization_generation": sig["materialization_generation"],
+                "contract_deferred": True,
+            },
+            local_order_id=local_order_id,
+            materialization_generation=sig["materialization_generation"],
+        )
+
+    def _durable_recovery_row(self, sig):
+        return {
+            "status": "PENDING_TRIGGER",
+            "kind": "ENTRY",
+            "local_order_id": sig["local_order_id"],
+            "signal_id": sig["signal_id"],
+            "canonical_signal_id": sig["canonical_signal_id"],
+            "client_id": sig["client_id"],
+            "execution_mode": sig["execution_mode"],
+            "broker_order_id": None,
+            "submitted_ts": None,
+            "meta": {
+                "canonical_signal_id": sig["canonical_signal_id"],
+                "client_id": sig["client_id"],
+                "execution_mode": sig["execution_mode"],
+                "materialization_generation": sig["materialization_generation"],
+                "broker_ready": False,
+            },
+        }
+
+    @staticmethod
+    def _assert_no_broker_mutation(broker):
+        for method_name in (
+            "post",
+            "post_order",
+            "submit_order",
+            "submit_entry",
+            "submit_existing_entry",
+            "cancel",
+            "cancel_order",
+            "replace",
+            "replace_order",
+        ):
+            assert not getattr(broker, method_name).called, method_name
+
+    def _run_recovery_owner_race(self, advance_row):
+        """Run watch() through an Event barrier before real add_signal()."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+
+        sig = self._recovery_sig()
+        local_order_id = sig["local_order_id"]
+        row = self._durable_recovery_row(sig)
+        store = {"row": row}
+        osm = MagicMock()
+        # A non-string client_id selects the test-double path rather than a
+        # real database connection; the final read is still the real watcher
+        # admission path and the barrier makes the interleaving deterministic.
+        osm.client_id = None
+
+        def _get_order(_local_order_id):
+            return copy.deepcopy(store["row"])
+
+        osm.get_order.side_effect = _get_order
+        osm.cancel_pending_entry = MagicMock()
+        osm.submit_existing_entry = MagicMock()
+        osm.replace_order = MagicMock()
+        osm.update_position = MagicMock()
+        osm.create_position = MagicMock()
+        osm.insert_proof_trade = MagicMock()
+        osm.enqueue = MagicMock()
+
+        broker = MagicMock()
+        w = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        broker.reset_mock()
+        w._persist_watcher_audit = lambda *a, **kw: None
+        w._validate_local_order_id = MagicMock(return_value=True)
+        w.on_trigger = MagicMock()
+
+        candidate_reached_commit = threading.Event()
+        owner_advanced = threading.Event()
+        worker_errors = []
+
+        def _gated_add(signal, **kwargs):
+            candidate_reached_commit.set()
+            if not owner_advanced.wait(timeout=5):
+                raise AssertionError("worker B did not publish its durable advance")
+            return real_add(signal, **kwargs)
+
+        real_add = w.add_signal
+        worker_b = threading.Thread(
+            target=lambda: _advance_from_barrier(
+                candidate_reached_commit,
+                owner_advanced,
+                store,
+                advance_row,
+                worker_errors,
+            ),
+            daemon=True,
+        )
+        worker_b.start()
+        with patch.object(w, "add_signal", side_effect=_gated_add), \
+             patch.object(w, "_is_regular_session_now", return_value=False), \
+             patch.object(w, "_is_past_entry_cutoff_now", return_value=False):
+            result = w.watch(
+                self._recovery_plan(sig, local_order_id),
+                local_order_id,
+                recovery_rearm=True,
+            )
+        worker_b.join(timeout=5)
+        assert not worker_b.is_alive(), "barrier worker did not complete"
+        assert not worker_errors, worker_errors
+        return result, w, osm, broker, sig, store
+
+    @pytest.mark.parametrize(
+        "surface,key,value",
+        [
+            ("row", "broker_order_id", "broker-race-1"),
+            ("meta", "submit_intent_at", "2026-09-08T16:00:00+00:00"),
+            ("meta", "broker_ready", True),
+        ],
+    )
+    def test_a1_broker_handoff_during_recovery_holds_before_commit(
+        self, surface, key, value
+    ):
+        """Any canonical broker handoff published after early proof cannot admit."""
+        def _advance(row):
+            target = row if surface == "row" else row["meta"]
+            target[key] = value
+
+        result, w, osm, broker, sig, store = self._run_recovery_owner_race(_advance)
+
+        assert result is False
+        assert w._pending == []
+        assert w._dedup_set == set()
+        assert w._last_reject_reason == (
+            "recovery_lifecycle_hold_broker_handoff_evidence"
+        )
+        assert w.on_trigger.call_count == 0
+        self._assert_no_broker_mutation(broker)
+        assert not osm.submit_existing_entry.mock_calls
+        assert not osm.cancel_pending_entry.mock_calls
+        assert not osm.replace_order.mock_calls
+        assert not osm.update_position.mock_calls
+        assert not osm.create_position.mock_calls
+        assert not osm.insert_proof_trade.mock_calls
+        assert not osm.enqueue.mock_calls
+        import ap_lifecycle as L
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+
+    def test_a1_active_materializer_during_recovery_holds_before_commit(self):
+        """A materializer that wins the gap remains the sole owner."""
+        def _advance(row):
+            row["meta"].update({
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "materializer:race-1",
+                "materialization_lease_until": "2099-01-01T00:00:00+00:00",
+            })
+
+        result, w, osm, broker, sig, store = self._run_recovery_owner_race(_advance)
+
+        assert result is False
+        assert w._pending == []
+        assert w._dedup_set == set()
+        assert w._last_reject_reason == (
+            "recovery_lifecycle_hold_materialization_authority"
+        )
+        assert w.on_trigger.call_count == 0
+        self._assert_no_broker_mutation(broker)
+        assert not osm.submit_existing_entry.mock_calls
+        assert not osm.cancel_pending_entry.mock_calls
+        assert not osm.replace_order.mock_calls
+        import ap_lifecycle as L
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+
+    def test_a2_failed_recovery_replacement_preserves_incumbent(self):
+        """A HOLD after conflict staging cannot evict the incumbent watcher."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+
+        incumbent_signal = {
+            "signal_id": "incumbent-signal",
+            "canonical_signal_id": "incumbent-canonical",
+            "ticker": "AAPL",
+            "side": "CALL",
+            "score": 70.0,
+            "entry_price": 200.0,
+            "stop_price": 198.0,
+            "target_price": 205.0,
+            "local_order_id": "lo-incumbent",
+        }
+        incumbent = ew.WatchedSignal(incumbent_signal, overnight=False)
+
+        candidate = self._recovery_sig(
+            signal_id="replacement-signal",
+            canonical_signal_id="replacement-canonical",
+            local_order_id="lo-replacement",
+        )
+        candidate["metadata"].update({
+            "canonical_signal_id": candidate["canonical_signal_id"],
+            "client_id": candidate["client_id"],
+            "execution_mode": candidate["execution_mode"],
+        })
+        row = self._durable_recovery_row(candidate)
+        store = {"row": row}
+        osm = MagicMock()
+        osm.client_id = None
+        osm.cancel_pending_entry = MagicMock()
+        osm.get_order.side_effect = lambda _oid: copy.deepcopy(store["row"])
+        osm.submit_existing_entry = MagicMock()
+        osm.replace_order = MagicMock()
+        osm.update_position = MagicMock()
+        osm.create_position = MagicMock()
+        osm.insert_proof_trade = MagicMock()
+        osm.enqueue = MagicMock()
+        broker = MagicMock()
+        w = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        broker.reset_mock()
+        w._persist_watcher_audit = lambda *a, **kw: None
+        w._validate_local_order_id = MagicMock(return_value=True)
+        incumbent._watcher_ref = w
+        w._pending.append(incumbent)
+        w._dedup_set.add(incumbent.signal_id)
+        before_incumbent_row = {"status": "PENDING_TRIGGER", "local_order_id": "lo-incumbent"}
+
+        conflict_staged = threading.Event()
+        owner_advanced = threading.Event()
+        worker_errors = []
+        real_get_order = osm.get_order.side_effect
+
+        def _gated_get_order(local_order_id):
+            conflict_staged.set()
+            if not owner_advanced.wait(timeout=5):
+                raise AssertionError("worker B did not publish replacement HOLD truth")
+            return real_get_order(local_order_id)
+
+        osm.get_order.side_effect = _gated_get_order
+
+        def _worker_b():
+            try:
+                if not conflict_staged.wait(timeout=5):
+                    raise AssertionError("candidate did not reach final fence")
+                store["row"]["broker_order_id"] = "broker-replacement-1"
+                owner_advanced.set()
+            except BaseException as exc:
+                worker_errors.append(exc)
+                owner_advanced.set()
+
+        worker_b = threading.Thread(target=_worker_b, daemon=True)
+        worker_b.start()
+        candidate["side"] = "PUT"
+        candidate["score"] = 90.0
+        result = w.add_signal(candidate)
+        worker_b.join(timeout=5)
+
+        assert not worker_b.is_alive(), "replacement barrier worker did not complete"
+        assert not worker_errors, worker_errors
+        assert result is False
+        assert incumbent.state == ew.WatchState.PENDING
+        assert w._pending == [incumbent]
+        assert incumbent.signal_id in w._dedup_set
+        assert candidate["signal_id"] not in w._dedup_set
+        assert before_incumbent_row == {
+            "status": "PENDING_TRIGGER",
+            "local_order_id": "lo-incumbent",
+        }
+        assert not osm.cancel_pending_entry.mock_calls
+        assert not osm.submit_existing_entry.mock_calls
+        assert not osm.replace_order.mock_calls
+        assert not osm.update_position.mock_calls
+        assert not osm.create_position.mock_calls
+        assert not osm.insert_proof_trade.mock_calls
+        assert not osm.enqueue.mock_calls
+        self._assert_no_broker_mutation(broker)
+        assert L.LEDGER.current_state(candidate["signal_id"]) is None
+
+    @pytest.mark.parametrize("watching_behavior", ["raises", "no_state"])
+    def test_a3_failed_watching_closes_adopted_lifecycle(self, watching_behavior):
+        """Adopted-but-not-WATCHING is repaired to canonical ERROR, never held."""
+        import ap_entry_watcher as ew, ap_lifecycle as L, sys
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        broker = MagicMock()
+        w = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=None,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        broker.reset_mock()
+        w._persist_watcher_audit = lambda *a, **kw: None
+        w.on_trigger = MagicMock()
+        sig = self._recovery_sig(
+            signal_id="failed-watching-signal",
+            canonical_signal_id="failed-watching-canonical",
+            local_order_id="lo-failed-watching",
+        )
+        base_module = sys.modules.get("_ap_entry_watcher_base", ew)
+        if watching_behavior == "raises":
+            behavior = MagicMock(side_effect=RuntimeError("injected watching failure"))
+        else:
+            behavior = MagicMock(return_value=None)
+
+        with patch.object(base_module, "signal_watching", behavior):
+            result = w.add_signal(sig)
+
+        assert result is False
+        assert w._pending == []
+        assert w._dedup_set == set()
+        assert w.on_trigger.call_count == 0
+        self._assert_no_broker_mutation(broker)
+        history = L.LEDGER.history(sig["signal_id"])
+        transitions = [(entry.from_state, entry.to_state) for entry in history]
+        assert (None, L.SignalState.ADOPTED) in transitions
+        assert (L.SignalState.ADOPTED, L.SignalState.ERROR) in transitions
+        assert (L.SignalState.ADOPTED, L.SignalState.WATCHING) not in transitions
+        assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.ERROR
+
+    def test_a1_postgres_row_lock_serializes_final_recovery_commit(self, monkeypatch):
+        """The real OSM row lock spans lifecycle and watcher admission."""
+        database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+        if not database_url:
+            pytest.skip("disposable PostgreSQL URL not configured")
+
+        import uuid
+        from contextlib import contextmanager
+
+        import psycopg2
+        import psycopg2.extras
+
+        import ap.db as db_module
+        import ap_entry_watcher as ew
+        import ap_lifecycle as L
+
+        schema = f"pr580_lock_{uuid.uuid4().hex}"
+        client_id = "jasoncosby1@gmail.com"
+        sig = self._recovery_sig(
+            signal_id=f"pg-lock-signal-{uuid.uuid4().hex}",
+            canonical_signal_id=f"pg-lock-canonical-{uuid.uuid4().hex}",
+            local_order_id=f"pg-lock-order-{uuid.uuid4().hex}",
+            client_id=client_id,
+            execution_mode="live",
+        )
+        sig["metadata"].update({
+            "client_id": client_id,
+            "execution_mode": "live",
+            "canonical_signal_id": sig["canonical_signal_id"],
+        })
+
+        class _ConnectionWrapper:
+            def __init__(self, connection, cursor):
+                self.connection = connection
+                self.cursor = cursor
+
+            def execute(self, sql, params=None):
+                self.cursor.execute(sql, params)
+                return self
+
+            def fetchone(self):
+                return self.cursor.fetchone()
+
+        @contextmanager
+        def _pg_conn():
+            connection = psycopg2.connect(database_url)
+            cursor = connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            try:
+                cursor.execute(f'SET search_path TO "{schema}"')
+                yield _ConnectionWrapper(connection, cursor)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                cursor.close()
+                connection.close()
+
+        admin = psycopg2.connect(database_url)
+        admin.autocommit = True
+        try:
+            with admin.cursor() as cursor:
+                cursor.execute(f'CREATE SCHEMA "{schema}"')
+                cursor.execute(
+                    f"""
+                    CREATE TABLE "{schema}".orders (
+                        local_order_id TEXT PRIMARY KEY,
+                        client_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        broker_order_id TEXT,
+                        submitted_ts TIMESTAMPTZ,
+                        execution_mode TEXT NOT NULL,
+                        signal_id TEXT,
+                        canonical_signal_id TEXT,
+                        meta JSONB
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    INSERT INTO "{schema}".orders (
+                        local_order_id, client_id, kind, status,
+                        execution_mode, signal_id, canonical_signal_id, meta
+                    ) VALUES (%s, %s, 'ENTRY', 'PENDING_TRIGGER', %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        sig["local_order_id"],
+                        client_id,
+                        "live",
+                        sig["signal_id"],
+                        sig["canonical_signal_id"],
+                        json.dumps(sig["metadata"]),
+                    ),
+                )
+
+            monkeypatch.setattr(db_module, "conn", _pg_conn)
+            with L.LEDGER._entry_lock:
+                L.LEDGER._current_state.clear()
+
+            broker = MagicMock()
+            osm = MagicMock()
+            osm.client_id = client_id
+            watcher = ew.APEntryWatcher(
+                broker=broker,
+                order_state_machine=osm,
+                require_on_trigger=False,
+                mode="LIVE",
+            )
+            watcher._persist_watcher_audit = lambda *a, **kw: None
+            watcher._validate_local_order_id = MagicMock(return_value=True)
+            watched = ew.WatchedSignal(sig, overnight=False)
+
+            lifecycle_entered = threading.Event()
+            worker_ready = threading.Event()
+            worker_done = threading.Event()
+            worker_errors = []
+            original_restore = watcher._restore_recovered_watcher_lifecycle
+
+            def _restore_with_wait(candidate):
+                lifecycle_entered.set()
+                assert worker_ready.wait(timeout=5), "database worker did not start"
+                assert not worker_done.is_set(), "row update was not serialized"
+                return original_restore(candidate)
+
+            def _advance_row():
+                connection = psycopg2.connect(database_url)
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(f'SET search_path TO "{schema}"')
+                    assert lifecycle_entered.wait(timeout=5)
+                    worker_ready.set()
+                    cursor.execute(
+                        "UPDATE orders SET broker_order_id=%s WHERE local_order_id=%s",
+                        ("broker-after-lock", sig["local_order_id"]),
+                    )
+                    connection.commit()
+                    worker_done.set()
+                except BaseException as exc:
+                    worker_errors.append(exc)
+                    connection.rollback()
+                    worker_done.set()
+                finally:
+                    cursor.close()
+                    connection.close()
+
+            worker = threading.Thread(target=_advance_row, daemon=True)
+            worker.start()
+            watcher._restore_recovered_watcher_lifecycle = _restore_with_wait
+            result = watcher.add_signal(sig)
+            worker.join(timeout=5)
+
+            assert not worker.is_alive(), "database owner did not finish after lock release"
+            assert not worker_errors, worker_errors
+            assert result is True
+            assert len(watcher._pending) == 1
+            assert watcher._pending[0].signal_id == sig["signal_id"]
+            assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.WATCHING
+            assert worker_done.is_set()
+            assert not broker.called
+
+            with psycopg2.connect(database_url) as check_connection:
+                with check_connection.cursor() as cursor:
+                    cursor.execute(
+                        f'SET search_path TO "{schema}"'
+                    )
+                    cursor.execute(
+                        "SELECT broker_order_id FROM orders WHERE local_order_id=%s",
+                        (sig["local_order_id"],),
+                    )
+                    assert cursor.fetchone()[0] == "broker-after-lock"
+        finally:
+            admin.autocommit = True
+            with admin.cursor() as cursor:
+                cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            admin.close()
+
+
+def _advance_from_barrier(
+    reached: threading.Event,
+    advanced: threading.Event,
+    store: dict,
+    advance_row,
+    errors: list,
+):
+    """Worker-B side of the deterministic recovery ownership race."""
+    try:
+        if not reached.wait(timeout=5):
+            raise AssertionError("recovery candidate did not reach final boundary")
+        advance_row(store["row"])
+        advanced.set()
+    except BaseException as exc:
+        errors.append(exc)
+        advanced.set()
