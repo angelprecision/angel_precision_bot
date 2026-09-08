@@ -13,7 +13,8 @@ from types import SimpleNamespace
 import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
-os.environ.setdefault("SCHEMA_ATTESTATION_ENABLED", "0")
+if not os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "").strip():
+    os.environ.setdefault("SCHEMA_ATTESTATION_ENABLED", "0")
 from ap_execution_core import APExecutionCore
 
 

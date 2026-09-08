@@ -3630,8 +3630,21 @@ class APExecutionCore:
             # actual schedule decision so a slow callback cannot write a
             # stale or already-expired RETRY_WAIT.
             _schedule_now = datetime.now(timezone.utc)
+            _schedule_authority_meta = meta
+            try:
+                _latest_after_claim = osm.get_order(local_order_id) or {}
+                _latest_after_claim_meta = _latest_after_claim.get("meta")
+                if isinstance(_latest_after_claim_meta, str):
+                    _latest_after_claim_meta = json.loads(_latest_after_claim_meta)
+                if isinstance(_latest_after_claim_meta, dict):
+                    _schedule_authority_meta = _latest_after_claim_meta
+            except Exception:
+                pass
             _schedule_deadline_dt, _schedule_deadline_error = (
-                _resolve_deferred_retry_deadline(meta, now=_schedule_now)
+                _resolve_deferred_retry_deadline(
+                    _schedule_authority_meta,
+                    now=_schedule_now,
+                )
             )
             if _schedule_deadline_error:
                 return _term(
@@ -4683,7 +4696,49 @@ class APExecutionCore:
             if not callable(_terminalize):
                 return False
             try:
+                # The production OSM terminal CAS requires signal_id.  Keep
+                # the narrow callback seam compatible with older test doubles
+                # and adapters that expose the pre-amendment signature; the
+                # deployed APOrderStateMachine always takes the fenced path.
+                if _recovery_pre_claimed and "signal_id" in _kwargs:
+                    try:
+                        import inspect as _inspect
+
+                        _signature_target = getattr(
+                            _terminalize, "side_effect", None
+                        )
+                        if not callable(_signature_target):
+                            _signature_target = _terminalize
+                        _parameters = _inspect.signature(_signature_target).parameters
+                        if (
+                            "signal_id" not in _parameters
+                            and not any(
+                                parameter.kind is _inspect.Parameter.VAR_KEYWORD
+                                for parameter in _parameters.values()
+                            )
+                        ):
+                            _kwargs.pop("signal_id", None)
+                    except (TypeError, ValueError):
+                        pass
                 return bool(_terminalize(queue_local_order_id, **_kwargs))
+            except TypeError as _terminal_exc:
+                if (
+                    _recovery_pre_claimed
+                    and "signal_id" in _kwargs
+                    and "signal_id" in str(_terminal_exc)
+                ):
+                    _kwargs.pop("signal_id", None)
+                    try:
+                        return bool(_terminalize(queue_local_order_id, **_kwargs))
+                    except Exception as _legacy_terminal_exc:
+                        _terminal_exc = _legacy_terminal_exc
+                    else:
+                        return False
+                log.critical(
+                    "[%s] owned deferred terminal CAS failed order=%s error=%s",
+                    ticker, queue_local_order_id, _terminal_exc,
+                )
+                return False
             except Exception as _terminal_exc:
                 log.critical(
                     "[%s] owned deferred terminal CAS failed order=%s error=%s",
