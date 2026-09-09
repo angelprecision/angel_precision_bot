@@ -5,7 +5,7 @@
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
 Base: `d404df34e00522ba2cce995b6a0129ba39b83944`
-Current implementation/code head: `86b97873a2068b02c89f846b7fbd4180417f04d6`
+Current implementation/code head: `2cf420c5`
 PR state: **Draft / open / HARD HOLD**. The final branch head including this
 documentation attestation is recorded in the PR body; this spec commit is
 documentation-only and does not alter production code.
@@ -15,6 +15,10 @@ Head before this rebase: `442f37c16c4dbff0b2fcc9b02ff35d7d9d88f84b`
 Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92bf4be`
 Amendment applied: 2026-09-09
 
+Latest code amendment commit (before this documentation attestation):
+`2cf420c5`. The final branch SHA, including this specification update, is
+recorded in the PR body after the documentation commit.
+
 Dependencies (§STATUS binding order):
 - PR #568 (deferred selector/materialization retry authority): current `main`
   is the committed pre-#568 rebuild at `d404df34e00522ba2cce995b6a0129ba39b83944`;
@@ -22,6 +26,62 @@ Dependencies (§STATUS binding order):
   base and does not copy or modify #568 retry-owner code
 - PR #569 (fresh market truth / late watcher recovery): **open/draft** and
   remains a separate ownership boundary; it is not included in this amendment
+
+### Latest audit corrections — strict trigger authority and post-admission liveness
+
+The latest audit identified two remaining production blockers and one
+observability gap. They are corrected in the code commit above without
+changing the PR's ownership boundary.
+
+- `trigger_generation` is now parsed independently from every top-level,
+  `metadata`, and `meta` authority with the same strict positive-integer
+  contract as `materialization_generation`. Zero, negative, boolean, float,
+  fractional-string, blank, malformed, one-sided, and conflicting authorities
+  HOLD. A populated trigger generation must equal the materialization
+  generation on both the recovery candidate and the durable row. The final
+  row identity fence, lifecycle bridge, and OSM dispatch claim all apply this
+  binding; no generation is coerced while building a restart plan.
+- The package poll path now performs an OSM-backed exact identity/mode/
+  generation claim CAS immediately before any recovery `TRIGGER_READY` audit,
+  lifecycle write, timestamp write, or callback. A missing OSM claim method,
+  row-lock capability, exact row, or claim proof fails closed. A recovery
+  claim CAS cannot be satisfied by a bare test mock; the only bypass is the
+  explicit `_test_only_allow_recovery_without_row_lock` unit seam.
+- Post-admission HOLDs have explicit dispositions. Proven broker/materializer
+  ownership is permanently non-executable; transient durable read/claim
+  failure receives a bounded authority recheck and can restore the exact
+  original watcher; identity/generation conflict is an auditable quarantine.
+  None of these paths invokes a callback, selector, broker submit/cancel/
+  replace, position, proof-trade, or queue mutation.
+- The final OSM claim parses both metadata aliases independently and rejects
+  malformed or conflicting identity/generation authorities. Its mode-scoped
+  `FOR UPDATE` transaction installs a deterministic recovery dispatch owner;
+  top-level-only generation schemas remain supported because the Python proof
+  is performed while the row lock is held.
+- Successful candidate-first replacement still cancels and terminally rereads
+  only the exact displaced incumbent before releasing its registration and
+  dedup key. Canonical transition events and opportunity-ledger notifications
+  are replayed only after the transaction commits; rollback emits neither.
+- `materialization_resume=True` remains outside this transaction and lifecycle
+  bridge. Restart plan construction preserves raw generation values for the
+  #580 strict fence, while the existing #596 retry lease/generation/attempt
+  adoption CAS remains the sole materializer authority and is not changed.
+
+Focused local evidence for this amendment:
+
+- complete `tests/test_p0_pending_trigger_lifecycle_integrity.py`:
+  `142 passed, 1 skipped`;
+- lifecycle-integrity plus post-outage convergence:
+  `164 passed, 1 skipped`;
+- recovery/convergence, replay, replacement, pre-breach, reattach, and
+  #596-isolation suites:
+  `368 passed, 2 skipped`;
+- the local PostgreSQL row-lock test is skipped when
+  `INTELLIGENCE_POSTGRES_TEST_URL` is unset; the CI workflow is the required
+  PostgreSQL evidence;
+- OSM-adjacent validation: `65 passed, 1 skipped`, then the pre-existing
+  unrelated `TestFix1_EntryMetaPersistence.test_create_entry_order_writes_score_column`
+  failure (`metadata_invalid:unknown_execution_mode` from its MagicMock plan).
 
 Implementation on this branch is preparatory only, per explicit override.
 Before merge:
@@ -225,9 +285,11 @@ Test/CI files changed:
 - `tests/test_p0_watcher_conflict_cancellation_proof.py` — 1 insertion;
   explicit test-only fence seam.
 
-`ap/pending_trigger_restart_recovery.py` and all #596 production retry
-authority remain unchanged by this amendment. The only OSM change is the
-private transaction-aware recovery cancellation seam described above.
+`ap/pending_trigger_restart_recovery.py` and `ap_recovery.py` only preserve raw
+generation values so the #580 fence can reject corruption; their #596
+materialization retry lease, generation, attempt, and adoption-CAS authority
+remain unchanged. The OSM change is limited to the private transaction-aware
+recovery cancellation seam and final recovery dispatch claim described above.
 
 Files NOT touched (§4/§5 binding):
 - `ap_lifecycle.py`, `ap/order_monitor.py`, `ap/preopen_readiness.py`,
