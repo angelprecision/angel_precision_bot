@@ -1016,6 +1016,15 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             if action != "trigger":
                 retained.append((action, watched))
                 continue
+            # The base poller resolves durable terminal/ambiguity truth before
+            # this hook. Such watchers bypass direction mutation entirely and
+            # return to the base consumer for cleanup or fail-closed retention.
+            _durable_disposition = getattr(
+                watched, "_pre_dispatch_durable_disposition", None
+            )
+            if _durable_disposition not in {None, "NON_DEFERRED", "PENDING_TRIGGER"}:
+                retained.append((action, watched))
+                continue
             key = self._direction_key(watched)
             if key is None:
                 invalid_triggers.append(watched)

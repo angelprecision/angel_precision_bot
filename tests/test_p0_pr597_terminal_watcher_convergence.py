@@ -37,7 +37,9 @@ import logging
 import os
 import types
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from threading import Barrier
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -406,6 +408,23 @@ class TestBrokerHandoffFence:
         _, w, osm, broker, watched = make_scenario(row=row)
         assert resolve(w, watched)[0] == "TERMINAL_DURABLE"
 
+    @pytest.mark.parametrize("value", [True, "true", 1])
+    def test_nested_materialization_broker_ready_uses_canonical_detector(self, value):
+        row = make_row()
+        row["meta"]["materialization"] = {"broker_ready": value}
+        _, w, osm, broker, watched = make_scenario(row=row)
+        assert resolve(w, watched)[0] == "RECONCILE_BROKER_INTENT"
+        zero_broker(broker, osm)
+
+    def test_nested_materialization_submit_intent_uses_canonical_detector(self):
+        row = make_row()
+        row["meta"]["materialization"] = {
+            "submit_intent_at": "2026-09-08T14:00:00+00:00"
+        }
+        _, w, osm, broker, watched = make_scenario(row=row)
+        assert resolve(w, watched)[0] == "RECONCILE_BROKER_INTENT"
+        zero_broker(broker, osm)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Negative authority: missing client / mode / identity
@@ -517,6 +536,22 @@ class TestSignalIdentityCheck:
             row=row, signal_id="sig-watcher-only")
         assert resolve(w, watched)[0] == "TERMINAL_DURABLE"
 
+    def test_metadata_canonical_signal_conflict_holds(self):
+        row = make_row()
+        row["meta"]["canonical_signal_id"] = "canon-durable-wrong"
+        _, w, osm, broker, watched = make_scenario(
+            row=row, canonical_signal_id="canon-watcher-expected")
+        assert resolve(w, watched)[0] == "KEEP_WATCHER"
+        zero_broker(broker, osm)
+
+    def test_durable_metadata_identity_with_missing_watcher_identity_holds(self):
+        row = make_row()
+        row["meta"]["signal_id"] = "sig-durable"
+        _, w, osm, broker, watched = make_scenario(row=row)
+        watched.signal.pop("signal_id", None)
+        assert resolve(w, watched)[0] == "KEEP_WATCHER"
+        zero_broker(broker, osm)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime watcher ↔ restart recovery identity parity (spec §17.11)
@@ -606,6 +641,7 @@ class _RealOSM:
 
     def __init__(self, initial_row: dict):
         self._row = dict(initial_row)
+        self.meta_updates = []
 
     def set_row(self, row: dict):
         self._row = dict(row)
@@ -613,10 +649,25 @@ class _RealOSM:
     def get_order(self, local_order_id: str) -> dict:
         return dict(self._row)
 
-    def update_order_meta(self, local_order_id: str, meta_patch: dict) -> bool:
+    def update_order_meta(self, local_order_id: str, meta_patch: dict, **expected) -> bool:
+        if local_order_id != self._row.get("local_order_id"):
+            return False
+        if expected.get("expected_status") is not None and str(
+            self._row.get("status") or ""
+        ).upper() != str(expected["expected_status"]).upper():
+            return False
+        if expected.get("expected_execution_mode") is not None and str(
+            self._row.get("execution_mode") or ""
+        ).strip().lower() != str(expected["expected_execution_mode"]).strip().lower():
+            return False
+        if expected.get("expected_signal_id") is not None and str(
+            self._row.get("signal_id") or ""
+        ).strip() != str(expected["expected_signal_id"]).strip():
+            return False
         _m = dict(self._row.get("meta") or {})
         _m.update(meta_patch or {})
         self._row["meta"] = _m
+        self.meta_updates.append((dict(meta_patch or {}), dict(expected)))
         return True
 
     def cancel_pending_entry(self, *a, **kw): return True
@@ -638,6 +689,8 @@ def _terminal_row_for(local_oid: str, *, client="jason@example.com",
         "broker_order_id": None,
         "submitted_ts": None,
         "signal_id": signal_id,
+        "ticker": "TMO",
+        "side": "CALL",
         "meta": {
             "restart_recovery_terminal_reason": _TMO_DURABLE_REASON,
             "restart_recovery_cls": "STUCK_TRIGGER_READY",
@@ -691,6 +744,7 @@ def _build_live_watcher(osm, *, client="jason@example.com"):
     w.mode = "LIVE"
     w.paper = False
     w.client_id = client
+    w._persist_watcher_audit = MagicMock(return_value=True)
     return w, broker
 
 
@@ -748,6 +802,8 @@ class TestPollDispatchPreTerminalConvergence:
         # 4) Dedup released (production helper actually removed the key).
         with w._lock:
             assert sig["signal_id"] not in w._dedup_set
+        # Terminal truth is checked before every trigger-authority write.
+        assert osm.meta_updates == []
         # 5) Structured diagnostic fired.
         joined = "\n".join(r.getMessage() for r in caplog.records)
         assert "WATCHER_TERMINAL_PRE_DISPATCH_SKIP" in joined
@@ -783,6 +839,12 @@ class TestPollDispatchPreTerminalConvergence:
 
         # Callback ran once because at dispatch the row wasn't yet terminal.
         assert callback_count["n"] == 1
+        assert len(osm.meta_updates) == 1
+        assert osm.meta_updates[0][1] == {
+            "expected_status": "PENDING_TRIGGER",
+            "expected_execution_mode": "live",
+            "expected_signal_id": "sig-B",
+        }
         # No broker action from convergence.
         broker.submit_order.assert_not_called()
         broker.cancel_order.assert_not_called()
@@ -796,6 +858,51 @@ class TestPollDispatchPreTerminalConvergence:
                           return_value=_quote_that_confirms_call_breach("TMO")):
             w._poll_active_signals(open_protect_active=False)
         assert callback_count["n"] == 1, "No post-terminal callback repeat"
+
+    def test_terminal_broker_ambiguity_real_poll_suppresses_callback_and_write(self):
+        local_oid = str(uuid.uuid4())
+        row = _terminal_row_for(local_oid, signal_id="sig-broker-hold")
+        row["meta"]["materialization"] = {"broker_ready": "true"}
+        osm = _RealOSM(row)
+        w, broker = _build_live_watcher(osm)
+        w.on_trigger = MagicMock(return_value={"disposition": "SUBMITTED"})
+
+        sig = _real_signal(local_oid, "TMO", "sig-broker-hold")
+        ws = _install_watched_in_pending(w, sig)
+        with patch.object(w, "_fetch_quotes",
+                          return_value=_quote_that_confirms_call_breach("TMO")):
+            w._poll_active_signals(open_protect_active=False)
+
+        w.on_trigger.assert_not_called()
+        assert osm.meta_updates == []
+        with w._lock:
+            assert ws in w._pending
+            assert sig["signal_id"] in w._dedup_set
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_terminal_identity_ambiguity_real_poll_suppresses_callback_and_write(self):
+        local_oid = str(uuid.uuid4())
+        row = _terminal_row_for(local_oid, signal_id="sig-identity-hold")
+        row["meta"]["canonical_signal_id"] = "canon-durable-wrong"
+        osm = _RealOSM(row)
+        w, broker = _build_live_watcher(osm)
+        w.on_trigger = MagicMock(return_value={"disposition": "SUBMITTED"})
+
+        sig = _real_signal(local_oid, "TMO", "sig-identity-hold")
+        sig["metadata"] = {"canonical_signal_id": "canon-watcher-expected"}
+        ws = _install_watched_in_pending(w, sig)
+        with patch.object(w, "_fetch_quotes",
+                          return_value=_quote_that_confirms_call_breach("TMO")):
+            w._poll_active_signals(open_protect_active=False)
+
+        w.on_trigger.assert_not_called()
+        assert osm.meta_updates == []
+        with w._lock:
+            assert ws in w._pending
+            assert sig["signal_id"] in w._dedup_set
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
 
     def test_unrelated_watcher_survives_pre_dispatch_convergence(self):
         """A convergence event on watcher A must not touch watcher B."""
@@ -963,8 +1070,8 @@ class TestRealDirectionClaimConvergence:
         broker.cancel_order.assert_not_called()
 
 
-class TestTwoObserverIdempotency:
-    """Blocker #7 test 19: two convergence attempts race the same watcher."""
+class TestSequentialIdempotency:
+    """A completed convergence remains a no-op on the next poll."""
 
     def test_two_polls_on_same_terminal_row_are_idempotent(self):
         local_oid = str(uuid.uuid4())
@@ -1002,31 +1109,95 @@ class TestTwoObserverIdempotency:
         broker.cancel_order.assert_not_called()
 
 
+class TestTwoObserverRace:
+    """Two runtime observers concurrently see the same terminal identity."""
+
+    def test_concurrent_observers_both_suppress_callback_and_economic_work(self):
+        local_oid = str(uuid.uuid4())
+        osm = _RealOSM(_terminal_row_for(local_oid, signal_id="sig-race"))
+        watchers = []
+        callbacks = []
+        brokers = []
+        for _ in range(2):
+            watcher, broker = _build_live_watcher(osm)
+            callback = MagicMock(return_value={"disposition": "SUBMITTED"})
+            watcher.on_trigger = callback
+            signal = _real_signal(local_oid, "TMO", "sig-race")
+            watched = _install_watched_in_pending(watcher, signal)
+            watchers.append((watcher, watched, signal))
+            callbacks.append(callback)
+            brokers.append(broker)
+
+        start = Barrier(2)
+
+        def _poll(item):
+            watcher, _, _ = item
+            start.wait()
+            with patch.object(
+                watcher, "_fetch_quotes",
+                return_value=_quote_that_confirms_call_breach("TMO"),
+            ):
+                watcher._poll_active_signals(open_protect_active=False)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(_poll, watchers))
+
+        assert osm.meta_updates == []
+        for (watcher, watched, signal), callback, broker in zip(
+            watchers, callbacks, brokers
+        ):
+            callback.assert_not_called()
+            with watcher._lock:
+                assert watched not in watcher._pending
+                assert signal["signal_id"] not in watcher._dedup_set
+            broker.submit_order.assert_not_called()
+            broker.cancel_order.assert_not_called()
+
+
 class TestRestartNoRehydrate:
     """Blocker #7 test 20: after terminalization, a fresh watcher instance
     (simulating process restart) must not rehydrate a behavior-active
     watcher for that exact row through the runtime code #597 owns."""
 
     def test_terminal_row_does_not_rehydrate_via_watcher(self):
+        from ap.pending_trigger_restart_recovery import PendingTriggerRestartRecovery
+
         local_oid = str(uuid.uuid4())
         terminal_row = _terminal_row_for(local_oid, signal_id="sig-rehydrate")
-        osm = _RealOSM(terminal_row)
-        w, broker = _build_live_watcher(osm)
+        crossed_at = datetime.now(timezone.utc).isoformat()
+        terminal_row["meta"].update({
+            "trigger_crossed_at": crossed_at,
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": "sig-rehydrate",
+                "client_id": "jason@example.com",
+                "execution_mode": "live",
+                "local_order_id": local_oid,
+            },
+        })
+        osm = MagicMock()
+        fresh_watcher = MagicMock()
+        fresh_watcher._pending = []
+        fresh_watcher._dedup_set = set()
+        fresh_watcher.watch = MagicMock(return_value=True)
+        broker = MagicMock()
+        recovery = PendingTriggerRestartRecovery(
+            client_id="jason@example.com",
+            execution_mode="LIVE",
+            osm=osm,
+            entry_watcher=fresh_watcher,
+            broker=broker,
+            quote_check_fn=MagicMock(),
+            caller_source="pr597_restart_regression",
+        )
 
-        # No WatchedSignal is installed — simulates a fresh restart where
-        # the runtime has no in-memory ownership. The runtime must not
-        # invent one; _pending remains empty for this row.
-        with patch.object(w, "_fetch_quotes", return_value={}):
-            w._poll_active_signals(open_protect_active=False)
-
-        with w._lock:
-            assert not any(
-                str((getattr(x, "signal", {}) or {}).get("local_order_id") or "") == local_oid
-                for x in w._pending
-            )
-            # Dedup registry untouched by the poll.
-            # (Recovery/#580 lifecycle is out of scope here; this only proves
-            # #597 doesn't rehydrate.)
+        # Enter the real restart engine. A terminal row is already resolved;
+        # it must be skipped before watcher admission or any durable mutation.
+        assert recovery.recover_one_row(terminal_row) == "SKIPPED"
+        fresh_watcher.watch.assert_not_called()
+        assert fresh_watcher._pending == []
+        assert fresh_watcher._dedup_set == set()
+        osm.update_order_meta.assert_not_called()
+        osm.terminalize_deferred_breach.assert_not_called()
         broker.submit_order.assert_not_called()
         broker.cancel_order.assert_not_called()
 
@@ -1226,10 +1397,8 @@ class TestStructuralAnchors:
 
     def test_broker_handoff_fence_wired(self):
         src = self._src()
-        for tok in ("_collect_broker_handoff_markers",
-                    "submit_intent_at", "broker_submit_key",
-                    "broker_submit_payload_hash", "broker_ready"):
-            assert tok in src, f"missing broker handoff marker: {tok}"
+        assert "has_broker_handoff_evidence" in src
+        assert "_collect_broker_handoff_markers" not in src
 
     def test_pre_dispatch_convergence_wired(self):
         src = self._src()
