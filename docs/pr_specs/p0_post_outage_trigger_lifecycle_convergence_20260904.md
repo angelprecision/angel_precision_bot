@@ -157,6 +157,9 @@ Test/CI files changed:
   explicit test-only fence seam for the September 8 Jason LIVE replay.
 - `tests/test_p0_reattach_no_cancel_on_missing_quote.py` — 5 insertions;
   explicit test-only fence seam and complete identity fixture.
+- `tests/test_p0_prebreach_stop_activation.py` — 3 insertions; existing
+  production-shaped recovery fixtures explicitly opt into the test-only
+  no-PostgreSQL seam.
 - `tests/test_p0_seam4_e2e_deferred_lifecycle.py` — 34 insertions; preserves
   the #596 materialization-resume argument and adoption-CAS in the harness.
 - `tests/test_p0_watcher_conflict_cancellation_proof.py` — 1 insertion;
