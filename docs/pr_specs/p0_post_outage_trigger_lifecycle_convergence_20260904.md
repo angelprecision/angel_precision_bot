@@ -4,25 +4,29 @@
 
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
-Base: `84d8d61278d45040d8a6830e58c0ac912d683ff2`
-Current implementation/code head: `d353067a62df8ccf67579a68361d36c986e3a0d4`
+Base: `d404df34e00522ba2cce995b6a0129ba39b83944`
+Current implementation/code head: `2e4437aba86702279f1b60dd3401dd951e92e9d8`
 PR state: **Draft / open / HARD HOLD**. The final branch head including this
 documentation attestation is recorded in the PR body; this spec commit is
 documentation-only and does not alter production code.
-Audited deployed main: `98eeaadae05f9e4e1db624703ec1e3cd758b732c`
+Audited committed main: `d404df34e00522ba2cce995b6a0129ba39b83944`
 Original head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
+Head before this rebase: `442f37c16c4dbff0b2fcc9b02ff35d7d9d88f84b`
 Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92bf4be`
 Amendment applied: 2026-09-09
 
 Dependencies (§STATUS binding order):
-- PR #568 (deferred selector/materialization retry authority): **merged** into
-  current main at `09d30cff2f418e81c1a9bcec734f14f9f82a9a93`
+- PR #568 (deferred selector/materialization retry authority): current `main`
+  is the committed pre-#568 rebuild at `d404df34e00522ba2cce995b6a0129ba39b83944`;
+  this rebase replayed only the #580 commits after the former `84d8d612...`
+  base and does not copy or modify #568 retry-owner code
 - PR #569 (fresh market truth / late watcher recovery): **open/draft** and
   remains a separate ownership boundary; it is not included in this amendment
 
 Implementation on this branch is preparatory only, per explicit override.
 Before merge:
-1. #569 remains separately finalized and audited; no #569 code is copied here.
+1. #569 remains separately open/draft and must be independently resolved and
+   audited; no #569 code is copied here.
 2. This branch must remain based on the actual committed `main` SHA above.
 3. The PEP and September 8 Jason LIVE fail-first replays in
    `tests/test_p0_post_outage_trigger_lifecycle_convergence.py` must pass
@@ -137,7 +141,7 @@ Recovery never creates a second broker submission attempt.
 
 ### Follow-up amendment — materialization-resume ownership boundary
 
-Code/test commit: `d353067a62df8ccf67579a68361d36c986e3a0d4`.
+Code/test commit (replayed onto current `main`): `a9f95926`.
 
 The real production `watch()` → `add_signal()` path now treats
 `__materialization_resume=True` as an explicit #596 ownership boundary:
@@ -216,11 +220,11 @@ evidence.
 evidence. No local PostgreSQL server was available (`pg_isready` returned
 `localhost:5432 - no response`).
 
-The final exact-head and merge-ref CI run is `34373920720` on PR head
-`b12ef19919b97008b89788a8f47ef002d21c2c77` with merge ref
-`945bb95484fd5f92fd82206a64224bf0e1e91725`. Both jobs passed the complete
-5,287-test inventory with PostgreSQL enabled: `p0-tests` job `102541773696`
-and `p0-merge-ref-tests` job `102541774136` each reported `5287 passed, 2
+The post-rebase verification run is `34385296024` on PR head
+`2e4437aba86702279f1b60dd3401dd951e92e9d8` with merge ref
+`c798acc71e2b2824db4e4b743704f5d92f5c53c0`. Both jobs passed the complete
+5,189-test inventory with PostgreSQL enabled: `p0-tests` job `102579923305`
+and `p0-merge-ref-tests` job `102579923243` each reported `5189 passed, 2
 warnings`. The run includes the real PostgreSQL row-lock race,
 same/opposite durable replacement, cancellation-failure preservation,
 missing-OSM-client HOLD, and materialization-resume isolation. The exact RTX
@@ -293,7 +297,9 @@ It does **not** own the entire September 4 PEP failure because the current PR ch
 
 Do not copy #569's market-truth logic here.
 
-After #569 is finalized, this PR must rebase and prove the same resolved lifecycle behavior with #569's recovery output.
+After #569 is finalized, this PR must be independently re-audited against the
+resulting main and prove the same resolved lifecycle behavior with #569's
+recovery output. This PR is not merge-ready while #569 remains unresolved.
 
 ### #568 — validity-bound deferred materialization retry
 
