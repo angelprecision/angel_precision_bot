@@ -1181,7 +1181,7 @@ class TestPR580AmendmentCorrections:
             trigger_price=sig["entry_price"],
             stop_underlying=sig["stop_price"],
             target_underlying=sig["target_price"],
-            contract_symbol="DEFERRED:AAPL",
+            contract_symbol=sig.get("contract_symbol", "DEFERRED:AAPL"),
             plan_id=sig["plan_id"],
             pattern="2-1-2",
             prior_day_high=200.10,
@@ -1200,6 +1200,59 @@ class TestPR580AmendmentCorrections:
             local_order_id=local_order_id,
             materialization_generation=sig["materialization_generation"],
         )
+
+    def _materialization_resume_fixture(
+        self,
+        *,
+        sig=None,
+        generation=19,
+        retry_attempt=13,
+        next_retry_at="2026-09-08T16:00:00+00:00",
+        adopt_result=True,
+    ):
+        """Build the real production watch/add_signal #596 resume seam."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+
+        signal = copy.deepcopy(sig or self._recovery_sig())
+        signal["materialization_generation"] = generation
+        signal["contract_deferred"] = True
+        signal["metadata"] = dict(signal.get("metadata") or {})
+        signal["metadata"].update({
+            "materialization_generation": generation,
+            "retry_attempt": retry_attempt,
+            "materialization_next_retry_at": next_retry_at,
+            "contract_deferred": True,
+        })
+        plan = self._recovery_plan(signal, signal["local_order_id"])
+        plan.contract_symbol = signal.get("contract_symbol", "")
+        plan.metadata.update({
+            "materialization_generation": generation,
+            "retry_attempt": retry_attempt,
+            "materialization_next_retry_at": next_retry_at,
+            "contract_deferred": True,
+        })
+
+        osm = MagicMock()
+        osm.adopt_deferred_retry_watcher.return_value = adopt_result
+        broker = MagicMock()
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._test_only_allow_recovery_without_row_lock = True
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+        watcher._validate_local_order_id = MagicMock(return_value=True)
+        watcher._is_live_runtime = MagicMock(return_value=False)
+        watcher._get_quote = lambda _ticker: {
+            "bid": 199.0, "ask": 199.1, "quote_age_ms": 1,
+        }
+        watcher.on_trigger = MagicMock()
+        return ew, L, signal, plan, osm, broker, watcher
 
     def _durable_recovery_row(self, sig):
         return {
@@ -1850,24 +1903,10 @@ class TestPR580AmendmentCorrections:
         self._assert_no_broker_mutation(evidence["broker"])
 
     def test_a7_materialization_resume_does_not_enter_pr580_transaction(self):
-        """The #596 retry owner keeps its existing adoption CAS and bypasses #580."""
-        import ap_entry_watcher as ew
-
-        sig = self._recovery_sig()
-        plan = self._recovery_plan(sig, sig["local_order_id"])
-        plan.metadata.update({
-            "retry_attempt": 3,
-            "materialization_next_retry_at": "2026-09-08T16:00:00+00:00",
-        })
-        osm = MagicMock()
-        osm.adopt_deferred_retry_watcher.return_value = True
-        watcher = ew.APEntryWatcher(
-            broker=MagicMock(),
-            order_state_machine=osm,
-            require_on_trigger=False,
-            mode="LIVE",
+        """Real #596 adoption registers once without entering #580 lifecycle."""
+        ew, L, sig, plan, osm, broker, watcher = (
+            self._materialization_resume_fixture()
         )
-        watcher._persist_watcher_audit = lambda *a, **kw: None
 
         with patch.object(
             watcher, "_commit_recovery_candidate",
@@ -1875,28 +1914,145 @@ class TestPR580AmendmentCorrections:
         ) as commit, patch.object(
             watcher, "_restore_recovered_watcher_lifecycle",
             side_effect=AssertionError("#580 lifecycle bridge entered"),
-        ) as restore, patch.object(
-            watcher, "add_signal", return_value=True,
-        ), patch.object(
-            watcher, "_is_regular_session_now", return_value=False,
-        ):
+        ) as restore:
             assert watcher.watch(
                 plan,
                 sig["local_order_id"],
                 recovery_rearm=True,
+                no_cancel_on_reject=True,
                 materialization_resume=True,
             ) is True
 
         commit.assert_not_called()
         restore.assert_not_called()
+        assert len(watcher._pending) == 1
+        assert len(watcher._dedup_set) == 1
+        assert watcher._pending[0].signal["__materialization_resume"] is True
+        # #596's durable retry owner is authoritative; #580 must not invent a
+        # parallel ap_lifecycle WATCHING owner for this path.
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
         osm.adopt_deferred_retry_watcher.assert_called_once_with(
             sig["local_order_id"],
             watcher_token=watcher.owner_token,
-            generation=1,
-            retry_attempt=3,
+            generation=19,
+            retry_attempt=13,
             next_retry_at="2026-09-08T16:00:00+00:00",
             execution_mode="live",
         )
+        assert not watcher.on_trigger.mock_calls
+        assert not broker.mock_calls
+        for method_name in (
+            "submit_existing_entry", "cancel_pending_entry", "replace_order",
+            "materialize_deferred_entry", "select_contract",
+        ):
+            assert not getattr(osm, method_name).mock_calls, method_name
+
+    def test_a7_materialization_resume_cas_miss_is_deterministic_hold(self):
+        """A #596 adoption CAS miss creates no false watcher/lifecycle owner."""
+        _, L, sig, plan, osm, broker, watcher = (
+            self._materialization_resume_fixture(adopt_result=False)
+        )
+
+        with patch.object(
+            watcher, "_commit_recovery_candidate",
+            side_effect=AssertionError("#580 transaction entered"),
+        ) as commit, patch.object(
+            watcher, "_restore_recovered_watcher_lifecycle",
+            side_effect=AssertionError("#580 lifecycle bridge entered"),
+        ) as restore:
+            assert watcher.watch(
+                plan,
+                sig["local_order_id"],
+                recovery_rearm=True,
+                no_cancel_on_reject=True,
+                materialization_resume=True,
+            ) is False
+
+        commit.assert_not_called()
+        restore.assert_not_called()
+        assert watcher._last_reject_reason == (
+            "recovery_materialization_adoption_cas_miss"
+        )
+        assert watcher._pending == []
+        assert watcher._dedup_set == set()
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+        assert not watcher.on_trigger.mock_calls
+        assert not broker.mock_calls
+        assert not osm.submit_existing_entry.mock_calls
+        assert not osm.cancel_pending_entry.mock_calls
+        assert not osm.replace_order.mock_calls
+
+        # A retry sees the same failed CAS deterministically and still cannot
+        # create a second selector/materialization or watcher attempt.
+        assert watcher.watch(
+            plan,
+            sig["local_order_id"],
+            recovery_rearm=True,
+            no_cancel_on_reject=True,
+            materialization_resume=True,
+        ) is False
+        assert watcher._pending == []
+        assert watcher._dedup_set == set()
+        assert osm.adopt_deferred_retry_watcher.call_count == 2
+        assert not watcher.on_trigger.mock_calls
+        assert not broker.mock_calls
+
+    def test_a7_rtx_materialization_resume_replay_cas_miss_retains_no_false_owner(self):
+        """September-8 Jason LIVE RTX shape stays in #596 on CAS miss."""
+        sig = self._recovery_sig(
+            signal_id="322adca3-c407-491f-b5f5-102c2b0a5701",
+            canonical_signal_id="322adca3-c407-491f-b5f5-102c2b0a5701",
+            local_order_id="84d9106b-7b67-4d58-b479-e9e65b9eb289",
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",
+            ticker="RTX",
+            side="PUT",
+            entry_price=198.13,
+            entry_trigger=198.13,
+            stop_price=200.0,
+            target_price=190.0,
+            contract_symbol="DEFERRED:RTX",
+            materialization_generation=19,
+        )
+        _, L, sig, plan, osm, broker, watcher = (
+            self._materialization_resume_fixture(
+                sig=sig, generation=19, retry_attempt=13, adopt_result=False,
+            )
+        )
+
+        assert plan.ticker == "RTX"
+        assert plan.side == "PUT"
+        assert plan.trigger_price == 198.13
+        assert plan.metadata["materialization_generation"] == 19
+        assert plan.metadata["retry_attempt"] == 13
+
+        assert watcher.watch(
+            plan,
+            sig["local_order_id"],
+            recovery_rearm=True,
+            no_cancel_on_reject=True,
+            materialization_resume=True,
+        ) is False
+        osm.adopt_deferred_retry_watcher.assert_called_once_with(
+            "84d9106b-7b67-4d58-b479-e9e65b9eb289",
+            watcher_token=watcher.owner_token,
+            generation=19,
+            retry_attempt=13,
+            next_retry_at="2026-09-08T16:00:00+00:00",
+            execution_mode="live",
+        )
+        assert watcher._last_reject_reason == (
+            "recovery_materialization_adoption_cas_miss"
+        )
+        assert watcher._pending == []
+        assert watcher._dedup_set == set()
+        assert L.LEDGER.current_state(
+            "322adca3-c407-491f-b5f5-102c2b0a5701"
+        ) is None
+        assert not watcher.on_trigger.mock_calls
+        assert not broker.mock_calls
+        assert not osm.submit_existing_entry.mock_calls
+        assert not osm.cancel_pending_entry.mock_calls
 
     def test_a8_post_admission_broker_owner_suppresses_recovered_callback(self):
         """A broker owner winning after lock release cannot create attempt two."""

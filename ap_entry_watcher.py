@@ -4728,9 +4728,17 @@ class APEntryWatcher:
                     return False
             else:
                 # Preserve the existing deferred-materialization resume
-                # lifecycle path. It is a separate #596 owner and does not
-                # enter the #580 final watcher-admission transaction.
-                if _recovery_admission:
+                # lifecycle path. It is a separate #596 owner: a successful
+                # adoption may register the watcher, but must not enter the
+                # #580 lifecycle-restoration transaction.
+                if (
+                    _recovery_admission
+                    and not bool(
+                        (getattr(watched, "signal", {}) or {}).get(
+                            "__materialization_resume"
+                        )
+                    )
+                ):
                     _rlok, _rlreason = self._restore_recovered_watcher_lifecycle(
                         watched
                     )
@@ -5117,6 +5125,9 @@ class APEntryWatcher:
                 or _plan_meta_for_adopt.get("next_retry_at")
             )
             if not callable(_adopt_fn):
+                self._last_reject_reason = (
+                    "recovery_materialization_adoption_unavailable"
+                )
                 log.critical(
                     "[%s] RECOVERY_REARM_WATCHER_ADOPT_UNAVAILABLE local_order_id=%s",
                     ticker, local_order_id,
@@ -5132,12 +5143,18 @@ class APEntryWatcher:
                     execution_mode=str(signal_dict.get("execution_mode") or ""),
                 ))
             except Exception as _adopt_exc:
+                self._last_reject_reason = (
+                    "recovery_materialization_adoption_raised"
+                )
                 log.critical(
                     "[%s] RECOVERY_REARM_WATCHER_ADOPT_RAISED local_order_id=%s error=%s",
                     ticker, local_order_id, _adopt_exc,
                 )
                 return False
             if not _adopt_ok:
+                self._last_reject_reason = (
+                    "recovery_materialization_adoption_cas_miss"
+                )
                 log.critical(
                     "[%s] RECOVERY_REARM_WATCHER_ADOPT_CAS_MISS local_order_id=%s "
                     "generation=%s attempt=%s",
