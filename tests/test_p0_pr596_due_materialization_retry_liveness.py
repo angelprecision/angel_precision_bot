@@ -76,9 +76,11 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -135,6 +137,7 @@ CREATE TABLE IF NOT EXISTS orders (
     plan_id           TEXT,
     created_ts        TIMESTAMPTZ DEFAULT NOW(),
     submitted_ts      TIMESTAMPTZ,
+    last_error        TEXT,
     qty               INTEGER DEFAULT 1,
     direction         TEXT DEFAULT 'CALL',
     execution_mode    TEXT,
@@ -146,9 +149,13 @@ CREATE TABLE IF NOT EXISTS orders (
     trigger_price     NUMERIC,
     stop_underlying   NUMERIC,
     target_underlying NUMERIC,
+    pattern           TEXT,
+    timeframe         TEXT,
     meta              JSONB DEFAULT '{}',
     client_id         TEXT,
-    kind              TEXT DEFAULT 'ENTRY'
+    kind              TEXT DEFAULT 'ENTRY',
+    contract_selection_status TEXT,
+    updated_ts        TIMESTAMPTZ DEFAULT NOW()
 )
 """
 
@@ -162,6 +169,10 @@ class _CursorWrapper:
     def execute(self, sql, params=None):
         self.cursor.execute(sql, params)
         return self
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
 
     def fetchall(self):
         rows = self.cursor.fetchall()
@@ -209,8 +220,12 @@ def _ensure_orders_table():
 def _insert_order(*, local_order_id, client_id, execution_mode, meta,
                   contract="DEFERRED:MO", symbol="MO",
                   broker_order_id=None, submitted_ts=None,
-                  status="PENDING_TRIGGER"):
+                  status="PENDING_TRIGGER", signal_id=None, plan_id=None,
+                  created_ts=None):
     now = datetime.now(timezone.utc)
+    _created_ts = created_ts or now
+    _signal_id = signal_id or str(uuid.uuid4())
+    _plan_id = plan_id or str(uuid.uuid4())
     with _pg_conn() as c:
         c.execute(
             """
@@ -237,7 +252,7 @@ def _insert_order(*, local_order_id, client_id, execution_mode, meta,
             """,
             (
                 local_order_id, broker_order_id, status, symbol, contract,
-                str(uuid.uuid4()), str(uuid.uuid4()), now, submitted_ts,
+                _signal_id, _plan_id, _created_ts, submitted_ts,
                 execution_mode,
                 json.dumps(meta),
                 client_id,
@@ -502,6 +517,489 @@ class TestProductionBoundaryProjection:
             f"Unexpected reason: {reason!r}"
         )
         assert _mo_osm.cancel_calls == [], "No cancel on RETRY_OWNED"
+
+    def test_due_retry_monitor_restart_materializes_once(self, monkeypatch):
+        """The complete production caller graph consumes one due retry once.
+
+        This deliberately starts with a real PostgreSQL PENDING_TRIGGER row,
+        lets APOrderMonitor fetch the row through its production SELECT and
+        classify it through the canonical recovery wrapper, then runs two
+        competing APStartupRecovery consumers against the same durable row.
+        The existing OSM generation/attempt CAS admits one materializer; the
+        real execution-core callback then invokes the selector and reaches the
+        existing broker-ready handoff exactly once. Broker transport,
+        cancellation, proof, and position mutation remain untouched.
+        """
+        import ap.db as db_mod
+        import ap.order_monitor as monitor_mod
+        import ap.order_state_machine as osm_mod
+        import ap_execution_core as core_mod
+        import ap_entry_confirmation
+        from ap.order_state_machine import APOrderStateMachine
+        from ap_recovery import APStartupRecovery
+        from ap.order_monitor import PENDING_TRIGGER_MAX_AGE_SECONDS
+
+        client_id = _DB_TEST_MO_CLIENT
+        execution_mode = "paper"
+        local_order_id = f"pr596-full-path-{uuid.uuid4()}"
+        signal_id = f"sig-{uuid.uuid4()}"
+        plan_id = f"plan-{uuid.uuid4()}"
+        now = datetime.now(timezone.utc)
+        due_at = now - timedelta(seconds=10)
+
+        meta = _retry_meta(due=True, attempts=1)
+        meta.update({
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_generation": 1,
+            "retry_attempt": 1,
+            "breach_attempt_count": 1,
+            "materialization_attempts": 1,
+            "retry_max_attempts": 3,
+            "materialization_in_flight": False,
+            "broker_ready": False,
+            "watcher_token": "",
+            "current_owner": "",
+            "materialization_owner": "",
+            "retry_owner": "",
+            "materialization_retry_owner": "",
+            "canonical_signal_id": signal_id,
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "local_order_id": local_order_id,
+            "signal_id": signal_id,
+            "trigger_crossed_at": (now - timedelta(seconds=60)).isoformat(),
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": signal_id,
+                "client_id": client_id,
+                "execution_mode": execution_mode,
+                "local_order_id": local_order_id,
+            },
+            "observed_underlying_price": 50.05,
+            "score": 72.0,
+            "tier": "A",
+            "timeframe": "1d",
+            "pattern": "3-1-2",
+            "contract_deferred": True,
+            "selection_context": "deferred_breach",
+            "materialization_next_retry_at": due_at.isoformat(),
+            "next_retry_at": due_at.isoformat(),
+            "materialization_selector_failure": {
+                "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                "materialization_outcome": "RETRY_LATER_SELECTOR_BUDGET",
+                "materialization_detail": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            },
+        })
+        _insert_order(
+            local_order_id=local_order_id,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            meta=meta,
+            contract="DEFERRED:MO",
+            symbol="MO",
+            signal_id=signal_id,
+            plan_id=plan_id,
+            created_ts=now - timedelta(
+                seconds=PENDING_TRIGGER_MAX_AGE_SECONDS + 1
+            ),
+        )
+
+        monkeypatch.setenv("DEFERRED_RETRY_OWNER_GRACE_SECONDS", "0")
+        monkeypatch.setenv("SELECTOR_DURABLE_RECOVERY_CURSOR_ENABLED", "0")
+        monkeypatch.setenv("INTELLIGENCE_EVIDENCE_ENABLED", "0")
+
+        # All production DB calls below use the test-owned schema. The real
+        # SQL, real OSM CAS, and real monitor/recovery methods remain intact.
+        monkeypatch.setattr(monitor_mod, "conn", _pg_conn)
+        monkeypatch.setattr(
+            monitor_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        )
+        monkeypatch.setattr(db_mod, "conn", _pg_conn)
+        monkeypatch.setattr(
+            db_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        )
+        monkeypatch.setattr(osm_mod, "conn", _pg_conn)
+        monkeypatch.setattr(
+            osm_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        )
+
+        osm = APOrderStateMachine(client_id)
+        osm.execution_mode = execution_mode
+
+        trace_lock = threading.RLock()
+        trace: list[str] = []
+        selector_calls: list[dict] = []
+        materialization_calls: list[dict] = []
+        submit_calls: list[dict] = []
+        resume_results: list[dict] = []
+
+        class _Broker:
+            def __init__(self):
+                self.base_url = "https://sandbox.tradier.com/v1"
+                self.sandbox = True
+                self.cfg = SimpleNamespace(
+                    base_url=self.base_url, account_id="TEST"
+                )
+                self.submit_order = MagicMock()
+                self.place_order = MagicMock()
+                self.cancel_order = MagicMock()
+
+            def get_quote(self, _symbol):
+                return {
+                    "bid": 1.04,
+                    "ask": 1.05,
+                    "last": 1.045,
+                    "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "source": "tradier_sandbox",
+                }
+
+        broker = _Broker()
+
+        class _DataBroker:
+            base_url = "https://api.tradier.com/v1"
+            cfg = SimpleNamespace(
+                base_url="https://api.tradier.com/v1", account_id="TEST"
+            )
+
+            def get_quote(self, _symbol):
+                if _symbol == "MO":
+                    return {
+                        "bid": 50.04,
+                        "ask": 50.06,
+                        "last": 50.05,
+                        "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                        "source": "tradier_live",
+                    }
+                return {
+                    "bid": 1.04,
+                    "ask": 1.05,
+                    "last": 1.045,
+                    "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "source": "tradier_live",
+                }
+
+        data_broker = _DataBroker()
+        broker.data_broker = data_broker
+
+        class _Selector:
+            def __init__(self, data_broker):
+                self.data_broker = data_broker
+
+            def select(self, _plan, *, request_context=None):
+                assert request_context is not None
+                with trace_lock:
+                    selector_calls.append({
+                        "request_kind": request_context.selector_request_kind,
+                    })
+                    trace.append("selector")
+                return SimpleNamespace(
+                    contract_symbol="MO270115C00050000",
+                    bid=1.04,
+                    ask=1.05,
+                    mid=1.045,
+                    affordable_contracts=1,
+                    premium_per_contract=105.0,
+                    execution_price_per_share=1.05,
+                    expiration_date="2027-01-15",
+                    dte=128,
+                    delta=0.45,
+                    open_interest=1000,
+                    volume=500,
+                    option_type="call",
+                    candidate_audit={"candidates_considered": 1},
+                )
+
+            def get_last_failure(self):
+                return None
+
+            def get_last_dte_ladder_audit(self):
+                return {}
+
+        selector = _Selector(data_broker)
+
+        # The test stops at the existing broker-bound OSM seam: the selector
+        # must already have produced a valid OCC result, but no broker or
+        # position/proof side effect is allowed in this regression.
+        def _submit_existing_entry(*_args, **kwargs):
+            with trace_lock:
+                submit_calls.append(dict(kwargs))
+                trace.append("submit_existing_entry")
+                assert len(selector_calls) == 1, (
+                    "OSM submit seam reached before a valid selector result"
+                )
+            return {
+                "ok": True,
+                "local_order_id": local_order_id,
+                "broker_order_id": None,
+                "status": "PENDING_TRIGGER",
+            }
+
+        osm.submit_existing_entry = _submit_existing_entry
+
+        original_copyback = osm.persist_deferred_broker_ready
+
+        def _persist_deferred_broker_ready(*args, **kwargs):
+            with trace_lock:
+                materialization_calls.append(dict(kwargs))
+            return original_copyback(*args, **kwargs)
+
+        osm.persist_deferred_broker_ready = _persist_deferred_broker_ready
+
+        class _Confirmation:
+            passed = True
+            fail_reason = None
+
+            def __init__(self):
+                self.metadata = {"live_entry_ts": now.isoformat()}
+
+            def to_meta(self, **kwargs):
+                return {
+                    "confirmation_required": False,
+                    "confirmation_passed": True,
+                    **kwargs,
+                }
+
+        monkeypatch.setattr(
+            ap_entry_confirmation,
+            "check_entry_confirmation",
+            lambda **_kwargs: _Confirmation(),
+        )
+
+        cores: list = []
+
+        def _build_core():
+            core = core_mod.APExecutionCore.__new__(core_mod.APExecutionCore)
+            core.client_id = client_id
+            core.email = client_id
+            core.execution_mode = execution_mode
+            core.mode = execution_mode.upper()
+            core.paper = True
+            core.order_state_machine = osm
+            core.broker = broker
+            core.contract_selector = selector
+            core.master_control = SimpleNamespace(
+                mode=execution_mode.upper(),
+                max_positions=5,
+                _kill_switch_fn=lambda: False,
+                revalidate_exposure=lambda **_kwargs: SimpleNamespace(ok=True),
+            )
+            core.store = MagicMock()
+            core.store.update_status.return_value = True
+            core.store.update_signal_fields.return_value = True
+            core.position_manager = MagicMock()
+            core.position_manager.get_open_count.return_value = 0
+            core.fill_monitor = MagicMock()
+            core.entry_telemetry = MagicMock()
+            core.intelligence_context = MagicMock()
+            core.intelligence_context.is_enabled.return_value = False
+            core.exit_eng = None
+            core.entry_watcher = None
+            core._kill_switch = False
+            core._max_positions = 5
+            core._pos_lock = threading.RLock()
+            core._capital_lock = threading.RLock()
+            core._open_positions = {}
+            core._pending_entries = {}
+            core._reserved_capital = 0.0
+            core._breach_risk_check = lambda _watched: True
+            core._recover_plan_for_revalidation = (
+                lambda watched: watched.signal.get("_approved_plan")
+            )
+            core._emit_breach_diag = lambda *a, **kw: None
+            core._current_open_position_count = lambda: 0
+            core._current_pending_entry_count = lambda: 0
+            core._refresh_hydrated_prebreach_plan = lambda *a, **kw: False
+            core._alert_degraded = lambda *a, **kw: None
+            core._cleanup_pending_entry_order = (
+                core_mod.APExecutionCore._cleanup_pending_entry_order
+                .__get__(core, type(core))
+            )
+            core._classify_recovered_ownership_loss = (
+                core_mod.APExecutionCore._classify_recovered_ownership_loss
+                .__get__(core, type(core))
+            )
+            core._is_real_occ_contract = core_mod.APExecutionCore._is_real_occ_contract
+            core._strict_materialization_int = (
+                core_mod.APExecutionCore._strict_materialization_int
+            )
+            core._live_materialization_lease = (
+                core_mod.APExecutionCore._live_materialization_lease
+            )
+            core._claim_deferred_materialization_for_trigger = (
+                core_mod.APExecutionCore._claim_deferred_materialization_for_trigger
+                .__get__(core, type(core))
+            )
+            core._plan_is_deferred = core_mod.APExecutionCore._plan_is_deferred
+            core.resume_deferred_materialization_retry = (
+                core_mod.APExecutionCore.resume_deferred_materialization_retry
+                .__get__(core, type(core))
+            )
+            _real_resume = core.resume_deferred_materialization_retry
+
+            def _record_resume(*args, **kwargs):
+                outcome = _real_resume(*args, **kwargs)
+                with trace_lock:
+                    resume_results.append(dict(outcome or {}))
+                return outcome
+
+            core.resume_deferred_materialization_retry = _record_resume
+            core._on_entry_trigger = (
+                core_mod.APExecutionCore._on_entry_trigger.__get__(core, type(core))
+            )
+            cores.append(core)
+            return core
+
+        # First prove the monitor's real SQL projection and canonical wrapper.
+        monitor = _make_monitor(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            osm=osm,
+        )
+        monitor.entry_watcher = SimpleNamespace(has_order=lambda _oid: False)
+        canonical_results: list[tuple] = []
+        original_canonical = monitor._canonical_pending_trigger_rearm
+
+        def _record_canonical(*args, **kwargs):
+            result = original_canonical(*args, **kwargs)
+            canonical_results.append(result)
+            return result
+
+        monitor._canonical_pending_trigger_rearm = _record_canonical
+        fetched_rows: list[dict] = []
+        original_get_active = monitor._get_active_entry_orders
+
+        def _capture_active_rows():
+            rows = original_get_active()
+            fetched_rows.extend(rows)
+            return rows
+
+        monitor._get_active_entry_orders = _capture_active_rows
+        monitor._maybe_hydrate_deferred_order = (
+            lambda _order, *, hydration_seen: {
+                "attempted": False,
+                "success": False,
+                "reason": "disabled",
+            }
+        )
+        with patch.object(monitor_mod, "conn", _pg_conn), patch.object(
+            monitor_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        ):
+            # Use the real entry tick caller: it fetches the row, computes
+            # age, and dispatches the PENDING_TRIGGER watchdog/recovery path.
+            monitor._check_entry_orders()
+            assert len(fetched_rows) == 1
+            fetched = fetched_rows[0]
+            assert fetched["client_id"] == client_id
+            assert fetched["kind"] == "ENTRY"
+            assert fetched["execution_mode"] == execution_mode
+            assert fetched["status"] == "PENDING_TRIGGER"
+            assert fetched["broker_order_id"] is None
+
+        assert canonical_results == [
+            (True, True, "canonical_recovery_retry_owned")
+        ]
+
+        # Force both restart consumers to load the same pre-claim snapshot and
+        # then reach the same real durable CAS. The loader barrier matters:
+        # without it, the first consumer could advance the row before the
+        # second startup query returns, turning this into a one-consumer test.
+        loader_barrier = threading.Barrier(2)
+        claim_barrier = threading.Barrier(2)
+        original_claim = osm.claim_deferred_materialization
+        claim_calls: list[dict] = []
+
+        def _claim_competing(*args, **kwargs):
+            call = dict(kwargs)
+            with trace_lock:
+                claim_calls.append(call)
+            claim_barrier.wait(timeout=5)
+            claimed = original_claim(*args, **kwargs)
+            with trace_lock:
+                call["result"] = claimed
+            return claimed
+
+        osm.claim_deferred_materialization = _claim_competing
+
+        results = [{"deferred_lifecycles_recovered": 0, "errors": []},
+                   {"deferred_lifecycles_recovered": 0, "errors": []}]
+        thread_errors: list[BaseException] = []
+
+        def _run_restart(index: int):
+            try:
+                recovery = APStartupRecovery(
+                    client_id=client_id,
+                    broker=broker,
+                    osm=osm,
+                    pm=MagicMock(),
+                    master_control=SimpleNamespace(mode="PAPER"),
+                    entry_watcher=None,
+                    execution_core=_build_core(),
+                )
+                recovery._recover_deferred_breach_lifecycles(results[index])
+            except BaseException as exc:  # surface worker failures below
+                thread_errors.append(exc)
+
+        workers = [
+            threading.Thread(target=_run_restart, args=(index,), daemon=True)
+            for index in range(2)
+        ]
+        def _load_with_barrier(fn, *args, **kwargs):
+            loaded = fn()
+            loader_barrier.wait(timeout=5)
+            return loaded
+
+        with patch.object(db_mod, "conn", _pg_conn), patch.object(
+            db_mod, "run_with_retry", _load_with_barrier
+        ), patch.object(osm_mod, "conn", _pg_conn), patch.object(
+            osm_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        ):
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=15)
+
+        assert all(not worker.is_alive() for worker in workers)
+        assert thread_errors == []
+        assert len(claim_calls) == 2, f"claim_calls={claim_calls!r}"
+        assert sorted(call["result"] for call in claim_calls) == [False, True]
+        assert sorted(result["disposition"] for result in resume_results) == [
+            "BROKER_READY",
+            "CLAIM_LOST",
+        ]
+        assert len(selector_calls) == 1, (
+            "selector must execute exactly once"
+        )
+        assert len(materialization_calls) == 1, (
+            "canonical deferred broker-ready materialization must execute once"
+        )
+        assert len(submit_calls) == 1
+        assert trace.index("selector") < trace.index("submit_existing_entry")
+        assert sum(result["deferred_lifecycles_recovered"] for result in results) == 1
+
+        final_row = osm.get_order(local_order_id)
+        final_meta = final_row["meta"]
+        assert final_row["local_order_id"] == local_order_id
+        assert final_row["status"] == "PENDING_TRIGGER"
+        assert final_row["client_id"] == client_id
+        assert final_row["execution_mode"] == execution_mode
+        assert final_row["kind"] == "ENTRY"
+        assert final_row["broker_order_id"] is None
+        assert final_row["submitted_ts"] is None
+        assert final_row["contract"] == "MO270115C00050000"
+        assert float(final_row["limit_price"]) > 0.01
+        assert final_meta["lifecycle_state"] == "BROKER_READY"
+        assert final_meta["materialization_status"] == "SELECTED"
+        assert final_meta["broker_ready"] is True
+        assert int(final_meta["materialization_generation"]) == 2
+        assert int(final_meta["retry_attempt"]) == 2
+
+        # No broker transport, cancel, proof-trade, or position mutation was
+        # permitted while proving the liveness handoff.
+        assert broker.submit_order.call_count == 0
+        assert broker.place_order.call_count == 0
+        assert broker.cancel_order.call_count == 0
+        for core in cores:
+            assert core.position_manager.method_calls == []
 
     def test_paper_mmm_db_projection_path_retry_owned(self):
         """
