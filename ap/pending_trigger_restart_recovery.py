@@ -44,6 +44,8 @@ from ap_entry_watcher import (
 from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
+    has_canonical_materialization_retry_authority,
+    has_conflicting_materialization_retry_authority,
     has_broker_handoff_evidence,
     is_active_materialization_in_flight,
 )
@@ -218,6 +220,33 @@ class PendingTriggerRestartRecovery:
         Returns the _RowOutcome constant."""
         return self._recover_one(row, plan_builder_fn=plan_builder_fn)
 
+    def ensure_future_materialization_retry_watcher(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        plan_builder_fn=None,
+    ) -> str:
+        """Attach the dormant watcher required for a future retry schedule.
+
+        The durable retry proof remains the authority.  This narrow follow-up
+        only repairs the in-memory owner used by LIVE readiness; due retries
+        stay with the canonical materializer consumer.
+        """
+        proof = self._verify_materialization_retry_ownership(local_oid, row)
+        if proof is None:
+            return _RowOutcome.UNRESOLVED
+        next_at = _parse_iso(proof.get("materialization_next_retry_at"))
+        if next_at is None or next_at <= datetime.now(timezone.utc):
+            return _RowOutcome.RETRY_OWNED
+        if self._check_watcher_owns(local_oid, row) is True:
+            return _RowOutcome.WATCHER_OWNED
+        return self._rearm_and_verify(
+            row,
+            local_oid,
+            plan_builder_fn=plan_builder_fn,
+        )
+
     # ── Per-row dispatch ──────────────────────────────────────────────────────
 
     def _recover_one(self, row: dict, *, plan_builder_fn=None) -> str:
@@ -302,6 +331,25 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
 
+        # A retry-marked trigger row with contradictory durable authority is
+        # unresolved, even when the trigger marker itself is proven.  In
+        # particular, do not let the STUCK_TRIGGER_READY cleanup branch turn
+        # malformed retry metadata into a terminal outcome.
+        if has_conflicting_materialization_retry_authority(row):
+            self._mark_failure(local_oid, "retry_authority_conflict")
+            watcher_owned = self._check_watcher_owns(local_oid, row)
+            log.critical(
+                "RESTART_RECOVERY_RETRY_AUTHORITY_CONFLICT local=%s client=%s "
+                "mode=%s signal=%s — row held; no claim, selector, broker, "
+                "cancel, or terminal write",
+                local_oid, row_client, row_mode, signal_id,
+            )
+            if watcher_owned is True:
+                # An exact live watcher remains the read-only owner. Do not
+                # relabel it retryable or let the conflict reach cleanup.
+                return _RowOutcome.WATCHER_OWNED
+            return _RowOutcome.UNRESOLVED
+
         # Confirmed-trigger evidence is a durable lifecycle fact, not a quote
         # hint.  First probe the registry so an already-owned watcher can take
         # its read-only proof path.  This matters for the legacy/crash window
@@ -310,11 +358,22 @@ class PendingTriggerRestartRecovery:
         # that path; the exact watcher/order ownership proof is the authority.
         watcher_owned: Optional[bool] = self._check_watcher_owns(local_oid, row)
         _evidence_proven = recovery_trigger_evidence_identity_is_proven(row, local_oid)
+        _canonical_retry_after_trigger = (
+            isinstance(_extract_meta(row).get("watcher_audit"), dict)
+            and str(
+                _extract_meta(row).get("watcher_audit", {}).get("reason_code") or ""
+            ).strip().lower() == "trigger_ready"
+            and has_canonical_materialization_retry_authority(row)
+        )
 
         # For an unowned row, keep the fail-closed fence before quote checks,
         # selector work, watcher admission, or any terminal/cleanup action.
         # A row with no timestamp remains an ordinary pre-breach candidate.
-        if watcher_owned is not True and not _evidence_proven:
+        if (
+            watcher_owned is not True
+            and not _evidence_proven
+            and not _canonical_retry_after_trigger
+        ):
             return _reject_unproven_trigger_evidence()
 
         # A contradictory broker-ready or submit marker is not permission to
@@ -492,7 +551,7 @@ class PendingTriggerRestartRecovery:
         # lifecycle identity.  Only the proven already-owned fast path above
         # and the MATERIALIZATION_IN_FLIGHT read-only path are allowed to
         # return before this fence.
-        if not _evidence_proven:
+        if not _evidence_proven and not _canonical_retry_after_trigger:
             return _reject_unproven_trigger_evidence()
 
         if cls == PTC.NOT_PENDING_TRIGGER:
@@ -1432,6 +1491,17 @@ class PendingTriggerRestartRecovery:
             return None
 
         meta = _extract_meta(reread)
+        watcher_audit = meta.get("watcher_audit")
+        if (
+            isinstance(watcher_audit, dict)
+            and str(watcher_audit.get("reason_code") or "").strip().lower()
+            == "trigger_ready"
+            and str(meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
+            == "RETRY_PENDING"
+            and reread.get("kind") is not None
+            and not has_canonical_materialization_retry_authority(reread)
+        ):
+            return None
         materialization_outcome = str(
             meta.get("materialization_outcome") or ""
         ).strip().upper()

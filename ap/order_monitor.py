@@ -1714,6 +1714,20 @@ class APOrderMonitor:
             if _outcome == _RowOutcome.WATCHER_OWNED:
                 return (True, True, "canonical_recovery_watcher_owned")
             elif _outcome == _RowOutcome.RETRY_OWNED:
+                # A future materialization retry needs the same dormant
+                # watcher that startup recovery installs; durable retry
+                # ownership alone is invisible to LIVE readiness.
+                if getattr(self, "entry_watcher", None) is not None:
+                    _watcher_outcome = _ptr.ensure_future_materialization_retry_watcher(
+                        _row,
+                        local_order_id,
+                    )
+                    if _watcher_outcome == _RowOutcome.WATCHER_OWNED:
+                        return (True, True, "canonical_recovery_retry_watcher_owned")
+                    if _watcher_outcome == _RowOutcome.TERMINALIZED:
+                        return (True, False, "canonical_recovery_terminalized")
+                    if _watcher_outcome == _RowOutcome.UNRESOLVED:
+                        return (True, False, "canonical_recovery_retry_watcher_unresolved")
                 return (True, True, "canonical_recovery_retry_owned")
             elif _outcome == _RowOutcome.TERMINALIZED:
                 return (True, False, "canonical_recovery_terminalized")
@@ -4288,7 +4302,7 @@ class APOrderMonitor:
             with conn() as c:
                 c.execute(
                     """
-                    SELECT local_order_id, broker_order_id, status, symbol,
+                    SELECT local_order_id, client_id, kind, broker_order_id, status, symbol,
                            contract, position_id, signal_id, plan_id,
                            created_ts, submitted_ts,
                            qty, direction, execution_mode, reserved_cost,

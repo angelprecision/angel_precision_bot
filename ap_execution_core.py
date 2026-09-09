@@ -2013,8 +2013,14 @@ class APExecutionCore:
             meta = {}
             try:
                 approved_plan.metadata = meta
-            except Exception:
-                pass
+            except Exception as _deadline_read_exc:
+                log.warning(
+                    "[%s] deferred retry post-claim deadline reread failed "
+                    "order=%s exc=%s — using pre-claim deadline authority",
+                    self.client_id,
+                    local_order_id,
+                    _deadline_read_exc,
+                )
 
         approved_plan.contract_symbol = contract
         approved_plan.limit_price = limit_price
@@ -3204,36 +3210,56 @@ class APExecutionCore:
             "generation": None,
             "next_retry_at": None,
         }
+        signal_id = ""
 
         def _keep(reason: str) -> dict:
             return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
 
+        _post_claim_terminal_fence: dict | None = None
+
         def _term(reason: str, status: str = "EXPIRED", **extra) -> dict:
             # P0 FINAL AMENDMENT: return TERMINAL_REQUIRED (not TERMINAL_DURABLE)
-            # so recovery uses the fenced terminalize_deferred_retry_if_unchanged()
-            # CAS rather than the broad terminalize_deferred_breach(). The expected
-            # state fields enable the fenced predicate to refuse writes when a
-            # concurrent worker has already advanced generation, attempt, lifecycle,
-            # broker_ready, or submit_intent.
+            # so recovery uses an exact terminal CAS rather than the broad
+            # terminalize_deferred_breach(). Before the due retry claims, the
+            # expected state is RETRY_WAIT. After the phase-one claim, the
+            # expected state is the exact MATERIALIZING/RUNNING owner fence;
+            # using the pre-claim fence here would leave the row active.
+            _post_claim = _post_claim_terminal_fence
+            _expected = {
+                "expected_generation": (
+                    _post_claim["generation"]
+                    if _post_claim is not None
+                    else _expected_generation
+                ),
+                "expected_client_id": (
+                    str(getattr(self, "client_id", "") or getattr(self, "email", "") or "")
+                    .strip().lower()
+                ),
+                "expected_execution_mode": (
+                    str(getattr(self, "execution_mode", "") or getattr(self, "mode", "") or "")
+                    .strip().lower()
+                ),
+                "expected_signal_id": str(signal_id or "").strip(),
+                "expected_lifecycle_state": (
+                    "MATERIALIZING" if _post_claim is not None else "RETRY_WAIT"
+                ),
+                "expected_materialization_status": (
+                    "RUNNING" if _post_claim is not None else "RETRY_PENDING"
+                ),
+            }
+            if _post_claim is not None:
+                _expected.update({
+                    "expected_owner": _post_claim["owner"],
+                    "expected_retry_attempt": _post_claim["retry_attempt"],
+                })
+            else:
+                _expected["expected_prior_retry_attempt"] = _expected_attempt - 1
             return {
                 **_base, **extra,
                 "disposition": "TERMINAL_REQUIRED",
                 "reason_code": reason,
                 "terminal_status": status,
-                # Fencing fields: exact state the row must still be in for the
-                # terminal CAS to succeed. Use the caller's expectation
-                # (_expected_generation, _expected_attempt) since these are
-                # locked in at call time and never change within the method.
-                "expected_generation": _expected_generation,
-                "expected_prior_retry_attempt": _expected_attempt - 1,
-                "expected_client_id": (
-                    str(getattr(self, "client_id", "") or getattr(self, "email", "") or "").strip().lower()
-                ),
-                "expected_execution_mode": (
-                    str(getattr(self, "execution_mode", "") or getattr(self, "mode", "") or "").strip().lower()
-                ),
-                "expected_lifecycle_state": "RETRY_WAIT",
-                "expected_materialization_status": "RETRY_PENDING",
+                **_expected,
             }
 
         def _claim_lost(reason: str) -> dict:
@@ -3298,6 +3324,37 @@ class APExecutionCore:
             meta = {}
             _meta_parse_ok = False
 
+        # Retry aliases are one durable authority.  A row with a trigger
+        # marker plus contradictory retry identity is unresolved; it must not
+        # earn a phase-one claim merely because one alias looks usable.
+        from ap.pending_trigger_classifier import (
+            has_canonical_materialization_retry_authority,
+            has_conflicting_materialization_retry_authority,
+            resolve_materialization_retry_schedule,
+            resolve_materialization_trigger_crossed_at,
+        )
+        if has_conflicting_materialization_retry_authority(row):
+            return _keep("RETRY_CONFLICTING_AUTHORITY")
+        _retry_lifecycle = str(meta.get("lifecycle_state") or "").strip().upper()
+        _retry_status = str(meta.get("materialization_status") or "").strip().upper()
+        _trigger_ready_marker = meta.get("watcher_audit")
+        _trigger_ready_marker = (
+            isinstance(_trigger_ready_marker, dict)
+            and str(_trigger_ready_marker.get("reason_code") or "").strip().lower()
+            == "trigger_ready"
+        )
+        if (
+            (_retry_lifecycle == "RETRY_WAIT" or _retry_status == "RETRY_PENDING")
+            and meta.get("materialization_market_truth_pending") is not True
+            and _trigger_ready_marker
+        ):
+            _retry_authority_row = dict(row)
+            _retry_authority_row["meta"] = meta
+            if not has_canonical_materialization_retry_authority(
+                _retry_authority_row
+            ):
+                return _keep("RETRY_INCOMPLETE_AUTHORITY")
+
         _selector_failure_meta = meta.get("materialization_selector_failure")
         if not isinstance(_selector_failure_meta, dict):
             _selector_failure_meta = meta.get("selector_failure")
@@ -3361,17 +3418,17 @@ class APExecutionCore:
             return _term("RETRY_MISSING_TICKER", status="ERROR")
 
         # trigger_crossed_at: must be present and parseable — never substitute now.
-        trigger_crossed_at_raw = (
-            meta.get("trigger_crossed_at") or meta.get("triggered_at")
+        trigger_crossed_at_dt, trigger_timestamp_error = (
+            resolve_materialization_trigger_crossed_at(row, meta)
         )
-        if not trigger_crossed_at_raw:
+        trigger_crossed_at_raw = (
+            trigger_crossed_at_dt.isoformat() if trigger_crossed_at_dt is not None else ""
+        )
+        if trigger_timestamp_error == "trigger_timestamp_missing":
             return _term("RETRY_MISSING_TRIGGER_CROSSED_AT", status="ERROR")
-        try:
-            trigger_crossed_dt = datetime.fromisoformat(str(trigger_crossed_at_raw))
-            if trigger_crossed_dt.tzinfo is None:
-                trigger_crossed_dt = trigger_crossed_dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            return _term("RETRY_INVALID_TRIGGER_CROSSED_AT", status="ERROR")
+        if trigger_timestamp_error:
+            return _keep("RETRY_CONFLICTING_TRIGGER_TIMESTAMP_AUTHORITY")
+        trigger_crossed_dt = trigger_crossed_at_dt
 
         # trigger_price: must be positive.
         _trigger_price_raw = row.get("trigger_price") or meta.get("trigger_price")
@@ -3463,19 +3520,11 @@ class APExecutionCore:
                 max_attempts=max_attempts,
             )
 
-        durable_due_at_raw = (
-            meta.get("materialization_next_retry_at")
-            or meta.get("deferred_retry_next_attempt_at")
-            or meta.get("next_retry_at")
-        )
-        if not durable_due_at_raw:
+        durable_due_at, durable_schedule_error = resolve_materialization_retry_schedule(meta)
+        if durable_schedule_error == "retry_schedule_missing":
             return _keep("RETRY_NO_DURABLE_SCHEDULE")
-        try:
-            durable_due_at = datetime.fromisoformat(str(durable_due_at_raw))
-            if durable_due_at.tzinfo is None:
-                durable_due_at = durable_due_at.replace(tzinfo=timezone.utc)
-        except Exception:
-            return _term("RETRY_INVALID_DURABLE_SCHEDULE", status="ERROR")
+        if durable_schedule_error:
+            return _keep("RETRY_CONFLICTING_DURABLE_SCHEDULE")
         if durable_due_at > _now:
             return {**_base, "disposition": "NOT_DUE", "reason_code": "RETRY_NOT_DUE"}
 
@@ -3566,6 +3615,11 @@ class APExecutionCore:
             max_attempts=max_attempts,
             generation=_new_generation,
         )
+        _post_claim_terminal_fence = {
+            "owner": str(owner),
+            "generation": _new_generation,
+            "retry_attempt": _callback_attempt,
+        }
 
         # ── Helper: durable RETRY_WAIT schedule (blocker §5) ────────
         # Every RETRY_WAIT return MUST call this so the durable row
@@ -3602,8 +3656,21 @@ class APExecutionCore:
             # actual schedule decision so a slow callback cannot write a
             # stale or already-expired RETRY_WAIT.
             _schedule_now = datetime.now(timezone.utc)
+            _schedule_authority_meta = meta
+            try:
+                _latest_after_claim = osm.get_order(local_order_id) or {}
+                _latest_after_claim_meta = _latest_after_claim.get("meta")
+                if isinstance(_latest_after_claim_meta, str):
+                    _latest_after_claim_meta = json.loads(_latest_after_claim_meta)
+                if isinstance(_latest_after_claim_meta, dict):
+                    _schedule_authority_meta = _latest_after_claim_meta
+            except Exception:
+                pass
             _schedule_deadline_dt, _schedule_deadline_error = (
-                _resolve_deferred_retry_deadline(meta, now=_schedule_now)
+                _resolve_deferred_retry_deadline(
+                    _schedule_authority_meta,
+                    now=_schedule_now,
+                )
             )
             if _schedule_deadline_error:
                 return _term(
@@ -3986,16 +4053,17 @@ class APExecutionCore:
             return {**_base, "disposition": "BROKER_READY",
                     "reason_code": "RETRY_CANONICAL_BROKER_READY"}
         after_lifecycle = str(after_meta.get("lifecycle_state") or "").upper()
-        after_next_retry = (
-            after_meta.get("materialization_next_retry_at")
-            or after_meta.get("next_retry_at")
+        after_next_retry, after_schedule_error = resolve_materialization_retry_schedule(
+            after_meta
         )
-        if after_lifecycle == "RETRY_WAIT" and after_next_retry:
+        if after_lifecycle == "RETRY_WAIT" and after_schedule_error:
+            return _keep("RETRY_CONFLICTING_DURABLE_SCHEDULE")
+        if after_lifecycle == "RETRY_WAIT" and after_next_retry is not None:
             return {**_base, "disposition": "RETRY_WAIT",
                     "reason_code": str(after_meta.get("retry_reason")
                                        or after_meta.get("materialization_reason")
                                        or "RETRY_RESCHEDULED"),
-                    "next_retry_at": str(after_next_retry)}
+                    "next_retry_at": after_next_retry.isoformat()}
         # P0 FINAL AMENDMENT: use TERMINAL_ALREADY_DURABLE (not TERMINAL_DURABLE)
         # when the canonical downstream path already wrote a terminal status.
         # Recovery must NOT call terminalize_deferred_retry_if_unchanged() again —
@@ -4635,6 +4703,9 @@ class APExecutionCore:
                     "retry_attempt": _prior_mat_attempt,
                     "client_id": _mat_client_id,
                     "execution_mode": _mat_exec_mode,
+                    "signal_id": str(
+                        sig.get("signal_id") or signal_id or ""
+                    ).strip(),
                     "diagnostics": diagnostics or {},
                 }
             else:
@@ -4651,7 +4722,55 @@ class APExecutionCore:
             if not callable(_terminalize):
                 return False
             try:
+                # The production OSM terminal CAS requires signal_id.  Keep
+                # the narrow callback seam compatible with older test doubles
+                # and adapters that expose the pre-amendment signature; the
+                # deployed APOrderStateMachine always takes the fenced path.
+                if _recovery_pre_claimed and "signal_id" in _kwargs:
+                    try:
+                        import inspect as _inspect
+
+                        _signature_target = getattr(
+                            _terminalize, "side_effect", None
+                        )
+                        if not callable(_signature_target):
+                            _signature_target = _terminalize
+                        _parameters = _inspect.signature(_signature_target).parameters
+                        if (
+                            "signal_id" not in _parameters
+                            and not any(
+                                parameter.kind is _inspect.Parameter.VAR_KEYWORD
+                                for parameter in _parameters.values()
+                            )
+                        ):
+                            _kwargs.pop("signal_id", None)
+                    except (TypeError, ValueError) as _signature_exc:
+                        log.warning(
+                            "[%s] deferred retry terminal callable signature "
+                            "unavailable order=%s exc=%s — preserving fenced call",
+                            self.client_id,
+                            queue_local_order_id,
+                            _signature_exc,
+                        )
                 return bool(_terminalize(queue_local_order_id, **_kwargs))
+            except TypeError as _terminal_exc:
+                if (
+                    _recovery_pre_claimed
+                    and "signal_id" in _kwargs
+                    and "signal_id" in str(_terminal_exc)
+                ):
+                    _kwargs.pop("signal_id", None)
+                    try:
+                        return bool(_terminalize(queue_local_order_id, **_kwargs))
+                    except Exception as _legacy_terminal_exc:
+                        _terminal_exc = _legacy_terminal_exc
+                    else:
+                        return False
+                log.critical(
+                    "[%s] owned deferred terminal CAS failed order=%s error=%s",
+                    ticker, queue_local_order_id, _terminal_exc,
+                )
+                return False
             except Exception as _terminal_exc:
                 log.critical(
                     "[%s] owned deferred terminal CAS failed order=%s error=%s",
@@ -11224,6 +11343,7 @@ class APExecutionCore:
                         retry_attempt=ownership.get("retry_attempt"),
                         client_id=str(ownership.get("client_id") or ""),
                         execution_mode=str(ownership.get("execution_mode") or ""),
+                        signal_id=str(sig.get("signal_id") or "").strip(),
                         terminal_status=terminal_status,
                         reason=reason,
                     ))

@@ -40,7 +40,12 @@ from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
 )
-from ap.pending_trigger_classifier import is_active_materialization_in_flight
+from ap.pending_trigger_classifier import (
+    has_canonical_materialization_retry_authority,
+    has_conflicting_materialization_retry_authority,
+    is_active_materialization_in_flight,
+    resolve_materialization_retry_schedule,
+)
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
 
 log = logging.getLogger("ap.recovery")
@@ -1707,7 +1712,7 @@ class APStartupRecovery:
                 c.execute(
                     """
                     SELECT local_order_id, client_id, signal_id, plan_id,
-                           symbol, contract, direction, score, tier,
+                           symbol, contract, direction, kind, score, tier,
                            trigger_price, stop_underlying, target_underlying,
                            pattern, timeframe, execution_mode, qty, limit_price,
                            reserved_cost, status, broker_order_id, submitted_ts, meta
@@ -1808,7 +1813,7 @@ class APStartupRecovery:
             return ok
 
         def _terminalize_fenced_retry(loid, *, outcome: dict, extra_diagnostics: dict | None = None):
-            """Fenced terminal CAS via terminalize_deferred_retry_if_unchanged.
+            """Fenced terminal CAS for the exact state carried by the outcome.
 
             All fencing identity fields MUST come from the TERMINAL_REQUIRED outcome
             dict. No fallback to self.client_id, recovery_mode, or zero values — any
@@ -1825,17 +1830,6 @@ class APStartupRecovery:
               {"result": "FENCED_TERMINAL_UNAVAILABLE"} — OSM method missing; retain
               {"result": "INVALID_FENCED_OUTCOME"}      — outcome missing required fields; retain
             """
-            _fn = getattr(self.osm, "terminalize_deferred_retry_if_unchanged", None)
-            if not callable(_fn):
-                log.critical(
-                    "[%s] RECOVERY_FENCED_TERM_UNAVAILABLE local_order_id=%s "
-                    "— terminalize_deferred_retry_if_unchanged missing from OSM; "
-                    "row retained; deploy OSM update to unblock",
-                    self.client_id, loid,
-                )
-                result.setdefault("errors", []).append("recovery_fenced_terminal_unavailable")
-                return {"result": "FENCED_TERMINAL_UNAVAILABLE"}
-
             # ── Require all fencing identity fields from the outcome dict ────
             # Never substitute self.client_id, recovery_mode, or zero values.
             # An incomplete outcome means the consumer did not produce reliable
@@ -1845,6 +1839,7 @@ class APStartupRecovery:
             _exp_mode = str(outcome.get("expected_execution_mode") or "").strip().lower()
             _exp_lc = str(outcome.get("expected_lifecycle_state") or "").strip().upper()
             _exp_ms = str(outcome.get("expected_materialization_status") or "").strip().upper()
+            _exp_signal = str(outcome.get("expected_signal_id") or "").strip()
             _exp_reason = str(outcome.get("reason_code") or "").strip()
             _exp_status = str(outcome.get("terminal_status") or "").strip().upper()
             try:
@@ -1855,20 +1850,37 @@ class APStartupRecovery:
                 _exp_prior = int(outcome["expected_prior_retry_attempt"])
             except (KeyError, TypeError, ValueError):
                 _exp_prior = None
+            try:
+                _exp_retry = int(outcome["expected_retry_attempt"])
+            except (KeyError, TypeError, ValueError):
+                _exp_retry = None
+            _exp_owner = str(outcome.get("expected_owner") or "").strip()
+            _post_claim = (
+                _exp_lc == "MATERIALIZING"
+                and _exp_ms == "RUNNING"
+            )
 
             _missing = []
             if not _exp_client:
                 _missing.append("expected_client_id")
             if _exp_mode not in {"live", "paper"}:
                 _missing.append("expected_execution_mode")
-            if _exp_lc != "RETRY_WAIT":
-                _missing.append("expected_lifecycle_state=RETRY_WAIT")
-            if _exp_ms != "RETRY_PENDING":
-                _missing.append("expected_materialization_status=RETRY_PENDING")
+            if _post_claim:
+                if not _exp_signal:
+                    _missing.append("expected_signal_id")
+                if not _exp_owner:
+                    _missing.append("expected_owner")
+                if _exp_retry is None or _exp_retry < 1:
+                    _missing.append("expected_retry_attempt>=1")
+            else:
+                if _exp_lc != "RETRY_WAIT":
+                    _missing.append("expected_lifecycle_state=RETRY_WAIT")
+                if _exp_ms != "RETRY_PENDING":
+                    _missing.append("expected_materialization_status=RETRY_PENDING")
+                if _exp_prior is None or _exp_prior < 0:
+                    _missing.append("expected_prior_retry_attempt>=0")
             if _exp_gen is None or _exp_gen < 1:
                 _missing.append("expected_generation>=1")
-            if _exp_prior is None or _exp_prior < 0:
-                _missing.append("expected_prior_retry_attempt>=0")
             if not _exp_reason:
                 _missing.append("reason_code")
             if _exp_status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
@@ -1886,22 +1898,53 @@ class APStartupRecovery:
                 )
                 return {"result": "INVALID_FENCED_OUTCOME"}
 
+            _fn_name = (
+                "terminalize_materialization_retry"
+                if _post_claim
+                else "terminalize_deferred_retry_if_unchanged"
+            )
+            _fn = getattr(self.osm, _fn_name, None)
+            if not callable(_fn):
+                log.critical(
+                    "[%s] RECOVERY_FENCED_TERM_UNAVAILABLE local_order_id=%s "
+                    "— %s missing from OSM; row retained; deploy OSM update "
+                    "to unblock",
+                    self.client_id, loid, _fn_name,
+                )
+                result.setdefault("errors", []).append("recovery_fenced_terminal_unavailable")
+                return {"result": "FENCED_TERMINAL_UNAVAILABLE"}
+
             _ok = False
             try:
-                _ok = bool(_fn(
-                    loid,
-                    reason_code=_exp_reason,
-                    terminal_status=_exp_status,
-                    expected_client_id=_exp_client,
-                    expected_execution_mode=_exp_mode,
-                    expected_generation=_exp_gen,
-                    expected_prior_retry_attempt=_exp_prior,
-                    diagnostics={
-                        **(extra_diagnostics or {}),
-                        "recovery_classification": "fenced_retry_terminal",
-                        "recovery_owner": outcome.get("owner"),
-                    },
-                ))
+                _diagnostics = {
+                    **(extra_diagnostics or {}),
+                    "recovery_classification": "fenced_retry_terminal",
+                    "recovery_owner": outcome.get("owner"),
+                }
+                if _post_claim:
+                    _ok = bool(_fn(
+                        loid,
+                        reason=_exp_reason,
+                        terminal_status=_exp_status,
+                        owner=_exp_owner,
+                        generation=_exp_gen,
+                        retry_attempt=_exp_retry,
+                        client_id=_exp_client,
+                        execution_mode=_exp_mode,
+                        signal_id=_exp_signal,
+                        diagnostics=_diagnostics,
+                    ))
+                else:
+                    _ok = bool(_fn(
+                        loid,
+                        reason_code=_exp_reason,
+                        terminal_status=_exp_status,
+                        expected_client_id=_exp_client,
+                        expected_execution_mode=_exp_mode,
+                        expected_generation=_exp_gen,
+                        expected_prior_retry_attempt=_exp_prior,
+                        diagnostics=_diagnostics,
+                    ))
             except Exception as exc:
                 log.critical(
                     "[%s] RECOVERY_FENCED_TERM_RAISED local_order_id=%s exc=%s",
@@ -1953,7 +1996,14 @@ class APStartupRecovery:
             if _rr_gen is None or _rr_attempt is None:
                 return {"result": "WRITE_FAILED"}
             _exp_gen = int(outcome.get("expected_generation") or 0)
-            _exp_attempt_prior = int(outcome.get("expected_prior_retry_attempt") or 0)
+            _exp_attempt_prior = int(
+                outcome.get(
+                    "expected_retry_attempt"
+                    if _post_claim
+                    else "expected_prior_retry_attempt"
+                )
+                or 0
+            )
 
             # B: Concurrent generation or attempt advance
             if _rr_gen > _exp_gen or _rr_attempt > _exp_attempt_prior:
@@ -1964,18 +2014,170 @@ class APStartupRecovery:
                 )
                 return {"result": "CLAIM_LOST"}
 
+            _rr_lifecycle = str((_rr_meta or {}).get("lifecycle_state") or "").upper()
+            _rr_inflight = str((_rr_meta or {}).get("materialization_in_flight") or "false").lower()
+            _rr_nested = (
+                (_rr_meta or {}).get("materialization")
+                if isinstance((_rr_meta or {}).get("materialization"), dict)
+                else {}
+            )
+            _rr_surfaces = ((_rr_meta or {}), _rr_nested)
+
+            def _rr_absent(surface, key):
+                raw = surface.get(key) if isinstance(surface, dict) else None
+                return raw is None or (isinstance(raw, str) and not raw.strip())
+
+            def _rr_false_or_absent(surface, key):
+                raw = surface.get(key) if isinstance(surface, dict) else None
+                return _rr_absent(surface, key) or raw is False or (
+                    isinstance(raw, str) and raw.strip().lower() == "false"
+                )
+
+            def _rr_true_or_absent(surface, key):
+                raw = surface.get(key) if isinstance(surface, dict) else None
+                return _rr_absent(surface, key) or raw is True or (
+                    isinstance(raw, str) and raw.strip().lower() == "true"
+                )
+
+            def _rr_optional_equal(surface, key, expected, *, lower=False):
+                if _rr_absent(surface, key):
+                    return True
+                value = str(surface.get(key)).strip()
+                return value.lower() == expected if lower else value == expected
+
+            try:
+                from ap_canonical_signal import build_canonical_signal_id
+
+                _rr_canonical_signal = str(
+                    build_canonical_signal_id(_exp_signal) or ""
+                ).strip()
+            except Exception:
+                _rr_canonical_signal = ""
+
+            _rr_identity_same = (
+                bool(_exp_signal)
+                and bool(_rr_canonical_signal)
+                and str(_reread.get("signal_id") or "").strip() == _exp_signal
+                and str(_reread.get("client_id") or "").strip().lower() == _exp_client
+                and str(_reread.get("execution_mode") or "").strip().lower() == _exp_mode
+                and _rr_optional_equal(
+                    _reread, "canonical_signal_id", _rr_canonical_signal
+                )
+                and all(
+                    _rr_optional_equal(surface, "client_id", _exp_client, lower=True)
+                    and _rr_optional_equal(surface, "client_email", _exp_client, lower=True)
+                    and _rr_optional_equal(surface, "execution_mode", _exp_mode, lower=True)
+                    and _rr_optional_equal(surface, "signal_id", _exp_signal)
+                    and _rr_optional_equal(surface, "canonical_signal_id", _rr_canonical_signal)
+                    for surface in _rr_surfaces
+                )
+            )
+
+            # A post-claim CAS miss with the exact same active fence is a
+            # write/mismatch failure, not ownership advancement.  Retain the
+            # recovery owner so a transient DB failure cannot strand a
+            # MATERIALIZING/RUNNING row until its lease expires.
+            if _post_claim:
+                _same_post_claim_fence = (
+                    _rr_gen == _exp_gen
+                    and _rr_attempt == _exp_attempt_prior
+                    and str((_rr_meta or {}).get("materialization_owner") or "").strip()
+                    == str(outcome.get("expected_owner") or "").strip()
+                    and str((_rr_meta or {}).get("current_owner") or "").strip()
+                    == str(outcome.get("expected_owner") or "").strip()
+                    and str((_rr_meta or {}).get("watcher_token") or "").strip()
+                    == str(outcome.get("expected_owner") or "").strip()
+                    and _rr_lifecycle == "MATERIALIZING"
+                    and str((_rr_meta or {}).get("materialization_status") or "").upper()
+                    == "RUNNING"
+                    and _rr_inflight == "true"
+                    and _rr_identity_same
+                    and all(
+                        _rr_optional_equal(surface, "lifecycle_state", "MATERIALIZING")
+                        and _rr_optional_equal(surface, "materialization_status", "RUNNING")
+                        and _rr_true_or_absent(surface, "materialization_in_flight")
+                        and _rr_optional_equal(
+                            surface,
+                            "materialization_owner",
+                            str(outcome.get("expected_owner") or "").strip(),
+                        )
+                        and _rr_optional_equal(
+                            surface,
+                            "current_owner",
+                            str(outcome.get("expected_owner") or "").strip(),
+                        )
+                        and _rr_optional_equal(
+                            surface,
+                            "watcher_token",
+                            str(outcome.get("expected_owner") or "").strip(),
+                        )
+                        and _rr_optional_equal(surface, "materialization_generation", str(_exp_gen))
+                        and _rr_optional_equal(surface, "retry_attempt", str(_exp_attempt_prior))
+                        for surface in _rr_surfaces
+                    )
+                    and all(
+                        _rr_false_or_absent(surface, "broker_ready")
+                        and _rr_false_or_absent(surface, "recovery_submit_fenced")
+                        and all(
+                            _rr_absent(surface, key)
+                            for key in (
+                                "submit_intent_at",
+                                "broker_submit_key",
+                                "broker_submit_payload_hash",
+                                "recovery_submit_owner",
+                                "recovery_submit_lease_until",
+                            )
+                        )
+                        for surface in _rr_surfaces
+                    )
+                )
+                if _same_post_claim_fence:
+                    log.critical(
+                        "[%s] RECOVERY_FENCED_TERM_POSTCLAIM_WRITE_FAILED "
+                        "local_order_id=%s — exact MATERIALIZING/RUNNING owner "
+                        "still present after CAS miss; retaining ownership",
+                        self.client_id, loid,
+                    )
+                    result.setdefault("errors", []).append(
+                        f"fenced_postclaim_write_failed:{loid}"
+                    )
+                    return {"result": "WRITE_FAILED"}
+
             # C: Submit intent, broker-ready, or active lifecycle
             _rr_lifecycle = str((_rr_meta or {}).get("lifecycle_state") or "").upper()
-            _rr_submit_intent = str((_rr_meta or {}).get("submit_intent_at") or "").strip()
             _rr_broker_id = str(_reread.get("broker_order_id") or "").strip()
             _rr_broker_ready = str((_rr_meta or {}).get("broker_ready") or "false").lower()
             _rr_inflight = str((_rr_meta or {}).get("materialization_in_flight") or "false").lower()
+            _rr_handoff_advanced = any(
+                not _rr_false_or_absent(surface, "broker_ready")
+                or not _rr_false_or_absent(surface, "recovery_submit_fenced")
+                or any(
+                    not _rr_absent(surface, key)
+                    for key in (
+                        "submit_intent_at",
+                        "broker_submit_key",
+                        "broker_submit_payload_hash",
+                        "recovery_submit_owner",
+                        "recovery_submit_lease_until",
+                    )
+                )
+                for surface in _rr_surfaces
+            )
+            _rr_inflight_advanced = any(
+                str(surface.get("materialization_in_flight") or "false").strip().lower()
+                not in {"false", ""}
+                for surface in _rr_surfaces
+            )
+            _rr_submit_intent = any(
+                not _rr_absent(surface, "submit_intent_at")
+                for surface in _rr_surfaces
+            )
             if (
                 _rr_submit_intent
                 or _rr_broker_id
                 or _reread.get("submitted_ts")
-                or _rr_broker_ready not in {"false", ""}
-                or _rr_inflight not in {"false", ""}
+                or _rr_handoff_advanced
+                or _rr_inflight_advanced
                 or _rr_lifecycle in {
                     "MATERIALIZING", "BROKER_READY", "SUBMITTING",
                     "PRE_SUBMIT_PROOF_RETRY", "SUBMITTED", "ACKNOWLEDGED",
@@ -2127,8 +2329,30 @@ class APStartupRecovery:
                 continue
 
             meta = self._coerce_order_meta(order.get("meta"))
+
+            # Conflicting retry authority is unresolved durable truth.  Do
+            # not route it into terminalization, watcher takeover, selector,
+            # or broker handling merely because trigger evidence is present.
+            if has_conflicting_materialization_retry_authority(order):
+                log.critical(
+                    "[%s] RECOVERY_RETRY_AUTHORITY_CONFLICT local_order_id=%s "
+                    "— row held untouched; no claim, selector, broker, cancel, "
+                    "or lifecycle mutation",
+                    self.client_id, local_order_id,
+                )
+                result.setdefault("errors", []).append(
+                    f"retry_authority_conflict:{local_order_id}"
+                )
+                continue
+
             lifecycle = str(meta.get("lifecycle_state") or "").upper()
             materialization_status = str(meta.get("materialization_status") or "").upper()
+            watcher_audit = meta.get("watcher_audit")
+            watcher_reason = (
+                str(watcher_audit.get("reason_code") or "").strip().lower()
+                if isinstance(watcher_audit, dict)
+                else ""
+            )
 
             # Do this before stale/terminal classification, quote work, or any
             # recovery ownership mutation.  A confirmed timestamp with missing
@@ -2136,9 +2360,13 @@ class APStartupRecovery:
             # evidence and continue as pre-breach.
             _evidence_row = dict(order)
             _evidence_row["meta"] = meta
+            _canonical_retry_after_trigger = (
+                watcher_reason == "trigger_ready"
+                and has_canonical_materialization_retry_authority(_evidence_row)
+            )
             if not recovery_trigger_evidence_identity_is_proven(
                 _evidence_row, local_order_id
-            ):
+            ) and not _canonical_retry_after_trigger:
                 log.critical(
                     "[%s] %s local_order_id=%s — preserving order unchanged",
                     self.client_id,
@@ -2502,22 +2730,46 @@ class APStartupRecovery:
                     lifecycle == "RETRY_WAIT" or materialization_status == "RETRY_PENDING"
                 )
 
+                if (
+                    _is_retry_row
+                    and watcher_reason == "trigger_ready"
+                    and meta.get("materialization_market_truth_pending") is not True
+                ):
+                    # The due takeover path must never manufacture retry
+                    # lineage from absent JSONB counters.  Require the same
+                    # complete canonical authority used by classification;
+                    # unresolved rows are retained for repair and cannot
+                    # reach phase-one claim or selector work.
+                    _retry_authority_row = dict(order)
+                    _retry_authority_row["meta"] = meta
+                    if not has_canonical_materialization_retry_authority(
+                        _retry_authority_row
+                    ):
+                        log.critical(
+                            "[%s] RECOVERY_RETRY_AUTHORITY_INCOMPLETE "
+                            "local_order_id=%s lifecycle=%s mstatus=%s "
+                            "— holding unresolved; no synthesized retry attempt",
+                            self.client_id,
+                            local_order_id,
+                            lifecycle,
+                            materialization_status,
+                        )
+                        result.setdefault("errors", []).append(
+                            f"retry_authority_incomplete:{local_order_id}"
+                        )
+                        continue
+
                 # ── Parse + validate the durable retry schedule ───────────────
-                _durable_next_retry_at = (
-                    meta.get("materialization_next_retry_at")
-                    or meta.get("deferred_retry_next_attempt_at")
-                    or meta.get("next_retry_at")
-                )
+                _durable_next_retry_at = None
                 _due_at = None
                 _ts_parse_error = False
-                if _durable_next_retry_at and _is_retry_row:
-                    try:
-                        _due_at = datetime.fromisoformat(str(_durable_next_retry_at))
-                        if _due_at.tzinfo is None:
-                            _due_at = _due_at.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        _ts_parse_error = True
+                if _is_retry_row:
+                    _due_at, _schedule_error = resolve_materialization_retry_schedule(meta)
+                    if _schedule_error:
+                        _ts_parse_error = _schedule_error != "retry_schedule_missing"
                         _due_at = None
+                    else:
+                        _durable_next_retry_at = _due_at.isoformat() if _due_at else None
 
                 if _is_retry_row and _ts_parse_error:
                     # Blocker §3: malformed durable timestamp — quarantine.

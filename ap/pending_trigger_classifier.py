@@ -48,11 +48,17 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
 
 from ap.logger import get_logger
+from ap.selector_retry_policy import (
+    DeferredMaterializationConfigConflict,
+    is_retryable_selector_reason,
+    resolve_deferred_materialization_max_attempts,
+    resolve_deferred_retry_reason,
+)
 
 log = get_logger("ap.pending_trigger_classifier")
 
@@ -646,7 +652,9 @@ class PendingTriggerClassification:
     # Active materialization owner — recovery must observe and leave read-only
     MATERIALIZATION_IN_FLIGHT  = "MATERIALIZATION_IN_FLIGHT"
 
-    # Unsafe — must NOT be rearmed; terminal cleanup required
+    # Unsafe or unresolved — must NOT be rearmed.  Retry authority conflicts
+    # are held for repair; other unsafe states retain their terminal policy.
+    RETRY_AUTHORITY_CONFLICT    = "RETRY_AUTHORITY_CONFLICT"
     STUCK_TRIGGER_READY        = "STUCK_TRIGGER_READY"
     STUCK_INVALIDATED          = "STUCK_INVALIDATED"
     STUCK_TERMINAL_MATERIALIZATION = "STUCK_TERMINAL_MATERIALIZATION"
@@ -691,7 +699,6 @@ _RETRY_MATERIALIZATION_OUTCOMES: frozenset[str] = frozenset({
     "RETRY_LATER_DATA_UNAVAILABLE",
     "RETRY_LATER_SELECTOR_BUDGET",
 })
-
 
 def _reason_is_invalidation(reason_code: str) -> bool:
     """PR #324 §4: delegate to classify_watcher_reason for canonical classification.
@@ -754,6 +761,152 @@ def _parse_iso_classifier(raw) -> Optional[datetime]:
         return datetime.fromisoformat(text)
     except Exception:
         return None
+
+
+_MATERIALIZATION_RETRY_TIME_FIELDS = (
+    "materialization_next_retry_at",
+    "next_retry_at",
+    "deferred_retry_next_attempt_at",
+)
+_MATERIALIZATION_RETRY_DEADLINE_FIELDS = (
+    "absolute_entry_deadline",
+    "retry_deadline",
+    "deferred_retry_deadline",
+)
+
+
+def _retry_authority_surfaces(meta: dict) -> list[dict]:
+    """Return every durable retry metadata surface, without choosing one."""
+    surfaces = [meta]
+    nested = meta.get("materialization")
+    if isinstance(nested, dict):
+        surfaces.append(nested)
+    return surfaces
+
+
+def _surface_values(surfaces: list[dict], *keys: str) -> list[object]:
+    values = []
+    for surface in surfaces:
+        for key in keys:
+            if key in surface and not _persisted_value_is_absent(surface.get(key)):
+                values.append(surface.get(key))
+    return values
+
+
+def _equal_text_authorities(
+    entries: list[tuple[str, object]],
+    *,
+    lower: bool = False,
+    allowed: Optional[set[str]] = None,
+) -> bool:
+    """Validate all populated text authorities; never resolve by precedence."""
+    observed: list[str] = []
+    for _label, raw in entries:
+        if _persisted_value_is_absent(raw):
+            continue
+        if not isinstance(raw, str):
+            return False
+        value = raw.strip().lower() if lower else raw.strip()
+        if not value or (allowed is not None and value not in allowed):
+            return False
+        observed.append(value)
+    return not observed or all(value == observed[0] for value in observed[1:])
+
+
+def _equal_timestamp_authorities(
+    entries: list[tuple[str, object]],
+    *,
+    required: bool,
+) -> tuple[bool, Optional[datetime]]:
+    """Parse and compare every populated timestamp alias in UTC."""
+    parsed: list[datetime] = []
+    for _label, raw in entries:
+        if _persisted_value_is_absent(raw):
+            continue
+        value = _parse_iso_classifier(raw)
+        if value is None or value.tzinfo is None or value.utcoffset() is None:
+            return False, None
+        parsed.append(value.astimezone(timezone.utc))
+    if not parsed:
+        return (not required), None
+    # JSONB aliases written by adjacent legacy code can differ only by
+    # sub-millisecond serialization jitter. Treat that as the same instant;
+    # materially different retry/deadline authorities still fail closed.
+    if any(abs(value - parsed[0]) > timedelta(milliseconds=1) for value in parsed[1:]):
+        return False, None
+    return True, parsed[0]
+
+
+def _equal_strict_integer_authorities(
+    surfaces: list[dict],
+    key: str,
+    *,
+    required: bool = True,
+) -> tuple[bool, Optional[int]]:
+    values = _surface_values(surfaces, key)
+    if not values:
+        return (not required), None
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        return False, None
+    if any(value != values[0] for value in values[1:]):
+        return False, None
+    return True, values[0]
+
+
+def resolve_materialization_retry_schedule(
+    meta_or_row: dict,
+) -> tuple[Optional[datetime], Optional[str]]:
+    """Resolve the retry schedule only when every populated alias agrees."""
+    if not isinstance(meta_or_row, dict):
+        return None, "metadata_not_mapping"
+    meta = (
+        _coerce_classifier_meta(meta_or_row.get("meta"))
+        if "meta" in meta_or_row
+        else meta_or_row
+    )
+    surfaces = _retry_authority_surfaces(meta)
+    entries = [
+        (f"retry_schedule.{field}", value)
+        for surface in surfaces
+        for field in _MATERIALIZATION_RETRY_TIME_FIELDS
+        for value in ([surface.get(field)] if field in surface else [])
+    ]
+    if not entries:
+        return None, "retry_schedule_missing"
+    ok, value = _equal_timestamp_authorities(entries, required=True)
+    if not ok:
+        return None, "retry_schedule_conflict_or_malformed"
+    return value, None
+
+
+def resolve_materialization_trigger_crossed_at(
+    row: dict,
+    meta: Optional[dict] = None,
+) -> tuple[Optional[datetime], Optional[str]]:
+    """Resolve row/meta/nested trigger timestamp aliases without precedence."""
+    if not isinstance(row, dict):
+        return None, "row_not_mapping"
+    _meta = meta if isinstance(meta, dict) else _coerce_classifier_meta(row.get("meta"))
+    surfaces = _retry_authority_surfaces(_meta)
+    entries = [
+        ("row.trigger_crossed_at", row.get("trigger_crossed_at")),
+        ("row.triggered_at", row.get("triggered_at")),
+    ]
+    for surface_name, surface in zip(("meta", "materialization"), surfaces):
+        entries.extend(
+            (f"{surface_name}.{field}", surface.get(field))
+            for field in ("trigger_crossed_at", "triggered_at")
+        )
+        provenance = surface.get("trigger_crossed_at_provenance")
+        if isinstance(provenance, dict):
+            entries.extend(
+                (f"{surface_name}.provenance.{field}", provenance.get(field))
+                for field in ("trigger_crossed_at", "triggered_at")
+            )
+    if not any(not _persisted_value_is_absent(raw) for _label, raw in entries):
+        return None, "trigger_timestamp_missing"
+    ok, value = _equal_timestamp_authorities(entries, required=True)
+    return (value, None) if ok else (None, "trigger_timestamp_conflict_or_malformed")
 
 
 def _active_materialization_proof(meta: dict) -> bool:
@@ -915,10 +1068,502 @@ def has_broker_handoff_evidence(row: dict) -> bool:
             "submit_intent_at",
             "broker_submit_key",
             "broker_submit_payload_hash",
+            "recovery_submit_owner",
+            "recovery_submit_lease_until",
         ):
             if not _persisted_value_is_absent(surface.get(key)):
                 return True
+        recovery_fenced = surface.get("recovery_submit_fenced")
+        if not _persisted_value_is_absent(recovery_fenced) and recovery_fenced is not False:
+            return True
     return False
+
+
+def has_canonical_materialization_retry_authority(row: dict) -> bool:
+    """Recognize the exact post-breach retry handoff without claiming it.
+
+    This predicate is intentionally read-only.  It exists so the historical
+    ``watcher_audit=trigger_ready`` marker cannot outrank a complete durable
+    ``RETRY_PENDING`` handoff.  Callers still perform their own CAS/claim and
+    execution-mode checks before any selector or broker work.
+    """
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+        return False
+    if str(row.get("kind") or "").strip().upper() != "ENTRY":
+        return False
+    if not str(row.get("local_order_id") or "").strip():
+        return False
+    if not str(row.get("client_id") or "").strip():
+        return False
+    if str(row.get("execution_mode") or "").strip().lower() not in {"live", "paper"}:
+        return False
+    if not str(row.get("signal_id") or "").strip():
+        return False
+    if not _persisted_value_is_absent(row.get("broker_order_id")):
+        return False
+    if not _persisted_value_is_absent(row.get("submitted_ts")):
+        return False
+
+    meta = _coerce_classifier_meta(row.get("meta"))
+    nested = meta.get("materialization")
+    if nested is not None and not isinstance(nested, dict):
+        return False
+    surfaces = _retry_authority_surfaces(meta)
+
+    # Every populated identity alias is authority.  In particular, the
+    # legacy missing-provenance exception is not allowed to choose a column
+    # over contradictory JSONB identity.
+    provenance_surfaces: list[dict] = []
+    for surface in surfaces:
+        if "trigger_crossed_at_provenance" not in surface:
+            continue
+        provenance = surface.get("trigger_crossed_at_provenance")
+        if not isinstance(provenance, dict):
+            return False
+        if any(
+            _persisted_value_is_absent(provenance.get(field))
+            for field in (
+                "canonical_signal_id",
+                "client_id",
+                "execution_mode",
+                "local_order_id",
+            )
+        ):
+            return False
+        provenance_surfaces.append(provenance)
+
+    try:
+        from ap_canonical_signal import build_canonical_signal_id
+
+        derived_canonical = str(
+            build_canonical_signal_id(str(row.get("signal_id") or ""))
+        ).strip()
+    except Exception:
+        return False
+    if not derived_canonical:
+        return False
+
+    client_entries = [
+        ("row.client_id", row.get("client_id")),
+        ("row.client_email", row.get("client_email")),
+    ]
+    mode_entries = [("row.execution_mode", row.get("execution_mode"))]
+    signal_entries = [("row.signal_id", row.get("signal_id"))]
+    canonical_entries = [
+        ("row.canonical_signal_id", row.get("canonical_signal_id")),
+        ("derived.row.signal_id", derived_canonical),
+    ]
+    local_entries = [
+        ("row.local_order_id", row.get("local_order_id")),
+        ("row.order_id", row.get("order_id")),
+    ]
+    for name, surface in (("meta", meta), ("materialization", nested)):
+        if not isinstance(surface, dict):
+            continue
+        client_entries.extend(
+            ((f"{name}.client_id", surface.get("client_id")),
+             (f"{name}.client_email", surface.get("client_email")))
+        )
+        mode_entries.append((f"{name}.execution_mode", surface.get("execution_mode")))
+        signal_entries.append((f"{name}.signal_id", surface.get("signal_id")))
+        canonical_entries.append(
+            (f"{name}.canonical_signal_id", surface.get("canonical_signal_id"))
+        )
+        local_entries.extend(
+            ((f"{name}.local_order_id", surface.get("local_order_id")),
+             (f"{name}.order_id", surface.get("order_id")))
+        )
+    for index, provenance in enumerate(provenance_surfaces):
+        client_entries.extend(
+            ((f"provenance[{index}].client_id", provenance.get("client_id")),
+             (f"provenance[{index}].client_email", provenance.get("client_email")))
+        )
+        mode_entries.append(
+            (f"provenance[{index}].execution_mode", provenance.get("execution_mode"))
+        )
+        signal_entries.append(
+            (f"provenance[{index}].signal_id", provenance.get("signal_id"))
+        )
+        canonical_entries.append(
+            (f"provenance[{index}].canonical_signal_id", provenance.get("canonical_signal_id"))
+        )
+        local_entries.extend(
+            ((f"provenance[{index}].local_order_id", provenance.get("local_order_id")),
+             (f"provenance[{index}].order_id", provenance.get("order_id")))
+        )
+
+    if not _equal_text_authorities(client_entries, lower=True):
+        return False
+    if not _equal_text_authorities(mode_entries, lower=True, allowed={"live", "paper"}):
+        return False
+    if not _equal_text_authorities(signal_entries):
+        return False
+    if not _equal_text_authorities(canonical_entries):
+        return False
+    if not _equal_text_authorities(local_entries):
+        return False
+
+    # Nested materialization fields are duplicate authority, not a fallback.
+    def _text_surface_authority(keys: tuple[str, ...], *, allowed=None) -> tuple[bool, Optional[str]]:
+        values = _surface_values(surfaces, *keys)
+        if not values:
+            return False, None
+        entries = [("materialization", value) for value in values]
+        if not _equal_text_authorities(entries, lower=True, allowed=allowed):
+            return False, None
+        return True, str(values[0]).strip().lower()
+
+    ok, materialization_status = _text_surface_authority(
+        ("materialization_status",), allowed={"retry_pending"}
+    )
+    if not ok or materialization_status != "retry_pending":
+        return False
+    ok, lifecycle_state = _text_surface_authority(
+        ("lifecycle_state",), allowed={"retry_wait"}
+    )
+    if not ok or lifecycle_state != "retry_wait":
+        return False
+
+    contract_values = _surface_values(surfaces, "contract")
+    if contract_values:
+        if any(not isinstance(value, str) for value in contract_values):
+            return False
+        normalized_contracts = [value.strip().upper() for value in contract_values]
+        if any(not value.startswith("DEFERRED:") for value in normalized_contracts):
+            return False
+        if any(value != normalized_contracts[0] for value in normalized_contracts[1:]):
+            return False
+    contract = str(row.get("contract") or "").strip().upper()
+    if contract and not contract.startswith("DEFERRED:"):
+        return False
+    contract_deferred_values = _surface_values(surfaces, "contract_deferred")
+    if not contract and (
+        not contract_deferred_values
+        or any(value is not True for value in contract_deferred_values)
+    ):
+        return False
+    if any(value is not True for value in contract_deferred_values):
+        return False
+
+    broker_ready_values = _surface_values(surfaces, "broker_ready")
+    if not broker_ready_values or any(value is not False for value in broker_ready_values):
+        return False
+    if has_broker_handoff_evidence(row):
+        return False
+
+    counter_values: dict[str, int] = {}
+    for field in (
+        "materialization_attempts",
+        "retry_attempt",
+        "breach_attempt_count",
+        "materialization_generation",
+        "retry_max_attempts",
+    ):
+        ok, value = _equal_strict_integer_authorities(surfaces, field)
+        if not ok or value is None:
+            return False
+        counter_values[field] = value
+    attempts = counter_values["materialization_attempts"]
+    if attempts < 1 or counter_values["retry_attempt"] != attempts:
+        return False
+    if counter_values["breach_attempt_count"] != attempts:
+        return False
+    if counter_values["materialization_generation"] < 1:
+        return False
+    if counter_values["retry_max_attempts"] < attempts:
+        return False
+    try:
+        live_max_attempts = resolve_deferred_materialization_max_attempts()
+    except (DeferredMaterializationConfigConflict, TypeError, ValueError):
+        return False
+    if attempts > live_max_attempts:
+        return False
+
+    # Retry reason and selector audit are also duplicated authority.  Any
+    # explicit non-mapping selector surface is malformed, not a fallback.
+    reason_values: list[str] = []
+    for surface in surfaces:
+        for field in ("retry_reason", "materialization_reason", "deferred_retry_reason_code"):
+            raw = surface.get(field)
+            if not _persisted_value_is_absent(raw):
+                if not isinstance(raw, str):
+                    return False
+                reason_values.append(raw.strip().upper())
+        for field in ("materialization_selector_failure", "selector_failure"):
+            audit = surface.get(field)
+            if _persisted_value_is_absent(audit):
+                continue
+            if not isinstance(audit, dict):
+                return False
+            raw = audit.get("reason_code")
+            if not _persisted_value_is_absent(raw):
+                if not isinstance(raw, str):
+                    return False
+                reason_values.append(raw.strip().upper())
+    if not reason_values or any(value != reason_values[0] for value in reason_values[1:]):
+        return False
+    if not is_retryable_selector_reason(reason_values[0]):
+        return False
+
+    schedule, schedule_error = resolve_materialization_retry_schedule(meta)
+    if schedule_error or schedule is None:
+        return False
+    last_failure_entries = [
+        (f"{name}.materialization_last_failure_at", surface.get("materialization_last_failure_at"))
+        for name, surface in (("meta", meta), ("materialization", nested))
+        if isinstance(surface, dict)
+    ]
+    last_failure_ok, _last_failure = _equal_timestamp_authorities(
+        last_failure_entries, required=True
+    )
+    if not last_failure_ok:
+        return False
+    _trigger_crossed_at, trigger_error = resolve_materialization_trigger_crossed_at(row, meta)
+    if trigger_error or _trigger_crossed_at is None:
+        return False
+
+    deadline_entries = [
+        (f"{name}.{field}", surface.get(field))
+        for name, surface in (("meta", meta), ("materialization", nested))
+        if isinstance(surface, dict)
+        for field in _MATERIALIZATION_RETRY_DEADLINE_FIELDS
+    ]
+    deadline_ok, _deadline = _equal_timestamp_authorities(
+        deadline_entries, required=True
+    )
+    if not deadline_ok:
+        return False
+
+    outcome_values = _surface_values(surfaces, "materialization_outcome", "outcome")
+    if not outcome_values:
+        return False
+    if any(
+        not isinstance(value, str)
+        or value.strip().upper() not in _RETRY_MATERIALIZATION_OUTCOMES
+        for value in outcome_values
+    ):
+        return False
+    normalized_outcomes = [value.strip().upper() for value in outcome_values]
+    return all(value == normalized_outcomes[0] for value in normalized_outcomes[1:])
+
+
+def has_conflicting_materialization_retry_authority(row: dict) -> bool:
+    """Identify retry-marked trigger rows that must be held, never cleaned up."""
+    if not isinstance(row, dict):
+        return False
+    meta = _coerce_classifier_meta(row.get("meta"))
+    watcher_audit = meta.get("watcher_audit")
+    if not isinstance(watcher_audit, dict) or str(
+        watcher_audit.get("reason_code") or ""
+    ).strip().lower() != "trigger_ready":
+        return False
+    # MATERIALIZING/RUNNING rows use the existing owner/lease and phase-one
+    # recovery fences.  Their retry markers describe the attempt being
+    # materialized, not a RETRY_WAIT handoff that can be misrouted into
+    # terminalization.  Leave that lifecycle to the active-owner classifier.
+    materialization = meta.get("materialization")
+    lifecycle_values = [meta.get("lifecycle_state"), meta.get("materialization_status")]
+    if isinstance(materialization, dict):
+        lifecycle_values.extend(
+            [materialization.get("lifecycle_state"), materialization.get("materialization_status")]
+        )
+    if any(
+        str(value or "").strip().upper() in {"MATERIALIZING", "RUNNING"}
+        for value in lifecycle_values
+    ):
+        return False
+    # The phase-one market-truth crash window is a separate same-attempt
+    # recovery contract.  Its explicit marker is not a due canonical retry
+    # handoff and must retain the existing phase-one recovery path.
+    if meta.get("materialization_market_truth_pending") is True:
+        return False
+    surfaces = _retry_authority_surfaces(meta)
+    retry_markers = (
+        "materialization_status",
+        "lifecycle_state",
+        "retry_attempt",
+        "materialization_attempts",
+        "breach_attempt_count",
+        "materialization_next_retry_at",
+        "next_retry_at",
+        "deferred_retry_next_attempt_at",
+        "materialization_outcome",
+        "materialization_reason",
+        "retry_reason",
+    )
+    marked = any(
+        not _persisted_value_is_absent(surface.get(field))
+        for surface in surfaces
+        for field in retry_markers
+    )
+    if not marked:
+        return False
+
+    # Retry lineage is executable only when the complete canonical authority
+    # predicate succeeds. Missing counters, schedule, identity, or any other
+    # required durable field are unresolved authority, not first-attempt
+    # defaults. Active MATERIALIZING/RUNNING proof was excluded above.
+    if not has_canonical_materialization_retry_authority(row):
+        return True
+
+    # Retain the duplicate checks below as a defensive guard if the canonical
+    # predicate gains a new surface without this helper being updated.
+    def _text_conflict(entries, *, lower: bool = False, allowed=None) -> bool:
+        observed = []
+        for _label, raw in entries:
+            if _persisted_value_is_absent(raw):
+                continue
+            if not isinstance(raw, str):
+                return True
+            value = raw.strip().lower() if lower else raw.strip()
+            if not value or (allowed is not None and value not in allowed):
+                return True
+            observed.append(value)
+        return len(set(observed)) > 1
+
+    provenance_surfaces = []
+    for surface in surfaces:
+        if "trigger_crossed_at_provenance" not in surface:
+            continue
+        provenance = surface.get("trigger_crossed_at_provenance")
+        if not isinstance(provenance, dict) or any(
+            _persisted_value_is_absent(provenance.get(field))
+            for field in (
+                "canonical_signal_id",
+                "client_id",
+                "execution_mode",
+                "local_order_id",
+            )
+        ):
+            return True
+        provenance_surfaces.append(provenance)
+
+    client_entries = [
+        ("row.client_id", row.get("client_id")),
+        ("row.client_email", row.get("client_email")),
+    ]
+    mode_entries = [("row.execution_mode", row.get("execution_mode"))]
+    signal_entries = [("row.signal_id", row.get("signal_id"))]
+    local_entries = [
+        ("row.local_order_id", row.get("local_order_id")),
+        ("row.order_id", row.get("order_id")),
+    ]
+    canonical_entries = [("row.canonical_signal_id", row.get("canonical_signal_id"))]
+    for name, surface in (("meta", meta), ("materialization", meta.get("materialization"))):
+        if not isinstance(surface, dict):
+            if name == "materialization" and surface is not None:
+                return True
+            continue
+        client_entries.extend(
+            ((f"{name}.client_id", surface.get("client_id")),
+             (f"{name}.client_email", surface.get("client_email")))
+        )
+        mode_entries.append((f"{name}.execution_mode", surface.get("execution_mode")))
+        signal_entries.append((f"{name}.signal_id", surface.get("signal_id")))
+        canonical_entries.append((f"{name}.canonical_signal_id", surface.get("canonical_signal_id")))
+        local_entries.extend(
+            ((f"{name}.local_order_id", surface.get("local_order_id")),
+             (f"{name}.order_id", surface.get("order_id")))
+        )
+    for index, provenance in enumerate(provenance_surfaces):
+        client_entries.extend(
+            ((f"provenance[{index}].client_id", provenance.get("client_id")),
+             (f"provenance[{index}].client_email", provenance.get("client_email")))
+        )
+        mode_entries.append((f"provenance[{index}].execution_mode", provenance.get("execution_mode")))
+        signal_entries.append((f"provenance[{index}].signal_id", provenance.get("signal_id")))
+        canonical_entries.append(
+            (f"provenance[{index}].canonical_signal_id", provenance.get("canonical_signal_id"))
+        )
+        local_entries.extend(
+            ((f"provenance[{index}].local_order_id", provenance.get("local_order_id")),
+             (f"provenance[{index}].order_id", provenance.get("order_id")))
+        )
+
+    try:
+        from ap_canonical_signal import build_canonical_signal_id
+
+        derived = str(build_canonical_signal_id(str(row.get("signal_id") or "")) or "").strip()
+    except Exception:
+        derived = ""
+    if derived:
+        canonical_entries.append(("derived.row.signal_id", derived))
+
+    if (
+        _text_conflict(client_entries, lower=True)
+        or _text_conflict(mode_entries, lower=True, allowed={"live", "paper"})
+        or _text_conflict(signal_entries)
+        or _text_conflict(canonical_entries)
+        or _text_conflict(local_entries)
+    ):
+        return True
+
+    # Duplicate lifecycle/counter/schedule/outcome authorities must agree, but
+    # a single legacy value is not treated as a contradiction merely because
+    # the complete canonical predicate needs more fields than that path has.
+    for field in ("materialization_status", "lifecycle_state"):
+        values = _surface_values(surfaces, field)
+        if _text_conflict([(field, value) for value in values], lower=True):
+            return True
+    for field in (
+        "materialization_attempts",
+        "retry_attempt",
+        "breach_attempt_count",
+        "materialization_generation",
+        "retry_max_attempts",
+    ):
+        values = _surface_values(surfaces, field)
+        if values and (
+            any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+            or len(set(values)) > 1
+        ):
+            return True
+
+    _schedule, schedule_error = resolve_materialization_retry_schedule(meta)
+    if schedule_error and schedule_error != "retry_schedule_missing":
+        return True
+    _trigger, trigger_error = resolve_materialization_trigger_crossed_at(row, meta)
+    if trigger_error and trigger_error != "trigger_timestamp_missing":
+        return True
+    for field_group in (
+        ("materialization_last_failure_at",),
+        _MATERIALIZATION_RETRY_DEADLINE_FIELDS,
+    ):
+        entries = [
+            (f"{name}.{field}", surface.get(field))
+            for name, surface in (("meta", meta), ("materialization", meta.get("materialization")))
+            if isinstance(surface, dict)
+            for field in field_group
+        ]
+        ok, _value = _equal_timestamp_authorities(entries, required=False)
+        if not ok:
+            return True
+
+    outcomes = _surface_values(surfaces, "materialization_outcome", "outcome")
+    if outcomes:
+        if any(
+            not isinstance(value, str)
+            or value.strip().upper() not in _RETRY_MATERIALIZATION_OUTCOMES
+            for value in outcomes
+        ):
+            return True
+        if len({value.strip().upper() for value in outcomes}) > 1:
+            return True
+
+    reason_values = []
+    for surface in surfaces:
+        for field in ("retry_reason", "materialization_reason", "deferred_retry_reason_code"):
+            raw = surface.get(field)
+            if not _persisted_value_is_absent(raw):
+                if not isinstance(raw, str):
+                    return True
+                reason_values.append(raw.strip().upper())
+    if len(set(reason_values)) > 1:
+        return True
+
+    return has_broker_handoff_evidence(row)
 
 
 def is_active_materialization_in_flight(row: dict) -> bool:
@@ -1006,6 +1651,10 @@ def classify_pending_trigger_row(
         if watcher_reason == "trigger_ready":
             if is_active_materialization_in_flight(row):
                 return PendingTriggerClassification.MATERIALIZATION_IN_FLIGHT
+            if has_canonical_materialization_retry_authority(row):
+                return PendingTriggerClassification.WAITING_RETRYABLE
+            if has_conflicting_materialization_retry_authority(row):
+                return PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
             return PendingTriggerClassification.STUCK_TRIGGER_READY
 
         # ── Priority 2: real invalidation reason ──
@@ -1061,7 +1710,8 @@ def classify_pending_trigger_row(
 def is_safe_to_recovery_rearm(classification: str) -> bool:
     """
     LIVE rescue rule: ONLY WAITING_VALID and WAITING_RETRYABLE may be
-    recovery-rearmed. All other classifications require terminal cleanup.
+    recovery-rearmed. RETRY_AUTHORITY_CONFLICT is held unresolved; other
+    classifications retain their existing terminal/skip policy.
 
     Callers should treat this as the definitive live-safety gate — if this
     returns False, do NOT call entry_watcher.watch(recovery_rearm=True).
