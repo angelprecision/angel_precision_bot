@@ -1620,10 +1620,11 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
             or 0
         )
         generation = meta.get("materialization_generation")
-        try:
-            generation = int(generation) if generation is not None else None
-        except (TypeError, ValueError):
-            generation = None
+        # Preserve the raw authority in metadata. The watcher recovery fence
+        # performs the strict positive-integer parse; coercing here would turn
+        # booleans or fractional/invalid JSON values into a different
+        # generation. Do not add a separate plan attribute: materialization
+        # resume remains owned by its existing #596 plan contract.
         return _RecoveryPlan(
             signal_id=signal_id,
             canonical_signal_id=canonical_signal_id,

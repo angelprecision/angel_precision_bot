@@ -1869,14 +1869,11 @@ class APStartupRecovery:
             or ""
         )
         materialization_generation = meta.get("materialization_generation")
-        try:
-            materialization_generation = (
-                int(materialization_generation)
-                if materialization_generation is not None
-                else None
-            )
-        except (TypeError, ValueError):
-            materialization_generation = None
+        # Preserve the raw authority in metadata. The #580 watcher fence
+        # performs the strict positive-integer parse; coercing here would
+        # erase malformed boolean/fractional/blank values before they can be
+        # held. The existing #596 materialization-resume plan shape remains
+        # unchanged.
 
         return _RecoveryPlan(
             signal_id=signal_id,

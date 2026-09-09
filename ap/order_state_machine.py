@@ -2328,6 +2328,314 @@ class APOrderStateMachine:
             )
             return False
 
+    def claim_recovery_trigger_dispatch(
+        self,
+        *,
+        local_order_id: str,
+        signal_id: str,
+        canonical_signal_id: str,
+        client_id: str,
+        execution_mode: str,
+        ticker: str,
+        side: str,
+        materialization_generation: int,
+        trigger_generation: int,
+        claim_owner: str,
+        watcher_token: str | None = None,
+        watcher_owner: str | None = None,
+        trigger_cursor: str | None = None,
+    ) -> bool:
+        """Claim one recovered trigger immediately before callback dispatch.
+
+        This is the final durable TOCTOU fence for PR #580.  The exact ENTRY
+        row is locked, all identity and generation authorities are proved, and
+        a durable claim marker is installed in one transaction.  A competing
+        broker/materializer owner therefore either appears before this claim
+        (and recovery HOLDs) or after it (and canonical downstream ownership
+        must reconcile without a second callback).
+        """
+        values = {
+            "local_order_id": local_order_id,
+            "signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "ticker": ticker,
+            "side": side,
+            "claim_owner": claim_owner,
+        }
+        if any(
+            not isinstance(value, str) or not value or value != value.strip()
+            for value in values.values()
+        ):
+            return False
+        if execution_mode not in {"live", "paper"} or side not in {"CALL", "PUT"}:
+            return False
+        for optional_authority in (watcher_token, watcher_owner, trigger_cursor):
+            if optional_authority is not None and (
+                not isinstance(optional_authority, str)
+                or not optional_authority
+                or optional_authority != optional_authority.strip()
+            ):
+                return False
+
+        def _strict_generation(raw) -> int | None:
+            if isinstance(raw, bool):
+                return None
+            if isinstance(raw, int):
+                parsed = raw
+            elif isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+                parsed = int(raw)
+            else:
+                return None
+            return parsed if parsed > 0 else None
+
+        candidate_generation = _strict_generation(materialization_generation)
+        candidate_trigger_generation = _strict_generation(trigger_generation)
+        if (
+            candidate_generation is None
+            or candidate_trigger_generation is None
+            or candidate_generation != candidate_trigger_generation
+        ):
+            return False
+
+        def _metadata_sources(row: dict) -> list[dict] | None:
+            """Parse every durable metadata alias independently.
+
+            The claim is the last durable fence, so it cannot silently choose
+            ``meta`` over ``metadata`` (or vice versa).  An explicit malformed
+            alias is unknown authority and therefore fails closed.
+            """
+            sources: list[dict] = []
+            for key in ("meta", "metadata"):
+                if key not in row:
+                    continue
+                raw = row.get(key)
+                if isinstance(raw, dict):
+                    sources.append(dict(raw))
+                    continue
+                if not isinstance(raw, str) or not raw.strip():
+                    return None
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    return None
+                if not isinstance(parsed, dict):
+                    return None
+                sources.append(dict(parsed))
+            return sources
+
+        _row_metadata_sources = _metadata_sources(row if isinstance(row, dict) else {})
+        if _row_metadata_sources is None:
+            return False
+
+        def _meta(row: dict) -> dict | None:
+            sources = _metadata_sources(row)
+            if sources is None:
+                return None
+            merged: dict = {}
+            for source in sources:
+                for key, value in source.items():
+                    if key in merged and merged[key] != value:
+                        return None
+                    merged[key] = value
+            return merged
+
+        def _authority(row: dict, key: str):
+            found = []
+            if key in row:
+                found.append(row.get(key))
+            for row_meta in _row_metadata_sources:
+                if key in row_meta:
+                    found.append(row_meta.get(key))
+            return found
+
+        def _coherent_string(
+            row: dict, aliases: tuple[str, ...],
+        ) -> tuple[str | None, bool]:
+            found = []
+            metadata_sources = _metadata_sources(row)
+            if metadata_sources is None:
+                return None, False
+            for container in (row, *metadata_sources):
+                for alias in aliases:
+                    if alias in container:
+                        raw = container.get(alias)
+                        if not isinstance(raw, str) or not raw or raw != raw.strip():
+                            return None, False
+                        found.append(raw)
+            if not found:
+                return None, True
+            if len(set(found)) != 1:
+                return None, False
+            return found[0], True
+
+        def _row_generations(row: dict, key: str) -> int | None:
+            authorities = _authority(row, key)
+            if not authorities:
+                return None
+            parsed = [_strict_generation(raw) for raw in authorities]
+            if any(value is None for value in parsed) or len(set(parsed)) != 1:
+                return None
+            return parsed[0]
+
+        def _handoff(row: dict) -> bool:
+            if row.get("broker_order_id") or row.get("submitted_ts"):
+                return True
+            meta = _meta(row)
+            if meta is None:
+                return True
+            if any(
+                meta.get(key)
+                for key in (
+                    "broker_ready",
+                    "submit_intent_at",
+                    "broker_submit_key",
+                    "broker_submit_key_hash",
+                    "recovery_submit_owner",
+                )
+            ):
+                return True
+            try:
+                from ap.pending_trigger_classifier import (
+                    has_broker_handoff_evidence,
+                    is_active_materialization_in_flight,
+                )
+                shaped = dict(row)
+                shaped["meta"] = meta
+                return bool(
+                    has_broker_handoff_evidence(shaped)
+                    or is_active_materialization_in_flight(shaped)
+                )
+            except Exception:
+                return True
+
+        try:
+            with conn() as connection:
+                cursor = connection.execute(
+                    "SELECT * FROM orders "
+                    "WHERE local_order_id=%s AND client_id=%s "
+                    "AND kind='ENTRY' "
+                    "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
+                    "FOR UPDATE",
+                    (local_order_id, client_id, execution_mode),
+                )
+                fetchone = getattr(cursor, "fetchone", None)
+                if not callable(fetchone):
+                    return False
+                row = fetchone()
+                if not isinstance(row, dict):
+                    return False
+                if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+                    return False
+                if _handoff(row):
+                    return False
+                exact_fields = (
+                    ("local_order_id", ("local_order_id",), local_order_id),
+                    ("signal_id", ("signal_id",), signal_id),
+                    ("canonical_signal_id", ("canonical_signal_id",), canonical_signal_id),
+                    ("client_id", ("client_id", "client_email"), client_id),
+                    ("execution_mode", ("execution_mode", "mode"), execution_mode),
+                    ("ticker", ("ticker", "symbol"), ticker),
+                    ("side", ("side", "direction"), side),
+                )
+                for _field, aliases, expected in exact_fields:
+                    actual, coherent = _coherent_string(row, aliases)
+                    if not coherent or actual != expected:
+                        return False
+                for aliases, expected in (
+                    (("watcher_token",), watcher_token),
+                    (("watcher_owner", "current_owner"), watcher_owner),
+                    (("trigger_cursor", "trigger_cursor_id"), trigger_cursor),
+                ):
+                    actual, coherent = _coherent_string(row, aliases)
+                    if not coherent:
+                        return False
+                    if (actual is None) != (expected is None):
+                        return False
+                    if actual is not None and actual != expected:
+                        return False
+                row_generation = _row_generations(row, "materialization_generation")
+                row_trigger_generation = _row_generations(row, "trigger_generation")
+                if (
+                    row_generation != candidate_generation
+                    or row_trigger_generation != candidate_trigger_generation
+                ):
+                    return False
+                metadata = _meta(row)
+                existing_owner = metadata.get("recovery_trigger_dispatch_owner")
+                if existing_owner is not None and (
+                    not isinstance(existing_owner, str)
+                    or not existing_owner.strip()
+                    or existing_owner != claim_owner
+                ):
+                    return False
+                existing_generation = metadata.get("recovery_trigger_dispatch_generation")
+                existing_trigger_generation = metadata.get(
+                    "recovery_trigger_dispatch_trigger_generation"
+                )
+                if existing_generation is not None and (
+                    _strict_generation(existing_generation) != candidate_generation
+                ):
+                    return False
+                if existing_trigger_generation is not None and (
+                    _strict_generation(existing_trigger_generation)
+                    != candidate_trigger_generation
+                ):
+                    return False
+                patch = json.dumps(
+                    {
+                        "recovery_trigger_dispatch_owner": claim_owner,
+                        "recovery_trigger_dispatch_generation": candidate_generation,
+                        "recovery_trigger_dispatch_trigger_generation": candidate_trigger_generation,
+                        "recovery_trigger_dispatch_claimed_at": now_utc_iso(),
+                    }
+                )
+                _update_sql = (
+                    "UPDATE orders SET meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb, "
+                    "updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s "
+                    "AND kind='ENTRY' AND status='PENDING_TRIGGER' "
+                    "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
+                    "AND COALESCE(meta->>'recovery_trigger_dispatch_owner','') IN ('', %s)"
+                )
+                _update_params: list[object] = [
+                    patch,
+                    local_order_id,
+                    client_id,
+                    execution_mode,
+                    claim_owner,
+                ]
+                # The Python proof above covers top-level durable columns as
+                # well as metadata aliases. Add JSONB predicates only for
+                # authorities actually owned by the database row; otherwise a
+                # valid top-level-only row would fail closed merely because
+                # this schema variant has no JSONB generation copy.
+                if any(
+                    "materialization_generation" in source
+                    for source in _row_metadata_sources
+                ):
+                    _update_sql += (
+                        " AND COALESCE(meta->>'materialization_generation','')=%s"
+                    )
+                    _update_params.append(str(candidate_generation))
+                if any(
+                    "trigger_generation" in source
+                    for source in _row_metadata_sources
+                ):
+                    _update_sql += " AND COALESCE(meta->>'trigger_generation','')=%s"
+                    _update_params.append(str(candidate_trigger_generation))
+                result = connection.execute(_update_sql, tuple(_update_params))
+                rowcount = getattr(result, "rowcount", getattr(connection, "rowcount", None))
+                return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] recovery trigger dispatch claim failed local_order_id=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
     def retire_unsubmitted_exit_intent(self, local_order_id: str, *, last_error: str) -> bool:
         """Atomically retire one EXIT_REQUESTED row only if no submit evidence exists."""
         error_text = str(last_error or "NO_POST_ATTEMPTED")

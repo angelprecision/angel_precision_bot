@@ -18,12 +18,15 @@ _terminalize_recovery_rearm_candidate call.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+
+os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 
 import ap_entry_watcher as ew
 
@@ -75,6 +78,10 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
     w._last_quote_fetch_proof = {}
     w.owner_token = "test-owner"
     w._test_only_allow_recovery_without_row_lock = True
+    # This fixture is an explicit unit seam without a real OSM/database. The
+    # production canonical handoff classifier remains fail-closed when its
+    # authority is unavailable.
+    w._recovery_has_broker_handoff_evidence = lambda *_a, **_kw: False
     w.core = None
 
     # Spy on the OSM cancel_pending_entry call — must be 0 for the fix.
@@ -89,7 +96,11 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
             "status":             "PENDING_TRIGGER",
             "signal_id":          "sig-reattach-1",
             "canonical_signal_id": "sig-reattach-1",
-            "meta":               {"watcher_audit": {}},
+            "meta":               {
+                "watcher_audit": {},
+                "materialization_generation": 1,
+                "trigger_generation": 1,
+            },
             "client_id":          "jason@example.com",
             "execution_mode":     "live",
             "ticker":             "SPY",

@@ -105,6 +105,7 @@ def _recovery_signal_dict(
         "client_id": client_id,
         "execution_mode": execution_mode,
         "materialization_generation": materialization_generation,
+        "trigger_generation": materialization_generation,
     }
     if extra_metadata:
         metadata.update(extra_metadata)
@@ -585,6 +586,7 @@ class TestSeptember8JasonLiveRecoveryRearm:
             "ticker": "TMO",
             "side": "CALL",
             "materialization_generation": 1,
+            "trigger_generation": 1,
             "contract_deferred": True,
         }
         row = {
@@ -613,6 +615,7 @@ class TestSeptember8JasonLiveRecoveryRearm:
             plan_id=f"plan:{sid}",
             metadata=dict(metadata),
             materialization_generation=1,
+            trigger_generation=1,
             client_id=TestSeptember8JasonLiveRecoveryRearm.client_id,
             execution_mode=TestSeptember8JasonLiveRecoveryRearm.execution_mode,
             contract_symbol="DEFERRED:TMO",

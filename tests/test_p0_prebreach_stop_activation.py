@@ -762,6 +762,7 @@ def _restart_row_with_confirmed_evidence() -> dict:
             "selected_qty": 1,
             "selected_limit": 1.20,
             "materialization_generation": 7,
+            "trigger_generation": 7,
             "trigger_crossed_at": crossed_at,
             "trigger_crossed_at_provenance": provenance,
         },

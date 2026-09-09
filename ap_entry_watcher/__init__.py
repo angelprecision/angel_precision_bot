@@ -1044,28 +1044,33 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_filtered.append((action, watched))
                 continue
 
-            # A durable broker/materializer owner that wins after the
-            # admission lock releases must suppress the recovered callback.
-            # Retain the exact lifecycle/registry pair in explicit quarantine:
-            # no callback, no second economic attempt, and no invented cancel.
-            watched._ownership_quarantine = True
-            watched._quarantine_reason = (
-                f"recovery_post_admission_hold:{final_reason}"
-            )
-            watched.state = WatchState.PENDING
-            self._record_call_result(
-                "recovery_post_admission_owner_hold",
-                final_reason,
-                local_order_id=signal.get("local_order_id"),
-                signal_id=signal.get("signal_id"),
-            )
-            self._direction_event_audit(
-                watched,
-                "recovery_post_admission_owner_hold",
-                final_reason,
-                no_broker_submit=True,
-                no_broker_cancel=True,
-            )
+            # A durable owner that wins after admission, a temporary authority
+            # read failure, and an identity conflict have different retry
+            # dispositions. Keep the exact lifecycle/registry pair retained;
+            # never route this through ordinary cleanup (which could invoke a
+            # cancel callback).
+            hold_fn = getattr(self, "_enter_recovery_post_admission_hold", None)
+            if callable(hold_fn):
+                hold_fn(watched, final_reason, _row)
+            else:  # pragma: no cover - compatibility with a legacy shim
+                watched._ownership_quarantine = True
+                watched._quarantine_reason = (
+                    f"recovery_post_admission_hold:{final_reason}"
+                )
+                watched.state = WatchState.PENDING
+                self._record_call_result(
+                    "recovery_post_admission_owner_hold",
+                    final_reason,
+                    local_order_id=signal.get("local_order_id"),
+                    signal_id=signal.get("signal_id"),
+                )
+                self._direction_event_audit(
+                    watched,
+                    "recovery_post_admission_owner_hold",
+                    final_reason,
+                    no_broker_submit=True,
+                    no_broker_cancel=True,
+                )
         completed = recovery_filtered
         trigger_groups: dict[tuple[str, str, str], list] = {}
         invalid_triggers = []

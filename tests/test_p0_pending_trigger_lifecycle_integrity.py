@@ -28,6 +28,7 @@ import os
 import threading
 import types
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -687,6 +688,7 @@ class TestPR580AmendmentCorrections:
             "execution_mode": "live",
             "watcher_token": "tok-test",
             "materialization_generation": 1,
+            "trigger_generation": 1,
             "contract_symbol": "DEFERRED:AAPL",
             "pattern": "2-1-2",
             "prior_day_high": 200.10,
@@ -700,6 +702,7 @@ class TestPR580AmendmentCorrections:
                 "client_id": "jason@example.com",
                 "execution_mode": "live",
                 "materialization_generation": 1,
+                "trigger_generation": 1,
             },
             "__recovery_rearm": True,
         }
@@ -840,6 +843,60 @@ class TestPR580AmendmentCorrections:
         assert ok is False
         assert "generation" in reason
 
+    def test_c2_numeric_identity_scalar_is_not_stringified(self):
+        """JSON numeric identity must not compare equal to a string plan."""
+        import ap_entry_watcher as ew
+
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        row["meta"]["canonical_signal_id"] = 123
+        ok, reason = ew.APEntryWatcher._recovery_identity_matches_durable_row(
+            sig, row, sig["local_order_id"]
+        )
+        assert ok is False
+        assert "canonical_signal_id" in reason
+
+    @pytest.mark.parametrize(
+        "trigger_generation,expected_fragment",
+        [
+            (0, "trigger_generation"),
+            (-1, "trigger_generation"),
+            (1.5, "trigger_generation"),
+            (True, "trigger_generation"),
+            ("", "trigger_generation"),
+            ("1.5", "trigger_generation"),
+            ("malformed", "trigger_generation"),
+        ],
+    )
+    def test_c2_trigger_generation_is_strict_and_bound(
+        self, trigger_generation, expected_fragment,
+    ):
+        import ap_entry_watcher as ew
+
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        sig["trigger_generation"] = trigger_generation
+        sig["metadata"]["trigger_generation"] = trigger_generation
+        ok, reason = ew.APEntryWatcher._recovery_identity_matches_durable_row(
+            sig, row, sig["local_order_id"]
+        )
+        assert ok is False
+        assert expected_fragment in reason
+
+    def test_c2_trigger_generation_must_equal_materialization_generation(self):
+        import ap_entry_watcher as ew
+
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        sig["trigger_generation"] = 2
+        sig["metadata"]["trigger_generation"] = 2
+        row["meta"]["trigger_generation"] = 2
+        ok, reason = ew.APEntryWatcher._recovery_identity_matches_durable_row(
+            sig, row, sig["local_order_id"]
+        )
+        assert ok is False
+        assert "trigger_generation" in reason
+
     @pytest.mark.parametrize("malformed_metadata", [None, "", "not-json", []])
     def test_c2_malformed_durable_metadata_is_hold(self, malformed_metadata):
         """An explicit malformed metadata alias cannot become absence."""
@@ -908,12 +965,16 @@ class TestPR580AmendmentCorrections:
         sig = self._recovery_sig()
         if signal_generation == "MISSING":
             sig.pop("materialization_generation", None)
+            sig.pop("trigger_generation", None)
         else:
             sig["materialization_generation"] = signal_generation
+            sig["trigger_generation"] = signal_generation
         if metadata_generation == "MISSING":
             sig["metadata"].pop("materialization_generation", None)
+            sig["metadata"].pop("trigger_generation", None)
         else:
             sig["metadata"]["materialization_generation"] = metadata_generation
+            sig["metadata"]["trigger_generation"] = metadata_generation
 
         sid = sig["signal_id"]
         ok = w.add_signal(sig)
@@ -1195,11 +1256,13 @@ class TestPR580AmendmentCorrections:
                 "client_id": sig["client_id"],
                 "execution_mode": sig["execution_mode"],
                 "materialization_generation": sig["materialization_generation"],
+                "trigger_generation": sig["trigger_generation"],
                 "watcher_token": sig["watcher_token"],
                 "contract_deferred": True,
             },
             local_order_id=local_order_id,
             materialization_generation=sig["materialization_generation"],
+            trigger_generation=sig["trigger_generation"],
         )
 
     def _materialization_resume_fixture(
@@ -1273,6 +1336,7 @@ class TestPR580AmendmentCorrections:
                 "client_id": sig["client_id"],
                 "execution_mode": sig["execution_mode"],
                 "materialization_generation": sig["materialization_generation"],
+                "trigger_generation": sig["trigger_generation"],
                 **(
                     {"watcher_token": sig["watcher_token"]}
                     if "watcher_token" in sig else {}
@@ -1873,6 +1937,10 @@ class TestPR580AmendmentCorrections:
         assert evidence["lifecycle"].LEDGER.current_state(
             candidate_sig["signal_id"]
         ) == evidence["lifecycle"].SignalState.WATCHING
+        assert evidence["osm"]._emit_transition_event.call_count == 1
+        assert evidence["osm"]._emit_transition_event.call_args.kwargs[
+            "decision"
+        ] == "TERMINAL"
         assert not evidence["osm"].submit_existing_entry.mock_calls
         self._assert_no_broker_mutation(evidence["broker"])
 
@@ -1900,6 +1968,7 @@ class TestPR580AmendmentCorrections:
         assert evidence["lifecycle"].LEDGER.current_state(
             candidate_sig["signal_id"]
         ) == evidence["lifecycle"].SignalState.ERROR
+        assert evidence["osm"]._emit_transition_event.call_count == 0
         assert not evidence["osm"].submit_existing_entry.mock_calls
         self._assert_no_broker_mutation(evidence["broker"])
 
@@ -1992,6 +2061,7 @@ class TestPR580AmendmentCorrections:
                 self.source = source
                 self.cancel_calls = []
                 self.fail_second = False
+                self._emit_transition_event = MagicMock()
 
             def get_order(self, oid):
                 return copy.deepcopy(self.source.get(oid, {}))
@@ -2314,6 +2384,91 @@ class TestPR580AmendmentCorrections:
         assert not osm.submit_existing_entry.mock_calls
         assert not osm.cancel_pending_entry.mock_calls
         self._assert_no_broker_mutation(broker)
+
+    def test_a8_transient_post_admission_authority_recheck_restores_owner(self):
+        """A temporary final-read failure is bounded, then re-enables the owner."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        osm = MagicMock()
+        osm.client_id = None
+        osm.get_order.side_effect = lambda _oid: copy.deepcopy(row)
+        watcher = ew.APEntryWatcher(
+            broker=MagicMock(), order_state_machine=osm,
+            require_on_trigger=False, mode="LIVE",
+        )
+        watcher._test_only_allow_recovery_without_row_lock = True
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+        assert watcher.add_signal(sig) is True
+        registered = watcher._pending[0]
+        registered.state = ew.WatchState.TRIGGERED
+        sequence = [
+            (False, "recovery_lifecycle_durable_row_unavailable", {}),
+            (True, "recovery_lifecycle_final_durable_authority_proven", row),
+        ]
+        watcher._recovery_final_durable_authority = MagicMock(
+            side_effect=sequence
+        )
+        assert watcher._before_trigger_dispatch([("trigger", registered)]) == []
+        assert registered._recovery_post_admission_disposition == (
+            ew.RECOVERY_POST_ADMISSION_AUTHORITY_RECHECK
+        )
+        assert registered.cleanup_retry_next_at is None
+        registered.recovery_authority_recheck_next_at = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=1)
+        watcher._retry_recovery_authority_rechecks()
+        assert registered._ownership_quarantine is False
+        assert registered._recovery_post_admission_disposition == ""
+        assert registered in watcher._pending
+        assert registered.signal_id in watcher._dedup_set
+        assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.WATCHING
+
+    def test_a8b_dispatch_claim_barrier_suppresses_lifecycle_and_callback(self):
+        """The final durable claim must precede TRIGGER_READY/callback work."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        _, watcher = self._bare_watcher()
+        watcher._validate_local_order_id = MagicMock(return_value=True)
+        sig = self._recovery_sig()
+        assert watcher.add_signal(sig) is True
+        registered = watcher._pending[0]
+        # The production clock may be post-session while this unit exercises
+        # the normal regular-session polling dispatch.
+        registered.overnight = False
+        registered.check = MagicMock(return_value=ew.WatchState.TRIGGERED)
+        registered.last_quote_bid = 199.0
+        registered.last_quote_ask = 201.0
+        watcher._fetch_quotes = MagicMock(
+            return_value={sig["ticker"]: {"bid": 199.0, "ask": 201.0}}
+        )
+        watcher._before_trigger_dispatch = MagicMock(
+            side_effect=lambda completed: completed
+        )
+        watcher._claim_recovery_trigger_dispatch = MagicMock(
+            return_value=(False, "recovery_lifecycle_durable_claim_cas_miss", {})
+        )
+        watcher.on_trigger = MagicMock()
+        watcher._persist_watcher_audit = MagicMock()
+
+        watcher._poll_active_signals(False)
+
+        watcher._claim_recovery_trigger_dispatch.assert_called_once_with(registered)
+        assert watcher.on_trigger.call_count == 0
+        assert all(
+            not (call.args[1] or {}).get("reason_code") == "trigger_ready"
+            for call in watcher._persist_watcher_audit.call_args_list
+        )
+        assert registered.state == ew.WatchState.PENDING
+        assert registered._ownership_quarantine is True
+        assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.WATCHING
+        assert registered in watcher._pending
+        assert registered.signal_id in watcher._dedup_set
 
     @pytest.mark.parametrize(
         "corruption,reason_fragment",
