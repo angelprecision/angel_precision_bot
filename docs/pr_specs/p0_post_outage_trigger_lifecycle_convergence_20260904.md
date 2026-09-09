@@ -5,7 +5,7 @@
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
 Base: `d404df34e00522ba2cce995b6a0129ba39b83944`
-Current implementation/code head: `2e4437aba86702279f1b60dd3401dd951e92e9d8`
+Current implementation/code head: `86b97873a2068b02c89f846b7fbd4180417f04d6`
 PR state: **Draft / open / HARD HOLD**. The final branch head including this
 documentation attestation is recorded in the PR body; this spec commit is
 documentation-only and does not alter production code.
