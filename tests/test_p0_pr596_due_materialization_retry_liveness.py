@@ -2,16 +2,22 @@
 tests/test_p0_pr596_due_materialization_retry_liveness.py
 
 P0 #596 — Due Materialization Retry Liveness
-PR #602 — Focused behavioral proof for the client_id/kind projection fix.
+PR #602 — Order-monitor durable retry projection correction.
 
-Confirmed blocker (fixed in PR #602):
+Confirmed order-monitor projection defect (fixed in PR #602):
   _get_active_entry_orders() did not project client_id or kind.
   The row dict passed to PendingTriggerRestartRecovery.recover_one_row()
   had row_client='', triggering:
 
-      RESTART_RECOVERY_MISSING_DURABLE_CLIENT_ID
+  RESTART_RECOVERY_MISSING_DURABLE_CLIENT_ID
       -> UNRESOLVED
-      -> due RETRY_PENDING is never consumed
+      -> monitor cannot classify the row as retry-owned
+
+This file keeps that projection proof separate from the actual due-retry
+executor. `APStartupRecovery._recover_deferred_breach_lifecycles()` owns the
+startup due query and calls `resume_deferred_materialization_retry()` directly;
+the startup replay below begins at that boundary and does not call
+`APOrderMonitor`.
 
 Fix:
   SELECT now includes client_id, kind from the database row.
@@ -58,17 +64,20 @@ Tests in this file:
     - test_row_with_client_id_succeeds
         Post-fix row shape → RETRY_OWNED.
 
-  TestMOProductionShapedReplay       — MO live due RETRY_PENDING
-  TestMMMProductionShapedReplay      — MMM paper due RETRY_PENDING + isolation
+  TestProductionBoundaryProjection   — monitor projection plus the independent
+                                       startup executor replay
+  TestStartupRecoveryNegativeControls — malformed identity/schedule/broker
+                                        evidence and stale-generation holds
+  TestMOProductionShapedReplay       — MO live due RETRY_PENDING classification
+  TestMMMProductionShapedReplay      — MMM paper due RETRY_PENDING classification
   TestWFCPositiveControl             — existing deferred retry unchanged
   TestNotDueControl                  — future next_retry_at, no broker action
   TestBrokerAmbiguity                — broker evidence → HOLD
   TestIdentityFailure                — blank/mismatched identity → UNRESOLVED, no mutation
   TestSelectorQuality                — fix adds SQL columns only, no policy changes
-  TestConcurrentRecoveryIdempotency  — two sequential recovery calls both RETRY_OWNED
-                                       (idempotent classification proof; concurrent
-                                       execution exclusivity is owned by the deferred
-                                       materializer's CAS, not by the recovery engine)
+  TestConcurrentRecoveryIdempotency  — sequential classification remains stable;
+                                       real concurrent executor exclusivity is
+                                       proven by the PostgreSQL startup replay
 
 Spec: docs/pr_specs/p0_pr596_due_materialization_retry_liveness_20260909.md
 """
@@ -413,7 +422,7 @@ class TestProductionBoundaryProjection:
     """
     Real PostgreSQL production-boundary proof for PR #602.
 
-    These tests exercise the exact caller path that broke in production:
+    These tests cover two deliberately separate production seams:
 
       APOrderMonitor._get_active_entry_orders()
         → real DB projection (the fixed SELECT)
@@ -421,8 +430,12 @@ class TestProductionBoundaryProjection:
         → PendingTriggerRestartRecovery.recover_one_row()
         → classification
 
-    We do NOT hand-build the recovered dict. The database row is the authority.
-    The production SELECT is what constructs it, which is the point.
+      APStartupRecovery._recover_deferred_breach_lifecycles()
+        → due retry executor → selector/materializer/OSM handoff
+
+    The second replay does NOT route through APOrderMonitor. We do not hand-
+    build the monitor's recovered dict; the database row is the authority for
+    that projection proof, while startup recovery owns due execution.
     """
 
     @pytest.fixture(autouse=True)
@@ -520,36 +533,42 @@ class TestProductionBoundaryProjection:
         )
         assert _mo_osm.cancel_calls == [], "No cancel on RETRY_OWNED"
 
-    def test_due_retry_monitor_restart_materializes_once(self, monkeypatch):
-        """The complete production caller graph consumes one due retry once.
+    @pytest.mark.parametrize(
+        ("client_id", "execution_mode", "ticker", "retry_reason"),
+        [
+            (_DB_TEST_MO_CLIENT, "live", "MO", "no_tradeable_contract"),
+            (_DB_TEST_MMM_CLIENT, "paper", "MMM", "dte_ladder_exhausted"),
+        ],
+    )
+    def test_due_retry_startup_recovery_materializes_once(
+        self, monkeypatch, client_id, execution_mode, ticker, retry_reason,
+    ):
+        """The real due-retry executor consumes LIVE MO and PAPER MMM once.
 
-        This deliberately starts with a real PostgreSQL PENDING_TRIGGER row,
-        lets APOrderMonitor fetch the row through its production SELECT and
-        classify it through the canonical recovery wrapper, then runs two
-        competing APStartupRecovery consumers against the same durable row.
-        The existing OSM generation/attempt CAS admits one materializer; the
-        real execution-core callback then invokes the selector and reaches the
-        existing broker-ready handoff exactly once. Broker transport,
-        cancellation, proof, and position mutation remain untouched.
+        This replay deliberately begins at APStartupRecovery's durable due
+        retry query.  It does not route through APOrderMonitor: that monitor
+        is a separate classification observer, while APStartupRecovery owns
+        the due-retry execution handoff.  Two competing startup consumers
+        load the same durable snapshot; the existing OSM generation/attempt
+        CAS admits one materializer. The real execution-core callback invokes
+        the selector and reaches the existing broker-ready handoff exactly
+        once. Broker transport, cancellation, proof, and position mutation
+        remain untouched.
         """
         import ap.db as db_mod
-        import ap.order_monitor as monitor_mod
         import ap.order_state_machine as osm_mod
         import ap_execution_core as core_mod
         import ap_entry_confirmation
         from ap.order_state_machine import APOrderStateMachine
         from ap_recovery import APStartupRecovery
-        from ap.order_monitor import PENDING_TRIGGER_MAX_AGE_SECONDS
 
-        client_id = _DB_TEST_MO_CLIENT
-        execution_mode = "paper"
         local_order_id = f"pr596-full-path-{uuid.uuid4()}"
         signal_id = f"sig-{uuid.uuid4()}"
         plan_id = f"plan-{uuid.uuid4()}"
         now = datetime.now(timezone.utc)
         due_at = now - timedelta(seconds=10)
 
-        meta = _retry_meta(due=True, attempts=1)
+        meta = _retry_meta(due=True, attempts=1, reason=retry_reason)
         meta.update({
             "lifecycle_state": "RETRY_WAIT",
             "materialization_status": "RETRY_PENDING",
@@ -586,10 +605,15 @@ class TestProductionBoundaryProjection:
             "selection_context": "deferred_breach",
             "materialization_next_retry_at": due_at.isoformat(),
             "next_retry_at": due_at.isoformat(),
+            # Keep this replay independent of the wall-clock session while
+            # still exercising the real LIVE cutoff gate. The production
+            # safety gate remains intact; this is a test-only durable fixture
+            # value for the replay's synthetic execution window.
+            "entry_cutoff_et": 2359,
             "materialization_selector_failure": {
                 "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                 "materialization_outcome": "RETRY_LATER_SELECTOR_BUDGET",
-                "materialization_detail": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                "materialization_detail": retry_reason,
             },
         })
         _insert_order(
@@ -597,13 +621,10 @@ class TestProductionBoundaryProjection:
             client_id=client_id,
             execution_mode=execution_mode,
             meta=meta,
-            contract="DEFERRED:MO",
-            symbol="MO",
+            contract=f"DEFERRED:{ticker}",
+            symbol=ticker,
             signal_id=signal_id,
             plan_id=plan_id,
-            created_ts=now - timedelta(
-                seconds=PENDING_TRIGGER_MAX_AGE_SECONDS + 1
-            ),
         )
 
         monkeypatch.setenv("DEFERRED_RETRY_OWNER_GRACE_SECONDS", "0")
@@ -632,11 +653,8 @@ class TestProductionBoundaryProjection:
         monkeypatch.setitem(sys.modules, "ap.execution", fake_execution)
 
         # All production DB calls below use the test-owned schema. The real
-        # SQL, real OSM CAS, and real monitor/recovery methods remain intact.
-        monkeypatch.setattr(monitor_mod, "conn", _pg_conn)
-        monkeypatch.setattr(
-            monitor_mod, "run_with_retry", lambda fn, *a, **kw: fn()
-        )
+        # APStartupRecovery query, OSM CAS, and execution-core methods remain
+        # intact.
         monkeypatch.setattr(db_mod, "conn", _pg_conn)
         monkeypatch.setattr(
             db_mod, "run_with_retry", lambda fn, *a, **kw: fn()
@@ -654,12 +672,16 @@ class TestProductionBoundaryProjection:
         selector_calls: list[dict] = []
         materialization_calls: list[dict] = []
         submit_calls: list[dict] = []
-        resume_results: list[dict] = []
+        resume_results: list[tuple[object, dict]] = []
 
         class _Broker:
             def __init__(self):
-                self.base_url = "https://sandbox.tradier.com/v1"
-                self.sandbox = True
+                self.base_url = (
+                    "https://api.tradier.com/v1"
+                    if execution_mode == "live"
+                    else "https://sandbox.tradier.com/v1"
+                )
+                self.sandbox = execution_mode != "live"
                 self.cfg = SimpleNamespace(
                     base_url=self.base_url, account_id="TEST"
                 )
@@ -668,24 +690,40 @@ class TestProductionBoundaryProjection:
                 self.cancel_order = MagicMock()
 
             def get_quote(self, _symbol):
+                if str(_symbol or "").upper() == ticker:
+                    return {
+                        "bid": 50.04,
+                        "ask": 50.06,
+                        "last": 50.05,
+                        "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                        "source": (
+                            "tradier_live"
+                            if execution_mode == "live"
+                            else "tradier_sandbox"
+                        ),
+                    }
                 return {
                     "bid": 1.04,
                     "ask": 1.05,
                     "last": 1.045,
                     "quote_timestamp": datetime.now(timezone.utc).isoformat(),
-                    "source": "tradier_sandbox",
+                    "source": (
+                        "tradier_live"
+                        if execution_mode == "live"
+                        else "tradier_sandbox"
+                    ),
                 }
 
         broker = _Broker()
 
         class _DataBroker:
+            # PAPER execution still uses approved live market-data truth for
+            # the retry revalidation gate; only order submission is sandboxed.
             base_url = "https://api.tradier.com/v1"
-            cfg = SimpleNamespace(
-                base_url="https://api.tradier.com/v1", account_id="TEST"
-            )
+            cfg = SimpleNamespace(base_url=base_url, account_id="TEST")
 
             def get_quote(self, _symbol):
-                if _symbol == "MO":
+                if str(_symbol or "").upper() == ticker:
                     return {
                         "bid": 50.04,
                         "ask": 50.06,
@@ -716,7 +754,7 @@ class TestProductionBoundaryProjection:
                     })
                     trace.append("selector")
                 return SimpleNamespace(
-                    contract_symbol="MO270115C00050000",
+                    contract_symbol=f"{ticker}270115C00050000",
                     bid=1.04,
                     ask=1.05,
                     mid=1.045,
@@ -796,7 +834,7 @@ class TestProductionBoundaryProjection:
             core.email = client_id
             core.execution_mode = execution_mode
             core.mode = execution_mode.upper()
-            core.paper = True
+            core.paper = execution_mode == "paper"
             core.order_state_machine = osm
             core.broker = broker
             core.contract_selector = selector
@@ -804,8 +842,25 @@ class TestProductionBoundaryProjection:
                 mode=execution_mode.upper(),
                 max_positions=5,
                 _kill_switch_fn=lambda: False,
-                revalidate_exposure=lambda **_kwargs: SimpleNamespace(ok=True),
+                revalidate_exposure=lambda *_args, **_kwargs: SimpleNamespace(ok=True),
             )
+            if execution_mode == "live":
+                # APExecutionCore's real deferred LIVE path requires the same
+                # affordability authority that production APMasterControl
+                # supplies.  Keep the authority seam explicit while avoiding
+                # account/network setup in this replay: the test is proving
+                # startup recovery -> real core -> selector/OSM handoff.
+                core.master_control.get_entry_capacity = lambda **_kwargs: {
+                    "ok": True,
+                    "reason_code": "CAPACITY_AVAILABLE",
+                    "account_equity": 1709.20,
+                    "per_trade_budget": 170.92,
+                    "total_capital_cap": 683.68,
+                    "current_total_exposure": 0.0,
+                    "remaining_total_capacity": 683.68,
+                    "selector_budget": 170.92,
+                    "max_affordable_premium": 1.7092,
+                }
             core.store = MagicMock()
             core.store.update_status.return_value = True
             core.store.update_signal_fields.return_value = True
@@ -862,7 +917,7 @@ class TestProductionBoundaryProjection:
             def _record_resume(*args, **kwargs):
                 outcome = _real_resume(*args, **kwargs)
                 with trace_lock:
-                    resume_results.append(dict(outcome or {}))
+                    resume_results.append((core, dict(outcome or {})))
                 return outcome
 
             core.resume_deferred_materialization_retry = _record_resume
@@ -871,56 +926,6 @@ class TestProductionBoundaryProjection:
             )
             cores.append(core)
             return core
-
-        # First prove the monitor's real SQL projection and canonical wrapper.
-        monitor = _make_monitor(
-            client_id=client_id,
-            execution_mode=execution_mode,
-            osm=osm,
-        )
-        monitor.entry_watcher = SimpleNamespace(has_order=lambda _oid: False)
-        canonical_results: list[tuple] = []
-        original_canonical = monitor._canonical_pending_trigger_rearm
-
-        def _record_canonical(*args, **kwargs):
-            result = original_canonical(*args, **kwargs)
-            canonical_results.append(result)
-            return result
-
-        monitor._canonical_pending_trigger_rearm = _record_canonical
-        fetched_rows: list[dict] = []
-        original_get_active = monitor._get_active_entry_orders
-
-        def _capture_active_rows():
-            rows = original_get_active()
-            fetched_rows.extend(rows)
-            return rows
-
-        monitor._get_active_entry_orders = _capture_active_rows
-        monitor._maybe_hydrate_deferred_order = (
-            lambda _order, *, hydration_seen: {
-                "attempted": False,
-                "success": False,
-                "reason": "disabled",
-            }
-        )
-        with patch.object(monitor_mod, "conn", _pg_conn), patch.object(
-            monitor_mod, "run_with_retry", lambda fn, *a, **kw: fn()
-        ):
-            # Use the real entry tick caller: it fetches the row, computes
-            # age, and dispatches the PENDING_TRIGGER watchdog/recovery path.
-            monitor._check_entry_orders()
-            assert len(fetched_rows) == 1
-            fetched = fetched_rows[0]
-            assert fetched["client_id"] == client_id
-            assert fetched["kind"] == "ENTRY"
-            assert fetched["execution_mode"] == execution_mode
-            assert fetched["status"] == "PENDING_TRIGGER"
-            assert fetched["broker_order_id"] is None
-
-        assert canonical_results == [
-            (True, True, "canonical_recovery_retry_owned")
-        ]
 
         # Force both restart consumers to load the same pre-claim snapshot and
         # then reach the same real durable CAS. The loader barrier matters:
@@ -954,7 +959,7 @@ class TestProductionBoundaryProjection:
                     broker=broker,
                     osm=osm,
                     pm=MagicMock(),
-                    master_control=SimpleNamespace(mode="PAPER"),
+                    master_control=SimpleNamespace(mode=execution_mode.upper()),
                     entry_watcher=None,
                     execution_core=_build_core(),
                 )
@@ -985,7 +990,7 @@ class TestProductionBoundaryProjection:
         assert thread_errors == []
         assert len(claim_calls) == 2, f"claim_calls={claim_calls!r}"
         assert sorted(call["result"] for call in claim_calls) == [False, True]
-        assert sorted(result["disposition"] for result in resume_results) == [
+        assert sorted(result["disposition"] for _, result in resume_results) == [
             "BROKER_READY",
             "CLAIM_LOST",
         ]
@@ -999,6 +1004,27 @@ class TestProductionBoundaryProjection:
         assert trace.index("selector") < trace.index("submit_existing_entry")
         assert sum(result["deferred_lifecycles_recovered"] for result in results) == 1
 
+        winner_core, winner_result = next(
+            (core, result)
+            for core, result in resume_results
+            if result["disposition"] == "BROKER_READY"
+        )
+        loser_core, loser_result = next(
+            (core, result)
+            for core, result in resume_results
+            if result["disposition"] == "CLAIM_LOST"
+        )
+        assert winner_result["disposition"] == "BROKER_READY"
+        assert loser_result["disposition"] == "CLAIM_LOST"
+        # The losing startup consumer performed no downstream mutation at
+        # the executor boundary: no selector/materializer/OSM signal/proof/
+        # position work was reached after its durable CAS lost.
+        assert loser_core.store.method_calls == []
+        assert loser_core.position_manager.method_calls == []
+        assert loser_core.entry_telemetry.method_calls == []
+        assert loser_core.intelligence_context.method_calls == []
+        assert loser_core.fill_monitor.method_calls == []
+
         final_row = osm.get_order(local_order_id)
         final_meta = final_row["meta"]
         assert final_row["local_order_id"] == local_order_id
@@ -1008,7 +1034,7 @@ class TestProductionBoundaryProjection:
         assert final_row["kind"] == "ENTRY"
         assert final_row["broker_order_id"] is None
         assert final_row["submitted_ts"] is None
-        assert final_row["contract"] == "MO270115C00050000"
+        assert final_row["contract"] == f"{ticker}270115C00050000"
         assert float(final_row["limit_price"]) > 0.01
         assert final_meta["lifecycle_state"] == "BROKER_READY"
         assert final_meta["materialization_status"] == "SELECTED"
@@ -1292,6 +1318,215 @@ class TestProductionBoundaryProjection:
         assert succeeded is True, f"Not-due RETRY_PENDING must still be RETRY_OWNED; got {reason!r}"
         assert reason == "canonical_recovery_retry_owned"
         assert _mo_osm.cancel_calls == [], "No cancel for not-due waiting retry"
+
+
+@pytest.mark.skipif(
+    not _PSYCOPG2_AVAILABLE,
+    reason="INTELLIGENCE_POSTGRES_TEST_URL not set — skipping real DB boundary proof",
+)
+class TestStartupRecoveryNegativeControls:
+    """Fail-closed controls at APStartupRecovery's actual due boundary."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_and_teardown(self):
+        _ensure_orders_table()
+        yield
+        _delete_test_orders(_DB_TEST_MO_CLIENT, _DB_TEST_MMM_CLIENT)
+        _drop_test_schema()
+
+    def _seed_retry_row(
+        self,
+        *,
+        local_order_id,
+        row_client_id,
+        row_execution_mode,
+        due=True,
+        generation=1,
+        broker_order_id=None,
+        submit_intent=False,
+    ):
+        now = datetime.now(timezone.utc)
+        signal_id = f"sig-{uuid.uuid4()}"
+        next_retry_at = (
+            now - timedelta(seconds=10)
+            if due
+            else now + timedelta(minutes=5)
+        )
+        meta = _retry_meta(due=due, attempts=1)
+        meta.update({
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_generation": generation,
+            "retry_attempt": 1,
+            "breach_attempt_count": 1,
+            "materialization_attempts": 1,
+            "retry_max_attempts": 3,
+            "materialization_in_flight": False,
+            "broker_ready": False,
+            "canonical_signal_id": signal_id,
+            "client_id": row_client_id,
+            "execution_mode": row_execution_mode,
+            "local_order_id": local_order_id,
+            "signal_id": signal_id,
+            "trigger_crossed_at": (now - timedelta(seconds=60)).isoformat(),
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": signal_id,
+                "client_id": row_client_id,
+                "execution_mode": row_execution_mode,
+                "local_order_id": local_order_id,
+            },
+            "observed_underlying_price": 50.05,
+            "contract_deferred": True,
+            "selection_context": "deferred_breach",
+            "materialization_next_retry_at": next_retry_at.isoformat(),
+            "next_retry_at": next_retry_at.isoformat(),
+        })
+        if submit_intent:
+            meta["submit_intent_at"] = (now - timedelta(seconds=5)).isoformat()
+        _insert_order(
+            local_order_id=local_order_id,
+            client_id=row_client_id,
+            execution_mode=row_execution_mode,
+            meta=meta,
+            contract="DEFERRED:MO",
+            symbol="MO",
+            broker_order_id=broker_order_id,
+        )
+        return meta, signal_id
+
+    def _run_recovery_control(
+        self,
+        *,
+        row_client_id,
+        row_execution_mode,
+        due=True,
+        generation=1,
+        broker_order_id=None,
+        submit_intent=False,
+        recovery_client_id=_DB_TEST_MO_CLIENT,
+        recovery_execution_mode="live",
+    ):
+        import ap.db as db_mod
+        import ap.order_state_machine as osm_mod
+        from ap.order_state_machine import APOrderStateMachine
+        from ap_recovery import APStartupRecovery
+
+        local_order_id = f"pr596-negative-{uuid.uuid4()}"
+        meta, signal_id = self._seed_retry_row(
+            local_order_id=local_order_id,
+            row_client_id=row_client_id,
+            row_execution_mode=row_execution_mode,
+            due=due,
+            generation=generation,
+            broker_order_id=broker_order_id,
+            submit_intent=submit_intent,
+        )
+        osm = APOrderStateMachine(recovery_client_id)
+        osm.execution_mode = recovery_execution_mode
+        broker = MagicMock()
+        execution_core = MagicMock()
+        execution_core.resume_deferred_materialization_retry.return_value = {
+            "disposition": "BROKER_READY",
+            "reason_code": "TEST_SHOULD_NOT_BE_REACHED",
+        }
+        recovery = APStartupRecovery(
+            client_id=recovery_client_id,
+            broker=broker,
+            osm=osm,
+            pm=MagicMock(),
+            master_control=SimpleNamespace(mode=recovery_execution_mode.upper()),
+            entry_watcher=None,
+            execution_core=execution_core,
+        )
+        result = {"deferred_lifecycles_recovered": 0, "errors": []}
+        with patch.object(db_mod, "conn", _pg_conn), patch.object(
+            db_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        ), patch.object(osm_mod, "conn", _pg_conn), patch.object(
+            osm_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        ):
+            recovery._recover_deferred_breach_lifecycles(result)
+        return execution_core, broker, result, osm, local_order_id, meta, signal_id
+
+    @pytest.mark.parametrize(
+        "control",
+        [
+            "malformed_generation",
+            "client_mismatch",
+            "mode_mismatch",
+            "future_due_schedule",
+            "broker_order_evidence",
+            "submit_intent_evidence",
+        ],
+    )
+    def test_due_executor_negative_controls_never_reach_resume(self, control):
+        kwargs = {
+            "row_client_id": _DB_TEST_MO_CLIENT,
+            "row_execution_mode": "live",
+        }
+        if control == "malformed_generation":
+            kwargs["generation"] = "1.5"
+        elif control == "client_mismatch":
+            kwargs["row_client_id"] = "other-client@angelprecision.co"
+        elif control == "mode_mismatch":
+            kwargs["row_execution_mode"] = "paper"
+        elif control == "future_due_schedule":
+            kwargs["due"] = False
+        elif control == "broker_order_evidence":
+            kwargs["broker_order_id"] = "BROKER-602"
+        elif control == "submit_intent_evidence":
+            kwargs["submit_intent"] = True
+
+        execution_core, broker, result, _osm, _oid, _meta, _signal_id = (
+            self._run_recovery_control(**kwargs)
+        )
+        assert execution_core.resume_deferred_materialization_retry.call_count == 0, (
+            f"{control} must not cross APStartupRecovery's due executor gate"
+        )
+        assert broker.mock_calls == [], (
+            f"{control} must not submit, cancel, or query broker"
+        )
+        assert result["deferred_lifecycles_recovered"] == 0
+
+    def test_stale_generation_loses_real_materialization_cas(self):
+        """A stale next-generation claim is rejected before downstream work."""
+        import ap.db as db_mod
+        import ap.order_state_machine as osm_mod
+        from ap.order_state_machine import APOrderStateMachine
+
+        oid = f"pr596-stale-generation-{uuid.uuid4()}"
+        meta, signal_id = self._seed_retry_row(
+            local_order_id=oid,
+            row_client_id=_DB_TEST_MO_CLIENT,
+            row_execution_mode="live",
+            generation=2,
+        )
+        osm = APOrderStateMachine(_DB_TEST_MO_CLIENT)
+        osm.execution_mode = "live"
+        broker = MagicMock()
+        with patch.object(db_mod, "conn", _pg_conn), patch.object(
+            db_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        ), patch.object(osm_mod, "conn", _pg_conn), patch.object(
+            osm_mod, "run_with_retry", lambda fn, *a, **kw: fn()
+        ):
+            claimed = osm.claim_deferred_materialization(
+                oid,
+                owner="stale-worker",
+                generation=2,
+                lease_until=(datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                trigger_crossed_at=meta["trigger_crossed_at"],
+                trigger_price=50.0,
+                observed_underlying_price=50.05,
+                signal_id=signal_id,
+                execution_mode="live",
+                retry_attempt=2,
+            )
+            durable = osm.get_order(oid)
+
+        assert claimed is False
+        assert int(durable["meta"]["materialization_generation"]) == 2
+        assert durable["broker_order_id"] is None
+        assert durable["submitted_ts"] is None
+        assert broker.mock_calls == []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
