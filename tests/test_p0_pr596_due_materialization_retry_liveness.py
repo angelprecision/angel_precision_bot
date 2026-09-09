@@ -125,6 +125,52 @@ class _NoopBroker:
     pass
 
 
+class _HydratingRetryWatcher:
+    """Small registry-shaped watcher for the real order-monitor replay."""
+
+    def __init__(self):
+        self._pending = []
+        self._dedup_set = set()
+
+    def has_order(self, local_order_id):
+        return any(
+            str(getattr(w, "signal", {}).get("local_order_id") or "")
+            == str(local_order_id)
+            for w in self._pending
+        )
+
+    def watch(
+        self,
+        plan,
+        local_order_id,
+        *,
+        recovery_rearm=False,
+        registration_provenance_out=None,
+        **_kwargs,
+    ):
+        signal_id = str(plan.get("signal_id") or "").strip()
+        watcher = SimpleNamespace(
+            state="PENDING",
+            _ownership_quarantine=False,
+            _registration_token=f"monitor-retry-{uuid.uuid4().hex}",
+            signal={
+                "local_order_id": local_order_id,
+                "signal_id": signal_id,
+                "client_id": plan.get("client_id"),
+                "execution_mode": plan.get("execution_mode"),
+            },
+        )
+        self._pending.append(watcher)
+        if signal_id:
+            self._dedup_set.add(signal_id)
+        if registration_provenance_out is not None:
+            registration_provenance_out.update({
+                "created_by_this_call": True,
+                "registration_token": watcher._registration_token,
+            })
+        return True
+
+
 class _EmptySessionBroker:
     """Complete empty broker snapshot for phase-one crash replay."""
 
@@ -182,6 +228,7 @@ def _isolated_postgres(monkeypatch):
     psycopg2, database_url = _require_postgres()
     import psycopg2.extras
     import ap.db as db_mod
+    import ap.order_monitor as order_monitor_mod
     import ap.order_state_machine as osm_mod
     from ap.order_state_machine import APOrderStateMachine
 
@@ -201,6 +248,7 @@ def _isolated_postgres(monkeypatch):
                 signal_id TEXT,
                 canonical_signal_id TEXT,
                 plan_id TEXT,
+                position_id TEXT,
                 broker_order_id TEXT,
                 submitted_ts TIMESTAMPTZ,
                 contract TEXT,
@@ -215,6 +263,7 @@ def _isolated_postgres(monkeypatch):
                 target_underlying NUMERIC,
                 pattern TEXT,
                 qty INTEGER,
+                fill_price NUMERIC,
                 limit_price NUMERIC,
                 reserved_cost NUMERIC,
                 meta JSONB,
@@ -244,6 +293,8 @@ def _isolated_postgres(monkeypatch):
     monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, *a, **k: fn())
     monkeypatch.setattr(db_mod, "conn", pg_conn)
     monkeypatch.setattr(db_mod, "run_with_retry", lambda fn, *a, **k: fn())
+    monkeypatch.setattr(order_monitor_mod, "conn", pg_conn)
+    monkeypatch.setattr(order_monitor_mod, "run_with_retry", lambda fn, *a, **k: fn())
     try:
         yield APOrderStateMachine(CLIENT_ID), pg_conn, schema
     finally:
@@ -414,6 +465,112 @@ def test_real_postgres_due_retry_replay_mo_mmm_wfc(symbol, monkeypatch):
         assert after_meta["materialization_generation"] == 2
         assert after_meta["retry_attempt"] == 1
         assert after_meta["broker_ready"] is False
+
+
+@pytest.mark.parametrize("symbol", ["MO", "MMM"])
+def test_real_postgres_order_monitor_hydrates_identity_and_rearms_future_retry(
+    symbol, monkeypatch
+):
+    """The live order-monitor caller preserves durable identity and watcher ownership."""
+    import ap.preopen_readiness as readiness
+    from ap.order_monitor import APOrderMonitor
+
+    with _isolated_postgres(monkeypatch) as (osm, pg_conn, _schema):
+        local_order_id = f"pr596-monitor-{symbol.lower()}-{uuid.uuid4().hex[:8]}"
+        meta = _real_retry_meta(now=datetime.now(timezone.utc), due=False)
+        _seed_real_retry(
+            pg_conn,
+            local_order_id=local_order_id,
+            symbol=symbol,
+            meta=meta,
+        )
+        with pg_conn() as connection:
+            connection.execute(
+                "UPDATE orders SET created_ts = NOW() - INTERVAL '4 hours' "
+                "WHERE local_order_id = %s",
+                (local_order_id,),
+            )
+
+        watcher = _HydratingRetryWatcher()
+        monitor = APOrderMonitor(
+            client_id=CLIENT_ID,
+            broker=_NoopBroker(),
+            order_state_machine=osm,
+            position_manager=SimpleNamespace(),
+            entry_watcher=watcher,
+            client_mode="LIVE",
+        )
+        hydrated_orders = monitor._get_active_entry_orders()
+        assert len(hydrated_orders) == 1
+        hydrated = hydrated_orders[0]
+        assert hydrated["client_id"] == CLIENT_ID
+        assert hydrated["execution_mode"] == "live"
+
+        monitor._check_pending_trigger_order(
+            order=hydrated,
+            local_id=local_order_id,
+            contract=hydrated["contract"],
+            age_secs=4 * 60 * 60,
+            broker_oid=hydrated["broker_order_id"],
+            submitted_ts=hydrated["submitted_ts"],
+        )
+
+        assert watcher.has_order(local_order_id)
+
+        after = _read_real(pg_conn, local_order_id)
+        state = {
+            "stale_processing_ids": [],
+            "watching_orphans": [],
+            "pending_trigger_rows": [after],
+            "watching_count": 1,
+        }
+        runner = SimpleNamespace(
+            mode="live",
+            initialized=SimpleNamespace(is_set=lambda: True),
+            worker_thread=SimpleNamespace(is_alive=lambda: True),
+            order_state_machine=osm,
+            master_control=SimpleNamespace(mode="LIVE"),
+            core=SimpleNamespace(entry_watcher=watcher),
+            _overnight_reeval_success_date="2026-09-09",
+            is_alive=lambda: True,
+        )
+        monkeypatch.setattr(readiness, "_upsert_preopen_row", lambda **_kwargs: None)
+        monkeypatch.setattr(
+            readiness,
+            "_query_client_state",
+            lambda _client_id: state,
+        )
+        monkeypatch.setattr(readiness, "_trading_date", lambda now=None: "2026-09-09")
+        monkeypatch.setattr(readiness, "_pod_mode", lambda: "live")
+        monkeypatch.setattr(readiness, "_after_929_et", lambda now=None: True)
+        monkeypatch.setattr(
+            readiness,
+            "_broker_credentials_present",
+            lambda _runner, _mode: (True, {"credential_status": "verified"}),
+        )
+        monkeypatch.setattr(
+            readiness,
+            "_selector_identity",
+            lambda _runner: {
+                "quote_source": "tradier",
+                "tradier_base_url": "https://api.tradier.com",
+            },
+        )
+        monkeypatch.setattr(
+            readiness,
+            "_morning_handoff_success_exists",
+            lambda *_args, **_kwargs: True,
+        )
+
+        readiness_result = readiness.run_preopen_autonomous_readiness(
+            CLIENT_ID,
+            "live",
+            dry_run=True,
+            runner=runner,
+        )
+        assert readiness_result["details"]["pending_trigger_without_watcher"] == []
+        assert "pending_trigger_without_watcher_ownership" not in readiness_result["errors"]
+        assert readiness_result["status"] != "BLOCKED"
 
 
 def test_real_postgres_due_retry_missing_attempt_authority_is_held(monkeypatch):

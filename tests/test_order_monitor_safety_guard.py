@@ -150,6 +150,8 @@ def test_get_active_entry_orders_hydration_includes_required_fields():
     assert select_blocks, "No SELECT block found in _get_active_entry_orders"
     select = select_blocks[0]
     for field in (
+        "client_id",
+        "kind",
         "qty",
         "direction",
         "execution_mode",

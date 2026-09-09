@@ -220,6 +220,33 @@ class PendingTriggerRestartRecovery:
         Returns the _RowOutcome constant."""
         return self._recover_one(row, plan_builder_fn=plan_builder_fn)
 
+    def ensure_future_materialization_retry_watcher(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        plan_builder_fn=None,
+    ) -> str:
+        """Attach the dormant watcher required for a future retry schedule.
+
+        The durable retry proof remains the authority.  This narrow follow-up
+        only repairs the in-memory owner used by LIVE readiness; due retries
+        stay with the canonical materializer consumer.
+        """
+        proof = self._verify_materialization_retry_ownership(local_oid, row)
+        if proof is None:
+            return _RowOutcome.UNRESOLVED
+        next_at = _parse_iso(proof.get("materialization_next_retry_at"))
+        if next_at is None or next_at <= datetime.now(timezone.utc):
+            return _RowOutcome.RETRY_OWNED
+        if self._check_watcher_owns(local_oid, row) is True:
+            return _RowOutcome.WATCHER_OWNED
+        return self._rearm_and_verify(
+            row,
+            local_oid,
+            plan_builder_fn=plan_builder_fn,
+        )
+
     # ── Per-row dispatch ──────────────────────────────────────────────────────
 
     def _recover_one(self, row: dict, *, plan_builder_fn=None) -> str:
