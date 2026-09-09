@@ -2074,8 +2074,10 @@ class APEntryWatcher:
                                                   ownership unresolved; caller
                                                   retains ownership and lets
                                                   the reconciler handle it.
-          ``("PENDING_TRIGGER", None)`` — exact pending status is currently
+          ``("PENDING_TRIGGER", None)`` — exact pending identity is currently
                                           eligible for the fenced authority CAS.
+          ``("PENDING_HOLD", None)`` — pending status exists, but the exact
+                                        identity or broker-free proof failed.
           ``("KEEP_WATCHER", None)`` — a non-pending row must remain held.
           ``("UNKNOWN", None)`` — reread unavailable; caller must hold.
 
@@ -2105,6 +2107,196 @@ class APEntryWatcher:
 
         status = str(row.get("status") or "").strip().upper()
         if status == "PENDING_TRIGGER":
+            # A status word is not pending authority.  Before the direction
+            # arbiter, trigger audit, fenced CAS, selector, or callback can
+            # run, prove that this exact row is still owned by this exact
+            # watcher and has not crossed into broker handoff.
+            _raw_meta = row.get("meta")
+            if _raw_meta is None:
+                _pending_meta: dict = {}
+            elif isinstance(_raw_meta, dict):
+                _pending_meta = dict(_raw_meta)
+            elif isinstance(_raw_meta, str):
+                try:
+                    _pending_meta = json.loads(_raw_meta)
+                except Exception:
+                    _pending_meta = None
+                if not isinstance(_pending_meta, dict):
+                    log.critical(
+                        "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                        "reason=durable_meta_unreadable",
+                        local_order_id,
+                    )
+                    return "PENDING_HOLD", None
+            else:
+                log.critical(
+                    "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                    "reason=durable_meta_unreadable",
+                    local_order_id,
+                )
+                return "PENDING_HOLD", None
+
+            def _present(value) -> bool:
+                return value is not None and not (
+                    isinstance(value, str) and not value.strip()
+                )
+
+            # The classifier is the shared broker-handoff authority.  Include
+            # row-level mirrors here as well because a projection can expose
+            # broker_order_id/submitted_ts (or the handoff fields) outside
+            # orders.meta.
+            _row_handoff = any(
+                _present(row.get(_field))
+                for _field in (
+                    "broker_order_id",
+                    "submitted_ts",
+                    "submit_intent_at",
+                    "broker_submit_key",
+                    "broker_submit_payload_hash",
+                )
+            )
+            _row_broker_ready = row.get("broker_ready")
+            if _present(_row_broker_ready) and not (
+                _row_broker_ready is False
+                or (
+                    isinstance(_row_broker_ready, str)
+                    and _row_broker_ready.strip().lower() == "false"
+                )
+            ):
+                _row_handoff = True
+            try:
+                from ap.pending_trigger_classifier import has_broker_handoff_evidence
+
+                _row_handoff = _row_handoff or has_broker_handoff_evidence(row)
+            except Exception:
+                # If the shared authority cannot be loaded, absence of broker
+                # evidence is unproven.  Hold rather than making a callback.
+                _row_handoff = True
+            if _row_handoff:
+                log.critical(
+                    "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                    "disposition=RECONCILE_BROKER_INTENT "
+                    "reason=broker_handoff_ambiguity",
+                    local_order_id,
+                )
+                return "RECONCILE_BROKER_INTENT", None
+
+            _signal = getattr(watched, "signal", {}) or {}
+            _signal_meta = _signal.get("metadata") or {}
+            if not isinstance(_signal_meta, dict):
+                log.critical(
+                    "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                    "reason=watcher_metadata_unreadable",
+                    local_order_id,
+                )
+                return "PENDING_HOLD", None
+
+            # Resolve the watcher-side identity from the same normalized
+            # fields used by arm/recovery.  Every authority component is
+            # required for a deferred PENDING_TRIGGER row; no legacy
+            # missing-field fallback is safe at this callback boundary.  If
+            # two durable/runtime aliases disagree, treat that as a conflict
+            # instead of silently selecting whichever field appears first.
+            def _text(value, *, lower: bool = False) -> str:
+                if value is None or isinstance(value, bool):
+                    return ""
+                value = str(value).strip()
+                return value.lower() if lower else value
+
+            def _consistent(values: list[str]) -> tuple[str, bool]:
+                _values = [value for value in values if value]
+                return (_values[0] if _values else "", len(set(_values)) <= 1)
+
+            _expected_local, _watcher_local_consistent = _consistent([
+                _text(_signal.get("local_order_id")),
+                _text(_signal_meta.get("local_order_id")),
+            ])
+            _expected_client, _watcher_client_consistent = _consistent([
+                _text(_signal.get("client_id"), lower=True),
+                _text(_signal.get("client_email"), lower=True),
+                _text(_signal_meta.get("client_id"), lower=True),
+                _text(_signal_meta.get("client_email"), lower=True),
+                _text(getattr(self, "client_id", ""), lower=True),
+            ])
+            _expected_mode, _watcher_mode_consistent = _consistent([
+                _text(_signal.get("execution_mode"), lower=True),
+                _text(_signal_meta.get("execution_mode"), lower=True),
+                _text(getattr(self, "execution_mode", ""), lower=True),
+            ])
+            _expected_signal_id, _watcher_signal_consistent = _consistent([
+                _text(getattr(watched, "signal_id", "")),
+                _text(_signal.get("signal_id")),
+                _text(_signal_meta.get("signal_id")),
+            ])
+            _explicit_canon, _watcher_canon_consistent = _consistent([
+                _text(_signal.get("canonical_signal_id")),
+                _text(_signal_meta.get("canonical_signal_id")),
+            ])
+            _expected_canonical = _explicit_canon or (
+                build_canonical_signal_id(_expected_signal_id)
+                if _expected_signal_id
+                else ""
+            )
+
+            _row_local, _row_local_consistent = _consistent([
+                _text(row.get("local_order_id")),
+                _text(row.get("id")),
+            ])
+            _row_client, _row_client_consistent = _consistent([
+                _text(row.get("client_id"), lower=True),
+                _text(row.get("client_email"), lower=True),
+                _text(_pending_meta.get("client_id"), lower=True),
+                _text(_pending_meta.get("client_email"), lower=True),
+            ])
+            _row_mode, _row_mode_consistent = _consistent([
+                _text(row.get("execution_mode"), lower=True),
+                _text(_pending_meta.get("execution_mode"), lower=True),
+            ])
+            _row_signal_id, _row_signal_consistent = _consistent([
+                _text(row.get("signal_id")),
+                _text(_pending_meta.get("signal_id")),
+            ])
+            _row_canonical, _row_canon_consistent = _consistent([
+                _text(row.get("canonical_signal_id")),
+                _text(_pending_meta.get("canonical_signal_id")),
+            ])
+
+            _identity_ok = bool(
+                _watcher_local_consistent
+                and _row_local_consistent
+                and _expected_local
+                and _row_local
+                and _expected_local == _row_local
+                and _watcher_client_consistent
+                and _row_client_consistent
+                and _expected_client
+                and _row_client
+                and _expected_client == _row_client
+                and _watcher_mode_consistent
+                and _row_mode_consistent
+                and _expected_mode in {"live", "paper"}
+                and _row_mode == _expected_mode
+                and _watcher_signal_consistent
+                and _row_signal_consistent
+                and _expected_signal_id
+                and _row_signal_id
+                and _expected_signal_id == _row_signal_id
+                and _watcher_canon_consistent
+                and _row_canon_consistent
+            )
+            # Durable canonical identity is optional for legacy rows, but if
+            # present it is authoritative and must agree with the watcher.
+            if _row_canonical and (
+                not _expected_canonical or _row_canonical != _expected_canonical
+            ):
+                _identity_ok = False
+            if not _identity_ok:
+                log.critical(
+                    "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                    "reason=identity_conflict",
+                    local_order_id,
+                )
+                return "PENDING_HOLD", None
             return "PENDING_TRIGGER", None
         if status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
             return "KEEP_WATCHER", None
@@ -5768,6 +5960,21 @@ class APEntryWatcher:
                 protected.append((action, watched))
                 continue
 
+            # A failed/ambiguous deferred pending proof is already a durable
+            # HOLD.  Open protection must not turn that HOLD into an expiry or
+            # an in-memory ownership claim while the row remains unresolved.
+            _durable_disposition = getattr(
+                watched, "_pre_dispatch_durable_disposition", None
+            )
+            if _durable_disposition not in {
+                None,
+                "NON_DEFERRED",
+                "PENDING_TRIGGER",
+                "TERMINAL_DURABLE",
+            }:
+                protected.append((action, watched))
+                continue
+
             key = self._open_protection_key(watched)
             ticker = str(getattr(watched, "ticker", "") or "").strip().upper()
             owner = self._open_protection_owner(watched)
@@ -5899,6 +6106,12 @@ class APEntryWatcher:
             # this: no other code path in _poll_active_signals can trigger an
             # overnight watcher whose revalidation is still pending.
             active = [w for w in self._pending if w.is_active and not w.overnight]
+            # A direction winner may fence its confirmation before the base
+            # dispatch loop. This marker is per poll, so a later retry must
+            # perform a fresh identity/status CAS rather than trusting a
+            # process-local write from an earlier attempt.
+            for _active_watched in active:
+                _active_watched._dispatch_authority_status = None
 
         if not active:
             return
@@ -6017,7 +6230,47 @@ class APEntryWatcher:
                     )
                     continue
 
-                # Signal breached — record TRIGGER_READY before firing callback.
+                # The exact PENDING_TRIGGER read is the only authority that
+                # may advance a deferred callback.  Fence the confirmation
+                # metadata CAS *before* emitting trigger_ready, so the audit
+                # can never get ahead of the durable authority claim.  A
+                # direction winner may already have performed this same CAS;
+                # retain that proof and do not write it twice.
+                _dispatch_authority_status = getattr(
+                    w, "_dispatch_authority_status", None
+                )
+                _deferred_authority_pre_persisted = (
+                    _dispatch_authority_status == "persisted"
+                )
+                if _is_deferred_trigger and _pre_terminal == "PENDING_TRIGGER":
+                    if _dispatch_authority_status is None:
+                        _deferred_authority_pre_persisted = bool(
+                            self._persist_trigger_confirmation_authority(
+                                w,
+                                require_pending_row=True,
+                            )
+                        )
+                        w._dispatch_authority_status = (
+                            "persisted" if _deferred_authority_pre_persisted else "failed"
+                        )
+                    if not _deferred_authority_pre_persisted:
+                        with self._lock:
+                            w.state = WatchState.PENDING
+                            w.deferred_retry_not_before = (
+                                datetime.now(timezone.utc) + timedelta(seconds=5)
+                            )
+                        log.critical(
+                            "WATCHER_TRIGGER_PRE_DISPATCH_HOLD "
+                            "ticker=%s signal_id=%s disposition=PENDING_HOLD "
+                            "reason=trigger_authority_cas_failed "
+                            "trigger_authority_write=false on_trigger_called=false",
+                            w.ticker, _sig_id or "?",
+                        )
+                        continue
+
+                # For deferred signals the authority CAS above is deliberately
+                # first.  Only then may the trigger_ready audit precede the
+                # callback.  Non-deferred behavior remains unchanged.
                 if not _pre_dispatch_convergence:
                     _trigger_audit = self._build_watcher_audit_payload(
                         w,
@@ -6086,14 +6339,9 @@ class APEntryWatcher:
                         # Durable terminal truth was proved before every write.
                         _ts_pre_write_ok = True
                     elif _is_deferred_trigger:
-                        _ts_pre_write_ok = bool(
-                            _ts_expected_mode
-                            and _ts_expected_signal_id
-                            and self._persist_trigger_confirmation_authority(
-                                w,
-                                require_pending_row=True,
-                            )
-                        )
+                        # The fenced CAS was completed before trigger_ready;
+                        # do not issue a second authority write here.
+                        _ts_pre_write_ok = _deferred_authority_pre_persisted
                     else:
                         _ts_pre_write_ok = self._persist_trigger_confirmation_authority(w)
                     if not _ts_pre_write_ok:

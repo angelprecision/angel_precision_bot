@@ -698,6 +698,27 @@ def _terminal_row_for(local_oid: str, *, client="jason@example.com",
     }
 
 
+def _pending_row_for(local_oid: str, *, client="jason@example.com",
+                     execution_mode="live", signal_id="sig-tmo",
+                     canonical_signal_id=None):
+    """Fully populated clean PENDING_TRIGGER authority for deferred polls."""
+    return {
+        "local_order_id": local_oid,
+        "client_id": client,
+        "execution_mode": execution_mode,
+        "status": "PENDING_TRIGGER",
+        "last_error": None,
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "signal_id": signal_id,
+        "ticker": "TMO",
+        "side": "CALL",
+        "meta": ({
+            "canonical_signal_id": canonical_signal_id,
+        } if canonical_signal_id is not None else {}),
+    }
+
+
 def _real_signal(local_oid, ticker, signal_id, *, side="CALL",
                  client="jason@example.com", execution_mode="live"):
     return {
@@ -808,6 +829,146 @@ class TestPollDispatchPreTerminalConvergence:
         joined = "\n".join(r.getMessage() for r in caplog.records)
         assert "WATCHER_TERMINAL_PRE_DISPATCH_SKIP" in joined
         assert "on_trigger_called=false" in joined
+
+
+class TestPollDispatchPendingAuthority:
+    """The deferred PENDING_TRIGGER boundary is fail-closed before every
+    audit, direction claim, confirmation CAS, selector, or callback."""
+
+    @pytest.mark.parametrize("marker", [
+        "wrong_local_order_id",
+        "wrong_client",
+        "wrong_execution_mode",
+        "wrong_signal_id",
+        "wrong_canonical_signal_id",
+        "submit_intent_at",
+        "broker_submit_key",
+        "broker_ready",
+        "nested_broker_ready",
+    ])
+    def test_pending_negative_proof_holds_before_all_downstream_work(self, marker):
+        local_oid = str(uuid.uuid4())
+        signal_id = f"sig-pending-{marker}"
+        row = _pending_row_for(
+            local_oid,
+            signal_id=signal_id,
+            canonical_signal_id=signal_id,
+        )
+        if marker == "wrong_local_order_id":
+            row["local_order_id"] = str(uuid.uuid4())
+        elif marker == "wrong_client":
+            row["client_id"] = "someone-else@example.com"
+        elif marker == "wrong_execution_mode":
+            row["execution_mode"] = "paper"
+        elif marker == "wrong_signal_id":
+            row["signal_id"] = "durable-signal-does-not-match"
+        elif marker == "wrong_canonical_signal_id":
+            row["meta"]["canonical_signal_id"] = "durable-canonical-does-not-match"
+        elif marker == "submit_intent_at":
+            row["meta"]["submit_intent_at"] = "2026-09-09T14:00:00+00:00"
+        elif marker == "broker_submit_key":
+            row["meta"]["broker_submit_key"] = "broker-key-already-claimed"
+        elif marker == "broker_ready":
+            row["meta"]["broker_ready"] = True
+        elif marker == "nested_broker_ready":
+            row["meta"]["materialization"] = {"broker_ready": "true"}
+
+        osm = _RealOSM(row)
+        w, broker = _build_live_watcher(osm)
+        callback = MagicMock(return_value={"disposition": "KEEP_WATCHER"})
+        w.on_trigger = callback
+        sig = _real_signal(local_oid, "TMO", signal_id)
+        ws = _install_watched_in_pending(w, sig)
+
+        with patch.object(
+            w,
+            "_fetch_quotes",
+            return_value=_quote_that_confirms_call_breach("TMO"),
+        ):
+            w._poll_active_signals(open_protect_active=False)
+
+        # Every negative shape is a PENDING_HOLD: no direction mutation, no
+        # watcher audit, no trigger-confirmation CAS, and no callback/selector.
+        callback.assert_not_called()
+        w._persist_watcher_audit.assert_not_called()
+        assert osm.meta_updates == []
+        assert getattr(w, "_direction_claims", {}) == {}
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+        with w._lock:
+            assert ws in w._pending
+            import ap_entry_watcher as ew
+            assert ws.state == ew.WatchState.PENDING
+            assert sig["signal_id"] in w._dedup_set
+
+    def test_exact_clean_pending_proof_cas_precedes_audit_and_callback(self):
+        local_oid = str(uuid.uuid4())
+        signal_id = "sig-pending-clean"
+        row = _pending_row_for(
+            local_oid,
+            signal_id=signal_id,
+            canonical_signal_id=signal_id,
+        )
+        osm = _RealOSM(row)
+        w, broker = _build_live_watcher(osm)
+        events = []
+
+        # Observe the actual production calls, not a replica of the dispatch
+        # loop.  The fenced CAS must be durable before trigger_ready audit and
+        # on_trigger are entered.
+        _real_update = osm.update_order_meta
+
+        def _record_cas(*args, **kwargs):
+            events.append("cas")
+            return _real_update(*args, **kwargs)
+
+        osm.update_order_meta = MagicMock(side_effect=_record_cas)
+        def _record_audit(*args, **kwargs):
+            payload = args[1] if len(args) > 1 else kwargs.get("payload") or {}
+            events.append(("audit", payload.get("reason_code")))
+            return True
+
+        w._persist_watcher_audit = MagicMock(side_effect=_record_audit)
+        w.on_trigger = MagicMock(
+            side_effect=lambda *_args, **_kwargs: (
+                events.append("callback")
+                or {"disposition": "KEEP_WATCHER", "retry_after_seconds": 1}
+            )
+        )
+
+        sig = _real_signal(local_oid, "TMO", signal_id)
+        ws = _install_watched_in_pending(w, sig)
+        with patch.object(
+            w,
+            "_fetch_quotes",
+            return_value=_quote_that_confirms_call_breach("TMO"),
+        ):
+            w._poll_active_signals(open_protect_active=False)
+
+        assert events[0] == "cas"
+        assert events[-1] == "callback"
+        trigger_ready_index = events.index(("audit", "trigger_ready"))
+        assert trigger_ready_index > events.index("cas")
+        assert trigger_ready_index < events.index("callback")
+        assert len(osm.meta_updates) == 1
+        assert osm.meta_updates[0][1] == {
+            "expected_status": "PENDING_TRIGGER",
+            "expected_execution_mode": "live",
+            "expected_signal_id": signal_id,
+        }
+        assert w._persist_watcher_audit.call_count == 2
+        assert any(
+            call.args[1].get("reason_code") == "trigger_ready"
+            for call in w._persist_watcher_audit.call_args_list
+        )
+        w.on_trigger.assert_called_once()
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+        with w._lock:
+            # KEEP_WATCHER is the positive control's callback outcome, so the
+            # owner and dedup key remain available for a later retry.
+            assert ws in w._pending
+            assert sig["signal_id"] in w._dedup_set
 
     def test_row_pending_at_dispatch_but_terminal_after_callback_wins_terminal(self):
         """Row changes PENDING_TRIGGER → terminal AFTER on_trigger begins.
