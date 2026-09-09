@@ -111,6 +111,83 @@ SECTOR_MAP: dict[str, str] = {
     # with TECH or FINANCIAL)
     "SPY":   "INDEX",     "QQQ":   "INDEX",     "DIA":   "INDEX",
     "IWM":   "INDEX",
+
+    # ---------------------------------------------------------------
+    # #589 canonical executable-underlying sector coverage.
+    # Every underlying that can reach entry execution (scanner TICKERS,
+    # 0DTE index options, priority/premium and contract-selector premium
+    # authorities) resolves to a canonical risk sector so Master Control
+    # never falls back to a synthetic shared bucket. Data-only; get_sector
+    # logic is unchanged. Caret benchmark aliases (e.g. ^GSPC) are omitted:
+    # they are normalized to ETF proxies before execution (_INDEX_TO_ETF).
+    # ---------------------------------------------------------------
+    # Healthcare
+    "ABT": "HEALTHCARE", "AMGN": "HEALTHCARE", "BMY": "HEALTHCARE",
+    "CVS": "HEALTHCARE", "DHR": "HEALTHCARE", "GILD": "HEALTHCARE",
+    "ISRG": "HEALTHCARE", "MDT": "HEALTHCARE", "VRTX": "HEALTHCARE",
+    "REGN": "HEALTHCARE", "GEHC": "HEALTHCARE", "DXCM": "HEALTHCARE",
+    "IDXX": "HEALTHCARE", "BIIB": "HEALTHCARE", "ILMN": "HEALTHCARE",
+    "MRNA": "HEALTHCARE",
+
+    # Financials / fintech
+    "AIG": "FINANCIAL", "BK": "FINANCIAL", "BLK": "FINANCIAL",
+    "COF": "FINANCIAL", "MET": "FINANCIAL", "USB": "FINANCIAL",
+    "PYPL": "FINANCIAL", "HOOD": "FINANCIAL", "BRK.B": "FINANCIAL",
+
+    # Tech / semis / software
+    "ACN": "TECH", "CSCO": "TECH", "IBM": "TECH",
+    "INTU": "TECH", "TXN": "TECH", "ASML": "TECH",
+    "AMAT": "TECH", "ADI": "TECH", "LRCX": "TECH",
+    "SNPS": "TECH", "CDNS": "TECH", "KLAC": "TECH",
+    "CRWD": "TECH", "FTNT": "TECH", "ADSK": "TECH",
+    "NXPI": "TECH", "WDAY": "TECH", "MCHP": "TECH",
+    "ANSS": "TECH", "ZS": "TECH", "DDOG": "TECH",
+    "MDB": "TECH", "CDW": "TECH", "DELL": "TECH",
+    "TEAM": "TECH", "ON": "TECH", "GFS": "TECH",
+    "CTSH": "TECH", "ZM": "TECH",
+    "ROP": "TECH",   # GICS Information Technology (Application Software)
+
+    # Communication services (new bucket)
+    "T": "COMMUNICATION", "VZ": "COMMUNICATION", "TMUS": "COMMUNICATION",
+    "CMCSA": "COMMUNICATION", "CHTR": "COMMUNICATION", "WBD": "COMMUNICATION",
+    "SIRI": "COMMUNICATION", "EA": "COMMUNICATION", "TTWO": "COMMUNICATION",
+
+    # Consumer (staples + discretionary)
+    "CL": "CONSUMER", "KO": "CONSUMER", "MDLZ": "CONSUMER",
+    "MO": "CONSUMER", "PG": "CONSUMER", "PM": "CONSUMER",
+    "PEP": "CONSUMER", "MNST": "CONSUMER", "KDP": "CONSUMER",
+    "KHC": "CONSUMER", "CCEP": "CONSUMER", "ORLY": "CONSUMER",
+    "ROST": "CONSUMER", "DLTR": "CONSUMER", "WBA": "CONSUMER",
+    "MAR": "CONSUMER", "BKNG": "CONSUMER", "DASH": "CONSUMER",
+    "MELI": "CONSUMER", "PDD": "CONSUMER",
+
+    # Industrials / logistics / business services
+    "HON": "INDUSTRIAL", "MMM": "INDUSTRIAL", "EMR": "INDUSTRIAL",
+    "GD": "INDUSTRIAL", "UNP": "INDUSTRIAL", "UPS": "INDUSTRIAL",
+    "FDX": "INDUSTRIAL", "CSX": "INDUSTRIAL", "CTAS": "INDUSTRIAL",
+    "FAST": "INDUSTRIAL", "ODFL": "INDUSTRIAL", "CPRT": "INDUSTRIAL",
+    "PCAR": "INDUSTRIAL", "VRSK": "INDUSTRIAL", "PAYX": "INDUSTRIAL",
+    "ADP": "INDUSTRIAL",
+
+    # Utilities
+    "NEE": "UTILITIES", "DUK": "UTILITIES", "SO": "UTILITIES",
+    "AEP": "UTILITIES", "EXC": "UTILITIES", "XEL": "UTILITIES",
+
+    # Energy
+    "BKR": "ENERGY", "FANG": "ENERGY",
+
+    # Real estate (new bucket)
+    "AMT": "REAL_ESTATE", "SPG": "REAL_ESTATE",
+    "CSGP": "REAL_ESTATE",   # GICS Real Estate (Real Estate Services)
+
+    # Materials (new bucket)
+    "LIN": "MATERIALS", "DOW": "MATERIALS",
+
+    # Index / 0DTE index-option underlyings
+    "SPX": "INDEX", "NDX": "INDEX",
+
+    # Crypto-sensitive option underlyings (new bucket)
+    "COIN": "CRYPTO", "MSTR": "CRYPTO",
 }
 
 
