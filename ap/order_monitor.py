@@ -4311,7 +4311,7 @@ class APOrderMonitor:
                            -- with real identity to PendingTriggerRestartRecovery.
                            -- Without these columns, row.get('client_id') is None,
                            -- which triggers RESTART_RECOVERY_MISSING_DURABLE_CLIENT_ID
-                           -- -> UNRESOLVED -> due RETRY_PENDING is never consumed.
+                           -- -> UNRESOLVED in order-monitor canonical recovery.
                            -- Use the database row as authority; never synthesize
                            -- identity from runner context.
                            client_id, kind
