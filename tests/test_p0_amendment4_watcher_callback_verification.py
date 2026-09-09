@@ -161,11 +161,20 @@ def test_terminal_claim_row_terminal_but_no_reason_retains_watcher():
 
 
 def test_terminal_claim_row_terminal_with_reason_removes_watcher():
-    """Row proves terminal (status + reason) — release as TERMINAL_DURABLE."""
+    """Row proves terminal (status + reason) — release as TERMINAL_DURABLE.
+
+    PR #597 corrections #1/#2: the row must also carry client_id and
+    execution_mode for the identity guard; a production row that reached
+    a terminal state through the canonical write path always carries them.
+    """
     watcher = _watcher_with_row({
         "status": "EXPIRED",
+        "local_order_id": "oid-1",
+        "client_id": "test@example.com",
+        "execution_mode": "live",
         "meta": {"reason_code": "DEFERRED_TIMEOUT"},
     })
+    watcher.client_id = "test@example.com"
     disposition, _ = watcher._resolve_trigger_callback_disposition(
         _deferred_watched(), {"disposition": "TERMINAL_DURABLE"}
     )
@@ -375,11 +384,19 @@ def test_callback_malformed_dict_with_pending_row_returns_unknown():
 
 def test_callback_none_but_row_proves_terminal_returns_terminal_durable():
     """Even without a claim, a truly terminal row surfaces as
-    TERMINAL_DURABLE from the fallback branch."""
+    TERMINAL_DURABLE from the fallback branch.
+
+    PR #597 corrections #1/#2: production terminal rows always carry
+    client_id and execution_mode from the canonical write path.
+    """
     watcher = _watcher_with_row({
         "status": "REJECTED",
+        "local_order_id": "oid-1",
+        "client_id": "test@example.com",
+        "execution_mode": "live",
         "meta": {"reason_code": "BROKER_REJECTED"},
     })
+    watcher.client_id = "test@example.com"
     disposition, _ = watcher._resolve_trigger_callback_disposition(
         _deferred_watched(), None
     )

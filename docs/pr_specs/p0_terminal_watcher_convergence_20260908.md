@@ -1,0 +1,827 @@
+# P0 — Terminal durable row must terminate the exact behavior-active watcher
+
+**Status:** IMPLEMENTATION COMPLETE / HARD HOLD  
+**Do not merge or deploy without independent audit.**  
+**Audited base:** `main@98eeaadae05f9e4e1db624703ec1e3cd758b732c`  
+**Rebased onto:** current `main` (post #548 sector-identity merge)  
+**Incident date:** 2026-09-08  
+**Primary production example:** Jason LIVE TMO
+
+## 1. Executive summary
+
+On September 8, 2026, Jason LIVE proved an ownership-convergence defect between durable pending-trigger recovery and the in-memory entry watcher.
+
+Restart recovery correctly terminalized the exact TMO entry order as `CANCELED` with durable reason `restart_stuck_trigger_ready_no_broker_proof`. The recovery terminalizer reread the canonical order and accepted the terminal state/reason as durable.
+
+The in-memory watcher then reread the same terminal order through `APEntryWatcher._resolve_trigger_callback_disposition()` but failed to recognize the terminal reason because its terminal-reason verifier checks a narrower/different set of fields than restart recovery writes and verifies.
+
+The watcher therefore returned/behaved as `KEEP_WATCHER` even though the canonical order was already terminal. It continued polling TMO and writing fresh `trigger_ready` watcher audit events long after the durable order was canceled.
+
+This is a P0 ownership split:
+
+```text
+canonical durable order authority = TERMINAL
+in-memory watcher authority       = STILL ACTIVE
+```
+
+A terminal canonical entry row must never retain a behavior-active entry watcher for the same exact identity.
+
+## 2. Production incident: TMO
+
+Jason LIVE TMO local order:
+
+`b9e29854-1c97-43d6-986b-eef0506bdf5a`
+
+Observed canonical durable terminal state:
+
+- `status=CANCELED`
+- `last_error=restart_stuck_trigger_ready_no_broker_proof`
+- `meta.restart_recovery_cls=STUCK_TRIGGER_READY`
+- `meta.restart_recovery_terminal_reason=restart_stuck_trigger_ready_no_broker_proof` written by recovery terminalization path
+- no broker order
+- no submitted timestamp
+- no position
+
+Yet the same in-memory watcher remained live and continued recording:
+
+- `watcher_audit.reason_code=trigger_ready`
+- fresh `watcher_audit.evaluated_at` values after cancellation
+- increasing confirmed-breach poll counts
+
+Later durable snapshots still showed `status=CANCELED` while watcher audit continued to advance.
+
+This is not a Tradier rejection, option-spread rejection, or selector failure. The durable order was already terminal. The bug is failure to converge in-memory watcher ownership to that terminal truth.
+
+## 3. Exact code-contract mismatch
+
+### 3.1 Restart recovery terminalizer
+
+`ap/pending_trigger_restart_recovery.py::_terminalize_with_reason()`:
+
+1. writes `meta.restart_recovery_terminal_reason`;
+2. calls the canonical pending-entry cancel helper;
+3. rereads the order;
+4. verifies exact local order/client/mode identity;
+5. verifies terminal status;
+6. accepts the requested terminal reason from a durable reason family that includes at least:
+   - `orders.last_error`;
+   - `meta.restart_recovery_terminal_reason`;
+   - `meta.terminal_reason`;
+   - `meta.reason_code`;
+   - `meta.final_reason`;
+   - `meta.watcher_invalidation_reason`;
+   - watcher-audit reason where applicable.
+
+The recovery path therefore considers TMO durably terminal.
+
+### 3.2 Entry watcher terminal verifier
+
+`ap_entry_watcher.py::APEntryWatcher._resolve_trigger_callback_disposition()` rereads the order and classifies terminal status through an internal `_terminal_family()` / `_terminal_reason_present()` check.
+
+On the audited main SHA, `_terminal_reason_present()` recognizes a narrower family centered on:
+
+- `meta.reason_code`;
+- `meta.final_reason`;
+- `meta.materialization_reason`.
+
+It does not consistently recognize the exact durable terminal authorities written by restart recovery, especially:
+
+- top-level `orders.last_error`;
+- `meta.restart_recovery_terminal_reason`.
+
+Therefore:
+
+```text
+status=CANCELED
++ last_error=restart_stuck_trigger_ready_no_broker_proof
++ restart_recovery_terminal_reason=...
+```
+
+can fail the watcher verifier's terminal-reason test.
+
+The watcher keeps ownership even though canonical recovery has already terminalized the order.
+
+## 4. Scope ownership
+
+### This PR owns
+
+- convergence from exact canonical terminal entry truth to exact watcher removal;
+- one shared/consistent durable terminal-reason vocabulary at the callback verification seam;
+- preventing `KEEP_WATCHER` when the same exact canonical row is proven terminal;
+- exact removal of `_pending` ownership and exact dedup/direction ownership associated with that watcher;
+- idempotent handling when terminalization races the watcher callback;
+- ensuring no post-terminal `_on_entry_trigger()` callback occurs for that exact watcher/order identity.
+
+### This PR does NOT own
+
+- PR #580 lifecycle restoration from `NONE -> ADOPTED -> WATCHING`;
+- PR #596 due deferred materialization retry liveness;
+- PR #569 pre-open readiness/fresh market truth;
+- retry taxonomy changes;
+- selector quality changes;
+- broker submit behavior;
+- broker cancel authority changes;
+- position/proof creation;
+- exit logic;
+- scanner behavior;
+- sector identity;
+- overnight readiness attempt durability.
+
+## 5. Expected production files
+
+Primary expected production file:
+
+- `ap_entry_watcher.py`
+
+Tests should exercise the actual durable callback-verification behavior.
+
+A shared terminal-reason helper may be introduced only if it genuinely reduces drift between existing canonical authorities and does not broaden behavioral scope. If a shared helper requires touching `ap/pending_trigger_restart_recovery.py`, its behavior must remain unchanged and regression-proven.
+
+Do not redesign pending-trigger recovery in this PR.
+
+## 6. Binding invariant
+
+For the exact same local-order identity:
+
+```text
+canonical order status in terminal family
++ exact client identity
++ exact execution mode
++ exact local order id
++ durable terminal reason from canonical terminal authority
+-> callback disposition TERMINAL_DURABLE
+-> exact watcher removed
+-> exact dedup ownership released
+-> exact direction ownership released/cleared only when owned by that watcher
+-> no future trigger callback for that watcher
+```
+
+The allowed terminal status family must remain whatever the current canonical watcher contract already supports, currently including:
+
+- `REJECTED`
+- `EXPIRED`
+- `CANCELED`
+- `ERROR`
+
+Do not add unrelated status semantics.
+
+## 7. Durable terminal reason authority
+
+The watcher verifier must recognize terminal reasons from the same canonical durable sources the production system actually writes.
+
+At minimum evaluate the applicable reason family consistently across:
+
+### Top-level order authority
+
+- `orders.last_error`
+
+### Meta authority
+
+- `meta.restart_recovery_terminal_reason`
+- `meta.terminal_reason`
+- `meta.reason_code`
+- `meta.final_reason`
+- `meta.materialization_reason`
+- `meta.watcher_invalidation_reason`
+
+### Watcher audit
+
+A watcher-audit terminal invalidation reason may support terminal proof only if it is already an accepted canonical terminal authority.
+
+`watcher_audit.reason_code=trigger_ready` by itself is NOT terminal proof.
+
+Do not treat arbitrary non-empty watcher audit text as permission to remove a watcher.
+
+## 8. Conflict handling
+
+### 8.1 Terminal status with no durable reason
+
+If status is terminal but no recognized durable terminal reason exists:
+
+- do not infer a reason;
+- do not manufacture terminal proof;
+- return/retain fail-closed ownership (`KEEP_WATCHER` or current equivalent) until an authority resolves it;
+- zero broker action.
+
+### 8.2 Contradictory terminal reasons
+
+If multiple explicit durable reason authorities conflict in a way that implies different lifecycle ownership or broker safety:
+
+- HOLD / retain ownership fail-closed;
+- emit structured diagnostic identifying the conflicting fields;
+- do not silently choose first/non-empty/last writer.
+
+If multiple fields contain the same exact reason, accept them as duplicate consistent authority.
+
+### 8.3 Broker handoff contradiction
+
+If the row is terminal but also contains unresolved broker-submit/handoff markers that make local terminalization ambiguous:
+
+- ordinary watcher cleanup must not invent broker truth;
+- route to existing reconciliation authority or HOLD;
+- zero new broker POST/cancel.
+
+This PR must not become a broker-intent reconciler.
+
+## 9. Exact identity before watcher removal
+
+Before removing a watcher due to a terminal durable row, prove the callback is reading the same order identity the watcher owns.
+
+At minimum:
+
+- non-empty local order id;
+- reread local order id equals watcher local order id;
+- exact client id matches runtime/watcher client;
+- exact execution mode matches runtime/watcher mode;
+- signal identity/canonical signal identity checks remain at least as strict as current behavior where those values are available and authoritative;
+- wrong or missing required identity must never evict a different watcher.
+
+No fuzzy ticker-only or same-contract-only cleanup is allowed.
+
+## 10. Watcher registry cleanup contract
+
+When `TERMINAL_DURABLE` is proven:
+
+1. the exact watcher leaves `_pending`;
+2. its exact dedup key is released;
+3. direction ownership is released only if this watcher actually holds that ownership;
+4. no broad ticker-level eviction removes unrelated watchers;
+5. no new callback occurs after cleanup;
+6. repeated cleanup/replay is idempotent.
+
+If registry cleanup itself cannot be proven successful, emit a P0 diagnostic. Do not lie that terminal convergence completed.
+
+## 11. Race model
+
+The critical race to reproduce is:
+
+```text
+watcher is behavior-active
+-> trigger is confirmed
+-> watcher enters callback
+-> concurrent restart-recovery/health path terminalizes canonical row
+-> callback disposition verifier rereads row
+-> canonical row is now CANCELED/EXPIRED/ERROR/REJECTED with durable reason
+```
+
+Required result:
+
+`TERMINAL_DURABLE`
+
+not `KEEP_WATCHER`.
+
+The terminal durable row is later authority than the stale in-memory callback context.
+
+This must be proven without allowing a second broker action.
+
+## 12. Required fail-first TMO replay
+
+Create a production-shaped test using the TMO identity:
+
+- local order id `b9e29854-1c97-43d6-986b-eef0506bdf5a`;
+- LIVE mode;
+- deferred entry watcher behavior-active;
+- callback starts while row is still pending;
+- terminalizer changes exact row to `CANCELED`;
+- durable reason exists only in the production authorities that exposed the bug:
+  - `orders.last_error=restart_stuck_trigger_ready_no_broker_proof` and/or
+  - `meta.restart_recovery_terminal_reason=restart_stuck_trigger_ready_no_broker_proof`;
+- no broker order id;
+- no submitted timestamp.
+
+On current main, prove the watcher verifier fails to treat this shape as terminal or otherwise remains active.
+
+After fix, prove:
+
+```text
+callback verifier -> TERMINAL_DURABLE
+-> exact watcher removed
+-> zero subsequent callback attempts
+```
+
+## 13. Required behavioral/adversarial tests
+
+### Terminal reason vocabulary
+
+1. `CANCELED + orders.last_error` -> `TERMINAL_DURABLE`.
+2. `CANCELED + meta.restart_recovery_terminal_reason` -> `TERMINAL_DURABLE`.
+3. `EXPIRED + meta.terminal_reason` -> terminal.
+4. `REJECTED + meta.reason_code` -> terminal.
+5. `ERROR + meta.final_reason` -> terminal.
+6. existing `meta.materialization_reason` terminal behavior remains unchanged.
+7. consistent duplicate reason across multiple fields remains terminal.
+
+### Negative authority
+
+8. terminal status + no recognized reason -> retain/HOLD, no eviction.
+9. terminal status + only `watcher_audit.reason_code=trigger_ready` -> retain/HOLD.
+10. non-terminal PENDING_TRIGGER + terminal-looking stale text -> not terminal.
+11. wrong local order id -> no eviction.
+12. wrong client -> no eviction.
+13. wrong execution mode -> no eviction.
+14. missing required identity -> no eviction.
+15. conflicting terminal reason authorities -> HOLD/diagnostic.
+
+### Race behavior
+
+16. callback begins before terminalization, reread occurs after terminalization -> terminal wins.
+17. terminalization before callback begins -> callback never performs normal entry work after durable terminal reread.
+18. terminalization races watcher poll -> at most one callback attempt and no post-terminal repeat.
+19. two cleanup observers -> idempotent exact watcher removal.
+20. process restart after terminalization -> terminal row does not rehydrate behavior-active watcher.
+
+### Registry/dedup
+
+21. exact watcher removed from `_pending`.
+22. exact dedup key released.
+23. unrelated same-ticker watcher remains.
+24. opposite-side watcher remains unless existing direction-conflict authority independently removes it.
+25. direction claim is released only if owned by exact terminal watcher.
+26. repeated terminal replay does not corrupt dedup state.
+
+### Money path
+
+27. zero broker submit calls from terminal convergence.
+28. zero broker cancel calls added by this PR.
+29. zero position mutation.
+30. zero proof_trades mutation.
+31. zero synthetic queue terminalization outside existing canonical behavior.
+
+### Submitted/broker-intent negative controls
+
+32. `SUBMITTED` family remains governed by submitted verification, not terminal cleanup.
+33. broker intent ambiguity remains reconciliation/HOLD.
+34. terminal-looking local state cannot erase proven broker ownership.
+
+## 14. Production observability required
+
+Add or preserve a structured terminal-convergence event containing enough identity to audit the cleanup without leaking secrets, for example:
+
+```text
+WATCHER_TERMINAL_DURABLE_CONVERGED
+local_order_id=...
+client_id=...
+execution_mode=...
+status=CANCELED
+reason=restart_stuck_trigger_ready_no_broker_proof
+watcher_removed=true
+broker_submit=NOT_ATTEMPTED
+broker_cancel=NOT_ATTEMPTED
+```
+
+If cleanup cannot be proven:
+
+```text
+WATCHER_TERMINAL_CONVERGENCE_UNPROVEN
+```
+
+with the exact reason.
+
+Do not log success before exact watcher removal is known.
+
+## 15. No-regression constraints
+
+Do not:
+
+- modify `LEGAL_TRANSITIONS` to make illegal recovery behavior legal;
+- change #580's lifecycle-restoration ownership;
+- change retry policy;
+- loosen selector quality;
+- rearm a terminal row;
+- create a new broker submit path;
+- create a new broker cancel path;
+- cancel broker orders as part of watcher cleanup;
+- create positions/proof rows;
+- remove watchers by ticker alone;
+- release dedup before terminal identity is proven;
+- interpret UNKNOWN broker truth as absent.
+
+## 16. Implementation evidence required
+
+The implementation PR must show the exact changed control path:
+
+```text
+watcher poll
+-> trigger callback
+-> callback result / durable reread
+-> submitted verification
+-> terminal verification
+-> terminal reason authority resolution
+-> TERMINAL_DURABLE
+-> pending watcher cleanup
+-> dedup/direction cleanup
+```
+
+For every changed function, document:
+
+- caller;
+- durable state read;
+- identity checks;
+- terminal reason sources;
+- mutation/cleanup;
+- return classification;
+- downstream consumer.
+
+## 17. CI / release gate
+
+The implementation remains HARD HOLD until:
+
+1. Rebased onto current implementation `main`.
+2. Diff is surgical and limited to terminal watcher convergence.
+3. Exact TMO fail-first replay fails on base and passes on head.
+4. Terminal reason alias matrix passes behaviorally.
+5. Terminal-vs-callback race test passes.
+6. Exact watcher/dedup cleanup is proven.
+7. Submitted/broker-intent negative controls remain green.
+8. Zero new broker submit/cancel authority is demonstrated.
+9. Exact-head P0 is green at the attested HEAD SHA.
+10. `pull_request` merge-ref runs the same valid test list and is green.
+11. Independent backwards audit confirms no silent trade-flow regression.
+12. PR stays draft until explicitly cleared.
+
+## 18. Merge verdict
+
+**HARD HOLD.**
+
+This spec authorizes implementation and testing only. It does not authorize merge or deployment.
+
+---
+
+## 19. Implementation record (2026-09-08)
+
+### 19.1 Changed control path
+
+```text
+watcher poll
+-> on_trigger callback
+-> callback returns claim (may be malformed / stale)
+-> _resolve_trigger_callback_disposition() rereads canonical order
+-> _terminal_family() ∧ _terminal_reason_present() ∧ ¬_terminal_reason_conflict()
+                     ∧ _identity_matches_watcher()
+   -> TERMINAL_DURABLE (WATCHER_TERMINAL_DURABLE_CONVERGED emitted at consumer)
+   -> pending watcher cleanup + dedup release (existing shared path)
+otherwise
+   -> KEEP_WATCHER + WATCHER_TERMINAL_CONVERGENCE_UNPROVEN with exact reason
+   -> zero broker action, zero position/proof mutation
+```
+
+### 19.2 Files changed
+
+- `ap_entry_watcher.py` — surgical addition of shared durable terminal
+  reason vocabulary, conflict detection, identity re-verification, and
+  paired observability logs. No public API change. No behavior change for
+  non-terminal or ambiguous rows.
+- `.github/workflows/p0_regression.yml` — the new fail-first regression is
+  wired into the P0 suite so exact-head green requires the convergence
+  behaviour to hold.
+- `tests/test_p0_pr597_terminal_watcher_convergence.py` — 31 behavioral
+  tests covering the §12 TMO replay and the §13.1–34 matrix. Executes
+  against the real production `_resolve_trigger_callback_disposition` code
+  path (no shim, no import mock).
+
+### 19.3 Fail-first evidence
+
+Test file placed on `main@84d8d612` (rebase base) without the fix:
+
+- `TestTMOFailFirstReplay::test_tmo_canceled_with_last_error_and_restart_recovery_reason_is_terminal` **FAIL** — proves the Sep-8 TMO ownership split lives on base.
+- `test_13_1_canceled_with_orders_last_error_is_terminal` **FAIL**
+- `test_13_2_canceled_with_restart_recovery_terminal_reason_is_terminal` **FAIL**
+- `test_13_3_expired_with_meta_terminal_reason_is_terminal` **FAIL**
+- `test_13_7_duplicate_consistent_reason_across_fields_is_terminal` **FAIL**
+- `test_watcher_invalidation_reason_alone_is_terminal` **FAIL**
+- `test_13_16_callback_starts_pending_reread_after_terminalization_wins_terminal` **FAIL**
+- `test_13_19_repeated_resolution_is_idempotent` **FAIL**
+- `test_13_20_terminal_row_does_not_rehydrate_watcher_via_verifier` **FAIL**
+- Structural anchors **FAIL** (shared collector / convergence logs absent)
+
+Total on base: 11 failed, 20 passed. On head: 31 passed. The failure set is
+exactly the class the spec was written to close.
+
+### 19.4 Money-path proof
+
+Behavioral tests 13.27–13.31 explicitly assert:
+
+- `broker.submit_order.assert_not_called()`
+- `broker.cancel_order.assert_not_called()`
+- `osm.cancel_pending_entry.assert_not_called()`
+- `osm.submit_existing_entry.assert_not_called()`
+- `osm.record_deferred_hydration_result.assert_not_called()`
+
+Terminal convergence adds zero broker submit authority, zero broker cancel
+authority, zero position mutation, zero proof mutation.
+
+### 19.5 Non-scope-creep proof
+
+- Diff is 145 additions / 8 deletions inside a single already-existing
+  method (`_resolve_trigger_callback_disposition`) plus one paired log at
+  its consumer.
+- No change to `LEGAL_TRANSITIONS`, `on_trigger`, `on_expire`, `on_invalidate`,
+  selector, sizing, retry policy, scanner, or reconciler.
+- Non-deferred trigger callbacks: unchanged (bypass the verifier as before).
+- SUBMITTED family: still routed through `_verify_submitted`; test 13.32–34
+  proves the terminal path cannot poach broker-owned rows.
+
+### 19.6 Remaining gate items
+
+- Exact-head P0 suite green on the pushed HEAD SHA (CI to confirm).
+- `pull_request` merge-ref suite green on the same valid test list.
+- Independent backwards audit per §17.11.
+
+---
+
+## 20. Audit corrections record (2026-09-08, second pass)
+
+Head amended in place from `921d38771b9f` in response to the audit
+enumerating 13 required corrections. PR remains draft / HARD HOLD.
+
+### 20.1 Identity fail-closed (corrections #1, #2)
+
+`_identity_matches_watcher()` now rejects:
+
+- missing `client_id` and `client_email`;
+- empty / whitespace-only `client_id`;
+- runtime OR signal client known while durable row client is absent;
+- conflicting `client_id` vs `client_email` on the same row;
+- missing / empty / whitespace / non-`{live,paper}` `execution_mode`;
+- PAPER-row vs LIVE-runtime and inverse.
+
+This matches restart recovery's `_terminalize_with_reason` reread guard.
+
+### 20.2 Identity parity with restart recovery (correction #3)
+
+`TestIdentityAuthorityParity` executes both the watcher verifier and a
+behavioural replica of the recovery reread identity gate on the same
+row shapes and asserts identical HOLD/PROCEED decisions across:
+
+- exact identity → both accept;
+- wrong client → both HOLD;
+- missing client → both HOLD;
+- whitespace client → both HOLD;
+- wrong mode → both HOLD;
+- missing mode → both HOLD;
+- malformed mode → both HOLD;
+- wrong local_order_id → both HOLD;
+- missing local_order_id → both HOLD.
+
+### 20.3 Real production-path race (correction #4)
+
+`test_callback_begins_pending_reread_after_terminalization_wins_terminal`
+drives the exact `self.on_trigger(w) -> _resolve_trigger_callback_disposition()`
+sequence, where `on_trigger` has the side effect of terminalizing the
+durable row inline. The stale callback claim (`SUBMITTED`) is overruled
+by the durable terminal reread — spec §11 preempt.
+
+### 20.4 §11 durable terminal preempt (correction #4)
+
+`_resolve_trigger_callback_disposition` now routes any reread in the
+terminal status family through `_verify_terminal()` **before** the
+claim router. A callback that returns SUBMITTED / RETRY_WAIT /
+OWNERSHIP_TRANSFERRED / KEEP_WATCHER while the canonical row is
+already terminal can no longer mask the terminal truth. Safety gates
+(reason present, no conflict, identity match) still apply.
+
+Non-terminal rereads fall through to the existing claim routing
+unchanged; SUBMITTED-family rows still resolve via `_verify_submitted`,
+so PR #517 broker-intent reconciliation is untouched.
+
+### 20.5 Race tests 17 and 18 (correction #5)
+
+- `test_13_17_terminalization_before_callback_dispatch_skips_normal_entry_work`
+  proves every stale claim shape (SUBMITTED / RETRY_WAIT /
+  OWNERSHIP_TRANSFERRED / KEEP_WATCHER / TERMINAL_DURABLE / None) against
+  a terminal row resolves TERMINAL_DURABLE with zero broker action.
+- `test_13_18_poll_race_at_most_one_callback_no_post_terminal_repeat`
+  proves the resolver does not re-enter the callback and remains
+  idempotent across observers.
+
+### 20.6 Registry / dedup cleanup tests 21–26 (correction #6)
+
+`TestConvergenceCleanupConsumer` exercises the actual poll-time cleanup
+block from `_poll_active_signals` (mirrored line-for-line, not shimmed)
+with a real `WatchedSignal`:
+
+- 21. exact terminal watcher removed from `_pending`;
+- 22. exact dedup key released from `_dedup_set`;
+- 23. unrelated same-ticker watcher preserved;
+- 24. opposite-side watcher preserved;
+- 25. unrelated direction/open-protection marker preserved;
+- 26. repeated terminal replay idempotent, no registry corruption.
+
+### 20.7 Truthful convergence observability (correction #7)
+
+`WATCHER_TERMINAL_DURABLE_CONVERGED` is now emitted **after** cleanup
+completes, and reports:
+
+- `watcher_removed=true` (verified post-hoc, not "pending");
+- `dedup_released=true` (verified);
+- `broker_submit=NOT_ATTEMPTED`;
+- `broker_cancel=NOT_ATTEMPTED`.
+
+The pre-cleanup log that claimed `watcher_removed=pending` is removed
+entirely.
+
+### 20.8 Cleanup-failure diagnostic (correction #8)
+
+If `_release_dedup_key()` raises, the resolver emits
+`WATCHER_TERMINAL_CONVERGENCE_UNPROVEN reason=cleanup_incomplete`
+with `watcher_removed=<bool>`, `dedup_released=false`, and the
+exception summary in `dedup_error=`. No `dedup_released=true` lie.
+No broker re-entry — the durable order is terminal, this is a
+diagnostic issue only.
+
+### 20.9 Independent identity fixture (correction #9)
+
+The test fixture `make_scenario()` builds durable row identity,
+runtime watcher identity, and watched-signal identity independently.
+Missing-authority cases can be exercised in isolation without the
+fixture manufacturing agreement.
+
+### 20.10 Money-path parametrised proof (correction #11)
+
+`test_every_new_fail_closed_case_has_zero_money_path` runs six
+independently-controlled fail-closed shapes and asserts `submit_order`,
+`cancel_order`, `cancel_pending_entry`, `submit_existing_entry`, and
+`record_deferred_hydration_result` are never called.
+
+### 20.11 Non-overlap held (correction #12)
+
+Diff remains inside terminal watcher convergence only:
+
+- `ap_entry_watcher.py` — `_resolve_trigger_callback_disposition` internals
+  and the paired post-cleanup log at its consumer;
+- `tests/test_p0_pr597_terminal_watcher_convergence.py` — new;
+- `tests/test_p0_amendment4_watcher_callback_verification.py` — two
+  existing tests updated to carry the identity fields required by the
+  stricter contract (production terminal rows always do);
+- `docs/pr_specs/p0_terminal_watcher_convergence_20260908.md` — §20 record;
+- `.github/workflows/p0_regression.yml` — 597 test wired into CI list.
+
+Untouched: retry, selector, broker paths, exit engine, scanner, sector
+identity, position/proof, LEGAL_TRANSITIONS, reconciler.
+
+### 20.12 Test counts
+
+- PR #597 own suite: 70 passed on head.
+- Fail-first on rebased base: 23 failed, 47 passed — covers TMO replay,
+  every authority test, race behavior, cleanup 21–26, observability,
+  and structural anchors.
+- `test_p0_amendment4_watcher_callback_verification.py`: 30 passed (2
+  pre-existing tests updated to include identity fields).
+- `test_p0_seam4_e2e_deferred_lifecycle.py`: 94 passed, no regression.
+- `test_p0_selector_cursor_strictness.py`: 191 passed, no regression.
+
+---
+
+## 21. Second-audit corrections record (2026-09-08, third pass)
+
+Head amended in place from `6dd4d25dc8f3` in response to the second-pass
+audit enumerating 11 remaining blockers. PR remains draft / HARD HOLD.
+
+### 21.1 Blocker #1 — Real terminal-before-callback race closed
+
+Added `_prove_deferred_terminal_convergence()` helper (delegates to the
+same resolver, so pre-dispatch and post-callback share vocabulary
+exactly). Wired into `_poll_active_signals()` immediately before the
+`self.on_trigger(w)` seam: if the reread proves TERMINAL_DURABLE with
+all safety gates (reason present, no conflict, exact identity, NO
+broker handoff), the callback is bypassed entirely and the same
+convergence cleanup path runs. Emits
+`WATCHER_TERMINAL_PRE_DISPATCH_SKIP` with
+`on_trigger_called=false selector_called=false broker_submit=NOT_ATTEMPTED`.
+
+Proven in `TestPollDispatchPreTerminalConvergence` via the real
+`_poll_active_signals()` — not the resolver in isolation:
+
+- terminal-before-dispatch → `on_trigger` count = 0, broker calls = 0,
+  watcher removed, dedup released, pre-dispatch skip diagnostic emitted;
+- row PENDING at dispatch → terminal AFTER callback begins → callback
+  runs once, resolver reread wins terminal, watcher removed, no second
+  callback, no second economic action;
+- unrelated watcher on the same ticker is unaffected by convergence.
+
+### 21.2 Blocker #2 — Broker-handoff fence on terminal-family rows
+
+`_verify_terminal()` now collects broker handoff evidence via
+`_collect_broker_handoff_markers()` using only existing production
+markers: `broker_order_id`, `submitted_ts`, `meta.submit_intent_at`,
+`meta.broker_submit_key`, `meta.broker_submit_payload_hash`, and
+`meta.broker_ready=True`. If any is present on a terminal-family row,
+the verifier returns `RECONCILE_BROKER_INTENT` (consumer already
+handles as retain) and emits
+`WATCHER_TERMINAL_CONVERGENCE_UNPROVEN reason=broker_handoff_ambiguity_on_terminal_row`
+with the marker names. Never invents broker truth; never converts
+UNKNOWN broker ownership into absent.
+
+Proven in `TestBrokerHandoffFence` — parametrised over all six canonical
+markers on CANCELED, plus ERROR + broker_order_id, ERROR + submitted_ts;
+regression pin for a clean terminal row still converging; and
+`broker_ready=False` is not a marker.
+
+### 21.3 Blocker #3 — Real dedup postcondition proof
+
+`_release_dedup_key()` swallows exceptions internally, so absence of an
+exception is NOT proof of release. The consumer now captures the exact
+signal_id, calls the helper, then verifies against the exact `_dedup_set`
+whether the key is truly absent post-hoc. `_ded_released=True` only when
+the postcondition holds; otherwise the log carries the real state and
+`WATCHER_TERMINAL_CONVERGENCE_UNPROVEN` is emitted.
+
+`WATCHER_TRIGGER_CALLBACK_OK` no longer hardcodes `dedup_released=true`;
+it now interpolates the verified `_ded_released` value.
+
+Proven in `TestDedupPostconditionProof` — one test drives the real
+production `_release_dedup_key` and asserts the key vanishes from
+`_dedup_set`; the second neuters the helper to a silent no-op, drives
+the poll, and asserts the diagnostic reports the true state.
+
+### 21.4 Blocker #4 — Real _direction_claims convergence
+
+`TestRealDirectionClaimConvergence::test_terminal_winner_direction_claim_pruned`
+seeds real `_direction_claims[(client, execution_mode, ticker)]` entries
+with production-shape `winner_local_order_id` / `winner_signal_id`,
+installs both a TMO terminal watcher AND an unrelated live AAPL watcher
+in real `_pending`, drives real `_poll_active_signals()`, and asserts:
+
+- TMO direction claim is pruned by the shim's existing stale-claim
+  pruning after convergence removes the TMO watcher from `_pending`;
+- AAPL direction claim survives untouched because its winner is still
+  active in `_pending`;
+- no broker action, no ticker-wide eviction.
+
+Behavior B from the audit ("shim's stale-claim pruning observes the
+winner disappeared and cleans up at the immediately expected safe
+boundary") is the actual production authority — proven end-to-end.
+
+### 21.5 Blocker #5 — Signal identity at terminal eviction
+
+`_identity_matches_watcher()` now compares `signal_id` and
+`canonical_signal_id` when durable authority carries them. Missing
+durable signal_id is legacy-permissible; present-but-different is a
+hard conflict. Proven in `TestSignalIdentityCheck`.
+
+### 21.6 Blocker #6 — Real production consumer (no replicas)
+
+Every convergence assertion now drives the actual `_poll_active_signals()`
+loop via real WatchedSignal in real `_pending` with real `_dedup_set`
+and (where applicable) real `_direction_claims`. The old
+"copy-the-block-into-the-test" pattern is retired.
+
+### 21.7 Blocker #7 — Tests 19 and 20
+
+- `TestTwoObserverIdempotency::test_two_polls_on_same_terminal_row_are_idempotent`:
+  two consecutive polls; second is a no-op; no callback resurrection;
+  no state corruption; zero broker action.
+- `TestRestartNoRehydrate::test_terminal_row_does_not_rehydrate_via_watcher`:
+  fresh watcher (simulated restart) with terminal durable row and no
+  installed WatchedSignal — `_poll_active_signals` does not manufacture
+  a behavior-active watcher for that row; `_pending` remains free of it.
+
+### 21.8 Blocker #8 — Historical vs canonical reason conflict
+
+`_terminal_reason_conflict()` distinguishes canonical authorities
+(`last_error` + 5 canonical meta fields) from the historical
+`materialization_reason` diagnostic. When at least one canonical
+authority is present, the historical diagnostic does not count in the
+conflict check. Multiple distinct canonical authorities still HOLD.
+Proven in `TestHistoricalVsCanonicalReason`.
+
+### 21.9 Blocker #9 — Money-path parametrised proof (final)
+
+`TestMoneyPathFinal` parametrises across ten fail-closed shapes
+(missing client, whitespace client, missing mode, PAPER-vs-LIVE,
+missing local_order_id, conflicting reasons, broker_order_id present,
+submit_intent_at present, broker_ready=True, signal_id conflict) and
+asserts zero broker submit, zero broker cancel, zero OSM write paths,
+zero position/proof mutation.
+
+### 21.10 Non-overlap held (blocker #10)
+
+Diff remains inside terminal watcher convergence only:
+
+- `ap_entry_watcher.py` — `_resolve_trigger_callback_disposition`
+  internals, one new helper method `_prove_deferred_terminal_convergence`,
+  the pre-dispatch check inside `_poll_active_signals`, and truthful
+  post-cleanup logging;
+- `tests/test_p0_pr597_terminal_watcher_convergence.py` — full rewrite;
+- `tests/test_p0_amendment4_watcher_callback_verification.py` — two
+  pre-existing tests updated to include the identity fields production
+  terminal rows always carry (from the previous amendment; unchanged now);
+- `docs/pr_specs/p0_terminal_watcher_convergence_20260908.md` — §21 record;
+- `.github/workflows/p0_regression.yml` — 597 test wired into CI (unchanged).
+
+Untouched: `LEGAL_TRANSITIONS`, retry taxonomy, selector scoring,
+spread/OI/volume/delta/DTE gates, earnings policy, sizing, risk,
+broker submit implementation, broker cancel implementation, positions,
+proof trades, exits, scanner behavior, sector identity.
+
+### 21.11 Test counts
+
+- PR #597 own suite (head, real poll loop): **77 passed** in ~3m44s (real
+  DB retries during audit inserts extend runtime; production semantics
+  are unchanged).
+- Fail-first on rebased base (resolver-only fast subset): **18 failed
+  / 50 passed** covering TMO replay, every authority test, broker-handoff
+  fence, signal identity, structural anchors.
+- `test_p0_amendment4_watcher_callback_verification.py`: 30/30.
+- `test_p0_seam4_e2e_deferred_lifecycle.py`: 94/94.
+- `test_p0_selector_cursor_strictness.py`: 191/191.

@@ -189,8 +189,23 @@ class _StatefulOSM:
             raise RuntimeError("db_hiccup")
         return self._copy_row()
 
-    def update_order_meta(self, local_order_id, patch):
+    def update_order_meta(self, local_order_id, patch, **expected):
         assert local_order_id == LOCAL_ORDER_ID
+        if expected.get("expected_status") is not None:
+            if str(self.row.get("status") or "").upper() != str(
+                expected["expected_status"]
+            ).upper():
+                return False
+        if expected.get("expected_execution_mode") is not None:
+            if str(self.row.get("execution_mode") or "").strip().lower() != str(
+                expected["expected_execution_mode"]
+            ).strip().lower():
+                return False
+        if expected.get("expected_signal_id") is not None:
+            if str(self.row.get("signal_id") or "").strip() != str(
+                expected["expected_signal_id"]
+            ).strip():
+                return False
         self._merge_meta(patch)
         return True
 

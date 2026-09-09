@@ -655,11 +655,31 @@ def test_live_timestamp_persistence_retry_requires_durable_write_before_callback
     watcher._persist_watcher_audit = lambda *args, **kwargs: None
     watcher._is_live_runtime = lambda: True
 
+    _base_get_order = osm.get_order
+
+    def _production_shaped_row(oid):
+        row = _base_get_order(oid)
+        row.update({
+            "signal_id": signal["signal_id"],
+            "canonical_signal_id": signal["canonical_signal_id"],
+            "ticker": signal["ticker"],
+            "side": signal["side"],
+        })
+        return row
+
+    osm.get_order = _production_shaped_row  # type: ignore[assignment]
+
     persist_attempts: list[dict] = []
     fail_persistence = True
 
-    def _meta_write(oid, patch):
+    def _meta_write(oid, patch, **expected):
         nonlocal fail_persistence
+        if deferred:
+            assert expected == {
+                "expected_status": "PENDING_TRIGGER",
+                "expected_execution_mode": "paper",
+                "expected_signal_id": signal["signal_id"],
+            }
         osm.meta_writes.append((oid, dict(patch)))
         persist_attempts.append(dict(patch))
         if fail_persistence:

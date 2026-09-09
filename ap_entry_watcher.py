@@ -1703,12 +1703,185 @@ class APEntryWatcher:
         def _terminal_family() -> bool:
             return status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
 
+        # ── PR #597: durable terminal reason authority ────────────────────
+        # The recovery terminalizer in ap/pending_trigger_restart_recovery.py
+        # (_terminalize_with_reason) writes and verifies terminal reasons from
+        # this exact canonical family:
+        #   * top-level orders.last_error
+        #   * meta.restart_recovery_terminal_reason
+        #   * meta.terminal_reason
+        #   * meta.reason_code
+        #   * meta.final_reason
+        #   * meta.watcher_invalidation_reason
+        # The previous watcher-side verifier only checked reason_code,
+        # final_reason, and materialization_reason, so a row that recovery
+        # had durably terminalized as CANCELED + last_error=... could still
+        # come back KEEP_WATCHER here — the Sep 8 TMO ownership split.
+        # Spec §7: watcher_audit.reason_code is NOT terminal proof on its
+        # own (would legalize trigger_ready residue) — deliberately excluded.
+        def _collect_durable_terminal_reasons() -> set[str]:
+            reasons: set[str] = set()
+            # Top-level authority.
+            _le = row.get("last_error")
+            if _le is not None:
+                _le_s = str(_le).strip()
+                if _le_s:
+                    reasons.add(_le_s)
+            # Meta authorities — canonical fields written by recovery and
+            # by legacy watcher/materialization paths.
+            for _field in (
+                "restart_recovery_terminal_reason",
+                "terminal_reason",
+                "reason_code",
+                "final_reason",
+                "materialization_reason",
+                "watcher_invalidation_reason",
+            ):
+                _v = meta.get(_field)
+                if _v is None:
+                    continue
+                _v_s = str(_v).strip()
+                if _v_s:
+                    reasons.add(_v_s)
+            return reasons
+
         def _terminal_reason_present() -> bool:
-            return bool(
-                meta.get("reason_code")
-                or meta.get("final_reason")
-                or meta.get("materialization_reason")
+            return bool(_collect_durable_terminal_reasons())
+
+        def _terminal_reason_conflict() -> bool:
+            # Spec §8.2 + blocker #8: multiple DISTINCT non-empty CANONICAL
+            # durable authorities is conflicting authority — HOLD fail-closed,
+            # never last-writer-wins. Duplicate identical reasons across fields
+            # are accepted as consistent proof.
+            # meta.materialization_reason is a HISTORICAL diagnostic written
+            # by the materialization taxonomy; a later canonical terminal
+            # reason (e.g. restart_recovery_terminal_reason) on the same row
+            # is not a conflict with it. Exclude materialization_reason from
+            # the conflict count when at least one canonical terminal
+            # authority is present.
+            all_reasons = _collect_durable_terminal_reasons()
+            if len(all_reasons) <= 1:
+                return False
+            canonical: set[str] = set()
+            _canonical_fields = (
+                "last_error",  # from top-level; collector prefixes are unused
             )
+            # Recollect distinguishing which came from which field.
+            canonical_vals: set[str] = set()
+            historical_vals: set[str] = set()
+            _le = row.get("last_error")
+            if _le:
+                canonical_vals.add(str(_le).strip())
+            for _f in (
+                "restart_recovery_terminal_reason",
+                "terminal_reason",
+                "reason_code",
+                "final_reason",
+                "watcher_invalidation_reason",
+            ):
+                _v = meta.get(_f)
+                if _v is not None and str(_v).strip():
+                    canonical_vals.add(str(_v).strip())
+            _mr = meta.get("materialization_reason")
+            if _mr is not None and str(_mr).strip():
+                historical_vals.add(str(_mr).strip())
+            canonical_vals.discard("")
+            historical_vals.discard("")
+            # If canonical authorities agree, historical diagnostic does not
+            # produce a conflict — it is legacy metadata.
+            if canonical_vals:
+                return len(canonical_vals) > 1
+            # No canonical authority — only historical. If more than one
+            # historical value exists, that is still ambiguous.
+            return len(historical_vals) > 1
+
+        def _identity_matches_watcher() -> bool:
+            # Spec §9 + corrections #1/#2: prove the reread order still names the
+            # same identity the watcher owns before allowing eviction. Runtime
+            # watcher and restart recovery must agree — recovery already fails
+            # closed on missing/blank/malformed durable identity, and the
+            # runtime verifier must not silently accept absent identity as
+            # agreement. Wrong OR missing required identity must never evict.
+
+            # ── Local order id: both sides must be present and identical.
+            _sig_local = str(signal.get("local_order_id") or "").strip()
+            _row_local = str(row.get("local_order_id") or "").strip()
+            if not _sig_local or not _row_local or _sig_local != _row_local:
+                return False
+
+            # ── Client identity: durable row must carry it whenever runtime
+            # or signal advertises it. Empty/whitespace never counts as
+            # agreement.
+            _sig_client = str(
+                signal.get("client_id") or signal.get("client_email") or ""
+            ).strip().lower()
+            _row_client_id = str(row.get("client_id") or "").strip().lower()
+            _row_client_email = str(row.get("client_email") or "").strip().lower()
+            _row_client = _row_client_id or _row_client_email
+            _runtime_client = str(getattr(self, "client_id", "") or "").strip().lower()
+            # If runtime or signal knows the client, row MUST also know it.
+            if (_runtime_client or _sig_client) and not _row_client:
+                return False
+            # If row carries both aliases, they must not conflict with each other.
+            if _row_client_id and _row_client_email and _row_client_id != _row_client_email:
+                return False
+            # If both sides are populated, they must match.
+            if _runtime_client and _row_client and _runtime_client != _row_client:
+                return False
+            if _sig_client and _row_client and _sig_client != _row_client:
+                return False
+
+            # ── Execution mode: same rules. Restart recovery already treats
+            # missing/blank mode as UNRESOLVED — the runtime verifier must
+            # not treat it as tacit LIVE agreement.
+            _row_mode = str(row.get("execution_mode") or "").strip().lower()
+            _runtime_mode = str(
+                getattr(self, "execution_mode", "")
+                or getattr(self, "mode", "")
+                or ""
+            ).strip().lower()
+            _sig_mode = str(signal.get("execution_mode") or "").strip().lower()
+            # If runtime or signal knows the mode, row MUST also know it.
+            if (_runtime_mode or _sig_mode) and not _row_mode:
+                return False
+            # Mode value must be one of the canonical two — no invented aliases.
+            if _row_mode and _row_mode not in {"live", "paper"}:
+                return False
+            if _runtime_mode and _row_mode and _runtime_mode != _row_mode:
+                return False
+            if _sig_mode and _row_mode and _sig_mode != _row_mode:
+                return False
+
+            # ── Signal identity: use the same production shape as trigger
+            # provenance/restart recovery. Identity may live at the top level
+            # or in metadata; watcher canonical identity falls back to the
+            # canonical builder exactly as the package shim does. Durable
+            # canonical identity remains optional, but when present it must
+            # resolve and agree exactly.
+            _sig_meta = signal.get("metadata") or {}
+            if not isinstance(_sig_meta, dict):
+                _sig_meta = {}
+            _sig_sid = str(
+                signal.get("signal_id") or _sig_meta.get("signal_id") or ""
+            ).strip()
+            _row_sid = str(
+                row.get("signal_id") or meta.get("signal_id") or ""
+            ).strip()
+            _sig_canon = str(
+                signal.get("canonical_signal_id")
+                or _sig_meta.get("canonical_signal_id")
+                or (build_canonical_signal_id(_sig_sid) if _sig_sid else "")
+            ).strip()
+            _row_canon = str(
+                row.get("canonical_signal_id")
+                or meta.get("canonical_signal_id")
+                or ""
+            ).strip()
+            if _row_sid and (not _sig_sid or _sig_sid != _row_sid):
+                return False
+            if _row_canon and (not _sig_canon or _sig_canon != _row_canon):
+                return False
+            return True
 
         def _verify_submitted() -> tuple[str, str | None]:
             """Return the verified disposition for a SUBMITTED claim."""
@@ -1730,9 +1903,51 @@ class APEntryWatcher:
             return "KEEP_WATCHER", None
 
         def _verify_terminal() -> tuple[str, str | None]:
-            if _terminal_family() and _terminal_reason_present():
-                return "TERMINAL_DURABLE", None
-            return "KEEP_WATCHER", None
+            if not _terminal_family():
+                return "KEEP_WATCHER", None
+            if not _terminal_reason_present():
+                # Spec §8.1: terminal status with no durable reason → HOLD.
+                log.critical(
+                    "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                    "local_order_id=%s status=%s reason=no_recognized_durable_terminal_reason",
+                    local_order_id, status,
+                )
+                return "KEEP_WATCHER", None
+            if _terminal_reason_conflict():
+                # Spec §8.2: conflicting canonical durable authorities → HOLD.
+                log.critical(
+                    "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                    "local_order_id=%s status=%s reason=conflicting_durable_terminal_reasons reasons=%s",
+                    local_order_id, status,
+                    sorted(_collect_durable_terminal_reasons()),
+                )
+                return "KEEP_WATCHER", None
+            if not _identity_matches_watcher():
+                # Spec §9: identity mismatch → never evict a watcher for the
+                # wrong row. Retain fail-closed.
+                log.critical(
+                    "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                    "local_order_id=%s status=%s reason=identity_mismatch_row_client_mode_or_signal",
+                    local_order_id, status,
+                )
+                return "KEEP_WATCHER", None
+            # Blocker #2: even a terminally-statused row with a valid reason
+            # and matching identity is not safe for ordinary terminal cleanup
+            # if broker ownership is still unresolved. Route to the existing
+            # RECONCILE_BROKER_INTENT authority (consumer treats it as
+            # retain), so no ordinary cleanup runs and no broker action
+            # fires. Never invent broker truth or convert unknown broker
+            # ownership into absent.
+            from ap.pending_trigger_classifier import has_broker_handoff_evidence
+            if broker_order_id or submitted_ts or has_broker_handoff_evidence(row):
+                log.critical(
+                    "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                    "local_order_id=%s status=%s "
+                    "reason=broker_handoff_ambiguity_on_terminal_row",
+                    local_order_id, status,
+                )
+                return "RECONCILE_BROKER_INTENT", None
+            return "TERMINAL_DURABLE", None
 
         def _verify_retry() -> tuple[str, str | None]:
             if status not in {"PENDING_TRIGGER", "CREATED"}:
@@ -1790,6 +2005,17 @@ class APEntryWatcher:
                 return "KEEP_WATCHER", None
             return "OWNERSHIP_TRANSFERRED", None
 
+        # ── PR #597 §11: durable terminal truth wins over any stale claim ──
+        # When the reread canonical row is in the terminal status family, it
+        # is later authority than the in-memory callback context. Route to
+        # _verify_terminal (which enforces reason + identity + conflict
+        # safety) BEFORE the claim router so a callback that returns SUBMITTED
+        # / RETRY_WAIT / OWNERSHIP_TRANSFERRED after a concurrent recovery
+        # terminalization cannot mask the durable terminal truth. Non-terminal
+        # rereads fall through to the existing claim routing unchanged.
+        if _terminal_family():
+            return _verify_terminal()
+
         # ── Route the claim through its verifier ──────────────────────
         if claimed_disposition == "SUBMITTED":
             return _verify_submitted()
@@ -1828,6 +2054,269 @@ class APEntryWatcher:
         if lifecycle == "MATERIALIZING":
             return "KEEP_WATCHER", meta.get("materialization_lease_until")
         return "UNKNOWN", None
+
+    def _prove_deferred_terminal_convergence(
+        self, watched
+    ) -> tuple[str, str | None]:
+        """Return the exact durable disposition at the callback boundary.
+
+        Called from ``_poll_active_signals`` immediately before ``on_trigger``
+        for a deferred watcher. Rereads the exact canonical order and, when
+        the reread proves TERMINAL_DURABLE (with full safety gates: reason
+        recognized, no reason conflict, exact identity match, no broker
+        handoff ambiguity), the caller MUST skip the callback entirely and
+        route to the terminal convergence cleanup path — no on_trigger,
+        no selector work, no materializer work, no broker POST/cancel.
+
+        Returns one of:
+          ``("TERMINAL_DURABLE", None)``  — safe to skip callback and clean up
+          ``("RECONCILE_BROKER_INTENT", None)`` — terminal row but broker
+                                                  ownership unresolved; caller
+                                                  retains ownership and lets
+                                                  the reconciler handle it.
+          ``("PENDING_TRIGGER", None)`` — exact pending identity is currently
+                                          eligible for the fenced authority CAS.
+          ``("PENDING_HOLD", None)`` — pending status exists, but the exact
+                                        identity or broker-free proof failed.
+          ``("KEEP_WATCHER", None)`` — a non-pending row must remain held.
+          ``("UNKNOWN", None)`` — reread unavailable; caller must hold.
+
+        Delegates to ``_resolve_trigger_callback_disposition`` with a
+        synthetic TERMINAL_DURABLE claim so the exact same vocabulary,
+        identity, conflict, and broker-handoff logic runs in both seams.
+        This is deliberate: any behavior drift between pre-dispatch and
+        post-callback would reopen the ownership-split defect this PR
+        exists to close.
+        """
+        # Only deferred watchers use the durable reread contract. Non-deferred
+        # signals have their own submit gate; do not repurpose their behavior.
+        signal = getattr(watched, "signal", {}) or {}
+        if not self._is_deferred_signal(signal):
+            return "NON_DEFERRED", None
+
+        local_order_id = str(signal.get("local_order_id") or "").strip()
+        get_order = getattr(self.order_state_machine, "get_order", None)
+        if not local_order_id or not callable(get_order):
+            return "UNKNOWN", None
+        try:
+            row = get_order(local_order_id)
+        except Exception:
+            return "UNKNOWN", None
+        if not isinstance(row, dict):
+            return "UNKNOWN", None
+
+        status = str(row.get("status") or "").strip().upper()
+        if status == "PENDING_TRIGGER":
+            # A status word is not pending authority.  Before the direction
+            # arbiter, trigger audit, fenced CAS, selector, or callback can
+            # run, prove that this exact row is still owned by this exact
+            # watcher and has not crossed into broker handoff.
+            _raw_meta = row.get("meta")
+            if _raw_meta is None:
+                _pending_meta: dict = {}
+            elif isinstance(_raw_meta, dict):
+                _pending_meta = dict(_raw_meta)
+            elif isinstance(_raw_meta, str):
+                try:
+                    _pending_meta = json.loads(_raw_meta)
+                except Exception:
+                    _pending_meta = None
+                if not isinstance(_pending_meta, dict):
+                    log.critical(
+                        "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                        "reason=durable_meta_unreadable",
+                        local_order_id,
+                    )
+                    return "PENDING_HOLD", None
+            else:
+                log.critical(
+                    "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                    "reason=durable_meta_unreadable",
+                    local_order_id,
+                )
+                return "PENDING_HOLD", None
+
+            def _present(value) -> bool:
+                return value is not None and not (
+                    isinstance(value, str) and not value.strip()
+                )
+
+            # The classifier is the shared broker-handoff authority.  Include
+            # row-level mirrors here as well because a projection can expose
+            # broker_order_id/submitted_ts (or the handoff fields) outside
+            # orders.meta.
+            _row_handoff = any(
+                _present(row.get(_field))
+                for _field in (
+                    "broker_order_id",
+                    "submitted_ts",
+                    "submit_intent_at",
+                    "broker_submit_key",
+                    "broker_submit_payload_hash",
+                )
+            )
+            _row_broker_ready = row.get("broker_ready")
+            if _present(_row_broker_ready) and not (
+                _row_broker_ready is False
+                or (
+                    isinstance(_row_broker_ready, str)
+                    and _row_broker_ready.strip().lower() == "false"
+                )
+            ):
+                _row_handoff = True
+            _nested_materialization = _pending_meta.get("materialization")
+            if (
+                _nested_materialization is not None
+                and not isinstance(_nested_materialization, dict)
+            ):
+                _row_handoff = True
+            try:
+                from ap.pending_trigger_classifier import has_broker_handoff_evidence
+
+                _row_handoff = _row_handoff or has_broker_handoff_evidence(row)
+            except Exception:
+                # If the shared authority cannot be loaded, absence of broker
+                # evidence is unproven.  Hold rather than making a callback.
+                _row_handoff = True
+            if _row_handoff:
+                log.critical(
+                    "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                    "disposition=RECONCILE_BROKER_INTENT "
+                    "reason=broker_handoff_ambiguity",
+                    local_order_id,
+                )
+                return "RECONCILE_BROKER_INTENT", None
+
+            _signal = getattr(watched, "signal", {}) or {}
+            _signal_meta = _signal.get("metadata") or {}
+            if not isinstance(_signal_meta, dict):
+                log.critical(
+                    "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                    "reason=watcher_metadata_unreadable",
+                    local_order_id,
+                )
+                return "PENDING_HOLD", None
+
+            # Resolve the watcher-side identity from the same normalized
+            # fields used by arm/recovery.  Every authority component is
+            # required for a deferred PENDING_TRIGGER row; no legacy
+            # missing-field fallback is safe at this callback boundary.  If
+            # two durable/runtime aliases disagree, treat that as a conflict
+            # instead of silently selecting whichever field appears first.
+            def _text(value, *, lower: bool = False) -> str:
+                if value is None or isinstance(value, bool):
+                    return ""
+                value = str(value).strip()
+                return value.lower() if lower else value
+
+            def _consistent(values: list[str]) -> tuple[str, bool]:
+                _values = [value for value in values if value]
+                return (_values[0] if _values else "", len(set(_values)) <= 1)
+
+            _expected_local, _watcher_local_consistent = _consistent([
+                _text(_signal.get("local_order_id")),
+                _text(_signal_meta.get("local_order_id")),
+            ])
+            _expected_client, _watcher_client_consistent = _consistent([
+                _text(_signal.get("client_id"), lower=True),
+                _text(_signal.get("client_email"), lower=True),
+                _text(_signal_meta.get("client_id"), lower=True),
+                _text(_signal_meta.get("client_email"), lower=True),
+                _text(getattr(self, "client_id", ""), lower=True),
+            ])
+            _expected_mode, _watcher_mode_consistent = _consistent([
+                _text(_signal.get("execution_mode"), lower=True),
+                _text(_signal_meta.get("execution_mode"), lower=True),
+                _text(getattr(self, "execution_mode", ""), lower=True),
+            ])
+            _expected_signal_id, _watcher_signal_consistent = _consistent([
+                _text(getattr(watched, "signal_id", "")),
+                _text(_signal.get("signal_id")),
+                _text(_signal_meta.get("signal_id")),
+            ])
+            _explicit_canon, _watcher_canon_consistent = _consistent([
+                _text(_signal.get("canonical_signal_id")),
+                _text(_signal_meta.get("canonical_signal_id")),
+            ])
+            _expected_canonical = _explicit_canon or (
+                build_canonical_signal_id(_expected_signal_id)
+                if _expected_signal_id
+                else ""
+            )
+
+            _row_local, _row_local_consistent = _consistent([
+                _text(row.get("local_order_id")),
+                _text(row.get("id")),
+            ])
+            _row_client, _row_client_consistent = _consistent([
+                _text(row.get("client_id"), lower=True),
+                _text(row.get("client_email"), lower=True),
+                _text(_pending_meta.get("client_id"), lower=True),
+                _text(_pending_meta.get("client_email"), lower=True),
+            ])
+            _row_mode, _row_mode_consistent = _consistent([
+                _text(row.get("execution_mode"), lower=True),
+                _text(_pending_meta.get("execution_mode"), lower=True),
+            ])
+            _row_signal_id, _row_signal_consistent = _consistent([
+                _text(row.get("signal_id")),
+                _text(_pending_meta.get("signal_id")),
+            ])
+            _row_canonical, _row_canon_consistent = _consistent([
+                _text(row.get("canonical_signal_id")),
+                _text(_pending_meta.get("canonical_signal_id")),
+            ])
+
+            _identity_ok = bool(
+                _watcher_local_consistent
+                and _row_local_consistent
+                and _expected_local
+                and _row_local
+                and _expected_local == _row_local
+                and _watcher_client_consistent
+                and _row_client_consistent
+                and _expected_client
+                and _row_client
+                and _expected_client == _row_client
+                and _watcher_mode_consistent
+                and _row_mode_consistent
+                and _expected_mode in {"live", "paper"}
+                and _row_mode == _expected_mode
+                and _watcher_signal_consistent
+                and _row_signal_consistent
+                and _expected_signal_id
+                and _row_signal_id
+                and _expected_signal_id == _row_signal_id
+                and _watcher_canon_consistent
+                and _row_canon_consistent
+            )
+            # Durable canonical identity is optional for legacy rows, but if
+            # present it is authoritative and must agree with the watcher.
+            if _row_canonical and (
+                not _expected_canonical or _row_canonical != _expected_canonical
+            ):
+                _identity_ok = False
+            if not _identity_ok:
+                log.critical(
+                    "WATCHER_PENDING_AUTHORITY_HOLD local_order_id=%s "
+                    "reason=identity_conflict",
+                    local_order_id,
+                )
+                return "PENDING_HOLD", None
+            return "PENDING_TRIGGER", None
+        if status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return "KEEP_WATCHER", None
+
+        # The shared resolver performs the terminal reason, identity, and
+        # canonical broker-handoff checks. A terminal row remains terminal for
+        # dispatch purposes even when cleanup cannot be proven: convert every
+        # ambiguous result to a terminal HOLD so the callback stays suppressed.
+        disposition, next_retry = self._resolve_trigger_callback_disposition(
+            watched, {"disposition": "TERMINAL_DURABLE"}
+        )
+        if disposition in {"TERMINAL_DURABLE", "RECONCILE_BROKER_INTENT"}:
+            return disposition, next_retry
+        return "TERMINAL_HOLD", None
 
     def _dedup_key_for_signal(self, signal: dict) -> str:
         return str(signal.get("signal_id") or "").strip()
@@ -5477,6 +5966,21 @@ class APEntryWatcher:
                 protected.append((action, watched))
                 continue
 
+            # A failed/ambiguous deferred pending proof is already a durable
+            # HOLD.  Open protection must not turn that HOLD into an expiry or
+            # an in-memory ownership claim while the row remains unresolved.
+            _durable_disposition = getattr(
+                watched, "_pre_dispatch_durable_disposition", None
+            )
+            if _durable_disposition not in {
+                None,
+                "NON_DEFERRED",
+                "PENDING_TRIGGER",
+                "TERMINAL_DURABLE",
+            }:
+                protected.append((action, watched))
+                continue
+
             key = self._open_protection_key(watched)
             ticker = str(getattr(watched, "ticker", "") or "").strip().upper()
             owner = self._open_protection_owner(watched)
@@ -5608,6 +6112,12 @@ class APEntryWatcher:
             # this: no other code path in _poll_active_signals can trigger an
             # overnight watcher whose revalidation is still pending.
             active = [w for w in self._pending if w.is_active and not w.overnight]
+            # A direction winner may fence its confirmation before the base
+            # dispatch loop. This marker is per poll, so a later retry must
+            # perform a fresh identity/status CAS rather than trusting a
+            # process-local write from an earlier attempt.
+            for _active_watched in active:
+                _active_watched._dispatch_authority_status = None
 
         if not active:
             return
@@ -5674,6 +6184,14 @@ class APEntryWatcher:
             #   FAILED: enter quarantine (stay in _pending, dedup held, not active)
             pass  # removal now handled per-watcher after callback verification
 
+        # Resolve deferred durable truth before the package-level direction
+        # arbiter can persist winner authority or cancel an opposite watcher.
+        for _action, _watched in completed:
+            if _action == "trigger":
+                _watched._pre_dispatch_durable_disposition = (
+                    self._prove_deferred_terminal_convergence(_watched)[0]
+                )
+
         # The package watcher uses this post-check/pre-callback seam to make a
         # batch-level confirmed-breach direction claim.  It may remove proven
         # losers or convert an ambiguous batch to a fail-closed hold.
@@ -5684,31 +6202,106 @@ class APEntryWatcher:
             _sig_id = str(w.signal.get("signal_id", ""))
             _ticker = str(w.ticker or "")
             if action == "trigger":
-                # Signal breached — record TRIGGER_READY before firing callback.
-                _trigger_audit = self._build_watcher_audit_payload(
-                    w,
-                    trigger_type="trigger",
-                    current_bid=float(getattr(w, "last_quote_bid", 0) or 0),
-                    current_ask=float(getattr(w, "last_quote_ask", 0) or 0),
-                    reason_code="trigger_ready",
-                    raw_reason=(
-                        f"{str(getattr(w, 'side', '')).lower()}_breach_confirmed"
-                        f"_after_{int(getattr(w, 'breach_count', 0) or 0)}_polls"
-                    ),
-                    extra={
-                        "breach_count": int(getattr(w, "breach_count", 0) or 0),
-                        "queue_status": str((getattr(w, "signal", {}) or {}).get("queue_status") or ""),
-                    },
+                # Deferred callbacks are submit-capable. Prove the exact durable
+                # row before any trigger audit/authority write. Only an exact
+                # PENDING_TRIGGER row may advance to the fenced metadata CAS.
+                _pre_terminal = getattr(
+                    w, "_pre_dispatch_durable_disposition", None
                 )
-                self._persist_watcher_audit(
-                    (getattr(w, "signal", {}) or {}).get("local_order_id"),
-                    _trigger_audit,
+                if _pre_terminal is None:
+                    _pre_terminal, _ = self._prove_deferred_terminal_convergence(w)
+                try:
+                    delattr(w, "_pre_dispatch_durable_disposition")
+                except AttributeError:
+                    pass
+                _is_deferred_trigger = self._is_deferred_signal(
+                    getattr(w, "signal", {}) or {}
                 )
-                if _sig_id and _ticker:
-                    _ew_record(_sig_id, _ticker, "TRIGGER_READY",
-                               "trigger_breached_entry_submitted",
-                               contract=str(w.signal.get("contract_symbol", "")),
-                               entry_trigger=str(w.entry_trigger or ""))
+                _pre_dispatch_convergence = (
+                    _pre_terminal == "TERMINAL_DURABLE"
+                )
+                if _is_deferred_trigger and _pre_terminal not in {
+                    "PENDING_TRIGGER", "TERMINAL_DURABLE"
+                }:
+                    with self._lock:
+                        w.state = WatchState.PENDING
+                        w.deferred_retry_not_before = (
+                            datetime.now(timezone.utc) + timedelta(seconds=5)
+                        )
+                    log.critical(
+                        "WATCHER_TRIGGER_PRE_DISPATCH_HOLD "
+                        "ticker=%s signal_id=%s disposition=%s "
+                        "trigger_authority_write=false on_trigger_called=false",
+                        w.ticker, _sig_id or "?", _pre_terminal,
+                    )
+                    continue
+
+                # The exact PENDING_TRIGGER read is the only authority that
+                # may advance a deferred callback.  Fence the confirmation
+                # metadata CAS *before* emitting trigger_ready, so the audit
+                # can never get ahead of the durable authority claim.  A
+                # direction winner may already have performed this same CAS;
+                # retain that proof and do not write it twice.
+                _dispatch_authority_status = getattr(
+                    w, "_dispatch_authority_status", None
+                )
+                _deferred_authority_pre_persisted = (
+                    _dispatch_authority_status == "persisted"
+                )
+                if _is_deferred_trigger and _pre_terminal == "PENDING_TRIGGER":
+                    if _dispatch_authority_status is None:
+                        _deferred_authority_pre_persisted = bool(
+                            self._persist_trigger_confirmation_authority(
+                                w,
+                                require_pending_row=True,
+                            )
+                        )
+                        w._dispatch_authority_status = (
+                            "persisted" if _deferred_authority_pre_persisted else "failed"
+                        )
+                    if not _deferred_authority_pre_persisted:
+                        with self._lock:
+                            w.state = WatchState.PENDING
+                            w.deferred_retry_not_before = (
+                                datetime.now(timezone.utc) + timedelta(seconds=5)
+                            )
+                        log.critical(
+                            "WATCHER_TRIGGER_PRE_DISPATCH_HOLD "
+                            "ticker=%s signal_id=%s disposition=PENDING_HOLD "
+                            "reason=trigger_authority_cas_failed "
+                            "trigger_authority_write=false on_trigger_called=false",
+                            w.ticker, _sig_id or "?",
+                        )
+                        continue
+
+                # For deferred signals the authority CAS above is deliberately
+                # first.  Only then may the trigger_ready audit precede the
+                # callback.  Non-deferred behavior remains unchanged.
+                if not _pre_dispatch_convergence:
+                    _trigger_audit = self._build_watcher_audit_payload(
+                        w,
+                        trigger_type="trigger",
+                        current_bid=float(getattr(w, "last_quote_bid", 0) or 0),
+                        current_ask=float(getattr(w, "last_quote_ask", 0) or 0),
+                        reason_code="trigger_ready",
+                        raw_reason=(
+                            f"{str(getattr(w, 'side', '')).lower()}_breach_confirmed"
+                            f"_after_{int(getattr(w, 'breach_count', 0) or 0)}_polls"
+                        ),
+                        extra={
+                            "breach_count": int(getattr(w, "breach_count", 0) or 0),
+                            "queue_status": str((getattr(w, "signal", {}) or {}).get("queue_status") or ""),
+                        },
+                    )
+                    self._persist_watcher_audit(
+                        (getattr(w, "signal", {}) or {}).get("local_order_id"),
+                        _trigger_audit,
+                    )
+                    if _sig_id and _ticker:
+                        _ew_record(_sig_id, _ticker, "TRIGGER_READY",
+                                   "trigger_breached_entry_submitted",
+                                   contract=str(w.signal.get("contract_symbol", "")),
+                                   entry_trigger=str(w.entry_trigger or ""))
                 if self.on_trigger:
                     # Retry on_trigger up to 3 times before expiring.
                     # A transient Tradier timeout or DB hiccup at breach time
@@ -5733,7 +6326,30 @@ class APEntryWatcher:
                     _ts_pre_local_oid = str(
                         ((getattr(w, "signal", {}) or {}).get("local_order_id") or "")
                     ).strip()
-                    _ts_pre_write_ok = self._persist_trigger_confirmation_authority(w)
+                    _ts_signal = getattr(w, "signal", {}) or {}
+                    _ts_meta = _ts_signal.get("metadata") or {}
+                    if not isinstance(_ts_meta, dict):
+                        _ts_meta = {}
+                    _ts_expected_mode = str(
+                        _ts_signal.get("execution_mode")
+                        or _ts_meta.get("execution_mode")
+                        or getattr(self, "execution_mode", "")
+                        or ""
+                    ).strip()
+                    _ts_expected_signal_id = str(
+                        _ts_signal.get("signal_id")
+                        or _ts_meta.get("signal_id")
+                        or ""
+                    ).strip()
+                    if _pre_dispatch_convergence:
+                        # Durable terminal truth was proved before every write.
+                        _ts_pre_write_ok = True
+                    elif _is_deferred_trigger:
+                        # The fenced CAS was completed before trigger_ready;
+                        # do not issue a second authority write here.
+                        _ts_pre_write_ok = _deferred_authority_pre_persisted
+                    else:
+                        _ts_pre_write_ok = self._persist_trigger_confirmation_authority(w)
                     if not _ts_pre_write_ok:
                         _is_live_ts = self._is_live_runtime()
                         if _is_live_ts:
@@ -5752,9 +6368,8 @@ class APEntryWatcher:
                                 w.ticker, _ts_pre_local_oid or "?",
                             )
 
-                    if (
-                        self._is_live_runtime()
-                        and not _ts_pre_write_ok
+                    if not _ts_pre_write_ok and (
+                        self._is_live_runtime() or _is_deferred_trigger
                     ):
                         # Database truth is unavailable.  Keep the watcher as the
                         # active owner and never enter selector/broker work.
@@ -5770,12 +6385,48 @@ class APEntryWatcher:
                         )
                         continue
 
+                    if _pre_dispatch_convergence:
+                        # Emit the diagnostic pairing that proves callback
+                        # was intentionally skipped by pre-dispatch proof.
+                        try:
+                            _pre_sig = getattr(w, "signal", {}) or {}
+                            log.info(
+                                "WATCHER_TERMINAL_PRE_DISPATCH_SKIP "
+                                "local_order_id=%s signal_id=%s ticker=%s "
+                                "on_trigger_called=false selector_called=false "
+                                "broker_submit=NOT_ATTEMPTED "
+                                "broker_cancel=NOT_ATTEMPTED",
+                                str(_pre_sig.get("local_order_id") or "?"),
+                                _sig_id or "?",
+                                w.ticker,
+                            )
+                        except Exception:
+                            pass
+                        # Route to the shared cleanup + convergence log by
+                        # synthesizing the disposition — callback body is
+                        # deliberately not invoked. NOTE: this deliberately
+                        # bypasses w._trigger_attempts reset because the
+                        # attempt was never made.
+                        _callback_disposition = "TERMINAL_DURABLE"
+                        _callback_next_retry = None
+                        _callback_result = None
+
                     # ── Call the trigger callback — timestamps are now durable ──
+                    if _pre_dispatch_convergence:
+                        # Skip the try-block entirely; we already have the
+                        # synthesized disposition. Fall through to the
+                        # existing disposition consumer below by re-entering
+                        # its structure inline (mirrors the try-branch
+                        # exactly for TERMINAL_DURABLE ONLY).
+                        _skip_on_trigger = True
+                    else:
+                        _skip_on_trigger = False
                     try:
-                        _callback_result = self.on_trigger(w)
-                        _callback_disposition, _callback_next_retry = (
-                            self._resolve_trigger_callback_disposition(w, _callback_result)
-                        )
+                        if not _skip_on_trigger:
+                            _callback_result = self.on_trigger(w)
+                            _callback_disposition, _callback_next_retry = (
+                                self._resolve_trigger_callback_disposition(w, _callback_result)
+                            )
                         if _callback_disposition in {"RETRY_WAIT", "KEEP_WATCHER", "RECONCILE_BROKER_INTENT"}:
                             with self._lock:
                                 w.state = WatchState.PENDING
@@ -5819,18 +6470,113 @@ class APEntryWatcher:
                         # needs an explicit removal so the watcher doesn't
                         # re-fire on the next poll cycle. Uses id-based match
                         # to avoid mutating _pending during callback iteration.
+                        _wid = id(w)
                         with self._lock:
-                            _wid = id(w)
                             self._pending = [_p for _p in self._pending if id(_p) != _wid]
+                        # PR #597 blocker #3: real dedup POSTCONDITION proof.
+                        # WatchedSignal._release_dedup_key() swallows its own
+                        # exceptions internally, so a try/except around it is
+                        # NOT proof of successful release. Capture the signal
+                        # identity, call the helper, then verify the exact
+                        # dedup key is no longer in the actual registry.
+                        _ded_signal_id = str(getattr(w, "signal_id", "") or "").strip()
+                        _ded_pre_present = False
+                        with self._lock:
+                            if _ded_signal_id:
+                                _ded_pre_present = _ded_signal_id in self._dedup_set
+                        _ded_error: str | None = None
                         try:
                             w._release_dedup_key()
-                        except Exception:
-                            pass
+                        except Exception as _dd_exc:
+                            _ded_error = f"{type(_dd_exc).__name__}: {str(_dd_exc)[:180]}"
+                        # Verify the postcondition against the real registry.
+                        with self._lock:
+                            _ded_post_present = (
+                                bool(_ded_signal_id)
+                                and _ded_signal_id in self._dedup_set
+                            )
+                        # dedup_released is TRUE only when we can prove the
+                        # exact key is absent from the registry. If the key
+                        # was never present (e.g. the watcher was constructed
+                        # without registering), we still record true because
+                        # there is no residue to clean; the failure mode we
+                        # care about is "we called release and the key is
+                        # still there".
+                        _ded_released = (
+                            _ded_error is None
+                            and not _ded_post_present
+                        )
+                        if not _ded_released and _ded_error is None:
+                            _ded_error = (
+                                "helper_returned_without_removing_key "
+                                f"(pre_present={_ded_pre_present}, post_present=True)"
+                            )
+                        # PR #597 §14: emit the paired convergence proof only
+                        # AFTER cleanup has been observed. If cleanup could not
+                        # be proven, emit CONVERGENCE_UNPROVEN with the exact
+                        # reason — never lie that convergence succeeded, and
+                        # never re-enter broker work over a bookkeeping failure
+                        # (the durable order remains terminal).
+                        if _callback_disposition == "TERMINAL_DURABLE":
+                            with self._lock:
+                                _watcher_removed = all(
+                                    id(_p) != _wid for _p in self._pending
+                                )
+                            try:
+                                _sig = getattr(w, "signal", {}) or {}
+                                _conv_local_oid = str(_sig.get("local_order_id") or "").strip()
+                                _conv_client = str(
+                                    _sig.get("client_email")
+                                    or _sig.get("client_id")
+                                    or ""
+                                ).strip()
+                                _conv_mode = str(
+                                    getattr(self, "execution_mode", "")
+                                    or getattr(self, "mode", "")
+                                    or ""
+                                ).strip()
+                                if _watcher_removed and _ded_released:
+                                    log.info(
+                                        "WATCHER_TERMINAL_DURABLE_CONVERGED "
+                                        "local_order_id=%s client_id=%s execution_mode=%s "
+                                        "signal_id=%s ticker=%s "
+                                        "watcher_removed=true dedup_released=true "
+                                        "broker_submit=NOT_ATTEMPTED "
+                                        "broker_cancel=NOT_ATTEMPTED",
+                                        _conv_local_oid or "?",
+                                        _conv_client or "?",
+                                        _conv_mode or "?",
+                                        _sig_id or "?",
+                                        w.ticker,
+                                    )
+                                else:
+                                    log.critical(
+                                        "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                                        "local_order_id=%s client_id=%s execution_mode=%s "
+                                        "signal_id=%s ticker=%s "
+                                        "reason=cleanup_incomplete "
+                                        "watcher_removed=%s dedup_released=%s "
+                                        "dedup_error=%s "
+                                        "broker_submit=NOT_ATTEMPTED "
+                                        "broker_cancel=NOT_ATTEMPTED",
+                                        _conv_local_oid or "?",
+                                        _conv_client or "?",
+                                        _conv_mode or "?",
+                                        _sig_id or "?",
+                                        w.ticker,
+                                        _watcher_removed,
+                                        _ded_released,
+                                        _ded_error or "none",
+                                    )
+                            except Exception:
+                                pass
                         log.info(
                             "WATCHER_TRIGGER_CALLBACK_OK ticker=%s signal_id=%s "
-                            "removed_from_pending=true dedup_released=true "
+                            "removed_from_pending=true dedup_released=%s "
                             "timestamps_pre_persisted=%s",
-                            w.ticker, _sig_id or "?", _ts_pre_write_ok,
+                            w.ticker, _sig_id or "?",
+                            str(_ded_released).lower(),
+                            _ts_pre_write_ok,
                         )
                         # Post-success: log marker only — timestamps already durable.
                         log.debug(

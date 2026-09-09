@@ -405,6 +405,46 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             row = self._read_order(expected.local_order_id)
         except Exception:
             return False
+        # The read used by the fenced CAS is also a broker-handoff fence. A
+        # submit marker that appears after the base pre-dispatch snapshot must
+        # not be treated as an ordinary pending row.
+        _raw_meta = row.get("meta") if isinstance(row, dict) else None
+        if _raw_meta is not None and not isinstance(_raw_meta, dict):
+            if isinstance(_raw_meta, str):
+                try:
+                    _raw_meta = _json.loads(_raw_meta)
+                except Exception:
+                    return False
+            if not isinstance(_raw_meta, dict):
+                return False
+        _handoff = bool(
+            isinstance(row, dict)
+            and (
+                row.get("broker_order_id")
+                or row.get("submitted_ts")
+                or row.get("submit_intent_at")
+                or row.get("broker_submit_key")
+                or row.get("broker_submit_payload_hash")
+            )
+        )
+        if isinstance(row, dict):
+            _top_ready = row.get("broker_ready")
+            if _top_ready is not None and not (
+                _top_ready is False
+                or (
+                    isinstance(_top_ready, str)
+                    and _top_ready.strip().lower() == "false"
+                )
+            ):
+                _handoff = True
+        try:
+            from ap.pending_trigger_classifier import has_broker_handoff_evidence
+
+            _handoff = _handoff or has_broker_handoff_evidence(row)
+        except Exception:
+            return False
+        if _handoff:
+            return False
         proven, _status, _reason = self._verify_row(
             row, expected, pending_only=True
         )
@@ -936,21 +976,30 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         signal = getattr(watched, "signal", {}) or {}
         return str(getattr(watched, "signal_id", "") or signal.get("signal_id") or "").strip()
 
-    def _set_direction_hold(self, watched, key, reason_code: str, raw_reason: str) -> None:
+    def _set_direction_hold(
+        self,
+        watched,
+        key,
+        reason_code: str,
+        raw_reason: str,
+        *,
+        persist_audit: bool = True,
+    ) -> None:
         with self._lock:
             if any(item is watched for item in self._pending):
                 watched.state = WatchState.PENDING
                 watched.deferred_retry_not_before = (
                     _datetime.now(_timezone.utc) + _base.timedelta(seconds=5)
                 )
-        self._direction_event_audit(
-            watched,
-            reason_code,
-            raw_reason,
-            ownership_key=key,
-            held_local_order_id=self._local_order_id(watched),
-            held_signal_id=self._signal_id(watched),
-        )
+        if persist_audit:
+            self._direction_event_audit(
+                watched,
+                reason_code,
+                raw_reason,
+                ownership_key=key,
+                held_local_order_id=self._local_order_id(watched),
+                held_signal_id=self._signal_id(watched),
+            )
 
     def _preexisting_crossed_at(self, watched):
         context = self._direction_poll_context or {}
@@ -985,6 +1034,8 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             return [
                 item for item in self._pending
                 if item is not winner
+                and getattr(item, "_pre_dispatch_durable_disposition", None)
+                in {None, "NON_DEFERRED", "PENDING_TRIGGER"}
                 and str(getattr(item, "ticker", "") or "").upper().strip() == str(key[2]).upper().strip()
                 and (
                     self._direction_key(item) == key
@@ -1012,15 +1063,42 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         trigger_groups: dict[tuple[str, str, str], list] = {}
         invalid_triggers = []
         retained = []
+        held_direction_keys = set()
         for action, watched in completed:
             if action != "trigger":
                 retained.append((action, watched))
+                continue
+            # The base poller resolves durable terminal/ambiguity truth before
+            # this hook. Such watchers bypass direction mutation entirely and
+            # return to the base consumer for cleanup or fail-closed retention.
+            _durable_disposition = getattr(
+                watched, "_pre_dispatch_durable_disposition", None
+            )
+            if _durable_disposition not in {None, "NON_DEFERRED", "PENDING_TRIGGER"}:
+                retained.append((action, watched))
+                _held_key = self._direction_key(watched)
+                if _held_key is not None:
+                    held_direction_keys.add(_held_key)
                 continue
             key = self._direction_key(watched)
             if key is None:
                 invalid_triggers.append(watched)
             else:
                 trigger_groups.setdefault(key, []).append(watched)
+
+        # A key with any deferred watcher held on an identity/broker proof
+        # cannot make a directional claim this poll.  Retain every other
+        # confirmed watcher on that key as PENDING too; otherwise a clean
+        # opposite could mutate the shared direction authority or cancel the
+        # unresolved owner while its exact proof is still absent.
+        for _held_key in held_direction_keys:
+            for _blocked_watched in trigger_groups.pop(_held_key, []):
+                with self._lock:
+                    if any(item is _blocked_watched for item in self._pending):
+                        _blocked_watched.state = WatchState.PENDING
+                        _blocked_watched.deferred_retry_not_before = (
+                            _datetime.now(_timezone.utc) + _base.timedelta(seconds=5)
+                        )
 
         with self._watch_admission_gate:
             with self._direction_claim_gate:
@@ -1032,6 +1110,11 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                     if self._direction_key(item) is not None
                 }
                 for key, claim in list(self._direction_claims.items()):
+                    # Do not prune or rewrite a claim for a key whose
+                    # deferred watcher failed its exact pending proof.  The
+                    # watcher remains the owner until durable truth resolves.
+                    if key in held_direction_keys:
+                        continue
                     if key not in pending_keys:
                         self._direction_claims.pop(key, None)
                         continue
@@ -1183,11 +1266,28 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         losers.append(loser)
 
                 # A loser must never be canceled while the selected winner's
-                # trigger authority exists only in process memory.  Persist the
-                # winner first; a false return/exception is a fail-closed HOLD.
-                if losers and not self._persist_trigger_confirmation_authority(
-                    winner, require_pending_row=True
-                ):
+                # trigger authority exists only in process memory.  Deferred
+                # PENDING_TRIGGER winners also need this CAS before the
+                # direction-claim audit itself; otherwise trigger_ready (or a
+                # direction audit) could get ahead of durable authority.  A
+                # false return/exception is a fail-closed HOLD.
+                _winner_is_deferred_pending = (
+                    getattr(winner, "_pre_dispatch_durable_disposition", None)
+                    == "PENDING_TRIGGER"
+                )
+                _winner_authority_needed = bool(
+                    losers or _winner_is_deferred_pending
+                ) and getattr(winner, "_dispatch_authority_status", None) is None
+                if _winner_authority_needed:
+                    _winner_authority_ok = self._persist_trigger_confirmation_authority(
+                        winner, require_pending_row=True
+                    )
+                    winner._dispatch_authority_status = (
+                        "persisted" if _winner_authority_ok else "failed"
+                    )
+                else:
+                    _winner_authority_ok = True
+                if _winner_authority_needed and not _winner_authority_ok:
                     with self._direction_claim_gate:
                         self._direction_claims[key] = {
                             "status": "ambiguous_hold",
@@ -1198,6 +1298,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         key,
                         "direction_claim_authority_unproven_hold",
                         "winner_confirmed_trigger_authority_not_durable",
+                        persist_audit=not _winner_is_deferred_pending,
                     )
                     for watched in triggered:
                         if watched is not winner:
@@ -1206,6 +1307,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                                 key,
                                 "direction_claim_authority_unproven_hold",
                                 "winner_confirmed_trigger_authority_not_durable",
+                                persist_audit=not _winner_is_deferred_pending,
                             )
                     continue
 
